@@ -381,6 +381,15 @@ pub fn render_status(view: &StatusView, now: DateTime<Utc>) -> String {
     lines.join("\n")
 }
 
+/// "2 sub-agents or background commands", for `/clear` and `/wipe`.
+fn background_work_count(count: usize) -> String {
+    if count == 1 {
+        "1 sub-agent or background command".to_string()
+    } else {
+        format!("{count} sub-agents or background commands")
+    }
+}
+
 /// What `/cancel`'s arguments ask for; `None` when they are not a request.
 pub fn cancel_request(args: &str) -> Option<crate::stop::StopRequest> {
     let args = args.trim();
@@ -796,8 +805,12 @@ impl SharedCommands {
     }
 
     async fn handle_clear(&self, session_id: &str) -> String {
-        // Cancel any running tasks for this session so the agent loop aborts
-        // immediately instead of continuing to burn tokens after /clear.
+        // Stop the chat's sub-agents and background commands first (while
+        // the turn that waits on them still runs), then its turns, so the
+        // agent loop aborts instead of burning tokens after /clear.
+        let stopped_work =
+            crate::stop::stop_background_work(&self.task_registry, self.agent.as_ref(), session_id)
+                .await;
         let cancelled_tasks = self
             .task_registry
             .cancel_running_for_session(session_id)
@@ -823,6 +836,9 @@ impl SharedCommands {
                         if cancelled_tasks.len() == 1 { "" } else { "s" }
                     ));
                 }
+                if stopped_work > 0 {
+                    cancellations.push(background_work_count(stopped_work));
+                }
                 if !cancelled_goals.is_empty() {
                     cancellations.push(format!(
                         "{} background goal{}",
@@ -845,6 +861,9 @@ impl SharedCommands {
     }
 
     async fn handle_wipe(&self, session_id: &str) -> String {
+        let stopped_work =
+            crate::stop::stop_background_work(&self.task_registry, self.agent.as_ref(), session_id)
+                .await;
         let cancelled = self
             .task_registry
             .cancel_running_for_session(session_id)
@@ -853,14 +872,21 @@ impl SharedCommands {
         // Destructive: erases this session's active database artifacts.
         match self.agent.clear_session(session_id).await {
             Ok(_) => {
-                let suffix = if cancelled.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        " ({} running task{} cancelled.)",
+                let mut cancellations = Vec::new();
+                if !cancelled.is_empty() {
+                    cancellations.push(format!(
+                        "{} running task{}",
                         cancelled.len(),
                         if cancelled.len() == 1 { "" } else { "s" }
-                    )
+                    ));
+                }
+                if stopped_work > 0 {
+                    cancellations.push(background_work_count(stopped_work));
+                }
+                let suffix = if cancellations.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} cancelled.)", cancellations.join(" and "))
                 };
                 format!(
                     "Conversation erased from the active database (events, exact-search index, \

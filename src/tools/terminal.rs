@@ -10399,6 +10399,29 @@ mod tests {
         (host, sandboxed)
     }
 
+    /// After outside content only egress waits on the safety check: a
+    /// read-only command never does, and neither does a local project's own
+    /// status query (the check the live run stalled on).
+    #[tokio::test]
+    async fn read_only_checks_never_wait_on_the_safety_check() {
+        let (host, _) = host_and_sandboxed_terminals().await;
+        let ann = |command: &str| {
+            host.call_annotations_in(
+                &serde_json::json!({"action":"run","command":command}).to_string(),
+                &crate::traits::TrustRoots::new(&[]),
+            )
+        };
+        for read in ["ls -la ADMIN_PASSWORD.txt", "git status", "cat notes.txt | head -n 5"] {
+            let annotations = ann(read);
+            assert!(annotations.read_only && !annotations.egress, "{read}");
+        }
+        let check = "cd /tmp/synthetic-site && ls -la ADMIN_PASSWORD.txt && \
+                     ddev wp core is-installed; echo \"is-installed exit: $?\"; \
+                     ddev wp option get siteurl";
+        assert!(!ann(check).egress, "{check}");
+        assert!(ann("ddev wp plugin install akismet").egress);
+    }
+
     /// Ordinary local work on the host (builds, tests, local git, file
     /// shuffling) is not egress; programs outside the local-work table,
     /// inline interpreters and remote git are.

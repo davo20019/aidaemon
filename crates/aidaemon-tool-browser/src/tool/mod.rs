@@ -198,6 +198,19 @@ impl WaitCondition {
     }
 }
 
+/// A page's address as a caption names it: no scheme, no bare trailing
+/// slash.
+fn short_page_name(display_url: &str) -> &str {
+    let name = display_url
+        .strip_prefix("https://")
+        .or_else(|| display_url.strip_prefix("http://"))
+        .unwrap_or(display_url);
+    match name.strip_suffix('/') {
+        Some(host) if !host.contains('/') => host,
+        _ => name,
+    }
+}
+
 /// Decision returned by the approval gate. `Allow` lets the action reach the
 /// backend; `Deny` blocks it with a user-facing reason BEFORE any page/backend
 /// method is touched.
@@ -726,7 +739,9 @@ impl BrowserTool {
     ///   but an owner-confirmed scheduled run may execute the exact dispatcher-
     ///   issued call without waking the owner.
     /// - Opening a site on this computer: ask once per site, in every kind of
-    ///   session, unless the owner already let this session open it.
+    ///   session, unless the owner already let this session open it, the
+    ///   work set the site up itself, or the owner's request names it
+    ///   ([`aidaemon_tools::local_sites`]).
     /// - Other `Navigation` (`navigate`/`new_tab`/`switch_tab`): never ask. Public
     ///   HTTP(S) targets are validated against network/private-host policy before
     ///   this gate, while tab-only operations have no external side effect.
@@ -918,12 +933,20 @@ impl BrowserTool {
         };
         if blocked.is_loopback() {
             if let Some(key) = policy::local_site_key(url) {
-                if self.sessions.is_local_site_approved(session_id, &key).await {
+                if self.local_site_allowed(session_id, &key).await {
                     return Ok(());
                 }
             }
         }
         Err(blocked)
+    }
+
+    /// Whether `session_id` may open the local site `key`: the owner let
+    /// it, or the work set the site up itself or was asked for it by the
+    /// owner's request ([`aidaemon_tools::local_sites`]).
+    async fn local_site_allowed(&self, session_id: &str, key: &str) -> bool {
+        aidaemon_tools::local_sites::is_noted(&self.sessions.grant_key(session_id), key)
+            || self.sessions.is_local_site_approved(session_id, key).await
     }
 
     /// The local site this call would open that the owner has not approved
@@ -933,11 +956,7 @@ impl BrowserTool {
             return None;
         }
         let key = policy::local_site_key(args.url?)?;
-        (!self
-            .sessions
-            .is_local_site_approved(args.session_id, &key)
-            .await)
-            .then_some(key)
+        (!self.local_site_allowed(args.session_id, &key).await).then_some(key)
     }
 
     /// Defense-in-depth gate for observation/JS actions: read the page's LIVE
@@ -1076,7 +1095,9 @@ impl BrowserTool {
             .await
             .map(|u| redact_url_for_display(&u))
             .unwrap_or_else(|| "current page".to_string());
-        let caption = format!("Screenshot of {}", display_url);
+        // A short caption: the page without its scheme or a bare trailing
+        // slash ("Screenshot of demo.ddev.site").
+        let caption = format!("Screenshot of {}", short_page_name(&display_url));
 
         // Guard the delivery path: never enqueue media with an empty session id.
         if session_id.is_empty() {

@@ -594,9 +594,7 @@ pub struct TestHarness {
 /// Build a fully-wired agent with mock provider and temp-file SQLite DB.
 ///
 /// Each call creates an isolated database, so tests can run in parallel.
-pub use aidaemon_tools::testing::{
-    call_facts, call_through_kernel, call_with_facts, CallWithFacts,
-};
+pub use aidaemon_tools::testing::{call_facts, call_with_facts, CallWithFacts};
 
 /// The `fake_mcp_server` test binary of `aidaemon-mcp`: built once per test
 /// process into its own target directory (so it never waits on the build

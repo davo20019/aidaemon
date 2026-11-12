@@ -24,7 +24,17 @@ struct Progress {
     task_id: u64,
     last_step: Option<(String, Instant)>,
     plan: Option<String>,
-    helpers: Vec<(String, String, Instant)>,
+    /// Each helper: its label, latest progress, when that came, and when
+    /// it was first seen.
+    helpers: Vec<Helper>,
+}
+
+#[derive(Debug)]
+struct Helper {
+    label: String,
+    progress: String,
+    at: Instant,
+    started: Instant,
 }
 
 /// Each session's running work as its status updates showed it.
@@ -95,12 +105,17 @@ impl LiveWork {
                 label,
                 progress: line,
             } => {
-                match progress.helpers.iter_mut().find(|(l, _, _)| l == label) {
+                match progress.helpers.iter_mut().find(|h| h.label == *label) {
                     Some(helper) => {
-                        helper.1 = line.clone();
-                        helper.2 = now;
+                        helper.progress = line.clone();
+                        helper.at = now;
                     }
-                    None => progress.helpers.push((label.clone(), line.clone(), now)),
+                    None => progress.helpers.push(Helper {
+                        label: label.clone(),
+                        progress: line.clone(),
+                        at: now,
+                        started: now,
+                    }),
                 }
                 None
             }
@@ -131,10 +146,11 @@ impl LiveWork {
             work.helpers = progress
                 .helpers
                 .iter()
-                .map(|(label, line, at)| HelperProgress {
-                    label: label.clone(),
-                    progress: line.clone(),
-                    since: at.elapsed(),
+                .map(|helper| HelperProgress {
+                    label: helper.label.clone(),
+                    progress: helper.progress.clone(),
+                    since: helper.at.elapsed(),
+                    running_for: helper.started.elapsed(),
                 })
                 .collect();
         }
@@ -149,9 +165,10 @@ fn ago(duration: Duration) -> String {
     )
 }
 
-/// The reply to a question about the running work when the agent gave no
-/// answer: what the state itself says, in plain words.
-pub fn running_work_reply(work: &RunningWork) -> String {
+/// Where the running work stands, from its typed state: the request and how
+/// long it has run, its latest step, and each helper's job, progress and
+/// running time.
+pub fn running_work_status(work: &RunningWork) -> String {
     let mut lines = vec![format!(
         "Still working on \"{}\" ({} so far).",
         crate::presentation::word_preview(&work.request, 80),
@@ -166,11 +183,19 @@ pub fn running_work_reply(work: &RunningWork) -> String {
     }
     for helper in work.helpers.iter().take(MAX_HELPERS) {
         lines.push(format!(
-            "• {}: {}",
+            "• {}: {} (running {})",
             crate::presentation::word_preview(&helper.label, 60),
-            crate::presentation::word_preview(&helper.progress, 80)
+            crate::presentation::word_preview(&helper.progress, 80),
+            ago(helper.running_for)
         ));
     }
+    lines.join("\n")
+}
+
+/// The reply to a question about the running work when the agent gave no
+/// answer: what the state itself says, in plain words.
+pub fn running_work_reply(work: &RunningWork) -> String {
+    let mut lines = vec![running_work_status(work)];
     if let Some(plan) = &work.plan {
         lines.push(String::new());
         lines.push(plan.trim().to_string());
@@ -178,6 +203,17 @@ pub fn running_work_reply(work: &RunningWork) -> String {
     lines.push(String::new());
     lines.push("I'll send the results when it's done.".to_string());
     lines.join("\n")
+}
+
+/// The notice for a message the agent could not read (its model call
+/// failed): the message joins the running work, and the owner sees where
+/// that work stands, so a question about it is answered either way.
+pub fn unread_message_notice(work: &RunningWork) -> String {
+    let notice = crate::presentation::queued_message_notice(false);
+    if work.request.trim().is_empty() {
+        return notice;
+    }
+    format!("{notice}\n\n{}", running_work_status(work))
 }
 
 #[cfg(test)]
@@ -251,13 +287,14 @@ mod tests {
                 label: "Set up the blog".into(),
                 progress: "step 2 of 4".into(),
                 since: Duration::from_secs(5),
+                running_for: Duration::from_secs(130),
             }],
             ..RunningWork::default()
         };
         let reply = running_work_reply(&work);
         assert!(reply.starts_with("Still working on \"Set up two demo sites\" (5m 30s so far)."));
         assert!(reply.contains("Latest step: installing the blog (20s ago)."));
-        assert!(reply.contains("• Set up the blog: step 2 of 4"));
+        assert!(reply.contains("• Set up the blog: step 2 of 4 (running 2m 10s)"));
         assert!(reply.ends_with("I'll send the results when it's done."));
         assert!(!reply.contains('#'));
     }

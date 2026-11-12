@@ -2721,6 +2721,7 @@ impl Agent {
             known_resources: inherited
                 .map(|inherited| inherited.known_resources.clone())
                 .unwrap_or_default(),
+            card_title: inherited.and_then(|inherited| inherited.card_title.clone()),
             lineage: inherited
                 .map(|inherited| inherited.lineage.clone())
                 .unwrap_or_default(),
@@ -3024,6 +3025,13 @@ impl Agent {
                 goal_id.as_deref(),
             )
             .await;
+        // What the owner reads for this child on cards and status lines: the
+        // short title its parent gave it, else its mission.
+        let card_name = parent_authority
+            .card_title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| mission.to_string());
         // Emit SubAgentSpawn event
         {
             let emitter =
@@ -3126,7 +3134,7 @@ impl Agent {
         let session_for_task = child_session.clone();
         let task_for_task = task.to_string();
         let parent_status_tx = status_tx.clone();
-        let status_tx = child_status_sender(status_tx, mission);
+        let status_tx = child_status_sender(status_tx, &card_name);
         // Setup is done: from here the child counts toward its request's
         // total even if it then fails.
         crate::agent::authority::mark_child_began();
@@ -3135,7 +3143,7 @@ impl Agent {
         // runs, waited on or in the background.
         let listed = effective_approval_session_id.as_deref().map(|chat| {
             self.running_children
-                .enter(chat, mission, task, &child_session)
+                .enter(chat, &card_name, task, &child_session)
         });
         let owner_stop = listed.as_ref().map(RunningChildEntry::stopped);
         let owner_stopped = async {
@@ -3190,6 +3198,24 @@ impl Agent {
                 _ = &mut owner_stopped => {
                     join.abort();
                     let _ = (&mut join).await;
+                    // Release the durable task's attempt now rather than
+                    // leaving its lease to expire.
+                    if role == AgentRole::Executor {
+                        if let Some(task_id) = saved_task_id.as_deref() {
+                            if let Err(error) = self
+                                .finalize_executor_task_outcome(
+                                    task_id,
+                                    task_attempt.as_ref(),
+                                    None,
+                                    Some("Stopped by the owner from the chat."),
+                                    &child_session,
+                                )
+                                .await
+                            {
+                                warn!(task_id, %error, "Could not record a stopped executor's task");
+                            }
+                        }
+                    }
                     return Err(crate::runtime_ports::ChildStoppedByOwner.into());
                 }
                 _ = heartbeat.tick(), if task_attempt.is_some() => {
@@ -3270,7 +3296,7 @@ impl Agent {
         // child ended, not with the last step it reported.
         if let Some(tx) = &parent_status_tx {
             let _ = tx.try_send(StatusUpdate::SubAgentProgress {
-                label: child_status_label(mission),
+                label: child_status_label(&card_name),
                 progress: child_end_progress(child_outcome).to_string(),
             });
         }

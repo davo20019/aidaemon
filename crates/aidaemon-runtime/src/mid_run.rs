@@ -38,7 +38,8 @@ Judge by effect, not by grammar: a message phrased as an order (\"send me X now\
 about_running_work, because the task itself stays the same. It is changes_work only when \
 following it would make the task do something it was not going to do.\n\
 For about_running_work, write `answer`: one to three short, plain sentences for the owner, \
-using only the live state you are given: what is happening and for how long. If they ask \
+using only the live state you are given: what is happening and for how long, and for each \
+helper what it is doing and how long it has been running. If they ask \
 for results or files the state does not show as done, say they are not ready yet and that \
 they will come when the task finishes. Never invent progress, numbers, findings or files. \
 Do not mention tools, task numbers, internal names or file paths. For the others, \
@@ -66,6 +67,7 @@ fn work_facts(work: &RunningWork) -> Value {
             "job": clip(&helper.label, LINE_CHARS),
             "progress": clip(&helper.progress, LINE_CHARS),
             "seconds_ago": helper.since.as_secs(),
+            "running_for_seconds": helper.running_for.as_secs(),
         })).collect::<Vec<_>>(),
         "running": work.running.iter().take(MAX_RUNNING).map(|item| json!({
             "number": item.number,
@@ -119,13 +121,22 @@ enum Intent {
     Unrelated,
 }
 
+/// A provider that ignores the schema may send `null` for the answer or the
+/// intent in another case: both still read.
 #[derive(Deserialize)]
 struct Verdict {
-    intent: Intent,
+    intent: String,
     #[serde(default)]
-    answer: String,
+    answer: Option<String>,
     #[serde(default)]
     stop: Vec<u64>,
+}
+
+impl Verdict {
+    fn intent(&self) -> Option<Intent> {
+        let intent = self.intent.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        serde_json::from_value(Value::String(intent)).ok()
+    }
 }
 
 /// The verdict in `raw`, the model's JSON (possibly fenced).
@@ -149,9 +160,12 @@ fn parse(raw: &str) -> Option<MidRunReading> {
         answer: None,
         stop: Vec::new(),
     };
-    Some(match verdict.intent {
+    Some(match verdict.intent()? {
         Intent::AboutRunningWork => MidRunReading {
-            answer: Some(verdict.answer.trim().to_string()).filter(|a| !a.is_empty()),
+            answer: verdict
+                .answer
+                .map(|answer| answer.trim().to_string())
+                .filter(|a| !a.is_empty()),
             ..plain(MidRunIntent::AboutRunningWork)
         },
         Intent::ChangesWork => plain(MidRunIntent::ChangesWork),
@@ -214,6 +228,7 @@ mod tests {
                 label: "Install the blog site".into(),
                 progress: "step 2 of 4".into(),
                 since: Duration::from_secs(3),
+                running_for: Duration::from_secs(90),
             }],
             running: vec![RunningItem {
                 number: 4,
@@ -317,6 +332,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_verdict_off_the_schema_is_still_read() {
+        let (gateway, _) = gateway_with(provider_answering(
+            r#"{"intent":"About_Running_Work","answer":null}"#,
+        ))
+        .await;
+        let reading = read_mid_run_message(&gateway, "how's it going?", &work())
+            .await
+            .unwrap();
+        assert_eq!(reading.intent, MidRunIntent::AboutRunningWork);
+        assert_eq!(reading.answer, None);
+        let (gateway, _) =
+            gateway_with(provider_answering(r#"{"intent":"changes work"}"#)).await;
+        let reading = read_mid_run_message(&gateway, "use port 8081", &work())
+            .await
+            .unwrap();
+        assert_eq!(reading.intent, MidRunIntent::ChangesWork);
+    }
+
+    #[tokio::test]
     async fn a_failed_or_unreadable_reading_leaves_the_message_to_the_run() {
         let (gateway, _) = gateway_with(provider_failing("503")).await;
         assert!(read_mid_run_message(&gateway, "how is it going?", &work())
@@ -339,5 +373,6 @@ mod tests {
             "installing the blog"
         );
         assert_eq!(user["live_state"]["helpers"][0]["progress"], "step 2 of 4");
+        assert_eq!(user["live_state"]["helpers"][0]["running_for_seconds"], 90);
     }
 }

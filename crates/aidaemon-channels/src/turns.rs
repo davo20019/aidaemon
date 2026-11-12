@@ -257,6 +257,9 @@ impl TurnRunner {
         }
         if registry.has_running_task(&session_id).await {
             let mut steerable = true;
+            // The agent was asked to read it but gave no reading (its model
+            // call failed): the owner still sees where the work stands.
+            let mut unread = false;
             match self.read_mid_run(&turn).await {
                 Some(
                     reading @ MidRunReading {
@@ -298,8 +301,8 @@ impl TurnRunner {
                 Some(MidRunReading {
                     intent: MidRunIntent::ChangesWork,
                     ..
-                })
-                | None => {}
+                }) => {}
+                None => unread = Self::mid_run_readable(&turn),
             }
             let mut queued = QueuedMessage::new(
                 &turn.text,
@@ -323,9 +326,15 @@ impl TurnRunner {
                     // Notify for the first few only: a long message pasted
                     // in parts can arrive as many.
                     if position <= 3 {
-                        let notice = crate::presentation::queued_message_notice(
-                            !turn.attachments.is_empty() || !steerable,
-                        );
+                        let notice = if unread {
+                            crate::mid_run::unread_message_notice(
+                                &self.running_work(&session_id).await,
+                            )
+                        } else {
+                            crate::presentation::queued_message_notice(
+                                !turn.attachments.is_empty() || !steerable,
+                            )
+                        };
                         if let Ok(ids) = surface.say(&notice).await {
                             if let [message_id] = ids.as_slice() {
                                 self.remember_queued_notice(
@@ -398,14 +407,19 @@ impl TurnRunner {
         self.live.snapshot(session_id, &request, elapsed)
     }
 
+    /// Whether the agent reads `turn` sent mid-run: the owner's own text,
+    /// without files.
+    fn mid_run_readable(turn: &Turn) -> bool {
+        turn.user_role == UserRole::Owner
+            && turn.attachments.is_empty()
+            && !turn.text.trim().is_empty()
+    }
+
     /// Have the agent read a message the owner sent while a turn runs:
     /// only the owner's own text is read (another sender's message or one
     /// with files joins the queue as before), within a time limit.
     async fn read_mid_run(&self, turn: &Turn) -> Option<MidRunReading> {
-        if turn.user_role != UserRole::Owner
-            || !turn.attachments.is_empty()
-            || turn.text.trim().is_empty()
-        {
+        if !Self::mid_run_readable(turn) {
             return None;
         }
         let work = self.running_work(&turn.session_id).await;
@@ -1169,6 +1183,8 @@ mod tests {
         registry.clear_queue(session).await;
 
         // A change to the work (or no reading at all): it joins the run.
+        // With no reading (the model call failed) the owner also sees where
+        // the work stands, so a question is answered either way.
         for (reading, key) in [
             (
                 Some(MidRunReading {
@@ -1180,13 +1196,25 @@ mod tests {
             ),
             (None, "m6"),
         ] {
+            let unread = reading.is_none();
             set(reading);
             runner
-                .submit(surface.clone(), owner_turn("Use port 8081 instead.", key))
+                .submit(surface.clone(), owner_turn("how's it going?", key))
                 .await;
+            let notice = last(&surface);
+            assert!(
+                notice.starts_with(&crate::presentation::queued_message_notice(false)),
+                "{notice}"
+            );
             assert_eq!(
-                last(&surface),
-                crate::presentation::queued_message_notice(false)
+                notice.contains("Still working on \"Set up two demo sites\""),
+                unread,
+                "{notice}"
+            );
+            assert_eq!(
+                notice.contains("Latest step: installing the blog"),
+                unread,
+                "{notice}"
             );
             let taken = registry
                 .take_steering_messages(session, UserRole::Owner, &ctx)
@@ -1297,6 +1325,22 @@ mod tests {
         .await;
         assert_eq!(reply, "⏹️ Stopped:\n• Background command: count to 300");
         assert_eq!(agent.work.lock().unwrap().len(), 1);
+    }
+
+    /// `/clear` and `/wipe` stop the chat's sub-agents and background
+    /// commands through the same read-back stop.
+    #[tokio::test]
+    async fn clearing_stops_every_sub_agent_and_command() {
+        let agent = Arc::new(ScriptedAgent {
+            release: tokio::sync::Notify::new(),
+            reading: std::sync::Mutex::new(None),
+            work: std::sync::Mutex::new(two_counting_jobs()),
+        });
+        let registry = TaskRegistry::new(10);
+        let stopped =
+            crate::stop::stop_background_work(&registry, agent.as_ref(), "test:mid-run").await;
+        assert_eq!(stopped, 2);
+        assert!(agent.work.lock().unwrap().is_empty());
     }
 
     fn two_counting_jobs() -> Vec<crate::ports::ChatWork> {

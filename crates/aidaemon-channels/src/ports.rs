@@ -140,6 +140,8 @@ pub struct HelperProgress {
     pub progress: String,
     /// How long ago that progress came.
     pub since: std::time::Duration,
+    /// How long it has been running (since its first progress).
+    pub running_for: std::time::Duration,
 }
 
 /// The running work as its typed live state shows it, for answering a

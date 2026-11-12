@@ -824,38 +824,7 @@ pub(crate) fn normalize_terminal_agent_name(raw: &str) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn normalize_terminal_agent_permission_aliases(
-    agent: Option<&str>,
-    args: Vec<String>,
-) -> (Vec<String>, bool) {
-    if !agent
-        .map(|value| value.trim().eq_ignore_ascii_case("claude"))
-        .unwrap_or(false)
-    {
-        return (args, false);
-    }
-
-    let mut out = Vec::with_capacity(args.len());
-    let mut has_dangerous_skip = false;
-    let mut rewrote = false;
-
-    for arg in args {
-        if arg == "--dangerously-skip-permissions" {
-            has_dangerous_skip = true;
-            out.push(arg);
-        } else if arg == "--allow-dangerously-skip-permissions" {
-            rewrote = true;
-            if !has_dangerous_skip {
-                out.push("--dangerously-skip-permissions".to_string());
-                has_dangerous_skip = true;
-            }
-        } else {
-            out.push(arg);
-        }
-    }
-
-    (out, rewrote)
-}
+pub(crate) use aidaemon_tools::permission_bypass::normalize_terminal_agent_permission_aliases;
 
 fn parse_terminal_agent_launch_args(
     raw_args: &[String],
@@ -1113,34 +1082,5 @@ mod cli_alias_tests {
         assert_eq!(normalize_terminal_agent_name("CoDeX"), Some("codex"));
         assert_eq!(normalize_terminal_agent_name("claude"), Some("claude"));
         assert_eq!(normalize_terminal_agent_name("nope"), None);
-    }
-
-    #[test]
-    fn normalize_terminal_agent_permission_aliases_rewrites_claude_allow_flag() {
-        let args = vec![
-            "--allow-dangerously-skip-permissions".to_string(),
-            "--model".to_string(),
-            "sonnet".to_string(),
-        ];
-        let (normalized, rewrote) =
-            normalize_terminal_agent_permission_aliases(Some("claude"), args);
-        assert!(rewrote);
-        assert_eq!(
-            normalized,
-            vec![
-                "--dangerously-skip-permissions".to_string(),
-                "--model".to_string(),
-                "sonnet".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn normalize_terminal_agent_permission_aliases_leaves_other_agents_unchanged() {
-        let args = vec!["--allow-dangerously-skip-permissions".to_string()];
-        let (normalized, rewrote) =
-            normalize_terminal_agent_permission_aliases(Some("codex"), args.clone());
-        assert!(!rewrote);
-        assert_eq!(normalized, args);
     }
 }

@@ -32,6 +32,9 @@ use crate::traits::{
 use crate::types::StatusUpdate;
 use crate::types::{ApprovalResponse, UserRole};
 use crate::utils::{floor_char_boundary, truncate_str, truncate_with_note};
+use aidaemon_tools::permission_bypass::strip_permission_bypass_flags;
+#[cfg(test)]
+use aidaemon_tools::permission_bypass::without_permission_bypass;
 
 /// Max bytes for output buffer (1 MB) to prevent unbounded memory growth.
 const BUFFER_CAP: usize = 1_048_576;
@@ -830,78 +833,6 @@ async fn resolve_executable(backend: &SharedExecutionBackend, executable: &str) 
     None
 }
 
-/// Resolve both the configured launcher and, for `/usr/bin/env` wrappers, the
-/// actual nested agent executable. GUI/launchd processes commonly lack user
-/// install directories such as `~/.local/bin` in PATH; accepting `env` alone
-/// used to defer that mistake until every invocation exited with code 127.
-/// Boolean flags that switch a CLI agent into unattended auto-approve mode,
-/// across every agent we launch. The single list for the cli_agent tool and
-/// the terminal-bridge review profiles.
-pub(crate) const PERMISSION_BYPASS_FLAGS: &[&str] = &[
-    // claude
-    "--dangerously-skip-permissions",
-    "--allow-dangerously-skip-permissions",
-    "--dangerously-bypass-hook-trust",
-    // codex
-    "--dangerously-bypass-approvals-and-sandbox",
-    "--full-auto",
-    // gemini
-    "--yolo",
-    // copilot
-    "--allow-all-tools",
-    "--allow-all-paths",
-    // aider
-    "--yes",
-    "--yes-always",
-];
-
-/// Options whose given value turns them into a bypass: (flag, value).
-const PERMISSION_BYPASS_OPTION_VALUES: &[(&str, &str)] = &[
-    ("--sandbox", "false"),
-    ("--sandbox", "danger-full-access"),
-    ("--approval-mode", "yolo"),
-    ("--permission-mode", "bypassPermissions"),
-];
-
-fn is_permission_bypass_flag(arg: &str, agent: &str) -> bool {
-    if arg == "-y" {
-        // `-y` means something else for most CLIs; it is gemini's --yolo.
-        return agent.eq_ignore_ascii_case("gemini");
-    }
-    PERMISSION_BYPASS_FLAGS.iter().any(|flag| {
-        arg == *flag
-            || arg
-                .strip_prefix(flag)
-                .is_some_and(|rest| rest.starts_with('='))
-    }) || PERMISSION_BYPASS_OPTION_VALUES.iter().any(|(flag, value)| {
-        arg.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) == Some(value)
-    })
-}
-
-fn without_permission_bypass(args: &[String], agent: &str) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len());
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].as_str();
-        if is_permission_bypass_flag(arg, agent) {
-            index += 1;
-            continue;
-        }
-        if let Some(value) = args.get(index + 1) {
-            if PERMISSION_BYPASS_OPTION_VALUES
-                .iter()
-                .any(|(flag, v)| arg == *flag && value == v)
-            {
-                index += 2;
-                continue;
-            }
-        }
-        out.push(args[index].clone());
-        index += 1;
-    }
-    out
-}
-
 /// The arguments a stored agent may launch with. Options that can change what
 /// an agent is allowed to do (`codex -c`, `--permission-mode`, `--add-dir`)
 /// are deliberately absent.
@@ -1004,20 +935,10 @@ fn unlisted_launch_argument(agent: &str, args: &[String]) -> Option<String> {
     None
 }
 
-/// Remove auto-approve flags from a launch argument list. `agent` is the
-/// agent's name or executable name (it only matters for gemini's `-y`).
-/// Every launch goes through this function; it refuses if a flag survives.
-pub(crate) fn strip_permission_bypass_flags(
-    args: &mut Vec<String>,
-    agent: &str,
-) -> Result<(), String> {
-    *args = without_permission_bypass(args, agent);
-    if without_permission_bypass(args, agent).len() != args.len() {
-        return Err("its permission-bypass flags could not be removed".to_string());
-    }
-    Ok(())
-}
-
+/// Resolve both the configured launcher and, for `/usr/bin/env` wrappers, the
+/// actual nested agent executable. GUI/launchd processes commonly lack user
+/// install directories such as `~/.local/bin` in PATH; accepting `env` alone
+/// used to defer that mistake until every invocation exited with code 127.
 async fn resolve_agent_launch(
     backend: &SharedExecutionBackend,
     command: &str,

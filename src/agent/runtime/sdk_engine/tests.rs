@@ -3370,6 +3370,7 @@ async fn a_child_of_an_untrusted_origin_turn_has_no_owner_request() {
             child_declaration: None,
             parent_run: None,
             known_resources: Default::default(),
+            card_title: None,
             lineage: Vec::new(),
             parent_task: None,
         },
@@ -3490,6 +3491,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
         child_declaration: None,
         parent_run: None,
         known_resources: Default::default(),
+        card_title: None,
         lineage: Vec::new(),
         parent_task: None,
     };

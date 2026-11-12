@@ -6,7 +6,7 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::config::NodeMonitoringConfig;
-use crate::traits::NotificationEntry;
+use aidaemon_work::goals::NotificationEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MonitorComparison {

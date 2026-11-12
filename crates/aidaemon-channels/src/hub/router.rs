@@ -44,8 +44,9 @@ pub struct ChannelHub {
     /// session. Without it, a file the background notifier delivers
     /// deterministically (Task 4) is sent a SECOND time when the model also calls
     /// `send_file` for it (e.g. the user's request ends with "…then send me the
-    /// file"). Keyed by `(session_id, canonical file path)`; genuinely different
-    /// files (different paths) are never suppressed. Photos are never deduped.
+    /// file"). Keyed by `(session_id, content)`, photos included, so a copy of
+    /// an image already in the chat is not sent again; genuinely different
+    /// content is never suppressed.
     recent_media_deliveries: RwLock<HashMap<String, tokio::time::Instant>>,
     /// Per-session editable message id of a delivered background-handoff reply
     /// ("⏳ **Still on it**"). Progress updates read it without consuming it,
@@ -125,12 +126,44 @@ impl ChannelHub {
     /// How long a delivered document suppresses an identical re-delivery.
     const MEDIA_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
-    /// De-dup key for a media message, or `None` for media that should never be
-    /// deduped (in-memory photos have no stable identity).
-    fn media_dedupe_key(session_id: &str, media: &MediaMessage) -> Option<String> {
-        match &media.kind {
-            MediaKind::Document { file_path, .. } => Some(format!("{session_id}\u{1}{file_path}")),
-            MediaKind::Photo { .. } => None,
+    /// The largest file whose content keys its de-duplication; a larger one
+    /// is keyed by its path.
+    const MEDIA_DEDUPE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+    /// De-dup key for a media message: its content, so the same image sent
+    /// again (a screenshot the browser already put in the chat, then copied
+    /// and sent with `send_file`) is suppressed whatever its path or kind.
+    /// A file that cannot be read (or is very large) is keyed by its path;
+    /// `None` only for nothing to key on.
+    async fn media_dedupe_key(session_id: &str, media: &MediaMessage) -> Option<String> {
+        use std::hash::{Hash, Hasher};
+        fn digest(bytes: &[u8]) -> String {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            format!("{}:{:016x}", bytes.len(), hasher.finish())
+        }
+        let content = match &media.kind {
+            MediaKind::Photo { data } => Some(digest(data)),
+            MediaKind::Document { file_path, .. } => {
+                let path = file_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    let size = std::fs::metadata(&path).ok()?.len();
+                    (size <= Self::MEDIA_DEDUPE_MAX_BYTES)
+                        .then(|| std::fs::read(&path).ok())
+                        .flatten()
+                })
+                .await
+                .ok()
+                .flatten()
+                .map(|bytes| digest(&bytes))
+            }
+        };
+        match (content, &media.kind) {
+            (Some(content), _) => Some(format!("{session_id}\u{1}content\u{1}{content}")),
+            (None, MediaKind::Document { file_path, .. }) => {
+                Some(format!("{session_id}\u{1}{file_path}"))
+            }
+            (None, MediaKind::Photo { .. }) => None,
         }
     }
 
@@ -141,7 +174,7 @@ impl ChannelHub {
     /// [`release_media_delivery`](Self::release_media_delivery) so a retry isn't
     /// wrongly suppressed.
     async fn claim_media_delivery(&self, session_id: &str, media: &MediaMessage) -> bool {
-        let Some(key) = Self::media_dedupe_key(session_id, media) else {
+        let Some(key) = Self::media_dedupe_key(session_id, media).await else {
             return true;
         };
         let now = tokio::time::Instant::now();
@@ -157,7 +190,7 @@ impl ChannelHub {
     /// Release a previously-claimed document delivery (used when the actual send
     /// failed, so a later retry of the same file is not suppressed).
     async fn release_media_delivery(&self, session_id: &str, media: &MediaMessage) {
-        if let Some(key) = Self::media_dedupe_key(session_id, media) {
+        if let Some(key) = Self::media_dedupe_key(session_id, media).await {
             self.recent_media_deliveries.write().await.remove(&key);
         }
     }
@@ -1165,6 +1198,47 @@ mod tests {
             2,
             "a different document must still be delivered"
         );
+    }
+
+    /// A screenshot the browser already put in the chat is not sent again
+    /// when a copy of it goes out with `send_file`; another image is.
+    #[tokio::test]
+    async fn a_copy_of_an_image_already_in_the_chat_is_not_sent_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = b"synthetic-png-bytes".to_vec();
+        let copy = dir.path().join("homepage.png");
+        std::fs::write(&copy, &png).unwrap();
+        let other = dir.path().join("other.png");
+        std::fs::write(&other, b"another image").unwrap();
+
+        let channel = Arc::new(CountingMediaChannel::new());
+        let session_map = empty_session_map();
+        session_map
+            .write()
+            .await
+            .insert("s1".to_string(), "counting_media".to_string());
+        let hub = ChannelHub::new(vec![channel.clone() as Arc<dyn HubChannel>], session_map);
+        let photo = MediaMessage {
+            session_id: "s1".to_string(),
+            caption: "Screenshot of demo.test".to_string(),
+            kind: crate::hub::MediaKind::Photo { data: png },
+            result_tx: None,
+        };
+        assert!(hub.claim_media_delivery("s1", &photo).await);
+        hub.send_media_strict(
+            "s1",
+            &doc_msg("s1", &copy.display().to_string(), "homepage.png"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(channel.doc_count().await, 0, "the copy is already in the chat");
+        hub.send_media_strict(
+            "s1",
+            &doc_msg("s1", &other.display().to_string(), "other.png"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(channel.doc_count().await, 1, "another image is sent");
     }
 
     fn session_map_with(entries: Vec<(&str, &str)>) -> SessionMap {

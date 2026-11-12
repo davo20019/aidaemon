@@ -279,6 +279,26 @@ pub async fn stop(
     reply
 }
 
+/// Stop every sub-agent and background command the chat has running (its
+/// turns are left to the caller), each read back; returns how many were
+/// read back as stopped.
+pub async fn stop_background_work(
+    registry: &TaskRegistry,
+    agent: &dyn ChannelAgentRuntime,
+    session_id: &str,
+) -> usize {
+    let list = running_work(registry, agent, session_id).await;
+    let mut stopped = 0;
+    for entry in &list.entries {
+        if let Target::Work(key) = &entry.target {
+            if agent.stop_chat_work(session_id, key).await {
+                stopped += 1;
+            }
+        }
+    }
+    stopped
+}
+
 /// Whether turn `id` has ended (or is no longer kept), reading the registry
 /// until it has or [`TURN_SETTLE`] passes.
 async fn turn_ended(registry: &TaskRegistry, id: u64) -> bool {

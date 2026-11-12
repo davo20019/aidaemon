@@ -116,6 +116,54 @@ const LOCAL_WORK_SUBCOMMANDS: &[(&str, &[&str])] = &[
     ("swift", &["build", "test"]),
 ];
 
+/// `ddev` subcommands that only report on a local project.
+const DDEV_QUERY_SUBCOMMANDS: &[&str] = &["describe", "status", "st", "list", "version", "logs"];
+
+/// Read-only queries run through a project's own tools inside its local
+/// containers: (`ddev` subcommand, its command, the command's read-only
+/// subcommands).
+const DDEV_TOOL_QUERIES: &[(&str, &str, &[&str])] = &[
+    ("wp", "core", &["is-installed", "version"]),
+    ("wp", "option", &["get", "list"]),
+    ("wp", "plugin", &["list", "status", "is-installed", "is-active"]),
+    ("wp", "theme", &["list", "status", "is-installed", "is-active"]),
+    ("wp", "user", &["list", "get"]),
+    ("wp", "post", &["list", "get"]),
+];
+
+/// `drush` commands that only report.
+const DRUSH_QUERIES: &[&str] = &["status", "st", "core:status", "core-status", "pm:list"];
+
+/// Options through which WP-CLI or drush run code or a file of their own.
+const DDEV_TOOL_CODE_OPTIONS: &[&str] = &["--exec", "--require", "--eval", "--include", "--ssh"];
+
+/// A `ddev` call that only asks a local project about itself: a project
+/// report, or a read-only WP-CLI or drush query run in the project's
+/// containers. Starting, importing or installing (which can pull from the
+/// network) and `exec`/`ssh` (any command) are not.
+fn ddev_query_ok(args: &[String]) -> bool {
+    if args.iter().any(|arg| {
+        DDEV_TOOL_CODE_OPTIONS
+            .iter()
+            .any(|option| arg == option || arg.starts_with(&format!("{option}=")))
+    }) {
+        return false;
+    }
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| !arg.starts_with('-'))
+        .collect();
+    match words.as_slice() {
+        [sub, ..] if DDEV_QUERY_SUBCOMMANDS.contains(sub) => true,
+        ["drush", command, ..] => DRUSH_QUERIES.contains(command),
+        [tool, command, sub, ..] => DDEV_TOOL_QUERIES
+            .iter()
+            .any(|(t, c, subs)| t == tool && c == command && subs.contains(sub)),
+        _ => false,
+    }
+}
+
 const FIND_MUTATING_FLAGS: &[&str] = &[
     "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
 ];
@@ -744,6 +792,7 @@ fn local_work_args_ok(program: &str, args: &[String]) -> bool {
         "find" => !args
             .iter()
             .any(|arg| arg != "-delete" && FIND_MUTATING_FLAGS.contains(&arg.as_str())),
+        "ddev" => ddev_query_ok(args),
         _ if LOCAL_WORK_PROGRAMS.contains(&program) => true,
         _ if OBSERVATION_PROGRAMS.contains(&program) => observation_args_ok(program, args),
         _ => false,
@@ -3126,6 +3175,38 @@ fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A local project's own status queries (a project report, read-only
+    /// WP-CLI and drush queries) are local work; starting, installing,
+    /// running code and arbitrary commands in its containers are not.
+    #[test]
+    fn ddev_status_queries_are_local_work() {
+        for query in [
+            "ddev describe",
+            "cd /srv/demo && ls -la ADMIN_PASSWORD.txt && ddev wp core is-installed; \
+             echo \"is-installed exit: $?\"; ddev wp option get siteurl",
+            "ddev wp core version --allow-root",
+            "ddev drush status --field=bootstrap",
+            "ddev wp plugin list --format=json",
+        ] {
+            let effects = command_effects(query);
+            assert!(effects.local_work_only, "{query}");
+            assert!(!fetches_network(query), "{query}");
+        }
+        for other in [
+            "ddev start",
+            "ddev wp plugin install akismet",
+            "ddev wp core download",
+            "ddev wp --exec='echo 1;' option get siteurl",
+            "ddev wp option get siteurl --require=/tmp/x.php",
+            "ddev exec curl https://example.invalid",
+            "ddev ssh",
+            "ddev drush sql:drop",
+            "ddev",
+        ] {
+            assert!(!command_effects(other).local_work_only, "{other}");
+        }
+    }
 
     /// Every path effect reads its argument the same way: a bracket in
     /// either form, `~user` and an unanchored relative path are unreadable.

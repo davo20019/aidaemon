@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aidaemon_core::{
-    collect_stream, Image, Message, ModelRequest, ModelResponse, Provider, ProviderError, Role,
-    StreamEvent, ToolCall, ToolChoice, Usage,
+    collect_stream, Image, Message, ModelRequest, ModelResponse, Provider, ProviderError,
+    ResponseFormat, Role, StreamEvent, ToolCall, ToolChoice, Usage,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -222,6 +222,70 @@ fn input_schema(parameters: &Value) -> Value {
     schema
 }
 
+/// Whether `model` constrains its reply to a JSON schema
+/// (`output_config.format`): the Claude 5 family, Opus 4.8, and the 4.5
+/// Haiku and Opus; other models get the schema only through the prompt.
+fn takes_structured_output(model: &str) -> bool {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    [
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-haiku-5",
+        "claude-opus-4-8",
+        "claude-haiku-4-5",
+        "claude-opus-4-5",
+        "claude-opus-4-1",
+    ]
+    .iter()
+    .any(|family| model.starts_with(family))
+}
+
+/// A JSON schema in the subset structured outputs accept: every object
+/// closed (`additionalProperties: false`), numeric, string and array-size
+/// constraints dropped (the caller still validates what it reads).
+fn output_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                match key.as_str() {
+                    "minimum"
+                    | "maximum"
+                    | "exclusiveMinimum"
+                    | "exclusiveMaximum"
+                    | "multipleOf"
+                    | "minLength"
+                    | "maxLength"
+                    | "pattern"
+                    | "minItems"
+                    | "maxItems"
+                    | "uniqueItems"
+                    | "minProperties"
+                    | "maxProperties"
+                    | "additionalProperties" => {}
+                    _ => {
+                        out.insert(key.clone(), output_schema(value));
+                    }
+                }
+            }
+            let is_object = out.get("type").is_some_and(|kind| {
+                kind == "object"
+                    || kind
+                        .as_array()
+                        .is_some_and(|kinds| kinds.iter().any(|k| k == "object"))
+            }) || out.contains_key("properties");
+            if is_object {
+                out.insert("additionalProperties".into(), Value::Bool(false));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(output_schema).collect()),
+        other => other.clone(),
+    }
+}
+
 fn ephemeral() -> Value {
     json!({"type": "ephemeral"})
 }
@@ -344,6 +408,15 @@ fn build_body(
             body["output_config"] = json!({"effort": adaptive_effort(effort)});
         }
         (None, None) => {}
+    }
+    if let ResponseFormat::JsonSchema { schema, .. } = &request.options.response_format {
+        if takes_structured_output(&request.model) {
+            if !body["output_config"].is_object() {
+                body["output_config"] = json!({});
+            }
+            body["output_config"]["format"] =
+                json!({"type": "json_schema", "schema": output_schema(schema)});
+        }
     }
     if !system.is_empty() {
         body["system"] = Value::Array(system);
@@ -762,5 +835,77 @@ mod input_schema_tests {
             sent["properties"]["targets"]["items"]["oneOf"],
             json!([{"type": "string"}])
         );
+    }
+}
+
+#[cfg(test)]
+mod output_format_tests {
+    use super::{build_body, output_schema};
+    use aidaemon_core::{Message, ModelRequest, ResponseFormat};
+    use serde_json::json;
+
+    fn schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "intent": {"type": "string", "enum": ["join", "answer"], "maxLength": 20},
+                "answer": {"type": ["string", "null"]},
+                "steps": {"type": "array", "maxItems": 3, "items": {
+                    "type": "object", "properties": {"n": {"type": "integer", "minimum": 0}}
+                }}
+            },
+            "required": ["intent", "answer"],
+            "additionalProperties": true
+        })
+    }
+
+    fn request(model: &str) -> ModelRequest {
+        let mut request = ModelRequest {
+            model: model.to_string(),
+            messages: vec![Message::user("how's it going?")],
+            ..Default::default()
+        };
+        request.options.response_format = ResponseFormat::JsonSchema {
+            name: "verdict".into(),
+            schema: schema(),
+            strict: true,
+        };
+        request.options.reasoning_effort = Some("low".into());
+        request
+    }
+
+    #[test]
+    fn a_json_schema_reply_is_constrained_through_output_config() {
+        let body = build_body(&request("claude-haiku-5-5"), 1024, false, None);
+        let format = &body["output_config"]["format"];
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["schema"]["required"], json!(["intent", "answer"]));
+        // Effort stays next to the format.
+        assert!(body["output_config"]["effort"].is_string());
+    }
+
+    #[test]
+    fn the_schema_is_closed_and_unsupported_constraints_dropped() {
+        let sent = output_schema(&schema());
+        assert_eq!(sent["additionalProperties"], json!(false));
+        assert_eq!(
+            sent["properties"]["steps"]["items"]["additionalProperties"],
+            json!(false)
+        );
+        assert!(sent["properties"]["intent"].get("maxLength").is_none());
+        assert!(sent["properties"]["steps"].get("maxItems").is_none());
+        assert!(sent["properties"]["steps"]["items"]["properties"]["n"]
+            .get("minimum")
+            .is_none());
+        assert_eq!(
+            sent["properties"]["intent"]["enum"],
+            json!(["join", "answer"])
+        );
+    }
+
+    #[test]
+    fn a_model_without_structured_outputs_gets_no_format() {
+        let body = build_body(&request("claude-3-5-haiku-latest"), 1024, false, None);
+        assert!(body["output_config"].get("format").is_none());
     }
 }
