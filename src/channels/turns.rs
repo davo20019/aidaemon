@@ -107,6 +107,14 @@ pub(crate) trait TurnSurface: Send + Sync + 'static {
         Err(updates)
     }
 
+    /// Whether this surface's status is one card that the reply settles
+    /// (its closing state decides whether the card stays). Such a surface
+    /// gets a finished turn's last updates before the reply; plain status
+    /// messages do not, since a late one would only repeat the reply.
+    fn status_settles_before_reply(&self) -> bool {
+        false
+    }
+
     /// Deliver the agent's reply (already prepared for chat).
     async fn deliver(&self, _envelope: &AgentResponseEnvelope, reply: &str) -> Delivered {
         Delivered::from_send(self.say(reply).await, self.platform())
@@ -310,7 +318,7 @@ impl TurnRunner {
                 Ok(envelope) if envelope.disposition
                     != crate::events::AssistantResponseDisposition::BackgroundHandoff
             );
-            if run_finished {
+            if run_finished && surface.status_settles_before_reply() {
                 let _ = tokio::time::timeout(STATUS_DRAIN, &mut status_task).await;
             }
             status_task.abort();
@@ -741,6 +749,9 @@ mod tests {
             Ok(vec!["1".to_string()])
         }
         fn show_working(&self, _: CancellationToken, _: Arc<AtomicU64>, _: u64) {}
+        fn status_settles_before_reply(&self) -> bool {
+            true
+        }
         fn show_status(
             &self,
             mut updates: mpsc::Receiver<StatusUpdate>,

@@ -4719,6 +4719,11 @@ impl TurnSurface for TelegramSurface {
         })
     }
 
+    /// The live card's closing checklist decides whether it stays.
+    fn status_settles_before_reply(&self) -> bool {
+        self.live.is_some()
+    }
+
     async fn deliver(&self, envelope: &AgentResponseEnvelope, reply: &str) -> Delivered {
         let background_handoff =
             envelope.disposition == crate::events::AssistantResponseDisposition::BackgroundHandoff;
