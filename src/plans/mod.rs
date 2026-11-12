@@ -333,9 +333,10 @@ impl TaskPlan {
 
     /// Compact, channel-friendly checklist for the live status card.
     ///
-    /// One header line carries the state and the count; one line per step
-    /// follows, so the card stays short on a phone. A one-step plan is just
-    /// that step (a header and a "1 of 1" would only repeat it). A fully
+    /// One header line carries the state and the count; the steps follow, a
+    /// blank line apart so wrapped descriptions stay readable on a phone. A
+    /// one-step plan is just that step (a header and a "1 of 1" would only
+    /// repeat it). A fully
     /// completed card starts with ✅ ([`is_completed_checklist`]) so the
     /// channel can drop it once the reply, which says what was done, lands.
     pub fn render_compact_checklist(&self) -> String {
@@ -369,7 +370,6 @@ impl TaskPlan {
             PlanStatus::Abandoned => format!("⏹️ Cancelled · {done} of {total} done"),
         };
         let mut out = header;
-        out.push('\n');
         for step in &self.steps {
             let line = match step.status {
                 StepStatus::Completed => format!("✅ {}", step.description),
@@ -379,7 +379,9 @@ impl TaskPlan {
                 StepStatus::Skipped => format!("➖ {} (skipped)", step.description),
                 StepStatus::Pending => format!("○ {}", step.description),
             };
-            out.push('\n');
+            // A blank line between steps: descriptions wrap on a phone, and
+            // without a gap the wrapped lines run into the next step.
+            out.push_str("\n\n");
             out.push_str(&line);
         }
         if self.status == PlanStatus::PartiallyCompleted {
@@ -791,7 +793,7 @@ mod tests {
         let checklist = plan.render_compact_checklist();
         assert_eq!(
             checklist,
-            "⚙️ Working · step 2 of 2\n\n✅ create script\n▶️ send the file"
+            "⚙️ Working · step 2 of 2\n\n✅ create script\n\n▶️ send the file"
         );
         assert_eq!(
             checklist_progress(&checklist).as_deref(),
@@ -837,7 +839,7 @@ mod tests {
         }
         plan.status = PlanStatus::Completed;
         let checklist = plan.render_compact_checklist();
-        assert_eq!(checklist, "✅ Done · 2 of 2 steps\n\n✅ first\n✅ second");
+        assert_eq!(checklist, "✅ Done · 2 of 2 steps\n\n✅ first\n\n✅ second");
         assert!(is_completed_checklist(&checklist));
         assert!(!checklist.contains("Finalizing"));
     }
