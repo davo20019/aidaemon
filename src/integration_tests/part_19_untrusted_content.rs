@@ -839,7 +839,7 @@ async fn queued_background_result(
         let pending = state.get_pending_notifications(20).await.unwrap();
         if let Some(entry) = pending
             .into_iter()
-            .find(|entry| entry.message.contains("Mission: Summarize"))
+            .find(|entry| entry.message.contains("in the background: Summarize"))
         {
             queued = Some(entry);
             break;

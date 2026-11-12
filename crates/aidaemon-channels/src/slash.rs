@@ -250,12 +250,18 @@ pub trait CommandHost: Send + Sync {
     async fn next_scheduled(&self) -> Option<ScheduledItem> {
         None
     }
+
+    /// `at` in the owner's local time and format ("2:39 PM ET"), for the
+    /// first line of `/status`; `None` when the host has no owner zone.
+    fn owner_time(&self, _at: DateTime<Utc>) -> Option<String> {
+        None
+    }
 }
 
 /// One scheduled item as `/status` shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledItem {
-    /// What runs, in the owner's words.
+    /// What runs, in the owner's words (`/status` cuts it at a word).
     pub what: String,
     /// When, already in the owner's local time ("2:39 PM ET").
     pub when: String,
@@ -264,6 +270,8 @@ pub struct ScheduledItem {
 /// What `/status` reports, read from typed state.
 #[derive(Debug, Clone)]
 pub struct StatusView {
+    /// The current time in the owner's local format, when known.
+    pub now: Option<String>,
     /// The chat's mode and when it ends; `None` is full access.
     pub mode: Option<(ChatMode, Option<DateTime<Utc>>)>,
     /// Running chat tasks: id, description, when it started.
@@ -290,7 +298,11 @@ fn mode_line(mode: Option<(ChatMode, Option<DateTime<Utc>>)>, now: DateTime<Utc>
 
 /// `/status`: the chat's mode, what is running and what is scheduled next.
 pub fn render_status(view: &StatusView, now: DateTime<Utc>) -> String {
-    let mut lines = vec![mode_line(view.mode, now)];
+    let mode = mode_line(view.mode, now);
+    let mut lines = vec![match &view.now {
+        Some(local) => format!("It's {local}. {mode}"),
+        None => mode,
+    }];
     if view.running.is_empty() {
         lines.push("Running: nothing right now.".to_string());
     } else {
@@ -502,6 +514,7 @@ impl SharedCommands {
             .map(|entry| (entry.id, entry.description, entry.started_at))
             .collect();
         let view = StatusView {
+            now: self.host.owner_time(now),
             mode: self.host.chat_mode(session_id, now).await,
             running,
             next_scheduled: self.host.next_scheduled().await,
@@ -980,6 +993,7 @@ mod help_and_status_tests {
     fn status_says_mode_running_work_and_whats_next() {
         let now = Utc::now();
         let quiet = StatusView {
+            now: None,
             mode: None,
             running: Vec::new(),
             next_scheduled: None,
@@ -989,6 +1003,7 @@ mod help_and_status_tests {
             "Mode: full.\nRunning: nothing right now.\nNext scheduled: nothing."
         );
         let busy = StatusView {
+            now: Some("2:05 PM ET".to_string()),
             mode: Some((ChatMode::ReadOnly, Some(now + chrono::Duration::hours(3)))),
             running: vec![(
                 7,
@@ -1002,7 +1017,7 @@ mod help_and_status_tests {
         };
         let status = render_status(&busy, now);
         assert!(
-            status.starts_with("Mode: read-only (about 3h left)."),
+            status.starts_with("It's 2:05 PM ET. Mode: read-only (about 3h left)."),
             "{status}"
         );
         assert!(
@@ -1013,6 +1028,19 @@ mod help_and_status_tests {
             status.ends_with("Next scheduled: Check disk space – 2:39 PM ET"),
             "{status}"
         );
+
+        // A long description is cut at a word, never mid-word.
+        let long = StatusView {
+            next_scheduled: Some(ScheduledItem {
+                what: "Every day, independently manage and publish to the synthetic blog at https://blog.example.test following the editorial plan".to_string(),
+                when: "Fri, Nov 13, 6:00 AM ET".to_string(),
+            }),
+            ..busy
+        };
+        let status = render_status(&long, now);
+        let next = status.lines().last().unwrap();
+        assert!(next.contains("… – Fri, Nov 13, 6:00 AM ET"), "{next}");
+        assert!(next.contains("Every day, independently manage"), "{next}");
     }
 }
 

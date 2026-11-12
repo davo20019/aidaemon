@@ -359,7 +359,7 @@ async fn a_good_key_is_saved_and_never_reaches_the_agent() {
         .wait_for("sendmessage", |body| {
             body["text"]
                 .as_str()
-                .is_some_and(|t| t.contains("is saved"))
+                .is_some_and(|t| t.contains("saved and tested"))
         })
         .await;
     assert!(!done.to_string().contains("synthetic-good-key"), "{done}");

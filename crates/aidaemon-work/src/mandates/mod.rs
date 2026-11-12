@@ -428,35 +428,58 @@ impl MandateObjectiveControl {
     /// Smallest meaningful effect: one thousandth of a unit.
     pub const MIN_EFFECT_MICROS: i64 = 1_000;
 
+    /// Checks every setting. An error names the one setting that is wrong,
+    /// its value and the allowed range, so the model can fix that setting
+    /// and tell the owner plainly what was wrong.
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != Self::SCHEMA_VERSION
-            || !canonical_text_within(&self.metric_name, 128)
-            || !canonical_text_within(&self.unit, 64)
-            || !canonical_text_within(&self.experiment_cohort, 128)
-        {
-            return Err("objective control metric metadata is invalid".to_string());
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(format!(
+                "schema_version is {}; it must be {}",
+                self.schema_version,
+                Self::SCHEMA_VERSION
+            ));
         }
-        let target_is_valid = match self.direction {
-            ObjectiveMetricDirection::AtLeast => self.target_micros > self.baseline_micros,
-            ObjectiveMetricDirection::AtMost => self.target_micros < self.baseline_micros,
-        };
-        if !target_is_valid || self.minimum_effect_micros <= 0 {
-            return Err(
-                "objective control target must advance from baseline in its declared direction and minimum_effect_micros must be positive"
-                    .to_string(),
-            );
+        for (field, value, max) in [
+            ("metric_name", &self.metric_name, 128),
+            ("unit", &self.unit, 64),
+            ("experiment_cohort", &self.experiment_cohort, 128),
+        ] {
+            if !canonical_text_within(value, max) {
+                return Err(format!(
+                    "{field} must be plain text of 1 to {max} characters with no surrounding spaces"
+                ));
+            }
+        }
+        let (target, baseline) = (self.target_micros, self.baseline_micros);
+        match self.direction {
+            ObjectiveMetricDirection::AtLeast if target <= baseline => {
+                return Err(format!(
+                    "with direction at_least, target_micros ({target}) must be greater than baseline_micros ({baseline})"
+                ));
+            }
+            ObjectiveMetricDirection::AtMost if target >= baseline => {
+                return Err(format!(
+                    "with direction at_most, target_micros ({target}) must be less than baseline_micros ({baseline})"
+                ));
+            }
+            _ => {}
         }
         // `*_micros` are millionths of one unit. A sub-milli-unit effect or a
         // target closer to baseline than the minimum effect is a unit slip
         // ("1 engagement" written as 1 micro), and it makes any single
         // observation satisfy the objective and terminate the mandate.
-        if self.minimum_effect_micros < Self::MIN_EFFECT_MICROS
-            || self.target_micros.abs_diff(self.baseline_micros)
-                < self.minimum_effect_micros.unsigned_abs()
-        {
+        if self.minimum_effect_micros < Self::MIN_EFFECT_MICROS {
             return Err(format!(
-                "objective control values are micro-units (1 unit = 1000000): minimum_effect_micros must be at least {} and the target must differ from baseline by at least minimum_effect_micros",
+                "minimum_effect_micros is {}; it must be at least {} (values are millionths of a unit: 1 unit = 1000000)",
+                self.minimum_effect_micros,
                 Self::MIN_EFFECT_MICROS
+            ));
+        }
+        let gap = target.abs_diff(baseline);
+        if gap < self.minimum_effect_micros.unsigned_abs() {
+            return Err(format!(
+                "target_micros and baseline_micros differ by {gap}; they must differ by at least minimum_effect_micros ({})",
+                self.minimum_effect_micros
             ));
         }
         let source_valid = reqwest::Url::parse(&self.measurement_source)
@@ -474,18 +497,42 @@ impl MandateObjectiveControl {
                 .is_some_and(canonical_scoped_resource_suffix);
         if !source_valid {
             return Err(
-                "objective control measurement_source must be an HTTPS URL or exact metric_source resource identity"
+                "measurement_source must be an HTTPS URL (no login details or #fragment) or an exact metric_source: identity"
                     .to_string(),
             );
         }
-        if !(60..=30 * 24 * 60 * 60).contains(&self.measurement_cadence_secs)
-            || self.experiment_window_secs < self.measurement_cadence_secs
-            || self.experiment_window_secs > 90 * 24 * 60 * 60
-            || !(1..=20).contains(&self.max_stagnant_measurements)
-            || !(1..=10).contains(&self.run_failure_budget)
-            || chrono::DateTime::parse_from_rfc3339(&self.baseline_observed_at).is_err()
+        const MAX_CADENCE_SECS: i64 = 30 * 24 * 60 * 60;
+        const MAX_WINDOW_SECS: i64 = 90 * 24 * 60 * 60;
+        if !(60..=MAX_CADENCE_SECS).contains(&self.measurement_cadence_secs) {
+            return Err(format!(
+                "measurement_cadence_secs is {}; allowed: 60 to {MAX_CADENCE_SECS} (1 minute to 30 days)",
+                self.measurement_cadence_secs
+            ));
+        }
+        if !(self.measurement_cadence_secs..=MAX_WINDOW_SECS).contains(&self.experiment_window_secs)
         {
-            return Err("objective control cadence, experiment, failure-budget, or baseline timestamp is invalid".to_string());
+            return Err(format!(
+                "experiment_window_secs is {}; allowed: measurement_cadence_secs ({}) to {MAX_WINDOW_SECS} (90 days)",
+                self.experiment_window_secs, self.measurement_cadence_secs
+            ));
+        }
+        if !(1..=20).contains(&self.max_stagnant_measurements) {
+            return Err(format!(
+                "max_stagnant_measurements is {}; allowed: 1 to 20",
+                self.max_stagnant_measurements
+            ));
+        }
+        if !(1..=10).contains(&self.run_failure_budget) {
+            return Err(format!(
+                "run_failure_budget is {}; allowed: 1 to 10",
+                self.run_failure_budget
+            ));
+        }
+        if chrono::DateTime::parse_from_rfc3339(&self.baseline_observed_at).is_err() {
+            return Err(format!(
+                "baseline_observed_at is {:?}; it must be an RFC 3339 time such as 2026-01-31T09:00:00Z",
+                self.baseline_observed_at
+            ));
         }
         Ok(())
     }
@@ -3447,6 +3494,38 @@ mod tests {
         control.target_micros = 8_000_000;
         control.experiment_window_secs = control.measurement_cadence_secs - 1;
         assert!(control.validate().is_err());
+
+        // Each refusal names the one setting that is wrong and its range,
+        // so it can be fixed and relayed plainly.
+        control.experiment_window_secs = 86_400;
+        let mut stalled = control.clone();
+        stalled.max_stagnant_measurements = 24;
+        assert_eq!(
+            stalled.validate().unwrap_err(),
+            "max_stagnant_measurements is 24; allowed: 1 to 20"
+        );
+        let mut window = control.clone();
+        window.experiment_window_secs = 60;
+        assert_eq!(
+            window.validate().unwrap_err(),
+            "experiment_window_secs is 60; allowed: measurement_cadence_secs (3600) to 7776000 (90 days)"
+        );
+        let mut budget = control.clone();
+        budget.run_failure_budget = 0;
+        assert!(budget
+            .validate()
+            .unwrap_err()
+            .starts_with("run_failure_budget is 0; allowed: 1 to 10"));
+        let mut when = control.clone();
+        when.baseline_observed_at = "yesterday".to_string();
+        assert!(when
+            .validate()
+            .unwrap_err()
+            .starts_with("baseline_observed_at is \"yesterday\""));
+        assert!(unit_slip
+            .validate()
+            .unwrap_err()
+            .starts_with("minimum_effect_micros is 1; it must be at least 1000"));
     }
 
     #[test]
