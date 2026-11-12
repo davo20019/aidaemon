@@ -96,3 +96,12 @@ crates/aidaemon-core/PLAN.md
 crates/aidaemon-core/PRODUCT_PLAN.md
 crates/aidaemon-core/plans/
 reports/*plan*.md
+
+# Specs, research, reports and design notes stay local (owner, 2026-11-12)
+research_notes/
+reports/
+crates/sdk-guide/
+crates/EXTENDING.md
+crates/PUBLISHING.md
+crates/aidaemon-core/DESIGN.md
+crates/aidaemon-eval/RESULTS.md

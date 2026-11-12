@@ -5,12 +5,13 @@ Thanks for helping. This repository holds two things:
 - **The daemon** (`src/`): the personal agent that runs on Telegram, Slack
   and Discord.
 - **The SDK** (`crates/aidaemon-*`): the kernel and crates that let anyone
-  build their own agents. Start with `crates/aidaemon-core/DESIGN.md`.
+  build their own agents. Start with the SDK guide at
+  <https://docs.aidaemon.ai/sdk>.
 
 Most new functionality (a channel, a provider, a tool, a memory backend, a
 policy) does not need to live in this repository at all. Every extension
-point is a public trait, so you can publish your own crate. See
-[`crates/EXTENDING.md`](crates/EXTENDING.md).
+point is a public trait, so you can publish your own crate. See the
+SDK guide at <https://docs.aidaemon.ai/sdk>.
 
 ## Before you start
 
@@ -50,8 +51,8 @@ cargo clippy -p aidaemon-core -p aidaemon-channels ... --all-targets --all-featu
 cargo test   -p aidaemon-core -p aidaemon-channels ... --all-features
 ```
 
-If you implement an SDK trait, also run its conformance kit (see
-`crates/EXTENDING.md`) and include the result in the PR description.
+If you implement an SDK trait, also run its conformance kit (the crate
+docs name it) and include the result in the PR description.
 
 If a local test run aborts with "has overflowed its stack", run it with
 `RUST_MIN_STACK=8388608`, as CI does.
@@ -61,8 +62,7 @@ If a local test run aborts with "has overflowed its stack", run it with
 - One topic per PR, with a description of the problem, the change, and how
   you tested it.
 - Add tests for new behaviour, including at least one negative case.
-- Update docs (`DESIGN.md`, `EXTENDING.md`, crate docs) when you change a
-  public API.
+- Update the crate docs when you change a public API.
 - Public SDK contracts (`aidaemon-core`, the `Channel` types, the memory
   traits) follow semver; breaking them needs a clear reason and a note in
   the PR.

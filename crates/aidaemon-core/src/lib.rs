@@ -11,7 +11,7 @@
 //! at a time) and go around again; otherwise ask the stop hooks whether the
 //! answer is acceptable and finish with a typed [`RunOutcome`].
 //!
-//! See `DESIGN.md` next to this crate for the reasoning behind each choice,
+//! See the SDK guide at <https://docs.aidaemon.ai/sdk> for the concepts,
 //! `examples/kernel_tour.rs` for a runnable tour of the kernel, and
 //! `aidaemon-sdk`'s `examples/quickstart.rs` for the shortest working agent.
 

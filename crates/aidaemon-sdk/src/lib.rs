@@ -55,8 +55,7 @@
 //! # }
 //! ```
 //!
-//! See `crates/aidaemon-core/DESIGN.md` for the design and
-//! `crates/aidaemon-core/PLAN.md` for the roadmap.
+//! See the SDK guide at <https://docs.aidaemon.ai/sdk>.
 
 pub use aidaemon_core::*;
 
