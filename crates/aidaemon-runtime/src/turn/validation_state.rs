@@ -1,9 +1,13 @@
+//! Step and task validation outcomes, approval state, and the executor
+//! handoff and step-result records kept in a task's context.
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::traits::{Task, ToolTargetHint};
+use aidaemon_events::traits::ToolTargetHint;
+use aidaemon_work::goals::Task;
 
-use super::execution_state::TargetScope;
+use crate::turn::execution_state::TargetScope;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

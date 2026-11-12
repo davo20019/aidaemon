@@ -3,7 +3,7 @@
 //! The new field/module is unused until Task 7 (the message-build integration
 //! consumes it); keep the lib clippy gate clean in the meantime.
 
-pub(crate) fn archived_budget(
+pub fn archived_budget(
     context_budget: usize,
     core: usize,
     tools: usize,
@@ -17,17 +17,17 @@ pub(crate) fn archived_budget(
     ((evictable as f64) * (1.0 - safety_margin)) as usize
 }
 
-pub(crate) fn low_water(archived_budget: usize) -> usize {
+pub fn low_water(archived_budget: usize) -> usize {
     (archived_budget as f64 * 0.60) as usize
 }
 
 /// A single archived turn's final-Archived token estimate (input to planning).
-pub(crate) struct RenderedTurn {
+pub struct RenderedTurn {
     pub turn_seq: i64,
     pub est_tokens: usize,
 }
 
-pub(crate) struct EvictionPlan {
+pub struct EvictionPlan {
     pub new_anchor_turn_seq: i64, // turn_seq of the OLDEST kept turn
     pub kept_est_tokens: usize,
     pub evicted_count: usize,
@@ -35,7 +35,7 @@ pub(crate) struct EvictionPlan {
 }
 
 /// `turns` ordered oldest→newest, each with its final-Archived est_tokens.
-pub(crate) fn plan_eviction(turns: &[RenderedTurn], archived_budget: usize) -> EvictionPlan {
+pub fn plan_eviction(turns: &[RenderedTurn], archived_budget: usize) -> EvictionPlan {
     let total: usize = turns.iter().map(|t| t.est_tokens).sum();
     if archived_budget == 0 {
         let anchor = turns.last().map(|t| t.turn_seq + 1).unwrap_or(0); // keep nothing

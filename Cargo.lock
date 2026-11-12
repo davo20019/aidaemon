@@ -428,6 +428,7 @@ dependencies = [
  "aidaemon-policies",
  "aidaemon-providers",
  "aidaemon-tools",
+ "aidaemon-work",
  "anyhow",
  "async-trait",
  "chrono",
@@ -442,7 +443,9 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

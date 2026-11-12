@@ -31,9 +31,10 @@ aidaemon-memory = { version = "0.2.0", path = "../aidaemon-memory" }
 aidaemon-policies = { version = "0.2.0", path = "../aidaemon-policies" }
 aidaemon-providers = { version = "0.2.0", path = "../aidaemon-providers" }
 aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools" }
+aidaemon-work = { version = "0.2.0", path = "../aidaemon-work" }
 anyhow = "1"
 async-trait = "0.1"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 futures = "0.3"
 once_cell = "1"
 regex = "1"
@@ -45,7 +46,9 @@ shellexpand = "3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio-util = "0.7.18"
 tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }

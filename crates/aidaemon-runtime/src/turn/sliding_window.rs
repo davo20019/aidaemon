@@ -4,11 +4,9 @@
 //! with compact summaries in old conversation pairs, preserving context while
 //! reducing token count.
 
-// Used by message_build.rs for age-based tool result summarization.
-
 use serde_json::Value;
 
-use crate::utils::truncate_str;
+use aidaemon_events::text::truncate_str;
 
 /// Maximum character length for the args portion of a terminal command summary.
 const COMMAND_TRUNCATE_CHARS: usize = 80;
@@ -29,7 +27,7 @@ const COMMAND_TRUNCATE_CHARS: usize = 80;
 /// // "read_file: src/main.rs -> 245 lines"
 /// // "write_file: src/utils.rs -> ok"
 /// ```
-pub(super) fn summarize_tool_result(tool_name: &str, args_json: &str, result: &str) -> String {
+pub fn summarize_tool_result(tool_name: &str, args_json: &str, result: &str) -> String {
     let args_summary = extract_args_summary(tool_name, args_json);
     let outcome = extract_outcome(tool_name, result);
 
@@ -76,7 +74,7 @@ fn extract_args_summary(tool_name: &str, args_json: &str) -> String {
             .unwrap_or_default(),
 
         "search_history" => action_field(&parsed),
-        name if crate::agent::memory_plugin::memory_tool_facts(name)
+        name if crate::turn::tool_facts::memory_tool_facts(name)
             .is_some_and(|facts| facts.summary_from_action) =>
         {
             action_field(&parsed)
@@ -128,7 +126,7 @@ fn extract_outcome(tool_name: &str, result: &str) -> String {
         // source question; replacing it with merely "completed" discards the
         // very provenance the user is asking to inspect.
         "search_history" | "web_search" => truncate_str(result, 1_200),
-        name if crate::agent::memory_plugin::memory_tool_facts(name)
+        name if crate::turn::tool_facts::memory_tool_facts(name)
             .is_some_and(|facts| facts.keep_result_excerpt) =>
         {
             truncate_str(result, 1_200)
