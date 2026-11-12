@@ -5016,3 +5016,128 @@ fn a_remote_change_is_judged_by_its_typed_effects() {
     replayed.receipt_replayed = true;
     assert!(!super::tool_calls::changed_remotely(&replayed, Succeeded));
 }
+
+/// A local tool's report of the sites it serves on this computer: untrusted
+/// output (like a sandboxed `ddev start`, which needs the network
+/// capability), but typed by the tool as its own site report when
+/// `reports` is set. Records the grant session the call ran under.
+struct SiteReportProbe {
+    name: &'static str,
+    reports: bool,
+    output: &'static str,
+    grants: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for SiteReportProbe {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        "Test probe: reports a local project."
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "description": "Test probe: reports a local project.",
+            "parameters": {"type": "object", "properties": {}}
+        })
+    }
+    async fn execute(
+        &self,
+        _arguments: &str,
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.grants
+            .lock()
+            .unwrap()
+            .push(facts.grants_session().to_string());
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            self.output.to_string(),
+        ))
+    }
+}
+
+impl crate::traits::ToolSemantics for SiteReportProbe {
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+    fn output_reports_local_sites(&self, _arguments: &str) -> bool {
+        self.reports
+    }
+}
+
+/// A sub-agent's `ddev` report names the site it set up: the site is noted
+/// under the chat's grant session (the one the browser checks for the
+/// sub-agent and the parent alike), though the report is untrusted output.
+/// A site named in other untrusted output is not.
+#[tokio::test]
+async fn a_sub_agents_local_site_report_covers_the_whole_chat() {
+    use crate::testing::MockProvider;
+    let chat = "telegram:synthetic-local-sites-chat";
+    let grants = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(vec![
+            MockProvider::tool_call_response("site_report_probe", "{}"),
+            MockProvider::tool_call_response("page_report_probe", "{}"),
+            MockProvider::text_response("The site is up."),
+        ]),
+        vec![
+            Arc::new(SiteReportProbe {
+                name: "site_report_probe",
+                reports: true,
+                output: "Successfully started drupal-synthetic\nYour project can be reached at \
+                         https://drupal-synthetic.localhost",
+                grants: grants.clone(),
+            }),
+            Arc::new(SiteReportProbe {
+                name: "page_report_probe",
+                reports: false,
+                output: "Open http://other-synthetic.localhost/admin to continue.",
+                grants: grants.clone(),
+            }),
+        ],
+        None,
+    )
+    .await
+    .unwrap();
+    harness
+        .agent
+        .set_test_approval_session_id(Some(chat.to_string()));
+    harness
+        .agent
+        .handle_message(
+            "specialist:executor:synthetic-local-sites-child",
+            "Install the Drupal site with ddev.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *grants.lock().unwrap(),
+        vec![chat.to_string(), chat.to_string()],
+        "the sub-agent's calls run under the chat's grants"
+    );
+    assert!(aidaemon_tools::local_sites::is_noted(
+        chat,
+        "drupal-synthetic.localhost"
+    ));
+    assert!(!aidaemon_tools::local_sites::is_noted(
+        chat,
+        "other-synthetic.localhost"
+    ));
+    assert!(!aidaemon_tools::local_sites::is_noted(
+        "specialist:executor:synthetic-local-sites-child",
+        "drupal-synthetic.localhost"
+    ));
+}

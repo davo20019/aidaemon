@@ -12,6 +12,19 @@ pub fn is_completed_checklist(rendered: &str) -> bool {
     rendered.trim_start().starts_with('✅')
 }
 
+/// The status line once a step has ended: it says the step finished, so a
+/// line left on screen never reads as work still running ("Finished running
+/// a command", not "Running a command…").
+pub fn step_ended_line(step: &str) -> String {
+    let step = step.trim().trim_end_matches(['…', '.']);
+    let mut chars = step.chars();
+    let step = match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect::<String>(),
+        None => return "finished a step".to_string(),
+    };
+    format!("finished {step}")
+}
+
 /// Abstraction over the chat surface so `LiveStatus` is testable without a bot.
 #[async_trait::async_trait]
 pub trait SurfaceSink: Send + Sync {
@@ -203,6 +216,20 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use super::*;
+
+    /// A step that ended never leaves a line that reads as still running.
+    #[test]
+    fn an_ended_step_reads_as_finished() {
+        assert_eq!(
+            step_ended_line("running a command"),
+            "finished running a command"
+        );
+        assert_eq!(
+            step_ended_line("Running the site installer…"),
+            "finished running the site installer"
+        );
+        assert_eq!(step_ended_line(" "), "finished a step");
+    }
 
     /// Records create/edit calls; create returns a fixed id, edit returns a flag.
     struct FakeSink {

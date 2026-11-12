@@ -384,8 +384,11 @@ const MAX_REPORT_TOOL_RECORDS: usize = 5_000;
 /// the parent's own checklist: a child's checklist is the child's plan, so it
 /// reaches the card as one `SubAgentProgress` line naming that child instead of
 /// replacing the parent's plan (two parallel children used to overwrite it in
-/// turn, leaving whichever wrote last looking like the whole task). Every other
-/// update passes through unchanged.
+/// turn, leaving whichever wrote last looking like the whole task). Each of
+/// the child's steps (a tool starting or ending) is likewise that child's
+/// progress line, so the parent's card and its status reply say what each
+/// helper is doing ("Drupal install: running the site installer"). Every
+/// other update passes through unchanged.
 fn child_status_sender(
     parent: Option<mpsc::Sender<StatusUpdate>>,
     mission: &str,
@@ -405,6 +408,18 @@ fn child_status_sender(
                         progress,
                     }
                 }
+                StatusUpdate::ToolStart { name, summary } => StatusUpdate::SubAgentProgress {
+                    label: label.clone(),
+                    progress: if summary.trim().is_empty() {
+                        name
+                    } else {
+                        format!("{name}: {summary}")
+                    },
+                },
+                StatusUpdate::ToolComplete { name, .. } => StatusUpdate::SubAgentProgress {
+                    label: label.clone(),
+                    progress: aidaemon_channels::live_status::step_ended_line(&name),
+                },
                 other => other,
             };
             if parent.send(update).await.is_err() {
@@ -3756,11 +3771,19 @@ mod tests {
             .unwrap();
         drupal
             .send(StatusUpdate::ToolStart {
-                name: "terminal".into(),
-                summary: "ddev start".into(),
+                name: "running the site installer".into(),
+                summary: String::new(),
             })
             .await
             .unwrap();
+        drupal
+            .send(StatusUpdate::ToolComplete {
+                name: "running the site installer".into(),
+                summary: "done".into(),
+            })
+            .await
+            .unwrap();
+        drupal.send(StatusUpdate::Thinking(2)).await.unwrap();
         drop((wordpress, drupal));
 
         let mut lines = Vec::new();
@@ -3771,7 +3794,7 @@ mod tests {
                 StatusUpdate::SubAgentProgress { label, progress } => {
                     lines.push(format!("{label}: {progress}"));
                 }
-                StatusUpdate::ToolStart { .. } => passed_through += 1,
+                StatusUpdate::Thinking(_) => passed_through += 1,
                 other => panic!("unexpected update {other:?}"),
             }
         }
@@ -3779,6 +3802,9 @@ mod tests {
         assert_eq!(
             lines,
             vec![
+                "Build the Drupal demo site for Acme Corp: finished running the site installer"
+                    .to_string(),
+                "Build the Drupal demo site for Acme Corp: running the site installer".to_string(),
                 "Build the Drupal demo site for Acme Corp: step 2 of 4".to_string(),
                 "Build the WordPress demo site for Acme Corp: 5 of 5 steps".to_string(),
             ]

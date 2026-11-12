@@ -381,13 +381,21 @@ pub fn render_status(view: &StatusView, now: DateTime<Utc>) -> String {
     lines.join("\n")
 }
 
-/// "2 sub-agents or background commands", for `/clear` and `/wipe`.
-fn background_work_count(count: usize) -> String {
-    if count == 1 {
-        "1 sub-agent or background command".to_string()
+/// The end of a `/clear` or `/wipe` reply: what else was cancelled, then
+/// the sub-agents and background commands stopped, named as `/cancel` names
+/// them.
+fn clear_suffix(cancellations: &[String], stopped_work: &[String]) -> String {
+    let mut suffix = if cancellations.is_empty() {
+        String::new()
     } else {
-        format!("{count} sub-agents or background commands")
+        format!(" ({} cancelled.)", cancellations.join(" and "))
+    };
+    let stopped = crate::stop::stopped_list(stopped_work);
+    if !stopped.is_empty() {
+        suffix.push_str("\n\n");
+        suffix.push_str(&stopped);
     }
+    suffix
 }
 
 /// What `/cancel`'s arguments ask for; `None` when they are not a request.
@@ -836,9 +844,6 @@ impl SharedCommands {
                         if cancelled_tasks.len() == 1 { "" } else { "s" }
                     ));
                 }
-                if stopped_work > 0 {
-                    cancellations.push(background_work_count(stopped_work));
-                }
                 if !cancelled_goals.is_empty() {
                     cancellations.push(format!(
                         "{} background goal{}",
@@ -846,11 +851,7 @@ impl SharedCommands {
                         if cancelled_goals.len() == 1 { "" } else { "s" }
                     ));
                 }
-                let suffix = if cancellations.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({} cancelled.)", cancellations.join(" and "))
-                };
+                let suffix = clear_suffix(&cancellations, &stopped_work);
                 format!(
                     "Context cleared. Starting fresh – your history is kept; use /wipe to \
                      delete this chat's history.{suffix}"
@@ -880,14 +881,7 @@ impl SharedCommands {
                         if cancelled.len() == 1 { "" } else { "s" }
                     ));
                 }
-                if stopped_work > 0 {
-                    cancellations.push(background_work_count(stopped_work));
-                }
-                let suffix = if cancellations.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({} cancelled.)", cancellations.join(" and "))
-                };
+                let suffix = clear_suffix(&cancellations, &stopped_work);
                 format!(
                     "Conversation erased from the active database (events, exact-search index, \
                      summaries, episodes, and raw memory spans). Facts already saved to memory \
@@ -1011,6 +1005,25 @@ pub fn build_help_text(commands: &[CommandDef], prefix: &str, scope: HelpScope) 
 #[cfg(test)]
 mod help_and_status_tests {
     use super::*;
+
+    /// `/clear` names the sub-agents and commands it stopped, the way
+    /// `/cancel` does, rather than counting them.
+    #[test]
+    fn clear_names_what_it_stopped() {
+        let suffix = clear_suffix(
+            &["1 running task".to_string()],
+            &[
+                "Sub-agent: Counter A".to_string(),
+                "Background command: a shell loop".to_string(),
+            ],
+        );
+        assert_eq!(
+            suffix,
+            " (1 running task cancelled.)\n\n⏹️ Stopped:\n• Sub-agent: Counter A\n• \
+             Background command: a shell loop"
+        );
+        assert_eq!(clear_suffix(&[], &[]), "");
+    }
 
     fn defs() -> Vec<CommandDef> {
         shared_commands()

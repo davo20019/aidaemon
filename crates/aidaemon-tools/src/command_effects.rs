@@ -125,8 +125,16 @@ const DDEV_QUERY_SUBCOMMANDS: &[&str] = &["describe", "status", "st", "list", "v
 const DDEV_TOOL_QUERIES: &[(&str, &str, &[&str])] = &[
     ("wp", "core", &["is-installed", "version"]),
     ("wp", "option", &["get", "list"]),
-    ("wp", "plugin", &["list", "status", "is-installed", "is-active"]),
-    ("wp", "theme", &["list", "status", "is-installed", "is-active"]),
+    (
+        "wp",
+        "plugin",
+        &["list", "status", "is-installed", "is-active"],
+    ),
+    (
+        "wp",
+        "theme",
+        &["list", "status", "is-installed", "is-active"],
+    ),
     ("wp", "user", &["list", "get"]),
     ("wp", "post", &["list", "get"]),
 ];
@@ -695,6 +703,153 @@ pub fn path_operands(command: &str) -> Option<Vec<String>> {
 }
 
 fn is_local_work_only(command: &str) -> bool {
+    every_segment(command, &local_work_args_ok)
+}
+
+/// Whether every command reaches nothing beyond this computer: an
+/// observation, `cd`, a local `ddev` project's own query, or a `curl`/`wget`
+/// read (no body, upload or writing method) whose every address points at
+/// this computer alone ([`crate::web::local_site_key`]: a `localhost` name,
+/// a loopback address, or a dev site such as `*.ddev.site` that resolves
+/// only to loopback). Checking a site the work set up is local work, and so
+/// is a `ddev` query, though both need the network capability in the
+/// sandbox to reach a local port or the container engine's socket. The
+/// shapes are the same fail-closed tables as everywhere here. Resolves the
+/// addresses' names, so it may block briefly.
+pub fn reaches_only_this_computer(command: &str) -> bool {
+    if sends_remote_write(command) {
+        return false;
+    }
+    every_segment(command, &|program, args| match program {
+        "cd" => true,
+        "ddev" => ddev_query_ok(args),
+        "curl" | "wget" => reads_only_local_sites(program, args),
+        _ => OBSERVATION_PROGRAMS.contains(&program) && observation_args_ok(program, args),
+    })
+}
+
+/// What a command runs, in a word or two for the owner: "a shell loop" for
+/// a `for`/`while`/`until` loop, else its first program's name ("ddev"),
+/// "a command" when neither can be read. Never the raw line.
+pub fn program_label(command: &str) -> String {
+    // The first segment that runs something (a `cd` only moves).
+    let first = scan(command)
+        .segments
+        .into_iter()
+        .filter_map(|segment| shell_words::split(&segment).ok())
+        .find(|words| {
+            words
+                .iter()
+                .find(|word| !is_env_assignment(word))
+                .is_some_and(|program| !matches!(basename(program), "cd" | "pushd" | "popd"))
+        })
+        .unwrap_or_default();
+    let mut words = first.iter().skip_while(|word| is_env_assignment(word));
+    let Some(program) = words.next() else {
+        return "a command".to_string();
+    };
+    let program = match basename(program) {
+        "for" | "while" | "until" | "select" => return "a shell loop".to_string(),
+        wrapper if WRAPPERS.contains(&wrapper) => words
+            .find(|word| !word.starts_with('-'))
+            .map(String::as_str),
+        name => Some(name),
+    };
+    program
+        .map(basename)
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+        .map_or_else(|| "a command".to_string(), str::to_string)
+}
+
+/// `ddev` subcommands whose output is ddev's own report of a local project,
+/// with the addresses it serves the project on.
+const DDEV_PROJECT_REPORTS: &[&str] = &[
+    "start", "restart", "describe", "status", "st", "list", "config",
+];
+
+/// Whether `command`'s output is a local `ddev` project's own report: at
+/// least one `ddev` project report (start, describe, ...), and otherwise only
+/// `cd`, filters that read nothing but that output (`head`, `tail`, `grep`
+/// or `jq` with no file operand) and `echo` lines that name no address. The
+/// sites such output names are ones this work set up, even when the run as
+/// a whole is not trusted output (ddev needs the network capability in the
+/// sandbox). No file or other program can add an address to it.
+pub fn reports_ddev_sites(command: &str) -> bool {
+    let reports = std::cell::Cell::new(false);
+    let shaped = every_segment(command, &|program, args| match program {
+        "ddev" => {
+            let report = !args.iter().any(|arg| {
+                DDEV_TOOL_CODE_OPTIONS
+                    .iter()
+                    .any(|option| arg == option || arg.starts_with(&format!("{option}=")))
+            }) && args
+                .iter()
+                .find(|arg| !arg.starts_with('-'))
+                .is_some_and(|sub| DDEV_PROJECT_REPORTS.contains(&sub.as_str()));
+            if report {
+                reports.set(true);
+            }
+            report
+        }
+        "cd" => true,
+        "echo" => !args.iter().any(|arg| arg.contains(':')),
+        "head" | "tail" => args
+            .iter()
+            .all(|arg| arg.starts_with('-') || arg.chars().all(|c| c.is_ascii_digit())),
+        "grep" | "jq" => {
+            observation_args_ok(program, args)
+                && args.iter().filter(|arg| !arg.starts_with('-')).count() <= 1
+        }
+        _ => false,
+    });
+    shaped && reports.get()
+}
+
+/// A `curl` or `wget` call in a shape the option tables understand whose
+/// every address (operands and `--url`) points at this computer alone.
+fn reads_only_local_sites(program: &str, args: &[String]) -> bool {
+    let spec = match program {
+        "curl" => &CURL,
+        "wget" => &WGET,
+        _ => return false,
+    };
+    let Some(parsed) = parse_options(spec, args) else {
+        return false;
+    };
+    if parsed
+        .values
+        .iter()
+        .any(|(_, value)| value.contains("%output{"))
+    {
+        return false;
+    }
+    let urls: Vec<&String> = parsed
+        .positionals
+        .iter()
+        .chain(
+            parsed
+                .values
+                .iter()
+                .filter(|(role, _)| *role == OptionValue::Url)
+                .map(|(_, value)| value),
+        )
+        .collect();
+    !urls.is_empty()
+        && urls
+            .iter()
+            .all(|url| strict_url(url).is_some() && crate::web::local_site_key(url).is_some())
+}
+
+/// Whether `command` is one or more simple commands, each passing `ok` on
+/// its program's bare name and its arguments: no syntax that hides a
+/// command, no input redirects, no variable assignments, programs named
+/// bare or from a system bin directory.
+fn every_segment(command: &str, ok: &dyn Fn(&str, &[String]) -> bool) -> bool {
     if command.contains("/dev/tcp/") || command.contains("/dev/udp/") || command.contains("$'") {
         return false;
     }
@@ -725,7 +880,7 @@ fn is_local_work_only(command: &str) -> bool {
                 || program
                     .rsplit_once('/')
                     .is_some_and(|(dir, _)| SYSTEM_BIN_DIRS.contains(&dir));
-            if !path_ok || !local_work_args_ok(basename(program), &tokens[1..]) {
+            if !path_ok || !ok(basename(program), &tokens[1..]) {
                 return false;
             }
             any = true;
@@ -3175,6 +3330,54 @@ fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A background command is named by what it runs, never by its line.
+    #[test]
+    fn a_command_is_labelled_by_its_program() {
+        assert_eq!(
+            program_label("for i in $(seq 1 200); do echo $i; sleep 2; done; echo done"),
+            "a shell loop"
+        );
+        assert_eq!(
+            program_label("while kill -0 123; do sleep 5; done"),
+            "a shell loop"
+        );
+        assert_eq!(program_label("cd /srv/demo && ddev start"), "ddev");
+        assert_eq!(program_label("ddev drush site:install -y"), "ddev");
+        assert_eq!(
+            program_label("FOO=1 nohup /usr/bin/python3 serve.py"),
+            "python3"
+        );
+        assert_eq!(program_label(""), "a command");
+    }
+
+    /// A ddev project report names the sites it serves; filters over it
+    /// keep that, but a file, another program or an echoed address could
+    /// add one, so they do not count.
+    #[test]
+    fn ddev_project_reports_are_recognised_by_shape() {
+        for report in [
+            "ddev start",
+            "cd /srv/demo && ddev start 2>&1; echo ---; ddev describe 2>&1 | head -30",
+            "ddev describe -j | jq -r .raw.primary_url",
+            "ddev status | grep -i url",
+            "ddev config --project-type=drupal11 --docroot=web && ddev start",
+        ] {
+            assert!(reports_ddev_sites(report), "{report}");
+        }
+        for other in [
+            "ddev drush uli",
+            "ddev describe; cat notes.txt",
+            "ddev describe; echo http://other.localhost",
+            "ddev describe | grep url notes.txt",
+            "ddev exec cat /etc/hosts",
+            "curl -s http://claude-drupal-2.ddev.site",
+            "echo ---",
+            "ddev describe $(cat x)",
+        ] {
+            assert!(!reports_ddev_sites(other), "{other}");
+        }
+    }
 
     /// A local project's own status queries (a project report, read-only
     /// WP-CLI and drush queries) are local work; starting, installing,

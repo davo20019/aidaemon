@@ -360,6 +360,11 @@ impl Agent {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_test_approval_session_id(&mut self, session: Option<String>) {
+        self.approval_session_id = session;
+    }
+
+    #[cfg(test)]
     pub fn set_test_goal_id(&mut self, goal_id: Option<String>) {
         self.goal_id = goal_id;
     }
