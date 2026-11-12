@@ -156,6 +156,29 @@ impl Agent {
             .unwrap_or_default()
     }
 
+    /// How a step reads on the owner's status line: the plain title the
+    /// call gave it ("running the site installer"), else the tool's
+    /// friendly label and a cleaned summary.
+    fn step_activity(
+        &self,
+        scope: &TurnScope<'_>,
+        tool: &str,
+        arguments: &str,
+        summary: impl FnOnce() -> String,
+    ) -> (String, String) {
+        if let Some(title) = self
+            .turn_tool(scope, tool)
+            .and_then(|known| known.call_title(arguments))
+        {
+            return (title, String::new());
+        }
+        crate::tools::sanitize::user_facing_tool_activity(
+            tool,
+            &summary(),
+            scope.channel_ctx.visibility,
+        )
+    }
+
     pub(super) fn turn_tool_facts(
         &self,
         scope: &TurnScope<'_>,
@@ -406,11 +429,9 @@ impl Agent {
         // User-facing activity labels for the channel's status line;
         // `track_requirements` shows its checklist instead.
         if !facts.requirement_checklist {
-            let (name, summary) = crate::tools::sanitize::user_facing_tool_activity(
-                &request.name,
-                &crate::agent::agent_helpers::summarize_tool_args(&request.name, arguments),
-                scope.channel_ctx.visibility,
-            );
+            let (name, summary) = self.step_activity(scope, &request.name, arguments, || {
+                crate::agent::agent_helpers::summarize_tool_args(&request.name, arguments)
+            });
             if let Some(status_tx) = &scope.status_tx {
                 let _ = status_tx.try_send(StatusUpdate::ToolStart { name, summary });
             }
@@ -907,16 +928,13 @@ impl Agent {
                 crate::agent::tool_execution::parse_checklist_from_result(&output)
                     .map(|text| StatusUpdate::Checklist { text })
             } else {
-                let source = if facts.status_from_arguments {
-                    crate::agent::agent_helpers::summarize_tool_args(&request.name, arguments)
-                } else {
-                    crate::agent::tool_execution::summarize_completed_tool_result(&output)
-                };
-                let (name, summary) = crate::tools::sanitize::user_facing_tool_activity(
-                    &request.name,
-                    &source,
-                    scope.channel_ctx.visibility,
-                );
+                let (name, summary) = self.step_activity(scope, &request.name, arguments, || {
+                    if facts.status_from_arguments {
+                        crate::agent::agent_helpers::summarize_tool_args(&request.name, arguments)
+                    } else {
+                        crate::agent::tool_execution::summarize_completed_tool_result(&output)
+                    }
+                });
                 Some(StatusUpdate::ToolComplete { name, summary })
             };
             if let Some(update) = update {

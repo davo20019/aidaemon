@@ -5334,7 +5334,10 @@ async fn run_status_consumer(
             // within a second of the track_requirements ToolStart (well inside
             // min_interval), which previously discarded it and the plan never showed.
             let now = tokio::time::Instant::now();
-            let is_checklist = matches!(&update, StatusUpdate::Checklist { .. });
+            let is_checklist = matches!(
+                &update,
+                StatusUpdate::Checklist { .. } | StatusUpdate::ToolComplete { .. }
+            );
             if !is_checklist && now.duration_since(last_sent) < min_interval {
                 continue;
             }
@@ -5363,7 +5366,10 @@ async fn run_status_consumer(
                     owner
                         .lock()
                         .await
-                        .set_activity(sink_ref, format!("{name}…"))
+                        .set_activity(
+                            sink_ref,
+                            aidaemon_channels::live_status::step_ended_line(name),
+                        )
                         .await;
                 }
                 StatusUpdate::PlanStepStart { description, .. }

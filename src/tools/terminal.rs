@@ -324,6 +324,8 @@ pub use aidaemon_channels::hub::ApprovalRequest;
 /// 3. **Detached** (`detached=true`): survives task-end and notifier. Requires explicit kill.
 struct RunningProcess {
     command: String,
+    /// The plain title the call gave the command, for the owner's lists.
+    title: Option<String>,
     declared_write_paths: Vec<String>,
     semantics: ToolCallSemantics,
     dedupe_key: Option<String>,
@@ -5248,6 +5250,7 @@ impl TerminalTool {
     async fn handle_run(&self, request: TerminalRunRequest<'_>) -> anyhow::Result<ToolCallOutcome> {
         let TerminalRunRequest {
             command,
+            title,
             script_via_stdin,
             working_dir,
             read_paths,
@@ -5634,6 +5637,7 @@ impl TerminalTool {
                 );
 
                 let proc = RunningProcess {
+                    title: title.map(str::to_string),
                     command: command.to_string(),
                     declared_write_paths: write_paths.to_vec(),
                     semantics: command_semantics.clone(),
@@ -6699,13 +6703,16 @@ impl TerminalTool {
                         elapsed, pid, pid, pid
                     )
                 } else {
-                    // Nothing will report this job's result: the run keeps
-                    // going and reads it itself before the task ends.
+                    // Nothing will report this job's result: the run holds
+                    // its answer until the job ends, then wakes it to read
+                    // the result (`sdk_wait_for_unreported_jobs`).
                     format!(
                         "Command still running after {}s. Moved to background (pid={}).\n\
                          You can run other commands (like curl) while this runs in the background.\n\
-                         Its result comes back to this run, not as a separate message: this run cannot finish while it is running, \
-                         so wait for it and read its output and result with action=\"check\" with pid={} before you answer, or stop it with action=\"kill\" with pid={}.",
+                         Its result comes back to this run, not as a separate message. Do not wait for it yourself: \
+                         no sleep, no loop polling its pid, no repeated checks. When you have nothing else to do, give your answer; \
+                         the run holds it until this command ends, then wakes you to read its output and result with action=\"check\" with pid={}. \
+                         To stop it instead, use action=\"kill\" with pid={}.",
                         elapsed, pid, pid, pid
                     )
                 };
@@ -7087,6 +7094,7 @@ impl TerminalTool {
                 let run_outcome = self
                     .handle_run(TerminalRunRequest {
                         command,
+                        title: call_title(&args).as_deref(),
                         script_via_stdin,
                         working_dir: args.working_dir.as_deref(),
                         read_paths: &declared_read_paths,
@@ -7153,10 +7161,30 @@ impl TerminalTool {
     }
 }
 
-/// A background command as the owner's list of running work names it.
-fn background_job_title(command: &str) -> String {
-    let command = command.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!("Background command: {}", truncate_str(&command, 80))
+/// A background command as the owner's list of running work names it: by
+/// the title its call gave it, else by its program ("a shell loop",
+/// "ddev"), never by its raw line.
+fn background_job_title(command: &str, title: Option<&str>) -> String {
+    let what = title
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::tools::command_effects::program_label(command));
+    format!("Background command: {what}")
+}
+
+/// Most characters of a command's plain title.
+const CALL_TITLE_CHARS: usize = 60;
+
+/// The plain title a call gave its command, cleaned for the owner's eyes
+/// (secrets and home paths hidden, one line, capped).
+fn call_title(args: &TerminalArgs) -> Option<String> {
+    let title = args.description.as_deref()?;
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        return None;
+    }
+    let title =
+        crate::tools::sanitize::redact_secrets(&crate::tools::sanitize::shorten_home_dir(&title));
+    Some(truncate_str(&title, CALL_TITLE_CHARS).to_string())
 }
 
 /// Whether a background job's completion notification reaches a reader: the
@@ -7171,6 +7199,8 @@ fn notifications_reach(exec_ctx: &ToolCallContext, notify_session_id: &str) -> b
 
 struct TerminalRunRequest<'a> {
     command: &'a str,
+    /// The plain title the call gave the command (`description`).
+    title: Option<&'a str>,
     script_via_stdin: bool,
     working_dir: Option<&'a str>,
     read_paths: &'a [String],
@@ -7277,6 +7307,11 @@ impl Drop for TerminalTool {
 #[derive(Deserialize)]
 struct TerminalArgs {
     command: Option<String>,
+    /// A few plain words naming what the command does, for the owner's
+    /// status line and list of running work. Never authority: it changes
+    /// nothing about how the call is judged.
+    #[serde(default)]
+    description: Option<String>,
     script: Option<String>,
     #[serde(alias = "cwd")]
     working_dir: Option<String>,
@@ -7636,8 +7671,8 @@ fn terminal_run_annotations(
     // when the sandbox needs the network capability to reach a local port
     // or the container engine. Judged only when the call would otherwise be
     // network (it resolves names).
-    let stays_on_this_computer = reaches_network
-        && crate::tools::command_effects::reaches_only_this_computer(text);
+    let stays_on_this_computer =
+        reaches_network && crate::tools::command_effects::reaches_only_this_computer(text);
     aidaemon_core::ToolAnnotations {
         read_only,
         destructive: effects.deletes,
@@ -8003,6 +8038,10 @@ impl Tool for TerminalTool {
                         "items": { "type": "string" },
                         "description": "Additional exact readable files/directories for a confined run. Paths outside the task scope (e.g. a deploy tool's config dir under $HOME) are allowed but prompt the user for approval; credential stores such as ~/.ssh or ~/.aws never are."
                     },
+                    "description": {
+                        "type": "string",
+                        "description": "A few plain words naming what this command does, shown to the owner while it runs (e.g. 'running the site installer', 'counting script'). Never the command itself."
+                    },
                     "network": {
                         "type": "boolean",
                         "description": "Allow outbound network for this run (deploys, package installs, API calls). Confined runs have no network by default; set true when the command needs it. Prompts the user for approval unless already granted for this command."
@@ -8220,6 +8259,16 @@ impl crate::traits::ToolSemantics for TerminalTool {
         }
     }
 
+    fn call_title(&self, arguments: &str) -> Option<String> {
+        let args = serde_json::from_str::<TerminalArgs>(arguments).ok()?;
+        matches!(
+            TerminalAction::parse(&args.action),
+            TerminalAction::Run | TerminalAction::Unrecognized
+        )
+        .then(|| call_title(&args))
+        .flatten()
+    }
+
     fn output_reports_local_sites(&self, arguments: &str) -> bool {
         let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
             return false;
@@ -8302,7 +8351,7 @@ impl crate::traits::ToolSemantics for TerminalTool {
             })
             .map(|(pid, proc)| aidaemon_tools::semantics::BackgroundJob {
                 key: pid.to_string(),
-                title: background_job_title(&proc.command),
+                title: background_job_title(&proc.command, proc.title.as_deref()),
                 started_at: now
                     - chrono::Duration::from_std(proc.started_at.elapsed()).unwrap_or_default(),
                 task_id: proc.origin_task_id.clone(),
@@ -10450,7 +10499,11 @@ mod tests {
                 &crate::traits::TrustRoots::new(&[]),
             )
         };
-        for read in ["ls -la ADMIN_PASSWORD.txt", "git status", "cat notes.txt | head -n 5"] {
+        for read in [
+            "ls -la ADMIN_PASSWORD.txt",
+            "git status",
+            "cat notes.txt | head -n 5",
+        ] {
             let annotations = ann(read);
             assert!(annotations.read_only && !annotations.egress, "{read}");
         }
@@ -10475,14 +10528,36 @@ mod tests {
         assert!(sandboxed.output_reports_local_sites(&report));
         assert!(!sandboxed.output_reports_local_sites(&run("ddev drush uli")));
         assert!(!sandboxed.output_reports_local_sites(&run("cat site-url.txt")));
-        sandboxed
-            .site_report_pids
-            .lock()
-            .unwrap()
-            .insert(4242);
+        sandboxed.site_report_pids.lock().unwrap().insert(4242);
         let check = |pid: u32| serde_json::json!({"action":"check","pid":pid}).to_string();
         assert!(sandboxed.output_reports_local_sites(&check(4242)));
         assert!(!sandboxed.output_reports_local_sites(&check(4243)));
+    }
+
+    /// A command reads to the owner by the title its call gave it, else by
+    /// its program, never by its raw line; the title also feeds the
+    /// status line.
+    #[tokio::test]
+    async fn a_command_shows_by_its_title_never_its_line() {
+        let (host, _) = host_and_sandboxed_terminals().await;
+        let loop_line = "for i in $(seq 1 200); do echo $i; sleep 2; done; echo done";
+        let titled = serde_json::json!({
+            "action": "run",
+            "command": loop_line,
+            "description": "  counting\nscript ",
+        })
+        .to_string();
+        assert_eq!(host.call_title(&titled).as_deref(), Some("counting script"));
+        let untitled = serde_json::json!({"action": "run", "command": "ls"}).to_string();
+        assert_eq!(host.call_title(&untitled), None);
+        assert_eq!(
+            background_job_title(loop_line, None),
+            "Background command: a shell loop"
+        );
+        assert_eq!(
+            background_job_title("ddev start", Some("starting the Drupal site")),
+            "Background command: starting the Drupal site"
+        );
     }
 
     /// A request to a site on this computer is local work, like a local
@@ -11542,10 +11617,7 @@ mod tests {
         assert!(outcome.metadata.background_started);
         let jobs = tool.background_jobs("telegram:synthetic-count").await;
         assert_eq!(jobs.len(), 1, "{jobs:?}");
-        assert_eq!(
-            jobs[0].title,
-            "Background command: for i in $(seq 1 300); do sleep 2; done"
-        );
+        assert_eq!(jobs[0].title, "Background command: a shell loop");
         assert_eq!(jobs[0].task_id.as_deref(), Some("turn-count"));
         assert!(!jobs[0].title.contains("pid"));
         assert!(tool
@@ -11605,7 +11677,11 @@ mod tests {
             .unwrap();
         assert!(!outcome.metadata.completion_notifications_enabled);
         assert!(!outcome.output.contains("No completion notification"));
-        assert!(outcome.output.contains("cannot finish while it is running"));
+        // The run wakes the sub-agent when the job ends: it must not poll.
+        assert!(outcome
+            .output
+            .contains("the run holds it until this command ends"));
+        assert!(outcome.output.contains("no loop polling its pid"));
         assert_eq!(tool.jobs_ended_by_task_end("child-task").await, 1);
         assert_eq!(tool.jobs_ended_by_task_end("other-task").await, 0);
         let jobs = tool

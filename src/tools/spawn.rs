@@ -525,8 +525,14 @@ fn combine_batch(
     let mut trust = SourceTrust::Trusted;
     let mut truncation: Option<crate::traits::TruncationInfo> = None;
     for (mission, run) in runs {
-        // Its own name, in words the parent can repeat to the owner.
-        let heading = format!("### {mission}");
+        // Its own name, in words the parent can repeat to the owner. A
+        // background start already names its helper in one line, which the
+        // run may ship as its reply: no heading over it.
+        let heading = if background {
+            String::new()
+        } else {
+            format!("### {mission}\n")
+        };
         match run {
             Ok(outcome) => {
                 if outcome.metadata.output_trust != Some(SourceTrust::Trusted) {
@@ -546,18 +552,22 @@ fn combine_batch(
                     sum.shown_chars += cut.shown_chars;
                     sum.total_chars += cut.total_chars;
                 }
-                sections.push(format!("{heading}\n{}", outcome.output));
+                sections.push(format!("{heading}{}", outcome.output));
             }
             Err(error) => {
                 failures += 1;
                 all_succeeded = false;
                 // An error may quote what the child wrote.
                 trust = SourceTrust::Untrusted;
-                sections.push(format!("{heading}\nFailed: {error}"));
+                sections.push(if background {
+                    format!("Could not start {mission}: {error}")
+                } else {
+                    format!("{heading}Failed: {error}")
+                });
             }
         }
     }
-    let output = sections.join("\n\n");
+    let output = sections.join(if background { "\n" } else { "\n\n" });
     if failures == count {
         anyhow::bail!("{output}");
     }
@@ -1397,7 +1407,13 @@ impl Tool for SpawnAgentTool {
             }
         });
 
-        let mut outcome = background_spawn_outcome(&args.mission);
+        let name = args
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .unwrap_or(args.mission.as_str());
+        let mut outcome = background_spawn_outcome(name);
         outcome.output.push_str(&scope_overlap_note);
         Ok(outcome)
     }
@@ -1468,11 +1484,13 @@ pub(crate) async fn update_checklist_card(hub: &dyn OutboundRouter, session_id: 
 
 /// A sub-agent now running in the background: the turn hands off to it, and
 /// its result reaches the parent session when it completes.
-fn background_spawn_outcome(mission: &str) -> ToolCallOutcome {
+/// What a background start returns. A run that ends on the start ships this
+/// as its reply, so it is one plain line naming the helper.
+fn background_spawn_outcome(name: &str) -> ToolCallOutcome {
     reported(
         format!(
-            "Sub-agent spawned in background for mission: \"{mission}\". \
-             The result will be delivered through the parent session when it completes."
+            "Started in the background: {name}. Its result will come to this chat when it \
+             finishes."
         ),
         SourceTrust::Trusted,
     )
@@ -2571,14 +2589,40 @@ mod child_runtime_tests {
             Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult)
         );
         assert_eq!(combined.metadata.output_trust, Some(SourceTrust::Untrusted));
-        assert!(combined
-            .output
-            .contains("### second\nFailed: boom"));
+        assert!(combined.output.contains("### second\nFailed: boom"));
         assert!(combine_batch(
             vec![("only".to_string(), Err(anyhow::anyhow!("boom")))],
             false
         )
         .is_err());
+    }
+
+    /// Starting helpers in the background answers with one plain line each,
+    /// naming the helper: the run may ship it as its reply, so no bare
+    /// heading ("Counter A") ever stands alone in the chat.
+    #[test]
+    fn a_background_start_reads_as_one_line_per_helper() {
+        let combined = combine_batch(
+            vec![
+                (
+                    "Counter A".to_string(),
+                    Ok(background_spawn_outcome("Counter A")),
+                ),
+                (
+                    "Counter B".to_string(),
+                    Ok(background_spawn_outcome("Counter B")),
+                ),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            combined.output,
+            "Started in the background: Counter A. Its result will come to this chat when it \
+             finishes.\nStarted in the background: Counter B. Its result will come to this chat \
+             when it finishes."
+        );
+        assert!(!combined.output.contains('#'));
     }
 
     /// A background child that panics still clears its record, frees its

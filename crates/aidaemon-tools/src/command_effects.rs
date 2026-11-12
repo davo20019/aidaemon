@@ -125,8 +125,16 @@ const DDEV_QUERY_SUBCOMMANDS: &[&str] = &["describe", "status", "st", "list", "v
 const DDEV_TOOL_QUERIES: &[(&str, &str, &[&str])] = &[
     ("wp", "core", &["is-installed", "version"]),
     ("wp", "option", &["get", "list"]),
-    ("wp", "plugin", &["list", "status", "is-installed", "is-active"]),
-    ("wp", "theme", &["list", "status", "is-installed", "is-active"]),
+    (
+        "wp",
+        "plugin",
+        &["list", "status", "is-installed", "is-active"],
+    ),
+    (
+        "wp",
+        "theme",
+        &["list", "status", "is-installed", "is-active"],
+    ),
     ("wp", "user", &["list", "get"]),
     ("wp", "post", &["list", "get"]),
 ];
@@ -718,6 +726,44 @@ pub fn reaches_only_this_computer(command: &str) -> bool {
         "curl" | "wget" => reads_only_local_sites(program, args),
         _ => OBSERVATION_PROGRAMS.contains(&program) && observation_args_ok(program, args),
     })
+}
+
+/// What a command runs, in a word or two for the owner: "a shell loop" for
+/// a `for`/`while`/`until` loop, else its first program's name ("ddev"),
+/// "a command" when neither can be read. Never the raw line.
+pub fn program_label(command: &str) -> String {
+    // The first segment that runs something (a `cd` only moves).
+    let first = scan(command)
+        .segments
+        .into_iter()
+        .filter_map(|segment| shell_words::split(&segment).ok())
+        .find(|words| {
+            words
+                .iter()
+                .find(|word| !is_env_assignment(word))
+                .is_some_and(|program| !matches!(basename(program), "cd" | "pushd" | "popd"))
+        })
+        .unwrap_or_default();
+    let mut words = first.iter().skip_while(|word| is_env_assignment(word));
+    let Some(program) = words.next() else {
+        return "a command".to_string();
+    };
+    let program = match basename(program) {
+        "for" | "while" | "until" | "select" => return "a shell loop".to_string(),
+        wrapper if WRAPPERS.contains(&wrapper) => words
+            .find(|word| !word.starts_with('-'))
+            .map(String::as_str),
+        name => Some(name),
+    };
+    program
+        .map(basename)
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+        .map_or_else(|| "a command".to_string(), str::to_string)
 }
 
 /// `ddev` subcommands whose output is ddev's own report of a local project,
@@ -3284,6 +3330,26 @@ fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A background command is named by what it runs, never by its line.
+    #[test]
+    fn a_command_is_labelled_by_its_program() {
+        assert_eq!(
+            program_label("for i in $(seq 1 200); do echo $i; sleep 2; done; echo done"),
+            "a shell loop"
+        );
+        assert_eq!(
+            program_label("while kill -0 123; do sleep 5; done"),
+            "a shell loop"
+        );
+        assert_eq!(program_label("cd /srv/demo && ddev start"), "ddev");
+        assert_eq!(program_label("ddev drush site:install -y"), "ddev");
+        assert_eq!(
+            program_label("FOO=1 nohup /usr/bin/python3 serve.py"),
+            "python3"
+        );
+        assert_eq!(program_label(""), "a command");
+    }
 
     /// A ddev project report names the sites it serves; filters over it
     /// keep that, but a file, another program or an echoed address could

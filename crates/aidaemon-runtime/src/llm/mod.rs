@@ -302,10 +302,7 @@ impl LlmRuntimeSnapshot {
 /// judgment does not pay for a known refusal on every call. When every model
 /// is known to be out, all are kept: the attempts then fail at once and the
 /// last error says why.
-fn available_first(
-    backend: &ModelBackend,
-    models: Vec<String>,
-) -> Vec<String> {
+fn available_first(backend: &ModelBackend, models: Vec<String>) -> Vec<String> {
     let now = std::time::SystemTime::now();
     let (out, available): (Vec<String>, Vec<String>) = models.into_iter().partition(|model| {
         backend
@@ -572,7 +569,11 @@ mod tests {
                 .expect("the failover provider judges");
             assert_eq!(answer.content.as_deref(), Some(verdict));
         }
-        assert_eq!(primary.requests().len(), 1, "the out-of-quota model is asked once");
+        assert_eq!(
+            primary.requests().len(),
+            1,
+            "the out-of-quota model is asked once"
+        );
         assert_eq!(failover.requests().len(), 2);
 
         // A request the provider rejected as malformed stops at once.

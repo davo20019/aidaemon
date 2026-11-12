@@ -246,16 +246,7 @@ pub async fn stop(
     }
     stopped.extend(goals);
 
-    let mut reply = String::new();
-    if !stopped.is_empty() {
-        reply.push_str("⏹️ Stopped:");
-        for title in &stopped {
-            reply.push_str(&format!(
-                "\n• {}",
-                crate::presentation::word_preview(title, 120)
-            ));
-        }
-    }
+    let mut reply = stopped_list(&stopped);
     if !still.is_empty() {
         if !reply.is_empty() {
             reply.push_str("\n\n");
@@ -280,23 +271,39 @@ pub async fn stop(
 }
 
 /// Stop every sub-agent and background command the chat has running (its
-/// turns are left to the caller), each read back; returns how many were
-/// read back as stopped.
+/// turns are left to the caller), each read back; returns the titles of
+/// those read back as stopped, in the list's order.
 pub async fn stop_background_work(
     registry: &TaskRegistry,
     agent: &dyn ChannelAgentRuntime,
     session_id: &str,
-) -> usize {
+) -> Vec<String> {
     let list = running_work(registry, agent, session_id).await;
-    let mut stopped = 0;
+    let mut stopped = Vec::new();
     for entry in &list.entries {
         if let Target::Work(key) = &entry.target {
             if agent.stop_chat_work(session_id, key).await {
-                stopped += 1;
+                stopped.push(entry.title.clone());
             }
         }
     }
     stopped
+}
+
+/// What stopped, one line each, as `/cancel` names it ("⏹️ Stopped:" and a
+/// bullet per title); empty when nothing did.
+pub fn stopped_list(titles: &[String]) -> String {
+    if titles.is_empty() {
+        return String::new();
+    }
+    let mut reply = "⏹️ Stopped:".to_string();
+    for title in titles {
+        reply.push_str(&format!(
+            "\n• {}",
+            crate::presentation::word_preview(title, 120)
+        ));
+    }
+    reply
 }
 
 /// Whether turn `id` has ended (or is no longer kept), reading the registry

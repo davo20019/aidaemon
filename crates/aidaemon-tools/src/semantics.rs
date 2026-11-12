@@ -2501,6 +2501,13 @@ pub trait ToolSemantics: Send + Sync {
         }
     }
 
+    /// A few plain words the call itself gave for what it does ("running
+    /// the site installer"), for the owner's status line and lists of
+    /// running work. Never authority. Default: none.
+    fn call_title(&self, _arguments: &str) -> Option<String> {
+        None
+    }
+
     /// Whether what this exact call returns is a local tool's own report of
     /// the sites it serves on this computer (a `ddev` project's report), so
     /// a local site it names is one this work set up even when the output

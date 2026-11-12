@@ -1339,7 +1339,13 @@ mod tests {
         let registry = TaskRegistry::new(10);
         let stopped =
             crate::stop::stop_background_work(&registry, agent.as_ref(), "test:mid-run").await;
-        assert_eq!(stopped, 2);
+        assert_eq!(stopped.len(), 2);
+        // `/clear` names what stopped, as `/cancel` does.
+        let named = crate::stop::stopped_list(&stopped);
+        assert!(named.starts_with("⏹️ Stopped:\n• "), "{named}");
+        for title in &stopped {
+            assert!(named.contains(title.as_str()), "{named}");
+        }
         assert!(agent.work.lock().unwrap().is_empty());
     }
 
