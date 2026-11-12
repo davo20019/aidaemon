@@ -1056,6 +1056,17 @@ pub trait NotificationStore: Send + Sync {
     async fn cleanup_expired_notifications(&self) -> anyhow::Result<i64> {
         Ok(0)
     }
+
+    /// Notices delivered to `session_id` at or after `since`, oldest first:
+    /// what the owner was already told while a turn ran, so its reply can
+    /// agree with them ([`crate::goals::notices_turn_context`]).
+    async fn notices_delivered_since(
+        &self,
+        _session_id: &str,
+        _since: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<Vec<crate::traits::DeliveredNotice>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Focused persistence contract used by mandate management. Includes the

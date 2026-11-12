@@ -21,18 +21,31 @@ pub(super) async fn enqueue_mandate_run_notification_on_connection(
     notice: &crate::traits::MandateRunNotification,
 ) -> anyhow::Result<bool> {
     notice.validate().map_err(|error| anyhow::anyhow!(error))?;
-    // Name the automation by its owner-confirmed objective. Every queued
-    // mandate notice passes through here, so no call site can forget it.
+    // Name the automation by the name the owner gave it, else its
+    // owner-confirmed objective. Every queued mandate notice passes through
+    // here, so no call site can forget it.
     let named;
-    let notice = if notice.objective.is_some() {
+    let notice = if notice.objective.is_some() && notice.name.is_some() {
         notice
     } else {
-        let objective =
-            sqlx::query_scalar::<_, String>("SELECT objective FROM mandates WHERE id = ?")
-                .bind(&notice.mandate_id)
-                .fetch_optional(&mut *connection)
-                .await?;
-        named = notice.clone().with_objective(objective.as_deref());
+        let stored = sqlx::query("SELECT name, objective FROM mandates WHERE id = ?")
+            .bind(&notice.mandate_id)
+            .fetch_optional(&mut *connection)
+            .await?;
+        let (name, objective) = stored.map_or((None, None), |row| {
+            (
+                row.get::<Option<String>, _>("name"),
+                row.get::<Option<String>, _>("objective"),
+            )
+        });
+        let mut filled = notice.clone();
+        if filled.name.is_none() {
+            filled.name = name;
+        }
+        if filled.objective.is_none() {
+            filled.objective = objective;
+        }
+        named = filled;
         &named
     };
     let entry = notice.to_notification_entry();
@@ -315,6 +328,45 @@ impl<S: WorkDatabase> crate::traits::NotificationStore for S {
         Ok(())
     }
 
+    async fn notices_delivered_since(
+        &self,
+        session_id: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<Vec<crate::traits::DeliveredNotice>> {
+        // `delivered_at` is SQLite's `datetime('now')`: UTC, second precision.
+        let rows = sqlx::query(
+            "SELECT n.id, n.notification_type, n.message, n.delivered_at,
+                    (SELECT m.id FROM mandates m WHERE m.goal_id = n.goal_id LIMIT 1) AS mandate_id
+             FROM notification_queue n
+             WHERE n.session_id = ?
+               AND n.delivered_at IS NOT NULL
+               AND datetime(n.delivered_at) >= datetime(?)
+             ORDER BY datetime(n.delivered_at), n.created_at",
+        )
+        .bind(session_id)
+        .bind(since.format("%Y-%m-%d %H:%M:%S").to_string())
+        .fetch_all(self.work_pool())
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let delivered_at: String = row.get("delivered_at");
+                crate::traits::DeliveredNotice {
+                    id: row.get("id"),
+                    notification_type: row.get("notification_type"),
+                    message: row.get("message"),
+                    delivered_at: chrono::NaiveDateTime::parse_from_str(
+                        &delivered_at,
+                        "%Y-%m-%d %H:%M:%S",
+                    )
+                    .map(|at| at.and_utc().to_rfc3339())
+                    .unwrap_or(delivered_at),
+                    mandate_id: row.get("mandate_id"),
+                }
+            })
+            .collect())
+    }
+
     async fn cleanup_expired_notifications(&self) -> anyhow::Result<i64> {
         let result = sqlx::query(
             "DELETE FROM notification_queue
@@ -358,6 +410,94 @@ mod tests {
             },
             "2026-08-02T12:00:00Z",
         )
+    }
+
+    /// A queued notice names the mandate by the name the owner gave it,
+    /// carries no internal reference, and a turn that started before it was
+    /// delivered gets it back as typed context for its reply.
+    #[tokio::test]
+    async fn named_mandate_notice_reaches_the_turn_that_was_running() {
+        let (store, _database) = test_store().await;
+        let goal = Goal::new_continuous(
+            "Watch the status page",
+            "owner-session",
+            Some(10_000),
+            Some(50_000),
+        );
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Every hour, check the status page and notify the owner when it is down",
+            "owner-session",
+            MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        mandate.name = Some("Status watch".to_string());
+        store
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        let turn_started = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let failed = MandateRunNotification::new(
+            &mandate.id,
+            mandate.version,
+            &goal.id,
+            "run-synthetic-1",
+            "owner-session",
+            MandateRunNotificationKind::ReviewFailed {
+                reason: MandateFinalizationRejectReason::DeliberatorFailed,
+            },
+            MandateRunProofCounts::default(),
+            "2026-08-02T12:00:00Z",
+        )
+        // A caller that names only the objective still gets the name.
+        .with_objective(Some(&mandate.objective));
+        let mut tx = store.pool.begin().await.unwrap();
+        assert!(
+            enqueue_mandate_run_notification_on_connection(&mut tx, &failed)
+                .await
+                .unwrap()
+        );
+        tx.commit().await.unwrap();
+        let entry_id = failed.notification_id();
+        store.mark_notification_delivered(&entry_id).await.unwrap();
+
+        let delivered = store
+            .notices_delivered_since("owner-session", turn_started)
+            .await
+            .unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].id, entry_id);
+        assert_eq!(
+            delivered[0].mandate_id.as_deref(),
+            Some(mandate.id.as_str())
+        );
+        assert_eq!(
+            delivered[0].message,
+            "Your automation \"Status watch\": a review stopped before it finished. Ask me what \
+             it got to if you want the details. It's still active and will retry automatically."
+        );
+        let context = crate::goals::notices_turn_context(&delivered).unwrap();
+        assert!(context.contains(&mandate.id), "{context}");
+        assert!(context.contains("mandate_review_failed"), "{context}");
+
+        // Another session, and a turn that started after it, see nothing.
+        assert!(store
+            .notices_delivered_since("other-session", turn_started)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .notices_delivered_since(
+                "owner-session",
+                chrono::Utc::now() + chrono::Duration::seconds(5)
+            )
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(crate::goals::notices_turn_context(&[]), None);
     }
 
     #[tokio::test]
