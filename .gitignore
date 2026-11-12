@@ -88,3 +88,9 @@ hello_world.php
 # Machine-local cargo build tuning (disk-constrained dev box) — not for CI/contributors
 .cargo/
 .aidaemon-workspaces/
+
+# Plans are local working notes, not part of the repository
+crates/aidaemon-core/PLAN.md
+crates/aidaemon-core/PRODUCT_PLAN.md
+crates/aidaemon-core/plans/
+reports/*plan*.md
