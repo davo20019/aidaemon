@@ -1,11 +1,17 @@
 [package]
 name = "aidaemon-decisions"
-version = "0.0.1"
-edition = "2021"
-license = "MIT"
-description = "aidaemon SDK: decision backends that answer closed questions with a confidence (experimental)"
-repository = "https://github.com/davo20019/aidaemon"
-homepage = "https://aidaemon.ai/"
+description = "Decision backends that answer closed questions with a confidence; internal to aidaemon, no stability promise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-decisions"
+readme = "README.md"
+keywords = ["agent", "decision", "llm", "gemini", "async"]
+categories = ["asynchronous", "development-tools"]
 publish = false
 
 [features]
@@ -15,7 +21,7 @@ gemini = ["dep:reqwest"]
 testing = []
 
 [dependencies]
-aidaemon-core = { path = "../aidaemon-core" }
+aidaemon-core = { version = "0.1.0", path = "../aidaemon-core" }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

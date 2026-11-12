@@ -12,6 +12,20 @@ keywords = ["ai", "daemon", "telegram", "llm", "mcp"]
 categories = ["command-line-utilities"]
 exclude = ["*.db", "*.db-shm", "*.db-wal", ".env", "config.toml", "lcov.info", "*.profraw", "docs/", "task-75498c01f980/"]
 
+[workspace.package]
+# One shared version for every SDK crate (crates/aidaemon-*), separate from the
+# daemon's own. The daemon pins them exactly (`=0.1.x`). See crates/PUBLISHING.md.
+# aidaemon-node-protocol and aidaemon-node-sdk keep their own versions.
+version = "0.1.0"
+edition = "2021"
+# Floor set by the SDK crates' dependency tree with all features (image,
+# ignore: 1.88); verified in CI by the MSRV job.
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/davo20019/aidaemon"
+homepage = "https://aidaemon.ai/"
+authors = ["David Loor <davo20019@gmail.com>"]
+
 [workspace]
 members = [
     "crates/node-protocol",
@@ -107,26 +121,26 @@ aes-gcm = { version = "0.10", optional = true }
 portable-pty = { version = "0.8", optional = true }
 
 # The agent kernel (workspace crate).
-aidaemon-core = { path = "crates/aidaemon-core" }
+aidaemon-core = { version = "=0.1.0", path = "crates/aidaemon-core" }
 # The kernel's run journal and checkpoints, on the daemon's own pool.
-aidaemon-store-sqlite = { path = "crates/aidaemon-store-sqlite" }
-aidaemon-policies = { path = "crates/aidaemon-policies" }
-aidaemon-decisions = { path = "crates/aidaemon-decisions", features = ["gemini"] }
+aidaemon-store-sqlite = { version = "=0.1.0", path = "crates/aidaemon-store-sqlite" }
+aidaemon-policies = { version = "=0.1.0", path = "crates/aidaemon-policies" }
+aidaemon-decisions = { version = "=0.1.0", path = "crates/aidaemon-decisions", features = ["gemini"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"], optional = true }
 # Tool semantics (call descriptions, receipts metadata) live in the SDK.
-aidaemon-tools = { path = "crates/aidaemon-tools" }
-aidaemon-providers = { path = "crates/aidaemon-providers" }
+aidaemon-tools = { version = "=0.1.0", path = "crates/aidaemon-tools" }
+aidaemon-providers = { version = "=0.1.0", path = "crates/aidaemon-providers" }
 # The MCP transport; the daemon keeps its registry and result rendering.
-aidaemon-mcp = { path = "crates/aidaemon-mcp" }
+aidaemon-mcp = { version = "=0.1.0", path = "crates/aidaemon-mcp" }
 # Channel contract and platform adapters (formatting today; transport next).
-aidaemon-channels = { path = "crates/aidaemon-channels" }
-aidaemon-channel-telegram = { path = "crates/aidaemon-channel-telegram", features = ["webhook"] }
-aidaemon-channel-slack = { path = "crates/aidaemon-channel-slack", optional = true }
-aidaemon-channel-discord = { path = "crates/aidaemon-channel-discord", optional = true }
+aidaemon-channels = { version = "=0.1.0", path = "crates/aidaemon-channels" }
+aidaemon-channel-telegram = { version = "=0.1.0", path = "crates/aidaemon-channel-telegram", features = ["webhook"] }
+aidaemon-channel-slack = { version = "=0.1.0", path = "crates/aidaemon-channel-slack", optional = true }
+aidaemon-channel-discord = { version = "=0.1.0", path = "crates/aidaemon-channel-discord", optional = true }
 # Long-term memory: shared primitives today; the `sdk` backend with `sdk-memory`.
-aidaemon-memory = { path = "crates/aidaemon-memory" }
-aidaemon-events = { path = "crates/aidaemon-events" }
-aidaemon-work = { path = "crates/aidaemon-work" }
+aidaemon-memory = { version = "=0.1.0", path = "crates/aidaemon-memory" }
+aidaemon-events = { version = "=0.1.0", path = "crates/aidaemon-events" }
+aidaemon-work = { version = "=0.1.0", path = "crates/aidaemon-work" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # keyring v4 dropped feature flags and moved `Entry` to `keyring-core`. The

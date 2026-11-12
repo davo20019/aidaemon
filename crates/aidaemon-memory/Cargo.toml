@@ -1,11 +1,17 @@
 [package]
 name = "aidaemon-memory"
-version = "0.0.1"
-edition = "2021"
-license = "MIT"
-description = "aidaemon SDK: long-term memory (experimental)"
-repository = "https://github.com/davo20019/aidaemon"
-homepage = "https://aidaemon.ai/"
+description = "Swappable long-term memory for aidaemon agents: the MemoryStore traits plus SQLite and embedding implementations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-memory"
+readme = "README.md"
+keywords = ["agent", "memory", "llm", "embeddings", "sqlite"]
+categories = ["asynchronous", "database"]
 publish = false
 
 [features]
@@ -18,8 +24,8 @@ fastembed = ["dep:fastembed"]
 conformance = ["aidaemon-core/testing"]
 
 [dependencies]
-aidaemon-core = { path = "../aidaemon-core" }
-aidaemon-policies = { path = "../aidaemon-policies" }
+aidaemon-core = { version = "0.1.0", path = "../aidaemon-core" }
+aidaemon-policies = { version = "0.1.0", path = "../aidaemon-policies" }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }

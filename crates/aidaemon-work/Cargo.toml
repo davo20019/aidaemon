@@ -1,11 +1,17 @@
 [package]
 name = "aidaemon-work"
-version = "0.0.1"
-edition = "2021"
-license = "MIT"
-description = "aidaemon SDK: goals, mandates, tasks, work coordination and notifications, with their SQLite store (experimental)"
-repository = "https://github.com/davo20019/aidaemon"
-homepage = "https://aidaemon.ai/"
+description = "Goals, mandates, tasks and work coordination with a SQLite store; internal to aidaemon, no stability promise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-work"
+readme = "README.md"
+keywords = ["agent", "tasks", "goals", "sqlite", "llm"]
+categories = ["database", "asynchronous"]
 publish = false
 
 [features]
@@ -14,8 +20,8 @@ publish = false
 testing = ["aidaemon-events/testing"]
 
 [dependencies]
-aidaemon-events = { path = "../aidaemon-events" }
-aidaemon-tools = { path = "../aidaemon-tools" }
+aidaemon-events = { version = "0.1.0", path = "../aidaemon-events" }
+aidaemon-tools = { version = "0.1.0", path = "../aidaemon-tools" }
 anyhow = "1"
 async-trait = "0.1"
 croner = "3"

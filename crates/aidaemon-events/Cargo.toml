@@ -1,11 +1,17 @@
 [package]
 name = "aidaemon-events"
-version = "0.0.1"
-edition = "2021"
-license = "MIT"
-description = "aidaemon SDK: the immutable event store, its payloads and the run aggregate (experimental)"
-repository = "https://github.com/davo20019/aidaemon"
-homepage = "https://aidaemon.ai/"
+description = "Immutable event store, payloads and run aggregate; internal to aidaemon, no stability promise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-events"
+readme = "README.md"
+keywords = ["agent", "events", "event-sourcing", "sqlite", "llm"]
+categories = ["database", "asynchronous"]
 publish = false
 
 [features]
@@ -14,8 +20,8 @@ publish = false
 testing = []
 
 [dependencies]
-aidaemon-policies = { path = "../aidaemon-policies" }
-aidaemon-tools = { path = "../aidaemon-tools" }
+aidaemon-policies = { version = "0.1.0", path = "../aidaemon-policies" }
+aidaemon-tools = { version = "0.1.0", path = "../aidaemon-tools" }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
