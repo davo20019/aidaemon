@@ -29,14 +29,13 @@ never deleted, and a crate name cannot be released once taken.
 ## Names
 
 Checked on 2026-10-31 against the crates.io API: `aidaemon` and
-`aidaemon-node-sdk` (and the node protocol) are ours already; all 17 SDK
-names (`aidaemon-core`, `-sdk`, `-providers`, `-tools`, `-store-sqlite`,
-`-mcp`, `-agents`, `-policies`, `-eval`, `-memory`, `-channels`,
-`-channel-telegram`, `-channel-slack`, `-channel-discord`, `-events`,
-`-work`, `-decisions`) were free (the last three were checked only in the
-sense that nothing in them existed then; re-check all of them). Names can be
-taken at any time: re-check right before the first release. No placeholder
-0.0.x versions.
+`aidaemon-node-sdk` are ours already, and the 14 original SDK names
+(`aidaemon-core`, `-sdk`, `-providers`, `-tools`, `-store-sqlite`, `-mcp`,
+`-agents`, `-policies`, `-eval`, `-memory`, `-channels`, `-channel-telegram`,
+`-channel-slack`, `-channel-discord`) were free. `aidaemon-events`,
+`aidaemon-work` and `aidaemon-decisions` have not been checked. Names can be
+taken at any time: re-check all 17 right before the first release. No
+placeholder 0.0.x versions.
 
 ## Stability tiers
 
