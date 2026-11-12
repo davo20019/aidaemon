@@ -1,0 +1,8 @@
+# The one toolchain for every checkout, worktree and CI job. Bump it here
+# (and fix new clippy lints in the same change); jobs that need another
+# toolchain (MSRV, the pinned nightly for the public-API snapshot) select it
+# explicitly with RUSTUP_TOOLCHAIN or `cargo +<toolchain>`.
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

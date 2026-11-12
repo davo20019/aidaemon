@@ -168,6 +168,17 @@ computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo"
 # The aidaemon-memory crate as the memory plugin for agent turns.
 sdk-memory = ["aidaemon-memory/fastembed"]
 
+# Debug builds keep file:line for the workspace's own code (panics,
+# backtraces) and drop the rest of the debug info, which is rarely read and
+# made every artifact bigger. Daemon lib tests, Rust 1.100, Apple Silicon:
+# 4.0 GB with full debug info, 2.6 GB with this; one-file edit rebuild
+# ~50 s -> ~45 s. For a debugger session: CARGO_PROFILE_DEV_DEBUG=true.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = true
 codegen-units = 1

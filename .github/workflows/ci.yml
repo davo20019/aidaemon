@@ -69,23 +69,23 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
 
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      # Registry plus the compiled dependencies (workspace crates are
+      # dropped before saving). Saved from master only, so pull requests
+      # restore it without evicting each other from the 10 GB cache budget.
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-check-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-check-v2-
+          prefix-key: v3-check
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Check formatting
         run: cargo fmt --check
@@ -132,7 +132,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
 
       - name: Install Linux dependencies
         run: |
@@ -196,6 +198,9 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-msrv-v1-
 
       - name: cargo check on the MSRV
+        # rust-toolchain.toml outranks the default the step above set.
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
         run: >-
           cargo check --locked --all-features
           -p aidaemon-core -p aidaemon-providers -p aidaemon-tools -p aidaemon-tool-browser
@@ -216,7 +221,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
 
       - uses: taiki-e/install-action@v2
         with:
@@ -257,7 +264,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-latest'
@@ -307,14 +316,14 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      # Registry plus the compiled dependencies (workspace crates are
+      # dropped before saving). Saved from master only, so pull requests
+      # restore it without evicting each other from the 10 GB cache budget.
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-test-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-v2-
+          prefix-key: v3-test
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Cache fastembed model
         uses: actions/cache@v4
@@ -377,7 +386,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
 
       - name: Install Linux dependencies
         run: |
@@ -403,7 +414,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
 
       - name: Install Linux dependencies
         run: |
@@ -426,6 +439,9 @@ jobs:
           if [ -n "$current_apparmor" ] && [ "$current_apparmor" != "0" ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+
+      - name: Install llvm-tools
+        run: rustup component add llvm-tools-preview
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov

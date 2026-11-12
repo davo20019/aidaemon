@@ -21,7 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
 
       - name: Install Linux dependencies
         run: |
@@ -102,10 +104,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # The toolchain comes from rust-toolchain.toml.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+          rustc --version
 
       - name: Install cross
         if: matrix.cross
@@ -175,7 +179,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install && rustc --version
 
       - name: Validate tag matches crate version
         id: release_meta

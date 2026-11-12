@@ -343,11 +343,7 @@ pub fn is_productive(
 
     // 5. Error ratio sanity: at least 75% of activity should be successful
     let total_activity = total_successful_tool_calls + unrecovered;
-    if total_activity > 0 && total_successful_tool_calls * 4 < total_activity * 3 {
-        return false;
-    }
-
-    true
+    total_activity == 0 || total_successful_tool_calls * 4 >= total_activity * 3
 }
 
 static ABS_UNIX_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
