@@ -2372,6 +2372,28 @@ impl MandateReconciliationReason {
             Self::NonActionReservedMutation => "non_action_reserved_mutation",
         }
     }
+
+    /// What went wrong, in the owner's words: no internal stage or
+    /// component names.
+    pub fn owner_text(self) -> &'static str {
+        match self {
+            Self::RootTaskNotSuccessful => "the review did not finish",
+            Self::ActMissingIntention => "it decided to act but did not record what it meant to do",
+            Self::ActMissingWorkTask => "it decided to act but started no work",
+            Self::ActBlockedBeforeDispatch { .. } => "an action was refused before it ran",
+            Self::WorkTasksIncomplete => "some of its work did not finish",
+            Self::ActMissingVerifiedMutation => {
+                "it decided to act but no change could be confirmed"
+            }
+            Self::ActionLedgerMismatch => "its record of what it did does not match what ran",
+            Self::MutationOutcomeFailed => "an action it took failed",
+            Self::MutationOutcomeAmbiguous => {
+                "it can't tell whether an action it took went through"
+            }
+            Self::NonActionCreatedWork => "it decided not to act but started work anyway",
+            Self::NonActionReservedMutation => "it decided not to act but prepared a change anyway",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2403,6 +2425,18 @@ impl MandateFinalizationRejectReason {
             Self::InvalidDecisionState => "invalid_decision_state",
             Self::DeliberatorFailed => "deliberator_failed",
             Self::ActChangedNothing => "act_changed_nothing",
+        }
+    }
+
+    /// What went wrong, in the owner's words: no internal stage or
+    /// component names.
+    pub fn owner_text(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "the review could not be checked",
+            Self::DecisionMissing => "it was interrupted before it decided anything",
+            Self::InvalidDecisionState => "its decision could not be confirmed",
+            Self::DeliberatorFailed => "it could not finish",
+            Self::ActChangedNothing => "the action it decided on did not go through",
         }
     }
 }
@@ -2517,10 +2551,6 @@ pub fn mandate_owner_label(objective: Option<&str>) -> String {
 fn plural(count: impl Into<u64>, one: &str, many: &str) -> String {
     let count = count.into();
     format!("{count} {}", if count == 1 { one } else { many })
-}
-
-fn humanize_reason(code: &str) -> String {
-    code.replace('_', " ")
 }
 
 /// Bounded, single-line rendering of a model-generated owner question. The
@@ -2672,15 +2702,14 @@ impl MandateRunNotification {
                     " Ask me for the details, then resume it when you're ready.".to_string()
                 };
                 format!(
-                    "{label} is paused for safety ({}).{detail} {reference}",
-                    humanize_reason(reason.as_str()),
+                    "{label} is paused for safety: {}.{detail} {reference}",
+                    reason.owner_text(),
                 )
             }
             MandateRunNotificationKind::ReviewFailed {
                 reason: MandateFinalizationRejectReason::DecisionMissing,
             } => format!(
-                "{label}: a review was interrupted before it decided anything ({}). Nothing was done. It's still active and will retry automatically. {reference}",
-                humanize_reason(MandateFinalizationRejectReason::DecisionMissing.as_str()),
+                "{label}: a review was interrupted before it decided anything. Nothing was done. It's still active and will try again on its own. {reference}",
             ),
             // The deliberator may fail after committing an ACT and starting an
             // executor, so this notice claims neither "nothing decided" nor
@@ -2689,17 +2718,16 @@ impl MandateRunNotification {
             MandateRunNotificationKind::ReviewFailed {
                 reason: MandateFinalizationRejectReason::DeliberatorFailed,
             } => format!(
-                "{label}: a review failed before it finished ({}). Ask me what it got to if you want the details. It's still active and will retry automatically. {reference}",
-                humanize_reason(MandateFinalizationRejectReason::DeliberatorFailed.as_str()),
+                "{label}: a review couldn't finish. Ask me what it got to if you want the details. It's still active and will try again on its own. {reference}",
             ),
             MandateRunNotificationKind::ReviewFailed {
                 reason: MandateFinalizationRejectReason::ActChangedNothing,
             } => format!(
-                "{label}: a review decided to act, but the action did not go through, so nothing changed. It's still active and will retry automatically. {reference}",
+                "{label}: a review decided to act, but the action did not go through, so nothing changed. It's still active and will try again on its own. {reference}",
             ),
             MandateRunNotificationKind::ReviewFailed { reason } => format!(
                 "{label}: a review could not be verified ({}), so nothing was done. {reference}",
-                humanize_reason(reason.as_str()),
+                reason.owner_text(),
             ),
             MandateRunNotificationKind::ExecutionLeaseLost => format!(
                 "{label} is paused for safety: a review was cut off before its results could be confirmed. {check_target} {reference}"
@@ -2773,7 +2801,7 @@ mod tests {
         assert!(!message.contains("decided anything"), "{message}");
         assert!(!message.contains("Nothing was done"), "{message}");
         assert!(message.contains("still active"));
-        assert!(message.contains("retry automatically"));
+        assert!(message.contains("will try again on its own"));
 
         let missing = MandateRunNotification::new(
             "08012d3d-synthetic",
@@ -2790,6 +2818,66 @@ mod tests {
         .message();
         assert!(missing.contains("before it decided anything"), "{missing}");
         assert!(missing.contains("Nothing was done"), "{missing}");
+    }
+
+    /// Owner notices say what happened in plain words, from the typed
+    /// failure kind: never an internal code or component name.
+    #[test]
+    fn failure_notices_never_name_internal_codes() {
+        let reject = [
+            MandateFinalizationRejectReason::InvalidRequest,
+            MandateFinalizationRejectReason::DecisionMissing,
+            MandateFinalizationRejectReason::InvalidDecisionState,
+            MandateFinalizationRejectReason::DeliberatorFailed,
+            MandateFinalizationRejectReason::ActChangedNothing,
+        ];
+        let reconcile = [
+            MandateReconciliationReason::RootTaskNotSuccessful,
+            MandateReconciliationReason::ActMissingIntention,
+            MandateReconciliationReason::ActMissingWorkTask,
+            MandateReconciliationReason::WorkTasksIncomplete,
+            MandateReconciliationReason::ActMissingVerifiedMutation,
+            MandateReconciliationReason::ActionLedgerMismatch,
+            MandateReconciliationReason::MutationOutcomeFailed,
+            MandateReconciliationReason::MutationOutcomeAmbiguous,
+            MandateReconciliationReason::NonActionCreatedWork,
+            MandateReconciliationReason::NonActionReservedMutation,
+        ];
+        let notice = |kind| {
+            MandateRunNotification::new(
+                "08012d3d-synthetic",
+                1,
+                "goal-synthetic",
+                "566978b6-synthetic",
+                "owner-synthetic",
+                kind,
+                MandateRunProofCounts::default(),
+                "2026-08-11T12:00:00Z",
+            )
+            .message()
+        };
+        let messages = reject
+            .iter()
+            .map(|reason| {
+                (
+                    reason.as_str(),
+                    notice(MandateRunNotificationKind::ReviewFailed { reason: *reason }),
+                )
+            })
+            .chain(reconcile.iter().map(|reason| {
+                (
+                    reason.as_str(),
+                    notice(MandateRunNotificationKind::ReconciliationRequired { reason: *reason }),
+                )
+            }));
+        for (code, message) in messages {
+            let lower = message.to_lowercase();
+            assert!(!lower.contains(code), "{message}");
+            assert!(!lower.contains(&code.replace('_', " ")), "{message}");
+            for internal in ["deliberator", "ledger", "mutation", "executor"] {
+                assert!(!lower.contains(internal), "{message}");
+            }
+        }
     }
 
     #[test]
