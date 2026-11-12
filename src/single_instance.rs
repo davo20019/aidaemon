@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::OnceLock;
 
-static INSTANCE_LOCK: OnceLock<fd_lock::RwLockWriteGuard<'static, File>> = OnceLock::new();
+static INSTANCE_LOCK: OnceLock<File> = OnceLock::new();
 
 /// Acquire the single-instance lock at `lock_path`, held until this process
 /// exits. Returns an error (naming the holder pid when recorded) if another
@@ -26,7 +26,7 @@ pub fn acquire(lock_path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
@@ -34,32 +34,30 @@ pub fn acquire(lock_path: &Path) -> anyhow::Result<()> {
         .open(lock_path)
         .map_err(|e| anyhow::anyhow!("cannot open instance lock {}: {e}", lock_path.display()))?;
 
-    let lock = Box::leak(Box::new(fd_lock::RwLock::new(file)));
-    let mut guard = match lock.try_write() {
-        Ok(guard) => guard,
-        Err(e) => {
-            let holder = std::fs::read_to_string(lock_path).unwrap_or_default();
-            let holder = holder.trim();
-            let who = if holder.is_empty() {
-                String::new()
-            } else {
-                format!(" (pid {holder})")
-            };
-            anyhow::bail!(
+    // `File::try_lock` is an exclusive `flock` on Unix and `LockFileEx` on
+    // Windows, released when the handle closes.
+    if let Err(e) = file.try_lock() {
+        let holder = std::fs::read_to_string(lock_path).unwrap_or_default();
+        let holder = holder.trim();
+        let who = if holder.is_empty() {
+            String::new()
+        } else {
+            format!(" (pid {holder})")
+        };
+        anyhow::bail!(
             "another aidaemon instance is already running{who} — refusing to start a second one \
              that would race it over the same database and channels. Stop the other instance \
              first (lock: {}) [{e}]",
             lock_path.display()
         );
-        }
-    };
+    }
 
     // Record our pid for diagnostics (best-effort; the lock itself is the guard).
-    let _ = guard.set_len(0);
-    let _ = write!(guard, "{}", std::process::id());
-    let _ = guard.flush();
+    let _ = file.set_len(0);
+    let _ = write!(file, "{}", std::process::id());
+    let _ = file.flush();
     // Hold the handle for the whole process lifetime so the lock stays held.
-    let _ = INSTANCE_LOCK.set(guard);
+    let _ = INSTANCE_LOCK.set(file);
     Ok(())
 }
 
@@ -80,8 +78,7 @@ mod tests {
             .truncate(false)
             .open(&path)
             .unwrap();
-        let lock = Box::leak(Box::new(fd_lock::RwLock::new(held)));
-        let guard = lock.try_write().expect("first holder acquires the lock");
+        held.try_lock().expect("first holder acquires the lock");
 
         // A second acquire must be refused while the first holds it.
         assert!(
@@ -90,7 +87,7 @@ mod tests {
         );
 
         // Once the holder exits (fd closed), the lock is free again.
-        drop(guard);
+        drop(held);
         assert!(
             acquire(&path).is_ok(),
             "lock should be acquirable after the holder releases it"
