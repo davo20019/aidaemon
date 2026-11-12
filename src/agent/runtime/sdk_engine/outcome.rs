@@ -11,6 +11,14 @@ pub(super) fn reconcile_plan_projection(plan: &mut crate::plans::TaskPlan) -> bo
     use crate::plans::StepStatus;
     let mut changed = false;
     for step in &mut plan.steps {
+        // Marked as handed to the background, but no launch took it: nothing
+        // is working on it, so it was not done.
+        if step.status == StepStatus::Background && step.background_jobs.is_empty() {
+            step.status = StepStatus::Deferred;
+            step.completed_at = Some(chrono::Utc::now());
+            changed = true;
+            continue;
+        }
         if matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
             && step.required_mutation_effects.is_empty()
             && !step.requires_observation

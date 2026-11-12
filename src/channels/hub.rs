@@ -54,6 +54,10 @@ pub struct ChannelHub {
     /// Last writer wins per session; take() removes the entry, so a second
     /// concurrent background command degrades to a fresh ping message.
     background_status_surfaces: RwLock<HashMap<String, String>>,
+    /// Per-session message id of the plan card a turn left in the chat. A
+    /// background job settling checklist steps edits it, so the card moves
+    /// from "running in the background" to what happened.
+    checklist_surfaces: RwLock<HashMap<String, String>>,
 }
 
 impl ChannelHub {
@@ -68,6 +72,7 @@ impl ChannelHub {
             last_sent_text: RwLock::new(HashMap::new()),
             recent_media_deliveries: RwLock::new(HashMap::new()),
             background_status_surfaces: RwLock::new(HashMap::new()),
+            checklist_surfaces: RwLock::new(HashMap::new()),
         }
     }
 
@@ -85,6 +90,23 @@ impl ChannelHub {
     /// completion still owns the terminal `take` transition below.
     pub async fn background_status_surface(&self, session_id: &str) -> Option<String> {
         self.background_status_surfaces
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+    }
+
+    /// Register the plan card a finished turn left in this session's chat.
+    pub async fn register_checklist_surface(&self, session_id: &str, message_id: &str) {
+        self.checklist_surfaces
+            .write()
+            .await
+            .insert(session_id.to_string(), message_id.to_string());
+    }
+
+    /// The plan card a turn left in this session's chat, if any.
+    pub async fn checklist_surface(&self, session_id: &str) -> Option<String> {
+        self.checklist_surfaces
             .read()
             .await
             .get(session_id)
@@ -873,6 +895,14 @@ impl OutboundRouter for ChannelHub {
 
     async fn delete_message(&self, session_id: &str, message_id: &str) -> anyhow::Result<bool> {
         ChannelHub::delete_message(self, session_id, message_id).await
+    }
+
+    async fn checklist_surface(&self, session_id: &str) -> Option<String> {
+        ChannelHub::checklist_surface(self, session_id).await
+    }
+
+    async fn register_checklist_surface(&self, session_id: &str, message_id: &str) {
+        ChannelHub::register_checklist_surface(self, session_id, message_id).await
     }
 
     async fn request_inline_approval(

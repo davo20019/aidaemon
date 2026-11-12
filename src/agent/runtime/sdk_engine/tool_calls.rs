@@ -1564,7 +1564,7 @@ impl Agent {
                     .filter(|item| {
                         !matches!(
                             item.status.as_str(),
-                            "completed" | "deferred" | "skipped" | "failed"
+                            "completed" | "deferred" | "skipped" | "failed" | "background"
                         )
                     })
                     .count();

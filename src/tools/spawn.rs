@@ -36,6 +36,9 @@ pub struct SpawnAgentTool {
     max_response_chars: usize,
     timeout_secs: u64,
     executor_task_runs: Arc<Mutex<HashSet<String>>>,
+    /// The session checklists, so a background child can carry the steps it
+    /// was given and settle them when it ends.
+    plan_store: OnceLock<Arc<crate::plans::PlanStore>>,
 }
 
 #[cfg(test)]
@@ -90,6 +93,7 @@ impl SpawnAgentTool {
             max_response_chars,
             timeout_secs,
             executor_task_runs: Arc::new(Mutex::new(HashSet::new())),
+            plan_store: OnceLock::new(),
         }
     }
 
@@ -103,6 +107,7 @@ impl SpawnAgentTool {
             max_response_chars,
             timeout_secs,
             executor_task_runs: Arc::new(Mutex::new(HashSet::new())),
+            plan_store: OnceLock::new(),
         }
     }
 
@@ -150,6 +155,11 @@ impl SpawnAgentTool {
         self.hub
             .set(hub)
             .expect("SpawnAgentTool::set_hub called more than once");
+    }
+
+    /// Wire the session checklists (see `plan_store`).
+    pub fn set_plan_store(&self, plan_store: Arc<crate::plans::PlanStore>) {
+        let _ = self.plan_store.set(plan_store);
     }
 
     fn get_hub(&self) -> Option<Arc<dyn OutboundRouter>> {
@@ -545,6 +555,11 @@ struct SpawnArgs {
     /// When true, spawn the sub-agent in the background and return immediately.
     #[serde(default)]
     background: bool,
+    /// Zero-based indices of the `track_requirements` items a background
+    /// child does: they show as running in the background, and its end
+    /// marks them done or failed.
+    #[serde(default)]
+    checklist_items: Vec<usize>,
     /// Task ID — when provided by a task lead, the executor tracks activity against this task.
     #[serde(default)]
     task_id: Option<String>,
@@ -720,6 +735,12 @@ impl Tool for SpawnAgentTool {
                             The result will be delivered through the parent session when the sub-agent finishes. \
                             Use this for long-running tasks where the user doesn't need to wait.",
                         "default": false
+                    },
+                    "checklist_items": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 0 },
+                        "uniqueItems": true,
+                        "description": "With background=true: the zero-based indices of your track_requirements items this sub-agent does. They show as running in the background until it ends, then as done or failed by its result."
                     },
                     "task_id": {
                         "type": "string",
@@ -1037,6 +1058,37 @@ impl Tool for SpawnAgentTool {
             }
         }
         let cancel_token = agent.background_cancel_token(&background_id).await;
+        let plan_store = self.plan_store.get().cloned();
+        // The steps this child does now wait on it (typed: the launch names
+        // them). The card shows them running in the background.
+        if let (Some(plans), Some(plan_session), false) = (
+            plan_store.as_ref(),
+            approval_session_id.as_deref(),
+            args.checklist_items.is_empty(),
+        ) {
+            match plans
+                .link_background_job(
+                    plan_session,
+                    facts.task_id.as_deref(),
+                    &args.checklist_items,
+                    &background_id,
+                )
+                .await
+            {
+                Ok(Some(plan)) => {
+                    if let Some(tx) = status_tx.as_ref() {
+                        let _ = tx.try_send(StatusUpdate::Checklist {
+                            text: plan.render_compact_checklist(),
+                        });
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(%error, "Could not hand checklist steps to a background sub-agent")
+                }
+            }
+        }
+        let plan_session = approval_session_id.clone();
 
         tokio::spawn(async move {
             // This task owns `family_permit`, so the slot stays taken until
@@ -1211,6 +1263,15 @@ impl Tool for SpawnAgentTool {
                     },
                 };
                 delivery.deliver(notification_type, &message, trust).await;
+                settle_background_steps(
+                    plan_store.as_ref(),
+                    hub_for_parent_delivery.as_ref(),
+                    plan_session.as_deref(),
+                    &session_id,
+                    &background_id,
+                    notification_type == "completed",
+                )
+                .await;
             })
             .catch_unwind()
             .await;
@@ -1231,6 +1292,15 @@ impl Tool for SpawnAgentTool {
                     SourceTrust::Trusted,
                 ))
                 .catch_unwind()
+                .await;
+                settle_background_steps(
+                    plan_store.as_ref(),
+                    hub_for_parent_delivery.as_ref(),
+                    plan_session.as_deref(),
+                    &session_id,
+                    &background_id,
+                    false,
+                )
                 .await;
                 if delivered.is_err() {
                     enqueue_background_notification(
@@ -1271,6 +1341,60 @@ fn coordination_trailer(
 ) -> String {
     tree.and_then(|family| family.coordination().result_trailer(session))
         .unwrap_or_default()
+}
+
+/// A background job ended: settle the checklist steps it was given and show
+/// the card's new state, editing the card the turn left (or the session's
+/// background status message) in place, else sending it fresh.
+pub(crate) async fn settle_background_steps(
+    plan_store: Option<&Arc<crate::plans::PlanStore>>,
+    hub: Option<&Weak<dyn OutboundRouter>>,
+    plan_session: Option<&str>,
+    chat_session: &str,
+    job_id: &str,
+    succeeded: bool,
+) {
+    let (Some(plans), Some(plan_session)) = (plan_store, plan_session) else {
+        return;
+    };
+    let plan = match plans
+        .settle_background_job(plan_session, job_id, succeeded)
+        .await
+    {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(%error, job_id, "Could not settle a background job's checklist steps");
+            return;
+        }
+    };
+    // A sub-agent's own checklist is not the card in the chat.
+    if plan_session != chat_session {
+        return;
+    }
+    let Some(hub) = hub.and_then(Weak::upgrade) else {
+        return;
+    };
+    update_checklist_card(hub.as_ref(), chat_session, &plan.render_compact_checklist()).await;
+}
+
+/// Show `card` in the session's chat: edit the plan card the turn left (or
+/// the background status message) in place, else send it as a new card.
+pub(crate) async fn update_checklist_card(hub: &dyn OutboundRouter, session_id: &str, card: &str) {
+    let surface = match hub.checklist_surface(session_id).await {
+        Some(id) => Some(id),
+        None => hub.background_status_surface(session_id).await,
+    };
+    if let Some(id) = surface {
+        if matches!(hub.edit_text(session_id, &id, card).await, Ok(true)) {
+            return;
+        }
+    }
+    match hub.send_text_tracked(session_id, card).await {
+        Ok(Some(id)) => hub.register_checklist_surface(session_id, &id).await,
+        Ok(None) => {}
+        Err(error) => warn!(session_id, %error, "Could not show the updated checklist"),
+    }
 }
 
 /// A sub-agent now running in the background: the turn hands off to it, and
@@ -2927,6 +3051,182 @@ mod child_runtime_tests {
             false
         }
         async fn unregister_session_route(&self, _child: &str, _parent: &str) {}
+    }
+
+    /// Records the plan card's edits.
+    #[derive(Default)]
+    struct CardHub {
+        edits: StdMutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl OutboundRouter for CardHub {
+        async fn send_text(&self, _session_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_text_tracked(
+            &self,
+            _session_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn edit_text(
+            &self,
+            _session_id: &str,
+            message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<bool> {
+            self.edits
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            Ok(true)
+        }
+        async fn send_media(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_media_strict(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn background_status_surface(&self, _session_id: &str) -> Option<String> {
+            None
+        }
+        async fn take_background_status_surface(&self, _session_id: &str) -> Option<String> {
+            None
+        }
+        async fn checklist_surface(&self, _session_id: &str) -> Option<String> {
+            Some("card-1".to_string())
+        }
+        async fn request_inline_approval(
+            &self,
+            _session_id: &str,
+            _description: &str,
+            _risk_level: crate::tools::command_risk::RiskLevel,
+            _warnings: &[String],
+            _permission_mode: crate::tools::command_risk::PermissionMode,
+        ) -> anyhow::Result<crate::types::ApprovalResponse> {
+            anyhow::bail!("no approvals in this test")
+        }
+        async fn register_session_route(&self, _child: &str, _parent: &str) -> bool {
+            false
+        }
+        async fn unregister_session_route(&self, _child: &str, _parent: &str) {}
+    }
+
+    /// Launch a background child for checklist items 1 and 2 of a three-item
+    /// checklist, and return the plan card the chat ends up showing.
+    async fn background_card_after(child: &Arc<ScriptedChild>) -> (String, crate::plans::TaskPlan) {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(pool).await.unwrap());
+        let session = "telegram:synthetic-user-1";
+        plans
+            .upsert_checklist(
+                session,
+                Some("task-synthetic"),
+                "track_requirements",
+                &[
+                    (
+                        "Inspect both sites".into(),
+                        crate::plans::StepStatus::Completed,
+                    ),
+                    (
+                        "Resume the first setup".into(),
+                        crate::plans::StepStatus::Pending,
+                    ),
+                    (
+                        "Send the screenshot".into(),
+                        crate::plans::StepStatus::Pending,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        let hub = Arc::new(CardHub::default());
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(child).with_state(state);
+        tool.set_hub(Arc::downgrade(&router));
+        tool.set_plan_store(plans.clone());
+        let args = json!({
+            "mission": "Setup",
+            "task": "Resume it",
+            "background": true,
+            "checklist_items": [1, 2]
+        })
+        .to_string();
+        let mut call_facts = facts();
+        call_facts.task_id = Some("task-synthetic".to_string());
+
+        tool.call_with_execution_context(&args, None, call_facts)
+            .await
+            .unwrap();
+        let running = plans.get_recent_for_session(session, 1).await.unwrap();
+        let running = running[0].render_compact_checklist();
+        assert!(
+            running.starts_with("⏳ Continuing in the background · 1 of 3 done"),
+            "{running}"
+        );
+        assert!(running.contains("⏳ Send the screenshot (running in the background)"));
+
+        let card = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some((id, text)) = hub.edits.lock().unwrap().last().cloned() {
+                    assert_eq!(id, "card-1", "the turn's card is edited in place");
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the card is updated when the child ends");
+        let plan = plans
+            .get_recent_for_session(session, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        (card, plan)
+    }
+
+    /// A child that finishes its work moves the steps it was given to done
+    /// on the card, from the typed launch, not from what anyone wrote.
+    #[tokio::test]
+    async fn finished_background_child_marks_its_steps_done() {
+        let child = ScriptedChild::new("set up", Duration::from_millis(200));
+        let (card, plan) = background_card_after(&child).await;
+        assert!(card.starts_with("✅ Done · 3 of 3 steps"), "{card}");
+        assert!(plan
+            .steps
+            .iter()
+            .all(|step| step.status == crate::plans::StepStatus::Completed));
+    }
+
+    /// A child that fails marks its steps failed, never done.
+    #[tokio::test]
+    async fn failed_background_child_marks_its_steps_failed() {
+        let child = ScriptedChild::new("unused", Duration::from_millis(200));
+        *child.failure.lock().unwrap() = Some(anyhow::anyhow!("synthetic failure"));
+        let (card, plan) = background_card_after(&child).await;
+        assert!(card.starts_with("❌ Stopped · 1 of 3 done"), "{card}");
+        assert!(
+            card.contains("Resume the first setup (needs attention)"),
+            "{card}"
+        );
+        assert_eq!(plan.steps[1].status, crate::plans::StepStatus::Failed);
+        assert_eq!(plan.steps[2].status, crate::plans::StepStatus::Failed);
     }
 
     /// A background job reports when it has something to report: its result.

@@ -81,6 +81,7 @@ pub async fn wire_hub_cycles(
     // Give the spawn tool a reference to the hub for background mode notifications.
     if let Some(st) = spawn_tool {
         st.set_hub(Arc::downgrade(&outbound));
+        st.set_plan_store(plan_store.clone());
     }
 
     // Give terminal a reference to the hub so background command progress/completion
