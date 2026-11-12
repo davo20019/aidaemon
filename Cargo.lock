@@ -527,6 +527,8 @@ dependencies = [
 name = "aidaemon-work"
 version = "0.1.0"
 dependencies = [
+ "aidaemon-channels",
+ "aidaemon-core",
  "aidaemon-events",
  "aidaemon-tools",
  "anyhow",

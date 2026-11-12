@@ -1,8 +1,7 @@
 //! The store traits, re-exported from the crates that own them, plus what
 //! the app assembles for itself: the `StateStore` facade over every slice,
-//! and the composites that span crates for tools still in `src/`
-//! (`MandateToolStore`: work + channel routing, moves with the mandate tools
-//! in 9.3; `SkillsStore`: memory + settings, moves with skills in 9.6). The
+//! and the composite that spans crates for a tool still in `src/`
+//! (`SkillsStore`: memory + settings, moves with skills in 9.6). The
 //! database liveness probe (`HealthCheckStore`) serves the daemon's own
 //! heartbeat.
 
@@ -31,31 +30,6 @@ pub trait HealthCheckStore: Send + Sync {
     async fn health_check(&self) -> anyhow::Result<()> {
         Ok(())
     }
-}
-
-/// Focused persistence contract used by mandate management. Includes the
-/// schedule and scheduled-run lifecycle so the mandate surface can project
-/// its controller goal's authoritative objective status.
-pub trait MandateToolStore:
-    MandateStore
-    + GoalStore
-    + WorkCoordinationStore
-    + SessionChannelStore
-    + GoalBudgetStore
-    + GoalScheduleStore
-    + ScheduledRunStore
-{
-}
-
-impl<T> MandateToolStore for T where
-    T: MandateStore
-        + GoalStore
-        + WorkCoordinationStore
-        + SessionChannelStore
-        + GoalBudgetStore
-        + GoalScheduleStore
-        + ScheduledRunStore
-{
 }
 
 /// Focused persistence contract used by skill startup and management.

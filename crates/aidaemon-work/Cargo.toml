@@ -23,6 +23,8 @@ publish = false
 testing = ["aidaemon-events/testing"]
 
 [dependencies]
+aidaemon-channels = { version = "0.1.0", path = "../aidaemon-channels" }
+aidaemon-core = { version = "0.1.0", path = "../aidaemon-core" }
 aidaemon-events = { version = "0.1.0", path = "../aidaemon-events" }
 aidaemon-tools = { version = "0.1.0", path = "../aidaemon-tools" }
 anyhow = "1"

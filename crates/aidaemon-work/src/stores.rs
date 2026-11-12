@@ -1058,6 +1058,31 @@ pub trait NotificationStore: Send + Sync {
     }
 }
 
+/// Focused persistence contract used by mandate management. Includes the
+/// schedule and scheduled-run lifecycle so the mandate surface can project
+/// its controller goal's authoritative objective status.
+pub trait MandateToolStore:
+    MandateStore
+    + GoalStore
+    + WorkCoordinationStore
+    + aidaemon_channels::hub::SessionChannelStore
+    + GoalBudgetStore
+    + GoalScheduleStore
+    + ScheduledRunStore
+{
+}
+
+impl<T> MandateToolStore for T where
+    T: MandateStore
+        + GoalStore
+        + WorkCoordinationStore
+        + aidaemon_channels::hub::SessionChannelStore
+        + GoalBudgetStore
+        + GoalScheduleStore
+        + ScheduledRunStore
+{
+}
+
 /// Focused persistence contract used by goal-trace tooling.
 pub trait GoalTraceStore:
     GoalStore + GoalScheduleStore + MandateStore + TaskStore + WorkCoordinationStore + ScheduledRunStore

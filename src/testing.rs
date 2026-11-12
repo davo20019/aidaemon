@@ -839,7 +839,9 @@ async fn setup_test_agent_internal(
             crate::tools::ManageMandatesTool::new(
                 state.clone() as Arc<dyn crate::traits::StateStore>
             )
-            .with_skills_dir(Some(skills_dir.path().to_path_buf())),
+            .with_strategy_skills(Some(
+                crate::tools::manage_mandates::strategy_skills_dir(skills_dir.path().to_path_buf()),
+            )),
         ));
     }
     tools.extend(extra_tools);

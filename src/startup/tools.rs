@@ -1209,12 +1209,14 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::ManageMandates => BuiltBaseTool {
-            tool: Arc::new(ManageMandatesTool::new(state).with_skills_dir(
+            tool: Arc::new(ManageMandatesTool::new(state).with_strategy_skills(
                 config.skills.enabled.then(|| {
-                    config_path
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."))
-                        .join(&config.skills.dir)
+                    crate::tools::manage_mandates::strategy_skills_dir(
+                        config_path
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .join(&config.skills.dir),
+                    )
                 }),
             )),
             terminal_tool: None,

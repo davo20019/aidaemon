@@ -21,7 +21,7 @@ pub(crate) use file_policy::{guarded_call, guarded_call_protecting};
 mod goal_trace;
 mod health_probe;
 pub mod image_generation;
-mod manage_mandates;
+pub(crate) mod manage_mandates;
 mod manage_memories;
 pub(crate) mod objective_status;
 pub(crate) use aidaemon_tools::owner_answers;
@@ -129,3 +129,5 @@ mod execution_backend_injection_tests;
 mod schema_golden_tests;
 #[cfg(test)]
 mod schema_lint_tests;
+#[cfg(test)]
+mod work_schema_golden_tests;
