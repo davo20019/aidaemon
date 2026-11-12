@@ -828,6 +828,7 @@ impl ManageApiTool {
         let mut warnings = auth.warnings;
         warnings.extend(probe.warnings);
         aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!("{}\n{}", auth.summary, probe.summary),
             subject: format!("{}\n{}", auth.subject, probe.subject),
@@ -852,6 +853,7 @@ impl ManageApiTool {
         let service = args.service.as_deref().unwrap_or_default();
         let subject = format!("manage_api probe POST {source}");
         Some(aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!(
                 "{subject}\nThe live probe may POST a GraphQL introspection query to the \

@@ -482,6 +482,7 @@ impl ManageHttpAuthTool {
         plan: &UpsertPlan,
     ) -> aidaemon_core::OwnerApprovalRequest {
         aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!(
                 "Update manual API auth profile '{}' (type={}, domains={}, user_id={})",
@@ -513,6 +514,7 @@ impl ManageHttpAuthTool {
 
     fn remove_request(profile_name: &str) -> aidaemon_core::OwnerApprovalRequest {
         aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!(
                 "Remove manual API auth profile '{}' and delete its stored credentials",

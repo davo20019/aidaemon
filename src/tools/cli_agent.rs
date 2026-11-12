@@ -1380,6 +1380,7 @@ impl CliAgentTool {
                 .to_string(),
         ];
         aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: vec![aidaemon_core::EffectKey::named(
                 aidaemon_core::EffectClass::Process,
                 &format!("cli_agent:{tool_name}"),

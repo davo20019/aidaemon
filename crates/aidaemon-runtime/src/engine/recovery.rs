@@ -297,6 +297,7 @@ mod tests {
             "a verifier check is not the owner's"
         );
         let owner = sdk::InterruptKind::OwnerApproval(sdk::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: "Open a site".to_string(),
             subject: "browser".to_string(),

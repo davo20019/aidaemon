@@ -64,6 +64,14 @@ pub(crate) fn render_html(md: &str) -> String {
             if i < lines.len() {
                 i += 1; // closing fence
             }
+            // Content a card shows collapsed (`approval_render::COLLAPSED_FENCE`):
+            // an expandable quote, plain text, no code styling.
+            if lang == aidaemon_channels::approval_render::COLLAPSED_FENCE {
+                out.push_str("<blockquote expandable>");
+                out.push_str(&html_escape(&code));
+                out.push_str("</blockquote>\n");
+                continue;
+            }
             if lang.is_empty() {
                 out.push_str("<pre><code>");
             } else {

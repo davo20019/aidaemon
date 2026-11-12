@@ -1193,6 +1193,7 @@ impl ComputerUseTool {
                     label.clone()
                 };
                 aidaemon_core::OwnerApprovalRequest {
+                    card: None,
                     effects: Vec::new(),
                     summary,
                     subject: consequential_subject(bundle_id, label, args),
@@ -1203,6 +1204,7 @@ impl ComputerUseTool {
             None => {
                 let (subject, _) = app_ask.as_ref()?;
                 aidaemon_core::OwnerApprovalRequest {
+                    card: None,
                     effects: Vec::new(),
                     summary: format!("Allow aidaemon to inspect and control {app_label}?"),
                     subject: subject.clone(),

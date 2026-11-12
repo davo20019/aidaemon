@@ -4631,6 +4631,7 @@ async fn a_new_message_never_gets_the_card_of_a_run_that_was_cut_off() {
             reason: "needs the owner".to_string(),
             kind: aidaemon_core::InterruptKind::OwnerApproval(
                 aidaemon_core::OwnerApprovalRequest {
+                    card: None,
                     effects: Vec::new(),
                     summary: "Summarize the forecast each Monday".to_string(),
                     subject: "goal".to_string(),

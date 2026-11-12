@@ -704,6 +704,18 @@ impl HubChannel for DiscordBot {
             .map_err(|e| anyhow::anyhow!("Discord approval request failed: {e}"))
     }
 
+    async fn request_approval_ask(
+        &self,
+        session_id: &str,
+        ask: &aidaemon_channels::approval_render::ApprovalAsk<'_>,
+    ) -> anyhow::Result<ApprovalResponse> {
+        let conversation = self.conversation_for(session_id).await?;
+        self.prompts
+            .approval_ask(self.transport(), &conversation, ask)
+            .await
+            .map_err(|e| anyhow::anyhow!("Discord approval request failed: {e}"))
+    }
+
     async fn request_goal_confirmation(
         &self,
         session_id: &str,

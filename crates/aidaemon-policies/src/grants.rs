@@ -61,6 +61,7 @@ mod tests {
 
     fn req(subject: &str, effects: Vec<EffectKey>) -> OwnerApprovalRequest {
         OwnerApprovalRequest {
+            card: None,
             effects,
             summary: format!("Run {subject} for Jordan Lee"),
             subject: subject.to_string(),

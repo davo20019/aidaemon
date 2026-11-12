@@ -339,6 +339,7 @@ fn call_request(
         format!("{tool_name} {arguments}")
     };
     OwnerApprovalRequest {
+        card: None,
         effects: info.effects.keys.clone(),
         summary: format!("Run {subject}: {why}"),
         subject,
@@ -660,6 +661,7 @@ mod rules_tests {
 
     fn request() -> OwnerApprovalRequest {
         OwnerApprovalRequest {
+            card: None,
             // The policy replaces these with the call's declared effects.
             effects: Vec::new(),
             summary: "Post a report for Alice Rivera to h.example.invalid".to_string(),

@@ -766,6 +766,114 @@ pub fn program_label(command: &str) -> String {
         .map_or_else(|| "a command".to_string(), str::to_string)
 }
 
+/// The approval card for running `line`, from its structure: the folders
+/// it only looks inside, and the one effect worth a warning (deleting,
+/// with the targets when they can be read, or sending a write to a
+/// service). `title` is the call's own few words for itself.
+pub fn command_card(line: &str, title: Option<String>) -> aidaemon_core::ApprovalCard {
+    let effects = command_effects(line);
+    let impact = if effects.deletes {
+        Some(aidaemon_core::HighImpact::Deletes {
+            targets: effects.delete_targets.unwrap_or_default(),
+        })
+    } else if sends_remote_write(line) {
+        Some(aidaemon_core::HighImpact::Sends)
+    } else {
+        None
+    };
+    aidaemon_core::ApprovalCard {
+        impact,
+        ..aidaemon_core::ApprovalCard::new(aidaemon_core::CardAction::Command {
+            line: line.to_string(),
+            title,
+            looks_inside: looked_inside(line),
+        })
+    }
+}
+
+/// Programs that list or describe folders, whose operands name the folders
+/// they look inside.
+const FOLDER_LISTERS: &[&str] = &["ls", "tree", "du", "find", "stat"];
+
+/// The folders a read-only command looks inside, by name, for the owner's
+/// card ("look inside your claude-drupal and claude-wordpress folders").
+/// Empty unless every command only reads or reports on this computer
+/// (observations, `cd`, a local `ddev` project's own query) and writes no
+/// file. Each listing command's operand (`ls`, `tree`, `du`, `find`,
+/// `stat`, a loop's words bound) counts once, by its first component when
+/// relative and its last when absolute; `.`, `..`, home and anything still
+/// holding a variable or a glob are left out.
+pub fn looked_inside(command: &str) -> Vec<String> {
+    if command_effects(command).deletes || scan(command).writes_file {
+        return Vec::new();
+    }
+    let folders = std::cell::RefCell::new(Vec::<String>::new());
+    let reads_only = every_segment(command, &|program, args| {
+        let ok = match program {
+            "cd" => true,
+            "ddev" => ddev_query_ok(args),
+            _ => OBSERVATION_PROGRAMS.contains(&program) && observation_args_ok(program, args),
+        };
+        if ok && FOLDER_LISTERS.contains(&program) {
+            let mut folders = folders.borrow_mut();
+            for operand in lister_operands(program, args) {
+                if let Some(name) = folder_name(operand) {
+                    if !folders.contains(&name) {
+                        folders.push(name);
+                    }
+                }
+            }
+        }
+        ok
+    });
+    if reads_only {
+        folders.into_inner()
+    } else {
+        Vec::new()
+    }
+}
+
+/// A listing command's path operands: its non-option arguments (`find`:
+/// those before its expression), skipping the values of `tree`'s `-L`,
+/// `-I` and `-P` and `du`'s `-d`.
+fn lister_operands<'a>(program: &str, args: &'a [String]) -> Vec<&'a str> {
+    let mut operands = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if program == "find" && (arg.starts_with('-') || matches!(arg.as_str(), "(" | "!")) {
+            break;
+        }
+        if matches!(
+            (program, arg.as_str()),
+            ("tree", "-L" | "-I" | "-P") | ("du", "-d")
+        ) {
+            iter.next();
+            continue;
+        }
+        if !arg.starts_with('-') {
+            operands.push(arg.as_str());
+        }
+    }
+    operands
+}
+
+/// A folder's name as the owner knows it, from an operand.
+fn folder_name(operand: &str) -> Option<String> {
+    let path = operand.trim_end_matches('/');
+    if path.is_empty()
+        || path.starts_with('~')
+        || path.chars().any(|c| matches!(c, '$' | '*' | '?' | '[' | '{'))
+    {
+        return None;
+    }
+    let name = if path.starts_with('/') {
+        path.rsplit('/').next()?
+    } else {
+        path.split('/').find(|part| !part.is_empty() && *part != ".")?
+    };
+    (!matches!(name, "" | "." | "..")).then(|| name.to_string())
+}
+
 /// `ddev` subcommands whose output is ddev's own report of a local project,
 /// with the addresses it serves the project on.
 const DDEV_PROJECT_REPORTS: &[&str] = &[
@@ -3721,6 +3829,50 @@ mod tests {
             assert!(!effects.observation_only, "{not_understood}");
             assert!(!effects.local_work_only, "{not_understood}");
         }
+    }
+
+    /// The card names the folders a read-only command looks inside; a
+    /// command that also deletes, writes or runs anything else names none.
+    #[test]
+    fn the_folders_a_read_only_command_looks_inside_are_named() {
+        assert_eq!(
+            looked_inside(INSPECT_SITES),
+            ["claude-drupal", "claude-wordpress"]
+        );
+        assert_eq!(looked_inside("ls -la /srv/www/shop/ && du -sh logs/2026"), ["shop", "logs"]);
+        assert_eq!(looked_inside("tree -L 2 src && find app -name '*.php'"), ["src", "app"]);
+        assert!(looked_inside("ls ~ . .. $HOME *.txt").is_empty());
+        assert!(looked_inside("cat notes.txt").is_empty());
+        for not_only_looking in [
+            INSPECT_SITES.replace("ls -la $d | head -30", "rm -rf $d"),
+            INSPECT_SITES.replace("ls -la $d | head -30", "ls -la $d > notes.txt"),
+            "ls site && curl -s http://localhost:5173/".to_string(),
+            "ls site && cargo build".to_string(),
+        ] {
+            assert!(looked_inside(&not_only_looking).is_empty(), "{not_only_looking}");
+        }
+    }
+
+    #[test]
+    fn a_command_card_carries_its_typed_effects() {
+        use aidaemon_core::{CardAction, HighImpact};
+        let card = command_card(INSPECT_SITES, Some("check the site folders".to_string()));
+        assert_eq!(card.impact, None);
+        assert!(matches!(
+            &card.action,
+            CardAction::Command { looks_inside, title: Some(_), line }
+                if looks_inside.len() == 2 && line == INSPECT_SITES
+        ));
+        assert_eq!(
+            command_card("rm -rf build dist", None).impact,
+            Some(HighImpact::Deletes {
+                targets: vec!["build".to_string(), "dist".to_string()]
+            })
+        );
+        assert_eq!(
+            command_card("curl -X POST https://example.invalid/hook", None).impact,
+            Some(HighImpact::Sends)
+        );
     }
 
     #[test]

@@ -429,6 +429,7 @@ mod tests {
         let key = crate::EffectKey::named(crate::EffectClass::Call, "send");
         let r = Fixed(Resolution::OwnerDeclined {
             request: crate::OwnerApprovalRequest {
+                card: None,
                 effects: vec![key.clone()],
                 summary: "send".into(),
                 subject: "send".into(),

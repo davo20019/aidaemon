@@ -112,17 +112,40 @@ impl Prompts {
         permission_mode: PermissionMode,
         one_time_only: bool,
     ) -> anyhow::Result<ApprovalResponse> {
+        self.approval_ask(
+            channel,
+            conversation,
+            &approval_render::ApprovalAsk {
+                command,
+                card: None,
+                risk_level,
+                warnings,
+                permission_mode,
+                one_time_only,
+            },
+        )
+        .await
+    }
+
+    /// Ask for `ask`, rendered from its typed card when it has one; waits up
+    /// to five minutes. A timeout, a failed send or a closed prompt is an
+    /// error (and declines).
+    pub async fn approval_ask(
+        &self,
+        channel: Arc<dyn Channel>,
+        conversation: &Conversation,
+        ask: &approval_render::ApprovalAsk<'_>,
+    ) -> anyhow::Result<ApprovalResponse> {
         let session_button =
-            approval_render::approval_use_session_button(permission_mode, risk_level);
-        let choices = approval_choices(session_button, one_time_only);
-        let text = approval_render::build_approval_message_markdown(
-            command,
-            risk_level,
-            warnings,
-            session_button,
-            one_time_only,
+            approval_render::approval_use_session_button(ask.permission_mode, ask.risk_level);
+        let choices = approval_choices(session_button, ask.one_time_only);
+        let text = approval_render::build_approval_ask_markdown(ask);
+        info!(
+            risk = %ask.risk_level,
+            mode = %ask.permission_mode,
+            card = ask.card.is_some(),
+            "Asking for an approval"
         );
-        info!(risk = %risk_level, mode = %permission_mode, "Asking for an approval");
         self.ask(
             channel,
             conversation,
@@ -265,15 +288,16 @@ impl Prompts {
     }
 }
 
-/// Allow once, then (unless the grant is one-time only) for the session or
-/// always, then deny.
+/// Allow (this once), then (unless the grant is one-time only) until a
+/// restart or always, then deny. The labels say what each grant lasts, so
+/// the card needs no footer explaining them.
 fn approval_choices(session_button: bool, one_time_only: bool) -> Vec<ApprovalChoice> {
-    let mut choices = vec![choice("once", "Allow Once")];
+    let mut choices = vec![choice("once", "Allow")];
     if !one_time_only {
         choices.push(if session_button {
-            choice("session", "Allow Session")
+            choice("session", "Allow until restart")
         } else {
-            choice("always", "Allow Always")
+            choice("always", "Always allow")
         });
     }
     choices.push(choice("deny", "Deny"));
@@ -400,14 +424,14 @@ mod tests {
     fn approval_buttons_follow_the_grant_offered() {
         assert_eq!(
             labels(approval_choices(false, false)),
-            ["Allow Once", "Allow Always", "Deny"]
+            ["Allow", "Always allow", "Deny"]
         );
         assert_eq!(
             labels(approval_choices(true, false)),
-            ["Allow Once", "Allow Session", "Deny"]
+            ["Allow", "Allow until restart", "Deny"]
         );
         // A one-time grant offers nothing that persists.
-        assert_eq!(labels(approval_choices(true, true)), ["Allow Once", "Deny"]);
+        assert_eq!(labels(approval_choices(true, true)), ["Allow", "Deny"]);
     }
 
     #[test]

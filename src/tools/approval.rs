@@ -56,6 +56,7 @@ mod tests {
 
         broker
             .send(ApprovalRequest {
+                card: None,
                 command: "deploy release-42".to_string(),
                 session_id: "session-approval".to_string(),
                 risk_level: RiskLevel::High,
@@ -106,6 +107,7 @@ mod tests {
 
         let result = broker
             .send(ApprovalRequest {
+                card: None,
                 command: "deploy release-42".to_string(),
                 session_id: "session-approval".to_string(),
                 risk_level: RiskLevel::High,
@@ -133,6 +135,7 @@ mod tests {
 
         broker
             .send(ApprovalRequest {
+                card: None,
                 command: "deploy release-42".to_string(),
                 session_id: "session-approval".to_string(),
                 risk_level: RiskLevel::High,
@@ -225,6 +228,7 @@ mod tests {
 
         broker
             .send(ApprovalRequest {
+                card: None,
                 command: "activate a goal".to_string(),
                 session_id: "session-abandoned".to_string(),
                 risk_level: RiskLevel::High,

@@ -5069,6 +5069,20 @@ async fn local_site_card_lets_the_session_open_that_site_only() {
     );
 }
 
+/// The local-site card's typed facts name the site and how long a one-time
+/// answer lasts, so every channel renders the same plain card.
+#[test]
+fn local_site_card_carries_typed_facts() {
+    let request = super::local_site_request("claude-wordpress.ddev.site");
+    assert_eq!(
+        request.card.expect("typed card").action,
+        aidaemon_core::CardAction::OpenLocalSite {
+            site: "claude-wordpress.ddev.site".to_string(),
+            once_minutes: super::LOCAL_SITE_ONCE.as_secs() / 60,
+        }
+    );
+}
+
 /// A site the work set up itself (or the owner's request named) is part of
 /// what was asked: no card. Another chat's work still asks.
 #[tokio::test]

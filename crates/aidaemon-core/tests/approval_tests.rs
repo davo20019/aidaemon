@@ -32,6 +32,7 @@ fn egress_key() -> EffectKey {
 
 fn owner_request(effects: Vec<EffectKey>) -> OwnerApprovalRequest {
     OwnerApprovalRequest {
+        card: None,
         effects,
         summary: "Send a report to h.example.invalid for Alice Rivera".to_string(),
         subject: "POST https://h.example.invalid/report".to_string(),

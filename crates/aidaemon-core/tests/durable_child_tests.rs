@@ -47,6 +47,7 @@ impl Hook for AskBeforeSend {
         ToolDecision::Interrupt {
             reason: "the owner must confirm this send".to_string(),
             kind: InterruptKind::OwnerApproval(OwnerApprovalRequest {
+                card: None,
                 effects: vec![egress()],
                 summary: "Send a report for Alice Rivera".to_string(),
                 subject: "POST https://h.example.invalid/report".to_string(),

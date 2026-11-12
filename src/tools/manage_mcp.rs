@@ -47,6 +47,7 @@ impl ManageMcpTool {
             return OwnerApprovalNeed::NotNeeded;
         }
         OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!("Add MCP server '{name}' ({command} {})", args.args.join(" ")),
             // The exact arguments the owner approves; a changed argument is a new card.
@@ -103,6 +104,7 @@ impl ManageMcpTool {
             "Start"
         };
         OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!("{verb} MCP server '{name}' ({command} {})", args.join(" ")),
             subject: json!({"action": action, "name": name, "command": command, "args": args})

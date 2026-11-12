@@ -70,6 +70,7 @@ impl ScheduledGoalPlan {
             card.details.push(format!("Name: {name}"));
         }
         aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: self.desc.clone(),
             subject: self.subject.clone(),

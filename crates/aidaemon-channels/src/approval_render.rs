@@ -4,6 +4,7 @@
 //! and scheduled-goal-confirmation prompts.
 
 use crate::split::split_message;
+use aidaemon_core::{ApprovalCard, AskReason, CardAction, HighImpact};
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
 use aidaemon_tools::semantics::{ApprovalResponse, GoalConfirmationStyle};
 
@@ -47,17 +48,6 @@ pub fn risk_header(risk_level: RiskLevel) -> (&'static str, &'static str, &'stat
             "Dangerous action",
             "Review carefully before allowing.",
         ),
-    }
-}
-
-/// Hint text explaining what the persistent-approval button does.
-pub fn allow_button_hint(use_session_button: bool, one_time_only: bool) -> &'static str {
-    if one_time_only {
-        "This approval applies only to this action; you will be asked again for another sensitive action."
-    } else if use_session_button {
-        "\"Allow Session\" means you won't be asked again until the daemon restarts."
-    } else {
-        "\"Allow Always\" means you won't be asked again for this type of action."
     }
 }
 
@@ -129,13 +119,12 @@ fn truncate_command(command: &str) -> String {
     }
 }
 
-/// Build the Markdown body for a command-approval prompt.
+/// Build the Markdown body for a command-approval prompt without typed card
+/// facts: the risk header, the action in a code block and the warnings.
 pub fn build_approval_message_markdown(
     command: &str,
     risk_level: RiskLevel,
     warnings: &[String],
-    use_session_button: bool,
-    one_time_only: bool,
 ) -> String {
     let display_cmd = truncate_command(command);
     let (risk_icon, risk_label, risk_subtitle) = risk_header(risk_level);
@@ -151,13 +140,228 @@ pub fn build_approval_message_markdown(
             text.push_str(&format!("\n• {warning}"));
         }
     }
-
-    text.push_str(&format!(
-        "\n\n*{}*",
-        allow_button_hint(use_session_button, one_time_only)
-    ));
-
     text
+}
+
+/// One approval to ask for: the request as the channel received it, and
+/// its card's typed facts when the asker gave them.
+#[derive(Debug, Clone, Copy)]
+pub struct ApprovalAsk<'a> {
+    /// The request's summary (what a channel without card rendering shows).
+    pub command: &'a str,
+    pub card: Option<&'a ApprovalCard>,
+    pub risk_level: RiskLevel,
+    pub warnings: &'a [String],
+    pub permission_mode: PermissionMode,
+    /// The grant covers this call only: no session or lasting choice.
+    pub one_time_only: bool,
+}
+
+/// The info string of a fenced block whose content a channel shows
+/// collapsed (Telegram: an expandable blockquote). Channels without it show
+/// an ordinary code block.
+pub const COLLAPSED_FENCE: &str = "details";
+
+/// How much of a command the collapsed block keeps: its head and tail
+/// around a marked cut.
+const CARD_COMMAND_CHARS: usize = 1_200;
+
+/// Build an approval prompt's Markdown: the typed card when there is one,
+/// else the summary and warnings as they are.
+pub fn build_approval_ask_markdown(ask: &ApprovalAsk<'_>) -> String {
+    match ask.card {
+        Some(card) => build_card_markdown(card, ask.risk_level, ask.warnings),
+        None => build_approval_message_markdown(ask.command, ask.risk_level, ask.warnings),
+    }
+}
+
+/// A card from typed facts: a warning only for a high-impact effect, one
+/// plain sentence saying what will happen, one line on why the owner is
+/// asked, and the exact command (with any notes) collapsed underneath.
+pub fn build_card_markdown(card: &ApprovalCard, risk: RiskLevel, notes: &[String]) -> String {
+    let mut lines = Vec::new();
+    if let Some(warning) = impact_warning(card.impact.as_ref(), risk) {
+        lines.push(warning);
+    }
+    lines.push(format!("**{}**", card_headline(card)));
+    if let Some(why) = card_why(card) {
+        lines.push(why);
+    }
+    let mut text = lines.join("\n");
+    let detail = match &card.action {
+        CardAction::Command { line, .. } => Some(shorten_middle(line, CARD_COMMAND_CHARS)),
+        CardAction::Use { detail, .. } => detail
+            .as_deref()
+            .map(|detail| shorten_middle(detail, CARD_COMMAND_CHARS)),
+        _ => None,
+    };
+    let notes: Vec<&str> = notes
+        .iter()
+        .map(|note| note.trim())
+        .filter(|note| !note.is_empty())
+        .collect();
+    if detail.is_some() || !notes.is_empty() {
+        let mut block = detail.unwrap_or_default();
+        for note in notes {
+            if !block.is_empty() {
+                block.push_str("\n\n");
+            }
+            block.push_str(note);
+        }
+        // A fence inside the content would end the block early.
+        let block = block.replace("```", "'''");
+        text.push_str(&format!("\n\n```{COLLAPSED_FENCE}\n{block}\n```"));
+    }
+    text
+}
+
+/// The warning lines a channel without card rendering shows: the ask's
+/// own, then the card's facts its summary does not carry (the effect, the
+/// check's sentence, the exact command).
+pub fn card_as_warnings(ask: &ApprovalAsk<'_>) -> Vec<String> {
+    let mut warnings = ask.warnings.to_vec();
+    let Some(card) = ask.card else {
+        return warnings;
+    };
+    if let Some(warning) = impact_warning(card.impact.as_ref(), ask.risk_level) {
+        warnings.push(warning.trim_start_matches("⚠️ ").replace("**", ""));
+    }
+    if let Some(AskReason::ReadOutsideContent {
+        check_says: Some(says),
+    }) = &card.reason
+    {
+        warnings.push(format!("Safety check: {says}"));
+    }
+    match &card.action {
+        CardAction::Command { line, .. } => {
+            warnings.push(format!(
+                "Details: {}",
+                shorten_middle(line, CARD_COMMAND_CHARS)
+            ));
+        }
+        CardAction::Use {
+            detail: Some(detail),
+            ..
+        } => warnings.push(format!(
+            "Details: {}",
+            shorten_middle(detail, CARD_COMMAND_CHARS)
+        )),
+        _ => {}
+    }
+    warnings
+}
+
+/// `text` with its middle cut at a marker when longer than `cap` chars.
+fn shorten_middle(text: &str, cap: usize) -> String {
+    let length = text.chars().count();
+    if length <= cap {
+        return text.to_string();
+    }
+    let tail_chars = cap / 4;
+    let head: String = text.chars().take(cap - tail_chars).collect();
+    let tail: String = text.chars().skip(length - tail_chars).collect();
+    format!("{head} … ({} characters left out) … {tail}", length - cap)
+}
+
+/// The warning line, only for an effect worth one: deleting, sending,
+/// spending or writing outside the work area, named. A critical request
+/// with no named effect gets a plain caution; ordinary work gets none.
+fn impact_warning(impact: Option<&HighImpact>, risk: RiskLevel) -> Option<String> {
+    let line = match impact {
+        Some(HighImpact::Deletes { targets }) if !targets.is_empty() => {
+            format!("This deletes {}.", plain_list(targets, 3))
+        }
+        Some(HighImpact::Deletes { .. }) => "This deletes files.".to_string(),
+        Some(HighImpact::Sends) => "This sends something to another service.".to_string(),
+        Some(HighImpact::Spends) => "This spends money.".to_string(),
+        Some(HighImpact::WritesOutsideWorkArea) => {
+            "This writes outside your work area.".to_string()
+        }
+        Some(_) => "This has effects beyond your computer.".to_string(),
+        None if risk >= RiskLevel::Critical => {
+            "This can change a lot on your computer.".to_string()
+        }
+        None => return None,
+    };
+    Some(format!("⚠️ **{line}**"))
+}
+
+/// "a", "a and b", "a, b and c", "a, b, c and 2 more".
+fn plain_list(items: &[String], shown: usize) -> String {
+    let named: Vec<&str> = items.iter().take(shown).map(String::as_str).collect();
+    let more = items.len().saturating_sub(shown);
+    match (named.split_last(), more) {
+        (None, _) => String::new(),
+        (Some((last, [])), 0) => (*last).to_string(),
+        (Some((last, rest)), 0) => format!("{} and {last}", rest.join(", ")),
+        (Some(_), more) => format!("{} and {more} more", named.join(", ")),
+    }
+}
+
+/// What will happen, in one sentence that names who asks.
+pub fn card_headline(card: &ApprovalCard) -> String {
+    let who = card
+        .asked_by
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Your assistant");
+    let what = match &card.action {
+        CardAction::Command {
+            looks_inside,
+            title,
+            ..
+        } => {
+            let title = title
+                .as_deref()
+                .map(|title| title.trim().trim_end_matches(['.', ':']))
+                .filter(|title| !title.is_empty());
+            if !looks_inside.is_empty() {
+                let noun = if looks_inside.len() == 1 {
+                    "folder"
+                } else {
+                    "folders"
+                };
+                format!("look inside your {} {noun}", plain_list(looks_inside, 3))
+            } else if let Some(title) = title {
+                format!("run a command on your computer: {title}")
+            } else {
+                "run a command on your computer".to_string()
+            }
+        }
+        CardAction::OpenLocalSite { site, .. } => {
+            format!("open {site} in the browser, a site on this computer")
+        }
+        CardAction::Use { what, .. } => what.trim().trim_end_matches('.').to_string(),
+        _ => "do something that needs your OK".to_string(),
+    };
+    format!("{who} wants to {what}.")
+}
+
+/// Why the owner is asked, in a line or two.
+fn card_why(card: &ApprovalCard) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Some(AskReason::ReadOutsideContent { check_says }) = &card.reason {
+        lines.push(
+            "It read content from outside, like a web page, so I'm checking with you \
+             before it runs this."
+                .to_string(),
+        );
+        if let Some(says) = check_says
+            .as_deref()
+            .map(str::trim)
+            .filter(|says| !says.is_empty())
+        {
+            lines.push(format!("_Safety check: {says}_"));
+        }
+    }
+    if let CardAction::OpenLocalSite { once_minutes, .. } = &card.action {
+        lines.push(format!(
+            "Allow only if you asked for it. Allow covers the next {once_minutes} minutes; \
+             the longer choice lasts until this browser session ends."
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 fn goal_detail_section(detail: &str) -> (&'static str, &str) {
@@ -332,35 +536,195 @@ mod tests {
             "Open website: https://example.com",
             RiskLevel::Medium,
             &[],
-            false,
-            false,
         );
         let final_msg = finalize_approval_message(&prompt, &ApprovalResponse::AllowAlways);
-        assert!(!final_msg.contains("Allow Always\" means"));
         assert!(final_msg.contains("Always allowed"));
         assert!(final_msg.contains("won't be asked again"));
         assert!(final_msg.contains("Open website"));
+        // A card sent before footers were dropped still loses its footer.
+        let old = format!("{prompt}\n\n*\"Allow Always\" means you won't be asked again.*");
+        let final_msg = finalize_approval_message(&old, &ApprovalResponse::Deny);
+        assert!(!final_msg.contains("Allow Always\" means"), "{final_msg}");
     }
 
     #[test]
     fn finalize_denied_shows_denied_status() {
-        let prompt =
-            build_approval_message_markdown("rm -rf /", RiskLevel::Critical, &[], true, false);
+        let prompt = build_approval_message_markdown("rm -rf /", RiskLevel::Critical, &[]);
         let final_msg = finalize_approval_message(&prompt, &ApprovalResponse::Deny);
         assert!(final_msg.contains("❌ Denied"));
     }
 
+    const INSPECT: &str = "cd /Users/davidloor/projects && for d in claude-drupal \
+        claude-wordpress; do echo \"== $d\"; ls -la $d | head -30; ls $d/.ddev 2>&1 | head; \
+        (cd $d && ddev describe 2>&1 | head -25); done";
+
+    fn ask<'a>(card: &'a ApprovalCard, risk: RiskLevel, warnings: &'a [String]) -> String {
+        build_approval_ask_markdown(&ApprovalAsk {
+            command: "summary a channel without cards would show",
+            card: Some(card),
+            risk_level: risk,
+            warnings,
+            permission_mode: PermissionMode::Default,
+            one_time_only: true,
+        })
+    }
+
+    /// The screenshot's card (live 2026-11-12), redone: a helper looking
+    /// inside two folders gets one plain sentence, one line on why, the
+    /// check's own short sentence, and the command collapsed below. No
+    /// warning, no prose in a code block, no footer.
     #[test]
-    fn one_time_only_prompt_has_no_persistent_choice() {
-        let prompt = build_approval_message_markdown(
-            "Run JavaScript on https://example.com (10 bytes)",
-            RiskLevel::High,
-            &[],
-            false,
-            true,
+    fn a_low_risk_read_only_card_says_what_happens_without_alarm() {
+        let card = ApprovalCard {
+            asked_by: Some("Drupal install".to_string()),
+            action: CardAction::Command {
+                line: INSPECT.to_string(),
+                title: Some("check claude site dirs and docker".to_string()),
+                looks_inside: vec!["claude-drupal".to_string(), "claude-wordpress".to_string()],
+            },
+            reason: Some(AskReason::ReadOutsideContent {
+                check_says: Some(
+                    "Looking inside these folders doesn't look needed to install Drupal."
+                        .to_string(),
+                ),
+            }),
+            impact: None,
+        };
+        let text = ask(&card, RiskLevel::High, &[]);
+        let expected = format!(
+            "**Drupal install wants to look inside your claude-drupal and claude-wordpress \
+             folders.**\n\
+             It read content from outside, like a web page, so I'm checking with you before \
+             it runs this.\n\
+             _Safety check: Looking inside these folders doesn't look needed to install \
+             Drupal._\n\n\
+             ```{COLLAPSED_FENCE}\n{INSPECT}\n```"
         );
-        assert!(prompt.contains("applies only to this action"));
-        assert!(!prompt.contains("Allow Always"));
+        assert_eq!(text, expected);
+        for gone in ["Review carefully", "significant effects", "applies only", "⚠️", "owner"] {
+            assert!(!text.contains(gone), "{gone}: {text}");
+        }
+        // Prose never sits in a fenced block; only the command does.
+        let fenced = text.split("```").nth(1).unwrap();
+        assert!(!fenced.contains("wants to"), "{text}");
+    }
+
+    /// A high-impact effect is the one thing that earns a warning, and it
+    /// says which effect; the title names the step when nothing typed does.
+    #[test]
+    fn a_high_risk_delete_card_names_the_effect() {
+        let card = ApprovalCard {
+            asked_by: None,
+            action: CardAction::Command {
+                line: "rm -rf build dist".to_string(),
+                title: Some("clean old builds".to_string()),
+                looks_inside: Vec::new(),
+            },
+            reason: None,
+            impact: Some(HighImpact::Deletes {
+                targets: vec!["build".to_string(), "dist".to_string()],
+            }),
+        };
+        let notes = ["Execution target: host (local) workspace /srv/app".to_string()];
+        let text = ask(&card, RiskLevel::High, &notes);
+        assert!(
+            text.starts_with(
+                "⚠️ **This deletes build and dist.**\n\
+                 **Your assistant wants to run a command on your computer: clean old builds.**"
+            ),
+            "{text}"
+        );
+        assert!(text.ends_with(&format!(
+            "```{COLLAPSED_FENCE}\nrm -rf build dist\n\nExecution target: host (local) \
+             workspace /srv/app\n```"
+        )));
+        // The same command with no effect worth a warning shows none, even
+        // when its request is rated high.
+        let plain = ApprovalCard {
+            impact: None,
+            ..card
+        };
+        assert!(!ask(&plain, RiskLevel::High, &[]).contains("⚠️"));
+        assert!(ask(&plain, RiskLevel::Critical, &[]).starts_with("⚠️ **This can change"));
+    }
+
+    #[test]
+    fn a_browser_card_names_the_site_and_how_long_allow_lasts() {
+        let card = ApprovalCard {
+            asked_by: Some("WordPress install".to_string()),
+            ..ApprovalCard::new(CardAction::OpenLocalSite {
+                site: "claude-wordpress.ddev.site".to_string(),
+                once_minutes: 30,
+            })
+        };
+        let text = ask(&card, RiskLevel::High, &[]);
+        assert_eq!(
+            text,
+            "**WordPress install wants to open claude-wordpress.ddev.site in the browser, a \
+             site on this computer.**\n\
+             Allow only if you asked for it. Allow covers the next 30 minutes; the longer \
+             choice lasts until this browser session ends."
+        );
+    }
+
+    #[test]
+    fn a_long_command_is_cut_in_the_middle_and_a_fence_cannot_end_the_block() {
+        let line = format!("echo ```; {} tail-marker", "x".repeat(5_000));
+        let card = ApprovalCard::new(CardAction::Command {
+            line,
+            title: None,
+            looks_inside: Vec::new(),
+        });
+        let text = ask(&card, RiskLevel::Medium, &[]);
+        assert!(text.starts_with("**Your assistant wants to run a command on your computer.**"));
+        assert!(text.contains("characters left out"));
+        assert!(text.contains("tail-marker"));
+        assert_eq!(text.matches("```").count(), 2, "{text}");
+        assert!(text.len() < 2_000);
+    }
+
+    /// A channel without card rendering still gets the card's facts as
+    /// warning lines under its summary.
+    #[test]
+    fn a_card_flattens_for_channels_without_cards() {
+        let card = ApprovalCard {
+            reason: Some(AskReason::ReadOutsideContent {
+                check_says: Some("This isn't part of your request.".to_string()),
+            }),
+            impact: Some(HighImpact::Deletes { targets: Vec::new() }),
+            ..ApprovalCard::new(CardAction::Command {
+                line: "rm -rf x".to_string(),
+                title: None,
+                looks_inside: Vec::new(),
+            })
+        };
+        let notes = ["note".to_string()];
+        let warnings = card_as_warnings(&ApprovalAsk {
+            command: "Run a command on your computer?",
+            card: Some(&card),
+            risk_level: RiskLevel::High,
+            warnings: &notes,
+            permission_mode: PermissionMode::Default,
+            one_time_only: true,
+        });
+        assert_eq!(
+            warnings,
+            [
+                "note",
+                "This deletes files.",
+                "Safety check: This isn't part of your request.",
+                "Details: rm -rf x"
+            ]
+        );
+    }
+
+    #[test]
+    fn lists_read_plainly() {
+        let names = |n: usize| (1..=n).map(|i| format!("f{i}")).collect::<Vec<_>>();
+        assert_eq!(plain_list(&names(1), 3), "f1");
+        assert_eq!(plain_list(&names(2), 3), "f1 and f2");
+        assert_eq!(plain_list(&names(3), 3), "f1, f2 and f3");
+        assert_eq!(plain_list(&names(5), 3), "f1, f2, f3 and 2 more");
     }
 
     #[test]

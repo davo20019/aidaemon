@@ -318,7 +318,7 @@ async fn an_approval_is_asked_with_buttons_and_answered_by_a_press() {
         .iter()
         .map(|b| b["label"].as_str().unwrap())
         .collect();
-    assert_eq!(labels, vec!["Allow Once", "Allow Always", "Deny"]);
+    assert_eq!(labels, vec!["Allow", "Always allow", "Deny"]);
     let (prompt_id, choice) =
         aidaemon_channel_discord::decode_custom_id(buttons[0]["custom_id"].as_str().unwrap())
             .unwrap();

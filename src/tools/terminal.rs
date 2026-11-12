@@ -4094,6 +4094,7 @@ impl TerminalTool {
     ) -> aidaemon_core::OwnerApprovalRequest {
         let shown = raw.to_string();
         aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!("terminal {shown}"),
             subject: format!("terminal {shown}"),
@@ -4171,7 +4172,13 @@ impl TerminalTool {
                 )
                 .await;
         }
+        // A command's card says what it does from its structure; the
+        // trust-all switch keeps its own wording.
+        let card = (subject != Self::TRUST_ALL_SUBJECT)
+            .then(|| crate::tools::command_effects::command_card(&subject, call_title(&args)))
+            .map(Box::new);
         Ok(Some(aidaemon_core::OwnerApprovalRequest {
+            card,
             effects: Vec::new(),
             summary: subject.clone(),
             subject,
@@ -10132,6 +10139,15 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("external_mutation")));
         assert!(request.warnings[0].starts_with("Execution target:"));
+        // The card shows the command collapsed under a plain sentence, and
+        // warns only about what it sends.
+        let card = request.card.expect("a command card");
+        assert_eq!(card.impact, Some(aidaemon_core::HighImpact::Sends));
+        assert!(matches!(
+            card.action,
+            aidaemon_core::CardAction::Command { ref line, .. }
+                if line == "git push synthetic-remote main"
+        ));
     }
 
     #[tokio::test]

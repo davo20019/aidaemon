@@ -46,7 +46,7 @@ pub mod testing;
 
 pub use agent::{Agent, AgentBuilder, InterruptResolver, Resolution};
 pub use approval::{
-    ApprovalRisk, CallEffects, EffectClass, EffectKey, InterruptKind, OwnerApprovalRequest,
+    ApprovalCard, ApprovalRisk, AskReason, CallEffects, CardAction, HighImpact, EffectClass, EffectKey, InterruptKind, OwnerApprovalRequest,
     SharedDeclines, AUTHORITY_BLOCKED, EGRESS_BLOCKED, OWNER_DECLINED, UNTRUSTED_BLOCKED,
 };
 pub use audience::{ChannelVisibility, UserRole};
