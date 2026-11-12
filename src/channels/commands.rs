@@ -168,6 +168,12 @@ pub(crate) fn shared_commands() -> Vec<CommandDef> {
             category: CommandCategory::Core,
         },
         CommandDef {
+            name: "private",
+            description: "Don't remember or learn from your next message",
+            usage: Some("/private [off]"),
+            category: CommandCategory::Core,
+        },
+        CommandDef {
             name: "mode",
             description: "Show or change this chat's access mode",
             usage: Some("/mode [full|unrestricted|readonly]"),
@@ -215,9 +221,33 @@ impl CommandContext {
             "/context" => Some(self.handle_context(session_id, user_role).await),
             "/checkpoints" => Some(self.handle_checkpoints(user_role).await),
             "/readonly" => Some(self.handle_readonly(session_id, user_role).await),
+            "/private" => Some(self.handle_private(args, session_id).await),
             "/mode" => Some(self.handle_mode(args, session_id, user_role).await),
             "/rollback" => Some(self.handle_rollback(args, session_id, user_role).await),
             _ => None,
+        }
+    }
+
+    /// `/private [off]`: the chat's next message is not remembered or learned
+    /// from (it only narrows memory, so anyone may ask). `off` cancels.
+    async fn handle_private(&self, args: &str, session_id: &str) -> String {
+        let on = match args.trim().to_ascii_lowercase().as_str() {
+            "" => true,
+            "off" => false,
+            _ => return "Usage: /private [off]".to_string(),
+        };
+        match crate::agent::memory_plugin::set_next_message_private(
+            self.state.as_ref(),
+            session_id,
+            on,
+        )
+        .await
+        {
+            Ok(()) if on => "Your next message won't be remembered or learned from. \
+                             Memory can still be used to answer it."
+                .to_string(),
+            Ok(()) => "Cancelled: your next message is remembered as usual.".to_string(),
+            Err(error) => format!("Could not set that: {error}"),
         }
     }
 
@@ -1101,6 +1131,42 @@ mod mode_command_tests {
                 "clock time in {reply:?}"
             );
         }
+    }
+
+    /// `/private` opts the chat's next message out of learning, once.
+    #[tokio::test]
+    async fn private_opts_the_next_message_out_once() {
+        use crate::agent::memory_plugin::take_next_message_private;
+
+        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .unwrap();
+        let state = Arc::clone(&harness.state);
+        let ctx = CommandContext {
+            agent: Arc::new(harness.agent),
+            state: state.clone(),
+            task_registry: Arc::new(TaskRegistry::new(10)),
+            config_path: PathBuf::new(),
+        };
+        let session = "telegram:synthetic-user-1";
+        assert!(!take_next_message_private(state.as_ref(), session).await);
+        let reply = ctx
+            .dispatch("/private", "", session, UserRole::Guest)
+            .await
+            .unwrap();
+        assert!(reply.contains("won't be remembered"), "{reply}");
+        assert!(take_next_message_private(state.as_ref(), session).await);
+        assert!(!take_next_message_private(state.as_ref(), session).await);
+
+        ctx.dispatch("/private", "", session, UserRole::Owner).await;
+        ctx.dispatch("/private", "off", session, UserRole::Owner)
+            .await;
+        assert!(!take_next_message_private(state.as_ref(), session).await);
+        assert!(ctx
+            .dispatch("/private", "bogus", session, UserRole::Owner)
+            .await
+            .unwrap()
+            .starts_with("Usage"));
     }
 
     #[tokio::test]

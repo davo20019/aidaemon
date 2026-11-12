@@ -204,6 +204,11 @@ Chat commands (owner only) change one chat for four hours:
   its own shows the current one. `/mode full` ends a read-only or unrestricted
   period early.
 
+To keep one message out of memory, send `/private` first (anyone can):
+aidaemon still uses what it knows to answer, but learns nothing from that
+message, now or later. `/private off` cancels. You can also just ask it not
+to remember something; the agent then marks that turn the same way.
+
 ### Approvals
 
 Some actions wait for your OK. aidaemon sends you a card in the chat that

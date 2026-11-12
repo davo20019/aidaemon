@@ -419,6 +419,7 @@ async fn build_isolated_mandate_bootstrap(
         resume_execution_snapshot: None,
         emitter,
         learning_ctx,
+        learning: Default::default(),
         active_untrusted_external_reference_skills: Vec::new(),
         restrict_untrusted_external_reference_tools: false,
         available_capabilities,
@@ -1217,6 +1218,20 @@ pub(in crate::agent) async fn run_bootstrap(
             },
         )
         .await?;
+    // "Don't remember this" sent as `/private` before this message. Only a
+    // message the user wrote consumes it.
+    let learning = aidaemon_policies::TurnLearning::default();
+    if !ctx.internal_continuation
+        && agent.depth == 0
+        && agent.mandate_execution.is_none()
+        && crate::agent::memory_plugin::take_next_message_private(&*agent.state, session_id).await
+    {
+        learning.opt_out();
+        if memory_pipeline_allowed {
+            crate::agent::memory_plugin::mark_turn_opted_out(&emitter, &task_id, &user_msg_id)
+                .await?;
+        }
+    }
     agent
         .emit_decision_point(
             &emitter,
@@ -1438,6 +1453,7 @@ pub(in crate::agent) async fn run_bootstrap(
             .and_then(|checkpoint| checkpoint.execution_snapshot.clone()),
         emitter,
         learning_ctx,
+        learning,
         active_untrusted_external_reference_skills,
         restrict_untrusted_external_reference_tools,
         available_capabilities,

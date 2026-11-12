@@ -38,7 +38,9 @@ pub(crate) struct WriterSettings {
 }
 
 /// Writes memory once per run, after the outcome is final: extraction and
-/// summarization only for a completed turn, learning for every run.
+/// summarization only for a completed turn, learning for every run. A turn
+/// opted out of learning is neither extracted nor learned from; its summary
+/// leaves the turn out (the turn's events are marked suppressed).
 pub(crate) struct DaemonMemoryWriter {
     turn: MemoryTurn,
     settings: WriterSettings,
@@ -85,7 +87,7 @@ impl sdk::Hook for DaemonMemoryWriter {
                 aidaemon_memory::progressive::worth_extracting(&turn.user_text),
                 self.settings.summarization,
             );
-            if extract {
+            if extract && turn.learning_consent.allowed() {
                 let reply = crate::tools::sanitize::sanitize_user_facing_reply(&reply);
                 self.writes.extract_facts(turn, &reply, self.run_started_at);
             }
@@ -93,7 +95,7 @@ impl sdk::Hook for DaemonMemoryWriter {
                 self.writes.summarize(turn);
             }
         }
-        if turn.mandate || !self.settings.learning {
+        if turn.mandate || !self.settings.learning || !turn.learning_consent.allowed() {
             return;
         }
         learning.completed_naturally = status == TaskStatus::Completed;
@@ -244,6 +246,24 @@ pub(crate) mod tests {
             recorded.learned[0].task_outcome,
             Some(crate::events::TaskOutcome::Succeeded)
         );
+    }
+
+    /// "Don't remember this": an opted-out turn is neither extracted nor
+    /// learned from. The summary still runs; it leaves the turn out itself.
+    #[tokio::test]
+    async fn an_opted_out_turn_is_not_learned_from() {
+        let turn = turn(0, "telegram:synthetic-user-1").await;
+        turn.learning_consent.opt_out();
+        let writes = run(
+            ScriptedProvider::new([text("first answer"), text("Saved: teal.")]),
+            turn,
+            false,
+        )
+        .await;
+        let recorded = writes.0.lock().unwrap();
+        assert!(recorded.extracted.is_empty());
+        assert!(recorded.learned.is_empty());
+        assert_eq!(recorded.summarized, 1);
     }
 
     struct Approve;

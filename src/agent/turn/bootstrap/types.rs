@@ -36,6 +36,8 @@ pub(in crate::agent) struct BootstrapData {
     pub resume_execution_snapshot: Option<ResumeExecutionSnapshot>,
     pub emitter: crate::events::EventEmitter,
     pub learning_ctx: LearningContext,
+    /// Whether the turn may be learned from (`/private` opts it out).
+    pub learning: aidaemon_policies::TurnLearning,
     pub active_untrusted_external_reference_skills: Vec<String>,
     pub restrict_untrusted_external_reference_tools: bool,
     pub available_capabilities: HashMap<String, ToolCapabilities>,

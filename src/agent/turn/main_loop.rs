@@ -469,6 +469,7 @@ impl Agent {
             resume_execution_snapshot,
             emitter,
             mut learning_ctx,
+            learning,
             active_untrusted_external_reference_skills,
             restrict_untrusted_external_reference_tools,
             available_capabilities,
@@ -1139,6 +1140,7 @@ impl Agent {
                 learning_ctx: learning_ctx.clone(),
                 instruction_tracker: project_instruction_tracker.take(),
                 memory_recall_allowed: memory_pipeline_policy.allows_recall(),
+                learning: learning.clone(),
                 conversation_summary: session_summary
                     .clone()
                     .filter(|_| preserve_archived_context),
