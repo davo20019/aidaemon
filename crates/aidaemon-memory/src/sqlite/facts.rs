@@ -946,7 +946,7 @@ impl FactStore for SqliteMemory {
             let sql = format!(
                 "UPDATE {table} SET recall_count = COALESCE(recall_count, 0) + 1, last_recalled_at = ? WHERE id IN ({placeholders})"
             );
-            let mut query = sqlx::query(&sql).bind(&now);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(&now);
             for id in &ids {
                 query = query.bind(id);
             }

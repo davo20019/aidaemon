@@ -303,14 +303,14 @@ impl SqliteMemory {
         } else {
             "tasks_failed"
         };
-        let updated = sqlx::query(&format!(
+        let updated = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE expertise
              SET tasks_attempted = tasks_attempted + 1,
                  {outcome_column} = {outcome_column} + 1,
                  last_task_at = ?,
                  updated_at = ?
              WHERE domain = ?"
-        ))
+        )))
         .bind(&now)
         .bind(&now)
         .bind(domain)

@@ -1,9 +1,9 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -25,14 +25,14 @@ pub fn load_or_create_instance_key() -> anyhow::Result<[u8; 32]> {
     }
 
     let mut key = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     crate::config::store_in_keychain(INSTANCE_KEYCHAIN_FIELD, &URL_SAFE_NO_PAD.encode(key))?;
     Ok(key)
 }
 
 pub fn random_secret(bytes: usize) -> String {
     let mut data = vec![0_u8; bytes];
-    rand::thread_rng().fill_bytes(&mut data);
+    rand::rng().fill_bytes(&mut data);
     URL_SAFE_NO_PAD.encode(data)
 }
 
@@ -131,23 +131,24 @@ mod tests {
     use super::*;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::SigningKey;
+    use p256::elliptic_curve::Generate;
 
     #[test]
     fn challenge_signature_round_trips_and_is_context_bound() {
-        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let signing_key = SigningKey::generate_from_rng(&mut rand::rng());
         let verifying_key = signing_key.verifying_key();
         let canonical =
             canonical_session_challenge("cred", "challenge", "nonce", 1, "instance", "boot");
         let signature: Signature = signing_key.sign(&canonical);
         let encoded = URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes());
         verify_session_signature(
-            verifying_key.to_encoded_point(true).as_bytes(),
+            verifying_key.to_sec1_point(true).as_bytes(),
             &canonical,
             &encoded,
         )
         .unwrap();
         assert!(verify_session_signature(
-            verifying_key.to_encoded_point(true).as_bytes(),
+            verifying_key.to_sec1_point(true).as_bytes(),
             b"different",
             &encoded,
         )

@@ -178,12 +178,12 @@ impl SqliteStore {
             .unwrap_or("unknown")
             .to_string();
         let run_id = run_id.to_string();
-        let seq: i64 = sqlx::query_scalar(&format!(
+        let seq: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "INSERT INTO run_events (run_id, seq, event_type, payload, created_at)
              SELECT ?1, COALESCE(MAX(seq), 0) + 1, ?2, ?3, {NOW}
              FROM run_events WHERE run_id = ?1
              RETURNING seq"
-        ))
+        )))
         .bind(&run_id)
         .bind(event_type)
         .bind(payload.to_string())
@@ -257,7 +257,7 @@ impl SqliteStore {
     /// Insert or replace the snapshot for `state.run_id`.
     pub async fn upsert_state(&self, state: &RunState) -> Result<(), Error> {
         let json = serde_json::to_string(state)?;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO run_states (run_id, agent_id, session_id, state, updated_at)
              VALUES (?, ?, ?, ?, {NOW})
              ON CONFLICT (run_id) DO UPDATE SET
@@ -265,7 +265,7 @@ impl SqliteStore {
                 session_id = excluded.session_id,
                 state = excluded.state,
                 updated_at = excluded.updated_at"
-        ))
+        )))
         .bind(state.run_id.to_string())
         .bind(&state.agent_id)
         .bind(&state.session_id)
@@ -347,7 +347,7 @@ impl SqliteStore {
             "SELECT state FROM run_states WHERE {predicate}
              ORDER BY updated_at {dir}, rowid {dir}{limit}"
         );
-        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(&*sql));
         if let Some(value) = bind {
             query = query.bind(value);
         }

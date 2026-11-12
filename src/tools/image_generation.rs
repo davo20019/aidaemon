@@ -562,7 +562,7 @@ impl GenerateImageTool {
                     "Reference image {resource_id} has no integrity receipt. Reattach the image and try again."
                 ))
             })?;
-            let actual_sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+            let actual_sha256 = hex::encode(sha2::Sha256::digest(&bytes));
             if actual_sha256 != expected_sha256 {
                 self.invalidate_resource(
                     session_id,

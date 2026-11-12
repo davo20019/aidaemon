@@ -84,7 +84,7 @@ impl TranscriptLog {
     }
 
     async fn rows(&self, sql: &str, binds: &[Bind<'_>]) -> anyhow::Result<Vec<(i64, LoggedTurn)>> {
-        let mut query = sqlx::query(sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for bind in binds {
             query = match bind {
                 Bind::Text(text) => query.bind(*text),
@@ -367,7 +367,7 @@ impl ActivityLog for TranscriptLog {
             if idle_before.is_some() {
                 sql.push_str(" AND created_at < ?");
             }
-            let mut query = sqlx::query_as::<_, (i64, Option<String>)>(&sql)
+            let mut query = sqlx::query_as::<_, (i64, Option<String>)>(sqlx::AssertSqlSafe(&*sql))
                 .bind(&session_id)
                 .bind(&end);
             if let Some(idle_before) = &idle_before {
@@ -395,7 +395,7 @@ impl ActivityLog for TranscriptLog {
             "SELECT COUNT(*) FROM memory_transcript
              WHERE session_id = ? AND role = 'user'{filter}"
         );
-        let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(session_id);
+        let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql)).bind(session_id);
         query = match end {
             Some(Bind::Text(end)) => query.bind(end),
             Some(Bind::Int(id)) => query.bind(id),
@@ -489,7 +489,7 @@ impl MessageLog for TranscriptLog {
         for chunk in ids.chunks(500) {
             let placeholders = vec!["?"; chunk.len()].join(", ");
             let sql = format!("SELECT id FROM memory_transcript WHERE id IN ({placeholders})");
-            let mut query = sqlx::query_scalar::<_, i64>(&sql);
+            let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql));
             for id in chunk {
                 query = query.bind(id);
             }

@@ -60,11 +60,11 @@ impl WebhookConfig {
 
 /// A secret Telegram accepts: 1-256 characters from `[A-Za-z0-9_-]`.
 pub(crate) fn generate_secret() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..48)
-        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
         .collect()
 }
 

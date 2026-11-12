@@ -1425,7 +1425,7 @@ impl EventStore {
             placeholders.join(",")
         );
 
-        let mut q = sqlx::query(&query).bind(&now);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(&*query)).bind(&now);
         for id in event_ids {
             q = q.bind(id);
         }
@@ -1525,7 +1525,7 @@ impl EventStore {
             placeholders.join(",")
         );
 
-        let mut q = sqlx::query(&query).bind(session_id);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(&*query)).bind(session_id);
         for type_str in type_strs {
             q = q.bind(type_str);
         }
@@ -1686,7 +1686,8 @@ impl EventStore {
                AND turn_id IN ({placeholders}) \
              ORDER BY id DESC"
         );
-        let mut query = sqlx::query_scalar::<_, String>(&sql).bind(session_id);
+        let mut query =
+            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(&*sql)).bind(session_id);
         for turn_id in turn_ids {
             query = query.bind(turn_id);
         }

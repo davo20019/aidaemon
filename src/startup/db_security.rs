@@ -4,7 +4,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use rand::RngCore;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
+use rand::Rng;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tracing::{info, warn};
@@ -159,7 +161,9 @@ async fn migrate_plaintext_db_to_encrypted(db_path: &Path, key: &str) -> anyhow:
         key.replace('\'', "''")
     );
     let plain_pool = connect_sqlite_with_create(db_path_str, true).await?;
-    sqlx::query(&attach_sql).execute(&plain_pool).await?;
+    sqlx::query(sqlx::AssertSqlSafe(&*attach_sql))
+        .execute(&plain_pool)
+        .await?;
     sqlx::query("SELECT sqlcipher_export('encrypted')")
         .execute(&plain_pool)
         .await?;
@@ -354,10 +358,13 @@ async fn connect_sqlite_with_create(
 #[cfg(feature = "encryption")]
 async fn apply_encryption_key(pool: &SqlitePool, key: &str) -> anyhow::Result<()> {
     let escaped_key = key.replace('\'', "''");
-    sqlx::query(&format!("PRAGMA key = '{}'", escaped_key))
-        .execute(pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to apply SQLCipher key: {}", e))?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PRAGMA key = '{}'",
+        escaped_key
+    )))
+    .execute(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to apply SQLCipher key: {}", e))?;
     Ok(())
 }
 
@@ -378,7 +385,9 @@ async fn collect_table_counts(pool: &SqlitePool) -> anyhow::Result<HashMap<Strin
             "SELECT COUNT(*) AS c FROM \"{}\"",
             table.replace('"', "\"\"")
         );
-        let (count,): (i64,) = sqlx::query_as(&sql).fetch_one(pool).await?;
+        let (count,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+            .fetch_one(pool)
+            .await?;
         counts.insert(table, count);
     }
     Ok(counts)
@@ -471,7 +480,7 @@ fn persist_key_to_env_file(env_path: &Path, key: &str) -> anyhow::Result<()> {
 #[cfg(feature = "encryption")]
 fn generate_encryption_key_hex() -> String {
     let mut key_bytes = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key_bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut key_bytes);
     bytes_to_hex(&key_bytes)
 }
 

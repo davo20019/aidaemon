@@ -635,7 +635,7 @@ mod tests {
             let (_, events) = run_with_trace(&scenario, 0).await.unwrap();
             let recorded = record_scenario_from_events(&session(&scenario), &events, None).unwrap();
             assert_eq!(recorded.input, scenario.input, "{}", scenario.name);
-            let yaml = serde_yaml::to_string(&recorded).unwrap();
+            let yaml = serde_saphyr::to_string(&recorded).unwrap();
             DaemonScenario::parse_yaml(&yaml, "recorded.yaml").unwrap();
         }
         for name in ["mock_tool_then_reply", "mutation_called_once_in_order"] {
@@ -648,7 +648,7 @@ mod tests {
                 Some(&result.task_end.task_id),
             )
             .unwrap();
-            let yaml = serde_yaml::to_string(&recorded).unwrap();
+            let yaml = serde_saphyr::to_string(&recorded).unwrap();
             let mut replay = DaemonScenario::parse_yaml(&yaml, "recorded.yaml").unwrap();
             assert_eq!(replay.script, scenario.script, "{name}");
             // The draft's own expectations must hold on the run it was

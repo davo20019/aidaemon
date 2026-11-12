@@ -26,7 +26,7 @@ checkpoints = ["dep:sqlx"]
 docker = []
 # OAuth connections (`services::oauth`): flows, token refresh, tokens in a
 # `SecretStore`.
-oauth = ["dep:aidaemon-secrets", "reqwest/json"]
+oauth = ["dep:aidaemon-secrets", "reqwest/json", "reqwest/form"]
 
 [dependencies]
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
@@ -34,25 +34,26 @@ aidaemon-policies = { version = "0.2.0", path = "../aidaemon-policies" }
 aidaemon-secrets = { version = "0.2.0", path = "../aidaemon-secrets", default-features = false, optional = true }
 anyhow = "1"
 async-trait = "0.1"
-base64 = "0.22"
-dirs = "6"
+base64 = "0.23"
+dirs = "7"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures = "0.3"
 globset = "0.4"
-hmac = "0.12"
-htmd = "0.1"
+hmac = "0.13"
+htmd = "0.5"
 ignore = "0.4"
 llm_readability = "0.0"
-rand = "0.8"
+rand = "0.10"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "deflate", "brotli"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "deflate", "brotli"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
+hex = "0.4"
 shell-words = "1.1"
 shellexpand = "3"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"], optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"], optional = true }
 thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }

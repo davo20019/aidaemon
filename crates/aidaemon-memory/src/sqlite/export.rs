@@ -43,10 +43,10 @@ impl SqliteMemory {
         } else {
             "superseded_at IS NULL"
         };
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT category, key, value, source, privacy, updated_at, superseded_at
              FROM facts WHERE {filter} ORDER BY category, key, id"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         let (name, title) = if superseded {

@@ -1150,7 +1150,7 @@ impl ToolResultProvenance {
     ) -> Self {
         use sha2::{Digest, Sha256};
 
-        let sha256 = format!("{:x}", Sha256::digest(result.as_bytes()));
+        let sha256 = hex::encode(Sha256::digest(result.as_bytes()));
         let chars = result.chars().count();
         let tool_truncated = metadata.truncation.is_some()
             || metadata

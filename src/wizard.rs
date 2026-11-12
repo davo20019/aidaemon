@@ -324,7 +324,7 @@ pub fn run_low_latency_setup(config_path: &Path) -> anyhow::Result<()> {
     ];
     let hostname_mode = Select::new()
         .with_prompt("How do you want to assign public HTTPS hostnames?")
-        .items(&hostname_mode_items)
+        .items(hostname_mode_items)
         .default(0)
         .interact()?;
 
@@ -844,7 +844,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     ];
     let style_index = Select::new()
         .with_prompt("Choose a communication style")
-        .items(&style_choices)
+        .items(style_choices)
         .default(0)
         .interact()?;
     let starter_persona = render_starter_persona(

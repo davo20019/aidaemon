@@ -455,7 +455,7 @@ impl ConfigManagerTool {
             if value.is_empty() {
                 String::new()
             } else {
-                format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
+                format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))
             }
         };
         let subject = match args.action.as_str() {

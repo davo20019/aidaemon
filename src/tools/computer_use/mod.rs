@@ -103,10 +103,7 @@ fn consequential_subject(bundle_id: &str, label: &str, args: &Value) -> String {
     .iter()
     .map(|field| args.get(*field).cloned().unwrap_or(Value::Null))
     .collect();
-    let digest = format!(
-        "{:x}",
-        Sha256::digest(Value::Array(exact).to_string().as_bytes())
-    );
+    let digest = hex::encode(Sha256::digest(Value::Array(exact).to_string().as_bytes()));
     format!(
         "computer_use consequential {bundle_id}: {label} [call {}]",
         &digest[..16]

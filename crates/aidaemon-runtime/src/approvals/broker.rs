@@ -58,7 +58,7 @@ impl ApprovalBroker {
         };
 
         let interaction_id = format!("int_{}", Uuid::new_v4().simple());
-        let action_sha256 = format!("{:x}", Sha256::digest(req.command.as_bytes()));
+        let action_sha256 = hex::encode(Sha256::digest(req.command.as_bytes()));
         let requested = InteractionRequestedData {
             schema_version: InteractionRequestedData::SCHEMA_VERSION,
             interaction_id: interaction_id.clone(),

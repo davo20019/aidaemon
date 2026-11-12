@@ -5,9 +5,10 @@
 //! Extracted verbatim from `telegram.rs` (behavior-preserving move).
 
 use base64::Engine;
-use hmac::{Hmac, Mac};
-use rand::rngs::OsRng;
-use rand::RngCore;
+use hmac::{Hmac, KeyInit, Mac};
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
+use rand::Rng;
 use sha2::Sha256;
 
 pub(super) const TERMINAL_TENANT_BOT_BOOTSTRAP_DEVICE_ID: &str = "tenant-bot-bootstrap";
@@ -16,7 +17,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub(super) fn random_terminal_bootstrap_nonce(num_bytes: usize) -> String {
     let mut bytes = vec![0u8; num_bytes.max(1)];
-    OsRng.fill_bytes(&mut bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
@@ -38,7 +39,7 @@ pub(super) fn sign_terminal_tenant_bot_bootstrap_proof(
     nonce: &str,
 ) -> Result<String, String> {
     let input = terminal_tenant_bot_bootstrap_signing_input(user_id, ts, nonce);
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(bot_token.as_bytes())
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(bot_token.as_bytes())
         .map_err(|_| "invalid HMAC key".to_string())?;
     mac.update(input.as_bytes());
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))

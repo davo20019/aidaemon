@@ -93,7 +93,7 @@ impl NodeAnnouncementService {
                 !bytes.is_empty() && bytes.len() <= maximum_audio_bytes,
                 "synthesized announcement exceeds the target limit"
             );
-            let sha256 = format!("{:x}", Sha256::digest(&bytes));
+            let sha256 = hex::encode(Sha256::digest(&bytes));
             self.store
                 .queue_audio_announcement(
                     &target,

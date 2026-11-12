@@ -1090,20 +1090,23 @@ mod state_version_tests {
             if !has_rows {
                 continue;
             }
-            let columns = sqlx::query(&format!("PRAGMA table_info(\"{name}\")"))
-                .fetch_all(pool)
-                .await
-                .unwrap();
+            let columns = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "PRAGMA table_info(\"{name}\")"
+            )))
+            .fetch_all(pool)
+            .await
+            .unwrap();
             let select = columns
                 .iter()
                 .map(|c| format!("quote(\"{}\")", c.get::<String, _>("name")))
                 .collect::<Vec<_>>()
                 .join(" || '|' || ");
-            let mut rows: Vec<String> =
-                sqlx::query_scalar(&format!("SELECT {select} FROM \"{name}\""))
-                    .fetch_all(pool)
-                    .await
-                    .unwrap();
+            let mut rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT {select} FROM \"{name}\""
+            )))
+            .fetch_all(pool)
+            .await
+            .unwrap();
             rows.sort();
             seen.insert(format!("rows:{name}"), rows);
         }
@@ -1111,9 +1114,9 @@ mod state_version_tests {
     }
 
     async fn recorded(pool: &SqlitePool) -> Vec<(i64, String, String)> {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT version, name, applied_at FROM {VERSION_TABLE} ORDER BY version"
-        ))
+        )))
         .fetch_all(pool)
         .await
         .unwrap()
@@ -1144,7 +1147,7 @@ mod state_version_tests {
             sqlx::query(statement).execute(&pool).await.unwrap();
         }
         migrate_state(&pool).await.unwrap();
-        sqlx::query(&format!("DROP TABLE {VERSION_TABLE}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {VERSION_TABLE}")))
             .execute(&pool)
             .await
             .unwrap();
@@ -1294,10 +1297,12 @@ mod schema_golden_tests {
             if object.get::<String, _>("type") != "table" || projected(&name) {
                 continue;
             }
-            let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{name}\""))
-                .fetch_one(pool)
-                .await
-                .unwrap();
+            let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM \"{name}\""
+            )))
+            .fetch_one(pool)
+            .await
+            .unwrap();
             out.push_str(&format!("rows {name} = {rows}\n"));
         }
         for row in sqlx::query("SELECT version, name FROM state_schema_versions ORDER BY version")

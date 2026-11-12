@@ -3,6 +3,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
+use p256::elliptic_curve::Generate;
 
 pub use aidaemon_node_protocol as protocol;
 
@@ -15,7 +16,7 @@ pub struct NodeIdentity {
 impl NodeIdentity {
     pub fn generate() -> Self {
         Self {
-            signing_key: SigningKey::random(&mut rand::thread_rng()),
+            signing_key: SigningKey::generate_from_rng(&mut rand::rng()),
             node_id: None,
             credential_id: None,
         }
@@ -34,7 +35,7 @@ impl NodeIdentity {
         URL_SAFE_NO_PAD.encode(
             self.signing_key
                 .verifying_key()
-                .to_encoded_point(true)
+                .to_sec1_point(true)
                 .as_bytes(),
         )
     }

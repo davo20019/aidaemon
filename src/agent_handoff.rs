@@ -1,5 +1,5 @@
 use chrono::Utc;
-use rand::{thread_rng, Rng};
+use rand::{rng as thread_rng, RngExt};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::StateStore;
@@ -70,7 +70,7 @@ fn generate_code() -> String {
     let mut rng = thread_rng();
     (0..HANDOFF_CODE_LEN)
         .map(|_| {
-            let idx = rng.gen_range(0..HANDOFF_ALPHABET.len());
+            let idx = rng.random_range(0..HANDOFF_ALPHABET.len());
             HANDOFF_ALPHABET[idx] as char
         })
         .collect()

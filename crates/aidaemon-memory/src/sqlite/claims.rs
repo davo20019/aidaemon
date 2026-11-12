@@ -42,7 +42,9 @@ impl SqliteMemory {
         &self,
     ) -> anyhow::Result<crate::records::MemoryHealthReport> {
         async fn count(pool: &SqlitePool, sql: &str) -> anyhow::Result<i64> {
-            Ok(sqlx::query_scalar(sql).fetch_one(pool).await?)
+            Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .fetch_one(pool)
+                .await?)
         }
         Ok(crate::records::MemoryHealthReport {
             spans: count(&self.pool, "SELECT COUNT(*) FROM memory_spans WHERE deleted_at IS NULL")

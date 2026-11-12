@@ -36,7 +36,7 @@ impl ApprovalStore for SqliteApprovalStore {
     /// One atomic upsert, so concurrent saves of a prompt never duplicate it.
     async fn save(&self, approval: &StoredApproval) -> Result<(), StoreError> {
         let record = serde_json::to_string(approval).map_err(Error::from)?;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO channel_approvals
                  (prompt_id, session_id, channel, conversation_id, expires_at_ms, record, saved_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, {NOW})
@@ -47,7 +47,7 @@ impl ApprovalStore for SqliteApprovalStore {
                  expires_at_ms = excluded.expires_at_ms,
                  record = excluded.record,
                  saved_at = excluded.saved_at"
-        ))
+        )))
         .bind(&approval.prompt_id)
         .bind(&approval.session_id)
         .bind(&approval.channel)

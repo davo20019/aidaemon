@@ -1228,7 +1228,7 @@ async fn print_gate_outcomes(pool: &SqlitePool, hours: i64) -> anyhow::Result<()
          WHERE event_type = 'decision_point' AND created_at >= ? AND task_id IS NOT NULL
            AND json_extract(data, '$.code') IN ({placeholders})"
     );
-    let mut query = sqlx::query(&decision_sql).bind(&cutoff);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*decision_sql)).bind(&cutoff);
     for code in GATE_INTERVENTION_CODES {
         query = query.bind(*code);
     }
@@ -1545,7 +1545,11 @@ async fn record_fixture_from_session(
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let yaml = serde_yaml::to_string(&scenario)?;
+    // One-line strings stay on one line, as serde_yaml wrote them.
+    let yaml = serde_saphyr::to_string_with_options(
+        &scenario,
+        serde_saphyr::ser_options! { folded_wrap_chars: usize::MAX },
+    )?;
     std::fs::write(&output_path, format!("{RECORDED_SCENARIO_HEADER}{yaml}"))?;
     println!("Recorded draft scenario -> {}", output_path.display());
     println!("Check it against the trace before moving it into the suite.");
@@ -3083,7 +3087,9 @@ async fn main() -> anyhow::Result<()> {
 /// values are rendered as text without interpretation.
 async fn print_query_rows(pool: &SqlitePool, title: &str, sql: &str) -> anyhow::Result<()> {
     use sqlx::{Column, Row, TypeInfo, ValueRef};
-    let rows = sqlx::query(sql).fetch_all(pool).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await?;
     println!("== {title} ({}) ==", rows.len());
     for row in rows {
         let mut parts = Vec::new();

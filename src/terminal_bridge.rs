@@ -13,11 +13,13 @@ use futures::{SinkExt, StreamExt};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use p256::ecdh::diffie_hellman;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
+use p256::elliptic_curve::Generate;
 use p256::{PublicKey, SecretKey};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, NativePtySystem, PtySize, PtySystem};
-use rand::rngs::OsRng;
-use rand::{Rng, RngCore};
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
+use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -2877,7 +2879,7 @@ fn b64_decode_flexible(input: &str) -> anyhow::Result<Vec<u8>> {
 
 fn random_nonce_hex(num_bytes: usize) -> String {
     let mut bytes = vec![0u8; num_bytes.max(1)];
-    OsRng.fill_bytes(&mut bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
@@ -2905,7 +2907,7 @@ fn sign_daemon_bootstrap_proof_hkdf(
 ) -> anyhow::Result<String> {
     let signing_key = derive_daemon_bootstrap_signing_key(bot_token)?;
     let input = daemon_bootstrap_signing_input(user_id, device_id, ts, nonce);
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(&signing_key)
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&signing_key)
         .map_err(|_| anyhow::anyhow!("invalid HMAC key"))?;
     mac.update(input.as_bytes());
     let signature = mac.finalize().into_bytes();
@@ -2920,7 +2922,7 @@ fn sign_daemon_bootstrap_proof_legacy(
     nonce: &str,
 ) -> anyhow::Result<String> {
     let input = daemon_bootstrap_signing_input(user_id, device_id, ts, nonce);
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(bot_token.as_bytes())
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(bot_token.as_bytes())
         .map_err(|_| anyhow::anyhow!("invalid HMAC key"))?;
     mac.update(input.as_bytes());
     let signature = mac.finalize().into_bytes();
@@ -2994,7 +2996,7 @@ async fn load_or_create_key_material() -> anyhow::Result<KeyMaterial> {
                     source = KeySource::LegacyFile;
                     parse_daemon_secret_key_from_encoded(&encoded)?
                 } else {
-                    SecretKey::random(&mut OsRng)
+                    SecretKey::generate_from_rng(&mut UnwrapErr(SysRng))
                 }
             }
         },
@@ -3016,7 +3018,7 @@ async fn load_or_create_key_material() -> anyhow::Result<KeyMaterial> {
                 source = KeySource::LegacyFile;
                 parse_daemon_secret_key_from_encoded(&encoded)?
             } else {
-                SecretKey::random(&mut OsRng)
+                SecretKey::generate_from_rng(&mut UnwrapErr(SysRng))
             }
         }
     };
@@ -3058,7 +3060,7 @@ async fn load_or_create_key_material() -> anyhow::Result<KeyMaterial> {
     }
 
     let public = secret.public_key();
-    let public_raw = public.to_encoded_point(false).as_bytes().to_vec();
+    let public_raw = public.to_sec1_point(false).as_bytes().to_vec();
     let fingerprint = sha256_hex(&public_raw);
     Ok(KeyMaterial {
         private_key: secret,
@@ -3762,7 +3764,7 @@ impl TerminalBridge {
             let jitter_ms = if RECONNECT_JITTER_MS == 0 {
                 0
             } else {
-                rand::thread_rng().gen_range(0..=RECONNECT_JITTER_MS)
+                rand::rng().random_range(0..=RECONNECT_JITTER_MS)
             };
             let sleep_ms = reconnect_backoff_ms.saturating_add(jitter_ms);
             debug!(
@@ -4178,7 +4180,7 @@ impl TerminalBridge {
         .await?;
 
         let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
+        UnwrapErr(SysRng).fill_bytes(&mut key);
         let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|_| anyhow::anyhow!("failed to initialize local relay cipher"))?;
 
@@ -5887,7 +5889,7 @@ impl TerminalBridge {
         crypto.send_counter = counter;
         let aad = format!("{}:{}", crypto.session_id, counter);
         let mut iv = [0u8; 12];
-        OsRng.fill_bytes(&mut iv);
+        UnwrapErr(SysRng).fill_bytes(&mut iv);
         let ct = crypto
             .cipher
             .encrypt(
@@ -6766,11 +6768,11 @@ mod tests {
 
     #[test]
     fn test_derive_relay_cipher_round_trip() {
-        let daemon_secret = SecretKey::random(&mut OsRng);
-        let client_secret = SecretKey::random(&mut OsRng);
+        let daemon_secret = SecretKey::generate_from_rng(&mut UnwrapErr(SysRng));
+        let client_secret = SecretKey::generate_from_rng(&mut UnwrapErr(SysRng));
         let relay_session_id = "relay-session-1";
 
-        let client_pub = client_secret.public_key().to_encoded_point(false);
+        let client_pub = client_secret.public_key().to_sec1_point(false);
         let client_pub_b64 = b64_encode(client_pub.as_bytes());
         let daemon_cipher =
             TerminalBridge::derive_relay_cipher(&daemon_secret, relay_session_id, &client_pub_b64)
@@ -6814,10 +6816,10 @@ mod tests {
 
     #[test]
     fn test_derive_relay_cipher_session_id_mismatch_breaks_decryption() {
-        let daemon_secret = SecretKey::random(&mut OsRng);
-        let client_secret = SecretKey::random(&mut OsRng);
+        let daemon_secret = SecretKey::generate_from_rng(&mut UnwrapErr(SysRng));
+        let client_secret = SecretKey::generate_from_rng(&mut UnwrapErr(SysRng));
 
-        let client_pub = client_secret.public_key().to_encoded_point(false);
+        let client_pub = client_secret.public_key().to_sec1_point(false);
         let client_pub_b64 = b64_encode(client_pub.as_bytes());
         let daemon_cipher = TerminalBridge::derive_relay_cipher(
             &daemon_secret,

@@ -198,7 +198,7 @@ fn executor_flavored_kinds_open_with_their_tagline_and_include_shared_base() {
             "{:?} prompt does not open with expected tagline.\nexpected prefix: {:?}\nactual head: {:?}",
             kind,
             tagline_prefix,
-            &prompt.chars().take(120).collect::<String>(),
+            prompt.chars().take(120).collect::<String>(),
         );
         // Shared base spliced in: discipline rules + headings must be present.
         for marker in [

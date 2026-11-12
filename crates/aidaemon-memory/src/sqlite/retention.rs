@@ -95,7 +95,7 @@ impl MemoryRetention {
                        SELECT 1 FROM memory_claims c WHERE c.source_span_id = memory_spans.id
                    )"
             );
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql));
             for id in ids {
                 query = query.bind(id);
             }

@@ -711,7 +711,7 @@ type Rows = Vec<Vec<Option<String>>>;
 type Snapshot = BTreeMap<String, Rows>;
 
 async fn rows(pool: &SqlitePool, sql: &str) -> Rows {
-    sqlx::query(sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .fetch_all(pool)
         .await
         .unwrap_or_else(|error| panic!("{sql}: {error}"))

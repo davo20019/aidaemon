@@ -141,10 +141,11 @@ async fn a_memory_system_of_another_shape_runs_a_whole_turn() {
         "behavior_patterns",
         "memory_claims",
     ] {
-        let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let rows: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(rows, 0, "{table} was written");
     }
 }

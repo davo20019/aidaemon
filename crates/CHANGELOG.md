@@ -12,6 +12,9 @@ stability promise.
 
 ## [Unreleased]
 
+### Dependencies updated
+- Latest releases throughout, including reqwest 0.13, sqlx 0.9, rand 0.10, the RustCrypto 0.11 generation (sha2, hmac, p256 0.14), tokio-tungstenite 0.30, toml 1.2, strum 0.28, dirs 7, croner 4 and base64 0.23; `aidaemon-eval` and `aidaemon-skills` read YAML with serde-saphyr (YAML 1.2 scalars) instead of the deprecated serde_yaml. `rust-version` is now 1.94 (sqlx 0.9).
+
 ### Security
 - `aidaemon-sdk`: `preset` without a workspace no longer runs a tool that may change things but declares no access without anyone seeing it: the approval policy asks the owner first (a `#[tool(write)] fn save(path, ..)` with no `access` could write `~/.bashrc` unchecked). With a workspace, a read-only tool that declares no paths is now refused like a writer (it could read `~/.ssh`). New `Preset::path_free_tool` marks tools that touch no files (business APIs); the tools a `Preset::memory` system gives are marked automatically; new `Preset::undeclared_reads`. An explicit `Preset::undeclared_writes(Allow)` still runs undeclared writers without asking.
 - `aidaemon-policies`: `ScopeGuard::path_free_tool`, `ApprovalPolicy::ask_undeclared_writes` and `ApprovalPolicy::path_free_tool`.

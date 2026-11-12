@@ -343,10 +343,17 @@ where
     /// `expect.ext:` types.
     pub fn parse_yaml(yaml: &str, origin: impl AsRef<Path>) -> Result<Self, EvalError> {
         let path = origin.as_ref().to_path_buf();
-        let mut scenario: Self = serde_yaml::from_str(yaml).map_err(|err| EvalError::Parse {
-            path: path.clone(),
-            message: err.to_string(),
-        })?;
+        // YAML 1.2 scalars, as serde_yaml read them: `yes` stays a string.
+        let options = serde_saphyr::options! {
+            strict_booleans: true,
+            leading_zero_numbers_as_strings: true,
+            underscored_numbers_as_strings: true,
+        };
+        let mut scenario: Self =
+            serde_saphyr::from_str_with_options(yaml, options).map_err(|err| EvalError::Parse {
+                path: path.clone(),
+                message: err.to_string(),
+            })?;
         scenario.source = Some(path.clone());
         scenario
             .validate()

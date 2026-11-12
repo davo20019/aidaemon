@@ -1047,7 +1047,7 @@ impl<S: WorkDatabase> crate::traits::GoalScheduleStore for S {
     }
 
     async fn get_scheduled_goals(&self) -> anyhow::Result<Vec<Goal>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {GOAL_LIST_COLUMNS}
              FROM goals
              WHERE domain = 'orchestration'
@@ -1056,14 +1056,14 @@ impl<S: WorkDatabase> crate::traits::GoalScheduleStore for S {
                  OR status = 'pending_confirmation'
                )
              ORDER BY created_at DESC"
-        ))
+        )))
         .fetch_all(self.work_pool())
         .await?;
         Ok(rows.iter().map(goal_from_list_row).collect())
     }
 
     async fn get_unscheduled_active_goals(&self) -> anyhow::Result<Vec<Goal>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {GOAL_LIST_COLUMNS}
              FROM goals
              WHERE domain = 'orchestration'
@@ -1072,7 +1072,7 @@ impl<S: WorkDatabase> crate::traits::GoalScheduleStore for S {
                AND NOT EXISTS (SELECT 1 FROM goal_schedules s WHERE s.goal_id = goals.id)
                AND NOT EXISTS (SELECT 1 FROM mandates m WHERE m.goal_id = goals.id)
              ORDER BY created_at DESC"
-        ))
+        )))
         .fetch_all(self.work_pool())
         .await?;
         Ok(rows.iter().map(goal_from_list_row).collect())

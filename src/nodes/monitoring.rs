@@ -481,7 +481,7 @@ impl MonitorRow {
 impl NodeMonitoringService {
     async fn load_monitor(&self, monitor_id: &str) -> anyhow::Result<Option<MonitorRow>> {
         let query = format!("{MONITOR_SELECT} WHERE m.monitor_id = ?");
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(monitor_id)
             .fetch_optional(&self.pool)
             .await?;
@@ -510,7 +510,7 @@ impl NodeMonitoringService {
         let query = format!(
             "{MONITOR_SELECT} WHERE m.owner_session_id = ? ORDER BY m.created_at DESC LIMIT 100"
         );
-        let rows = sqlx::query(&query)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(owner_session_id)
             .fetch_all(&self.pool)
             .await?;
@@ -673,7 +673,7 @@ impl NodeMonitoringService {
         let query = format!(
             "{MONITOR_SELECT} WHERE m.node_id = ? AND m.status = 'active' AND m.expires_at > ?"
         );
-        let rows = sqlx::query(&query)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(node_id)
             .bind(Utc::now().to_rfc3339())
             .fetch_all(&self.pool)
@@ -1003,7 +1003,7 @@ impl NodeMonitoringService {
         let expired_query = format!(
             "{MONITOR_SELECT} WHERE m.status IN ('active','paused','suspended') AND m.expires_at <= ?"
         );
-        let expired = sqlx::query(&expired_query)
+        let expired = sqlx::query(sqlx::AssertSqlSafe(&*expired_query))
             .bind(now.to_rfc3339())
             .fetch_all(&self.pool)
             .await?;
@@ -1039,7 +1039,9 @@ impl NodeMonitoringService {
         }
 
         let active_query = format!("{MONITOR_SELECT} WHERE m.status = 'active'");
-        let rows = sqlx::query(&active_query).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*active_query))
+            .fetch_all(&self.pool)
+            .await?;
         for row in &rows {
             let monitor = monitor_from_row(row)?;
             stats.evaluated += 1;

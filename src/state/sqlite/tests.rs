@@ -353,7 +353,7 @@ async fn clear_session_erases_exact_active_artifacts_and_detaches_claims() {
         "memory_spans",
     ] {
         let query = format!("SELECT COUNT(*) FROM {table}");
-        let count: i64 = sqlx::query_scalar(&query)
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(&*query))
             .fetch_one(&store.pool)
             .await
             .unwrap();

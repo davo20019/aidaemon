@@ -336,7 +336,7 @@ fn format_browser_approval_prompt(
             let bytes = script.len();
             // A short digest distinguishes different same-sized scripts without
             // exposing their potentially sensitive contents in chat or logs.
-            let digest = format!("{:x}", Sha256::digest(script.as_bytes()));
+            let digest = hex::encode(Sha256::digest(script.as_bytes()));
             format!(
                 "Run JavaScript on {origin} ({bytes} bytes, id {})",
                 &digest[..12]
@@ -788,7 +788,7 @@ impl BrowserTool {
             args.value,
         ])
         .to_string();
-        let digest = format!("{:x}", Sha256::digest(exact.as_bytes()));
+        let digest = hex::encode(Sha256::digest(exact.as_bytes()));
         let subject = format!("{summary} [call {}]", &digest[..16]);
         BrowserApproval::Ask {
             request: aidaemon_core::OwnerApprovalRequest {

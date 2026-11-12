@@ -67,14 +67,14 @@ impl Updater {
             .build()?
             .fetch()?;
 
-        if let Some(latest) = releases.first() {
-            let latest_version = latest.version.trim_start_matches('v');
+        if let Some(latest) = releases.latest() {
+            let latest_version = latest.version().trim_start_matches('v');
             if let (Ok(current), Ok(latest_parsed)) = (
                 semver::Version::parse(CURRENT_VERSION),
                 semver::Version::parse(latest_version),
             ) {
                 if latest_parsed > current {
-                    let notes = latest.body.as_deref().unwrap_or("No release notes.");
+                    let notes = latest.body().unwrap_or("No release notes.");
                     return Ok(Some((latest_version.to_string(), notes.to_string())));
                 }
             }
@@ -110,7 +110,7 @@ impl Updater {
             .repo_owner(REPO_OWNER)
             .repo_name(REPO_NAME)
             .bin_name(BIN_NAME)
-            .identifier(&target_asset)
+            .asset_identifier(&target_asset)
             .current_version(CURRENT_VERSION)
             .no_confirm(true)
             .show_download_progress(false)

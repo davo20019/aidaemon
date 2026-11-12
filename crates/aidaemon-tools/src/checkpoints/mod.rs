@@ -1601,7 +1601,7 @@ fn ensure_success(label: &str, output: &Output) -> anyhow::Result<()> {
 fn root_key(root: &Path) -> String {
     let mut digest = Sha256::new();
     digest.update(root.to_string_lossy().as_bytes());
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 fn checkpoint_id(prefix: &str) -> String {
@@ -2173,7 +2173,7 @@ fn current_entry(
     digest.update(&bytes);
     Ok(Some(TreeEntry {
         mode: git_file_mode(&metadata),
-        oid: format!("{:x}", digest.finalize()),
+        oid: hex::encode(digest.finalize()),
     }))
 }
 

@@ -331,7 +331,7 @@ impl crate::traits::MessageStore for SqliteStateStore {
                 continue;
             }
             let query = format!("DELETE FROM {table} WHERE session_id = ?");
-            sqlx::query(&query)
+            sqlx::query(sqlx::AssertSqlSafe(&*query))
                 .bind(session_id)
                 .execute(&mut *tx)
                 .await?;

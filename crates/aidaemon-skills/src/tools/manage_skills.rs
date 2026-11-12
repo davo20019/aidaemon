@@ -314,9 +314,17 @@ impl ManageSkillsTool {
             .ok()
             .filter(Self::looks_like_openapi)
             .or_else(|| {
-                serde_yaml::from_str::<Value>(content)
-                    .ok()
-                    .filter(Self::looks_like_openapi)
+                serde_saphyr::from_str_with_options::<Value>(
+                    content,
+                    // YAML 1.2 scalars: `no` in a spec stays a string.
+                    serde_saphyr::options! {
+                        strict_booleans: true,
+                        leading_zero_numbers_as_strings: true,
+                        underscored_numbers_as_strings: true,
+                    },
+                )
+                .ok()
+                .filter(Self::looks_like_openapi)
             })
     }
 
