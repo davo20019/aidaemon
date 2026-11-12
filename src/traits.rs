@@ -57,7 +57,9 @@ pub use aidaemon_work::mandates::{
     MandateTerminationKind, MandateWakeSignal, MandateWakeSignalKind, ObjectiveMetricDirection,
     SAFE_FALLBACK_WAIT_RATIONALE,
 };
-pub use channels::{ChannelCapabilities, HubChannel};
+#[cfg(test)]
+pub use channels::ChannelCapabilities;
+pub use channels::HubChannel;
 pub use dynamic::{
     CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,
     OAuthConnection, PendingOAuthFlow, SkillDraft,

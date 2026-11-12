@@ -9,7 +9,11 @@ use serde_json::{json, Value};
 use super::*;
 use crate::channels::mock_api::{MockApi, Recorded};
 use crate::runtime_ports::DaemonAgentRuntime;
+use crate::tasks::TaskRegistry;
 use crate::testing::{setup_test_agent, MockProvider};
+use crate::tools::command_risk::{PermissionMode, RiskLevel};
+use crate::traits::HubChannel;
+use crate::types::ApprovalResponse;
 
 const BOT: &str = "U0SYNTHBOT";
 const OWNER: &str = "U0SYNTHOWNER";
@@ -32,7 +36,7 @@ async fn channel(
         setup_test_agent(MockProvider::new()).await.unwrap().agent,
     ));
     let inbox = tempfile::tempdir().unwrap().keep();
-    let channel = SlackChannel::new(
+    let channel = new_slack_bot(
         "xapp-synthetic",
         "xoxb-synthetic",
         vec![OWNER.to_string()],
@@ -51,7 +55,7 @@ async fn channel(
             watchdog_stale_threshold_secs: 0,
         },
     )
-    .with_api(&api.base, BOT);
+    .with_api(&api.base, BOT, MockApi::client());
     (Arc::new(channel), harness)
 }
 

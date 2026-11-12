@@ -134,7 +134,7 @@ aidaemon-mcp = { version = "=0.2.0", path = "crates/aidaemon-mcp" }
 # Channel contract and platform adapters (formatting today; transport next).
 aidaemon-channels = { version = "=0.2.0", path = "crates/aidaemon-channels", features = ["http", "checkpoints"] }
 aidaemon-channel-telegram = { version = "=0.2.0", path = "crates/aidaemon-channel-telegram", features = ["bot"] }
-aidaemon-channel-slack = { version = "=0.2.0", path = "crates/aidaemon-channel-slack", optional = true }
+aidaemon-channel-slack = { version = "=0.2.0", path = "crates/aidaemon-channel-slack", optional = true, features = ["bot"] }
 aidaemon-channel-discord = { version = "=0.2.0", path = "crates/aidaemon-channel-discord", optional = true, features = ["bot"] }
 # Long-term memory: shared primitives today; the `sdk` backend with `sdk-memory`.
 aidaemon-memory = { version = "=0.2.0", path = "crates/aidaemon-memory" }

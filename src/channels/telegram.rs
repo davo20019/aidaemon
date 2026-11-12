@@ -33,7 +33,7 @@ use super::telegram_bootstrap_signing::{
 #[cfg(feature = "discord")]
 use crate::channels::spawn_discord_channel;
 #[cfg(feature = "slack")]
-use crate::channels::{spawn_slack_channel, SlackChannel};
+use crate::channels::spawn_slack_channel;
 use crate::channels::{ChannelHub, ChannelRuntimeDeps};
 use crate::config::{AppConfig, TelegramWebhookConfig};
 #[cfg(test)]
@@ -3098,7 +3098,7 @@ impl Cx<'_> {
         if let Some(weak_hub) = hub_ref {
             if let Some(hub) = weak_hub.upgrade() {
                 // Create the new Slack channel with same config as this Telegram channel
-                let new_channel = Arc::new(SlackChannel::new(
+                let new_channel = Arc::new(super::slack::new_slack_bot(
                     app_token,
                     bot_token,
                     allowed_user_ids_str, // Slack uses String user IDs

@@ -273,7 +273,7 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                       allowed_user_ids: Vec<String>,
                       use_threads: bool|
      -> Arc<SlackChannel> {
-        Arc::new(SlackChannel::new(
+        Arc::new(crate::channels::slack::new_slack_bot(
             app_token,
             bot_token,
             allowed_user_ids,

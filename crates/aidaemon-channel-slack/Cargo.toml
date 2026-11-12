@@ -17,8 +17,29 @@ categories = ["asynchronous", "network-programming"]
 exclude = ["tests/", "benches/"]
 publish = false
 
+[features]
+# The bot an application runs (`bot::SlackBot`): access, owners, workspace
+# grants, sessions, commands and files on the shared turn runner.
+bot = [
+    "dep:aidaemon-core",
+    "dep:aidaemon-events",
+    "dep:aidaemon-tools",
+    "dep:anyhow",
+    "dep:chrono",
+    "dep:shell-words",
+    "dep:uuid",
+    "reqwest/query",
+]
+
 [dependencies]
 aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels", features = ["http"] }
+aidaemon-core = { version = "0.2.0", path = "../aidaemon-core", optional = true }
+aidaemon-events = { version = "0.2.0", path = "../aidaemon-events", optional = true }
+aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools", optional = true }
+anyhow = { version = "1", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+shell-words = { version = "1", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
