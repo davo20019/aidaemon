@@ -36,6 +36,9 @@ struct RememberArgs {
     category: Option<String>,
     key: Option<String>,
     value: Option<String>,
+    /// Forget the single `category`/`key` fact instead of storing a value.
+    #[serde(default)]
+    delete: bool,
     #[serde(default)]
     facts: Option<Vec<FactEntry>>,
     #[serde(default)]
@@ -46,102 +49,23 @@ struct RememberArgs {
 struct FactEntry {
     category: String,
     key: String,
+    #[serde(default)]
     value: String,
-}
-
-const PERSONA_PATTERNS: &[&str] = &[
-    "talk like",
-    "speak like",
-    "act like",
-    "act as",
-    "pretend to be",
-    "roleplay",
-    "persona",
-    "character voice",
-    "pirate",
-    "accent",
-    "from now on",
-    "new identity",
-    "speak in character",
-    "respond as",
-];
-
-fn is_persona_manipulation(category: &str, key: &str, value: &str) -> bool {
-    // Word-boundary match: a substring check rejected every fact in the
-    // "personal" category because it contains "persona". Keys are snake_case,
-    // so split them into words first.
-    let combined = format!("{} {} {}", category, key, value).replace(['_', '-'], " ");
-    PERSONA_PATTERNS
-        .iter()
-        .any(|p| contains_words(&combined, p))
-}
-
-/// `keyword` appears in `text` as whole words, ignoring case and the
-/// punctuation around words (apostrophes kept).
-fn contains_words(text: &str, keyword: &str) -> bool {
-    let normalize = |w: &str| -> String {
-        w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
-            .to_lowercase()
-    };
-    let text_words: Vec<String> = text
-        .split_whitespace()
-        .map(normalize)
-        .filter(|w| !w.is_empty())
-        .collect();
-    let kw_words: Vec<String> = keyword
-        .split_whitespace()
-        .map(normalize)
-        .filter(|w| !w.is_empty())
-        .collect();
-    if kw_words.is_empty() {
-        return false;
-    }
-    text_words
-        .windows(kw_words.len())
-        .any(|window| window == kw_words.as_slice())
-}
-
-/// Empty/whitespace-only values and explicit markers delete the fact.
-fn is_deletion_marker(value: &str) -> bool {
-    let trimmed = value.trim();
-    trimmed.is_empty()
-        || [
-            "none", "null", "n/a", "delete", "remove", "deleted", "removed",
-        ]
-        .iter()
-        .any(|marker| trimmed.eq_ignore_ascii_case(marker))
+    #[serde(default)]
+    delete: bool,
 }
 
 /// True when this exact call would delete at least one fact. Mirrors the
 /// entry selection in `call`: a non-empty `facts` batch wins, otherwise the
-/// single key/value pair.
+/// single key/value pair. Deletion is the typed `delete` flag, never a value.
 pub fn call_deletes_facts(arguments: &str) -> bool {
     let Ok(args) = serde_json::from_str::<RememberArgs>(arguments) else {
         return false;
     };
     match args.facts.filter(|facts| !facts.is_empty()) {
-        Some(facts) => facts.iter().any(|entry| is_deletion_marker(&entry.value)),
-        None => {
-            args.key.is_some_and(|key| !key.trim().is_empty())
-                && args.value.as_deref().is_some_and(is_deletion_marker)
-        }
+        Some(facts) => facts.iter().any(|entry| entry.delete),
+        None => args.delete && args.key.is_some_and(|key| !key.trim().is_empty()),
     }
-}
-
-fn is_goal_fact(category: &str, key: &str, value: &str) -> bool {
-    let category_lower = category.trim().to_ascii_lowercase();
-    let key_lower = key.trim().to_ascii_lowercase();
-    let value_lower = value.trim().to_ascii_lowercase();
-    let looks_like_personal_goal_key =
-        key_lower.starts_with("personal_goal") || key_lower.contains("personal_goal");
-    let looks_like_user_goal_key =
-        key_lower.starts_with("goal_") && matches!(category_lower.as_str(), "user" | "preference");
-    let looks_like_goal_value = matches!(category_lower.as_str(), "user" | "preference")
-        && (value_lower.contains("my goal")
-            || value_lower.contains("personal goal")
-            || value_lower.contains("goal is to")
-            || value_lower.starts_with("goal:"));
-    looks_like_personal_goal_key || looks_like_user_goal_key || looks_like_goal_value
 }
 
 #[async_trait]
@@ -151,7 +75,7 @@ impl Tool for RememberFactTool {
     }
 
     fn description(&self) -> &str {
-        "Store stable user/environment facts, not task research, generated content, goals, or schedules. Use personal_memory for people and relationships."
+        "Store or forget stable user/environment facts, not task research, generated content, goals, or schedules. Use personal_memory for people and relationships."
     }
 
     fn schema(&self) -> Value {
@@ -169,7 +93,11 @@ impl Tool for RememberFactTool {
                     },
                     "value": {
                         "type": "string",
-                        "description": "Value; empty or 'delete' removes it."
+                        "description": "Stored as written, including \"none\"."
+                    },
+                    "delete": {
+                        "type": "boolean",
+                        "description": "Forget category/key; value is ignored."
                     },
                     "facts": {
                         "type": "array",
@@ -184,10 +112,14 @@ impl Tool for RememberFactTool {
                                 },
                                 "value": {
                                     "type": "string",
-                                    "description": "Value; empty or 'delete' removes it."
+                                    "description": "Stored as written, including \"none\"."
+                                },
+                                "delete": {
+                                    "type": "boolean",
+                                    "description": "Forget this fact; value is ignored."
                                 }
                             },
-                            "required": ["category", "key", "value"]
+                            "required": ["category", "key"]
                         }
                     },
                     "personal_memory": {
@@ -312,13 +244,12 @@ impl Tool for RememberFactTool {
                 })?;
                 let key = single_key
                     .ok_or_else(|| anyhow::anyhow!("'key' is required (or use 'facts' array)"))?;
-                let value = args
-                    .value
-                    .ok_or_else(|| anyhow::anyhow!("'value' is required (or use 'facts' array)"))?;
+                let value = args.value.unwrap_or_default();
                 vec![FactEntry {
                     category,
                     key,
                     value,
+                    delete: args.delete,
                 }]
             };
 
@@ -354,9 +285,9 @@ impl Tool for RememberFactTool {
                         | "birthplace"
                         | "place_of_birth"
                 );
-                // A deletion marker is a forget, not a value: it takes the
-                // delete path below, which also retracts the canonical record.
-                if !supported || is_deletion_marker(&entry.value) {
+                // A forget takes the delete path below, which also retracts
+                // the canonical record. An empty value is reported there.
+                if !supported || entry.delete || entry.value.trim().is_empty() {
                     continue;
                 }
                 if !owner_added {
@@ -405,6 +336,7 @@ impl Tool for RememberFactTool {
                         display_value: None,
                         valid_from: None,
                         valid_to: None,
+                        retract: false,
                     }),
                 }
                 structured_indices.insert(index);
@@ -435,26 +367,7 @@ impl Tool for RememberFactTool {
                 if structured_indices.contains(&index) {
                     continue;
                 }
-                // Reject persona/identity manipulation saves
-                if is_persona_manipulation(&entry.category, &entry.key, &entry.value) {
-                    results.push(format!(
-                        "Rejected [{}] {}: cannot save persona/identity changes",
-                        entry.category, entry.key
-                    ));
-                    continue;
-                }
-
-                // Reject personal goal tracking in facts
-                if is_goal_fact(&entry.category, &entry.key, &entry.value) {
-                    results.push(format!(
-                        "Rejected [{}] {}: use manage_memories(create_personal_goal) for goals",
-                        entry.category, entry.key
-                    ));
-                    continue;
-                }
-
-                // Empty/whitespace-only value or explicit deletion markers → delete the fact
-                if is_deletion_marker(&entry.value) {
+                if entry.delete {
                     let deleted = self
                         .state
                         .delete_fact_by_key(&entry.category, &entry.key)
@@ -467,6 +380,13 @@ impl Tool for RememberFactTool {
                             entry.category, entry.key
                         ));
                     }
+                    continue;
+                }
+                if entry.value.trim().is_empty() {
+                    results.push(format!(
+                        "Not stored [{}] {}: value is empty (set delete: true to forget it)",
+                        entry.category, entry.key
+                    ));
                     continue;
                 }
 
@@ -599,25 +519,50 @@ mod tests {
         assert!(tool.call(&args.to_string()).await.is_err());
     }
 
-    #[test]
-    fn persona_guard_uses_word_boundaries() {
-        assert!(!is_persona_manipulation(
-            "personal",
-            "qa_codename",
-            "SYNTH-CODE-7"
-        ));
-        assert!(!is_persona_manipulation(
-            "user",
-            "favorite_drink",
-            "Sharpie accents"
-        ));
-        assert!(is_persona_manipulation("preference", "persona", "grumpy"));
-        assert!(is_persona_manipulation(
-            "preference",
-            "style",
-            "talk like a pirate"
-        ));
-        assert!(is_persona_manipulation("preference", "act_as", "my lawyer"));
+    /// A value is stored as written: "none" is an answer, and wording such
+    /// as "from now on" is not an attack. Forgetting is the typed flag.
+    #[tokio::test]
+    async fn values_are_stored_as_written_and_delete_is_typed() {
+        let (tool, state, _db) = setup().await;
+        let stored = |key: &'static str| {
+            let state = state.clone();
+            async move {
+                state
+                    .get_facts(None)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|f| f.key == key)
+                    .map(|f| f.value)
+            }
+        };
+        for (key, value) in [
+            ("allergies", "none"),
+            ("middle_name", "N/A"),
+            ("work_schedule", "From now on I work remote Fridays"),
+            ("quarter_goal", "my goal is to ship the synthetic widget"),
+        ] {
+            let out = tool
+                .call(&json!({"category": "user", "key": key, "value": value}).to_string())
+                .await
+                .unwrap();
+            assert!(out.contains("Remembered"), "{out}");
+            assert_eq!(stored(key).await.as_deref(), Some(value));
+        }
+
+        let out = tool
+            .call(&json!({"category": "user", "key": "allergies", "delete": true}).to_string())
+            .await
+            .unwrap();
+        assert!(out.contains("Deleted"), "{out}");
+        assert_eq!(stored("allergies").await, None);
+
+        let out = tool
+            .call(&json!({"category": "user", "key": "middle_name", "value": ""}).to_string())
+            .await
+            .unwrap();
+        assert!(out.contains("Not stored"), "{out}");
+        assert_eq!(stored("middle_name").await.as_deref(), Some("N/A"));
     }
 
     #[tokio::test]
@@ -626,13 +571,18 @@ mod tests {
         let effects = |args: Value| tool.call_semantics(&args.to_string()).mutation_effects;
 
         let batch_delete = effects(json!({
-            "facts": [{"category": "user", "key": "qa_codename", "value": "delete"}],
+            "facts": [{"category": "user", "key": "qa_codename", "delete": true}],
             "key": "", "value": ""
         }));
         assert!(batch_delete.satisfies(ToolMutationEffects::DESTRUCTIVE));
         assert!(batch_delete.satisfies(ToolMutationEffects::CONFIGURATION));
         assert!(
-            effects(json!({"category": "user", "key": "qa_codename", "value": ""}))
+            effects(json!({"category": "user", "key": "qa_codename", "delete": true}))
+                .satisfies(ToolMutationEffects::DESTRUCTIVE)
+        );
+        // A value that reads like a forget is a value.
+        assert!(
+            !effects(json!({"category": "user", "key": "qa_codename", "value": "delete"}))
                 .satisfies(ToolMutationEffects::DESTRUCTIVE)
         );
 
@@ -650,9 +600,10 @@ mod tests {
         assert!(
             !ToolMutationEffects::CONFIGURATION.satisfies(ToolMutationEffects::LOCAL_DERIVED_WRITE)
         );
-        // An empty key/value pair names nothing to delete.
+        // An empty key names nothing to delete.
         assert!(
-            !effects(json!({"key": "", "value": ""})).satisfies(ToolMutationEffects::DESTRUCTIVE)
+            !effects(json!({"key": "", "delete": true}))
+                .satisfies(ToolMutationEffects::DESTRUCTIVE)
         );
     }
 }

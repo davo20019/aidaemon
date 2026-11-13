@@ -355,6 +355,7 @@ async fn search_facts_collapses_canonical_duplicate() {
             display_value: None,
             valid_from: None,
             valid_to: None,
+            retract: false,
         }],
         direct_user_statement: true,
         ..Default::default()

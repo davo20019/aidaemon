@@ -143,6 +143,10 @@ pub struct PersonalFactCandidate {
     pub valid_from: Option<String>,
     #[serde(default)]
     pub valid_to: Option<String>,
+    /// The writer asks to forget this predicate rather than state a value.
+    /// Only a direct owner statement retracts; `value` is ignored.
+    #[serde(default)]
+    pub retract: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

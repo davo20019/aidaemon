@@ -692,7 +692,7 @@ const TOOL_PARAMETERS_CHARS: usize = 4_000;
 
 /// The tool's documented contract for the verifier: its description and its
 /// parameter docs. The one-line description alone hid what an argument
-/// means (`remember_fact` value `"delete"` removes a fact), so a valid
+/// means (`remember_fact` `delete: true` removes a fact), so a valid
 /// forget read as storing a junk fact and was refused.
 pub fn tool_contract(description: &str, schema: &Value) -> String {
     match schema.get("parameters") {
@@ -726,7 +726,7 @@ mod tests {
     use super::*;
 
     /// The verifier sees what the arguments mean, not only the tool's
-    /// one-line description: `remember_fact` documents `"delete"` as a forget.
+    /// one-line description: `remember_fact` documents `delete` as a forget.
     #[test]
     fn the_verifier_sees_the_tools_parameter_docs() {
         let schema = json!({
@@ -735,7 +735,7 @@ mod tests {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "value": {"type": "string", "description": "Value; empty or 'delete' removes it."}
+                    "delete": {"type": "boolean", "description": "Forget category/key; value is ignored."}
                 }
             }
         });
@@ -745,11 +745,11 @@ mod tests {
             true,
             "remember_fact",
             &contract,
-            &json!({"category": "user", "key": "office", "value": "delete"}),
+            &json!({"category": "user", "key": "office", "delete": true}),
         );
         let user = messages[1]["content"].as_str().unwrap();
         assert!(user.contains("Parameters (JSON Schema)"), "{user}");
-        assert!(user.contains("'delete' removes it"), "{user}");
+        assert!(user.contains("Forget category/key"), "{user}");
     }
 
     #[test]
