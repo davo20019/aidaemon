@@ -97,8 +97,8 @@ pub enum StatusUpdate {
     /// the turn finished work itself after a helper ended ("Finished by me
     /// after the helper: Drupal install" and that work's measured line);
     /// `total`: the request's whole time, from the owner's message to the
-    /// answer ("Finished 10m 12s after your request (5:30:24 PM to 5:40:36
-    /// PM ET).").
+    /// answer ("Answer sent 10m 12s after your request (5:30:24 PM to
+    /// 5:40:36 PM ET)."), when it adds to the helpers' own times.
     Finished {
         by_me: Option<String>,
         total: Option<String>,

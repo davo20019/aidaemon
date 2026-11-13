@@ -81,8 +81,9 @@ pub struct GroupAnswer {
     /// The turn's task, which the continuation continues.
     pub parent_task_id: Option<String>,
     /// When the owner's request that started the runs came in (the
-    /// earliest of their records): the answer's total is measured from it.
-    pub requested_at: Option<DateTime<Utc>>,
+    /// earliest of their records), how many ran and when the last ended:
+    /// the answer's total is measured against it.
+    pub clock: Option<crate::run_state::RequestClock>,
     /// Each run's own result message, in start order: what the chat gets
     /// when no answer can be written.
     pub messages: Vec<String>,
@@ -350,7 +351,7 @@ impl BackgroundRun {
             GroupTurn::Complete(ends) => RunsTurn::Answer(GroupAnswer {
                 followup: group_followup(&ends, max_report_chars),
                 parent_task_id: self.task_id.clone(),
-                requested_at: crate::run_state::request_began(&ends),
+                clock: crate::run_state::RequestClock::of_group(&ends),
                 messages: ends.into_iter().map(|end| end.message).collect(),
             }),
         }

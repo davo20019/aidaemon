@@ -3201,7 +3201,7 @@ async fn run_background_continuation_with_timeout(
                 timeout.as_secs()
             )
         })?;
-    let requested_at = request.requested_at;
+    let clock = request.clock;
     let mut envelope = tokio::time::timeout_at(deadline, agent.continue_conversation(request))
         .await
         .map_err(|_| {
@@ -3213,13 +3213,16 @@ async fn run_background_continuation_with_timeout(
     // The final answer to a request carries its total, measured from the
     // owner's message to now and rendered from the records, never the
     // model's estimate (live 2026-11-13: an answer said the total "wasn't
-    // measured").
-    if let (Some(requested), false) = (requested_at, envelope.text.trim().is_empty()) {
+    // measured"), when it adds to the runs' own times.
+    let total = clock
+        .filter(|_| !envelope.text.trim().is_empty())
+        .and_then(|clock| crate::spawn_tool::answer_sent_line(clock, false, chrono::Utc::now()));
+    if let Some(total) = total {
         envelope.text = format!(
             "{}\n\n{}{}",
             envelope.text.trim_end(),
             crate::turn::sliding_window::MEASURED_TIMING_MARK,
-            crate::spawn_tool::request_total_line(requested, chrono::Utc::now())
+            total
         );
     }
     Ok(envelope)
@@ -6102,12 +6105,12 @@ impl TerminalTool {
                                                     .clone(),
                                                 parent_result_id: completion_parent_result_id
                                                     .clone(),
-                                                requested_at: match group_answer.as_ref() {
-                                                    Some(answer) => answer.requested_at,
+                                                clock: match group_answer.as_ref() {
+                                                    Some(answer) => answer.clock,
                                                     None => ended
                                                         .as_ref()
                                                         .and_then(|(state, _)| state.as_ref())
-                                                        .and_then(|state| state.requested_at),
+                                                        .and_then(crate::run_state::RequestClock::of_run),
                                                 },
                                             },
                                         )
@@ -10883,12 +10886,14 @@ mod tests {
     }
 
     /// A request answered once its background runs ended gets its total
-    /// under the final answer, measured from the owner's message to the
-    /// answer and rendered from the records; a continuation that knows no
-    /// request time adds nothing.
+    /// under the final answer, labelled as the answer's time, only when it
+    /// adds to the runs' own "ended … after your request": several runs or
+    /// a notable gap after the last one. One run that ended just before the
+    /// answer, or no request time, adds nothing (live 2026-11-13: "ended 16s
+    /// after your request" then "Finished 24s after your request").
     #[tokio::test]
-    async fn a_continuations_final_answer_carries_the_requests_total() {
-        let request = |requested_at| ConversationRequest {
+    async fn a_continuations_final_answer_carries_the_answer_time_when_it_adds_something() {
+        let request = |clock| ConversationRequest {
             session_id: "telegram:synthetic-total".to_string(),
             user_text: "[Background helpers finished]".to_string(),
             status_tx: None,
@@ -10898,34 +10903,47 @@ mod tests {
             parent_task_id: Some("synthetic-parent".to_string()),
             parent_tool_call_id: None,
             parent_result_id: None,
-            requested_at,
+            clock,
         };
-        let requested = chrono::Utc::now() - chrono::Duration::seconds(612);
-        let answered = run_background_continuation_with_timeout(
-            &AnsweringConversationRuntime,
-            request(Some(requested)),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
-        let (answer, footer) = answered.text.split_once("\n\n").unwrap();
-        assert_eq!(answer, "Drupal is installed.");
+        let answer = |clock| async move {
+            run_background_continuation_with_timeout(
+                &AnsweringConversationRuntime,
+                request(clock),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap()
+            .text
+        };
+        let now = chrono::Utc::now();
+        let requested = now - chrono::Duration::seconds(612);
+        let clock = |runs, ended_ago| crate::run_state::RequestClock {
+            requested,
+            runs,
+            last_run_ended: Some(now - chrono::Duration::seconds(ended_ago)),
+        };
+
+        let several = answer(Some(clock(2, 5))).await;
+        let (body, footer) = several.split_once("\n\n").unwrap();
+        assert_eq!(body, "Drupal is installed.");
         assert!(
             footer.starts_with(&format!(
-                "{}Finished 10m 1",
+                "{}Answer sent 10m 1",
                 crate::turn::sliding_window::MEASURED_TIMING_MARK
             )),
             "{footer}"
         );
         assert!(footer.contains("after your request ("), "{footer}");
-        let unmeasured = run_background_continuation_with_timeout(
-            &AnsweringConversationRuntime,
-            request(None),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
-        assert_eq!(unmeasured.text, "Drupal is installed.");
+
+        let late = answer(Some(clock(1, 120))).await;
+        assert!(late.contains("Answer sent 10m 1"), "{late}");
+
+        assert_eq!(
+            answer(Some(clock(1, 8))).await,
+            "Drupal is installed.",
+            "one run that just ended: its own end already says it"
+        );
+        assert_eq!(answer(None).await, "Drupal is installed.");
     }
 
     #[tokio::test]
@@ -10940,7 +10958,7 @@ mod tests {
             parent_task_id: Some("synthetic-parent".to_string()),
             parent_tool_call_id: Some("synthetic-call".to_string()),
             parent_result_id: None,
-            requested_at: None,
+            clock: None,
         };
         let error = run_background_continuation_with_timeout(
             &PendingConversationRuntime,

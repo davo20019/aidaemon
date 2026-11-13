@@ -1444,7 +1444,7 @@ async fn a_request_finished_by_the_parent_after_its_helper_shows_its_total() {
     );
     let total = reply
         .lines()
-        .find(|line| line.starts_with(&format!("{measured}Finished ")) && line.contains("after your request ("))
+        .find(|line| line.starts_with(&format!("{measured}Answer sent ")) && line.contains("after your request ("))
         .unwrap_or_else(|| panic!("the request's total under the answer: {reply}"));
     assert!(total.ends_with("ET)."), "{total}");
     assert!(!reply.contains("wasn't measured"), "{reply}");

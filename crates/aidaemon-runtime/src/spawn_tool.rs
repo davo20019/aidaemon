@@ -892,24 +892,45 @@ pub fn since_request_view(
     }
 }
 
+/// The answer's time this close after the last run's end says nothing the
+/// run's own "ended … after your request" did not (live 2026-11-13: one
+/// run "ended 16s after your request", then "Finished 24s after your
+/// request" read as a second figure for the same thing).
+pub const NOTABLE_ANSWER_GAP_SECS: i64 = 30;
+
 /// A request's whole time as the owner reads it, from their message to
-/// the answer: "Finished 10m 12s after your request (5:30:24 PM to 5:40:36
-/// PM ET)." The one wording of a request's total, under every final
-/// answer that measures one.
-pub fn request_total_line(
-    requested: chrono::DateTime<chrono::Utc>,
+/// the answer: "Answer sent 10m 12s after your request (5:30:24 PM to
+/// 5:40:36 PM ET)." The one renderer of a request's total, under every
+/// final answer. It is shown only when it adds to the runs' own times:
+/// several runs, work the parent did itself after them
+/// (`parent_worked_after`), no run end on record, or a gap of
+/// [`NOTABLE_ANSWER_GAP_SECS`] or more between the last run's end and the
+/// answer. Otherwise the run's "ended … after your request" already says
+/// it.
+pub fn answer_sent_line(
+    clock: crate::run_state::RequestClock,
+    parent_worked_after: bool,
     answered: chrono::DateTime<chrono::Utc>,
-) -> String {
-    format!(
-        "Finished {}.",
-        since_request_view(requested, answered).words
-    )
+) -> Option<String> {
+    let gap_is_notable = clock.last_run_ended.is_none_or(|ended| {
+        crate::run_state::measured_span(ended, answered)
+            .took()
+            .num_seconds()
+            >= NOTABLE_ANSWER_GAP_SECS
+    });
+    (clock.runs != 1 || parent_worked_after || gap_is_notable).then(|| {
+        format!(
+            "Answer sent {}.",
+            since_request_view(clock.requested, answered).words
+        )
+    })
 }
 
 /// What the runtime measured of a request a turn finished after helpers it
 /// waited on, worded for the owner: the work the turn finished itself after
 /// a helper (`by_me`, only when it changed something), and the request's
-/// total (`total`, when the turn knows when the request came in).
+/// total (`total`, when the turn knows when the request came in and it adds
+/// something: [`answer_sent_line`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestFinished {
     pub by_me: Option<String>,
@@ -934,8 +955,8 @@ impl RequestFinished {
 
 /// The measured end of a request a turn finished after a helper it waited
 /// on ended, from the records: `requested` (when the owner's message came
-/// in), `after` (when the helper ended and whether the turn then changed
-/// anything itself) and `answered` (now).
+/// in), `after` (when the last helper ended, how many it waited on, and
+/// whether the turn then changed anything itself) and `answered` (now).
 pub fn request_finished(
     requested: Option<chrono::DateTime<chrono::Utc>>,
     after: &crate::engine::scope::AfterHelper,
@@ -952,7 +973,17 @@ pub fn request_finished(
                 )
             )
         }),
-        total: requested.map(|requested| request_total_line(requested, answered)),
+        total: requested.and_then(|requested| {
+            answer_sent_line(
+                crate::run_state::RequestClock {
+                    requested,
+                    runs: after.helpers,
+                    last_run_ended: Some(after.since),
+                },
+                after.did_work,
+                answered,
+            )
+        }),
     }
 }
 
@@ -2293,7 +2324,7 @@ async fn answer_group(route: &ResultRoute, ends: Vec<crate::run_state::GroupEnd>
             chat: chat.clone(),
             parent_task_id: route.parent_task_id.clone(),
             followup: group_followup(&ends, route.max_response_chars),
-            requested_at: crate::run_state::request_began(&ends),
+            clock: crate::run_state::RequestClock::of_group(&ends),
         })
         .await;
     match answered {
@@ -2380,11 +2411,12 @@ pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usi
          mention what was sent, say exactly that (a helper whose list says nothing sent \
          nothing), never what a report claims it sent. The \"Times\" lines \
          are the only durations there are: \"took\" is a helper's own work from its start to its \
-         end, \"after your request\" counts from the owner's request. If you mention a time, \
-         quote one of these figures with its own words (\"took …\" or \"… after your request\"); \
-         never call one by the other's name and never work a time out yourself. The request's \
-         total, from the owner's message to this answer, is measured by the daemon and shown \
-         under your answer: never say it wasn't measured, and don't state one of your own. A record's \
+         end, \"ended … after your request\" is when a helper ended, counted from the owner's \
+         request. If you mention a time, quote one of these figures with its own words \
+         (\"took …\" or \"ended … after your request\"); never call one by the other's name and \
+         never work a time out yourself. When the answer's own time adds to these, the daemon \
+         measures it and shows it under your answer as \"Answer sent … after your request\": \
+         never say it wasn't measured, and don't state one of your own. A record's \
          \"Next step\" is the daemon's offer: make it in your answer, as given. Don't call tools \
          to re-check this work.",
     );
@@ -2914,6 +2946,37 @@ mod group_tests {
     use super::*;
     use crate::run_state::{GroupEnd, GroupTurn, RunMeasure, RunReport, RunState, RunStates};
     use crate::spawn::{ChildAgentRequest, ChildAgentRun, ChildAgentRuntime, RunsAnswer};
+
+    /// The answer's own time is shown only when it adds to the runs'
+    /// times, and always under its own label, never the run's "ended …".
+    #[test]
+    fn the_answer_time_shows_only_when_it_adds_to_the_runs_times() {
+        let requested = chrono::Utc::now();
+        let at = |secs| requested + chrono::Duration::seconds(secs);
+        let clock = |runs, ended: Option<i64>| crate::run_state::RequestClock {
+            requested,
+            runs,
+            last_run_ended: ended.map(at),
+        };
+        // One run that ended 8 s before the answer: its end says it.
+        assert_eq!(answer_sent_line(clock(1, Some(16)), false, at(24)), None);
+        for (clock, worked, why) in [
+            (clock(2, Some(16)), false, "several runs"),
+            (clock(1, Some(16)), true, "parent work after the run"),
+            (clock(1, Some(16)), false, "a notable gap"),
+            (clock(1, None), false, "no run end on record"),
+        ] {
+            let answered = if why == "a notable gap" {
+                at(60)
+            } else {
+                at(24)
+            };
+            let line = answer_sent_line(clock, worked, answered)
+                .unwrap_or_else(|| panic!("{why}: the answer time is shown"));
+            assert!(line.starts_with("Answer sent "), "{why}: {line}");
+            assert!(line.contains(" after your request ("), "{why}: {line}");
+        }
+    }
 
     /// A parent that records the group answers it is asked to write.
     #[derive(Default)]

@@ -1004,10 +1004,12 @@ impl TurnEngine<'_> {
                     .unwrap_or("the helper"),
             );
             if let Ok(mut after) = scope.after_helper.lock() {
+                let helpers = after.as_ref().map_or(0, |after| after.helpers) + 1;
                 *after = Some(crate::engine::scope::AfterHelper {
                     since: chrono::Utc::now(),
                     helper,
                     did_work: false,
+                    helpers,
                 });
             }
         } else if !failed {

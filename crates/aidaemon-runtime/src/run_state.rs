@@ -428,6 +428,38 @@ pub fn request_began(ends: &[GroupEnd]) -> Option<DateTime<Utc>> {
     ends.iter().filter_map(|end| end.state.requested_at).min()
 }
 
+/// What a request's answer is measured against: when the owner asked, how
+/// many runs it waited on, and when the last of them ended. It decides
+/// whether the answer's own time adds anything to the runs' times
+/// ([`crate::spawn_tool::answer_sent_line`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestClock {
+    pub requested: DateTime<Utc>,
+    pub runs: usize,
+    /// `None` when no run's end is on record.
+    pub last_run_ended: Option<DateTime<Utc>>,
+}
+
+impl RequestClock {
+    /// The clock of a group of runs' answer, from their records.
+    pub fn of_group(ends: &[GroupEnd]) -> Option<Self> {
+        Some(Self {
+            requested: request_began(ends)?,
+            runs: ends.len(),
+            last_run_ended: ends.iter().filter_map(|end| end.state.ended_at).max(),
+        })
+    }
+
+    /// The clock of one run's answer, from its record.
+    pub fn of_run(state: &RunState) -> Option<Self> {
+        Some(Self {
+            requested: state.requested_at?,
+            runs: 1,
+            last_run_ended: state.ended_at,
+        })
+    }
+}
+
 /// One grouped run's end with its result, held until its group's last run
 /// ends.
 #[derive(Debug, Clone)]

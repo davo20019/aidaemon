@@ -1260,9 +1260,10 @@ pub struct RunsAnswer {
     /// The runs' results and measured times, from their records
     /// ([`crate::spawn_tool::group_followup`]).
     pub followup: String,
-    /// When the owner's request that started the runs came in: the
-    /// answer's total is measured from it.
-    pub requested_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the owner's request that started the runs came in, how many
+    /// ran and when the last ended: the answer's total is measured against
+    /// it.
+    pub clock: Option<crate::run_state::RequestClock>,
 }
 
 /// Owned input for re-entering an existing conversation.
@@ -1278,11 +1279,11 @@ pub struct ConversationRequest {
     pub parent_task_id: Option<String>,
     pub parent_tool_call_id: Option<String>,
     pub parent_result_id: Option<String>,
-    /// When the owner's request this continues came in, when the
-    /// continuation gives its final answer: the request's total, from then
-    /// to the answer, is measured and rendered under it
-    /// ([`crate::spawn_tool::request_total_line`]).
-    pub requested_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the owner's request this continues came in and the runs it
+    /// waited on, when the continuation gives its final answer: the
+    /// request's total, from then to the answer, is rendered under it when
+    /// it adds to the runs' times ([`crate::spawn_tool::answer_sent_line`]).
+    pub clock: Option<crate::run_state::RequestClock>,
 }
 
 /// Minimal agent surface needed by background command/CLI completion paths.

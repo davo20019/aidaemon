@@ -232,4 +232,6 @@ pub struct AfterHelper {
     pub helper: String,
     /// The run finished work itself after the helper.
     pub did_work: bool,
+    /// How many helpers the run has waited on so far, this one included.
+    pub helpers: usize,
 }

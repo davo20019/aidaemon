@@ -3353,12 +3353,12 @@ impl CliAgentTool {
                                     parent_task_id,
                                     parent_tool_call_id: None,
                                     parent_result_id: None,
-                                    requested_at: match group_answer.as_ref() {
-                                        Some(answer) => answer.requested_at,
+                                    clock: match group_answer.as_ref() {
+                                        Some(answer) => answer.clock,
                                         None => ended
                                             .as_ref()
                                             .and_then(|(state, _)| state.as_ref())
-                                            .and_then(|state| state.requested_at),
+                                            .and_then(crate::run_state::RequestClock::of_run),
                                     },
                                 },
                             )

@@ -583,7 +583,7 @@ mod tests {
         helper.took = Some("Took 7m 54s (12:30:56 PM to 12:38:50 PM ET).".into());
         let finished = finished_block(
             Some("Finished by me after the helper: Drupal install\nTook 2m 44s (12:38:50 PM to 12:41:34 PM ET)."),
-            Some("Finished 11m 10s after your request (12:30:24 PM to 12:41:34 PM ET)."),
+            Some("Answer sent 11m 10s after your request (12:30:24 PM to 12:41:34 PM ET)."),
         )
         .unwrap();
         let card = render_card(&CardView {
@@ -595,7 +595,7 @@ mod tests {
         assert!(
             card.ends_with(
                 "✅ Finished by me after the helper: Drupal install\nTook 2m 44s (12:38:50 PM \
-                 to 12:41:34 PM ET).\nFinished 11m 10s after your request (12:30:24 PM to \
+                 to 12:41:34 PM ET).\nAnswer sent 11m 10s after your request (12:30:24 PM to \
                  12:41:34 PM ET)."
             ),
             "{card}"
