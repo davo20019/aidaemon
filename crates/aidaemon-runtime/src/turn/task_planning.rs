@@ -436,6 +436,56 @@ pub fn digest_identity(outcome: &crate::llm::decisions::DecisionOutcome) -> bool
 /// Determine whether a turn bypasses the relationship router. Semantic
 /// interpretation belongs to the model. Only protocol-level acknowledgments
 /// and exact emergency control commands bypass it.
+/// A `/private` request belongs to the sender who made it: in a shared chat
+/// another person's message neither consumes nor cancels it. A sender the
+/// channel cannot identify keys by the session alone.
+fn private_key(session_id: &str, sender_id: Option<&str>) -> String {
+    match sender_id {
+        Some(sender) => format!("learning_opt_out:{session_id}:{sender}"),
+        None => format!("learning_opt_out:{session_id}"),
+    }
+}
+
+/// `/private`: opt the sender's next message in this chat out of learning
+/// (`on`), or cancel the sender's own request.
+pub async fn set_next_message_private(
+    state: &(impl aidaemon_tools::services::SettingsStore + ?Sized),
+    session_id: &str,
+    sender_id: Option<&str>,
+    on: bool,
+) -> anyhow::Result<()> {
+    state
+        .set_setting(
+            &private_key(session_id, sender_id),
+            if on { "next" } else { "" },
+        )
+        .await
+}
+
+/// Whether the sender's `/private` opted this message out, consuming the
+/// request. A read error opts the message out: a request not to remember
+/// must not be lost to a storage fault.
+pub async fn take_next_message_private(
+    state: &(impl aidaemon_tools::services::SettingsStore + ?Sized),
+    session_id: &str,
+    sender_id: Option<&str>,
+) -> bool {
+    let key = private_key(session_id, sender_id);
+    match state.get_setting(&key).await {
+        Ok(Some(value)) if !value.is_empty() => {
+            if let Err(error) = state.set_setting(&key, "").await {
+                tracing::warn!(session_id, %error, "Could not clear the /private request");
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(error) => {
+            tracing::warn!(session_id, %error, "Could not read the /private request; not learning from this message");
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 fn should_skip_planning(
     _task_kind: &crate::turn::completion_contract::CompletionTaskKind,

@@ -108,3 +108,68 @@ pub fn extract_json_object(raw: &str) -> Option<String> {
         None
     }
 }
+
+/// Desktop-control tools, offered only in direct and internal sessions.
+pub const DESKTOP_CONTROL_TOOLS: &[&str] = &["computer_use"];
+
+/// Whether desktop-control tools may be exposed in a conversation of this
+/// visibility. Only direct messages (`Private`) and internal/system sessions
+/// (`Internal`, e.g. the scheduler or spawned sub-agents) qualify. Group and
+/// public channels never do, so another participant's message cannot reach
+/// the desktop.
+pub fn visibility_allows_desktop_control(visibility: aidaemon_core::ChannelVisibility) -> bool {
+    matches!(
+        visibility,
+        aidaemon_core::ChannelVisibility::Private | aidaemon_core::ChannelVisibility::Internal
+    )
+}
+
+/// Strip desktop-control tools from `defs`/`caps` when the channel visibility
+/// does not permit them. No-op for `Private`/`Internal`.
+pub fn restrict_desktop_control_for_visibility(
+    defs: &mut Vec<Value>,
+    caps: &mut std::collections::HashMap<String, aidaemon_tools::semantics::ToolCapabilities>,
+    visibility: aidaemon_core::ChannelVisibility,
+) {
+    if visibility_allows_desktop_control(visibility) {
+        return;
+    }
+    defs.retain(|d| {
+        tool_name_from_definition(d)
+            .map(|name| !DESKTOP_CONTROL_TOOLS.contains(&name))
+            .unwrap_or(true)
+    });
+    caps.retain(|name, _| !DESKTOP_CONTROL_TOOLS.contains(&name.as_str()));
+}
+
+/// Tools that read outside content, kept from a turn an untrusted external
+/// reference skill steers.
+pub fn is_untrusted_external_reference_blocked_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file"
+            | "search_files"
+            | "project_inspect"
+            | "check_environment"
+            | "web_fetch"
+            | "web_search"
+            | "browser"
+            | "send_file"
+            | "skill_resources"
+    )
+}
+
+/// `defs` without the tools [`is_untrusted_external_reference_blocked_tool`]
+/// names.
+pub fn filter_tool_defs_for_untrusted_external_reference(defs: &[Value]) -> Vec<Value> {
+    defs.iter()
+        .filter(|def| {
+            let name = def
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str());
+            !name.is_some_and(is_untrusted_external_reference_blocked_tool)
+        })
+        .cloned()
+        .collect()
+}

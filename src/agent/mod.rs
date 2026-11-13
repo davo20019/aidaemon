@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -12,10 +11,13 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::{IterationLimitConfig, PathAliasConfig};
+#[cfg(test)]
 use crate::events::{
-    AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
-    SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData, TaskStatus,
-    ThinkingStartData, ToolResultData,
+    AssistantResponseData, TaskEndData, TaskStartData, ThinkingStartData, ToolResultData,
+};
+use crate::events::{
+    DecisionPointData, DecisionType, EventStore, EventType, SubAgentCompleteData,
+    SubAgentSpawnData, TaskStatus,
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
@@ -26,11 +28,10 @@ use crate::providers::{ProviderError, ProviderErrorKind, ProviderRecoveryRoute};
 use crate::router::Router;
 use crate::runtime_ports::OutboundRouter;
 use crate::skills;
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{
     AgentRole, ChatOptions, Message, StateStore, Tool, ToolCapabilities, ToolRole,
 };
-use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
+use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
 #[cfg(test)]
 use crate::events::ToolCallInfo;
@@ -43,12 +44,6 @@ pub use crate::types::StatusUpdate;
 use crate::traits::Task;
 
 const DEFERRED_NO_TOOL_ERROR_MARKER: &str = "deferred-action no-tool loop";
-/// If the same tool NAME is called this many consecutive iterations (even with
-/// different arguments), treat it as a loop.  This catches the case where the
-/// LLM keeps calling e.g. `terminal` with varied commands without progress.
-/// Set high enough to allow complex multi-step investigations from mobile,
-/// and to leave room for follow-up work after cli_agent returns.
-use aidaemon_runtime::turn::loop_utils::MAX_CONSECUTIVE_SAME_TOOL;
 #[path = "response_analysis.rs"]
 mod response_analysis;
 #[cfg(test)]
@@ -72,17 +67,16 @@ use intent_routing::infer_intent_gate;
 #[allow(unused_imports)]
 pub(crate) use intent_routing::contains_keyword_as_words as keyword_match;
 /// Policy signals live in `aidaemon-runtime`.
+#[cfg(test)]
 mod policy_signals {
     pub(super) use aidaemon_runtime::policy::signals::*;
 }
 #[cfg(test)]
 use policy_signals::is_short_user_correction;
-use policy_signals::{build_policy_bundle, detect_explicit_outcome_signal};
 /// Validation state lives in `aidaemon-runtime`.
 mod validation_state {
     pub(crate) use aidaemon_runtime::turn::validation_state::*;
 }
-pub(in crate::agent) use validation_state::ApprovalState;
 pub(crate) use validation_state::{
     build_needs_approval_request, derive_executor_step_result, extract_executor_handoff_context,
     persist_executor_handoff_context, persist_executor_result_context, ExecutorHandoff,
@@ -94,7 +88,7 @@ mod execution_state;
 pub(crate) use execution_state::ExecutionBudget;
 pub(crate) use execution_state::TargetScope;
 pub(in crate::agent) use execution_state::{
-    select_initial_execution_budget, ExecutionPersistence, ExecutionState, StepExecutionOutcome,
+    select_initial_execution_budget, ExecutionPersistence, ExecutionState,
 };
 /// Tool-failure classification lives in `aidaemon-runtime`.
 mod loop_utils {
@@ -138,6 +132,7 @@ pub(crate) mod conversation_compaction;
 #[path = "runtime/coordination.rs"]
 pub(crate) mod coordination;
 /// The cacheable core prompt lives in `aidaemon-runtime`.
+#[cfg(test)]
 mod core_prompt {
     pub(crate) use aidaemon_runtime::prompt::core::*;
 }
@@ -184,13 +179,12 @@ mod tool_result_fit;
 mod turn_context;
 #[path = "runtime/untrusted.rs"]
 pub(crate) mod untrusted;
-pub(in crate::agent) use completion_contract::persistable_completion_contract;
+#[cfg(test)]
+pub(in crate::agent) use completion_contract::CompletionTaskKind;
 #[cfg(test)]
 pub(in crate::agent) use followup::FollowupMode;
-pub(in crate::agent) use history::retain_structural_completion_contract;
 pub(in crate::agent) use history::CompletionContract;
 pub(in crate::agent) use history::CompletionProgress;
-pub(in crate::agent) use history::CompletionTaskKind;
 pub(in crate::agent) use history::TurnContext;
 pub(in crate::agent) mod eval;
 /// Evidence routing lives in `aidaemon-runtime`.
@@ -222,6 +216,7 @@ pub(crate) use aidaemon_runtime::spawn::child_status_label as helper_card_label;
 /// The session history appends and turn-context assembly, on any TurnHost.
 pub(in crate::agent) use aidaemon_runtime::turn::turn_context::TurnHistory;
 /// The speech-to-text fallback lives in `aidaemon-runtime`.
+#[cfg(test)]
 pub(crate) mod stt {
     pub(crate) use aidaemon_runtime::media::stt::*;
 }
@@ -246,7 +241,7 @@ pub(crate) mod vision {
     pub(crate) use aidaemon_runtime::media::vision::*;
 }
 
-pub(in crate::agent) use eval::{HarnessEvalAccumulator, HarnessEvalConfig, HarnessEvalSeed};
+pub(in crate::agent) use eval::{HarnessEvalAccumulator, HarnessEvalConfig};
 use system_prompt::format_goal_context;
 pub(in crate::agent) use tool_result_notices::ToolResultNotice;
 
@@ -271,14 +266,12 @@ pub(in crate::agent) use policy_metrics::{
 // filtering, intent-gate merge). Implementation lives in `agent_helpers.rs`.
 #[path = "agent_helpers.rs"]
 mod agent_helpers;
+pub(in crate::agent) use agent_helpers::is_untrusted_external_reference_blocked_tool;
+pub use agent_helpers::touch_heartbeat;
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::IntentGateDecision;
-pub(in crate::agent) use agent_helpers::{
-    filter_tool_defs_for_untrusted_external_reference, is_resume_request,
-    is_untrusted_external_reference_blocked_tool, truncate_for_resume, ResumeCheckpoint,
-    ResumeExecutionSnapshot,
-};
-pub use agent_helpers::{send_status, touch_heartbeat};
+#[cfg(test)]
+pub(in crate::agent) use agent_helpers::ResumeCheckpoint;
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::{
     user_explicitly_requests_local_file_inspection, user_text_references_filesystem_path,
@@ -292,19 +285,7 @@ type WindowBoundaryMemory = Arc<tokio::sync::RwLock<HashMap<String, (usize, Opti
 /// Immutable execution identity for one worker inside one autonomous mandate
 /// decision cycle. The lease token is Rust-side control state and must never be
 /// serialized, logged, or exposed to the model.
-#[derive(Clone)]
-pub(crate) struct MandateExecutionFence {
-    pub(crate) mandate_id: String,
-    pub(crate) mandate_version: i64,
-    pub(crate) authority: crate::traits::MandateAuthority,
-    pub(crate) goal_id: String,
-    pub(crate) goal_run_id: String,
-    pub(crate) root_task_id: String,
-    pub(crate) root_task_attempt_id: String,
-    pub(crate) worker_task_id: String,
-    pub(crate) attempt_id: String,
-    pub(crate) lease_token: String,
-}
+pub(crate) use aidaemon_runtime::turn_runtime::MandateExecutionFence;
 
 pub struct Agent {
     llm_runtime: SharedLlmRuntime,
