@@ -9,18 +9,17 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use crate::config::{IterationLimitConfig, PathAliasConfig};
+use crate::events::EventStore;
 #[cfg(test)]
 use crate::events::TaskStatus;
 #[cfg(test)]
 use crate::events::{
     AssistantResponseData, TaskEndData, TaskStartData, ThinkingStartData, ToolResultData,
 };
-use crate::events::{
-    DecisionPointData, DecisionType, EventStore, EventType, SubAgentCompleteData, SubAgentSpawnData,
-};
+#[cfg(test)]
+use crate::events::{DecisionPointData, DecisionType, EventType};
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
 use crate::llm_runtime::side_calls::SideCall;
@@ -30,7 +29,7 @@ use crate::runtime_ports::OutboundRouter;
 use crate::skills;
 #[cfg(test)]
 use crate::traits::Message;
-use crate::traits::{AgentRole, StateStore, Tool, ToolCapabilities, ToolRole};
+use crate::traits::{AgentRole, StateStore, Tool, ToolCapabilities};
 use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
 #[cfg(test)]
@@ -91,10 +90,6 @@ pub(crate) use execution_state::TargetScope;
 mod loop_utils {
     pub(in crate::agent) use aidaemon_runtime::turn::loop_utils::*;
 }
-/// Recall guardrails live in `aidaemon-runtime`.
-mod recall_guardrails {
-    pub(super) use aidaemon_runtime::policy::recall_guardrails::*;
-}
 use loop_utils::is_trigger_session;
 /// The post-run learning context lives in `aidaemon-runtime`.
 mod post_task {
@@ -151,10 +146,6 @@ mod notes;
 mod parent_delivery;
 #[path = "turn/post_turn.rs"]
 mod post_turn;
-/// Project scopes live in `aidaemon-runtime`.
-mod project_scope {
-    pub(in crate::agent) use aidaemon_runtime::turn::project_scope::*;
-}
 #[path = "runtime/sdk_engine.rs"]
 pub(crate) mod sdk_engine;
 #[path = "runtime/sdk_provider.rs"]
@@ -223,8 +214,7 @@ mod tool_exec;
 #[path = "turn/tool_execution/mod.rs"]
 mod tool_execution;
 
-pub(in crate::agent) use eval::{HarnessEvalAccumulator, HarnessEvalConfig};
-use system_prompt::format_goal_context;
+pub(in crate::agent) use eval::HarnessEvalConfig;
 
 /// Policy runtime metrics and bounded autotuning live in `aidaemon-runtime`.
 mod policy_metrics {
@@ -428,22 +418,22 @@ impl AgentLimits {
     }
 }
 
-// Goal/task dispatch helpers. Implementation lives in `goal_dispatch.rs`.
+// Goal/task dispatch helpers live in `aidaemon_runtime::goal_dispatch`.
 #[path = "goal_dispatch.rs"]
 mod goal_dispatch;
-pub use goal_dispatch::is_group_session;
-pub(in crate::agent) use goal_dispatch::{
-    auto_dispatch_scheduled_run_extension_budget, clear_scheduled_run_state,
-    effective_goal_daily_budget, goal_has_scheduled_provenance, parse_goal_leading_wait,
-    parse_wait_task_seconds, persist_scheduled_run_state, strip_leading_wait,
-    task_has_scheduled_provenance, truncate_goal_result_text, user_facing_task_description,
-};
+#[cfg(test)]
+pub(crate) use goal_dispatch::{build_goal_failure_summary, extract_file_paths_from_text};
 pub(crate) use goal_dispatch::{
-    build_goal_failure_summary, build_goal_task_results_summary, extract_file_paths_from_text,
-    SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS, SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
+    build_goal_task_results_summary, SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS,
+    SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
 };
+pub(in crate::agent) use goal_dispatch::{
+    clear_scheduled_run_state, goal_has_scheduled_provenance, task_has_scheduled_provenance,
+};
+#[cfg(test)]
+pub(in crate::agent) use goal_dispatch::{parse_wait_task_seconds, user_facing_task_description};
 
-// Background task-lead spawner. Implementation lives in `background_task_lead.rs`.
+// A goal's background task lead lives in `aidaemon_runtime::background_task_lead`.
 #[path = "background_task_lead.rs"]
 mod background_task_lead;
 pub use background_task_lead::spawn_background_task_lead;
@@ -569,17 +559,6 @@ impl Agent {
     #[cfg(test)]
     pub(crate) fn event_store(&self) -> &Arc<EventStore> {
         &self.event_store
-    }
-
-    pub(in crate::agent) async fn with_harness_eval<R>(
-        &self,
-        f: impl FnOnce(&mut HarnessEvalAccumulator) -> R,
-    ) -> Option<R> {
-        self.runtime.with_harness_eval(f).await
-    }
-
-    pub(in crate::agent) fn harness_eval_enabled(&self) -> bool {
-        self.runtime.harness_eval_enabled()
     }
 
     /// Maximum recursion depth allowed.

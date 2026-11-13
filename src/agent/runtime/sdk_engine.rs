@@ -7,7 +7,6 @@
 
 use tracing::{info, warn};
 
-use super::Agent;
 use crate::config::{AppConfig, ProviderKind};
 
 pub(crate) use aidaemon_runtime::engine::settings::{
@@ -111,14 +110,6 @@ pub(crate) fn settings_from_config(
         backend.workspace_root().as_str().to_string(),
     );
     settings
-}
-
-impl Agent {
-    /// The trusted roots the owner configured: `[authority] trusted_roots`.
-    /// `[path_aliases] projects` is a naming convenience, not a grant.
-    pub(in crate::agent) fn configured_trust_roots(&self) -> Vec<String> {
-        self.sdk_engine.trusted_roots.clone()
-    }
 }
 
 #[cfg(test)]

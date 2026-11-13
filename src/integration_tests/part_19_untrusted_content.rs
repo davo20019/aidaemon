@@ -545,7 +545,7 @@ async fn guest_message_cannot_write_or_run_even_via_a_child() {
         "spawn_agent's own result is a refusal for a Read grant; saw {seen:?}"
     );
 
-    let parent = agent.inherited_for_child(None, UserRole::Guest, &ctx, None).await;
+    let parent = agent.engine().inherited_for_child(None, UserRole::Guest, &ctx, None).await;
     assert_eq!(parent.authority, Authority::read_only());
     assert_eq!(parent.owner_level, None);
 

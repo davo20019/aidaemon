@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::{SpecialistRegistry, SpecialistSource};
-use crate::traits::SpecialistKind;
+use aidaemon_agents::specialist::SpecialistKind;
 use std::fs;
 use tempfile::TempDir;
 

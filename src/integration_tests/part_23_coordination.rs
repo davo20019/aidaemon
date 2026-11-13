@@ -407,6 +407,7 @@ mod coordination_tests {
         });
         let run = agent
             .run_child(ChildAgentRequest {
+                bound_task_attempt: None,
                 mission: "Tidy the synthetic notes".to_string(),
                 task: "Tidy them.".to_string(),
                 status_tx: None,
@@ -1061,6 +1062,7 @@ mod coordination_tests {
         let agent = Arc::new(harness.agent);
         agent
             .run_child(ChildAgentRequest {
+                bound_task_attempt: None,
                 mission: "Tidy the synthetic notes".to_string(),
                 task: "Tidy them.".to_string(),
                 status_tx: None,

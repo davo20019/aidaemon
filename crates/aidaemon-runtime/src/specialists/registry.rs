@@ -1,4 +1,4 @@
-use crate::traits::SpecialistKind;
+use aidaemon_agents::specialist::SpecialistKind;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
@@ -9,39 +9,39 @@ use super::{SpecialistDef, SpecialistRegistry, SpecialistSource};
 const BUNDLED: &[(SpecialistKind, &str)] = &[
     (
         SpecialistKind::TaskLead,
-        include_str!("../../../specialists/task_lead.md"),
+        include_str!("../../../../specialists/task_lead.md"),
     ),
     (
         SpecialistKind::Executor,
-        include_str!("../../../specialists/executor.md"),
+        include_str!("../../../../specialists/executor.md"),
     ),
     (
         SpecialistKind::Research,
-        include_str!("../../../specialists/research.md"),
+        include_str!("../../../../specialists/research.md"),
     ),
     (
         SpecialistKind::ArtifactWriter,
-        include_str!("../../../specialists/artifact_writer.md"),
+        include_str!("../../../../specialists/artifact_writer.md"),
     ),
     (
         SpecialistKind::Code,
-        include_str!("../../../specialists/code.md"),
+        include_str!("../../../../specialists/code.md"),
     ),
     (
         SpecialistKind::BrowserVerifier,
-        include_str!("../../../specialists/browser_verifier.md"),
+        include_str!("../../../../specialists/browser_verifier.md"),
     ),
     (
         SpecialistKind::Review,
-        include_str!("../../../specialists/review.md"),
+        include_str!("../../../../specialists/review.md"),
     ),
     (
         SpecialistKind::CommsDraft,
-        include_str!("../../../specialists/comms_draft.md"),
+        include_str!("../../../../specialists/comms_draft.md"),
     ),
     (
         SpecialistKind::Generic,
-        include_str!("../../../specialists/generic.md"),
+        include_str!("../../../../specialists/generic.md"),
     ),
 ];
 

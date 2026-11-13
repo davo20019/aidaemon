@@ -58,24 +58,7 @@ impl ChildAgentRuntime for Agent {
     }
 
     async fn run_child(&self, request: ChildAgentRequest) -> anyhow::Result<ChildAgentRun> {
-        let result = self
-            .spawn_child_with_outcome(
-                &request.mission,
-                &request.task,
-                request.status_tx,
-                request.channel_ctx,
-                request.user_role,
-                request.child_role,
-                request.goal_id.as_deref(),
-                request.task_id.as_deref(),
-                request.project_scope.as_deref(),
-                request.specialist.as_deref(),
-                request.approval_session_id.as_deref(),
-                request.parent_authority,
-                request.time_limit,
-                request.model_tier,
-            )
-            .await?;
+        let result = self.engine().spawn_child(request).await?;
         Ok(ChildAgentRun {
             session: result.session,
             response: result.response,
@@ -127,7 +110,8 @@ impl ChildAgentRuntime for Agent {
         task_id: &str,
         timeout_secs: u64,
     ) -> Option<SalvagedTaskOutcome> {
-        Agent::salvage_executor_task_outcome(self, task_id, timeout_secs)
+        self.engine()
+            .salvage_executor_task_outcome(task_id, timeout_secs)
             .await
             .map(|result| SalvagedTaskOutcome {
                 status: result.status,
@@ -136,7 +120,9 @@ impl ChildAgentRuntime for Agent {
     }
 
     async fn mark_executor_task_timeout(&self, task_id: &str, timeout_secs: u64) {
-        Agent::mark_executor_task_timeout(self, task_id, timeout_secs).await;
+        self.engine()
+            .mark_executor_task_timeout(task_id, timeout_secs)
+            .await;
     }
 
     async fn deliver_background_child_result(

@@ -57,8 +57,6 @@ pub(crate) fn build_available_specialists_block(
     s
 }
 
-pub(super) use aidaemon_runtime::prompt::rules::format_goal_context;
-
 #[cfg(test)]
 impl Agent {
     #[allow(clippy::too_many_arguments)]
@@ -126,9 +124,9 @@ pub(super) use aidaemon_runtime::prompt::rules::{render_environment_section, tas
 #[cfg(test)]
 mod tests {
     use super::{
-        build_available_specialists_block, format_goal_context, infer_assistant_name_from_prompt,
-        task_lead_rules,
+        build_available_specialists_block, infer_assistant_name_from_prompt, task_lead_rules,
     };
+    use aidaemon_runtime::prompt::rules::format_goal_context;
 
     /// A bounded mandate's lead carries no control-loop rules and no
     /// receipt-copying instructions; autopilot with an objective control

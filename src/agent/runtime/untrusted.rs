@@ -1,6 +1,7 @@
 //! The untrusted-content rule lives in `aidaemon-runtime`; a mandate run's
 //! origin is [`aidaemon_runtime::turn::notes::TurnNotes::mandate_origin`].
 
+#[cfg(test)]
 pub(crate) use aidaemon_runtime::untrusted::*;
 
 #[cfg(test)]

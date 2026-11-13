@@ -1901,6 +1901,7 @@ impl SpawnAgentTool {
                                     parent_authority: parent_authority.clone(),
                                     time_limit,
                                     model_tier: args.model_tier.map(Into::into),
+                                    bound_task_attempt: None,
                                 })
                             )
                         )
@@ -2472,6 +2473,7 @@ impl SpawnAgentTool {
                 parent_authority,
                 time_limit: self.time_limit(),
                 model_tier,
+                bound_task_attempt: None,
             }),
         )
         .await;

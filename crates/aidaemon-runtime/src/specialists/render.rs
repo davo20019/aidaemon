@@ -10,7 +10,7 @@ use super::SpecialistRenderContext;
 /// loaded by the registry; it is spliced in by `render_template` before any
 /// other placeholder substitution so the base's own `{{mission}}`/`{{task}}`/
 /// `{{depth}}` markers resolve normally.
-const EXECUTOR_BASE: &str = include_str!("../../../specialists/_executor_base.md");
+const EXECUTOR_BASE: &str = include_str!("../../../../specialists/_executor_base.md");
 
 pub fn render_template(template: &str, ctx: &SpecialistRenderContext) -> String {
     let bools = |b: bool| if b { "true" } else { "false" };
