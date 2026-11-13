@@ -167,7 +167,7 @@ mod tests {
         assert!(
             unconfirmed.starts_with(
                 "\u{2705} Finished in the background: Site install\n\
-                 I couldn't verify one of its steps: Capture the screenshot.\n\nDone."
+                 Its report is the only record of one step: Capture the screenshot.\n\nDone."
             ),
             "{unconfirmed}"
         );
@@ -188,7 +188,7 @@ mod tests {
             assert!(!message.contains("Slow count"), "{message}");
             assert!(
                 message.starts_with(
-                    "I couldn't verify one of its steps: Capture the screenshot.\n\nCounted to 30."
+                    "Its report is the only record of one step: Capture the screenshot.\n\nCounted to 30."
                 ),
                 "{message}"
             );
