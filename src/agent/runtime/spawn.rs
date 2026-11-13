@@ -2391,11 +2391,16 @@ impl Agent {
             self.running_children
                 .enter(chat, &card_name, task, &child_session, run.as_deref())
         });
-        // Each helper gets its own start line on the chat's card.
+        // Each helper gets its own header on the chat's card.
+        let in_background = run.is_some();
         if let Some(tx) = status_tx.as_ref() {
-            let _ = tx.try_send(StatusUpdate::HelperStarted {
-                label: child_status_label(&card_name),
-            });
+            let _ = tx.try_send(StatusUpdate::Helper(
+                aidaemon_core::card::HelperView::running(
+                    &child_status_label(&card_name),
+                    in_background,
+                    None,
+                ),
+            ));
         }
         // Emit SubAgentSpawn event
         {
@@ -2504,6 +2509,7 @@ impl Agent {
         let status_tx = child_status_sender(
             status_tx,
             &card_name,
+            in_background,
             listed.as_ref().map(RunningChildEntry::step),
         );
         // Setup is done: from here the child counts toward its request's
@@ -2670,13 +2676,15 @@ impl Agent {
             }
             _ => aidaemon_runtime::spawn::run_phase(child_outcome, None, None),
         };
-        // The child's progress line on the parent's card ends with how the
-        // child ended, not with the last step it reported.
+        // The child's header on the parent's card ends with how the child
+        // ended, not with the last step it reported.
         if let Some(tx) = &parent_status_tx {
-            let _ = tx.try_send(StatusUpdate::SubAgentProgress {
+            let _ = tx.try_send(StatusUpdate::Helper(aidaemon_core::card::HelperView {
                 label: child_status_label(&card_name),
-                progress: phase.card_word().to_string(),
-            });
+                phase,
+                background: in_background,
+                step: None,
+            }));
         }
         let child_task_end = match child_end_record {
             Ok(record) => record,
@@ -3092,6 +3100,7 @@ impl Agent {
 mod tests {
     use super::*;
     use crate::events::TaskOutcome;
+    use aidaemon_core::card::{ActivityKind, Step};
 
     fn rendered_checklist(done: usize, total: usize) -> String {
         let steps = (0..total).map(|i| format!("synthetic step {i}")).collect();
@@ -3129,7 +3138,7 @@ mod tests {
         assert_eq!(crate::tools::terminal::latest_output_line(b"\n \n"), None);
 
         let (parent_tx, mut parent_rx) = mpsc::channel(4);
-        let counter = child_status_sender(Some(parent_tx), "Slow counter", None).unwrap();
+        let counter = child_status_sender(Some(parent_tx), "Slow counter", true, None).unwrap();
         counter
             .send(StatusUpdate::CommandOutput {
                 name: "terminal".into(),
@@ -3139,30 +3148,37 @@ mod tests {
             .unwrap();
         drop(counter);
         match parent_rx.recv().await {
-            Some(StatusUpdate::SubAgentProgress { label, progress }) => {
-                assert_eq!(label, "Slow counter");
-                assert_eq!(progress, "running a command: 42");
+            Some(StatusUpdate::Helper(view)) => {
+                assert_eq!(view.label, "Slow counter");
+                assert_eq!(view.step, Some(Step::Output("42".into())));
+                assert_eq!(
+                    view.step.unwrap().words(),
+                    "Running a command: 42",
+                    "the owner reads plain words"
+                );
             }
-            other => panic!("expected the helper's progress line, got {other:?}"),
+            other => panic!("expected the helper's record, got {other:?}"),
         }
     }
 
     /// Two parallel children each declare a checklist. Neither reaches the
-    /// parent's card as a checklist (which would replace the parent's plan);
-    /// each becomes a progress line naming its own child, and so does a
-    /// child's step handed to the background.
+    /// parent's card (which would replace the parent's plan); each step
+    /// becomes its own child's record with a typed kind, a step handed to
+    /// the background included, and a tool ending is not a step.
     #[tokio::test]
     async fn a_childs_checklist_never_replaces_the_parents_plan() {
         let (parent_tx, mut parent_rx) = mpsc::channel(16);
         let wordpress = child_status_sender(
             Some(parent_tx.clone()),
             "Build the WordPress demo site for Acme Corp",
+            false,
             None,
         )
         .unwrap();
         let drupal = child_status_sender(
             Some(parent_tx),
             "Build the Drupal demo site for Acme Corp",
+            false,
             None,
         )
         .unwrap();
@@ -3182,6 +3198,7 @@ mod tests {
             .send(StatusUpdate::ToolStart {
                 name: "running the site installer".into(),
                 summary: String::new(),
+                kind: ActivityKind::Run,
             })
             .await
             .unwrap();
@@ -3194,41 +3211,36 @@ mod tests {
             .unwrap();
         drupal
             .send(StatusUpdate::StepHandedOff {
-                name: "Counting 1 to 60 slowly".into(),
-                to_helper: false,
+                kind: ActivityKind::Run,
             })
             .await
             .unwrap();
-        drupal.send(StatusUpdate::Thinking(2)).await.unwrap();
         drop((wordpress, drupal));
 
         let mut lines = Vec::new();
-        let mut passed_through = 0;
         while let Some(update) = parent_rx.recv().await {
             match update {
                 StatusUpdate::Checklist { .. } => panic!("child checklist reached the parent card"),
-                StatusUpdate::SubAgentProgress { label, progress } => {
-                    lines.push(format!("{label}: {progress}"));
+                StatusUpdate::Helper(view) => {
+                    assert!(!view.background);
+                    lines.push(format!(
+                        "{}: {}",
+                        view.label,
+                        view.step.map(|step| step.words()).unwrap_or_default()
+                    ));
                 }
-                StatusUpdate::Thinking(_) => passed_through += 1,
                 other => panic!("unexpected update {other:?}"),
             }
         }
-        lines.sort();
         assert_eq!(
             lines,
             vec![
-                "Build the Drupal demo site for Acme Corp: counting 1 to 60 slowly goes on in \
-                 the background"
+                "Build the Drupal demo site for Acme Corp: Running a command".to_string(),
+                "Build the Drupal demo site for Acme Corp: Running a command · goes on in the \
+                 background"
                     .to_string(),
-                "Build the Drupal demo site for Acme Corp: finished running the site installer"
-                    .to_string(),
-                "Build the Drupal demo site for Acme Corp: running the site installer".to_string(),
-                "Build the Drupal demo site for Acme Corp: step 2 of 4".to_string(),
-                "Build the WordPress demo site for Acme Corp: 5 of 5 steps".to_string(),
             ]
         );
-        assert_eq!(passed_through, 1);
     }
 
     #[test]

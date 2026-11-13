@@ -36,8 +36,8 @@ pub struct WorkEntry {
     pub number: u64,
     /// What it is, in plain words.
     pub title: String,
-    /// Its latest step, when its progress said one (a sub-agent's).
-    pub step: Option<String>,
+    /// Its latest step, from its record (a sub-agent's).
+    pub step: Option<aidaemon_core::card::Step>,
     pub started_at: DateTime<Utc>,
     /// What it is: `None` for a chat turn.
     pub work: Option<ChatWorkKind>,
@@ -82,10 +82,13 @@ impl WorkList {
             .map(|entry| {
                 let step = entry
                     .step
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|step| !step.is_empty())
-                    .map(|step| format!(" – {}", crate::presentation::word_preview(step, 80)))
+                    .as_ref()
+                    .map(|step| {
+                        format!(
+                            " – {}",
+                            crate::presentation::word_preview(&step.words(), 80)
+                        )
+                    })
                     .unwrap_or_default();
                 format!(
                     "#{} {}{step} ({} so far)",

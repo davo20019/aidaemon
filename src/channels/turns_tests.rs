@@ -117,9 +117,10 @@ impl TurnSurface for SlowStatus {
             while let Some(update) = updates.recv().await {
                 log.lock().unwrap().push("status-received".to_string());
                 tokio::time::sleep(Duration::from_millis(150)).await;
-                log.lock()
-                    .unwrap()
-                    .push(format!("status-shown:{}", status_line(&update)));
+                log.lock().unwrap().push(format!(
+                    "status-shown:{}",
+                    status_line(&update).unwrap_or_default()
+                ));
             }
         }))
     }

@@ -1645,7 +1645,10 @@ impl TurnSurface for TelegramSurface {
                 use SurfaceSink;
                 let sink: &dyn SurfaceSink = live.sink.as_ref();
                 let mut owner = live.owner.lock().await;
-                if owner.finalize_text(sink, reply).await {
+                // A card with a helper still running stays the helper's
+                // card, settled to its final header when it ends; the reply
+                // goes out on its own.
+                if !owner.has_running_helpers() && owner.finalize_text(sink, reply).await {
                     if let Some(id) = owner.surface_message_id() {
                         if let Some(hub) = &self.hub {
                             hub.register_background_status_surface(&self.session_id, &id)
@@ -1700,7 +1703,7 @@ impl TurnSurface for TelegramSurface {
         let mut owner = live.owner.lock().await;
         // A card that stays in the chat can still change after the turn: a
         // background job settles the steps it was handed.
-        if let (Some(hub), Some(id)) = (&self.hub, owner.checklist_message_id()) {
+        if let (Some(hub), Some(id)) = (&self.hub, owner.kept_card_message_id()) {
             hub.register_checklist_surface(&self.session_id, &id).await;
         }
         owner.reset();
@@ -2163,10 +2166,9 @@ async fn run_status_consumer(
         let mut show_now = false;
         let mut typing = false;
         for update in backlog {
-            if is_indicator_only_status(&update) {
-                typing = true;
-                continue;
-            }
+            // Thinking shows as the typing indicator, and on the card as
+            // the turn's step between tool calls.
+            typing |= is_indicator_only_status(&update);
             let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
             // Non-DM channels: suppress progress except BudgetExtended (unchanged behaviour).
             if !is_dm && !is_budget_ext {
@@ -2216,53 +2218,37 @@ async fn run_status_consumer(
 }
 
 /// Apply one progress update to the card's state; `true` when the card
-/// should show it at once, past the interval: the plan, a step's end, a
-/// handoff and a helper's start are never held back.
+/// should show it at once, past the interval: the plan, a handoff and a
+/// helper's start or end are never held back. Each step is its typed kind; a
+/// tool ending is not a step.
 fn note_status(live: &mut LiveStatus, update: &StatusUpdate) -> bool {
+    use aidaemon_core::card::{ActivityKind, Step};
     match update {
         StatusUpdate::Checklist { text } => {
             live.note_checklist(text.clone());
             true
         }
-        StatusUpdate::ToolStart { name, summary } => {
-            live.note_activity(if summary.is_empty() {
-                format!("{name}…")
-            } else {
-                format!("{name}: {summary}…")
-            });
+        StatusUpdate::Thinking(_) => {
+            live.note_activity(Step::Doing(ActivityKind::Think));
             false
         }
-        StatusUpdate::ToolComplete { name, .. } => {
-            live.note_activity(aidaemon_channels::live_status::step_ended_line(name));
-            true
-        }
-        StatusUpdate::StepHandedOff { name, to_helper } => {
-            live.note_activity(aidaemon_channels::live_status::step_handed_off_line(
-                name, *to_helper,
-            ));
-            true
-        }
-        StatusUpdate::PlanStepStart { description, .. }
-        | StatusUpdate::PlanStepComplete { description, .. } => {
-            live.note_activity(description.clone());
+        StatusUpdate::ToolStart { kind, .. } => {
+            live.note_activity(Step::Doing(*kind));
             false
         }
-        StatusUpdate::HelperStarted { label } => {
-            live.note_helper_started(label);
+        StatusUpdate::StepHandedOff { kind } => {
+            live.note_activity(Step::HandedOff(*kind));
             true
         }
-        StatusUpdate::SubAgentProgress { label, progress } => {
-            live.note_helper_progress(label, progress);
-            false
-        }
-        // Other Plan*/Thinking variants: no line of their own.
+        StatusUpdate::Helper(helper) => live.note_helper(helper.clone()),
+        // Other Plan*/tool-ending variants: no line of their own.
         _ => false,
     }
 }
 
 /// Legacy (pre-LiveStatus) status consumer used only when the `ChannelHub` is
 /// not wired and the single live surface is unavailable. Sends a fresh message
-/// per status update (heavyweight `StatusUpdate` match) with the historical
+/// per status update (the same plain text every channel's status line uses) with the historical
 /// `dm_status_count`/`MAX_DM_STATUS_MESSAGES` spam cap. This is the defensive
 /// fallback shared by both the primary and queue-drain sites.
 async fn run_legacy_status_consumer(
@@ -2303,148 +2289,8 @@ async fn run_legacy_status_consumer(
         if !is_immediate && now.duration_since(last_sent) < min_interval {
             continue;
         }
-        let text = match &update {
-            StatusUpdate::Thinking(_) => continue,
-            StatusUpdate::ToolStart { name, summary } => {
-                let mut chars = name.chars();
-                let cap_name = match chars.next() {
-                    None => String::new(),
-                    Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
-                };
-                if summary.is_empty() {
-                    format!("{}...", cap_name)
-                } else {
-                    format!("{}: {}...", cap_name, summary)
-                }
-            }
-            StatusUpdate::ToolProgress { name, chunk } => {
-                let preview: String = chunk.chars().take(100).collect();
-                if chunk.chars().count() > 100 {
-                    format!("📤 {}: {}...", name, preview)
-                } else {
-                    format!("📤 {}: {}", name, preview)
-                }
-            }
-            StatusUpdate::UserActionRequired { message } => message.clone(),
-            StatusUpdate::ToolComplete { name, summary } => {
-                format!("✓ {}: {}", name, summary)
-            }
-            StatusUpdate::ToolCancellable { name, task_id } => {
-                format!("⏳ {} started (task_id: {})", name, task_id)
-            }
-            StatusUpdate::ProgressSummary {
-                elapsed_mins,
-                summary,
-            } => {
-                format!("📊 Progress ({} min): {}", elapsed_mins, summary)
-            }
-            StatusUpdate::IterationWarning { current, threshold } => {
-                format!(
-                    "⚠️ Approaching soft limit: {} of {} iterations",
-                    current, threshold
-                )
-            }
-            StatusUpdate::PlanCreated {
-                description,
-                total_steps,
-                ..
-            } => {
-                format!("📋 Plan created: {} ({} steps)", description, total_steps)
-            }
-            StatusUpdate::PlanStepStart {
-                step_index,
-                total_steps,
-                description,
-                ..
-            } => {
-                format!(
-                    "▶️ Step {}/{}: {}",
-                    step_index + 1,
-                    total_steps,
-                    description
-                )
-            }
-            StatusUpdate::PlanStepComplete {
-                step_index,
-                total_steps,
-                description,
-                summary,
-                ..
-            } => {
-                let base = format!(
-                    "✅ Step {}/{} done: {}",
-                    step_index + 1,
-                    total_steps,
-                    description
-                );
-                if let Some(s) = summary {
-                    format!("{} - {}", base, s)
-                } else {
-                    base
-                }
-            }
-            StatusUpdate::PlanStepFailed {
-                step_index,
-                description,
-                error,
-                ..
-            } => {
-                format!(
-                    "❌ Step {} failed: {} - {}",
-                    step_index + 1,
-                    description,
-                    error
-                )
-            }
-            StatusUpdate::PlanComplete {
-                description,
-                total_steps,
-                duration_secs,
-                ..
-            } => {
-                let mins = duration_secs / 60;
-                let secs = duration_secs % 60;
-                format!(
-                    "🎉 Plan complete: {} ({} steps in {}m {}s)",
-                    description, total_steps, mins, secs
-                )
-            }
-            StatusUpdate::PlanAbandoned { description, .. } => {
-                format!("🚫 Plan abandoned: {}", description)
-            }
-            StatusUpdate::PlanRevised {
-                description,
-                reason,
-                new_total_steps,
-                ..
-            } => {
-                format!(
-                    "🔄 Plan revised: {} ({} steps) - {}",
-                    description, new_total_steps, reason
-                )
-            }
-            StatusUpdate::BudgetExtended {
-                old_budget,
-                new_budget,
-                extension,
-                max_extensions,
-            } => {
-                format!(
-                    "💰 Auto-extended token budget {} → {} ({}/{}) — continuing.",
-                    old_budget, new_budget, extension, max_extensions
-                )
-            }
-            StatusUpdate::Checklist { text } => text.clone(),
-            StatusUpdate::SubAgentProgress { label, progress } => {
-                format!("🤖 {label}: {progress}")
-            }
-            StatusUpdate::HelperStarted { label } => {
-                aidaemon_channels::live_status::helper_started_line(label)
-            }
-            StatusUpdate::StepHandedOff { name, to_helper } => {
-                aidaemon_channels::live_status::step_handed_off_line(name, *to_helper)
-            }
-            StatusUpdate::CommandOutput { name, line } => format!("📤 {name}: {line}"),
+        let Some(text) = aidaemon_channels::turns::status_text(&update) else {
+            continue;
         };
         let _ = bot.send_message(chat_id, text).await;
         dm_status_count += 1;
@@ -2483,52 +2329,49 @@ mod tests {
         assert_eq!(outbound_content_type(b"homepage.png but text"), None);
     }
 
-    /// Two helpers started together each get their own start line on the
-    /// card, whatever order or batch their updates arrive in (live
-    /// 2026-11-12: only "Counter B" showed).
+    /// Two helpers started together each get their own header on the card,
+    /// whatever order or batch their updates arrive in (live 2026-11-12:
+    /// only "Counter B" showed), and every line is a typed kind in plain
+    /// words: a tool ending adds nothing.
     #[test]
     fn parallel_helpers_each_get_their_own_line() {
+        use aidaemon_core::card::{ActivityKind, HelperView, Step};
         let mut live = LiveStatus::new();
         assert!(note_status(
             &mut live,
-            &StatusUpdate::HelperStarted {
-                label: "Counter A".into()
-            }
+            &StatusUpdate::Helper(HelperView::running("Counter A", true, None))
         ));
         assert!(note_status(
             &mut live,
-            &StatusUpdate::HelperStarted {
-                label: "Counter B".into()
-            }
+            &StatusUpdate::Helper(HelperView::running("Counter B", true, None))
         ));
         assert!(!note_status(
             &mut live,
-            &StatusUpdate::SubAgentProgress {
-                label: "Counter B".into(),
-                progress: "running a command".into(),
+            &StatusUpdate::Helper(HelperView::running(
+                "Counter B",
+                true,
+                Some(Step::Doing(ActivityKind::Run)),
+            ))
+        ));
+        assert!(!note_status(
+            &mut live,
+            &StatusUpdate::ToolComplete {
+                name: "reading a file".into(),
+                summary: "done".into(),
             }
         ));
         assert!(note_status(
             &mut live,
             &StatusUpdate::StepHandedOff {
-                name: "delegating to a specialist".into(),
-                to_helper: true,
+                kind: ActivityKind::Delegate,
             }
         ));
         let card = live.preview().unwrap();
-        assert!(
-            card.contains("Started in the background: Counter A"),
-            "{card}"
+        assert_eq!(
+            card,
+            "⏳ Running in the background: Counter A\n\n⏳ Running in the background: \
+             Counter B\nRunning a command\n\n⏳ Handed to a helper; it works in the background"
         );
-        assert!(
-            card.contains("Started in the background: Counter B\n🤖 running a command"),
-            "{card}"
-        );
-        assert!(
-            card.contains("Handed off to a helper; it's working in the background"),
-            "{card}"
-        );
-        assert!(!card.contains("Finished"), "{card}");
     }
 
     #[test]

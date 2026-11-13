@@ -966,12 +966,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.contains("Done ·"), "{out}");
-        // Ticked on the model's word only: done, and the final card says no
-        // tool confirmed them.
-        assert!(
-            out.contains("2 of 3 done, 2 not confirmed by a tool"),
-            "{out}"
-        );
+        // Ticked on the model's word only: done. Neither changes anything,
+        // so neither needs a receipt and the card adds no note.
+        assert!(out.contains("Stopped · 2 of 3 done\n"), "{out}");
+        assert!(!out.contains("verify"), "{out}");
 
         let partial = json!({
             "items": [
@@ -986,20 +984,40 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.contains("Done ·"), "{out}");
-        assert!(
-            out.contains("Stopped short · 2 of 2 done, 2 not confirmed by a tool"),
-            "{out}"
-        );
+        assert!(out.contains("Stopped short · 2 of 2 done\n"), "{out}");
 
         let done = partial.replace("partial", "done");
         let out = tool
             .call_with(&done, crate::testing::call_facts("sess-done"))
             .await
             .unwrap();
+        assert!(out.contains("✅ Done · 2 of 2 steps"), "{out}");
+
+        // An action step that declared a side effect and that nothing
+        // verified is the one step the card flags, in plain words.
+        let action = json!({
+            "items": [
+                {"text": "Say the date", "status": "completed"},
+                {"text": "Save the quote to quote.txt", "status": "completed",
+                 "mutation_effects": ["local_workspace_write"]}
+            ],
+            "outcome": "done"
+        })
+        .to_string();
+        let out = tool
+            .call_with(&action, crate::testing::call_facts("sess-action"))
+            .await
+            .unwrap();
         assert!(
-            out.contains("☑️ Finished · 2 of 2 done, 2 not confirmed by a tool"),
+            out.contains("☑️ Finished · 2 of 2 done; I couldn't verify 1"),
             "{out}"
         );
+        assert!(
+            out.contains("☑️ Save the quote to quote.txt (I couldn't verify this one)"),
+            "{out}"
+        );
+        assert!(out.contains("✅ Say the date"), "{out}");
+        assert!(!out.to_lowercase().contains("tool"), "{out}");
     }
 
     /// Steps left open while the chat's background sub-agents run read as
@@ -1076,10 +1094,7 @@ mod tests {
             .call_with(&args, crate::testing::call_facts("sess-skip"))
             .await
             .unwrap();
-        assert!(
-            out.contains("☑️ Finished · 1 of 2 done, 1 not confirmed by a tool, 1 not needed"),
-            "{out}"
-        );
+        assert!(out.contains("✅ Done · 1 done, 1 not needed"), "{out}");
         assert!(
             out.contains("➖ Cancel the open orders (not needed)"),
             "{out}"
@@ -1104,7 +1119,7 @@ mod tests {
         facts.mutation_forbidden = true;
         let out = tool.call_with(&args, facts).await.unwrap();
         assert!(
-            out.contains("⏭️ Not done: read-only is on · 1 of 2 done, 1 not confirmed by a tool"),
+            out.contains("⏭️ Not done: read-only is on · 1 of 2 done\n"),
             "{out}"
         );
         assert!(

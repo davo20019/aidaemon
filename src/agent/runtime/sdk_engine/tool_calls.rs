@@ -432,8 +432,18 @@ impl Agent {
             let (name, summary) = self.step_activity(scope, &request.name, arguments, || {
                 crate::agent::agent_helpers::summarize_tool_args(&request.name, arguments)
             });
+            let kind = step_kind(
+                &request.name,
+                arguments,
+                &facts,
+                call_semantics.mutates_state(),
+            );
             if let Some(status_tx) = &scope.status_tx {
-                let _ = status_tx.try_send(StatusUpdate::ToolStart { name, summary });
+                let _ = status_tx.try_send(StatusUpdate::ToolStart {
+                    name,
+                    summary,
+                    kind,
+                });
             }
         }
         let executed = match self
@@ -929,13 +939,6 @@ impl Agent {
                 crate::agent::tool_execution::parse_checklist_from_result(&output)
                     .map(|text| StatusUpdate::Checklist { text })
             } else {
-                let (name, summary) = self.step_activity(scope, &request.name, arguments, || {
-                    if facts.status_from_arguments {
-                        crate::agent::agent_helpers::summarize_tool_args(&request.name, arguments)
-                    } else {
-                        crate::agent::tool_execution::summarize_completed_tool_result(&output)
-                    }
-                });
                 // A step that handed its work to a helper or a background
                 // job has not finished: its line says the work goes on
                 // (typed from the outcome, never from its text).
@@ -944,10 +947,29 @@ impl Agent {
                 });
                 Some(if handed_off {
                     StatusUpdate::StepHandedOff {
-                        name,
-                        to_helper: facts.spawns_child_agents,
+                        kind: step_kind(
+                            &request.name,
+                            arguments,
+                            &facts,
+                            metadata
+                                .as_ref()
+                                .is_some_and(|metadata| metadata.semantics.mutates_state()),
+                        ),
                     }
                 } else {
+                    let (name, summary) =
+                        self.step_activity(scope, &request.name, arguments, || {
+                            if facts.status_from_arguments {
+                                crate::agent::agent_helpers::summarize_tool_args(
+                                    &request.name,
+                                    arguments,
+                                )
+                            } else {
+                                crate::agent::tool_execution::summarize_completed_tool_result(
+                                    &output,
+                                )
+                            }
+                        });
                     StatusUpdate::ToolComplete { name, summary }
                 })
             };
@@ -1696,4 +1718,20 @@ impl Agent {
             Err(error) => Err(format!("[MANDATE AUTHORITY BLOCKED] {error}")),
         }
     }
+}
+
+/// What kind of work a call is, as every card shows it: from the tool's
+/// typed identity, its dispatch facts and its admitted semantics.
+fn step_kind(
+    tool: &str,
+    arguments: &str,
+    facts: &crate::traits::ToolDispatchFacts,
+    mutates: bool,
+) -> aidaemon_core::card::ActivityKind {
+    crate::tools::sanitize::tool_activity_kind(
+        tool,
+        &crate::agent::agent_helpers::summarize_tool_args(tool, arguments),
+        facts.spawns_child_agents,
+        mutates,
+    )
 }

@@ -115,11 +115,17 @@ mod live_status_surface_tests {
         let mut live = LiveStatus::new();
 
         // Activity 1 — lazy create (no message yet → send_text_tracked)
-        live.set_activity(sink_ref, "Writing netprobe3.py".to_string())
-            .await;
+        live.set_activity(
+            sink_ref,
+            aidaemon_core::card::Step::Doing(aidaemon_core::card::ActivityKind::Write),
+        )
+        .await;
         // Activity 2 — edit in place
-        live.set_activity(sink_ref, "Running the script".to_string())
-            .await;
+        live.set_activity(
+            sink_ref,
+            aidaemon_core::card::Step::Doing(aidaemon_core::card::ActivityKind::Run),
+        )
+        .await;
         // Checklist — edit in place (checklist owns the surface from here)
         live.set_checklist(sink_ref, "📋 Plan\n✅ Create script\n✅ Run it".to_string())
             .await;

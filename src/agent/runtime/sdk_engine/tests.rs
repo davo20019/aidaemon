@@ -5244,20 +5244,22 @@ async fn a_ticked_step_is_confirmed_only_by_the_runs_receipts() {
         .await
         .unwrap()
         .remove(0);
-    assert!(
-        !plan.steps[0].said_done,
+    assert_eq!(
+        plan.steps[0].evidence,
+        crate::plans::StepEvidence::Settled,
         "the read proved it: {:?}",
         plan.steps
     );
-    assert!(
-        plan.steps[1].said_done,
+    assert_eq!(
+        plan.steps[1].evidence,
+        crate::plans::StepEvidence::ModelSaid,
         "nothing proved it: {:?}",
         plan.steps
     );
+    // A read changes nothing: the reply reports what it found, so the card
+    // shows both done with no note.
     let card = plan.render_compact_checklist();
     assert!(card.contains("✅ read the first file"), "{card}");
-    assert!(
-        card.contains("☑️ read the second file (no tool confirmed it)"),
-        "{card}"
-    );
+    assert!(card.contains("✅ read the second file"), "{card}");
+    assert!(!card.contains("verify"), "{card}");
 }

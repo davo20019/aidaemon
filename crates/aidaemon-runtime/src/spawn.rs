@@ -80,8 +80,9 @@ pub struct SpawnChildResult {
 /// outcome is partial only for want of receipts (it ended normally with its
 /// own typed verdict `done`, nothing it started still runs, the owner
 /// declined nothing, and it set none of its steps aside) succeeded; the
-/// typed steps no receipt matched are its evidence, listed only when it
-/// declared more than one (a one-step run's step is the run itself).
+/// typed steps that declared a side effect and that no receipt matched are
+/// its evidence, listed only when it declared more than one step (a
+/// one-step run's step is the run itself).
 pub fn run_phase(
     outcome: TaskOutcome,
     end: Option<&TaskEndData>,
@@ -90,7 +91,7 @@ pub fn run_phase(
     use crate::run_state::{RunEvidence, RunPhase};
     use aidaemon_events::RunObligationState;
     let (Some(end), Some(aggregate)) = (end, aggregate) else {
-        return (RunPhase::ended(outcome), RunEvidence::default());
+        return (crate::run_state::phase_of(outcome), RunEvidence::default());
     };
     let checklist: Vec<&aidaemon_events::RunObligation> = aggregate
         .obligations
@@ -111,15 +112,18 @@ pub fn run_phase(
             )
         });
     if !only_receipts_missing {
-        return (RunPhase::ended(outcome), RunEvidence::default());
+        return (crate::run_state::phase_of(outcome), RunEvidence::default());
     }
     let unconfirmed = if checklist.len() > 1 {
         let mut pending: Vec<(&String, String)> = aggregate
             .obligations
             .iter()
             .filter(|(id, obligation)| {
+                // A step that changes nothing needs no receipt: the
+                // helper's report says what it found.
                 id.contains("/obligation:checklist:")
                     && obligation.state == RunObligationState::Pending
+                    && !obligation.required_effect.is_empty()
             })
             .map(|(id, obligation)| {
                 (
@@ -223,7 +227,7 @@ pub struct ListedChild {
 }
 
 /// A running child's latest step, written by its status channel.
-pub type ChildStep = Arc<std::sync::Mutex<Option<String>>>;
+pub type ChildStep = Arc<std::sync::Mutex<Option<aidaemon_core::card::Step>>>;
 
 /// A listed child, as the chat's running work shows it.
 pub struct ListedChildView {
@@ -231,7 +235,7 @@ pub struct ListedChildView {
     pub child: aidaemon_channels::ports::RunningChild,
     pub request: Option<String>,
     /// Its latest step, as `/tasks` and the status reply give it.
-    pub step: Option<String>,
+    pub step: Option<aidaemon_core::card::Step>,
 }
 
 /// A chat's running turn, recorded while it runs.
@@ -493,80 +497,54 @@ pub const MAX_REPORT_TOOL_RECORDS: usize = 5_000;
 
 /// The status channel a child reports through. The parent's live card shows
 /// the parent's own checklist: a child's checklist is the child's plan, so it
-/// reaches the card as one `SubAgentProgress` line naming that child instead of
-/// replacing the parent's plan (two parallel children used to overwrite it in
-/// turn, leaving whichever wrote last looking like the whole task). Each of
-/// the child's steps (a tool starting or ending) is likewise that child's
-/// progress line, so the parent's card and its status reply say what each
-/// helper is doing ("Drupal install: running the site installer"), and so
-/// is a step of the child's that goes on in the background. Every other
-/// update passes through unchanged.
+/// never reaches the parent's card (two parallel children used to overwrite
+/// it in turn, leaving whichever wrote last looking like the whole task).
+/// Each of the child's steps (a tool starting, a step handed on, the line its
+/// command printed, its thinking) becomes that child's [`HelperView`], so the
+/// parent's card and its status reply say what each helper is doing as a
+/// typed kind. A tool ending is not a step. Every other update passes
+/// through unchanged.
+///
+/// [`HelperView`]: aidaemon_core::card::HelperView
 pub fn child_status_sender(
     parent: Option<mpsc::Sender<StatusUpdate>>,
     mission: &str,
+    background: bool,
     step: Option<ChildStep>,
 ) -> Option<mpsc::Sender<StatusUpdate>> {
+    use aidaemon_core::card::{ActivityKind, HelperView, Step};
     let parent = parent?;
     let label = child_status_label(mission);
     let (tx, mut rx) = mpsc::channel::<StatusUpdate>(64);
     tokio::spawn(async move {
         while let Some(update) = rx.recv().await {
-            let update = match update {
-                StatusUpdate::Checklist { text } => {
-                    let Some(progress) = aidaemon_work::plans::checklist_progress(&text) else {
-                        continue;
-                    };
-                    StatusUpdate::SubAgentProgress {
-                        label: label.clone(),
-                        progress,
-                    }
-                }
-                StatusUpdate::ToolStart { name, summary } => StatusUpdate::SubAgentProgress {
-                    label: label.clone(),
-                    progress: if summary.trim().is_empty() {
-                        name
-                    } else {
-                        format!("{name}: {summary}")
-                    },
-                },
-                StatusUpdate::ToolComplete { name, .. } => StatusUpdate::SubAgentProgress {
-                    label: label.clone(),
-                    progress: aidaemon_channels::live_status::step_ended_line(&name),
-                },
+            let own_step = match &update {
+                StatusUpdate::Checklist { .. } | StatusUpdate::ToolComplete { .. } => continue,
+                StatusUpdate::ToolStart { kind, .. } => Some(Step::Doing(*kind)),
+                StatusUpdate::Thinking(_) => Some(Step::Doing(ActivityKind::Think)),
                 // A child's step that went on in the background is that
                 // child's progress, never the parent's own step (live
                 // 2026-11-13: "… goes on in the background" stood on the
                 // card as if the turn itself had handed off).
-                StatusUpdate::StepHandedOff { name, to_helper } => StatusUpdate::SubAgentProgress {
-                    label: label.clone(),
-                    progress: aidaemon_channels::live_status::helper_step_handed_off(
-                        &name, to_helper,
-                    ),
-                },
+                StatusUpdate::StepHandedOff { kind } => Some(Step::HandedOff(*kind)),
                 // What the child's running command printed last is that
                 // child's progress line, as it runs.
-                StatusUpdate::CommandOutput { line, .. } => StatusUpdate::SubAgentProgress {
-                    label: label.clone(),
-                    progress: format!("running a command: {line}"),
-                },
-                other => other,
+                StatusUpdate::CommandOutput { line, .. } => Some(Step::Output(line.clone())),
+                _ => None,
             };
-            // Its own latest step, for `/tasks`.
-            if let (
-                Some(slot),
-                StatusUpdate::SubAgentProgress {
-                    label: of,
-                    progress,
-                },
-            ) = (step.as_ref(), &update)
-            {
-                if *of == label {
-                    *slot
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(progress.clone());
+            let update = match own_step {
+                Some(own_step) => {
+                    // Its own latest step, for `/tasks`.
+                    if let Some(slot) = step.as_ref() {
+                        *slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(own_step.clone());
+                    }
+                    StatusUpdate::Helper(HelperView::running(&label, background, Some(own_step)))
                 }
-            }
+                None => update,
+            };
             if parent.send(update).await.is_err() {
                 break;
             }

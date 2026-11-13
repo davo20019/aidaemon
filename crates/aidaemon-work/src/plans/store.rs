@@ -153,8 +153,11 @@ impl PlanStore {
                 not_done: None,
                 // The model's own tick: done on its word until evidence
                 // confirms it.
-                said_done: item.status == StepStatus::Completed,
-                helper_not_started: false,
+                evidence: if item.status == StepStatus::Completed {
+                    crate::plans::StepEvidence::ModelSaid
+                } else {
+                    crate::plans::StepEvidence::Settled
+                },
                 status: item.status,
                 tool_call_ids: Vec::new(),
                 result_summary: None,
@@ -215,18 +218,18 @@ impl PlanStore {
                     }
                     if step.status == StepStatus::Completed
                         && previous.status == StepStatus::Completed
-                        && !previous.said_done
+                        && previous.evidence != crate::plans::StepEvidence::ModelSaid
                     {
-                        step.said_done = false;
+                        step.evidence = crate::plans::StepEvidence::Settled;
                         step.completed_at = previous.completed_at;
                     }
                     // Still the step whose helper didn't start, until a
                     // launch takes it or the model resolves it.
-                    if previous.helper_not_started
+                    if previous.helper_not_started()
                         && matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
                     {
                         step.status = StepStatus::Failed;
-                        step.helper_not_started = true;
+                        step.evidence = crate::plans::StepEvidence::HelperNotStarted;
                         step.error = previous.error.clone();
                         step.completed_at = previous.completed_at;
                     }
@@ -489,7 +492,7 @@ impl PlanStore {
 
             if effects_match && observation_matches && targets_match {
                 step.status = StepStatus::Completed;
-                step.said_done = false;
+                step.evidence = crate::plans::StepEvidence::Settled;
                 step.completed_at = Some(Utc::now());
                 step.result_summary = Some(aidaemon_events::text::truncate_str(result, 200));
                 if !step
@@ -701,7 +704,7 @@ impl PlanStore {
         let created_at_str: String = row.get("created_at");
         let updated_at_str: String = row.get("updated_at");
 
-        let steps = serde_json::from_str(&steps_json)?;
+        let steps = steps_from_json(&steps_json)?;
         let checkpoint = serde_json::from_str(&checkpoint_json)?;
         let status = PlanStatus::from_str(&status_str).unwrap_or(PlanStatus::InProgress);
         let created_at = DateTime::parse_from_rfc3339(&created_at_str)?.with_timezone(&Utc);
@@ -772,6 +775,41 @@ pub async fn migrate_task_plans(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A plan's steps as stored. Rows written before steps carried a typed
+/// [`crate::plans::StepEvidence`] kept it as two flags (`said_done`,
+/// `helper_not_started`); they read as the evidence they meant.
+fn steps_from_json(json: &str) -> anyhow::Result<Vec<crate::plans::PlanStep>> {
+    use crate::plans::StepEvidence;
+    let mut raw: Vec<serde_json::Value> = serde_json::from_str(json)?;
+    for step in &mut raw {
+        let Some(fields) = step.as_object_mut() else {
+            continue;
+        };
+        let flag = |fields: &mut serde_json::Map<String, serde_json::Value>, name: &str| {
+            fields
+                .remove(name)
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        };
+        let said_done = flag(fields, "said_done");
+        let not_started = flag(fields, "helper_not_started");
+        if fields.contains_key("evidence") {
+            continue;
+        }
+        let evidence = if not_started {
+            StepEvidence::HelperNotStarted
+        } else if said_done {
+            StepEvidence::ModelSaid
+        } else {
+            continue;
+        };
+        fields.insert("evidence".to_string(), serde_json::to_value(evidence)?);
+    }
+    raw.into_iter()
+        .map(|step| serde_json::from_value(step).map_err(anyhow::Error::from))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,61 +824,82 @@ mod tests {
         PlanStore::new(pool).await.unwrap()
     }
 
-    /// A step the model ticks is done only on its word until evidence
-    /// confirms it: the card never shows it ✅ or counts it done, an update
-    /// ticking it again keeps a confirmation, and a helper's success
-    /// confirms the step it was given (live 2026-11-13: "2 of 3 done" right
-    /// after an update ticked two steps nothing had proven).
+    /// A step the model ticks is done on its word. A check or a read needs
+    /// no receipt: the reply reports what it found, so the card shows it
+    /// done with no note. Only an action step that declared a side effect
+    /// and that nothing verified is flagged, in plain words; evidence (a
+    /// receipt, a helper's success) clears the flag, and an update ticking
+    /// the step again keeps the proof (live 2026-11-13: "Finished · 3 of 3
+    /// done, 1 not confirmed by a tool" on a read-only check).
     #[tokio::test]
-    async fn a_step_the_model_ticked_is_said_done_until_evidence_confirms_it() {
-        use crate::plans::StepStatus;
+    async fn only_an_action_step_nothing_verified_is_flagged() {
+        use crate::plans::{ChecklistItem, StepEvidence, StepStatus};
+        use crate::traits::ToolMutationEffects;
         let store = create_test_store().await;
+        let item = |text: &str, effects: ToolMutationEffects, status: StepStatus| ChecklistItem {
+            description: text.to_string(),
+            status,
+            depends_on: Vec::new(),
+            required_mutation_effects: effects,
+            requires_observation: false,
+            expected_targets: Vec::new(),
+        };
         let ticked = |done: bool| {
+            let status = if done {
+                StepStatus::Completed
+            } else {
+                StepStatus::Pending
+            };
             vec![
-                (
-                    "Check the first site".to_string(),
-                    if done {
-                        StepStatus::Completed
-                    } else {
-                        StepStatus::Pending
-                    },
+                item(
+                    "Check whether ~/projects/claude-test-a.txt is already occupied",
+                    ToolMutationEffects::NONE,
+                    status,
                 ),
-                (
-                    "Check the second site".to_string(),
-                    if done {
-                        StepStatus::Completed
-                    } else {
-                        StepStatus::Pending
-                    },
+                item(
+                    "Write the letters file",
+                    ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    status,
                 ),
-                ("Report both".to_string(), StepStatus::InProgress),
+                item(
+                    "Report both",
+                    ToolMutationEffects::NONE,
+                    StepStatus::InProgress,
+                ),
             ]
         };
         store
-            .upsert_checklist("s1", Some("t1"), "test", &ticked(false))
+            .upsert_checklist_graph("s1", Some("t1"), "test", &ticked(false))
             .await
             .unwrap();
         let plan = store
-            .upsert_checklist("s1", Some("t1"), "test", &ticked(true))
+            .upsert_checklist_graph("s1", Some("t1"), "test", &ticked(true))
             .await
             .unwrap();
         let card = plan.render_compact_checklist();
         assert!(card.starts_with("⚙️ Working · step 3 of 3"), "{card}");
         assert!(
-            card.contains("☑️ Check the second site (no tool confirmed it)"),
+            card.contains("✅ Check whether ~/projects/claude-test-a.txt is already occupied\n"),
             "{card}"
         );
-        assert!(!card.contains("✅"), "{card}");
-        assert_eq!(plan.confirmed_steps(), 0);
+        assert!(
+            card.contains("☑️ Write the letters file (I couldn't verify this one)"),
+            "{card}"
+        );
+        assert_eq!(plan.unverified_steps(), 1);
 
         let proven = std::collections::BTreeSet::from([0]);
         store.confirm_steps("s1", "t1", &proven).await.unwrap();
         let plan = store
-            .upsert_checklist("s1", Some("t1"), "test", &ticked(true))
+            .upsert_checklist_graph("s1", Some("t1"), "test", &ticked(true))
             .await
             .unwrap();
-        assert!(!plan.steps[0].said_done, "a later tick keeps the proof");
-        assert!(plan.steps[1].said_done);
+        assert_eq!(
+            plan.steps[0].evidence,
+            StepEvidence::Settled,
+            "a later tick keeps the proof"
+        );
+        assert_eq!(plan.steps[1].evidence, StepEvidence::ModelSaid);
 
         store
             .link_background_job("s1", Some("t1"), &[2], "job-1")
@@ -854,11 +913,42 @@ mod tests {
             .unwrap();
         let card = plan.render_compact_checklist();
         assert!(
-            card.starts_with("☑️ Finished · 3 of 3 done, 1 not confirmed by a tool"),
+            card.starts_with("☑️ Finished · 3 of 3 done; I couldn't verify 1"),
             "{card}"
         );
         assert!(card.contains("✅ Report both"), "{card}");
         assert!(!crate::plans::is_completed_checklist(&card), "{card}");
+        assert!(!card.to_lowercase().contains("tool"), "{card}");
+
+        // Every step a check: done, with nothing to flag.
+        let checks = vec![item(
+            "Check the first site",
+            ToolMutationEffects::NONE,
+            StepStatus::Completed,
+        )];
+        let plan = store
+            .upsert_checklist_graph("s2", Some("t2"), "test", &checks)
+            .await
+            .unwrap();
+        assert_eq!(plan.render_compact_checklist(), "✅ Check the first site");
+    }
+
+    /// Rows stored before steps carried typed evidence read as the
+    /// evidence their flags meant.
+    #[test]
+    fn legacy_step_flags_read_as_typed_evidence() {
+        use crate::plans::StepEvidence;
+        let mut plan = TaskPlan::new("s", "t", "d", vec!["a".into(), "b".into(), "c".into()], "r");
+        plan.steps[0].evidence = StepEvidence::ModelSaid;
+        let mut raw = serde_json::to_value(&plan.steps).unwrap();
+        let steps = raw.as_array_mut().unwrap();
+        steps[0].as_object_mut().unwrap().remove("evidence");
+        steps[0]["said_done"] = true.into();
+        steps[1]["helper_not_started"] = true.into();
+        let read = steps_from_json(&raw.to_string()).unwrap();
+        assert_eq!(read[0].evidence, StepEvidence::ModelSaid);
+        assert_eq!(read[1].evidence, StepEvidence::HelperNotStarted);
+        assert_eq!(read[2].evidence, StepEvidence::Settled);
     }
 
     /// A step whose helper never started is not done, the finished card says
@@ -907,7 +997,7 @@ mod tests {
             .unwrap()
             .expect("a retried launch takes the step");
         assert_eq!(plan.steps[1].status, StepStatus::Background);
-        assert!(!plan.steps[1].helper_not_started);
+        assert!(!plan.steps[1].helper_not_started());
         assert_eq!(plan.status, PlanStatus::InProgress);
     }
 

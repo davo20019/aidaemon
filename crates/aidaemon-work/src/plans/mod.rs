@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::traits::ToolMutationEffects;
+pub use aidaemon_core::card::StepEvidence;
 use aidaemon_events::text::truncate_str;
 
 /// A persistent multi-step task plan.
@@ -82,8 +83,7 @@ impl TaskPlan {
                 background_jobs: Vec::new(),
                 waits_on_jobs: false,
                 not_done: None,
-                said_done: false,
-                helper_not_started: false,
+                evidence: StepEvidence::Settled,
                 status: if index == 0 {
                     StepStatus::InProgress
                 } else {
@@ -166,21 +166,10 @@ impl TaskPlan {
             .count()
     }
 
-    /// Completed steps that typed evidence completed (not only the model's
-    /// word): what the card counts as done.
-    pub fn confirmed_steps(&self) -> usize {
-        self.steps
-            .iter()
-            .filter(|s| s.status == StepStatus::Completed && !s.said_done)
-            .count()
-    }
-
-    /// Completed steps only the model said were done.
-    pub fn said_done_steps(&self) -> usize {
-        self.steps
-            .iter()
-            .filter(|s| s.status == StepStatus::Completed && s.said_done)
-            .count()
+    /// Completed action steps no receipt verified: the only steps the card
+    /// flags ([`PlanStep::unverified`]).
+    pub fn unverified_steps(&self) -> usize {
+        self.steps.iter().filter(|s| s.unverified()).count()
     }
 
     /// The steps at `indices` were confirmed by typed evidence (the run's
@@ -189,8 +178,8 @@ impl TaskPlan {
     pub fn confirm_steps(&mut self, indices: &std::collections::BTreeSet<usize>) -> bool {
         let mut changed = false;
         for step in &mut self.steps {
-            if step.said_done && indices.contains(&step.index) {
-                step.said_done = false;
+            if step.evidence == StepEvidence::ModelSaid && indices.contains(&step.index) {
+                step.evidence = StepEvidence::Settled;
                 changed = true;
             }
         }
@@ -219,7 +208,7 @@ impl TaskPlan {
                 continue;
             }
             step.status = StepStatus::Failed;
-            step.helper_not_started = true;
+            step.evidence = StepEvidence::HelperNotStarted;
             step.error = Some(reason.to_string());
             step.completed_at = Some(now);
             changed = true;
@@ -422,7 +411,7 @@ impl TaskPlan {
             let Some(step) = self.steps.get_mut(index) else {
                 continue;
             };
-            let retried = step.status == StepStatus::Failed && step.helper_not_started;
+            let retried = step.status == StepStatus::Failed && step.helper_not_started();
             if !retried
                 && matches!(
                     step.status,
@@ -431,7 +420,7 @@ impl TaskPlan {
             {
                 continue;
             }
-            step.helper_not_started = false;
+            step.evidence = StepEvidence::Settled;
             step.error = None;
             step.status = StepStatus::Background;
             step.started_at.get_or_insert_with(Utc::now);
@@ -517,7 +506,7 @@ impl TaskPlan {
                 JobEnd::Succeeded if step.background_jobs.is_empty() => {
                     // The helper's run record completed it.
                     step.status = StepStatus::Completed;
-                    step.said_done = false;
+                    step.evidence = StepEvidence::Settled;
                     step.completed_at = Some(now);
                 }
                 JobEnd::Succeeded => {}
@@ -598,17 +587,17 @@ impl TaskPlan {
     /// failure.
     pub fn render_compact_checklist(&self) -> String {
         let total = self.steps.len();
-        let said = self.said_done_steps();
+        let unverified = self.unverified_steps();
         let in_background = self.has_background_steps();
         let finished = !matches!(
             self.status,
             PlanStatus::Planning | PlanStatus::InProgress | PlanStatus::Paused
         );
-        // Every completed step counts as done; which of them no tool
-        // confirmed is said once, in plain words, on the final card only.
+        // Every completed step counts as done; the action steps nothing
+        // verified are said once, in plain words, on the final card only.
         let done = self.completed_steps();
-        let said_note = if said > 0 && finished && !in_background {
-            format!(", {said} not confirmed by a tool")
+        let said_note = if unverified > 0 && finished && !in_background {
+            format!("; I couldn't verify {unverified}")
         } else {
             String::new()
         };
@@ -621,7 +610,7 @@ impl TaskPlan {
         if total == 1 && (self.status != PlanStatus::PartiallyCompleted || held.is_some()) {
             let step = &self.steps[0];
             let mark = match (self.status, step.status) {
-                (_, StepStatus::Completed) if step.said_done => "☑️",
+                (_, StepStatus::Completed) if step.unverified() => "☑️",
                 (_, StepStatus::Completed) => "✅",
                 (_, StepStatus::Skipped) => "✅",
                 _ if held.is_some() => "⏭️",
@@ -631,10 +620,10 @@ impl TaskPlan {
                 _ => "⏳",
             };
             return match (step.status, held) {
-                (StepStatus::Completed, _) if step.said_done => {
-                    format!("{mark} {} ({SAID_DONE})", step.description)
+                (StepStatus::Completed, _) if step.unverified() => {
+                    format!("{mark} {} ({UNVERIFIED})", step.description)
                 }
-                (StepStatus::Failed, _) if step.helper_not_started => {
+                (StepStatus::Failed, _) if step.helper_not_started() => {
                     format!("{mark} {} ({HELPER_NOT_STARTED})", step.description)
                 }
                 (StepStatus::Background, _) => {
@@ -665,9 +654,9 @@ impl TaskPlan {
                 format!("⚙️ Working · step {position} of {total}")
             }
             PlanStatus::Paused => format!("⏸️ Paused · {done} of {total} done{said_note}"),
-            // Every step resolved, some only on the model's word: never a
-            // ✅ the evidence does not back.
-            PlanStatus::Completed if said > 0 => {
+            // Every step resolved, and an action step only on the model's
+            // word: never a ✅ the evidence does not back.
+            PlanStatus::Completed if unverified > 0 => {
                 let needed_note = if not_needed > 0 {
                     format!(", {not_needed} not needed")
                 } else {
@@ -692,11 +681,11 @@ impl TaskPlan {
         let mut out = header;
         for step in &self.steps {
             let line = match (step.status, step.not_done) {
-                (StepStatus::Completed, _) if step.said_done => {
-                    format!("☑️ {} ({SAID_DONE})", step.description)
+                (StepStatus::Completed, _) if step.unverified() => {
+                    format!("☑️ {} ({UNVERIFIED})", step.description)
                 }
                 (StepStatus::Completed, _) => format!("✅ {}", step.description),
-                (StepStatus::Failed, _) if step.helper_not_started => {
+                (StepStatus::Failed, _) if step.helper_not_started() => {
                     format!("⚠️ {} ({HELPER_NOT_STARTED})", step.description)
                 }
                 (StepStatus::InProgress, _) => format!("▶️ {}", step.description),
@@ -725,7 +714,7 @@ impl TaskPlan {
         let not_run: Vec<&str> = self
             .steps
             .iter()
-            .filter(|step| step.status == StepStatus::Failed && step.helper_not_started)
+            .filter(|step| step.status == StepStatus::Failed && step.helper_not_started())
             .map(|step| step.description.as_str())
             .collect();
         if finished && !in_background && !not_run.is_empty() {
@@ -846,18 +835,12 @@ pub struct PlanStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_done: Option<NotDoneReason>,
 
-    /// Completed only on the executing model's word: its checklist update
-    /// said done, and no receipt, background helper's result or other typed
-    /// evidence completed it (live 2026-11-13: "2 of 3 done" right after an
-    /// update that ticked two steps nothing had proven). The card shows such
-    /// a step as said done, never as ✅. Evidence clears it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub said_done: bool,
-
-    /// The step was handed to a helper whose `spawn_agent` call failed, so
-    /// nothing ever worked on it. A later launch for it takes it again.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub helper_not_started: bool,
+    /// How its state is known: settled by typed evidence, completed on the
+    /// executing model's word alone (its checklist update said done and no
+    /// receipt or helper's result proved it; evidence clears it), or handed
+    /// to a helper that never started (a later launch takes it again).
+    #[serde(default, skip_serializing_if = "StepEvidence::is_settled")]
+    pub evidence: StepEvidence,
 
     /// Step status
     pub status: StepStatus,
@@ -893,6 +876,21 @@ fn plan_step_node_id(index: usize) -> String {
 }
 
 impl PlanStep {
+    /// Completed on the model's word alone, and a step that declared a
+    /// side effect: the one kind of step the card flags. A step that
+    /// changes nothing (a check, a read) needs no receipt: the reply says
+    /// what it found.
+    pub fn unverified(&self) -> bool {
+        self.status == StepStatus::Completed
+            && self.evidence == StepEvidence::ModelSaid
+            && !self.required_mutation_effects.is_empty()
+    }
+
+    /// It was handed to a helper that never started.
+    pub fn helper_not_started(&self) -> bool {
+        self.evidence == StepEvidence::HelperNotStarted
+    }
+
     /// Calculate step duration in seconds (if completed).
     pub fn duration_secs(&self) -> Option<u64> {
         match (self.started_at, self.completed_at) {
@@ -995,8 +993,8 @@ impl StepStatus {
     }
 }
 
-/// How the card marks a step only the model said was done.
-const SAID_DONE: &str = "no tool confirmed it";
+/// How the card marks an action step nothing verified.
+const UNVERIFIED: &str = "I couldn't verify this one";
 /// How the card marks a step whose helper never started.
 const HELPER_NOT_STARTED: &str = "didn't run: its helper didn't start";
 
@@ -1033,20 +1031,6 @@ pub enum JobEnd {
 /// Whether a card from [`TaskPlan::render_compact_checklist`] shows every
 /// step finished (the channel's live status reads cards the same way).
 pub use aidaemon_channels::live_status::is_completed_checklist;
-
-/// The progress part of a rendered checklist's header (`step 2 of 5`,
-/// `5 of 5 steps`), for showing a sub-agent's plan as one line. `None` for a
-/// one-step card, which has no count.
-pub fn checklist_progress(rendered: &str) -> Option<String> {
-    let header = rendered.lines().next()?;
-    let (_, progress) = header.split_once(" · ")?;
-    // The final card's confirmation note is for the final card, not a
-    // helper's one-line progress.
-    let progress = progress
-        .split_once(", ")
-        .map_or(progress, |(count, _)| count);
-    Some(progress.trim().to_string())
-}
 
 #[cfg(test)]
 mod tests {
@@ -1217,10 +1201,6 @@ mod tests {
             checklist,
             "⚙️ Working · step 2 of 2\n\n✅ create script\n\n▶️ send the file"
         );
-        assert_eq!(
-            checklist_progress(&checklist).as_deref(),
-            Some("step 2 of 2")
-        );
         assert!(!is_completed_checklist(&checklist));
         assert!(checklist.contains("create script"));
         assert!(checklist.contains("send the file"));
@@ -1246,7 +1226,6 @@ mod tests {
         // One step: the step itself, no header or "1 of 1".
         assert_eq!(checklist, "✅ observe result");
         assert!(is_completed_checklist(&checklist));
-        assert_eq!(checklist_progress(&checklist), None);
         assert!(!checklist.contains("Task complete"));
 
         let mut plan = TaskPlan::new(

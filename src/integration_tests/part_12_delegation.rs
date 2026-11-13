@@ -1101,7 +1101,12 @@ async fn test_a_child_is_listed_from_the_moment_it_is_created() {
         .expect("a status update arrives")
         .expect("the channel is open");
     assert!(
-        matches!(&first, crate::types::StatusUpdate::HelperStarted { label } if label == "Counter A"),
+        matches!(
+            &first,
+            crate::types::StatusUpdate::Helper(view)
+                if view.label == "Counter A"
+                    && view.phase == aidaemon_core::card::RunPhase::Running
+        ),
         "{first:?}"
     );
     // The start line is sent once the child is listed, so it is listed now.

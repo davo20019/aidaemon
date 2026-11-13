@@ -17,57 +17,23 @@ use aidaemon_events::TaskOutcome;
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
-/// Where a helper run stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunPhase {
-    Running,
-    /// Its own end record says it did the work.
-    Succeeded,
-    /// It ended without doing the work: an error, a typed failure.
-    Failed,
-    /// It ended before the work was done: it stopped short by its own
-    /// typed verdict, was cancelled, or made no progress for its limit.
-    Stopped,
-}
+pub use aidaemon_core::card::RunPhase;
+use aidaemon_core::card::{HelperView, Step};
 
-impl RunPhase {
-    /// The phase a child's typed end outcome gives.
-    pub fn ended(outcome: TaskOutcome) -> Self {
-        match outcome {
-            TaskOutcome::Succeeded => Self::Succeeded,
-            TaskOutcome::Partial => Self::Stopped,
-            TaskOutcome::Failed => Self::Failed,
-        }
-    }
-
-    pub fn is_terminal(self) -> bool {
-        self != Self::Running
-    }
-
-    /// The first line of the helper's result in the chat.
-    pub fn headline(self) -> &'static str {
-        match self {
-            Self::Running => "\u{23f3} Running in the background",
-            Self::Succeeded => "\u{2705} Finished in the background",
-            Self::Stopped => "\u{26a0}\u{fe0f} Didn't finish in the background",
-            Self::Failed => "\u{274c} Failed in the background",
-        }
-    }
-
-    /// The helper's line on the plan card, after its name.
-    pub fn card_word(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Succeeded => "done",
-            Self::Stopped => "stopped before it finished",
-            Self::Failed => "failed",
-        }
+/// The phase a child's typed end outcome gives.
+pub fn phase_of(outcome: TaskOutcome) -> RunPhase {
+    match outcome {
+        TaskOutcome::Succeeded => RunPhase::Succeeded,
+        TaskOutcome::Partial => RunPhase::Stopped,
+        TaskOutcome::Failed => RunPhase::Failed,
     }
 }
 
-/// What the run's receipts left unproven: its own typed checklist steps no
-/// receipt confirmed. Only a run with more than one typed step lists them;
-/// a one-step run's step is the run itself, which its phase already says.
+/// What the run's receipts left unproven: its own typed checklist steps
+/// that declared a side effect and that no receipt confirmed. A step that
+/// changes nothing needs none: the helper's report says what it found.
+/// Only a run with more than one typed step lists them; a one-step run's
+/// step is the run itself, which its phase already says.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunEvidence {
     pub unconfirmed: Vec<String>,
@@ -79,9 +45,9 @@ impl RunEvidence {
     pub fn line(&self) -> Option<String> {
         match self.unconfirmed.as_slice() {
             [] => None,
-            [one] => Some(format!("Its tools didn't confirm one step: {one}.")),
+            [one] => Some(format!("I couldn't verify one of its steps: {one}.")),
             many => Some(format!(
-                "Its tools didn't confirm {} steps: {}.",
+                "I couldn't verify {} of its steps: {}.",
                 many.len(),
                 many.join("; ")
             )),
@@ -106,8 +72,8 @@ pub struct RunState {
     pub work_began: Option<DateTime<Utc>>,
     /// How long it waited for the owner's answer on a card.
     pub waited: Duration,
-    /// Its latest step, as its progress line says it.
-    pub step: Option<String>,
+    /// Its latest step while it runs.
+    pub step: Option<Step>,
     pub evidence: RunEvidence,
 }
 
@@ -123,14 +89,17 @@ impl RunState {
             .map(|ended| (ended - self.began()).max(chrono::Duration::zero()))
     }
 
-    /// Its line on the plan card: its name, then its latest step while it
-    /// runs, else how it ended.
-    pub fn card_line(&self) -> (String, Option<String>) {
-        let detail = match self.phase {
-            RunPhase::Running => self.step.clone(),
-            phase => Some(phase.card_word().to_string()),
-        };
-        (self.label.clone(), detail)
+    /// The helper as every card shows it.
+    pub fn view(&self) -> HelperView {
+        HelperView {
+            label: self.label.clone(),
+            phase: self.phase,
+            background: true,
+            step: match self.phase {
+                RunPhase::Running => self.step.clone(),
+                _ => None,
+            },
+        }
     }
 }
 
@@ -206,11 +175,11 @@ impl RunStates {
     }
 
     /// The running run's latest step. Ignored once it ended.
-    pub fn step(&self, id: &str, step: &str) -> bool {
+    pub fn step(&self, id: &str, step: Step) -> bool {
         let mut runs = self.lock();
         match runs.get_mut(id) {
             Some(entry) if entry.state.phase == RunPhase::Running => {
-                entry.state.step = Some(step.to_string());
+                entry.state.step = Some(step);
                 true
             }
             _ => false,
@@ -342,7 +311,7 @@ mod tests {
         let runs = RunStates::default();
         let (tx, mut rx) = mpsc::unbounded_channel();
         runs.begin("job-1", "chat-a", "Slow count", Some(tx));
-        assert!(runs.step("job-1", "running a command: 3"));
+        assert!(runs.step("job-1", Step::Output("3".into())));
         assert!(rx.try_recv().is_err(), "nothing is pushed while it runs");
         let ended = runs
             .finish(
@@ -365,7 +334,7 @@ mod tests {
                 report()
             )
             .is_none());
-        assert!(!runs.step("job-1", "late step"));
+        assert!(!runs.step("job-1", Step::Output("4".into())));
         assert_eq!(runs.get("job-1").unwrap().phase, RunPhase::Succeeded);
         assert!(runs.running("chat-a").is_empty());
     }
@@ -378,10 +347,10 @@ mod tests {
         let runs = children.runs();
         let begun = runs.begin("job-7", "chat-a", "Slow count", None);
         let _entry = children.enter("chat-a", "Slow count", "Count", "child-7", Some("job-7"));
-        runs.step("job-7", "running a command: 9");
+        runs.step("job-7", Step::Output("9".into()));
         let listed = children.listed("chat-a");
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].step.as_deref(), Some("running a command: 9"));
+        assert_eq!(listed[0].step, Some(Step::Output("9".into())));
         assert_eq!(listed[0].child.started_at, begun.started_at);
     }
 }

@@ -62,7 +62,7 @@ fn status_of(update: &StatusUpdate) -> Option<TurnStatus> {
     let n = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
     Some(match update {
         StatusUpdate::Thinking(_) => TurnStatus::Thinking,
-        StatusUpdate::ToolStart { name, summary } => TurnStatus::ToolStarted {
+        StatusUpdate::ToolStart { name, summary, .. } => TurnStatus::ToolStarted {
             name: name.clone(),
             summary: summary.clone(),
         },
@@ -107,11 +107,12 @@ fn status_of(update: &StatusUpdate) -> Option<TurnStatus> {
             state: StepState::Failed,
         },
         StatusUpdate::Checklist { text } => TurnStatus::Checklist { text: text.clone() },
-        StatusUpdate::HelperStarted { label } => TurnStatus::Note {
-            text: format!("Helper started: {label}"),
-        },
-        StatusUpdate::SubAgentProgress { label, progress } => TurnStatus::Note {
-            text: format!("{label}: {progress}"),
+        StatusUpdate::Helper(helper) => TurnStatus::Note {
+            text: format!(
+                "{}: {}",
+                helper.label,
+                aidaemon_channels::live_status::helper_status_words(helper)
+            ),
         },
         StatusUpdate::ProgressSummary { summary, .. } => TurnStatus::Note {
             text: summary.clone(),
@@ -128,12 +129,8 @@ fn status_of(update: &StatusUpdate) -> Option<TurnStatus> {
         StatusUpdate::PlanAbandoned { description, .. } => TurnStatus::Note {
             text: format!("Plan abandoned: {description}"),
         },
-        StatusUpdate::StepHandedOff { name, to_helper } => TurnStatus::Note {
-            text: if *to_helper {
-                format!("{name}: handed to a helper")
-            } else {
-                format!("{name}: running in the background")
-            },
+        StatusUpdate::StepHandedOff { kind } => TurnStatus::Note {
+            text: aidaemon_core::card::Step::HandedOff(*kind).words(),
         },
         _ => return None,
     })

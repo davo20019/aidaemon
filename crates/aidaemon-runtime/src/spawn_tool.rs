@@ -270,7 +270,7 @@ pub fn bounded_child_response(
 
 /// A background helper's result for the chat, rendered from its run record
 /// alone: the header is its phase, the one evidence line names the typed
-/// steps no tool confirmed, and the footer is the time the runtime
+/// action steps nothing verified, and the footer is the time the runtime
 /// measured. The helper's report is the body, never what decides the rest.
 pub fn render_run_result(
     state: &crate::run_state::RunState,
@@ -323,15 +323,24 @@ pub fn job_end(phase: RunPhase) -> aidaemon_work::plans::JobEnd {
     }
 }
 
-/// The chat's running helpers' lines on its card, from their run records.
-pub fn running_helper_lines(
+/// The card a turn leaves in the chat, drawn from the records: the plan (as
+/// it renders itself) and each of the chat's helper runs, running or just
+/// ended, by the same renderer as the live card.
+pub fn kept_card(
+    plan: Option<&aidaemon_work::plans::TaskPlan>,
     runs: &crate::run_state::RunStates,
     chat: &str,
-) -> Vec<(String, Option<String>)> {
-    runs.running(chat)
-        .iter()
-        .map(crate::run_state::RunState::card_line)
-        .collect()
+) -> Option<String> {
+    let plan = plan.map(aidaemon_work::plans::TaskPlan::render_compact_checklist);
+    aidaemon_channels::live_status::render_card(&aidaemon_channels::live_status::CardView {
+        plan: plan.as_deref(),
+        helpers: runs
+            .for_chat(chat)
+            .iter()
+            .map(|run| (run.view(), None))
+            .collect(),
+        activity: None,
+    })
 }
 
 /// One writer at a time for a chat's kept card. A helper's step redraw and
@@ -372,9 +381,9 @@ pub struct HelperCard {
 pub const HELPER_CARD_EVERY: Duration = Duration::from_secs(3);
 
 impl HelperCard {
-    /// Redraw the card the helper's turn left (the plan, each running
-    /// helper's start line and latest step), when that turn has ended and
-    /// left one. While the turn runs, its own live card shows the steps.
+    /// Redraw the card the helper's turn left (its plan, when it has one,
+    /// and each helper's record), when that turn has ended and left one.
+    /// While the turn runs, its own live card shows the steps.
     pub async fn refresh(&self) {
         let writer = card_writer(&self.chat);
         let _turn = writer.lock().await;
@@ -386,46 +395,35 @@ impl HelperCard {
         {
             return;
         }
-        let (Some(hub), Some(plans), Some(plan_session)) = (
-            self.hub.as_ref().and_then(Weak::upgrade),
-            self.plans.as_ref(),
-            self.plan_session.as_deref(),
-        ) else {
+        let Some(hub) = self.hub.as_ref().and_then(Weak::upgrade) else {
             return;
         };
-        if plan_session != self.chat {
+        if self
+            .plan_session
+            .as_deref()
+            .is_some_and(|plan_session| plan_session != self.chat)
+        {
             return;
         }
         let now = (
             hub.checklist_surface(&self.chat).await,
             hub.background_status_surface(&self.chat).await,
         );
-        let Some(surface) = now.0.clone().or_else(|| now.1.clone()) else {
-            return;
-        };
         if now == self.at_start {
             return;
         }
-        let Some(plan) = plans
-            .get_recent_for_session(plan_session, 5)
-            .await
-            .ok()
-            .into_iter()
-            .flatten()
-            .find(|plan| {
-                plan.steps
-                    .iter()
-                    .any(|step| step.background_jobs.contains(&self.job))
-            })
-        else {
+        let plan = job_plan(self.plans.as_ref(), self.plan_session.as_deref(), &self.job).await;
+        // Without a plan the card is the helpers' own, kept by the turn; a
+        // background status message is the turn's reply and is never
+        // drawn over.
+        let surface = match (&plan, now.0, now.1) {
+            (_, Some(card), _) => card,
+            (Some(_), None, Some(status)) => status,
+            _ => return,
+        };
+        let Some(card) = kept_card(plan.as_ref(), &self.runs, &self.chat) else {
             return;
         };
-        let card = aidaemon_channels::live_status::with_helper_lines(
-            &plan.render_compact_checklist(),
-            running_helper_lines(&self.runs, &self.chat)
-                .iter()
-                .map(|(label, step)| (label.as_str(), step.as_deref())),
-        );
         let unchanged = self
             .drawn
             .lock()
@@ -448,6 +446,24 @@ impl HelperCard {
             ),
         }
     }
+}
+
+/// The recent plan of `plan_session` that background job `job` works on.
+async fn job_plan(
+    plans: Option<&Arc<aidaemon_work::plans::PlanStore>>,
+    plan_session: Option<&str>,
+    job: &str,
+) -> Option<aidaemon_work::plans::TaskPlan> {
+    plans?
+        .get_recent_for_session(plan_session?, 5)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|plan| {
+            plan.steps
+                .iter()
+                .any(|step| step.background_jobs.iter().any(|known| known == job))
+        })
 }
 
 /// A background helper's status channel: every update goes on to its
@@ -473,12 +489,25 @@ pub fn show_helper_steps_on_card(
             tokio::select! {
                 update = rx.recv() => {
                     let Some(update) = update else { break };
-                    if let StatusUpdate::SubAgentProgress { label, progress } = &update {
-                        if *label == card.label {
-                            card.runs.step(&card.job, progress);
-                            changed = true;
+                    // The helper's own view goes on as its record: the live
+                    // card shows what the kept card will.
+                    let update = match update {
+                        StatusUpdate::Helper(view)
+                            if view.label == card.label && !view.phase.is_terminal() =>
+                        {
+                            if let Some(step) = view.step.clone() {
+                                card.runs.step(&card.job, step);
+                                changed = true;
+                            }
+                            match card.runs.get(&card.job) {
+                                Some(run) if !run.phase.is_terminal() => {
+                                    StatusUpdate::Helper(run.view())
+                                }
+                                _ => continue,
+                            }
                         }
-                    }
+                        other => other,
+                    };
                     let _ = parent.send(update).await;
                 }
                 _ = redraw.tick(), if changed => {
@@ -1929,6 +1958,17 @@ pub async fn deliver_when_run_ends(
     } else {
         SourceTrust::Trusted
     };
+    // The card settles to its final header first; the result follows.
+    settle_background_steps(
+        &route.runs,
+        route.plans.as_ref(),
+        route.hub.as_ref(),
+        route.plan_session.as_deref(),
+        &state.chat,
+        &state.id,
+        job_end(state.phase),
+    )
+    .await;
     let notification_type = run_notification_type(state.phase);
     let delivery = BackgroundDelivery {
         agent: route.agent.as_ref(),
@@ -1954,16 +1994,6 @@ pub async fn deliver_when_run_ends(
         )
         .await;
     }
-    settle_background_steps(
-        &route.runs,
-        route.plans.as_ref(),
-        route.hub.as_ref(),
-        route.plan_session.as_deref(),
-        &state.chat,
-        &state.id,
-        job_end(state.phase),
-    )
-    .await;
     route.runs.forget(&state.id);
 }
 
@@ -1985,9 +2015,12 @@ pub fn coordination_trailer(tree: Option<&crate::authority::SpawnFamily>, sessio
         .unwrap_or_default()
 }
 
-/// A background job ended: settle the checklist steps it was given and show
-/// the card's new state, editing the card the turn left (or the session's
-/// background status message) in place, else sending it fresh.
+/// A background job ended: settle the checklist steps it was given and
+/// settle the card to its final state, drawn from the records: the plan (when
+/// the job had steps) and each helper, the one that ended under its final
+/// header. A card with a plan edits the card the turn left (or the session's
+/// background status message) in place, else is sent fresh; a helper's own
+/// card is the one the turn kept. The result message follows on its own.
 pub async fn settle_background_steps(
     runs: &crate::run_state::RunStates,
     plan_store: Option<&Arc<aidaemon_work::plans::PlanStore>>,
@@ -1999,37 +2032,42 @@ pub async fn settle_background_steps(
 ) {
     // Its run record already says it ended, so a step redraw that starts
     // now draws nothing; this waits for any still in flight.
-    let still_running: Vec<String> = runs
-        .running(chat_session)
-        .into_iter()
-        .map(|run| run.label)
-        .collect();
     let writer = card_writer(chat_session);
     let _turn = writer.lock().await;
-    let (Some(plans), Some(plan_session)) = (plan_store, plan_session) else {
-        return;
-    };
-    let plan = match plans.settle_background_job(plan_session, job_id, end).await {
-        Ok(Some(plan)) => plan,
-        Ok(None) => return,
-        Err(error) => {
-            warn!(%error, job_id, "Could not settle a background job's checklist steps");
-            return;
+    let plan = match (plan_store, plan_session) {
+        (Some(plans), Some(plan_session)) => {
+            match plans.settle_background_job(plan_session, job_id, end).await {
+                Ok(plan) => plan,
+                Err(error) => {
+                    warn!(%error, job_id, "Could not settle a background job's checklist steps");
+                    None
+                }
+            }
         }
+        _ => None,
     };
     // A sub-agent's own checklist is not the card in the chat.
-    if plan_session != chat_session {
+    if plan_session.is_some_and(|plan_session| plan_session != chat_session) {
         return;
     }
     let Some(hub) = hub.and_then(Weak::upgrade) else {
         return;
     };
-    // Each helper still running keeps its start line under the plan.
-    let card = aidaemon_channels::live_status::with_helper_start_lines(
-        &plan.render_compact_checklist(),
-        still_running.iter().map(String::as_str),
-    );
-    update_checklist_card(hub.as_ref(), chat_session, &card).await;
+    let Some(card) = kept_card(plan.as_ref(), runs, chat_session) else {
+        return;
+    };
+    if plan.is_some() {
+        update_checklist_card(hub.as_ref(), chat_session, &card).await;
+        return;
+    }
+    if runs.get(job_id).is_none() {
+        return;
+    }
+    if let Some(surface) = hub.checklist_surface(chat_session).await {
+        if let Err(error) = hub.edit_text(chat_session, &surface, &card).await {
+            warn!(session_id = %chat_session, %error, "Could not settle a helper's card");
+        }
+    }
 }
 
 /// Show `card` in the session's chat: edit the plan card the turn left (or
