@@ -417,25 +417,15 @@ fn metadata_from_std(metadata: std::fs::Metadata) -> BackendMetadata {
     }
 }
 
+/// The file `path` names after every symlink (a broken one to its target)
+/// and `..`, by the resolver the scope guard uses.
 async fn canonicalize_existing_or_parent(path: &Path) -> anyhow::Result<PathBuf> {
-    let mut candidate = path.to_path_buf();
-    let mut suffix = Vec::new();
-    while !candidate.exists() {
-        let Some(name) = candidate.file_name().map(OsStr::to_owned) else {
-            break;
-        };
-        suffix.push(name);
-        anyhow::ensure!(
-            candidate.pop(),
-            "Cannot resolve path parent: {}",
-            path.display()
-        );
-    }
-    let mut canonical = tokio::fs::canonicalize(candidate).await?;
-    for part in suffix.iter().rev() {
-        canonical.push(part);
-    }
-    Ok(canonical)
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(aidaemon_policies::resolve_path(&absolute)?)
 }
 
 fn sibling_temp_path(path: &Path, purpose: &str) -> PathBuf {

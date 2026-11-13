@@ -42,6 +42,7 @@ mod memory;
 mod opt_out;
 #[cfg(feature = "otel")]
 mod otel;
+mod path;
 mod redact;
 mod scope;
 mod shell;
@@ -72,6 +73,7 @@ pub use opt_out::{
 };
 #[cfg(feature = "otel")]
 pub use otel::{otlp_provider, OtelSink};
+pub use path::{resolve_path, resolve_path_from, resolves_within};
 pub use redact::{secret_patterns, Redactor};
 pub use scope::{ScopeGuard, UndeclaredAccess};
 pub use shell::{

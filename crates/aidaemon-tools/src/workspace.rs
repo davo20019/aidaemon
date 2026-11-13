@@ -1,6 +1,5 @@
-use std::ffi::OsString;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// Why a path argument was refused.
 #[derive(Debug, thiserror::Error)]
@@ -11,8 +10,6 @@ pub enum PathError {
         "`{path}` is outside the workspace ({root}); use a path relative to the workspace root"
     )]
     Escapes { path: String, root: String },
-    #[error("`{path}` uses `..` through a directory that does not exist; use a direct path")]
-    UnresolvableParent { path: String },
     #[error("cannot resolve `{path}`: {source}")]
     Io {
         path: String,
@@ -24,15 +21,18 @@ pub enum PathError {
 /// A root directory that confines every path argument a tool receives.
 ///
 /// Paths are resolved relative to the root (absolute paths are accepted only
-/// if they land inside it), then canonicalized so `..` and symlinks are
-/// followed before the containment check. A path that does not exist yet is
-/// allowed when its nearest existing ancestor is inside the root, so tools
-/// can create new files and directories.
+/// if they land inside it) by the same resolver as the scope guard
+/// ([`aidaemon_policies::resolve_path`]): one component at a time, every
+/// symlink followed (a broken one to its target) and `..` applied to the
+/// directory really reached, before the containment check. A path that does
+/// not exist yet is allowed when it resolves inside the root, so tools can
+/// create new files and directories.
 ///
-/// The check happens when a tool resolves its argument; a concurrent process
-/// that swaps a directory for a symlink between the check and the I/O is not
-/// defended against. Use a [`crate::Sandbox`] when the
-/// workspace itself is shared with untrusted processes.
+/// A path check is not a boundary against a hostile filesystem: a hard link
+/// inside the root to a file outside resolves inside, and a concurrent
+/// process that swaps a directory for a symlink between the check and the
+/// I/O is not seen. Use a [`crate::Sandbox`] when the workspace itself is
+/// shared with untrusted processes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
     root: PathBuf,
@@ -57,8 +57,8 @@ impl Workspace {
     }
 
     /// Resolve a path argument to a canonical absolute path inside the root.
-    /// The path need not exist, but its nearest existing ancestor must be
-    /// inside the root (after following symlinks).
+    /// The path need not exist, but it must resolve inside the root (after
+    /// following every symlink, including a broken last one).
     pub fn resolve(&self, path: &str) -> Result<PathBuf, PathError> {
         if path.trim().is_empty() {
             return Err(PathError::Empty);
@@ -69,41 +69,11 @@ impl Workspace {
         } else {
             self.root.join(given)
         };
-
-        // Walk up to the deepest ancestor that exists (as a file, directory
-        // or symlink); the rest is a tail of plain names to be created.
-        let mut existing = joined.clone();
-        let mut tail: Vec<OsString> = Vec::new();
-        while existing.symlink_metadata().is_err() {
-            match existing.components().next_back() {
-                Some(Component::Normal(name)) => {
-                    tail.push(name.to_os_string());
-                    existing.pop();
-                }
-                Some(Component::CurDir) => {
-                    existing.pop();
-                }
-                Some(Component::ParentDir) => {
-                    return Err(PathError::UnresolvableParent {
-                        path: path.to_string(),
-                    })
-                }
-                _ => {
-                    return Err(PathError::Escapes {
-                        path: path.to_string(),
-                        root: self.root.display().to_string(),
-                    })
-                }
-            }
-        }
-
-        let mut resolved = std::fs::canonicalize(&existing).map_err(|source| PathError::Io {
-            path: path.to_string(),
-            source,
-        })?;
-        for name in tail.into_iter().rev() {
-            resolved.push(name);
-        }
+        let resolved =
+            aidaemon_policies::resolve_path(&joined).map_err(|source| PathError::Io {
+                path: path.to_string(),
+                source,
+            })?;
         if !resolved.starts_with(&self.root) {
             return Err(PathError::Escapes {
                 path: path.to_string(),
@@ -203,5 +173,21 @@ mod tests {
             ws.resolve("inner/x").unwrap(),
             ws.root().join("real").join("x")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn follows_links_before_dot_dot_and_broken_links_to_their_target() {
+        let (_d, ws) = ws();
+        let other = tempfile::tempdir().unwrap();
+        let other = std::fs::canonicalize(other.path()).unwrap();
+        std::fs::create_dir(other.join("sub")).unwrap();
+        std::os::unix::fs::symlink(other.join("sub"), ws.root().join("link")).unwrap();
+        assert!(ws.resolve("link/../escape.txt").is_err());
+        std::os::unix::fs::symlink(other.join("new.txt"), ws.root().join("dangling")).unwrap();
+        assert!(ws.resolve("dangling").is_err());
+        assert!(!other.join("new.txt").exists());
+        std::os::unix::fs::symlink(ws.root().join("made.txt"), ws.root().join("inner")).unwrap();
+        assert_eq!(ws.resolve("inner").unwrap(), ws.root().join("made.txt"));
     }
 }

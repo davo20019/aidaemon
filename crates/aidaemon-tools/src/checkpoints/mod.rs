@@ -1675,25 +1675,7 @@ fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
 }
 
 fn canonicalize_existing_prefix(path: &Path) -> anyhow::Result<PathBuf> {
-    let mut existing = path.to_path_buf();
-    let mut suffix = Vec::new();
-    while !existing.exists() {
-        let name = existing
-            .file_name()
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| anyhow::anyhow!("no existing ancestor for {}", path.display()))?;
-        suffix.push(name);
-        anyhow::ensure!(
-            existing.pop(),
-            "cannot resolve path parent: {}",
-            path.display()
-        );
-    }
-    let mut canonical = existing.canonicalize()?;
-    for component in suffix.iter().rev() {
-        canonical.push(component);
-    }
-    Ok(canonical)
+    Ok(aidaemon_policies::resolve_path(path)?)
 }
 
 fn validate_checkpoint_root(root: &Path, store_root: &Path) -> anyhow::Result<()> {

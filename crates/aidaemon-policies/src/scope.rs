@@ -1,10 +1,12 @@
 //! Filesystem scope as a `before_tool` hook, driven by access manifests.
 
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use aidaemon_core::{Hook, HookContext, Safeguard, ToolCall, ToolDecision, ToolInfo};
 use async_trait::async_trait;
+
+use crate::path::{resolve_path, resolve_path_from};
 
 /// What to do with a call whose access manifest is empty (undeclared).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,10 +18,20 @@ pub enum UndeclaredAccess {
 /// Refuse calls whose declared `reads`/`writes` fall outside the allowed
 /// roots.
 ///
-/// Paths are normalized lexically (`.` and `..` resolved, relative paths
-/// joined to the base directory, which defaults to the first root). With
-/// [`ScopeGuard::resolve_symlinks`], the longest existing ancestor of each
-/// path is canonicalized too, so a symlink inside a root cannot point out.
+/// Each path is resolved the way the operating system would open it, by
+/// [`crate::resolve_path`]: relative paths are joined to the base directory
+/// (default: the first root), then walked one component at a time,
+/// following every symbolic link and applying `..` to the directory really
+/// reached. A link inside a root that points out, a broken link whose target
+/// is outside, and `link/..` all resolve outside and are refused. The roots
+/// are resolved the same way, so a root given through a link still admits
+/// its own files.
+///
+/// The guard checks paths, and a path check is not a boundary against a
+/// hostile filesystem: a **hard link** inside a root to a file outside, or a
+/// directory swapped for a link between the check and the write, gets
+/// through. Run tools that write a directory other processes can change in
+/// a sandbox (`aidaemon_tools::Sandbox`).
 ///
 /// The guard checks paths only. Hosts and commands are other policies'
 /// business ([`crate::ApprovalPolicy`] for commands); a manifest that
@@ -29,7 +41,6 @@ pub struct ScopeGuard {
     roots: Vec<PathBuf>,
     base: Option<PathBuf>,
     home: Option<PathBuf>,
-    resolve_symlinks: bool,
     undeclared_read_only: UndeclaredAccess,
     undeclared_writer: UndeclaredAccess,
     path_free: HashSet<String>,
@@ -42,13 +53,9 @@ impl ScopeGuard {
         P: AsRef<Path>,
     {
         Self {
-            roots: roots
-                .into_iter()
-                .map(|r| normalize(r.as_ref(), Path::new("/")))
-                .collect(),
+            roots: roots.into_iter().map(|r| absolute(r.as_ref())).collect(),
             base: None,
             home: None,
-            resolve_symlinks: false,
             undeclared_read_only: UndeclaredAccess::Allow,
             undeclared_writer: UndeclaredAccess::Deny,
             path_free: HashSet::new(),
@@ -57,19 +64,13 @@ impl ScopeGuard {
 
     /// Directory relative paths are resolved against (default: first root).
     pub fn base_dir(mut self, base: impl AsRef<Path>) -> Self {
-        self.base = Some(normalize(base.as_ref(), Path::new("/")));
+        self.base = Some(absolute(base.as_ref()));
         self
     }
 
     /// Expand `~` with this directory. Without it, `~` paths are refused.
     pub fn home_dir(mut self, home: impl AsRef<Path>) -> Self {
-        self.home = Some(normalize(home.as_ref(), Path::new("/")));
-        self
-    }
-
-    /// Canonicalize existing path prefixes (and the roots) before checking.
-    pub fn resolve_symlinks(mut self, on: bool) -> Self {
-        self.resolve_symlinks = on;
+        self.home = Some(absolute(home.as_ref()));
         self
     }
 
@@ -129,14 +130,17 @@ impl ScopeGuard {
             .map(|p| ("read", p))
             .chain(info.access.writes.iter().map(|p| ("write", p)));
         for (kind, raw) in checks {
-            let Some(resolved) = self.resolve(raw) else {
-                return ToolDecision::Deny {
-                    reason: format!(
-                        "blocked by scope policy: cannot {kind} `{raw}`: `~` paths are not \
-                         resolvable here; use a path under {}",
-                        self.roots_list()
-                    ),
-                };
+            let resolved = match self.resolve(raw) {
+                Ok(resolved) => resolved,
+                Err(why) => {
+                    return ToolDecision::Deny {
+                        reason: format!(
+                            "blocked by scope policy: cannot {kind} `{raw}`: {why}; use a path \
+                             under {}",
+                            self.roots_list()
+                        ),
+                    }
+                }
             };
             if !self.within_roots(&resolved) {
                 return ToolDecision::Deny {
@@ -152,13 +156,18 @@ impl ScopeGuard {
         ToolDecision::Allow
     }
 
-    fn resolve(&self, raw: &str) -> Option<PathBuf> {
-        let raw = raw.trim();
+    /// The file `raw` names, as [`crate::resolve_path`] finds it: `~`
+    /// expanded with the home directory, a relative path joined to the base
+    /// directory. The same resolution the guard checks, for rules and tools
+    /// that want to judge or use the path the guard judged.
+    pub fn resolve(&self, raw: &str) -> Result<PathBuf, String> {
         let path = if raw == "~" || raw.starts_with("~/") {
-            let home = self.home.as_ref()?;
+            let Some(home) = self.home.as_ref() else {
+                return Err("`~` paths are not resolvable here".to_string());
+            };
             home.join(raw.trim_start_matches('~').trim_start_matches('/'))
         } else if raw.starts_with('~') {
-            return None;
+            return Err("`~user` paths are not resolvable here".to_string());
         } else {
             PathBuf::from(raw)
         };
@@ -167,21 +176,12 @@ impl ScopeGuard {
             .clone()
             .or_else(|| self.roots.first().cloned())
             .unwrap_or_else(|| PathBuf::from("/"));
-        let normalized = normalize(&path, &base);
-        Some(if self.resolve_symlinks {
-            canonicalize_existing_prefix(&normalized)
-        } else {
-            normalized
-        })
+        resolve_path_from(&path, &base).map_err(|error| error.to_string())
     }
 
     fn within_roots(&self, path: &Path) -> bool {
         self.roots.iter().any(|root| {
-            let root = if self.resolve_symlinks {
-                canonicalize_existing_prefix(root)
-            } else {
-                root.clone()
-            };
+            let root = resolve_path(root).unwrap_or_else(|_| root.clone());
             path.starts_with(&root)
         })
     }
@@ -198,51 +198,9 @@ impl ScopeGuard {
     }
 }
 
-/// Lexical normalization: join to `base` if relative, then resolve `.` and
-/// `..` without touching the filesystem. `..` never climbs above `/`.
-fn normalize(path: &Path, base: &Path) -> PathBuf {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base.join(path)
-    };
-    let mut out = PathBuf::from("/");
-    for component in joined.components() {
-        match component {
-            Component::Prefix(p) => out.push(p.as_os_str()),
-            Component::RootDir | Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::Normal(part) => out.push(part),
-        }
-    }
-    out
-}
-
-/// Canonicalize the longest existing ancestor and re-append the rest.
-fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
-    let mut existing = path.to_path_buf();
-    let mut rest = Vec::new();
-    loop {
-        if let Ok(canonical) = existing.canonicalize() {
-            let mut out = canonical;
-            for part in rest.iter().rev() {
-                out.push(part);
-            }
-            return out;
-        }
-        match (
-            existing.file_name().map(|n| n.to_owned()),
-            existing.parent(),
-        ) {
-            (Some(name), Some(parent)) => {
-                rest.push(name);
-                existing = parent.to_path_buf();
-            }
-            _ => return path.to_path_buf(),
-        }
-    }
+/// `path` made absolute against `/`, as roots and directories are given.
+fn absolute(path: &Path) -> PathBuf {
+    Path::new("/").join(path)
 }
 
 #[async_trait]
@@ -399,21 +357,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlinks_out_of_root_are_caught_when_resolving() {
+    fn symlinks_out_of_root_are_always_caught() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
         let target = root.path().join("link/file.txt");
         let target = target.to_str().unwrap();
-
-        let lexical = ScopeGuard::new([root.path()]);
-        assert_eq!(
-            lexical.decide("t", &info(ToolAnnotations::WRITE, &[], &[target])),
-            ToolDecision::Allow
-        );
-        let resolving = ScopeGuard::new([root.path()]).resolve_symlinks(true);
+        let guard = ScopeGuard::new([root.path()]);
         assert!(denied(
-            &resolving.decide("t", &info(ToolAnnotations::WRITE, &[], &[target]))
+            &guard.decide("t", &info(ToolAnnotations::WRITE, &[], &[target]))
         ));
     }
 }

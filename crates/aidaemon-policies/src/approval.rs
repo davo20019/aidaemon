@@ -49,6 +49,14 @@ pub enum RuleDecision {
 /// Application rules consulted after the hard blocks and deny rules and
 /// before the allow rules and the mode (for example: a trusted scheduled
 /// session needs no approval; a command needs one with these warnings).
+///
+/// Judge paths from `info.access`, never from `call.arguments`: the policy
+/// hands rules the manifest with every path resolved
+/// ([`ApprovalPolicy::resolved_access`]: absolute, links followed, `..`
+/// applied to real directories), so `drafts/../final.txt` reaches a rule as
+/// `<root>/final.txt` and a prefix check on it means what it says. Raw
+/// arguments are what the model typed: a check on them is a check on
+/// spelling.
 #[async_trait]
 pub trait ApprovalRules: Send + Sync {
     async fn judge(&self, ctx: &HookContext<'_>, call: &ToolCall, info: &ToolInfo) -> RuleDecision;
@@ -104,6 +112,7 @@ pub struct ApprovalPolicy {
     rules: Option<Arc<dyn ApprovalRules>>,
     grants: Option<Arc<dyn ApprovalGrants>>,
     workspace_root: Option<String>,
+    base_dir: Option<std::path::PathBuf>,
     ask_undeclared_writes: bool,
     path_free: HashSet<String>,
 }
@@ -119,6 +128,7 @@ impl std::fmt::Debug for ApprovalPolicy {
             .field("rules", &self.rules.is_some())
             .field("grants", &self.grants.is_some())
             .field("workspace_root", &self.workspace_root)
+            .field("base_dir", &self.base_dir)
             .field("ask_undeclared_writes", &self.ask_undeclared_writes)
             .field("path_free", &self.path_free)
             .finish()
@@ -201,6 +211,40 @@ impl ApprovalPolicy {
     pub fn path_free_tool(mut self, name: impl Into<String>) -> Self {
         self.path_free.insert(name.into());
         self
+    }
+
+    /// Directory relative paths in an access manifest are resolved against
+    /// before [`ApprovalRules`] see it (default: the
+    /// [`workspace root`](Self::workspace_root), if set).
+    pub fn base_dir(mut self, dir: impl AsRef<std::path::Path>) -> Self {
+        self.base_dir = Some(dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// `info` with its declared `reads` and `writes` resolved by
+    /// [`crate::resolve_path`] (links followed, `..` applied to real
+    /// directories), as [`ApprovalRules`] receive it. A relative path with no
+    /// base directory to resolve against, or one that cannot be resolved,
+    /// is left as declared.
+    pub fn resolved_access(&self, info: &ToolInfo) -> ToolInfo {
+        let base = self
+            .base_dir
+            .clone()
+            .or_else(|| self.workspace_root.as_ref().map(std::path::PathBuf::from));
+        let resolve = |raw: &String| {
+            let path = std::path::Path::new(raw);
+            let resolved = match &base {
+                Some(base) if base.is_absolute() => crate::resolve_path_from(path, base),
+                _ => crate::resolve_path(path),
+            };
+            resolved
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| raw.clone())
+        };
+        let mut info = info.clone();
+        info.access.reads = info.access.reads.iter().map(resolve).collect();
+        info.access.writes = info.access.writes.iter().map(resolve).collect();
+        info
     }
 
     pub fn mode(&self) -> ApprovalMode {
@@ -514,7 +558,7 @@ impl Hook for ApprovalPolicy {
             return decision;
         }
         let rule = match &self.rules {
-            Some(rules) => rules.judge(ctx, call, info).await,
+            Some(rules) => rules.judge(ctx, call, &self.resolved_access(info)).await,
             None => RuleDecision::Defer,
         };
         let step = match rule {
