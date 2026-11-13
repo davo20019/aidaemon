@@ -48,6 +48,9 @@ impl AgentIngress for ScriptedAgent {
                     kind: aidaemon_core::card::ActivityKind::Run,
                 })
                 .await;
+            for chunk in ["Do", "ne."] {
+                let _ = status.send(StatusUpdate::ReplyText(chunk.into())).await;
+            }
         }
         let text = if request.user_text.contains("approve") {
             let (response_tx, response_rx) = oneshot::channel();
@@ -647,6 +650,22 @@ async fn compact_sockets_get_no_turn_streaming() {
     let full_frames = until_completed(&mut full).await;
     assert!(!saw_status(&compact_frames), "{compact_frames:?}");
     assert!(saw_status(&full_frames), "{full_frames:?}");
+    // The reply streams as it is written: a full client gets it as
+    // `turn_delta` chunks, a compact one gets none.
+    let streamed = |frames: &[ServerFrame]| {
+        frames
+            .iter()
+            .filter_map(|frame| match frame {
+                ServerFrame::Event {
+                    event: Event::TurnDelta { text, .. },
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>()
+    };
+    assert_eq!(streamed(&full_frames), "Done.", "{full_frames:?}");
+    assert_eq!(streamed(&compact_frames), "", "{compact_frames:?}");
 }
 
 type Socket =

@@ -9,6 +9,11 @@ use crate::semantics::ToolCallContext;
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum StatusUpdate {
+    /// A chunk of the reply as the model writes it, for app clients that
+    /// stream it. Only a top-level turn sends it; the runner hands it to the
+    /// turn observer and never to a chat surface, its live state or a
+    /// parent's card. The finished reply still arrives as the turn's answer.
+    ReplyText(String),
     /// Sent before each LLM call (skipped on iteration 0).
     Thinking(usize),
     /// Sent before each tool execution. `kind` is what every card shows;

@@ -185,6 +185,16 @@ impl TurnObserver for GatewayObserver {
     fn turn_status(&self, session_id: &str, turn: u64, update: &StatusUpdate) {
         let turn_id = self.ids.turn(turn);
         let session = Some(session_id.to_string());
+        if let StatusUpdate::ReplyText(text) = update {
+            self.publisher.publish(
+                session,
+                Event::TurnDelta {
+                    turn_id,
+                    text: text.clone(),
+                },
+            );
+            return;
+        }
         if let StatusUpdate::UserActionRequired { message } = update {
             self.publisher.publish(
                 session,

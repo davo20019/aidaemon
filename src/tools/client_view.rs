@@ -165,6 +165,17 @@ impl Tool for ClientViewTool {
 }
 
 impl ToolSemantics for ClientViewTool {
+    /// Kept through every profile and risk pruning: the owner asked the app
+    /// to go somewhere, and a cheap model on a low-risk turn would otherwise
+    /// lose the one tool that can do it. `offered_in_session` already limits
+    /// it to turns from an app that can be moved.
+    fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
+        aidaemon_tools::semantics::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
+    }
+
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action
     }
@@ -320,6 +331,12 @@ mod tests {
                 "show_devices"
             ]
         );
+    }
+
+    #[test]
+    fn it_survives_profile_pruning() {
+        let tool = ClientViewTool::new(Arc::new(Views::default()));
+        assert!(tool.dispatch_facts().always_offered);
     }
 
     #[test]

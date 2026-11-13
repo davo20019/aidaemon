@@ -903,6 +903,10 @@ impl TurnEngine<'_> {
         let sink_status = status_tx.clone();
         let sink_heartbeat = heartbeat.clone();
         let sink_progress = self.child_progress().cloned();
+        // Reply text streams only from the owner's own turn; a helper's text
+        // is its parent's input, not the reply.
+        let reply_text = (self.depth() == 0).then(|| status_tx.clone()).flatten();
+        let pending_text = std::sync::Mutex::new(PendingReplyText::default());
         // The kernel holds one sink: heartbeat, kernel refusals for the
         // ledger, and the thinking status all go through it.
         // Every run journals its events and checkpoints its state, so a
@@ -933,6 +937,16 @@ impl TurnEngine<'_> {
                     let _ = refusals_tx.send(KernelNotice::Refusal(receipt.clone()));
                 }
                 _ => {}
+            }
+            if let Some(tx) = reply_text.as_ref() {
+                if let Ok(mut pending) = pending_text.lock() {
+                    match event {
+                        sdk::Event::TextDelta { text, .. } => pending.push(text),
+                        sdk::Event::TurnStarted { .. } => pending.next_call(),
+                        _ => {}
+                    }
+                    pending.flush(tx);
+                }
             }
             let Some(status_tx) = sink_status.as_ref() else {
                 return;
@@ -1474,5 +1488,72 @@ impl TurnEngine<'_> {
             .await
             .remove(session_id);
         reply
+    }
+}
+
+/// Reply text not yet handed to the status channel. A full channel keeps
+/// the text here for the next try instead of losing it, and a model call
+/// after one that already wrote text starts on a new paragraph.
+#[derive(Default)]
+struct PendingReplyText {
+    text: String,
+    wrote: bool,
+    paragraph: bool,
+}
+
+impl PendingReplyText {
+    fn push(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.paragraph {
+            self.text.push_str("\n\n");
+            self.paragraph = false;
+        }
+        self.text.push_str(delta);
+        self.wrote = true;
+    }
+
+    fn next_call(&mut self) {
+        if self.wrote {
+            self.paragraph = true;
+        }
+    }
+
+    fn flush(&mut self, tx: &mpsc::Sender<StatusUpdate>) {
+        if self.text.is_empty() {
+            return;
+        }
+        if tx
+            .try_send(StatusUpdate::ReplyText(self.text.clone()))
+            .is_ok()
+        {
+            self.text.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod pending_reply_text_tests {
+    use super::*;
+
+    #[test]
+    fn text_waits_out_a_full_channel_and_calls_start_paragraphs() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(StatusUpdate::Thinking(1)).unwrap();
+        let mut pending = PendingReplyText::default();
+        pending.next_call();
+        pending.push("Checking");
+        pending.flush(&tx);
+        pending.push(" now.");
+        pending.flush(&tx);
+        assert!(matches!(rx.try_recv(), Ok(StatusUpdate::Thinking(1))));
+        pending.next_call();
+        pending.push("Done");
+        pending.flush(&tx);
+        match rx.try_recv() {
+            Ok(StatusUpdate::ReplyText(text)) => assert_eq!(text, "Checking now.\n\nDone"),
+            other => panic!("expected reply text, got {other:?}"),
+        }
     }
 }
