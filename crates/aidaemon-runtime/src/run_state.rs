@@ -34,20 +34,76 @@ pub fn phase_of(outcome: TaskOutcome) -> RunPhase {
 /// changes nothing needs none: the helper's report says what it found.
 /// Only a run with more than one typed step lists them; a one-step run's
 /// step is the run itself, which its phase already says.
+///
+/// Why it failed or stopped is not evidence: it is part of how it ended
+/// ([`RunEnd`]), so a failed run cannot be recorded without its reason.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunEvidence {
     pub unconfirmed: Vec<String>,
-    /// Why a run failed or stopped, from its typed records; `None` for an
-    /// error, which says why itself.
-    pub failure: Option<RunFailure>,
     /// What its run sent the owner when it ended: each declared
     /// deliverable and what became of it. `None`: it ran outside a
     /// request's delivery ledger, so nothing recorded what it sent.
     pub delivered: Option<Vec<crate::coordination::RunDelivery>>,
 }
 
+/// How a run ended: its phase, with why when it did not succeed. A run
+/// recorded as failed always carries its reason: there is no way to end
+/// one `Failed` without a [`RunFailure`] (live 2026-11-13: a background
+/// disk-usage command read "Failed in the background" with nothing more,
+/// and a second run started without the owner hearing why).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunEnd {
+    Succeeded,
+    /// It stopped before finishing; why, when its records say.
+    Stopped(Option<RunFailure>),
+    Failed(RunFailure),
+}
+
+impl RunEnd {
+    /// The phase every surface shows.
+    pub fn phase(&self) -> RunPhase {
+        match self {
+            Self::Succeeded => RunPhase::Succeeded,
+            Self::Stopped(_) => RunPhase::Stopped,
+            Self::Failed(_) => RunPhase::Failed,
+        }
+    }
+
+    /// The one plain line under a finish header, from a run's end and
+    /// evidence: why it did not succeed, else the typed steps left
+    /// unconfirmed.
+    pub fn line(&self, evidence: &RunEvidence) -> Option<String> {
+        self.failure()
+            .map(RunFailure::reason)
+            .or_else(|| evidence.line())
+    }
+
+    /// Why it did not succeed, when known.
+    pub fn failure(&self) -> Option<&RunFailure> {
+        match self {
+            Self::Succeeded | Self::Stopped(None) => None,
+            Self::Stopped(Some(failure)) | Self::Failed(failure) => Some(failure),
+        }
+    }
+
+    /// How a program the runtime watched ended, from its exit status: zero
+    /// succeeded, any other status failed with it, none (killed, or its
+    /// status lost) stopped.
+    pub fn of_exit(code: Option<i32>) -> Self {
+        match code {
+            Some(0) => Self::Succeeded,
+            Some(code) => Self::Failed(RunFailure::Exited { code: Some(code) }),
+            None => Self::Stopped(Some(RunFailure::Exited { code: None })),
+        }
+    }
+}
+
+/// The most of an error's own text a failure reason keeps.
+pub const ERROR_REASON_CHARS: usize = 240;
+
 /// Why a helper's run failed, decided from its typed records (its checklist
-/// steps and its receipts), never from its reply.
+/// steps, its receipts, its end record and the runtime's own errors), never
+/// from its reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunFailure {
     /// It ended without changing anything, while each step of its own that
@@ -62,6 +118,21 @@ pub enum RunFailure {
     /// (`track_requirements`' `short_of`): its end offers the step that
     /// frees it ([`FreeStep`]).
     ShortOf(aidaemon_events::ShortResource),
+    /// An error ended it: the runtime's own error, as it recorded it (its
+    /// end record's error, or the error its run returned), never its reply.
+    Errored { error: String },
+    /// The daemon's own code failed while it ran.
+    Crashed,
+    /// It changed something but ended with these steps of its own that
+    /// needed a change left undone.
+    Unfinished { undone: Vec<String> },
+    /// The owner cancelled it.
+    Cancelled,
+    /// It made no progress for its limit and was stopped.
+    NoProgress,
+    /// Its end record says it failed and records nothing more: said as
+    /// that, so the owner is never left with a bare "failed".
+    NoCause,
 }
 
 /// The concrete next step offered for a resource a run ran out of: what
@@ -139,21 +210,43 @@ impl RunFailure {
                 let step = FreeStep::of(*resource);
                 format!("It stopped because {}. {}", step.what, step.line())
             }
+            Self::Errored { error } => {
+                let error = error.split_whitespace().collect::<Vec<_>>().join(" ");
+                let error = aidaemon_events::text::truncate_str(&error, ERROR_REASON_CHARS);
+                format!("It stopped on an error: {}.", error.trim_end_matches('.'))
+            }
+            Self::Crashed => {
+                "It stopped unexpectedly: the daemon hit an internal error while it ran."
+                    .to_string()
+            }
+            Self::Unfinished { undone } => format!(
+                "It ended before finishing: {} undone: {}.",
+                if undone.len() == 1 {
+                    "this step is"
+                } else {
+                    "these steps are"
+                },
+                undone.join("; ")
+            ),
+            Self::Cancelled => "You cancelled it before it finished.".to_string(),
+            Self::NoProgress => {
+                "It made no progress for its time limit, so it was stopped.".to_string()
+            }
+            Self::NoCause => {
+                "It ended without a successful outcome, and its records give no cause.".to_string()
+            }
         }
     }
 }
 
 impl RunEvidence {
-    /// The one plain line under a finish header: why it failed, else the
-    /// typed steps left unconfirmed. The unconfirmed ones belong to a run
-    /// that finished (its own verdict was done and nothing contradicts it),
-    /// so the line says only what is true of them, in words that agree with
-    /// "finished": its report is the one record of them (live 2026-11-13:
-    /// "I couldn't verify one of its steps" under a ✅ read as a failure).
+    /// The typed steps left unconfirmed, in one plain line. They belong to
+    /// a run that finished (its own verdict was done and nothing
+    /// contradicts it), so the line says only what is true of them, in
+    /// words that agree with "finished": its report is the one record of
+    /// them (live 2026-11-13: "I couldn't verify one of its steps" under a
+    /// ✅ read as a failure).
     pub fn line(&self) -> Option<String> {
-        if let Some(failure) = &self.failure {
-            return Some(failure.reason());
-        }
         match self.unconfirmed.as_slice() {
             [] => None,
             [one] => Some(format!("Its report is the only record of one step: {one}.")),
@@ -192,6 +285,9 @@ pub struct RunState {
     /// The plan steps it was started for (`checklist_items`).
     pub steps: Vec<usize>,
     pub evidence: RunEvidence,
+    /// Why it did not succeed, as its end recorded it ([`RunEnd`]): always
+    /// set for a failed run.
+    pub failure: Option<RunFailure>,
     /// The chat card this run's line is drawn on after its turn: the card
     /// the turn that started it kept. A no-plan run's end edits exactly this
     /// card, never whichever card is newest.
@@ -240,6 +336,19 @@ impl RunState {
         self.span().map(|span| span.took())
     }
 
+    /// Why it did not succeed, in plain words, from its record: the one
+    /// renderer of a run's reason, for its card, its result and the
+    /// parent's continuation alike.
+    pub fn reason(&self) -> Option<String> {
+        self.failure.as_ref().map(RunFailure::reason)
+    }
+
+    /// The one plain line under its finish header: why it did not
+    /// succeed, else the typed steps left unconfirmed.
+    pub fn line(&self) -> Option<String> {
+        self.reason().or_else(|| self.evidence.line())
+    }
+
     /// The helper as every card shows it.
     pub fn view(&self) -> HelperView {
         HelperView {
@@ -257,6 +366,11 @@ impl RunState {
             // when a request started it, so the time from that request to
             // the run's start is said, not left as a gap between two
             // figures; a run no request started has it under its result.
+            // Why it failed or stopped, on its card as in its result.
+            reason: match self.phase {
+                RunPhase::Failed | RunPhase::Stopped => self.reason(),
+                _ => None,
+            },
             took: self
                 .times()
                 .filter(|times| times.requested.is_some())
@@ -306,6 +420,12 @@ struct RunGroup {
 /// once the last of them ends.
 pub fn turn_group(chat: &str, task_id: &str) -> String {
     format!("{chat}#{task_id}")
+}
+
+/// When the owner's request behind a group of runs came in: the earliest
+/// request time their records hold.
+pub fn request_began(ends: &[GroupEnd]) -> Option<DateTime<Utc>> {
+    ends.iter().filter_map(|end| end.state.requested_at).min()
 }
 
 /// One grouped run's end with its result, held until its group's last run
@@ -368,6 +488,7 @@ impl RunStates {
             step: None,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
+            failure: None,
             card: RunCard::default(),
         };
         let seq = self
@@ -488,12 +609,12 @@ impl RunStates {
     pub fn finish(
         &self,
         id: &str,
-        phase: RunPhase,
+        end: RunEnd,
         measured: RunMeasure,
         evidence: RunEvidence,
         report: RunReport,
     ) -> Option<RunState> {
-        debug_assert!(phase.is_terminal());
+        let phase = end.phase();
         let (state, on_end) = {
             let mut runs = self.lock();
             let entry = runs.get_mut(id)?;
@@ -505,6 +626,7 @@ impl RunStates {
             entry.state.work_began = measured.work_began;
             entry.state.waited = measured.waited;
             entry.state.evidence = evidence;
+            entry.state.failure = end.failure().cloned();
             (entry.state.clone(), entry.on_end.take())
         };
         if let Some(on_end) = on_end {
@@ -739,7 +861,7 @@ mod tests {
         let ended = runs
             .finish(
                 "job-1",
-                RunPhase::Succeeded,
+                RunEnd::Succeeded,
                 measure(),
                 RunEvidence::default(),
                 report(),
@@ -751,7 +873,7 @@ mod tests {
         assert!(runs
             .finish(
                 "job-1",
-                RunPhase::Failed,
+                RunEnd::Failed(RunFailure::NoCause),
                 measure(),
                 RunEvidence::default(),
                 report()
@@ -785,6 +907,7 @@ mod tests {
             step: None,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
+            failure: None,
             card: RunCard::default(),
         };
         let times = state.times().unwrap();
@@ -805,6 +928,89 @@ mod tests {
             ..state
         };
         assert_eq!(unrequested.view().took, None);
+    }
+
+    /// Live 2026-11-13: a background disk-usage command exited 1 and read
+    /// "Failed in the background: measuring caches and app data. Took 1m
+    /// 6s…" with no reason; a second run started and the owner never heard
+    /// why. A failed run is recorded only with its typed reason, and its
+    /// card and its result say it in the same plain words.
+    #[test]
+    fn every_failure_path_renders_a_reason() {
+        use aidaemon_events::ShortResource;
+        let failures = [
+            RunFailure::NothingDone { undone: Vec::new() },
+            RunFailure::NothingDone {
+                undone: vec!["Install Drupal".into()],
+            },
+            RunFailure::Exited { code: Some(1) },
+            RunFailure::Exited { code: None },
+            RunFailure::ShortOf(ShortResource::DockerDiskSpace),
+            RunFailure::ShortOf(ShortResource::DiskSpace),
+            RunFailure::ShortOf(ShortResource::Memory),
+            RunFailure::Errored {
+                error: "provider quota exhausted".into(),
+            },
+            RunFailure::Crashed,
+            RunFailure::Unfinished {
+                undone: vec!["Repair the homepage".into()],
+            },
+            RunFailure::Cancelled,
+            RunFailure::NoProgress,
+            RunFailure::NoCause,
+        ];
+        let runs = RunStates::default();
+        for (index, failure) in failures.into_iter().enumerate() {
+            let reason = failure.reason();
+            assert!(reason.trim().len() > 10, "{failure:?}: {reason}");
+            let id = format!("run-{index}");
+            runs.begin(&id, "chat", "measuring caches and app data", None);
+            let ended = runs
+                .finish(
+                    &id,
+                    RunEnd::Failed(failure.clone()),
+                    measure(),
+                    RunEvidence::default(),
+                    report(),
+                )
+                .expect("it ends");
+            assert_eq!(ended.phase, RunPhase::Failed);
+            assert_eq!(ended.failure.as_ref(), Some(&failure));
+            assert_eq!(ended.line(), Some(reason.clone()));
+            assert_eq!(ended.view().reason, Some(reason.clone()));
+            let result = crate::spawn_tool::render_run_result(
+                &ended,
+                "measuring caches and app data",
+                "",
+                100,
+                true,
+            );
+            assert!(result.contains(&reason), "{result}");
+            let card = aidaemon_channels::live_status::render_card(
+                &aidaemon_channels::live_status::CardView {
+                    helpers: vec![(ended.view(), None)],
+                    ..Default::default()
+                },
+            )
+            .expect("a card");
+            assert!(card.contains(&reason), "{card}");
+        }
+    }
+
+    /// The exit status of a program the runtime watched is how it ended:
+    /// an error status fails with it, a lost status stops with that said.
+    #[test]
+    fn a_programs_exit_status_is_its_end() {
+        assert_eq!(RunEnd::of_exit(Some(0)), RunEnd::Succeeded);
+        assert_eq!(
+            RunEnd::of_exit(Some(1)),
+            RunEnd::Failed(RunFailure::Exited { code: Some(1) })
+        );
+        assert_eq!(RunEnd::of_exit(None).phase(), RunPhase::Stopped);
+        assert!(RunEnd::of_exit(None).failure().is_some());
+        assert!(RunEnd::of_exit(Some(1))
+            .line(&RunEvidence::default())
+            .is_some_and(|line| line.contains("exit status 1")));
     }
 
     /// `/tasks` lists a background helper from its run record: the step

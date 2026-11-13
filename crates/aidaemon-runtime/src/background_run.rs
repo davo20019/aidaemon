@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::run_state::{
-    GroupEnd, GroupTurn, RunEvidence, RunMeasure, RunPhase, RunReport, RunState, RunStates,
+    GroupEnd, GroupTurn, RunEnd, RunEvidence, RunMeasure, RunReport, RunState, RunStates,
 };
 use crate::spawn_tool::{
     group_followup, job_end, render_run_result, settle_background_steps, HelperCard,
@@ -80,6 +80,9 @@ pub struct GroupAnswer {
     pub followup: String,
     /// The turn's task, which the continuation continues.
     pub parent_task_id: Option<String>,
+    /// When the owner's request that started the runs came in (the
+    /// earliest of their records): the answer's total is measured from it.
+    pub requested_at: Option<DateTime<Utc>>,
     /// Each run's own result message, in start order: what the chat gets
     /// when no answer can be written.
     pub messages: Vec<String>,
@@ -291,13 +294,14 @@ impl BackgroundRun {
     /// turn is over, and settle its card (the plan steps waiting on it and
     /// its own final header). Returns its record and whether a card now
     /// shows how it ended. A second end changes nothing.
-    pub async fn finish(&self, phase: RunPhase, evidence: RunEvidence) -> (Option<RunState>, bool) {
+    pub async fn finish(&self, end: RunEnd, evidence: RunEvidence) -> (Option<RunState>, bool) {
         if let Some(turn) = self.turn.as_ref() {
             turn.wait().await;
         }
+        let phase = end.phase();
         let ended = self.home.runs.finish(
             &self.id,
-            phase,
+            end,
             RunMeasure {
                 ended_at: Utc::now(),
                 work_began: Some(self.work_began),
@@ -346,6 +350,7 @@ impl BackgroundRun {
             GroupTurn::Complete(ends) => RunsTurn::Answer(GroupAnswer {
                 followup: group_followup(&ends, max_report_chars),
                 parent_task_id: self.task_id.clone(),
+                requested_at: crate::run_state::request_began(&ends),
                 messages: ends.into_iter().map(|end| end.message).collect(),
             }),
         }
@@ -438,11 +443,11 @@ mod tests {
             )
         };
         let (state, _) = command
-            .finish(RunPhase::Succeeded, RunEvidence::default())
+            .finish(RunEnd::Succeeded, RunEvidence::default())
             .await;
         assert!(matches!(end(&command, state, "8"), RunsTurn::Waiting));
         let (state, _) = agent
-            .finish(RunPhase::Succeeded, RunEvidence::default())
+            .finish(RunEnd::Succeeded, RunEvidence::default())
             .await;
         match end(&agent, state, "installed") {
             RunsTurn::Answer(answer) => {
@@ -462,9 +467,7 @@ mod tests {
             },
         )
         .await;
-        let (state, _) = solo
-            .finish(RunPhase::Succeeded, RunEvidence::default())
-            .await;
+        let (state, _) = solo.finish(RunEnd::Succeeded, RunEvidence::default()).await;
         assert!(matches!(end(&solo, state, "ok"), RunsTurn::Alone));
     }
 

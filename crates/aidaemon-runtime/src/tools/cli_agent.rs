@@ -483,7 +483,7 @@ fn permission_profile_path_key(path: &str) -> Result<&str, String> {
 /// ([`crate::helper_run::program_phase`]).
 #[derive(Debug, Clone)]
 struct CliRunEnd {
-    phase: crate::run_state::RunPhase,
+    end: crate::run_state::RunEnd,
     evidence: crate::run_state::RunEvidence,
     changed_something: bool,
 }
@@ -3093,7 +3093,7 @@ impl CliAgentTool {
                     step: task_context.clone(),
                 });
             let _ = end_record_for_task.set(CliRunEnd {
-                phase: run_phase,
+                end: run_phase.clone(),
                 evidence: run_evidence.clone(),
                 changed_something,
             });
@@ -3121,7 +3121,7 @@ impl CliAgentTool {
                         .await;
                 }
             }
-            if run_phase != crate::run_state::RunPhase::Succeeded {
+            if run_phase.phase() != crate::run_state::RunPhase::Succeeded {
                 crate::spawn_tool::release_new_folders(&folders_for_task);
             }
             // Persist completion even if the caller timed out and moved the task to background.
@@ -3147,8 +3147,8 @@ impl CliAgentTool {
                         max_output_for_log,
                     )
                 };
-                let success =
-                    completion.success && run_phase == crate::run_state::RunPhase::Succeeded;
+                let success = completion.success
+                    && run_phase.phase() == crate::run_state::RunPhase::Succeeded;
                 if completion.authentication_failed {
                     CliAgentTool::quarantine_unavailable_tool(
                         &tools_for_completion,
@@ -3161,7 +3161,7 @@ impl CliAgentTool {
                 let (structured_response, structured_error) = if success {
                     (completion.response, completion.error)
                 } else {
-                    let why = run_evidence.line().unwrap_or_default();
+                    let why = run_phase.line(&run_evidence).unwrap_or_default();
                     (
                         None,
                         Some(
@@ -3201,7 +3201,7 @@ impl CliAgentTool {
                 // for completion (async_mode or sync->timeout moved to background).
                 if notify_async || should_notify_for_task.load(Ordering::Relaxed) {
                     let run = run_for_task.get().cloned();
-                    let phase = run_phase;
+                    let phase = run_phase.clone();
                     let status_word = if success { "completed" } else { "failed" };
                     // The run ends now, the moment its program did: its card
                     // settles to its final header before anything else (a
@@ -3313,7 +3313,7 @@ impl CliAgentTool {
                                 "cli_agent completion re-engagement budget exhausted; delivering raw result"
                             );
                         } else if let Some(ref agent) = agent_for_completion {
-                            let ending = match run_evidence.line() {
+                            let ending = match run_phase.line(&run_evidence) {
                                 Some(why) => format!("{status_word}. {why}"),
                                 None => status_word.to_string(),
                             };
@@ -3353,6 +3353,13 @@ impl CliAgentTool {
                                     parent_task_id,
                                     parent_tool_call_id: None,
                                     parent_result_id: None,
+                                    requested_at: match group_answer.as_ref() {
+                                        Some(answer) => answer.requested_at,
+                                        None => ended
+                                            .as_ref()
+                                            .and_then(|(state, _)| state.as_ref())
+                                            .and_then(|state| state.requested_at),
+                                    },
                                 },
                             )
                             .await
@@ -3662,8 +3669,8 @@ impl CliAgentTool {
                     if end.changed_something {
                         mark_run_changed_locally();
                     }
-                    if end.phase != crate::run_state::RunPhase::Succeeded {
-                        let why = end.evidence.line().unwrap_or_default();
+                    if end.end.phase() != crate::run_state::RunPhase::Succeeded {
+                        let why = end.end.line(&end.evidence).unwrap_or_default();
                         let error_msg = format!(
                             "ERROR: CLI agent '{tool_name}' did not do its work. {why}\n\n\
                              Its report:\n{result_text}"
@@ -5348,7 +5355,7 @@ impl CliAgentTool {
                 let made_folders = if args.new_folders.is_empty() {
                     Vec::new()
                 } else {
-                    match crate::spawn_tool::claim_new_folders(&args.new_folders) {
+                    match crate::spawn_tool::claim_request_folders(&args.new_folders, facts) {
                         Ok(made) => made,
                         Err(error) => return Ok(format!("Blocked: {error}")),
                     }
@@ -5442,7 +5449,7 @@ impl CliAgentTool {
                 // (only while still empty), as for a sub-agent.
                 let started = matches!(&output, Ok(text) if !run_did_not_start(text));
                 if !started {
-                    crate::spawn_tool::release_new_folders(&made_folders);
+                    crate::spawn_tool::release_request_folders(&made_folders, facts);
                 }
                 output
             }

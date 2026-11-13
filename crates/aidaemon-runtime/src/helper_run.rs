@@ -13,7 +13,7 @@
 //! none of this.
 
 use crate::authority::{ChildDeclaration, InheritedAuthority, ResolvedAuthority};
-use crate::run_state::{RunEvidence, RunFailure, RunPhase};
+use crate::run_state::{RunEnd, RunEvidence, RunFailure};
 
 /// What one helper call declared about the work it starts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -160,17 +160,13 @@ pub struct ProgramEnd {
 /// How a CLI agent's run ended: an error exit failed, a stop by the runtime
 /// failed; a normal exit succeeded only if it did its work, by the same
 /// [`nothing_done`] rule a sub-agent's run is judged by.
-pub fn program_phase(end: &ProgramEnd) -> (RunPhase, RunEvidence) {
+pub fn program_phase(end: &ProgramEnd) -> (RunEnd, RunEvidence) {
     if end.stopped || end.exit_code != Some(0) {
         return (
-            RunPhase::Failed,
-            RunEvidence {
-                unconfirmed: Vec::new(),
-                failure: Some(RunFailure::Exited {
-                    code: end.exit_code,
-                }),
-                ..Default::default()
-            },
+            RunEnd::Failed(RunFailure::Exited {
+                code: end.exit_code,
+            }),
+            RunEvidence::default(),
         );
     }
     let record = WorkRecord {
@@ -185,15 +181,8 @@ pub fn program_phase(end: &ProgramEnd) -> (RunPhase, RunEvidence) {
         changed_something: end.changed_something,
     };
     match nothing_done(&record) {
-        Some(failure) => (
-            RunPhase::Failed,
-            RunEvidence {
-                unconfirmed: Vec::new(),
-                failure: Some(failure),
-                ..Default::default()
-            },
-        ),
-        None => (RunPhase::Succeeded, RunEvidence::default()),
+        Some(failure) => (RunEnd::Failed(failure), RunEvidence::default()),
+        None => (RunEnd::Succeeded, RunEvidence::default()),
     }
 }
 
@@ -327,11 +316,10 @@ mod tests {
             changed_something: false,
             step: "Install WordPress in claude-wordpress-7".to_string(),
         };
-        let (phase, evidence) = program_phase(&refused);
-        assert_eq!(phase, RunPhase::Failed);
+        let (end, _) = program_phase(&refused);
         assert!(matches!(
-            evidence.failure,
-            Some(RunFailure::NothingDone { ref undone }) if undone == &vec![
+            end,
+            RunEnd::Failed(RunFailure::NothingDone { ref undone }) if undone == &vec![
                 "Install WordPress in claude-wordpress-7".to_string()
             ]
         ));
@@ -339,20 +327,19 @@ mod tests {
             changed_something: true,
             ..refused.clone()
         };
-        assert_eq!(program_phase(&did_it).0, RunPhase::Succeeded);
+        assert_eq!(program_phase(&did_it).0, RunEnd::Succeeded);
         let looked = ProgramEnd {
             expects_change: false,
             ..refused.clone()
         };
-        assert_eq!(program_phase(&looked).0, RunPhase::Succeeded);
+        assert_eq!(program_phase(&looked).0, RunEnd::Succeeded);
         let errored = ProgramEnd {
             exit_code: Some(2),
             changed_something: true,
             ..refused
         };
-        let (phase, evidence) = program_phase(&errored);
-        assert_eq!(phase, RunPhase::Failed);
-        assert_eq!(evidence.failure, Some(RunFailure::Exited { code: Some(2) }));
+        let (end, _) = program_phase(&errored);
+        assert_eq!(end, RunEnd::Failed(RunFailure::Exited { code: Some(2) }));
     }
 
     #[test]

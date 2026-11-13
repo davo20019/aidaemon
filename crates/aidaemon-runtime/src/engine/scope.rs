@@ -215,7 +215,21 @@ pub struct TurnScope<'a> {
     /// launch line names them all
     /// ([`crate::background_run::started_group_in_background`]).
     pub background_runs: std::sync::Mutex<Vec<String>>,
-    /// When the run took over a helper's work after the helper it waited on
-    /// failed: from here to the run's end is the run's own work, measured.
-    pub own_work_since: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    /// The latest helper the run waited on, once it ended: from then on
+    /// any change the run makes itself is its own work after the helper,
+    /// measured to the run's end, and the request's total is measured to
+    /// the answer.
+    pub after_helper: std::sync::Mutex<Option<AfterHelper>>,
+}
+
+/// The run's work after a helper it waited on ended, from typed records:
+/// when the helper ended, its name, and whether the run then changed
+/// anything itself (a later call that succeeded and was not read-only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AfterHelper {
+    pub since: chrono::DateTime<chrono::Utc>,
+    /// The name the owner reads for the helper.
+    pub helper: String,
+    /// The run finished work itself after the helper.
+    pub did_work: bool,
 }

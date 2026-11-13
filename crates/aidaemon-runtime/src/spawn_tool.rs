@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
-use crate::run_state::RunPhase;
+use crate::run_state::{RunEnd, RunPhase};
 use crate::spawn::{
     ChildAgentRequest, ChildAgentRun, ChildAgentRuntime, ChildTimeLimit, ChildTimedOut,
 };
@@ -293,7 +293,7 @@ pub fn render_run_result(
     } else {
         format!("{}: {name}", state.phase.headline())
     };
-    if let Some(line) = state.evidence.line() {
+    if let Some(line) = state.line() {
         if !lead.is_empty() {
             lead.push('\n');
         }
@@ -892,6 +892,70 @@ pub fn since_request_view(
     }
 }
 
+/// A request's whole time as the owner reads it, from their message to
+/// the answer: "Finished 10m 12s after your request (5:30:24 PM to 5:40:36
+/// PM ET)." The one wording of a request's total, under every final
+/// answer that measures one.
+pub fn request_total_line(
+    requested: chrono::DateTime<chrono::Utc>,
+    answered: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
+        "Finished {}.",
+        since_request_view(requested, answered).words
+    )
+}
+
+/// What the runtime measured of a request a turn finished after helpers it
+/// waited on, worded for the owner: the work the turn finished itself after
+/// a helper (`by_me`, only when it changed something), and the request's
+/// total (`total`, when the turn knows when the request came in).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestFinished {
+    pub by_me: Option<String>,
+    pub total: Option<String>,
+}
+
+impl RequestFinished {
+    /// The lines under the answer, each marked as a measurement so a later
+    /// turn keeps it.
+    pub fn footer(&self) -> Option<String> {
+        let lines: Vec<String> = [
+            self.by_me.as_deref().map(|line| line.replace('\n', " ")),
+            self.total.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|line| format!("{MEASURED_TIMING_MARK}{line}"))
+        .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+}
+
+/// The measured end of a request a turn finished after a helper it waited
+/// on ended, from the records: `requested` (when the owner's message came
+/// in), `after` (when the helper ended and whether the turn then changed
+/// anything itself) and `answered` (now).
+pub fn request_finished(
+    requested: Option<chrono::DateTime<chrono::Utc>>,
+    after: &crate::engine::scope::AfterHelper,
+    answered: chrono::DateTime<chrono::Utc>,
+) -> RequestFinished {
+    RequestFinished {
+        by_me: after.did_work.then(|| {
+            format!(
+                "Finished by me after the helper: {}\n{}",
+                after.helper.trim(),
+                took_line(
+                    crate::run_state::measured_span(after.since, answered),
+                    Duration::ZERO
+                )
+            )
+        }),
+        total: requested.map(|requested| request_total_line(requested, answered)),
+    }
+}
+
 /// How long a helper took and when, for the owner, from what the runtime
 /// measured: "Took 21s (2:21:16 PM to 2:21:37 PM ET)." and its wait for the
 /// owner's answer. A run with no request on record: one with a request
@@ -1096,6 +1160,48 @@ pub fn claim_new_folders(folders: &[String]) -> anyhow::Result<Vec<String>> {
 pub fn release_new_folders<P: AsRef<std::path::Path>>(folders: &[P]) {
     for folder in folders {
         let _ = std::fs::remove_dir(folder.as_ref());
+    }
+}
+
+/// The request tree a call belongs to: the folders its work made for
+/// itself are recorded there, for every run of the tree.
+fn request_folders(
+    facts: &aidaemon_tools::semantics::ToolCallContext,
+) -> Option<&aidaemon_tools::semantics::OwnedFolders> {
+    crate::authority::parent_authority(facts)
+        .and_then(|parent| parent.spawn_family.as_ref())
+        .map(crate::authority::SpawnFamily::owned_folders)
+}
+
+/// [`claim_new_folders`] for a helper call: the folders made are recorded
+/// as the request's own ([`crate::authority::SpawnFamily::owned_folders`]),
+/// a typed fact every run of the request reads, so a change or a delete
+/// inside them is never taken for acting on something the work did not
+/// make.
+pub fn claim_request_folders(
+    folders: &[String],
+    facts: &aidaemon_tools::semantics::ToolCallContext,
+) -> anyhow::Result<Vec<String>> {
+    let made = claim_new_folders(folders)?;
+    if let Some(owned) = request_folders(facts) {
+        owned.claim(&made);
+    }
+    Ok(made)
+}
+
+/// [`release_new_folders`] for a helper call that did not start: a folder
+/// removed again is no longer the request's.
+pub fn release_request_folders(
+    folders: &[String],
+    facts: &aidaemon_tools::semantics::ToolCallContext,
+) {
+    release_new_folders(folders);
+    if let Some(owned) = request_folders(facts) {
+        let gone: Vec<&String> = folders
+            .iter()
+            .filter(|folder| !std::path::Path::new(folder.as_str()).exists())
+            .collect();
+        owned.release(&gone);
     }
 }
 
@@ -1481,11 +1587,11 @@ impl SpawnAgentTool {
         facts: &aidaemon_tools::semantics::ToolCallContext,
     ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let mut args = SpawnArgs::parse(arguments)?;
-        let new_folders = claim_new_folders(&args.new_folders)?;
+        let new_folders = claim_request_folders(&args.new_folders, facts)?;
         args.task.push_str(&new_folders_note(&new_folders));
         let result = self.start_child(args, new_folders.clone(), facts).await;
         if result.is_err() {
-            release_new_folders(&new_folders);
+            release_request_folders(&new_folders, facts);
         }
         result
     }
@@ -1944,11 +2050,11 @@ impl SpawnAgentTool {
                         .is_some());
                 // How it ended (typed), what it found to say about it, and
                 // what its receipts left unconfirmed.
-                let (phase, evidence, report) = match result {
+                let (run_end, evidence, report) = match result {
                     _ if cancelled_by_owner => (
-                        RunPhase::Stopped,
+                        RunEnd::Stopped(Some(crate::run_state::RunFailure::Cancelled)),
                         Default::default(),
-                        "You cancelled it. It may have done part of the work.".to_string(),
+                        "It may have done part of the work.".to_string(),
                     ),
                     Ok(run) => {
                         let mut report = run.response.clone();
@@ -1959,10 +2065,14 @@ impl SpawnAgentTool {
                         {
                             report.push_str(&note);
                         }
-                        (run.phase, run.evidence, report)
+                        (run.end, run.evidence, report)
                     }
                     Err(error) => match error.downcast_ref::<ChildTimedOut>() {
-                        None => (RunPhase::Failed, Default::default(), error.to_string()),
+                        None => (
+                            RunEnd::Failed(crate::spawn::failure_of_error(&error)),
+                            Default::default(),
+                            error.to_string(),
+                        ),
                         Some(timed_out) => {
                             // The child may have persisted a terminal outcome
                             // before it was stopped — deliver that instead of a
@@ -1987,20 +2097,17 @@ impl SpawnAgentTool {
                             match salvaged {
                                 Some(outcome) => (
                                     match outcome.status.as_str() {
-                                        "completed" => RunPhase::Succeeded,
-                                        "blocked" => RunPhase::Stopped,
-                                        _ => RunPhase::Failed,
+                                        "completed" => RunEnd::Succeeded,
+                                        "blocked" => RunEnd::Stopped(None),
+                                        _ => RunEnd::Failed(crate::run_state::RunFailure::NoCause),
                                     },
                                     Default::default(),
                                     outcome.details,
                                 ),
                                 None => (
-                                    RunPhase::Stopped,
+                                    RunEnd::Stopped(Some(crate::run_state::RunFailure::NoProgress)),
                                     Default::default(),
-                                    format!(
-                                        "It made no progress for its limit and was stopped.\n\n{}",
-                                        timed_out.render()
-                                    ),
+                                    timed_out.render(),
                                 ),
                             }
                         }
@@ -2008,7 +2115,7 @@ impl SpawnAgentTool {
                 };
                 runs.finish(
                     &background_id,
-                    phase,
+                    run_end,
                     measured_end(&waits),
                     evidence,
                     crate::run_state::RunReport {
@@ -2029,7 +2136,7 @@ impl SpawnAgentTool {
                 // that already ended keeps how it ended.
                 runs.finish(
                     &background_id,
-                    RunPhase::Failed,
+                    RunEnd::Failed(crate::run_state::RunFailure::Crashed),
                     measured_end(&waits),
                     Default::default(),
                     crate::run_state::RunReport {
@@ -2186,6 +2293,7 @@ async fn answer_group(route: &ResultRoute, ends: Vec<crate::run_state::GroupEnd>
             chat: chat.clone(),
             parent_task_id: route.parent_task_id.clone(),
             followup: group_followup(&ends, route.max_response_chars),
+            requested_at: crate::run_state::request_began(&ends),
         })
         .await;
     match answered {
@@ -2236,7 +2344,7 @@ pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usi
         if let Some(times) = state.times() {
             out.push_str(&format!("Times: {}\n", times.line()));
         }
-        if let Some(line) = state.evidence.line() {
+        if let Some(line) = state.line() {
             out.push_str(&line);
             out.push('\n');
         }
@@ -2274,7 +2382,9 @@ pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usi
          are the only durations there are: \"took\" is a helper's own work from its start to its \
          end, \"after your request\" counts from the owner's request. If you mention a time, \
          quote one of these figures with its own words (\"took …\" or \"… after your request\"); \
-         never call one by the other's name and never work a time out yourself. A record's \
+         never call one by the other's name and never work a time out yourself. The request's \
+         total, from the owner's message to this answer, is measured by the daemon and shown \
+         under your answer: never say it wasn't measured, and don't state one of your own. A record's \
          \"Next step\" is the daemon's offer: make it in your answer, as given. Don't call tools \
          to re-check this work.",
     );
@@ -2639,10 +2749,15 @@ impl SpawnAgentTool {
         )
         .await;
         let measured = MeasuredRun::ended_now(started, &waits);
-        let failed = match &result {
-            Ok(run) => run.phase == RunPhase::Failed,
-            Err(error) => error.downcast_ref::<ChildTimedOut>().is_none(),
+        // How it ended, typed: a failure always with its reason.
+        let run_end = match &result {
+            Ok(run) => run.end.clone(),
+            Err(error) if error.downcast_ref::<ChildTimedOut>().is_some() => {
+                RunEnd::Stopped(Some(crate::run_state::RunFailure::NoProgress))
+            }
+            Err(error) => RunEnd::Failed(crate::spawn::failure_of_error(error)),
         };
+        let failed = run_end.phase() == RunPhase::Failed;
         // How long after the owner's request it ended: what the owner means
         // by "how long did it take", on the card and for the parent to
         // quote. Several helpers of one request each carry theirs, and the
@@ -2663,8 +2778,9 @@ impl SpawnAgentTool {
         };
         if requested_at.is_some() {
             window.push_str(&format!(
-                "\nCounted from the owner's request: {} (the last helper of a request to end \
-                 gives the whole request's time).",
+                "\nCounted from the owner's request: {} (the request's total, from the owner's \
+                 message to your final answer, is measured by the daemon and shown under that \
+                 answer: never say it wasn't measured, and don't work it out yourself).",
                 times.line()
             ));
         }
@@ -2672,17 +2788,13 @@ impl SpawnAgentTool {
         // the runtime measured: the owner reads the time there, never as
         // the parent's arithmetic.
         if let Some(tx) = card_tx {
-            let phase = match &result {
-                Ok(run) => run.phase,
-                Err(error) if error.downcast_ref::<ChildTimedOut>().is_some() => RunPhase::Stopped,
-                Err(_) => RunPhase::Failed,
-            };
             let _ = tx.try_send(StatusUpdate::Helper(aidaemon_core::card::HelperView {
                 label: helper_name.clone(),
-                phase,
+                phase: run_end.phase(),
                 background: false,
                 step: None,
                 steps: card_steps,
+                reason: run_end.failure().map(crate::run_state::RunFailure::reason),
                 took: Some(times.line()),
                 since_request: since,
             }));
@@ -2692,18 +2804,20 @@ impl SpawnAgentTool {
             Ok(run) => {
                 // How it ended is its run record's phase, decided from typed
                 // facts; its reply is only the body.
-                let response = match run.phase {
-                    RunPhase::Succeeded => run.response,
-                    RunPhase::Stopped | RunPhase::Running => {
-                        format!("\u{26a0}\u{fe0f} Sub-agent incomplete\n\n{}", run.response)
-                    }
-                    RunPhase::Failed => {
-                        let reason = run
-                            .evidence
-                            .failure
+                let response = match &run.end {
+                    RunEnd::Succeeded => run.response,
+                    RunEnd::Stopped(why) => {
+                        let why = why
                             .as_ref()
                             .map(|failure| format!("{}\n\n", failure.reason()))
                             .unwrap_or_default();
+                        format!(
+                            "\u{26a0}\u{fe0f} Sub-agent incomplete\n\n{why}{}",
+                            run.response
+                        )
+                    }
+                    RunEnd::Failed(failure) => {
+                        let reason = format!("{}\n\n", failure.reason());
                         let delivered =
                             crate::coordination::delivery_lines(run.evidence.delivered.as_deref())
                                 .map(|lines| format!("\n{lines}"))
@@ -2737,7 +2851,7 @@ impl SpawnAgentTool {
                 // The child's run already closed with a typed outcome: that,
                 // not a scan of its reply's wording (a review listing "Bugs"
                 // read as a failure), is the receipt's outcome.
-                outcome.metadata.outcome_status = Some(child_receipt_status(run.phase));
+                outcome.metadata.outcome_status = Some(child_receipt_status(run.end.phase()));
                 Ok(outcome)
             }
             Err(error) => match error.downcast_ref::<ChildTimedOut>() {
@@ -2878,7 +2992,7 @@ mod group_tests {
         let now = chrono::Utc::now();
         runs.finish(
             id,
-            RunPhase::Succeeded,
+            RunEnd::Succeeded,
             RunMeasure {
                 ended_at: now,
                 work_began: Some(now - chrono::Duration::seconds(185)),
@@ -2978,6 +3092,7 @@ mod group_tests {
             step: None,
             steps: Vec::new(),
             evidence: Default::default(),
+            failure: None,
             card: Default::default(),
         };
         let end = |state: RunState, report: &str| GroupEnd {
@@ -3078,6 +3193,7 @@ mod group_tests {
                     delivered,
                     ..Default::default()
                 },
+                failure: None,
                 card: Default::default(),
             },
             report: RunReport {
@@ -3159,5 +3275,53 @@ mod group_tests {
             other => panic!("expected the group: {other:?}"),
         }
         assert!(matches!(runs.group_end("b", end("b")), GroupTurn::Alone));
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+
+    /// The folders a helper call makes fresh are recorded as the request's
+    /// own, for every run of its tree; a folder removed again because its
+    /// helper never started is not.
+    #[test]
+    fn folders_a_helper_call_makes_are_the_requests_own() {
+        let base = tempfile::tempdir().unwrap();
+        let family = crate::authority::SpawnFamily::new(Default::default());
+        let mut facts = aidaemon_tools::semantics::ToolCallContext::default();
+        facts
+            .extensions
+            .insert(crate::authority::InheritedAuthority {
+                authority: aidaemon_core::Authority::full(),
+                owner_level: None,
+                task_access: None,
+                mode_session: None,
+                untrusted_context: false,
+                origin_request: None,
+                origin_trusted: true,
+                trusted_roots: Vec::new(),
+                declined: Vec::new(),
+                shared_declines: None,
+                learning: None,
+                spawn_family: Some(family.clone()),
+                child_declaration: None,
+                parent_run: None,
+                known_resources: Default::default(),
+                card_title: None,
+                card_steps: Vec::new(),
+                lineage: Vec::new(),
+                parent_task: None,
+            });
+        let folder = base.path().join("claude-drupal-9").display().to_string();
+        let made = claim_request_folders(std::slice::from_ref(&folder), &facts).unwrap();
+        assert_eq!(made, vec![folder.clone()]);
+        assert_eq!(family.owned_folders().list(), made);
+        assert!(aidaemon_tools::semantics::within_owned(
+            &format!("{folder}/web/pass-reset.php"),
+            &family.owned_folders().list()
+        ));
+        release_request_folders(&made, &facts);
+        assert!(family.owned_folders().list().is_empty());
     }
 }

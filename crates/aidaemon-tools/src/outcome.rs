@@ -151,6 +151,7 @@ pub struct KernelAdapter<T: ?Sized> {
     tool: Arc<T>,
     spec: ToolSpec,
     trust_roots: Arc<Vec<String>>,
+    owned: crate::semantics::OwnedFolders,
     validator: Option<CallValidator>,
     timeout: Option<Duration>,
     runner: Option<Arc<dyn OutcomeRunner>>,
@@ -163,6 +164,7 @@ impl<T: OutcomeTool + ?Sized> KernelAdapter<T> {
             tool,
             spec,
             trust_roots: Arc::new(Vec::new()),
+            owned: Default::default(),
             validator: None,
             timeout: None,
             runner: None,
@@ -178,6 +180,14 @@ impl<T: OutcomeTool + ?Sized> KernelAdapter<T> {
     /// The run's trusted roots: where an effect lands can decide its class.
     pub fn with_trust_roots(mut self, roots: Arc<Vec<String>>) -> Self {
         self.trust_roots = roots;
+        self
+    }
+
+    /// The folders the request's work made for itself: an effect landing
+    /// there is the work's own, so its class is judged like one inside the
+    /// trusted roots (read live: a folder claimed mid-turn counts at once).
+    pub fn with_owned_folders(mut self, owned: crate::semantics::OwnedFolders) -> Self {
+        self.owned = owned;
         self
     }
 
@@ -242,8 +252,11 @@ impl<T: OutcomeTool + ?Sized + 'static> aidaemon_core::Tool for KernelAdapter<T>
     /// Judged per call: a mixed tool such as a shell reads for `ls` and
     /// writes for `rm`.
     fn annotations_for(&self, arguments: &Value) -> ToolAnnotations {
-        self.tool
-            .call_annotations_in(&arguments.to_string(), &TrustRoots::new(&self.trust_roots))
+        let owned = self.owned.list();
+        self.tool.call_annotations_in(
+            &arguments.to_string(),
+            &TrustRoots::new(&self.trust_roots).with_owned(&owned),
+        )
     }
 
     fn outbound(&self, arguments: &Value) -> Outbound {

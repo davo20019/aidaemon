@@ -500,6 +500,10 @@ impl TurnEngine<'_> {
             internal_continuation,
         } = setup;
         let user_text = user_text.as_str();
+        // When this request reached the runner: a chat turn's own request
+        // time, else now. A request's total is measured from here.
+        let requested_at = aidaemon_channels::turns::TurnOver::current()
+            .map_or_else(chrono::Utc::now, |turn| turn.requested_at());
         let model = engine.model_override.clone().unwrap_or(model);
         touch_heartbeat(&heartbeat);
         // The chat's running turn, so the sub-agents it starts are listed
@@ -603,6 +607,15 @@ impl TurnEngine<'_> {
         // only while the active plugin owns them; `manage_memories` keeps
         // its goal actions under any plugin.
         let bridge_roots = Arc::new(trust_roots.clone());
+        // The request's tree: its runs share one budget, one coordination
+        // ledger and the folders its work made for itself, which every tool
+        // reads when it judges where an effect lands.
+        let spawn_family = self
+            .inherited_authority()
+            .as_ref()
+            .and_then(|parent| parent.spawn_family.clone())
+            .unwrap_or_else(|| crate::authority::SpawnFamily::new(self.turn_limits().spawn_family));
+        let owned_folders = spawn_family.owned_folders().clone();
         if user_role != UserRole::Public {
             for tool in self
                 .tools()
@@ -624,13 +637,16 @@ impl TurnEngine<'_> {
                         ),
                         DaemonToolOffer::Hidden => continue,
                     };
-                builder = builder.tool(turn_tool(
-                    spec,
-                    tool.clone(),
-                    goal_actions_only,
-                    calls_tx.clone(),
-                    bridge_roots.clone(),
-                ));
+                builder = builder.tool(
+                    turn_tool(
+                        spec,
+                        tool.clone(),
+                        goal_actions_only,
+                        calls_tx.clone(),
+                        bridge_roots.clone(),
+                    )
+                    .with_owned_folders(owned_folders.clone()),
+                );
             }
         }
         // The offered MCP-registry tools, bridged the same way so every
@@ -659,13 +675,16 @@ impl TurnEngine<'_> {
                         warn!(tool = %name, "MCP tool name is not a valid kernel tool name; not offered");
                         continue;
                     }
-                    builder = builder.tool(turn_tool(
-                        tool_spec(tool.as_ref()),
-                        tool.clone(),
-                        false,
-                        calls_tx.clone(),
-                        bridge_roots.clone(),
-                    ));
+                    builder = builder.tool(
+                        turn_tool(
+                            tool_spec(tool.as_ref()),
+                            tool.clone(),
+                            false,
+                            calls_tx.clone(),
+                            bridge_roots.clone(),
+                        )
+                        .with_owned_folders(owned_folders.clone()),
+                    );
                     mcp_tools.push(tool);
                 }
             }
@@ -825,11 +844,6 @@ impl TurnEngine<'_> {
             |guard, (name, tool)| guard.tool(name.clone(), tool.dispatch_facts().file_guard),
         );
         let turn_tools = Arc::new(turn_tools);
-        let spawn_family = self
-            .inherited_authority()
-            .as_ref()
-            .and_then(|parent| parent.spawn_family.clone())
-            .unwrap_or_else(|| crate::authority::SpawnFamily::new(self.turn_limits().spawn_family));
         if self.inherited_authority().is_none() {
             spawn_family
                 .coordination()
@@ -1190,7 +1204,7 @@ impl TurnEngine<'_> {
             open_background_jobs: AtomicUsize::new(0),
             background_ack: std::sync::Mutex::new(None),
             background_runs: std::sync::Mutex::new(Vec::new()),
-            own_work_since: std::sync::Mutex::new(None),
+            after_helper: std::sync::Mutex::new(None),
             emitter: &emitter,
             prefix,
             prefix_len,
@@ -1226,6 +1240,7 @@ impl TurnEngine<'_> {
                 cancel: cancel.clone(),
                 // The request's project folder.
                 working_area: scope.project_scope.as_deref(),
+                owned_folders: scope.spawn_family.owned_folders(),
             },
             owner: crate::approvals::OwnerApprovalResolver {
                 decisions: self.host,
@@ -1390,26 +1405,34 @@ impl TurnEngine<'_> {
                         reply = crate::engine::deferral::deferral_notice(attempt, &failure);
                     }
                 }
-                // Work the run finished itself after a helper it waited on
-                // failed has a measured end: the run's own, from the failure
-                // to now, on the card and under the reply, so its time to
-                // finish is quoted from a measurement, never estimated.
-                let own_work_since = scope.own_work_since.lock().ok().and_then(|since| *since);
-                if let (Some(since), TaskStatus::Completed, false) = (
-                    own_work_since,
+                // A request that waited on helpers has a measured end: its
+                // whole time, from the owner's message to this answer, and
+                // the work the run finished itself after a helper, on the
+                // card and under the reply, rendered from the records, so
+                // the answer never estimates a time or says it went
+                // unmeasured.
+                let after_helper = scope
+                    .after_helper
+                    .lock()
+                    .ok()
+                    .and_then(|after| after.clone());
+                if let (Some(after), TaskStatus::Completed, false) = (
+                    after_helper,
                     status,
                     scope.background_handoff.load(Ordering::Relaxed),
                 ) {
-                    let span = crate::run_state::measured_span(since, chrono::Utc::now());
-                    let took = crate::spawn_tool::took_line(span, std::time::Duration::ZERO);
+                    let now = chrono::Utc::now();
+                    let finished =
+                        crate::spawn_tool::request_finished(Some(requested_at), &after, now);
                     if let Some(tx) = scope.status_tx.as_ref() {
-                        let _ = tx.try_send(StatusUpdate::OwnWork { took: took.clone() });
+                        let _ = tx.try_send(StatusUpdate::Finished {
+                            by_me: finished.by_me.clone(),
+                            total: finished.total.clone(),
+                        });
                     }
-                    reply = format!(
-                        "{}\n\n{}Finished here after the helper failed. {took}",
-                        reply.trim_end(),
-                        crate::turn::sliding_window::MEASURED_TIMING_MARK
-                    );
+                    if let Some(footer) = finished.footer() {
+                        reply = format!("{}\n\n{footer}", reply.trim_end());
+                    }
                 }
                 let not_done = abandoned
                     .not_done

@@ -1384,3 +1384,68 @@ async fn a_background_helpers_result_reaches_the_chat_when_it_ends() {
         "{retried:?}"
     );
 }
+
+/// Live 2026-11-13: a Drupal helper took 7m 54s, the parent then repaired
+/// the homepage itself and answered that the total "wasn't measured",
+/// though the owner had asked how long it takes. A request the parent
+/// finishes after a helper it waited on ends with what the runtime
+/// measured, under the final answer: the parent's own work after the helper
+/// and the request's total from the owner's message to the answer.
+#[tokio::test]
+async fn a_request_finished_by_the_parent_after_its_helper_shows_its_total() {
+    use crate::runtime_ports::AgentIngress;
+    let script = vec![
+        MockProvider::tool_call_response(
+            "spawn_agent",
+            &json!({"title": "Drupal install", "mission": "Install Drupal", "task": "Install Drupal."})
+                .to_string(),
+        ),
+        MockProvider::text_response("Installed Drupal."),
+        MockProvider::tool_call_response(
+            "synthetic_patch",
+            &json!({"path": "/tmp/aidaemon-test/drupal/web/index.php"}).to_string(),
+        ),
+        MockProvider::text_response("Drupal is installed and its homepage is repaired."),
+    ];
+    let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(4000, 60));
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+        Arc::new(StructuredPatchTool),
+        Arc::new(OfferedSpawnAgent(spawn_tool.clone())),
+    ];
+    let mut harness = setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(script),
+        tools,
+        None,
+    )
+    .await
+    .unwrap();
+    harness.agent.set_test_orchestrator_mode();
+    let agent = Arc::new(harness.agent);
+    let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
+    spawn_tool.set_agent(Arc::downgrade(&runtime));
+    let reply = agent
+        .handle_inbound_message(crate::runtime_ports::InboundMessageRequest {
+            session_id: "telegram:synthetic-total".to_string(),
+            user_text: "Install Drupal with a helper and tell me how long it takes.".to_string(),
+            attachments: Vec::new(),
+            status_tx: None,
+            user_role: UserRole::Owner,
+            channel_ctx: ChannelContext::private("telegram"),
+            heartbeat: None,
+            ingress_timing: None,
+        })
+        .await
+        .unwrap()
+        .text;
+    let measured = aidaemon_runtime::turn::sliding_window::MEASURED_TIMING_MARK;
+    assert!(
+        reply.contains(&format!("{measured}Finished by me after the helper: Drupal install")),
+        "{reply}"
+    );
+    let total = reply
+        .lines()
+        .find(|line| line.starts_with(&format!("{measured}Finished ")) && line.contains("after your request ("))
+        .unwrap_or_else(|| panic!("the request's total under the answer: {reply}"));
+    assert!(total.ends_with("ET)."), "{total}");
+    assert!(!reply.contains("wasn't measured"), "{reply}");
+}

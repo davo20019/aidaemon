@@ -114,9 +114,10 @@ mod tests {
             steps: Vec::new(),
             evidence: aidaemon_runtime::run_state::RunEvidence {
                 unconfirmed: unconfirmed.iter().map(|s| s.to_string()).collect(),
-                failure: None,
                 ..Default::default()
             },
+            failure: (phase == RunPhase::Failed)
+                .then_some(aidaemon_runtime::run_state::RunFailure::NoCause),
             card: Default::default(),
         }
     }
@@ -578,7 +579,7 @@ mod child_runtime_tests {
         /// Its tree's helper run records.
         runs: Arc<aidaemon_runtime::run_state::RunStates>,
         /// How its runs end when they return.
-        phase: StdMutex<RunPhase>,
+        end: StdMutex<aidaemon_runtime::run_state::RunEnd>,
         /// What its run records say of how they ended.
         evidence: StdMutex<aidaemon_runtime::run_state::RunEvidence>,
     }
@@ -599,7 +600,7 @@ mod child_runtime_tests {
                 salvage_lookups: StdMutex::new(Vec::new()),
                 authorities: StdMutex::new(Vec::new()),
                 runs: Default::default(),
-                phase: StdMutex::new(RunPhase::Succeeded),
+                end: StdMutex::new(aidaemon_runtime::run_state::RunEnd::Succeeded),
                 evidence: StdMutex::new(Default::default()),
             })
         }
@@ -660,7 +661,7 @@ mod child_runtime_tests {
                 response: self.response.clone(),
                 outcome: TaskOutcome::Succeeded,
                 trust: SourceTrust::Trusted,
-                phase: *self.phase.lock().unwrap(),
+                end: self.end.lock().unwrap().clone(),
                 evidence: self.evidence.lock().unwrap().clone(),
             })
         }
@@ -1988,7 +1989,7 @@ mod child_runtime_tests {
         );
         runs.finish(
             "job-own-card",
-            aidaemon_runtime::run_state::RunPhase::Succeeded,
+            aidaemon_runtime::run_state::RunEnd::Succeeded,
             aidaemon_runtime::run_state::RunMeasure {
                 ended_at: chrono::Utc::now(),
                 work_began: None,
@@ -2061,7 +2062,9 @@ mod child_runtime_tests {
         *hub.later_card.lock().unwrap() = Some("card-2".to_string());
         runs.finish(
             "job-unknown",
-            aidaemon_runtime::run_state::RunPhase::Failed,
+            aidaemon_runtime::run_state::RunEnd::Failed(
+                aidaemon_runtime::run_state::RunFailure::NoCause,
+            ),
             aidaemon_runtime::run_state::RunMeasure {
                 ended_at: chrono::Utc::now(),
                 work_began: None,
@@ -2561,7 +2564,7 @@ mod child_runtime_tests {
         let ended = std::time::Instant::now();
         runs.finish(
             "job-race",
-            RunPhase::Succeeded,
+            aidaemon_runtime::run_state::RunEnd::Succeeded,
             aidaemon_runtime::run_state::RunMeasure {
                 ended_at: chrono::Utc::now(),
                 work_began: None,
@@ -2795,7 +2798,10 @@ mod child_runtime_tests {
                 RunPhase::Failed => {
                     *child.failure.lock().unwrap() = Some(anyhow::anyhow!("synthetic failure"))
                 }
-                other => *child.phase.lock().unwrap() = other,
+                RunPhase::Stopped => {
+                    *child.end.lock().unwrap() = aidaemon_runtime::run_state::RunEnd::Stopped(None)
+                }
+                _ => *child.end.lock().unwrap() = aidaemon_runtime::run_state::RunEnd::Succeeded,
             }
             let seen = surfaces_for(&child, cancel).await;
 
@@ -3013,14 +3019,11 @@ mod child_runtime_tests {
             "**Blocked:** the folder does not exist here.",
             Duration::from_millis(10),
         );
-        *child.phase.lock().unwrap() = RunPhase::Failed;
-        *child.evidence.lock().unwrap() = aidaemon_runtime::run_state::RunEvidence {
-            unconfirmed: Vec::new(),
-            failure: Some(aidaemon_runtime::run_state::RunFailure::NothingDone {
+        *child.end.lock().unwrap() = aidaemon_runtime::run_state::RunEnd::Failed(
+            aidaemon_runtime::run_state::RunFailure::NothingDone {
                 undone: vec!["Install WordPress with DDEV".to_string()],
-            }),
-            ..Default::default()
-        };
+            },
+        );
         let tool = tool_for(&child);
         let args = json!({
             "title": "WordPress install",

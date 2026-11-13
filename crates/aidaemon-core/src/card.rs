@@ -166,6 +166,9 @@ pub struct HelperView {
     /// named them: the typed link a later run for the same step supersedes
     /// it by ([`superseded_runs`]).
     pub steps: Vec<usize>,
+    /// Once it failed or stopped, why, in plain words from its run record
+    /// (the same sentence its result carries). Never from its reply.
+    pub reason: Option<String>,
     /// Once it ended, how long it took and when, as the runtime measured it
     /// and already worded for the owner ("Took 21s (2:21:16 PM to 2:21:37 PM
     /// ET)."). Never worked out from anything a model wrote.
@@ -195,6 +198,7 @@ impl HelperView {
             background,
             step,
             steps: Vec::new(),
+            reason: None,
             took: None,
             since_request: None,
         }

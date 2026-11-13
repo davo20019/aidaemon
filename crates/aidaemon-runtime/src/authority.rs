@@ -250,6 +250,10 @@ struct SpawnFamilyState {
     counts: std::sync::Mutex<SpawnCounts>,
     budget: std::sync::Arc<crate::engine::budgets::TreeBudget>,
     coordination: crate::coordination::Coordination,
+    /// The folders the runtime made fresh for this request's work (every
+    /// spawn's claimed `new_folders`): the work's own, for every run of
+    /// the tree.
+    owned_folders: aidaemon_tools::semantics::OwnedFolders,
 }
 
 /// One request's tree of plain sub-agents: its running count, how many it
@@ -328,7 +332,15 @@ impl SpawnFamily {
                 limits.max_escalations_per_child,
                 limits.max_escalations_per_request,
             ),
+            owned_folders: Default::default(),
         }))
+    }
+
+    /// The folders the runtime made fresh for this request's work, shared
+    /// by every run of the tree ([`crate::spawn_tool::claim_new_folders`]
+    /// records them here as it makes them).
+    pub fn owned_folders(&self) -> &aidaemon_tools::semantics::OwnedFolders {
+        &self.0.owned_folders
     }
 
     /// Whether this tree coordinates its members at all.

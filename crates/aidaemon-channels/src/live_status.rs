@@ -37,7 +37,9 @@ pub struct CardView<'a> {
     pub activity: Option<(&'a Step, Duration)>,
     /// The turn finished itself work a failed helper left: its measured
     /// time.
-    pub own_work: Option<&'a str>,
+    /// The request finished in the turn after its helpers: what the
+    /// runtime measured ([`finished_block`]).
+    pub finished: Option<&'a str>,
 }
 
 impl CardView<'_> {
@@ -92,11 +94,8 @@ pub fn render_card(view: &CardView<'_>) -> Option<String> {
     if let Some(total) = since_request_total(&view.helpers, &current) {
         parts.push(total);
     }
-    if let Some(took) = view.own_work {
-        parts.push(format!(
-            "✅ Finished here after the helper failed\n{}",
-            took.trim()
-        ));
+    if let Some(finished) = view.finished {
+        parts.push(finished.trim().to_string());
     }
     let done = view
         .plan
@@ -180,6 +179,27 @@ fn since_request_total(
     ))
 }
 
+/// The card's lines for a request the turn finished after its helpers:
+/// the work it finished itself after a helper ("✅ Finished by me after the
+/// helper: …" and its measured line), then the request's total, both as the
+/// runtime measured and worded them.
+pub fn finished_block(by_me: Option<&str>, total: Option<&str>) -> Option<String> {
+    let lines: Vec<String> = [
+        by_me
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| format!("✅ {line}")),
+        total
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// Where a helper stands, in a few plain words: its latest step while it
 /// runs, else how it ended. For one-line replies that list helpers.
 pub fn helper_status_words(helper: &HelperView) -> String {
@@ -201,6 +221,16 @@ fn helper_block(helper: &HelperView, elapsed: Option<Duration>) -> String {
         helper.phase.helper_headline(helper.background),
         helper.label.trim()
     );
+    // Why it failed or stopped, from its record, right under its header.
+    if let Some(reason) = helper
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| helper.phase.is_terminal() && !reason.is_empty())
+    {
+        block.push('\n');
+        block.push_str(reason);
+    }
     match (helper.phase, helper.step.as_ref(), helper.took.as_deref()) {
         (RunPhase::Running, Some(step), _) if step.is_shown() => {
             block.push('\n');
@@ -246,7 +276,7 @@ pub struct LiveStatus {
     helpers: Vec<(HelperView, std::time::Instant)>,
     /// The measured time of work the turn finished itself after a helper
     /// failed.
-    own_work: Option<String>,
+    finished: Option<String>,
     /// What the surface shows now, so an unchanged card is never re-sent.
     shown: Option<String>,
     edit_supported: bool,
@@ -277,7 +307,7 @@ impl LiveStatus {
             checklist: None,
             activity: None,
             helpers: Vec::new(),
-            own_work: None,
+            finished: None,
             shown: None,
             edit_supported: true,
         }
@@ -296,7 +326,7 @@ impl LiveStatus {
                 .then_some(self.activity.as_ref())
                 .flatten()
                 .map(|(step, since)| (step, since.elapsed())),
-            own_work: self.own_work.as_deref(),
+            finished: self.finished.as_deref(),
         }
     }
 
@@ -335,8 +365,8 @@ impl LiveStatus {
                 true
             }
             StatusUpdate::Helper(helper) => self.note_helper(helper.clone()),
-            StatusUpdate::OwnWork { took } => {
-                self.own_work = Some(took.clone());
+            StatusUpdate::Finished { by_me, total } => {
+                self.finished = finished_block(by_me.as_deref(), total.as_deref());
                 true
             }
             _ => false,
@@ -542,6 +572,57 @@ mod tests {
     use aidaemon_core::card::ActivityKind;
 
     use super::*;
+
+    /// A request the turn finished after its helper: the card says the work
+    /// it finished itself after the helper and the request's total, as the
+    /// runtime measured and worded them, under the helper's own line.
+    #[test]
+    fn the_card_shows_work_finished_after_the_helper_and_the_total() {
+        let mut helper = HelperView::running("Drupal install", false, None);
+        helper.phase = RunPhase::Succeeded;
+        helper.took = Some("Took 7m 54s (12:30:56 PM to 12:38:50 PM ET).".into());
+        let finished = finished_block(
+            Some("Finished by me after the helper: Drupal install\nTook 2m 44s (12:38:50 PM to 12:41:34 PM ET)."),
+            Some("Finished 11m 10s after your request (12:30:24 PM to 12:41:34 PM ET)."),
+        )
+        .unwrap();
+        let card = render_card(&CardView {
+            helpers: vec![(helper, None)],
+            finished: Some(&finished),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            card.ends_with(
+                "✅ Finished by me after the helper: Drupal install\nTook 2m 44s (12:38:50 PM \
+                 to 12:41:34 PM ET).\nFinished 11m 10s after your request (12:30:24 PM to \
+                 12:41:34 PM ET)."
+            ),
+            "{card}"
+        );
+        assert_eq!(finished_block(None, None), None);
+    }
+
+    /// A failed helper's card says why, from its record, under its header.
+    #[test]
+    fn a_failed_helpers_card_says_why() {
+        let mut helper = HelperView::running("measuring caches and app data", true, None);
+        helper.phase = RunPhase::Failed;
+        helper.reason = Some("Its program stopped with an error (exit status 1).".into());
+        helper.took = Some("Took 1m 6s.".into());
+        let card = render_card(&CardView {
+            helpers: vec![(helper, None)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            card.contains(
+                "measuring caches and app data\nIts program stopped with an error (exit status \
+                 1).\nTook 1m 6s."
+            ),
+            "{card}"
+        );
+    }
 
     /// Records create/edit calls; create returns a fixed id, edit returns a flag.
     struct FakeSink {
@@ -1076,6 +1157,7 @@ mod tests {
                                 background,
                                 step: Some(Step::Doing(Search)),
                                 steps: Vec::new(),
+                                reason: None,
                                 took: None,
                                 since_request: None,
                             },

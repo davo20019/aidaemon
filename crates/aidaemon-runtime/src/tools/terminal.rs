@@ -3201,14 +3201,28 @@ async fn run_background_continuation_with_timeout(
                 timeout.as_secs()
             )
         })?;
-    tokio::time::timeout_at(deadline, agent.continue_conversation(request))
+    let requested_at = request.requested_at;
+    let mut envelope = tokio::time::timeout_at(deadline, agent.continue_conversation(request))
         .await
         .map_err(|_| {
             anyhow::anyhow!(
                 "Background continuation for session {session_id} timed out after {}s",
                 timeout.as_secs()
             )
-        })?
+        })??;
+    // The final answer to a request carries its total, measured from the
+    // owner's message to now and rendered from the records, never the
+    // model's estimate (live 2026-11-13: an answer said the total "wasn't
+    // measured").
+    if let (Some(requested), false) = (requested_at, envelope.text.trim().is_empty()) {
+        envelope.text = format!(
+            "{}\n\n{}{}",
+            envelope.text.trim_end(),
+            crate::turn::sliding_window::MEASURED_TIMING_MARK,
+            crate::spawn_tool::request_total_line(requested, chrono::Utc::now())
+        );
+    }
+    Ok(envelope)
 }
 
 /// Build the internal follow-up that re-engages the agent loop after a
@@ -5733,11 +5747,12 @@ impl TerminalTool {
                                     }
                                 }
                             };
-                            let phase = match exit_code {
-                                Some(0) => crate::run_state::RunPhase::Succeeded,
-                                Some(_) => crate::run_state::RunPhase::Failed,
-                                None => crate::run_state::RunPhase::Stopped,
-                            };
+                            // How it ended, with why when it did not
+                            // succeed: its exit status (live 2026-11-13: a
+                            // `du` that exited 1 read "Failed in the
+                            // background" with no reason on its card or in
+                            // its result).
+                            let end = crate::run_state::RunEnd::of_exit(exit_code);
                             if !notify_on_completion.load(Ordering::Relaxed) {
                                 // A check or a stop already reported its end:
                                 // the run ends on its card, with no message.
@@ -5747,7 +5762,8 @@ impl TerminalTool {
                                     "Terminal background notifier suppressed (check/kill already handled notification)"
                                 );
                                 if let Some(run) = run {
-                                    let (state, _) = run.finish(phase, Default::default()).await;
+                                    let (state, _) =
+                                        run.finish(end.clone(), Default::default()).await;
                                     // Its end still counts for its turn's
                                     // group: when it was the last, the others'
                                     // results go out now.
@@ -5792,7 +5808,7 @@ impl TerminalTool {
                             // end recorded after it left the card on the last
                             // output line for minutes (live 2026-11-13: "last
                             // output: 8" after the loop had ended).
-                            let ended = conclude(phase).await;
+                            let ended = conclude(end.clone()).await;
 
                             let stdout =
                                 String::from_utf8_lossy(&stdout_buf.lock().await).to_string();
@@ -6086,6 +6102,13 @@ impl TerminalTool {
                                                     .clone(),
                                                 parent_result_id: completion_parent_result_id
                                                     .clone(),
+                                                requested_at: match group_answer.as_ref() {
+                                                    Some(answer) => answer.requested_at,
+                                                    None => ended
+                                                        .as_ref()
+                                                        .and_then(|(state, _)| state.as_ref())
+                                                        .and_then(|state| state.requested_at),
+                                                },
                                             },
                                         )
                                         .await
@@ -6251,7 +6274,7 @@ impl TerminalTool {
                             }
                             // However the result went, the run has ended.
                             if let Some(run) = run {
-                                run.finish(phase, Default::default()).await;
+                                run.finish(end, Default::default()).await;
                             }
                             // Remove the finished process from `running` (and
                             // its dedupe / task-process indexes), so the idle
@@ -7373,7 +7396,10 @@ fn terminal_run_annotations(
         // An observation-only command cannot write by construction.
         || (!effects.observation_only
             && aidaemon_tools::command_effects::command_names_git_config_path(text));
-    // A delete is egress unless every target is inside the trusted roots.
+    // A delete is egress unless every target is inside the trusted roots or
+    // a folder the request's work made for itself (everything there is the
+    // work's own: live 2026-11-13, removing a reset script the Drupal
+    // install had just written in its own new folder asked the owner).
     // Relative targets resolve against the call's own absolute working
     // directory; without one (the dispatcher may still pick it) they are
     // unknown.
@@ -7392,7 +7418,7 @@ fn terminal_run_annotations(
                         } else {
                             base.map(|base| format!("{}/{target}", base.trim_end_matches('/')))
                         };
-                    resolved.is_none_or(|path| !roots.contains(&path))
+                    resolved.is_none_or(|path| !roots.holds_effect(&path))
                 })
         });
     // On the host every program can reach the network; only observations
@@ -10516,6 +10542,45 @@ mod tests {
         }
     }
 
+    /// Live 2026-11-13: a Drupal helper removing a reset script its own
+    /// install had just written, in the folder its spawn created, asked
+    /// the owner. Everything inside a folder the request's work made for
+    /// itself is the work's own: deleting there is not egress, so nothing
+    /// is asked, while the same delete in a folder that already existed
+    /// (not trusted, not made by the work) still is.
+    #[tokio::test]
+    async fn deleting_in_the_requests_own_new_folder_asks_nothing() {
+        let (host, sandboxed) = host_and_sandboxed_terminals().await;
+        let base = tempfile::tempdir().unwrap();
+        let made = base.path().join("claude-drupal-9");
+        let older = base.path().join("claude-drupal-8");
+        std::fs::create_dir_all(made.join("web")).unwrap();
+        std::fs::create_dir_all(older.join("web")).unwrap();
+        let (made, older) = (made.display().to_string(), older.display().to_string());
+        let trusted: Vec<String> = Vec::new();
+        let owned = vec![made.clone()];
+        let roots = crate::tools::traits::TrustRoots::new(&trusted).with_owned(&owned);
+        for tool in [&host, &sandboxed] {
+            let ann = |command: &str, working_dir: &str| {
+                let args = serde_json::json!({
+                    "action": "run", "command": command, "working_dir": working_dir,
+                });
+                tool.call_annotations_in(&args.to_string(), &roots)
+            };
+            let own = ann(&format!("rm -f {made}/web/pass-reset.php"), &made);
+            assert!(!own.egress && own.destructive, "{own:?}");
+            assert!(!ann("rm -f web/pass-reset.php", &made).egress);
+            let existing = ann(&format!("rm -f {older}/web/pass-reset.php"), &made);
+            assert!(
+                existing.egress,
+                "a folder the work did not make: {existing:?}"
+            );
+            assert!(ann("rm -f web/pass-reset.php", &older).egress);
+            // A path that climbs out of the work's folder is not inside it.
+            assert!(ann("rm -f ../claude-drupal-8/web/x.php", &made).egress);
+        }
+    }
+
     #[tokio::test]
     async fn terminal_writes_into_git_config_are_egress() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -10790,6 +10855,79 @@ mod tests {
         }
     }
 
+    struct AnsweringConversationRuntime;
+
+    #[async_trait::async_trait]
+    impl ConversationRuntime for AnsweringConversationRuntime {
+        async fn continue_conversation(
+            &self,
+            _request: ConversationRequest,
+        ) -> anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope> {
+            Ok(aidaemon_channels::ports::AgentResponseEnvelope {
+                response_id: "r".to_string(),
+                task_id: "t".to_string(),
+                turn_id: None,
+                text: "Drupal is installed.".to_string(),
+                referenced_receipts: Vec::new(),
+                disposition: Default::default(),
+            })
+        }
+
+        async fn record_continuation_delivery(
+            &self,
+            _session_id: &str,
+            _delivery: aidaemon_events::ResponseDeliveryData,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A request answered once its background runs ended gets its total
+    /// under the final answer, measured from the owner's message to the
+    /// answer and rendered from the records; a continuation that knows no
+    /// request time adds nothing.
+    #[tokio::test]
+    async fn a_continuations_final_answer_carries_the_requests_total() {
+        let request = |requested_at| ConversationRequest {
+            session_id: "telegram:synthetic-total".to_string(),
+            user_text: "[Background helpers finished]".to_string(),
+            status_tx: None,
+            user_role: aidaemon_tools::semantics::UserRole::Owner,
+            channel_ctx: aidaemon_channels::context::ChannelContext::internal(),
+            heartbeat: None,
+            parent_task_id: Some("synthetic-parent".to_string()),
+            parent_tool_call_id: None,
+            parent_result_id: None,
+            requested_at,
+        };
+        let requested = chrono::Utc::now() - chrono::Duration::seconds(612);
+        let answered = run_background_continuation_with_timeout(
+            &AnsweringConversationRuntime,
+            request(Some(requested)),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let (answer, footer) = answered.text.split_once("\n\n").unwrap();
+        assert_eq!(answer, "Drupal is installed.");
+        assert!(
+            footer.starts_with(&format!(
+                "{}Finished 10m 1",
+                crate::turn::sliding_window::MEASURED_TIMING_MARK
+            )),
+            "{footer}"
+        );
+        assert!(footer.contains("after your request ("), "{footer}");
+        let unmeasured = run_background_continuation_with_timeout(
+            &AnsweringConversationRuntime,
+            request(None),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unmeasured.text, "Drupal is installed.");
+    }
+
     #[tokio::test]
     async fn background_continuation_has_a_wall_clock_bound() {
         let request = ConversationRequest {
@@ -10802,6 +10940,7 @@ mod tests {
             parent_task_id: Some("synthetic-parent".to_string()),
             parent_tool_call_id: Some("synthetic-call".to_string()),
             parent_result_id: None,
+            requested_at: None,
         };
         let error = run_background_continuation_with_timeout(
             &PendingConversationRuntime,

@@ -2120,7 +2120,7 @@ impl TurnEngine<'_> {
             unlanded_write,
         );
         // How the run ended, decided once from typed facts.
-        let (phase, evidence) = match child_end_record.as_ref() {
+        let (run_end, evidence) = match child_end_record.as_ref() {
             Ok(Some(end)) if result.is_ok() && !unlanded_write => {
                 let aggregate = self
                     .events()
@@ -2129,7 +2129,19 @@ impl TurnEngine<'_> {
                     .ok();
                 crate::spawn::run_phase(child_outcome, Some(end), aggregate.as_ref())
             }
-            _ => crate::spawn::run_phase(child_outcome, None, None),
+            _ => (
+                crate::spawn::unexplained_end(
+                    child_outcome,
+                    child_end_record.as_ref().ok().and_then(Option::as_ref),
+                    None,
+                    result
+                        .as_ref()
+                        .err()
+                        .map(|error| error.to_string())
+                        .as_deref(),
+                ),
+                Default::default(),
+            ),
         };
         let mut evidence = evidence;
         evidence.delivered = delivered;
@@ -2256,7 +2268,7 @@ impl TurnEngine<'_> {
             response,
             outcome: child_outcome,
             trust,
-            phase,
+            end: run_end,
             evidence,
         })
     }

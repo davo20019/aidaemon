@@ -261,10 +261,11 @@ impl TurnEngine<'_> {
         {
             return;
         }
+        let owned = scope.spawn_family.owned_folders().list();
         let egress = self.turn_tool(scope, tool_name).is_some_and(|tool| {
             tool.call_annotations_in(
                 arguments,
-                &aidaemon_tools::semantics::TrustRoots::new(&scope.trust_roots),
+                &aidaemon_tools::semantics::TrustRoots::new(&scope.trust_roots).with_owned(&owned),
             )
             .egress
                 || tool.call_outbound(arguments) != sdk::Outbound::Nothing
@@ -980,14 +981,50 @@ impl TurnEngine<'_> {
         if let Ok(mut latest) = scope.latest_tool_output.lock() {
             *latest = Some(output.clone());
         }
-        // A helper the run waited on failed: the work it was given is the
-        // run's own from here, and its end is measured when the run ends.
+        // A helper the run waited on ended (finished or not): what the run
+        // changes itself from here is its own work after the helper, and
+        // its end is measured when the run ends (live 2026-11-13: the parent
+        // repaired a Drupal homepage after a helper that succeeded, and its
+        // answer said the total "wasn't measured").
         let handed_on = metadata
             .as_ref()
             .is_some_and(|metadata| metadata.background_handoff || metadata.background_started);
-        if failed && facts.spawns_child_agents && !handed_on {
-            if let Ok(mut since) = scope.own_work_since.lock() {
-                since.get_or_insert_with(chrono::Utc::now);
+        if facts.spawns_child_agents && !handed_on {
+            let helper = crate::spawn::child_status_label(
+                ["title", "mission", "task"]
+                    .iter()
+                    .find_map(|key| {
+                        request
+                            .arguments
+                            .get(*key)
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())
+                    })
+                    .unwrap_or("the helper"),
+            );
+            if let Ok(mut after) = scope.after_helper.lock() {
+                *after = Some(crate::engine::scope::AfterHelper {
+                    since: chrono::Utc::now(),
+                    helper,
+                    did_work: false,
+                });
+            }
+        } else if !failed {
+            let changed = self.turn_tool(scope, &request.name).is_some_and(|tool| {
+                !tool
+                    .call_annotations_in(
+                        arguments,
+                        &aidaemon_tools::semantics::TrustRoots::new(&scope.trust_roots),
+                    )
+                    .read_only
+            });
+            if changed {
+                if let Ok(mut after) = scope.after_helper.lock() {
+                    if let Some(after) = after.as_mut() {
+                        after.did_work = true;
+                    }
+                }
             }
         }
         // Budget progress counts distinct successful operations: repeating
@@ -1316,9 +1353,11 @@ impl TurnEngine<'_> {
             let annotations = self
                 .turn_tool(scope, &request.name)
                 .map(|tool| {
+                    let owned = scope.spawn_family.owned_folders().list();
                     tool.call_annotations_in(
                         arguments,
-                        &aidaemon_tools::semantics::TrustRoots::new(&scope.trust_roots),
+                        &aidaemon_tools::semantics::TrustRoots::new(&scope.trust_roots)
+                            .with_owned(&owned),
                     )
                 })
                 .unwrap_or_default();

@@ -64,7 +64,7 @@ impl ChildAgentRuntime for Agent {
             response: result.response,
             outcome: result.outcome,
             trust: result.trust,
-            phase: result.phase,
+            end: result.end,
             evidence: result.evidence,
         })
     }
@@ -165,6 +165,7 @@ impl ChildAgentRuntime for Agent {
                 parent_task_id: answer.parent_task_id,
                 parent_tool_call_id: None,
                 parent_result_id: None,
+                requested_at: answer.requested_at,
             },
         )
         .await?;

@@ -1248,9 +1248,10 @@ pub fn status_text(update: &StatusUpdate) -> Option<String> {
         )?),
         StatusUpdate::StepHandedOff { kind } => progress(Step::HandedOff(*kind).words()),
         StatusUpdate::CommandOutput { line, .. } => progress(Step::Output(line.clone()).words()),
-        StatusUpdate::OwnWork { took } => {
-            progress(format!("✅ Finished here after the helper failed\n{took}"))
-        }
+        StatusUpdate::Finished { by_me, total } => progress(crate::live_status::finished_block(
+            by_me.as_deref(),
+            total.as_deref(),
+        )?),
     })
 }
 

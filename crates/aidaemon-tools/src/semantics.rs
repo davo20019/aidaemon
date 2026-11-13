@@ -2676,18 +2676,81 @@ pub fn default_call_annotations(
     }
 }
 
+/// The folders a request's work made fresh for itself (a spawn's
+/// `new_folders`, claimed empty by the runtime), shared by every run of the
+/// request's tree. Everything inside them is the work's own: a change or a
+/// delete there acts on nothing anyone else made. A planning and effect
+/// fact only, never a trust source for what is read there (a package
+/// manager fills them with other people's code).
+#[derive(Debug, Clone, Default)]
+pub struct OwnedFolders(std::sync::Arc<std::sync::RwLock<Vec<String>>>);
+
+impl OwnedFolders {
+    /// Record folders the runtime just made for this request's work.
+    pub fn claim(&self, folders: &[String]) {
+        let mut owned = self.0.write().unwrap_or_else(|e| e.into_inner());
+        for folder in folders {
+            let folder = folder.trim();
+            if std::path::Path::new(folder).is_absolute() && !owned.iter().any(|f| f == folder) {
+                owned.push(folder.to_string());
+            }
+        }
+    }
+
+    /// Give back folders that were removed again (the work never started).
+    pub fn release<P: AsRef<std::path::Path>>(&self, folders: &[P]) {
+        let mut owned = self.0.write().unwrap_or_else(|e| e.into_inner());
+        owned.retain(|kept| {
+            !folders
+                .iter()
+                .any(|folder| std::path::Path::new(kept) == folder.as_ref())
+        });
+    }
+
+    /// The folders, as claimed.
+    pub fn list(&self) -> Vec<String> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// Whether absolute `path` resolves inside one of `folders`, by the one
+/// path resolver every scope check uses (`aidaemon_policies::resolves_within`).
+pub fn within_owned(path: &str, folders: &[String]) -> bool {
+    let expanded = shellexpand::tilde(path.trim()).into_owned();
+    let path = std::path::Path::new(&expanded);
+    path.is_absolute()
+        && folders.iter().any(|folder| {
+            aidaemon_policies::resolves_within(path, std::path::Path::new(folder.trim()))
+        })
+}
+
 /// The owner's trusted file roots for one turn. A path is trusted only when
 /// it normalizes without escaping and equals a root or sits below it. A
 /// relative path resolves against `cwd` (where the file tools resolve it);
 /// without one it is never trusted.
+///
+/// `owned` are the folders the request's work made for itself
+/// ([`OwnedFolders`]): an effect landing there is the work's own
+/// ([`Self::holds_effect`]), but what is read there is not trusted for it.
 pub struct TrustRoots<'a> {
     roots: &'a [String],
+    owned: &'a [String],
     cwd: Option<&'a str>,
 }
 
 impl<'a> TrustRoots<'a> {
     pub fn new(roots: &'a [String]) -> Self {
-        Self { roots, cwd: None }
+        Self {
+            roots,
+            owned: &[],
+            cwd: None,
+        }
+    }
+
+    /// The folders the request's work made for itself.
+    pub fn with_owned(mut self, owned: &'a [String]) -> Self {
+        self.owned = owned;
+        self
     }
 
     /// Resolve relative paths against `cwd` (an absolute directory).
@@ -2701,8 +2764,26 @@ impl<'a> TrustRoots<'a> {
     pub fn anchored_at<'b>(&'b self, cwd: Option<&'b str>) -> TrustRoots<'b> {
         TrustRoots {
             roots: self.roots,
+            owned: self.owned,
             cwd,
         }
+    }
+
+    /// Whether an effect (a change, a delete) on `path` stays with the
+    /// owner's own things: inside a trusted root, or inside a folder the
+    /// request's work made for itself. Never a statement about trusting
+    /// what is read there ([`Self::contains`] is).
+    pub fn holds_effect(&self, path: &str) -> bool {
+        if self.contains(path) {
+            return true;
+        }
+        let resolved = match self.cwd {
+            Some(cwd) if !is_absolute_or_home(path) => {
+                format!("{}/{}", cwd.trim_end_matches('/'), path.trim())
+            }
+            _ => path.to_string(),
+        };
+        within_owned(&resolved, self.owned)
     }
 
     /// The directory relative paths resolve against, if any.

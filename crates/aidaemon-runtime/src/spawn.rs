@@ -70,7 +70,7 @@ pub struct SpawnChildResult {
     /// content: its result carries that taint back to the parent.
     pub trust: aidaemon_core::SourceTrust,
     /// How its run ended, as the run-state record holds it ([`run_phase`]).
-    pub phase: crate::run_state::RunPhase,
+    pub end: crate::run_state::RunEnd,
     /// Its typed steps no receipt confirmed.
     pub evidence: crate::run_state::RunEvidence,
 }
@@ -87,11 +87,14 @@ pub fn run_phase(
     outcome: TaskOutcome,
     end: Option<&TaskEndData>,
     aggregate: Option<&aidaemon_events::RunAggregate>,
-) -> (crate::run_state::RunPhase, crate::run_state::RunEvidence) {
-    use crate::run_state::{RunEvidence, RunPhase};
+) -> (crate::run_state::RunEnd, crate::run_state::RunEvidence) {
+    use crate::run_state::{RunEnd, RunEvidence, RunFailure};
     use aidaemon_events::RunObligationState;
     let (Some(end), Some(aggregate)) = (end, aggregate) else {
-        return (crate::run_state::phase_of(outcome), RunEvidence::default());
+        return (
+            unexplained_end(outcome, end, None, None),
+            RunEvidence::default(),
+        );
     };
     // It ran out of something the owner can free: that is why, whatever
     // else its steps say, and its end offers the step that frees it.
@@ -99,14 +102,12 @@ pub fn run_phase(
         aggregate.executor_short_of,
         outcome == TaskOutcome::Succeeded,
     ) {
-        return (
-            crate::run_state::phase_of(outcome),
-            RunEvidence {
-                unconfirmed: Vec::new(),
-                failure: Some(crate::run_state::RunFailure::ShortOf(resource)),
-                ..Default::default()
-            },
-        );
+        let failure = RunFailure::ShortOf(resource);
+        let end = match outcome {
+            TaskOutcome::Failed => RunEnd::Failed(failure),
+            _ => RunEnd::Stopped(Some(failure)),
+        };
+        return (end, RunEvidence::default());
     }
     let checklist: Vec<&aidaemon_events::RunObligation> = aggregate
         .obligations
@@ -115,14 +116,7 @@ pub fn run_phase(
         .map(|(_, obligation)| obligation)
         .collect();
     if let Some(failure) = nothing_done(outcome, &checklist, aggregate) {
-        return (
-            RunPhase::Failed,
-            RunEvidence {
-                unconfirmed: Vec::new(),
-                failure: Some(failure),
-                ..Default::default()
-            },
-        );
+        return (RunEnd::Failed(failure), RunEvidence::default());
     }
     let only_receipts_missing = outcome == TaskOutcome::Partial
         && end.status == aidaemon_events::TaskStatus::Completed
@@ -137,7 +131,10 @@ pub fn run_phase(
             )
         });
     if !only_receipts_missing {
-        return (crate::run_state::phase_of(outcome), RunEvidence::default());
+        return (
+            unexplained_end(outcome, Some(end), Some(&checklist), None),
+            RunEvidence::default(),
+        );
     }
     let unconfirmed = if checklist.len() > 1 {
         let mut pending: Vec<(&String, String)> = aggregate
@@ -170,13 +167,67 @@ pub fn run_phase(
         Vec::new()
     };
     (
-        RunPhase::Succeeded,
+        RunEnd::Succeeded,
         RunEvidence {
             unconfirmed,
-            failure: None,
             ..Default::default()
         },
     )
+}
+
+/// How a run ended when no more specific rule explained it: its outcome's
+/// phase, and for a failure the cause its typed records give, in order: the
+/// error its run returned (`error`, the runtime's), its end record's own
+/// error, its own steps that needed a change and were left undone, and
+/// otherwise that the records give none. Never a bare failure.
+pub fn unexplained_end(
+    outcome: TaskOutcome,
+    end: Option<&TaskEndData>,
+    checklist: Option<&[&aidaemon_events::RunObligation]>,
+    error: Option<&str>,
+) -> crate::run_state::RunEnd {
+    use crate::run_state::{RunEnd, RunFailure};
+    match outcome {
+        TaskOutcome::Succeeded => RunEnd::Succeeded,
+        TaskOutcome::Partial => RunEnd::Stopped(None),
+        TaskOutcome::Failed => {
+            let error = error
+                .or_else(|| end.and_then(|end| end.error.as_deref()))
+                .map(str::trim)
+                .filter(|error| !error.is_empty());
+            if let Some(error) = error {
+                return RunEnd::Failed(RunFailure::Errored {
+                    error: error.to_string(),
+                });
+            }
+            let mut undone: Vec<(&String, String)> = checklist
+                .unwrap_or_default()
+                .iter()
+                .filter(|obligation| {
+                    !obligation.required_effect.is_empty()
+                        && obligation.state != aidaemon_events::RunObligationState::Satisfied
+                })
+                .map(|obligation| {
+                    (
+                        &obligation.id,
+                        obligation
+                            .step
+                            .as_deref()
+                            .map(plain_step)
+                            .unwrap_or_else(|| "a step it listed".to_string()),
+                    )
+                })
+                .collect();
+            undone.sort_by(|a, b| a.0.cmp(b.0));
+            if undone.is_empty() {
+                RunEnd::Failed(RunFailure::NoCause)
+            } else {
+                RunEnd::Failed(RunFailure::Unfinished {
+                    undone: undone.into_iter().map(|(_, step)| step).collect(),
+                })
+            }
+        }
+    }
 }
 
 use crate::helper_run::plain_step;
@@ -846,10 +897,59 @@ pub fn enforce_child_terminal_outcome(
     {
         let summary = task_end
             .and_then(|data| data.error.as_deref().or(data.summary.as_deref()))
-            .unwrap_or("child task ended without a successful outcome");
-        return Err(anyhow::anyhow!("Child task failed: {summary}"));
+            .unwrap_or("child task ended without a successful outcome")
+            .to_string();
+        return Err(ChildTaskFailed {
+            error: task_end.and_then(|data| data.error.clone()),
+            summary,
+        }
+        .into());
     }
     result
+}
+
+/// A child replied, but its own end record says it failed: the record's
+/// error (the runtime's, when it holds one) is why, typed so its run's end
+/// carries it ([`ChildTaskFailed::failure`]) rather than its reply's words.
+#[derive(Debug)]
+pub struct ChildTaskFailed {
+    /// Its end record's error.
+    pub error: Option<String>,
+    /// What the failure says, for the parent.
+    pub summary: String,
+}
+
+impl std::fmt::Display for ChildTaskFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Child task failed: {}", self.summary)
+    }
+}
+
+impl std::error::Error for ChildTaskFailed {}
+
+impl ChildTaskFailed {
+    /// Why its run failed: its end record's error, else that its records
+    /// give no cause.
+    pub fn failure(&self) -> crate::run_state::RunFailure {
+        match self.error.as_deref().map(str::trim) {
+            Some(error) if !error.is_empty() => crate::run_state::RunFailure::Errored {
+                error: error.to_string(),
+            },
+            _ => crate::run_state::RunFailure::NoCause,
+        }
+    }
+}
+
+/// Why a helper run whose call returned `error` failed: a child whose own
+/// record says it failed gives that record's cause; any other error is the
+/// runtime's own and is the cause as it stands.
+pub fn failure_of_error(error: &anyhow::Error) -> crate::run_state::RunFailure {
+    match error.downcast_ref::<ChildTaskFailed>() {
+        Some(failed) => failed.failure(),
+        None => crate::run_state::RunFailure::Errored {
+            error: error.to_string(),
+        },
+    }
 }
 
 pub fn sqlite_busy_code(value: &str) -> bool {
@@ -938,7 +1038,7 @@ pub struct ChildAgentRun {
     /// someone other than the owner wrote.
     pub trust: aidaemon_core::SourceTrust,
     /// How its run ended ([`run_phase`]): what every surface shows.
-    pub phase: crate::run_state::RunPhase,
+    pub end: crate::run_state::RunEnd,
     /// Its typed steps no receipt confirmed.
     pub evidence: crate::run_state::RunEvidence,
 }
@@ -1160,6 +1260,9 @@ pub struct RunsAnswer {
     /// The runs' results and measured times, from their records
     /// ([`crate::spawn_tool::group_followup`]).
     pub followup: String,
+    /// When the owner's request that started the runs came in: the
+    /// answer's total is measured from it.
+    pub requested_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Owned input for re-entering an existing conversation.
@@ -1175,6 +1278,11 @@ pub struct ConversationRequest {
     pub parent_task_id: Option<String>,
     pub parent_tool_call_id: Option<String>,
     pub parent_result_id: Option<String>,
+    /// When the owner's request this continues came in, when the
+    /// continuation gives its final answer: the request's total, from then
+    /// to the answer, is measured and rendered under it
+    /// ([`crate::spawn_tool::request_total_line`]).
+    pub requested_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Minimal agent surface needed by background command/CLI completion paths.
@@ -1372,7 +1480,7 @@ mod tests {
         }))
         .unwrap();
         let (phase, evidence) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run));
-        assert_eq!(phase, crate::run_state::RunPhase::Succeeded);
+        assert_eq!(phase, crate::run_state::RunEnd::Succeeded);
         let line = evidence.line().expect("an evidence line");
         assert_eq!(
             line,
@@ -1405,15 +1513,14 @@ mod tests {
         let mut run = aggregate(&[("satisfied", 0), ("pending", 2)], &[("succeeded", 0)]);
         run.executor_claimed_outcome = Some(aidaemon_events::ExecutorClaimedOutcome::Blocked);
         run.executor_short_of = Some(aidaemon_events::ShortResource::DockerDiskSpace);
-        let (phase, evidence) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run));
-        assert_eq!(phase, crate::run_state::RunPhase::Stopped);
+        let (end, _) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run));
         assert_eq!(
-            evidence.failure,
-            Some(crate::run_state::RunFailure::ShortOf(
+            end,
+            crate::run_state::RunEnd::Stopped(Some(crate::run_state::RunFailure::ShortOf(
                 aidaemon_events::ShortResource::DockerDiskSpace
-            ))
+            )))
         );
-        let line = evidence.line().expect("a reason line");
+        let line = end.failure().expect("a reason").reason();
         assert!(
             line.starts_with("It stopped because Docker ran out of disk space."),
             "{line}"
@@ -1456,13 +1563,13 @@ mod tests {
             run
         };
         let (phase, _) = run_phase(TaskOutcome::Partial, Some(&end), Some(&shape("succeeded")));
-        assert_eq!(phase, crate::run_state::RunPhase::Succeeded);
+        assert_eq!(phase, crate::run_state::RunEnd::Succeeded);
         let (phase, _) = run_phase(
             TaskOutcome::Partial,
             Some(&end),
             Some(&shape("backgrounded")),
         );
-        assert_eq!(phase, crate::run_state::RunPhase::Stopped);
+        assert_eq!(phase.phase(), crate::run_state::RunPhase::Stopped);
     }
 
     /// A long label stops at a whole word, before any path: never a cut

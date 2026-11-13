@@ -178,7 +178,7 @@ mod live_status_surface_tests {
     #[tokio::test]
     async fn a_card_settles_once_nothing_on_it_runs() {
         use aidaemon_runtime::background_run::{BackgroundRun, RunHome, RunStart};
-        use aidaemon_runtime::run_state::RunPhase;
+        use aidaemon_runtime::run_state::RunEnd;
         let session = "telegram:synthetic-two-runs";
         let chat = crate::testing::CardChat::new(session).await;
         let db = tempfile::NamedTempFile::new().unwrap();
@@ -236,13 +236,13 @@ mod live_status_surface_tests {
             )
             .await;
 
-        let (_, on_card) = first.finish(RunPhase::Succeeded, Default::default()).await;
+        let (_, on_card) = first.finish(RunEnd::Succeeded, Default::default()).await;
         assert!(on_card);
         let card = chat.shown().await[0].clone();
         assert!(card.contains("✅ Finished in the background: Install site one"), "{card}");
         assert!(card.contains("⏳ Running in the background: Install site two"), "{card}");
 
-        let (_, on_card) = second.finish(RunPhase::Succeeded, Default::default()).await;
+        let (_, on_card) = second.finish(RunEnd::Succeeded, Default::default()).await;
         assert!(on_card);
         let shown = chat.shown().await;
         let card = &shown[0];
