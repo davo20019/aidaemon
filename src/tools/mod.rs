@@ -1,5 +1,4 @@
 pub mod approval;
-pub use aidaemon_tools::background_deliverable;
 #[cfg(feature = "slack")]
 #[cfg(feature = "slack")]
 mod channel_history;
@@ -11,7 +10,6 @@ pub(crate) mod config_manager;
 #[allow(unused_imports)]
 pub(crate) use aidaemon_tools::consequential;
 mod diagnose;
-pub use aidaemon_tools::file_delivery;
 /// SDK tools as daemon tools (no SDK tool is wrapped yet; 8.4 moves them).
 #[allow(dead_code)]
 mod file_policy;
@@ -34,7 +32,7 @@ mod search_history;
 mod send_file;
 mod set_reminder;
 pub mod spawn;
-pub mod terminal;
+pub use aidaemon_runtime::tools::terminal;
 mod tool_trace;
 pub mod track_requirements;
 pub mod web_fetch;
@@ -91,12 +89,10 @@ pub mod report_blocker;
 pub use aidaemon_client_gateway::client_view::ClientViewTool;
 pub use aidaemon_skills::tools::{ManageSkillsTool, SkillResourcesTool, UseSkillTool};
 pub(crate) use aidaemon_tools::command_effects;
-pub use manage_mcp::ManageMcpTool;
-pub use report_blocker::ReportBlockerTool;
-pub mod command_patterns;
 pub use aidaemon_tools::command_risk;
 pub use aidaemon_tools::daemon_guard;
-mod semantic_command_risk;
+pub use manage_mcp::ManageMcpTool;
+pub use report_blocker::ReportBlockerTool;
 
 // Deterministic tools
 pub(crate) use aidaemon_tools::fs_utils;
@@ -107,16 +103,15 @@ pub use write_file::WriteFileTool;
 mod edit_file;
 pub use edit_file::EditFileTool;
 mod search_files;
-pub use aidaemon_tools::project_inspect::ProjectInspectTool;
-pub use search_files::SearchFilesTool;
-pub(crate) mod run_command;
+pub(crate) use aidaemon_runtime::tools::run_command;
 pub use aidaemon_tools::check_environment::CheckEnvironmentTool;
 pub use aidaemon_tools::checkpoints::ListCheckpointsTool;
 pub use aidaemon_tools::git_commit::GitCommitTool;
 pub use aidaemon_tools::git_info::GitInfoTool;
-pub(crate) use aidaemon_tools::process_control;
+pub use aidaemon_tools::project_inspect::ProjectInspectTool;
 pub use aidaemon_tools::service_status::ServiceStatusTool;
 pub use run_command::RunCommandTool;
+pub use search_files::SearchFilesTool;
 
 #[cfg(test)]
 mod execution_backend_injection_tests;

@@ -1209,7 +1209,10 @@ async fn build_base_tool(
                 .await
                 .with_confinement(config.terminal.confinement)
                 .with_event_store(event_store)
-                .with_state(state)
+                .with_stores(
+                    state.clone() as Arc<dyn crate::traits::GoalStore>,
+                    state as Arc<dyn crate::traits::NotificationStore>,
+                )
                 .with_delivery_dirs(inbox_dir, outbox_dirs),
             );
             BuiltBaseTool {

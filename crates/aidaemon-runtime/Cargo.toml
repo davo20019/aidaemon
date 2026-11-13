@@ -53,6 +53,9 @@ serde-saphyr = { version = "2.1", default-features = false, features = ["deseria
 hmac = "0.13"
 sha2 = "0.11"
 hex = "0.4"
+libc = "0.2"
+shell-words = "1.1"
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 shellexpand = "3"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = { version = "3", optional = true }
@@ -68,6 +71,8 @@ aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 aidaemon-decisions = { path = "../aidaemon-decisions", features = ["testing", "gemini"] }
 aidaemon-events = { path = "../aidaemon-events", features = ["testing"] }
 aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
+aidaemon-channels = { path = "../aidaemon-channels", features = ["testing"] }
+aidaemon-work = { path = "../aidaemon-work", features = ["testing"] }
 axum = "0.8"
 proptest = "1"
 tempfile = "3"

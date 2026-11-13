@@ -13,6 +13,9 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+mod cards;
+pub use cards::{CardChannel, CardChat};
+
 use crate::channel::{
     ApprovalAnswer, ApprovalPrompt, Attachment, Channel, ChannelCapabilities, ChannelError,
     ChannelEvent, CommandInvocation, CommandSpec, Conversation, ConversationKind, InboundMessage,

@@ -55,8 +55,10 @@ impl WorkDatabase for SqliteWorkStore {
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn open_for_tests(path: &str) -> SqliteWorkStore {
+/// A store on a fresh database file at `path`, with the event and work
+/// tables (secrets are not redacted).
+#[cfg(any(test, feature = "testing"))]
+pub async fn open_for_tests(path: &str) -> SqliteWorkStore {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     let options = SqliteConnectOptions::new()
         .filename(path)

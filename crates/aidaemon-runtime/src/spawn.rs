@@ -1183,6 +1183,13 @@ pub trait ConversationRuntime: Send + Sync {
         session_id: &str,
         delivery: aidaemon_events::ResponseDeliveryData,
     ) -> anyhow::Result<()>;
+
+    /// One plain sentence about a short background result, from a tool-less
+    /// side call (it cannot re-run anything); `None` when this host does not
+    /// interpret results or the call fails, and the raw result goes out.
+    async fn interpret_background_result(&self, _command: &str, _output: &str) -> Option<String> {
+        None
+    }
 }
 
 // ---- Building a child ----
