@@ -94,10 +94,16 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
     /// The bundled specialists only (no user overrides), for a mandate
     /// worker's prompt.
     fn bundled_specialist_kinds(&self) -> Vec<(String, String)>;
+    /// The memory system serving the agent's turns.
+    fn memory_plugin(&self) -> &dyn crate::turn::memory::MemoryPlugin;
     /// Whether the memory system is the daemon's own.
-    fn memory_is_daemons_own(&self) -> bool;
+    fn memory_is_daemons_own(&self) -> bool {
+        self.memory_plugin().is_daemons_own()
+    }
     /// Whether the memory system serves the daemon tool `name` itself.
-    fn memory_owns_daemon_tool(&self, name: &str) -> bool;
+    fn memory_owns_daemon_tool(&self, name: &str) -> bool {
+        self.memory_plugin().owned_daemon_tools().contains(&name)
+    }
     /// A shared handle to the execution backend.
     fn execution_backend_handle(&self) -> aidaemon_tools::backend::SharedExecutionBackend;
     /// What a spawned child inherited from the turn that spawned it; `None`

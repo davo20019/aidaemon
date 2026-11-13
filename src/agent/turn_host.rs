@@ -125,12 +125,8 @@ impl TurnHost for Agent {
             .collect()
     }
 
-    fn memory_is_daemons_own(&self) -> bool {
-        self.memory.is_daemons_own()
-    }
-
-    fn memory_owns_daemon_tool(&self, name: &str) -> bool {
-        self.memory.owned_daemon_tools().contains(&name)
+    fn memory_plugin(&self) -> &dyn aidaemon_runtime::turn::memory::MemoryPlugin {
+        &*self.memory
     }
 
     fn execution_backend_handle(&self) -> crate::execution::SharedExecutionBackend {

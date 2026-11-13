@@ -17,6 +17,7 @@ pub mod followup;
 pub mod helpers;
 pub mod inquiry;
 pub mod loop_utils;
+pub mod memory;
 pub mod message_build;
 pub mod notes;
 pub mod post_task;
