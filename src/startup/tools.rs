@@ -127,6 +127,7 @@ pub async fn setup_tools(
 
     if let Some(terminal) = &terminal_tool {
         terminal.set_side_calls(side_calls);
+        crate::startup::trust_all::publish(terminal.clone());
     }
 
     let OptionalToolsOutcome {

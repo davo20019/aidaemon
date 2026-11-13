@@ -1268,28 +1268,26 @@ async fn terminal_malformed_internal_argument_still_asks() {
     assert!(results[0].contains("[OWNER DECLINED]"), "{results:?}");
 }
 
-/// Enabling trust-all always asks (Critical), whatever its arguments, and
-/// a decline persists nothing.
+/// Trust-all is the owner's `/trustall` command: the schema no longer has
+/// the action, so a model calling it gets an argument error, no card, and
+/// nothing is persisted.
 #[tokio::test]
-async fn terminal_trust_all_asks_and_persists_nothing_on_decline() {
+async fn terminal_trust_all_action_cannot_enable_trust_all() {
     let args = json!({"action": "trust_all", "_goal_id": 0});
     let (harness, approver, pool) = terminal_harness(
         vec![
             MockProvider::tool_call_response("terminal", &args.to_string()),
-            MockProvider::text_response("The owner declined."),
+            MockProvider::text_response("Only the owner can do that."),
         ],
-        vec![Some(crate::types::ApprovalResponse::Deny)],
+        vec![],
         no_assessor(&[]),
     )
     .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
 
-    assert_eq!(approver.card_count(), 1);
-    let card = approver.cards.lock().unwrap()[0].clone();
-    assert_eq!(
-        card.risk_level,
-        crate::tools::command_risk::RiskLevel::Critical
-    );
+    assert_eq!(approver.card_count(), 0);
+    let results = tool_results(&harness).await;
+    assert!(results[0].contains("must be one of"), "{results:?}");
     let persisted: Vec<String> =
         sqlx::query_scalar("SELECT prefix FROM terminal_backend_allowed_prefixes")
             .fetch_all(&pool)

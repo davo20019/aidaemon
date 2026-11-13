@@ -16,4 +16,5 @@ pub mod stores;
 pub(crate) mod terminal_bridge;
 pub(crate) mod tool_config;
 pub mod tools;
+pub(crate) mod trust_all;
 pub mod wiring;
