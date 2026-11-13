@@ -1,70 +1,7 @@
 use super::*;
 
-// impl-Agent justification: model selection and provider reload over model/fallback_model/model_override.
+// impl-Agent justification: provider reload from the daemon config, session clears.
 impl Agent {
-    /// Get the current model name.
-    pub async fn current_model(&self) -> String {
-        match tokio::time::timeout(Duration::from_secs(2), self.model.read()).await {
-            Ok(guard) => guard.clone(),
-            Err(_) => {
-                warn!("Timed out acquiring model lock for current_model()");
-                self.llm_runtime.snapshot().primary_model()
-            }
-        }
-    }
-
-    /// Switch the active model at runtime. Keeps the old model as fallback.
-    /// Also disables auto-routing until `clear_model_override()` is called.
-    pub async fn set_model(&self, model: String) {
-        let mut m = match tokio::time::timeout(Duration::from_secs(2), self.model.write()).await {
-            Ok(guard) => guard,
-            Err(_) => {
-                warn!("Timed out acquiring model write lock for set_model()");
-                return;
-            }
-        };
-        let mut fb =
-            match tokio::time::timeout(Duration::from_secs(2), self.fallback_model.write()).await {
-                Ok(guard) => guard,
-                Err(_) => {
-                    warn!("Timed out acquiring fallback_model write lock for set_model()");
-                    return;
-                }
-            };
-        info!(old = %*m, new = %model, "Model switched");
-        *fb = m.clone();
-        *m = model;
-        match tokio::time::timeout(Duration::from_secs(2), self.model_override.write()).await {
-            Ok(mut guard) => {
-                *guard = true;
-            }
-            Err(_) => {
-                warn!("Timed out acquiring model_override write lock for set_model()");
-            }
-        }
-    }
-
-    /// The model a new turn runs on: the `/model` override when set,
-    /// otherwise the runtime's primary model for autonomous primaries, the
-    /// router's choice for `profile`, or (without a router) the primary model
-    /// for the root agent and the agent's own model for sub-agents.
-    ///
-    /// `routed` is true when the router chose it.
-    /// Whether the owner pinned a model for this agent (a `/model` switch).
-    /// Re-enable auto-routing after a manual model override.
-    pub async fn clear_model_override(&self) {
-        match tokio::time::timeout(Duration::from_secs(2), self.model_override.write()).await {
-            Ok(mut guard) => {
-                *guard = false;
-            }
-            Err(_) => {
-                warn!("Timed out acquiring model_override write lock for clear_model_override()");
-                return;
-            }
-        }
-        info!("Model override cleared, auto-routing re-enabled");
-    }
-
     /// Rebuild and hot-swap the provider backend + router without a daemon restart.
     pub async fn reload_provider(
         &self,

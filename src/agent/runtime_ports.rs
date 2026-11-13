@@ -316,7 +316,7 @@ impl ChannelAgentRuntime for Agent {
     }
 
     async fn current_model(&self) -> String {
-        Agent::current_model(self).await
+        self.engine().current_model().await
     }
 
     async fn context_debug_settings(
@@ -328,7 +328,7 @@ impl ChannelAgentRuntime for Agent {
     }
 
     async fn set_model(&self, model: String) {
-        Agent::set_model(self, model).await;
+        self.engine().set_model(model).await;
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
@@ -336,7 +336,7 @@ impl ChannelAgentRuntime for Agent {
     }
 
     async fn clear_model_override(&self) {
-        Agent::clear_model_override(self).await;
+        self.engine().clear_model_override().await;
     }
 
     async fn clear_session_context(&self, session_id: &str) -> anyhow::Result<()> {

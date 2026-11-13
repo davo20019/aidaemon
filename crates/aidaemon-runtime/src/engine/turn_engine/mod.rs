@@ -60,9 +60,11 @@ use crate::turn::turn_context::TurnHistory;
 use aidaemon_channels::owner_wait::ProgressClock;
 
 pub mod compaction;
+pub mod entry;
 mod events;
 pub mod main_loop;
 pub mod model_call;
+pub mod model_pin;
 pub mod outcome;
 pub mod spawn;
 pub mod stop;

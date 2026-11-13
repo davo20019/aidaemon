@@ -151,13 +151,17 @@ async fn recorded_models(harness: &crate::testing::TestHarness) -> Vec<String> {
 async fn sdk_engine_follows_daemon_model_selection() {
     use crate::runtime_ports::AgentIngress;
     let harness = models_harness().await;
-    harness.agent.set_model("pinned-model".to_string()).await;
+    harness
+        .agent
+        .engine()
+        .set_model("pinned-model".to_string())
+        .await;
     harness
         .agent
         .handle_inbound_message(owner_request("hello"))
         .await
         .unwrap();
-    harness.agent.clear_model_override().await;
+    harness.agent.engine().clear_model_override().await;
     harness
         .agent
         .handle_inbound_message(owner_request("hello again"))

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use chrono::Utc;
+#[cfg(test)]
 use serde_json::json;
 #[cfg(test)]
 use serde_json::Value;
@@ -27,7 +28,6 @@ use crate::events::{DecisionPointData, DecisionType, EventType};
 #[cfg(test)]
 use crate::execution_policy::{ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
-use crate::llm_runtime::side_calls::SideCall;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
 use crate::runtime_ports::OutboundRouter;
@@ -434,9 +434,6 @@ pub(crate) use goal_dispatch::{
     build_goal_task_results_summary, SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS,
     SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
 };
-pub(in crate::agent) use goal_dispatch::{
-    clear_scheduled_run_state, goal_has_scheduled_provenance, task_has_scheduled_provenance,
-};
 #[cfg(test)]
 pub(in crate::agent) use goal_dispatch::{parse_wait_task_seconds, user_facing_task_description};
 
@@ -587,45 +584,12 @@ impl Agent {
         task_id: &str,
         expected_goal_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let Some(task) = self.state.get_task(task_id).await? else {
-            anyhow::bail!(
-                "Task '{}' was not found. Use manage_goal_tasks(list_tasks) and pass a valid task_id.",
-                task_id
-            );
-        };
-
-        if let Some(goal_id) = expected_goal_id {
-            if task.goal_id != goal_id {
-                anyhow::bail!(
-                    "Task '{}' belongs to goal '{}', not '{}'.",
-                    task_id,
-                    task.goal_id,
-                    goal_id
-                );
-            }
-        }
-
-        match task.status.as_str() {
-            "claimed" => Ok(()),
-            "pending" => anyhow::bail!(
-                "Task '{}' is still pending. Claim it first with manage_goal_tasks(action='claim_task').",
-                task_id
-            ),
-            "running" => anyhow::bail!(
-                "Task '{}' is already running. Do not spawn another executor for the same task.",
-                task_id
-            ),
-            "completed" | "failed" | "blocked" | "cancelled" => anyhow::bail!(
-                "Task '{}' is '{}' and should not be executed again without an explicit retry/reset.",
-                task_id,
-                task.status
-            ),
-            other => anyhow::bail!(
-                "Task '{}' has unsupported status '{}' for executor spawn (expected 'claimed').",
-                task_id,
-                other
-            ),
-        }
+        aidaemon_runtime::engine::work_scope::WorkScope::validate_executor_task_for_spawn(
+            self,
+            task_id,
+            expected_goal_id,
+        )
+        .await
     }
 
     /// Maximum agentic loop iterations per invocation.
@@ -664,39 +628,9 @@ impl Agent {
     /// Returns `None` on any failure or empty reply so the caller can fall back
     /// to delivering the raw result — the answer is never lost.
     pub async fn interpret_background_result(&self, command: &str, output: &str) -> Option<String> {
-        let system = "You translate the result of a shell command into ONE short, \
-            plain-language sentence for a non-technical user. Say what the result \
-            represents and flag any obvious caveat (for example, a raw text-match \
-            count is not the same as a count of files). Never suggest running \
-            anything, never use code formatting, and reply with the sentence only.";
-        let user = format!(
-            "Command that was run:\n{command}\n\nIts output:\n{output}\n\n\
-             In one sentence, tell the user what this result means."
-        );
-        let messages = vec![
-            json!({"role": "system", "content": system}),
-            json!({"role": "user", "content": user}),
-        ];
-
-        match self
-            .side_calls
-            .ask(
-                SideCall::BackgroundInterpretation,
-                &messages,
-                &Default::default(),
-                None,
-            )
+        self.engine()
+            .interpret_background_result(command, output)
             .await
-        {
-            Ok(answer) => {
-                let trimmed = answer.text.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_string())
-            }
-            Err(e) => {
-                warn!(error = %e, "Background-result interpretation LLM call failed");
-                None
-            }
-        }
     }
 
     pub async fn handle_message(
@@ -756,96 +690,18 @@ impl Agent {
         heartbeat: Option<Arc<AtomicU64>>,
         ingress_timing: Option<crate::runtime_ports::InboundMessageTiming>,
     ) -> anyhow::Result<String> {
-        let scheduled_goal_to_clear = if let Some(goal_id) = self.goal_id.as_deref() {
-            let is_scheduled_goal =
-                goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref()).await;
-            let is_root_scheduled_run = if self.task_id.is_none() {
-                is_scheduled_goal
-            } else {
-                task_has_scheduled_provenance(&self.state, self.task_id.as_deref()).await
-            };
-            // Background scheduled cycles are owned by background_task_lead,
-            // which must keep one shared budget alive across planning and all
-            // executor siblings. Direct/resume runs without a background task
-            // identity still own their cleanup here.
-            if agent_return_owns_scheduled_run_cleanup(
-                self.depth,
-                self.task_id.is_some(),
-                is_root_scheduled_run,
-            ) {
-                Some(goal_id.to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let backend = self.execution_backend.clone();
-        let mut execution_user_text = user_text.to_string();
-        if backend.kind() != crate::execution::BackendKind::Local {
-            for attachment in attachments {
-                let safe_name: String = attachment
-                    .filename
-                    .chars()
-                    .map(|character| {
-                        if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
-                        {
-                            character
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                let destination = backend
-                    .workspace_root()
-                    .join(".aidaemon")
-                    .join("inbox")
-                    .join(format!("{}-{}", uuid::Uuid::new_v4(), safe_name));
-                let imported = backend
-                    .import_local_file(std::path::Path::new(&attachment.local_path), &destination)
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "Failed to import attachment {:?} into the {} execution workspace: {}",
-                            attachment.filename,
-                            backend.kind().as_str(),
-                            error
-                        )
-                    })?;
-                execution_user_text =
-                    execution_user_text.replace(&attachment.local_path, imported.as_str());
-            }
-        }
-
-        let reply = self
-            .engine()
-            .handle_message_impl(
+        self.engine()
+            .handle_inbound(
                 session_id,
-                &execution_user_text,
+                user_text,
                 attachments,
                 status_tx,
                 user_role,
                 channel_ctx,
                 heartbeat,
                 ingress_timing,
-                false,
-                None,
-                None,
-                None,
             )
-            .await;
-
-        if let Some(goal_id) = scheduled_goal_to_clear.as_deref() {
-            if let Some(registry) = self.goal_token_registry.as_ref() {
-                registry.clear_run_budget(goal_id).await;
-            }
-            clear_scheduled_run_state(&self.state, goal_id).await;
-        }
-
-        // The loop's response-finalization phase is the sole owner of all
-        // user-facing transforms and persists that exact finalized text.
-        reply
+            .await
     }
 
     /// Re-enter an unfinished conversation with runtime-produced evidence.
@@ -872,14 +728,6 @@ impl Agent {
             )
             .await
     }
-}
-
-fn agent_return_owns_scheduled_run_cleanup(
-    depth: usize,
-    has_task_id: bool,
-    is_root_scheduled_run: bool,
-) -> bool {
-    is_root_scheduled_run && (depth == 0 || !has_task_id)
 }
 
 #[cfg(test)]
