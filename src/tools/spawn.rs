@@ -2815,11 +2815,10 @@ mod child_runtime_tests {
             );
             assert_eq!(
                 seen.running_lines,
-                vec![aidaemon_core::card::HelperView::running(
-                    "Site install",
-                    true,
-                    None
-                )],
+                vec![
+                    aidaemon_core::card::HelperView::running("Site install", true, None)
+                        .for_steps(&[1])
+                ],
                 "{case}"
             );
 
