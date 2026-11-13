@@ -246,6 +246,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aidaemon-client-protocol"
+version = "0.2.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aidaemon-core"
 version = "0.2.0"
 dependencies = [

@@ -30,6 +30,7 @@ authors = ["David Loor <davo20019@gmail.com>"]
 members = [
     "crates/node-protocol",
     "crates/node-sdk",
+    "crates/client-protocol",
     "crates/aidaemon-core",
     "crates/aidaemon-providers",
     "crates/aidaemon-tools",

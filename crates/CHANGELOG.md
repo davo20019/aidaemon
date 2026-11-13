@@ -12,6 +12,9 @@ stability promise.
 
 ## [Unreleased]
 
+### Added
+- New crate `aidaemon-client-protocol`: the wire types of the AIdaemon Client Protocol v1 (`/client/v1`) for the owner's own apps: `ClientFrame`/`ServerFrame`, typed commands, results and events, `Approval` with typed risk and card facts, `TaskSummary`, `Snapshot`, `Glance` (watch kind, `compact` capability, `get_glance`), `ProtocolVersion` and a closed `ErrorCode` set. Its JSON Schema is checked in at `schemas/client-protocol/v1.schema.json` (`cargo run -p aidaemon-client-protocol --bin export-client-schema`), with golden fixtures for every frame.
+
 ### Dependencies updated
 - Latest releases throughout, including reqwest 0.13, sqlx 0.9, rand 0.10, the RustCrypto 0.11 generation (sha2, hmac, p256 0.14), tokio-tungstenite 0.30, toml 1.2, strum 0.28, dirs 7, croner 4, base64 0.23, fastembed 7 (same model and vectors), chromiumoxide 0.9, keyring 4, async-imap 0.12 and syn 3; `aidaemon-eval` and `aidaemon-skills` read YAML with serde-saphyr (YAML 1.2 scalars) instead of the deprecated serde_yaml. `rust-version` is now 1.94 (sqlx 0.9).
 

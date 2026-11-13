@@ -39,6 +39,8 @@ __pycache__/
 *.json
 # Protocol fixtures compiled into tests (include_str!).
 !tests/fixtures/**/*.json
+# The Client Protocol's generated JSON Schema, which clients generate from.
+!schemas/**/*.json
 *.png
 *.txt
 *.pdf

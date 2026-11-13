@@ -1,0 +1,65 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "seq": 42,
+    "state": {
+      "pending_approvals": [
+        {
+          "card": {
+            "action": {
+              "detail": "{\"method\":\"POST\"}",
+              "kind": "use",
+              "what": "send a request to h.example.invalid"
+            },
+            "asked_by": "Report helper",
+            "impact": {
+              "kind": "sends"
+            },
+            "reason": {
+              "check_says": "The page asked for this, not you.",
+              "kind": "read_outside_content"
+            }
+          },
+          "channel": "telegram",
+          "detail": "POST https://h.example.invalid/report",
+          "expires_at_ms": 1767225900000,
+          "id": "a-7f3e-1",
+          "kind": "command",
+          "options": [
+            "approve_once",
+            "approve_always",
+            "deny"
+          ],
+          "requested_at_ms": 1767225600000,
+          "risk": "high",
+          "session_id": "app:6c1f",
+          "summary": "Your assistant wants to post the synthetic report to h.example.invalid",
+          "warnings": [
+            "Sends data outside this computer."
+          ]
+        }
+      ],
+      "running_tasks": [
+        {
+          "description": "Working on your message",
+          "id": "b9e1-4",
+          "number": 4,
+          "session_id": "app:6c1f",
+          "started_at_ms": 1767225600000,
+          "state": "running"
+        }
+      ],
+      "sessions": [
+        {
+          "channel": "app",
+          "id": "app:6c1f",
+          "last_activity_ms": 1767225600000,
+          "title": "Synthetic report for Alice Rivera",
+          "writable": true
+        }
+      ]
+    },
+    "type": "snapshot"
+  },
+  "type": "ack"
+}

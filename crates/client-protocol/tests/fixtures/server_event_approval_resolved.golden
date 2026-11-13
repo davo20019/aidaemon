@@ -1,0 +1,15 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "approval_id": "a-7f3e-1",
+    "outcome": "approved_once",
+    "resolved_by": {
+      "channel": "app",
+      "device": "Synthetic Watch 1"
+    },
+    "type": "approval_resolved"
+  },
+  "seq": 9,
+  "session_id": "app:6c1f",
+  "type": "event"
+}
