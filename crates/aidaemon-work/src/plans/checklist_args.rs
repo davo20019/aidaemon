@@ -85,6 +85,10 @@ pub fn executor_expectations_from_checklist_arguments(
             .get("outcome")
             .and_then(Value::as_str)
             .and_then(aidaemon_events::ExecutorClaimedOutcome::from_protocol_name),
+        short_of: value
+            .get("short_of")
+            .and_then(Value::as_str)
+            .and_then(aidaemon_events::ShortResource::from_protocol_name),
     })
 }
 

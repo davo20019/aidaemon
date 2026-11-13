@@ -142,19 +142,13 @@ pub struct TurnScope<'a> {
     /// Skills referencing untrusted external content are active.
     pub restrict_untrusted_reference_tools: bool,
     pub untrusted_reference_skills: Vec<String>,
-    /// Billable tokens this run spent, and the task budget (0: none).
-    /// Tokens used by this request's whole tree of plain sub-agents.
-    pub task_tokens: Arc<AtomicU64>,
-    pub task_budget: AtomicU64,
-    pub task_budget_extensions: std::sync::atomic::AtomicUsize,
     /// Distinct successful operations (tool and canonical arguments).
     pub succeeded_operations: std::sync::Mutex<HashSet<String>>,
     /// The latest successful call repeated an earlier operation.
     pub repeating: AtomicBool,
-    /// Distinct successful operations so far, and the count at the last
-    /// extension.
+    /// Distinct successful operations so far (the request's whole tree
+    /// counts its own in its task budget, [`crate::authority::SpawnFamily::budget`]).
     pub succeeded_calls: std::sync::atomic::AtomicUsize,
-    pub successes_at_task_extension: std::sync::atomic::AtomicUsize,
     /// The goal's effective daily budget after extensions, and their count.
     pub goal_daily_budget: std::sync::Mutex<Option<i64>>,
     pub goal_budget_extensions: std::sync::atomic::AtomicU32,

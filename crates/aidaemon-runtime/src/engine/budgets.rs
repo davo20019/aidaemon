@@ -25,6 +25,188 @@ pub fn task_token_budget(configured: Option<u64>, scheduled_per_check: Option<i6
     }
 }
 
+/// One request's task token budget: the whole tree's, the turn and every
+/// plain sub-agent it starts. Its tokens, its limit, its extensions and its
+/// progress are one record, so the tree is charged once and extended once
+/// (live 2026-11-13: two helpers charged the tree's shared counter but each
+/// held its own 500,000 limit and its own extension count, so each
+/// compared the tree's 513,391 tokens with its own limit, one extended on
+/// its own and the other asked the owner mid-run).
+#[derive(Debug, Default)]
+pub struct TreeBudget {
+    tokens: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// 0: none. Set by the tree's first turn ([`Self::start`]).
+    limit: std::sync::atomic::AtomicU64,
+    started: std::sync::atomic::AtomicBool,
+    /// Distinct successful operations across the tree: its progress.
+    successes: std::sync::atomic::AtomicUsize,
+    /// The member whose operation was the tree's latest new one.
+    last_new_by: std::sync::Mutex<Option<String>>,
+    warned: std::sync::atomic::AtomicBool,
+    /// Extensions so far, and the progress at the last one. Held while one
+    /// member decides, so a second member that hit the same limit waits for
+    /// that decision instead of making its own.
+    extensions: tokio::sync::Mutex<Extensions>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Extensions {
+    pub count: usize,
+    pub successes_at_last: usize,
+}
+
+impl TreeBudget {
+    /// The tree's budget as its first turn sets it; later members keep it.
+    pub fn start(&self, limit: u64) {
+        if !self.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.limit.store(limit, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The tree's token counter.
+    pub fn tokens(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.tokens.clone()
+    }
+
+    /// Charge `delta` tokens; the tree's total after it.
+    pub fn charge(&self, delta: u64) -> u64 {
+        self.tokens
+            .fetch_add(delta, std::sync::atomic::Ordering::Relaxed)
+            + delta
+    }
+
+    pub fn used(&self) -> u64 {
+        self.tokens.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.limit.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Member `member` made a new distinct successful operation.
+    pub fn note_success(&self, member: &str) {
+        self.successes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut last) = self.last_new_by.lock() {
+            *last = Some(member.to_string());
+        }
+    }
+
+    /// Whether the tree is making progress for `member`, whose latest call
+    /// repeated an earlier one when `repeating`: something new succeeded
+    /// since the last extension, and either `member` is not going round in
+    /// circles or another member did the newest work (a helper checking on
+    /// its running command while its sibling works is waiting, not stuck).
+    pub fn progressed(&self, extensions: &Extensions, member: &str, repeating: bool) -> bool {
+        let newest_by_other = self
+            .last_new_by
+            .lock()
+            .ok()
+            .and_then(|last| last.clone())
+            .is_some_and(|last| last != member);
+        self.successes() > extensions.successes_at_last && (!repeating || newest_by_other)
+    }
+
+    pub fn successes(&self) -> usize {
+        self.successes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The tree's one 80% warning: `true` once, for the member that gives it.
+    pub fn take_warning(&self) -> bool {
+        let (used, limit) = (self.used(), self.limit());
+        task_budget_warning_due(
+            used,
+            limit,
+            self.warned.load(std::sync::atomic::Ordering::Relaxed),
+        ) && !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Decide over the tree's extensions, one member at a time.
+    pub async fn deciding(&self) -> tokio::sync::MutexGuard<'_, Extensions> {
+        self.extensions.lock().await
+    }
+
+    /// Raise the limit, recording the extension and the progress at it.
+    pub fn extend(&self, to: u64, extensions: &mut Extensions) {
+        self.limit.store(to, std::sync::atomic::Ordering::SeqCst);
+        extensions.count += 1;
+        extensions.successes_at_last = self.successes();
+    }
+}
+
+/// What a used-up task budget does next, under the configured
+/// auto-extension policy: up to [`TASK_MAX_BUDGET_EXTENSIONS`] extensions,
+/// never past [`TASK_HARD_TOKEN_CAP`], each while the tree made new
+/// progress since the last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetStep {
+    /// Within the policy: extend without asking.
+    Extend { to: u64 },
+    /// Past the policy: more spending is the owner's decision.
+    Ask { to: u64, why: AskWhy },
+    /// At the hard cap: nothing can extend it.
+    Stop,
+}
+
+/// Why spending more is the owner's decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskWhy {
+    /// The automatic extensions the policy allows are used up.
+    ExtensionsUsed(usize),
+    /// Nothing new succeeded anywhere in the request since the budget last
+    /// grew.
+    NoProgress,
+    /// The request is not the owner's own.
+    NotOwners,
+}
+
+impl AskWhy {
+    /// Why the owner is asked, in plain words.
+    pub fn words(self) -> String {
+        match self {
+            Self::ExtensionsUsed(count) => format!(
+                "It already grew {count} time{} on its own, the most the budget policy allows.",
+                if count == 1 { "" } else { "s" }
+            ),
+            Self::NoProgress => {
+                "Nothing new has succeeded since the budget last grew, so it may be stuck."
+                    .to_string()
+            }
+            Self::NotOwners => "This request did not come from you.".to_string(),
+        }
+    }
+}
+
+/// The policy for a used-up task budget of `limit` at `used` tokens, given
+/// whether the tree made progress since its last extension
+/// ([`TreeBudget::progressed`]).
+pub fn task_budget_step(
+    used: u64,
+    limit: u64,
+    extensions: Extensions,
+    progressed: bool,
+    owners: bool,
+) -> BudgetStep {
+    let cap = TASK_HARD_TOKEN_CAP;
+    let to = limit
+        .saturating_mul(2)
+        .max(used.saturating_add(limit / 2))
+        .min(cap);
+    if limit >= cap || to <= used {
+        return BudgetStep::Stop;
+    }
+    let why = if !owners {
+        AskWhy::NotOwners
+    } else if extensions.count >= TASK_MAX_BUDGET_EXTENSIONS {
+        AskWhy::ExtensionsUsed(extensions.count)
+    } else if !progressed {
+        AskWhy::NoProgress
+    } else {
+        return BudgetStep::Extend { to };
+    };
+    BudgetStep::Ask { to, why }
+}
+
 // ---- Charging a model call to the run's budgets ----
 
 use std::sync::atomic::Ordering;
@@ -85,7 +267,7 @@ pub async fn sdk_charge_budgets(
     iteration: usize,
 ) -> Option<String> {
     let delta = usage.budget_tokens();
-    let used = scope.task_tokens.fetch_add(delta, Ordering::Relaxed) + delta;
+    let used = scope.spawn_family.budget().charge(delta);
     let successes = scope.succeeded_calls.load(Ordering::Relaxed);
     let learning = scope
         .learning
@@ -120,22 +302,15 @@ pub async fn sdk_charge_budgets(
     } else {
         None
     };
-    // One warning at 80% of the task budget (scheduled runs warn on their
-    // own per-run budget instead).
-    let budget = scope.task_budget.load(Ordering::Relaxed);
+    // One warning at 80% of the request's task budget, to the member that
+    // crossed it (scheduled runs warn on their own per-run budget instead).
+    let tree = scope.spawn_family.budget();
+    let budget = tree.limit();
     let scheduled = scope
         .budget_goal
         .as_ref()
         .is_some_and(|goal| goal.scheduled);
-    if stop.is_none()
-        && !scheduled
-        && task_budget_warning_due(
-            used,
-            budget,
-            scope.budget_warning_sent.load(Ordering::Relaxed),
-        )
-    {
-        scope.budget_warning_sent.store(true, Ordering::Relaxed);
+    if stop.is_none() && !scheduled && tree.take_warning() {
         let hint: String = scope.user_text.chars().take(150).collect();
         directives.push(
             crate::turn::system_directives::SystemDirective::TaskTokenBudgetWarning {
@@ -156,59 +331,65 @@ pub async fn sdk_charge_budgets(
     stop
 }
 
+/// The tree's task budget after a charge: within it, nothing; used up,
+/// the policy's step ([`task_budget_step`]). One member decides at a time,
+/// so a limit two helpers hit together is extended (or asked about) once.
 #[allow(clippy::too_many_arguments)]
 pub async fn sdk_task_budget(
     host: &dyn TurnHost,
     scope: &TurnScope<'_>,
     used: u64,
-    successes: usize,
+    _successes: usize,
     iteration: usize,
     learning: &crate::turn::post_task::LearningContext,
     directives: &mut Vec<crate::turn::system_directives::SystemDirective>,
 ) -> Option<String> {
-    let budget = scope.task_budget.load(Ordering::Relaxed);
+    let tree = scope.spawn_family.budget();
+    if tree.limit() == 0 || used < tree.limit() {
+        return None;
+    }
+    let mut extensions = tree.deciding().await;
+    // Another member may have extended it meanwhile.
+    let (used, budget) = (tree.used(), tree.limit());
     if budget == 0 || used < budget {
         return None;
     }
-    let cap = TASK_HARD_TOKEN_CAP;
-    let proposed = budget
-        .saturating_mul(2)
-        .max(used.saturating_add(budget / 2))
-        .min(cap);
-    let extensions = scope.task_budget_extensions.load(Ordering::Relaxed);
-    let progressed = successes > scope.successes_at_task_extension.load(Ordering::Relaxed)
-        && !scope.repeating.load(Ordering::Relaxed);
-    let can_extend = budget < cap && proposed > used;
-    let approved = can_extend
-        && if extensions < TASK_MAX_BUDGET_EXTENSIONS
-            && progressed
-            && scope.user_role == UserRole::Owner
-        {
-            true
-        } else {
-            crate::turn::budget::request_budget_continue_approval(
-                host,
-                scope.emitter,
-                scope.task_id,
-                iteration,
-                scope.session_id,
-                scope.user_role,
-                "task",
-                used as i64,
-                budget as i64,
-                proposed as i64,
-            )
-            .await
-        };
-    if approved {
-        let extension = extensions + 1;
-        scope.task_budget.store(proposed, Ordering::Relaxed);
-        scope
-            .task_budget_extensions
-            .store(extension, Ordering::Relaxed);
-        scope
-            .successes_at_task_extension
-            .store(successes, Ordering::Relaxed);
+    let step = task_budget_step(
+        used,
+        budget,
+        *extensions,
+        tree.progressed(
+            &extensions,
+            scope.session_id,
+            scope.repeating.load(Ordering::Relaxed),
+        ),
+        scope.user_role == UserRole::Owner,
+    );
+    let extended_to = match step {
+        BudgetStep::Extend { to } => Some(to),
+        BudgetStep::Ask { to, why } => crate::turn::budget::request_budget_continue_approval(
+            host,
+            scope.emitter,
+            scope.task_id,
+            iteration,
+            scope.session_id,
+            scope.user_role,
+            crate::turn::budget::BudgetAsk {
+                scope_label: "task",
+                work: crate::turn::budget::work_words(scope.user_text),
+                used: used as i64,
+                current: budget as i64,
+                proposed: to as i64,
+                why: why.words(),
+            },
+        )
+        .await
+        .then_some(to),
+        BudgetStep::Stop => None,
+    };
+    if let Some(proposed) = extended_to {
+        tree.extend(proposed, &mut extensions);
+        let extension = extensions.count;
         host.turn_runtime()
             .with_harness_eval(|eval| eval.record_budget_extension())
             .await;
@@ -229,6 +410,7 @@ pub async fn sdk_task_budget(
         );
         return None;
     }
+    drop(extensions);
     let alert = format!(
         "Token alert: execution in session '{}' hit task token budget (used {} / limit {}). \
          The run was stopped to prevent overspending.",
@@ -462,5 +644,141 @@ pub async fn persist_sdk_tool_call_message(
         .await
     {
         warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool-call message");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live 2026-11-13: a turn's two helpers charged the request's one
+    /// token counter, but each compared it with a limit of its own and
+    /// extended its own. The tree has one limit and one extension count:
+    /// the first member over it decides, and the second finds it extended.
+    #[tokio::test]
+    async fn a_request_and_its_helpers_have_one_budget() {
+        let family = crate::authority::SpawnFamily::new(Default::default());
+        let root = family.clone();
+        let helper = family.clone();
+        root.budget().start(500_000);
+        // A helper's own turn does not reset the request's budget.
+        helper.budget().start(500_000);
+        helper.budget().start(123);
+        assert_eq!(family.budget().limit(), 500_000);
+
+        root.budget().charge(96_599);
+        // WordPress works; Drupal checks on its running `ddev start`.
+        helper.budget().note_success("drupal");
+        helper.budget().note_success("wordpress");
+        let used = helper.budget().charge(416_792);
+        assert_eq!(used, 513_391);
+        assert_eq!(
+            family.tokens().load(std::sync::atomic::Ordering::Relaxed),
+            513_391
+        );
+
+        // Drupal, repeating its check, hits the limit first: its sibling
+        // did the newest work, so the tree is progressing.
+        let tree = helper.budget();
+        let mut extensions = tree.deciding().await;
+        assert!(tree.progressed(&extensions, "drupal", true));
+        let step = task_budget_step(
+            used,
+            tree.limit(),
+            *extensions,
+            tree.progressed(&extensions, "drupal", true),
+            true,
+        );
+        assert_eq!(step, BudgetStep::Extend { to: 1_000_000 });
+        tree.extend(1_000_000, &mut extensions);
+        drop(extensions);
+        // The other helper, over the old limit too, finds it extended.
+        assert!(root.budget().used() < root.budget().limit());
+        assert_eq!(root.budget().deciding().await.count, 1);
+        // Nothing new since that extension: no progress.
+        assert!(!tree.progressed(&*tree.deciding().await, "wordpress", false));
+    }
+
+    /// A lone run going round in circles is not progressing: its latest
+    /// call repeated one it made, and nobody else did newer work.
+    #[test]
+    fn a_lone_run_repeating_itself_is_not_progressing() {
+        let tree = TreeBudget::default();
+        tree.note_success("solo");
+        let fresh = Extensions::default();
+        assert!(tree.progressed(&fresh, "solo", false));
+        assert!(!tree.progressed(&fresh, "solo", true));
+    }
+
+    /// The owner is asked only past the configured policy: its extensions
+    /// used up, or nothing new done since the last one, or not the owner's
+    /// request. The hard cap stops without asking.
+    #[test]
+    fn the_owner_is_asked_only_past_the_auto_extension_policy() {
+        let fresh = Extensions::default();
+        assert_eq!(
+            task_budget_step(513_391, 500_000, fresh, true, true),
+            BudgetStep::Extend { to: 1_000_000 }
+        );
+        let spent = Extensions {
+            count: TASK_MAX_BUDGET_EXTENSIONS,
+            successes_at_last: 2,
+        };
+        assert_eq!(
+            task_budget_step(1_000_001, 1_000_000, spent, true, true),
+            BudgetStep::Ask {
+                to: 2_000_000,
+                why: AskWhy::ExtensionsUsed(TASK_MAX_BUDGET_EXTENSIONS)
+            }
+        );
+        let stalled = Extensions {
+            count: 1,
+            successes_at_last: 4,
+        };
+        assert_eq!(
+            task_budget_step(1_000_001, 1_000_000, stalled, false, true),
+            BudgetStep::Ask {
+                to: 2_000_000,
+                why: AskWhy::NoProgress
+            }
+        );
+        assert!(matches!(
+            task_budget_step(513_391, 500_000, fresh, true, false),
+            BudgetStep::Ask {
+                why: AskWhy::NotOwners,
+                ..
+            }
+        ));
+        assert_eq!(
+            task_budget_step(2_000_001, TASK_HARD_TOKEN_CAP, fresh, true, true),
+            BudgetStep::Stop
+        );
+    }
+
+    /// When the owner is asked, the card says what the spending is for,
+    /// what it cost so far and why it is asked, in plain words.
+    #[test]
+    fn a_budget_question_says_what_it_is_for_and_what_it_cost() {
+        let ask = crate::turn::budget::BudgetAsk {
+            scope_label: "task",
+            work: crate::turn::budget::work_words(
+                "Install a Drupal demo site in ~/projects/claude-drupal-2026-11-13-demo-4\nUse DDEV.",
+            ),
+            used: 513_391,
+            current: 500_000,
+            proposed: 1_000_000,
+            why: AskWhy::NoProgress.words(),
+        };
+        assert_eq!(
+            ask.action(),
+            "let \u{201c}Install a Drupal demo site in ~/projects/claude-drupal-2026-11-13-demo-4\u{201d} \
+             keep going past its token budget, up to 1,000,000 tokens"
+        );
+        assert_eq!(
+            ask.cost(),
+            "This request and the helpers it started have used 513,391 tokens, past its budget \
+             of 500,000."
+        );
+        assert!(!ask.action().contains("500000") && !ask.cost().contains("execution"));
     }
 }

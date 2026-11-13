@@ -989,6 +989,38 @@ pub struct ExecutorExpectationsDeclaredData {
     /// run unmet and nothing upgrades them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ExecutorClaimedOutcome>,
+    /// With an unfinished outcome: the resource on this machine the work
+    /// ran out of, when that is what stopped it (`track_requirements`'
+    /// `short_of`). The owner can free it, so the run's end offers how.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_of: Option<ShortResource>,
+}
+
+/// A resource on the owner's machine that work can run out of and the owner
+/// can free: the typed reason a run stopped, declared by the working agent
+/// that saw it run out, never read from an error's wording.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortResource {
+    /// The computer's own disk.
+    DiskSpace,
+    /// The disk Docker keeps its images, containers and volumes on.
+    DockerDiskSpace,
+    /// Memory.
+    Memory,
+}
+
+impl ShortResource {
+    pub const PROTOCOL_NAMES: [&'static str; 3] = ["disk_space", "docker_disk_space", "memory"];
+
+    pub fn from_protocol_name(name: &str) -> Option<Self> {
+        match name {
+            "disk_space" => Some(Self::DiskSpace),
+            "docker_disk_space" => Some(Self::DockerDiskSpace),
+            "memory" => Some(Self::Memory),
+            _ => None,
+        }
+    }
 }
 
 /// How the working agent says the request ended.

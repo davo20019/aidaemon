@@ -37,7 +37,7 @@ pub fn phase_of(outcome: TaskOutcome) -> RunPhase {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunEvidence {
     pub unconfirmed: Vec<String>,
-    /// Why a `Failed` run failed, from its typed records; `None` for an
+    /// Why a run failed or stopped, from its typed records; `None` for an
     /// error, which says why itself.
     pub failure: Option<RunFailure>,
 }
@@ -53,6 +53,60 @@ pub enum RunFailure {
     NothingDone { undone: Vec<String> },
     /// Its program ended with an error status, or was stopped (`None`).
     Exited { code: Option<i32> },
+    /// It stopped because this machine ran out of something the owner can
+    /// free, as the working agent declared in its typed verdict
+    /// (`track_requirements`' `short_of`): its end offers the step that
+    /// frees it ([`FreeStep`]).
+    ShortOf(aidaemon_events::ShortResource),
+}
+
+/// The concrete next step offered for a resource a run ran out of: what
+/// frees it, in plain words, and the command that would, when there is one
+/// safe to name. Typed by the resource, never by an error's wording (live
+/// 2026-11-13: DDEV stopped on "critically low Docker disk space" and the
+/// answer only reported it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreeStep {
+    /// What ran out, as the owner reads it.
+    pub what: &'static str,
+    /// The step that frees it, offered.
+    pub offer: &'static str,
+    /// The command it runs, when the step is one command.
+    pub command: Option<&'static str>,
+}
+
+impl FreeStep {
+    pub fn of(resource: aidaemon_events::ShortResource) -> Self {
+        use aidaemon_events::ShortResource;
+        match resource {
+            ShortResource::DockerDiskSpace => Self {
+                what: "Docker ran out of disk space",
+                offer: "I can free the space Docker isn't using (stopped containers, images no \
+                        container uses, and its build cache) and then try again",
+                command: Some("docker system prune"),
+            },
+            ShortResource::DiskSpace => Self {
+                what: "this computer ran out of disk space",
+                offer: "I can list what takes the most space in your home folder, so you can \
+                        pick what to delete, and then try again",
+                command: None,
+            },
+            ShortResource::Memory => Self {
+                what: "this computer ran out of memory",
+                offer: "I can list the programs using the most memory, so you can pick what to \
+                        close, and then try again",
+                command: None,
+            },
+        }
+    }
+
+    /// "Next step: … (`docker system prune`). Want me to?"
+    pub fn line(&self) -> String {
+        match self.command {
+            Some(command) => format!("Next step: {} (`{command}`). Want me to?", self.offer),
+            None => format!("Next step: {}. Want me to?", self.offer),
+        }
+    }
 }
 
 impl RunFailure {
@@ -76,6 +130,10 @@ impl RunFailure {
             }
             Self::Exited { code: None } => {
                 "Its program was stopped before it finished.".to_string()
+            }
+            Self::ShortOf(resource) => {
+                let step = FreeStep::of(*resource);
+                format!("It stopped because {}. {}", step.what, step.line())
             }
         }
     }
@@ -165,6 +223,12 @@ impl RunState {
             .map(|ended| measured_span(self.began(), ended))
     }
 
+    /// Its one time set, once it ended ([`RunTimes`]).
+    pub fn times(&self) -> Option<RunTimes> {
+        self.ended_at
+            .map(|ended| RunTimes::new(self.began(), ended, self.requested_at, self.waited))
+    }
+
     /// How long it took, once it ended.
     pub fn took(&self) -> Option<chrono::Duration> {
         self.span().map(|span| span.took())
@@ -180,11 +244,16 @@ impl RunState {
                 RunPhase::Running => self.step.clone(),
                 _ => None,
             },
-            // Its measured time goes with its result, the parent's record
-            // of it: the card says how it ended and, when a request started
-            // it, how long after that request it ended, so a card of
-            // several runs can say when the last one did.
-            took: None,
+            // The one measured line every surface shows for it
+            // ([`RunTimes::line`]): the card, its result and the parent's
+            // continuation all read the same labelled times. On the card
+            // when a request started it, so the time from that request to
+            // the run's start is said, not left as a gap between two
+            // figures; a run no request started has it under its result.
+            took: self
+                .times()
+                .filter(|times| times.requested.is_some())
+                .map(|times| times.line()),
             since_request: self
                 .requested_at
                 .zip(self.ended_at)
@@ -526,6 +595,96 @@ pub fn measured_span(from: DateTime<Utc>, to: DateTime<Utc>) -> MeasuredSpan {
     }
 }
 
+/// The one set of times a run's record gives, and the only one any surface
+/// shows for it: its work from start to end ("took", start-up left out:
+/// its first step, else its start) and, when a request started it, that
+/// request's time, so "started … after your request" and "… after your
+/// request" are the same three instants seen two ways. All cut to the whole
+/// second first, so the request's gap plus the run's own time is exactly
+/// its time after the request (live 2026-11-13: "Done 43s after your
+/// request" beside "Took 30s" left 13 s unexplained, and a group answer
+/// quoted "took 3m 55s" while the card said "5m 54s after your request").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunTimes {
+    /// Its work, start to end.
+    pub run: MeasuredSpan,
+    /// The owner's request that started it, never after its start.
+    pub requested: Option<DateTime<Utc>>,
+    /// How long it waited for the owner's answer on a card.
+    pub waited: Duration,
+}
+
+impl RunTimes {
+    pub fn new(
+        began: DateTime<Utc>,
+        ended: DateTime<Utc>,
+        requested: Option<DateTime<Utc>>,
+        waited: Duration,
+    ) -> Self {
+        use chrono::SubsecRound;
+        let run = measured_span(began, ended);
+        Self {
+            run,
+            requested: requested.map(|at| at.trunc_subsecs(0).min(run.from)),
+            waited,
+        }
+    }
+
+    /// Its work's own time: start to end.
+    pub fn took(&self) -> chrono::Duration {
+        self.run.took()
+    }
+
+    /// From the request to its start: the time before its work began.
+    pub fn started_after_request(&self) -> Option<chrono::Duration> {
+        self.requested.map(|requested| self.run.from - requested)
+    }
+
+    /// From the request to its end: what the owner means by "how long did
+    /// it take".
+    pub fn after_request(&self) -> Option<MeasuredSpan> {
+        self.requested.map(|requested| MeasuredSpan {
+            from: requested,
+            to: self.run.to,
+        })
+    }
+
+    /// The one labelled line for the owner and the parent: "Took 30s (8:17:58
+    /// AM to 8:18:28 AM ET), started 13s after your request, so it ended 43s
+    /// after your request." Each figure says what it measures; none is left
+    /// for anyone to work out.
+    pub fn line(&self) -> String {
+        use crate::spawn_tool::{compact, owner_clock_range};
+        let mut line = format!(
+            "Took {} ({})",
+            compact(self.took()),
+            owner_clock_range(self.run.from, self.run.to)
+        );
+        if let (Some(gap), Some(whole)) = (self.started_after_request(), self.after_request()) {
+            if gap.num_seconds() == 0 {
+                line.push_str(", starting at your request");
+            } else {
+                line.push_str(&format!(
+                    ", started {} after your request, so it ended {} after your request",
+                    compact(gap),
+                    compact(whole.took())
+                ));
+            }
+        }
+        line.push('.');
+        if self.waited.as_secs() > 0 {
+            line.push_str(&format!(
+                " It waited {} of that for your answer.",
+                aidaemon_tools::duration_format::compact_seconds(
+                    i64::try_from(self.waited.as_secs()).unwrap_or(i64::MAX),
+                    aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
+                )
+            ));
+        }
+        line
+    }
+}
+
 /// What the runtime measured of a run when it ended.
 #[derive(Debug, Clone, Copy)]
 pub struct RunMeasure {
@@ -586,6 +745,50 @@ mod tests {
         assert!(!runs.step("job-1", Step::Output("4".into())));
         assert_eq!(runs.get("job-1").unwrap().phase, RunPhase::Succeeded);
         assert!(runs.running("chat-a").is_empty());
+    }
+
+    /// Live 2026-11-13: a background shell loop's card said "Done 43s
+    /// after your request" and its result "Took 30s", leaving the 13 s
+    /// before it started unexplained. The card's line is the record's one
+    /// time set: how long it took, when after the request it started, and
+    /// so when after the request it ended.
+    #[test]
+    fn the_cards_line_says_when_after_the_request_a_run_started() {
+        use chrono::TimeZone;
+        let requested = Utc.with_ymd_and_hms(2026, 11, 13, 13, 23, 36).unwrap()
+            + chrono::Duration::milliseconds(748);
+        let state = RunState {
+            id: "loop".into(),
+            chat: "chat".into(),
+            label: "a shell loop".into(),
+            phase: RunPhase::Succeeded,
+            requested_at: Some(requested),
+            started_at: requested + chrono::Duration::seconds(14),
+            ended_at: Some(requested + chrono::Duration::milliseconds(42_729)),
+            work_began: Some(requested + chrono::Duration::milliseconds(12_400)),
+            waited: Duration::ZERO,
+            step: None,
+            evidence: RunEvidence::default(),
+            card: RunCard::default(),
+        };
+        let times = state.times().unwrap();
+        let line = state.view().took.expect("the card's measured line");
+        assert_eq!(line, times.line());
+        assert!(line.starts_with("Took 30s ("), "{line}");
+        assert!(
+            line.ends_with(", started 13s after your request, so it ended 43s after your request."),
+            "{line}"
+        );
+        assert_eq!(
+            times.started_after_request().unwrap() + times.took(),
+            times.after_request().unwrap().took()
+        );
+        // No request on record: its time is under its result, not the card.
+        let unrequested = RunState {
+            requested_at: None,
+            ..state
+        };
+        assert_eq!(unrequested.view().took, None);
     }
 
     /// `/tasks` lists a background helper from its run record: the step

@@ -1001,6 +1001,7 @@ impl TurnEngine<'_> {
                 let new_operation = seen.insert(operation);
                 if new_operation {
                     scope.succeeded_calls.fetch_add(1, Ordering::Relaxed);
+                    scope.spawn_family.budget().note_success(scope.session_id);
                 }
                 scope.repeating.store(!new_operation, Ordering::Relaxed);
             }

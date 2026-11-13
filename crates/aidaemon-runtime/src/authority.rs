@@ -248,12 +248,13 @@ struct SpawnCounts {
 struct SpawnFamilyState {
     limits: SpawnFamilyLimits,
     counts: std::sync::Mutex<SpawnCounts>,
-    tokens: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    budget: std::sync::Arc<crate::engine::budgets::TreeBudget>,
     coordination: crate::coordination::Coordination,
 }
 
 /// One request's tree of plain sub-agents: its running count, how many it
-/// has started, and the tokens the whole tree has used. Clones share all of
+/// has started, and its one task budget (the tokens the whole tree has
+/// used, its limit and its extensions). Clones share all of
 /// it. A runtime handle, never serialized.
 #[derive(Debug, Clone)]
 pub struct SpawnFamily(std::sync::Arc<SpawnFamilyState>);
@@ -322,7 +323,7 @@ impl SpawnFamily {
         Self(std::sync::Arc::new(SpawnFamilyState {
             limits,
             counts: std::sync::Mutex::default(),
-            tokens: std::sync::Arc::default(),
+            budget: std::sync::Arc::default(),
             coordination: crate::coordination::Coordination::new(
                 limits.max_escalations_per_child,
                 limits.max_escalations_per_request,
@@ -349,7 +350,13 @@ impl SpawnFamily {
 
     /// The tree's token counter, charged by every run in it.
     pub fn tokens(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
-        self.0.tokens.clone()
+        self.0.budget.tokens()
+    }
+
+    /// The tree's one task budget: its tokens, limit, extensions and
+    /// progress ([`crate::engine::budgets::TreeBudget`]).
+    pub fn budget(&self) -> &crate::engine::budgets::TreeBudget {
+        &self.0.budget
     }
 
     /// Admit one more child, or say why not.

@@ -1159,17 +1159,17 @@ impl TurnEngine<'_> {
             context_overflowed: AtomicBool::new(false),
             provider_failure: std::sync::Mutex::new(None),
             context_overflow_retries: std::sync::atomic::AtomicU32::new(0),
-            task_tokens: spawn_family.tokens(),
-            spawn_family,
-            task_budget: AtomicU64::new(task_token_budget(
-                self.turn_limits().task_token_budget,
-                scheduled_budget_per_check,
-            )),
-            task_budget_extensions: std::sync::atomic::AtomicUsize::new(0),
+            spawn_family: {
+                // The tree's first turn sets the request's one task budget.
+                spawn_family.budget().start(task_token_budget(
+                    self.turn_limits().task_token_budget,
+                    scheduled_budget_per_check,
+                ));
+                spawn_family
+            },
             succeeded_calls: std::sync::atomic::AtomicUsize::new(0),
             succeeded_operations: std::sync::Mutex::new(HashSet::new()),
             repeating: AtomicBool::new(false),
-            successes_at_task_extension: std::sync::atomic::AtomicUsize::new(0),
             goal_daily_budget: std::sync::Mutex::new(match &budget_goal_for_daily {
                 Some(goal_id) => match &self.goal_tokens() {
                     Some(registry) => registry.get_effective_daily_budget(goal_id).await,

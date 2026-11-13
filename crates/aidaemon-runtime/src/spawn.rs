@@ -93,6 +93,20 @@ pub fn run_phase(
     let (Some(end), Some(aggregate)) = (end, aggregate) else {
         return (crate::run_state::phase_of(outcome), RunEvidence::default());
     };
+    // It ran out of something the owner can free: that is why, whatever
+    // else its steps say, and its end offers the step that frees it.
+    if let (Some(resource), false) = (
+        aggregate.executor_short_of,
+        outcome == TaskOutcome::Succeeded,
+    ) {
+        return (
+            crate::run_state::phase_of(outcome),
+            RunEvidence {
+                unconfirmed: Vec::new(),
+                failure: Some(crate::run_state::RunFailure::ShortOf(resource)),
+            },
+        );
+    }
     let checklist: Vec<&aidaemon_events::RunObligation> = aggregate
         .obligations
         .iter()
@@ -1358,6 +1372,43 @@ mod tests {
         ] {
             assert!(!line.contains(internal), "{line}");
         }
+    }
+
+    /// Live 2026-11-13: DDEV stopped on low Docker disk space and the
+    /// answer only reported it. A helper that declared the resource it ran
+    /// out of (typed, `short_of`) ends with that reason and the concrete
+    /// step that frees it, offered.
+    #[test]
+    fn a_run_short_of_a_freeable_resource_offers_the_step_that_frees_it() {
+        let end: aidaemon_events::TaskEndData = serde_json::from_value(serde_json::json!({
+            "task_id": "t",
+            "status": "completed",
+            "duration_secs": 120,
+            "iterations": 24,
+            "tool_calls_count": 23,
+        }))
+        .unwrap();
+        let mut run = aggregate(&[("satisfied", 0), ("pending", 2)], &[("succeeded", 0)]);
+        run.executor_claimed_outcome = Some(aidaemon_events::ExecutorClaimedOutcome::Blocked);
+        run.executor_short_of = Some(aidaemon_events::ShortResource::DockerDiskSpace);
+        let (phase, evidence) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run));
+        assert_eq!(phase, crate::run_state::RunPhase::Stopped);
+        assert_eq!(
+            evidence.failure,
+            Some(crate::run_state::RunFailure::ShortOf(
+                aidaemon_events::ShortResource::DockerDiskSpace
+            ))
+        );
+        let line = evidence.line().expect("a reason line");
+        assert!(
+            line.starts_with("It stopped because Docker ran out of disk space."),
+            "{line}"
+        );
+        assert!(
+            line.contains("Next step: ") && line.contains("(`docker system prune`)"),
+            "{line}"
+        );
+        assert!(line.ends_with("Want me to?"), "{line}");
     }
 
     /// The live Drupal helper (2026-11-13): every step done, its own verdict
