@@ -5227,3 +5227,83 @@ async fn expired_local_site_approval_no_longer_counts() {
             .await
     );
 }
+
+/// A tree's delivery ledger as the host gives it: one per request, shared
+/// by every agent in it, each agent its own member.
+struct LedgerFence {
+    member: &'static str,
+    delivered: Arc<std::sync::Mutex<std::collections::HashMap<String, &'static str>>>,
+}
+
+#[async_trait::async_trait]
+impl aidaemon_tools::semantics::FileFence for LedgerFence {
+    async fn observed(&self, _path: &str, _bytes: &[u8]) {}
+
+    async fn begin_write(
+        &self,
+        _path: &str,
+    ) -> Result<Box<dyn aidaemon_tools::semantics::FileWriteGuard>, String> {
+        Err("not used".to_string())
+    }
+
+    async fn claim_delivery(
+        &self,
+        subject: &str,
+    ) -> Result<(), aidaemon_tools::semantics::DeliveredArtifact> {
+        let mut delivered = self.delivered.lock().unwrap();
+        if let Some(by) = delivered.get(subject) {
+            return Err(aidaemon_tools::semantics::DeliveredArtifact {
+                by: by.to_string(),
+                at: Default::default(),
+            });
+        }
+        delivered.insert(subject.to_string(), self.member);
+        Ok(())
+    }
+}
+
+/// One request sends a page's screenshot once (live 2026-11-13: a helper
+/// sent the Drupal homepage and the main agent sent it again): the second
+/// agent's capture is saved for it to look at and not sent, and it is told
+/// who sent the page and when.
+#[tokio::test]
+async fn one_request_sends_a_pages_screenshot_once() {
+    let (tool, _backend, rx) = mock_tool();
+    let media = spawn_media_responder(rx, Ok(()));
+    let delivered = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let facts_for = |session: &str, member: &'static str| {
+        let mut facts = aidaemon_tools::testing::call_facts(session);
+        let fence: Arc<dyn aidaemon_tools::semantics::FileFence> = Arc::new(LedgerFence {
+            member,
+            delivered: delivered.clone(),
+        });
+        facts
+            .extensions
+            .insert(aidaemon_tools::semantics::CallFileFence(fence));
+        facts
+    };
+    let args = json!({ "action": "screenshot"}).to_string();
+
+    let first = tool
+        .call_with(
+            &args,
+            facts_for("sess-helper", "the helper \"Drupal install\""),
+        )
+        .await
+        .unwrap();
+    assert!(first.contains("captured and delivered to chat"), "{first}");
+
+    let second = tool
+        .call_with(&args, facts_for("sess-main", "the main agent"))
+        .await
+        .unwrap();
+    assert!(
+        second.contains("not sent") && second.contains("the helper \"Drupal install\""),
+        "{second}"
+    );
+    assert_eq!(
+        media.messages.lock().await.len(),
+        1,
+        "the page went to the owner once"
+    );
+}

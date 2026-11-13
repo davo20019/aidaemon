@@ -99,6 +99,15 @@ pub fn run_phase(
         .filter(|(id, _)| id.contains("/obligation:checklist:"))
         .map(|(_, obligation)| obligation)
         .collect();
+    if let Some(failure) = nothing_done(outcome, &checklist, aggregate) {
+        return (
+            RunPhase::Failed,
+            RunEvidence {
+                unconfirmed: Vec::new(),
+                failure: Some(failure),
+            },
+        );
+    }
     let only_receipts_missing = outcome == TaskOutcome::Partial
         && end.status == aidaemon_events::TaskStatus::Completed
         && aggregate.executor_claimed_outcome
@@ -140,7 +149,62 @@ pub fn run_phase(
     } else {
         Vec::new()
     };
-    (RunPhase::Succeeded, RunEvidence { unconfirmed })
+    (
+        RunPhase::Succeeded,
+        RunEvidence {
+            unconfirmed,
+            failure: None,
+        },
+    )
+}
+
+/// A run that did none of its work, from its typed records: it did not
+/// succeed, it declared steps that need a change, none of them was done, no
+/// call of its changed anything, and neither the owner's answer nor work
+/// still running explains the stop. Such a run failed: whatever its reply
+/// says, nothing it was sent to do happened.
+fn nothing_done(
+    outcome: TaskOutcome,
+    checklist: &[&aidaemon_events::RunObligation],
+    aggregate: &aidaemon_events::RunAggregate,
+) -> Option<crate::run_state::RunFailure> {
+    use aidaemon_events::RunObligationState;
+    if outcome == TaskOutcome::Succeeded
+        || aggregate.owner_declined()
+        || aggregate.has_background_in_flight()
+    {
+        return None;
+    }
+    let effect_steps: Vec<&&aidaemon_events::RunObligation> = checklist
+        .iter()
+        .filter(|obligation| !obligation.required_effect.is_empty())
+        .collect();
+    let a_step_done = effect_steps
+        .iter()
+        .any(|obligation| obligation.state == RunObligationState::Satisfied);
+    let changed_something = aggregate.operations.values().any(|operation| {
+        operation.outcome == Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded)
+            && !operation.mutation_effects.is_empty()
+    });
+    if effect_steps.is_empty() || a_step_done || changed_something {
+        return None;
+    }
+    let mut undone: Vec<(&String, String)> = effect_steps
+        .iter()
+        .map(|obligation| {
+            (
+                &obligation.id,
+                obligation
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| "a step it listed".to_string()),
+            )
+        })
+        .collect();
+    undone.sort_by(|a, b| a.0.cmp(b.0));
+    Some(crate::run_state::RunFailure::NothingDone {
+        undone: undone.into_iter().map(|(_, summary)| summary).collect(),
+    })
 }
 
 #[derive(Debug)]
@@ -1070,4 +1134,110 @@ pub trait ChildAgent: crate::host::TurnHost {
     /// Set once any turn of the child read (or started with) untrusted
     /// content, even when the taint could not be recorded.
     fn read_untrusted(&self) -> Arc<std::sync::atomic::AtomicBool>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::run_state::RunFailure;
+    use aidaemon_events::RunAggregate;
+
+    /// A run's aggregate with checklist steps `(state, required effect)` and
+    /// operations `(outcome, effects)`.
+    fn aggregate(steps: &[(&str, u32)], operations: &[(&str, u32)]) -> RunAggregate {
+        let obligations: serde_json::Map<String, serde_json::Value> = steps
+            .iter()
+            .enumerate()
+            .map(|(index, (state, effect))| {
+                let id = format!("task:t/obligation:checklist:{index}");
+                (
+                    id.clone(),
+                    serde_json::json!({
+                        "id": id,
+                        "class": if *effect == 0 { "observe" } else { "achieve" },
+                        "state": state,
+                        "required_effect": effect,
+                        "summary": format!("step {index}"),
+                    }),
+                )
+            })
+            .collect();
+        let operations: serde_json::Map<String, serde_json::Value> = operations
+            .iter()
+            .enumerate()
+            .map(|(index, (outcome, effects))| {
+                let id = format!("op{index}");
+                (
+                    id.clone(),
+                    serde_json::json!({
+                        "operation_id": id,
+                        "tool_name": "terminal",
+                        "outcome": outcome,
+                        "dispatched": true,
+                        "mutation_effects": effects,
+                        "result_id": format!("sha256:{index}"),
+                    }),
+                )
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "task_id": "t",
+            "obligations": obligations,
+            "operations": operations,
+        }))
+        .unwrap()
+    }
+
+    fn checklist(aggregate: &RunAggregate) -> Vec<&aidaemon_events::RunObligation> {
+        aggregate.obligations.values().collect()
+    }
+
+    /// The live run (2026-11-13): it looked at its folder (a satisfied
+    /// observation), changed nothing, and set every step that needed a
+    /// change aside. Its outcome was only "partial"; its run failed.
+    #[test]
+    fn a_run_that_changed_nothing_and_did_no_change_step_failed() {
+        let run = aggregate(
+            &[
+                ("satisfied", 0),
+                ("deferred", 130),
+                ("deferred", 0),
+                ("deferred", 64),
+            ],
+            &[("failed_permanent", 0), ("succeeded", 0), ("succeeded", 0)],
+        );
+        assert_eq!(
+            nothing_done(TaskOutcome::Partial, &checklist(&run), &run),
+            Some(RunFailure::NothingDone {
+                undone: vec!["step 1".to_string(), "step 3".to_string()],
+            })
+        );
+    }
+
+    /// Any change made, any change step done, a success, or no step that
+    /// needed a change: not a failure of this kind.
+    #[test]
+    fn a_run_that_did_some_of_its_work_did_not_fail_for_nothing_done() {
+        let changed = aggregate(&[("deferred", 2)], &[("succeeded", 2)]);
+        assert_eq!(
+            nothing_done(TaskOutcome::Partial, &checklist(&changed), &changed),
+            None
+        );
+        let step_done = aggregate(&[("satisfied", 2), ("deferred", 64)], &[]);
+        assert_eq!(
+            nothing_done(TaskOutcome::Partial, &checklist(&step_done), &step_done),
+            None
+        );
+        let looked_only = aggregate(&[("deferred", 0)], &[("succeeded", 0)]);
+        assert_eq!(
+            nothing_done(TaskOutcome::Partial, &checklist(&looked_only), &looked_only),
+            None
+        );
+        let undone = aggregate(&[("deferred", 2)], &[]);
+        assert_eq!(
+            nothing_done(TaskOutcome::Succeeded, &checklist(&undone), &undone),
+            None
+        );
+    }
 }

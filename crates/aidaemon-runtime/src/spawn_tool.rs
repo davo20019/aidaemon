@@ -831,6 +831,25 @@ pub fn run_window(name: &str, run: &MeasuredRun) -> String {
     )
 }
 
+/// A failed child's measured run, for the parent: how long it ran before it
+/// failed, which is never a time to finish its work. Its work's time to
+/// finish exists only once something finishes it: quote a later helper's
+/// measured time, or say no time to finish was measured.
+pub fn failed_run_window(name: &str, run: &MeasuredRun) -> String {
+    let took = run.took();
+    format!(
+        "{MEASURED_TIMING_MARK}{name} ran {} ({}s), {}, and failed.{}\n\
+         These are the daemon's measurements: it failed after this long, so this is not how \
+         long its work takes. Report what was measured: if you start another helper for this \
+         work, its own measured time is the time to finish; if you do the work yourself, say \
+         that no time to finish was measured. Never estimate one.",
+        compact(took),
+        took.num_seconds(),
+        run.range(),
+        owner_wait_note(run.waited),
+    )
+}
+
 /// How long a child waited for the owner's answer on its cards, from its
 /// own wait clock; empty when it never waited.
 pub fn owner_wait_note(waited: Duration) -> String {
@@ -1000,29 +1019,97 @@ pub struct SpawnArgs {
     #[serde(default)]
     pub precedence: Option<crate::coordination::Precedence>,
     /// Folders this child creates fresh (a new install or project): each
-    /// must not exist yet ([`folders_already_there`]).
+    /// must not exist yet; the spawn creates them ([`claim_new_folders`]).
     #[serde(default)]
     pub new_folders: Vec<String>,
 }
 
-/// The `new_folders` that already exist, each with the next name beside it
-/// that is free: a child asked to create a folder fresh never starts on one
-/// that already holds something (live 2026-11-13: "fresh" installs went
-/// into claude-drupal-3, which held an earlier site, and preserved it).
-pub fn folders_already_there(folders: &[String]) -> Vec<(String, String)> {
-    folders
-        .iter()
-        .filter_map(|folder| {
-            let path = std::path::PathBuf::from(shellexpand::tilde(folder.trim()).as_ref());
-            if !path.exists() {
-                return None;
+/// Make each of `folders` fresh and empty for a child's work, and return
+/// them as absolute paths: the one place a spawn's `new_folders` become real.
+/// Creating the folder is what claims its name, so two siblings can never
+/// both start in it, and the child finds it there to work in (live
+/// 2026-11-13: a helper sent to install into a folder that did not exist yet
+/// found it missing and gave up). A folder that already exists, or a path
+/// that is not absolute, is refused with the next free name, and nothing is
+/// created (live 2026-11-13: "fresh" installs went into claude-drupal-3,
+/// which held an earlier site, and preserved it).
+pub fn claim_new_folders(folders: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut wanted = Vec::with_capacity(folders.len());
+    let mut refused = Vec::new();
+    for folder in folders {
+        let path = std::path::PathBuf::from(shellexpand::tilde(folder.trim()).as_ref());
+        if !path.is_absolute() {
+            refused.push(format!("{} is not an absolute path", path.display()));
+        } else if path.exists() {
+            refused.push(format!(
+                "{} already exists (the next free name is {})",
+                path.display(),
+                next_free_folder(&path).display()
+            ));
+        } else if !wanted.contains(&path) {
+            wanted.push(path);
+        }
+    }
+    let mut made: Vec<std::path::PathBuf> = Vec::new();
+    if refused.is_empty() {
+        for path in &wanted {
+            let parent_ready = path.parent().map_or(Ok(()), std::fs::create_dir_all);
+            match parent_ready.and_then(|()| std::fs::create_dir(path)) {
+                Ok(()) => made.push(path.clone()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    refused.push(format!(
+                        "{} already exists (the next free name is {})",
+                        path.display(),
+                        next_free_folder(path).display()
+                    ));
+                    break;
+                }
+                Err(error) => {
+                    refused.push(format!("{} could not be created: {error}", path.display()));
+                    break;
+                }
             }
-            Some((
-                path.display().to_string(),
-                next_free_folder(&path).display().to_string(),
-            ))
-        })
-        .collect()
+        }
+    }
+    if !refused.is_empty() {
+        release_new_folders(&made);
+        anyhow::bail!(
+            "No helper started: {}. New work needs an absolute folder that doesn't exist yet. \
+             Call again with the free folder in title, task, scope and new_folders, or ask \
+             the owner whether to use the existing one.",
+            refused.join("; ")
+        );
+    }
+    Ok(made
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .collect())
+}
+
+/// Give back folders [`claim_new_folders`] made for a child that did not
+/// start or that failed: each is removed only while it is still empty, so
+/// the name is free for the next try.
+pub fn release_new_folders<P: AsRef<std::path::Path>>(folders: &[P]) {
+    for folder in folders {
+        let _ = std::fs::remove_dir(folder.as_ref());
+    }
+}
+
+/// The line a child's task gets for the folders made for it: they exist,
+/// empty, and are where its work goes.
+pub fn new_folders_note(folders: &[String]) -> String {
+    match folders {
+        [] => String::new(),
+        [one] => format!(
+            "\n\nThe folder for this work, {one}, was just created for you and is empty: \
+             work in it. It is part of what you may change."
+        ),
+        many => format!(
+            "\n\nThe folders for this work were just created for you and are empty: {}. \
+             Work in them. They are part of what you may change.",
+            many.join(", ")
+        ),
+    }
 }
 
 /// The first sibling of `path` named like it with a higher number
@@ -1289,12 +1376,12 @@ impl Tool for SpawnAgentTool {
                     "scope": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional: the files or directories this child will change. When several children will write, give them disjoint scopes so they do not collide. If a scope must overlap a running child's, say who wins there with precedence."
+                        "description": "Optional: the files or directories this child will change. Given (here or as new_folders), the child may write only there; anything else it would change is put to the owner. When several children will write, give them disjoint scopes so they do not collide. If a scope must overlap a running child's, say who wins there with precedence."
                     },
                     "new_folders": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "When the work makes something new in a folder of its own (a fresh install, a new project), that folder's absolute path. The call fails if it already exists and names the next free folder, so pick that one (in title, task, scope and here) or ask the owner; never send a fresh install into a folder that holds something."
+                        "description": "When the work makes something new in a folder of its own (a fresh install, a new project), that folder's absolute path. It is created empty before the child starts, and the child may write in it. The call fails if it already exists and names the next free folder, so pick that one (in title, task, scope and here) or ask the owner; never send a fresh install into a folder that holds something."
                     },
                     "precedence": {
                         "type": "string",
@@ -1384,25 +1471,25 @@ impl SpawnAgentTool {
         arguments: &str,
         facts: &aidaemon_tools::semantics::ToolCallContext,
     ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
+        let mut args = SpawnArgs::parse(arguments)?;
+        let new_folders = claim_new_folders(&args.new_folders)?;
+        args.task.push_str(&new_folders_note(&new_folders));
+        let result = self.start_child(args, new_folders.clone(), facts).await;
+        if result.is_err() {
+            release_new_folders(&new_folders);
+        }
+        result
+    }
+
+    /// Start one child for parsed `args`, whose `new_folders` were made.
+    async fn start_child(
+        &self,
+        args: SpawnArgs,
+        new_folders: Vec<String>,
+        facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let status_tx = aidaemon_tools::status::status_sender(facts);
         let facts = facts.clone();
-
-        let args = SpawnArgs::parse(arguments)?;
-        let taken = folders_already_there(&args.new_folders);
-        if !taken.is_empty() {
-            let listed = taken
-                .iter()
-                .map(|(there, free)| {
-                    format!("{there} already exists (the next free name is {free})")
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            anyhow::bail!(
-                "No helper started: {listed}. New work needs a folder that doesn't exist yet. \
-                 Call again with the free folder in title, task, scope and new_folders, or ask \
-                 the owner whether to use the existing one."
-            );
-        }
         let project_scope = facts.project_scope.clone();
         let mut parent_authority = crate::authority::parent_authority(&facts).cloned();
         // A child can be made narrower than its parent and never wider.
@@ -1493,9 +1580,26 @@ impl SpawnAgentTool {
                     .and_then(|parent| parent.spawn_family.clone())
             })
             .flatten();
+        // What the child will change, resolved once: its write authority
+        // ([`crate::authority::narrow_for_child`]) and, in a tree, its place
+        // on the roster.
+        let mut scope = agent.resolve_child_scope(args.scope.clone()).await;
+        for folder in &new_folders {
+            if !scope.contains(folder) {
+                scope.push(folder.clone());
+            }
+        }
+        if let Some(parent) = parent_authority.as_mut() {
+            parent.child_declaration = Some(crate::authority::ChildDeclaration {
+                parent_session: facts.session_id.clone(),
+                scope: scope.clone(),
+                new_folders: new_folders.clone(),
+                precedence: args.precedence,
+                claim: None,
+            });
+        }
         if let Some(family) = tree.as_ref() {
             use crate::coordination::Precedence;
-            let scope = agent.resolve_child_scope(args.scope.clone()).await;
             let (claim, overlaps) = family.coordination().declare_scope(&args.mission, &scope);
             if !overlaps.is_empty() {
                 let listed = overlaps
@@ -1527,13 +1631,11 @@ impl SpawnAgentTool {
                     "\n\nThis child's scope overlaps running sub-agents at: {listed}. {rule}"
                 );
             }
-            if let Some(parent) = parent_authority.as_mut() {
-                parent.child_declaration = Some(crate::authority::ChildDeclaration {
-                    parent_session: facts.session_id.clone(),
-                    scope,
-                    precedence: args.precedence,
-                    claim: Some(Arc::new(claim)),
-                });
+            if let Some(declaration) = parent_authority
+                .as_mut()
+                .and_then(|parent| parent.child_declaration.as_mut())
+            {
+                declaration.claim = Some(Arc::new(claim));
             }
         }
 
@@ -2238,12 +2340,13 @@ impl aidaemon_tools::semantics::ToolSemantics for SpawnAgentTool {
     }
 }
 
-/// A child's typed outcome as its spawn receipt's outcome: only a child
-/// that succeeded makes the spawn a success, never its reply's wording.
-pub fn child_receipt_status(outcome: TaskOutcome) -> aidaemon_tools::semantics::ToolOutcomeStatus {
-    match outcome {
-        TaskOutcome::Succeeded => aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded,
-        TaskOutcome::Partial | TaskOutcome::Failed => {
+/// A child's run phase as its spawn receipt's outcome: only a child that
+/// succeeded makes the spawn a success, never its reply's wording.
+pub fn child_receipt_status(phase: RunPhase) -> aidaemon_tools::semantics::ToolOutcomeStatus {
+    match phase {
+        RunPhase::Succeeded => aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded,
+        RunPhase::Failed => aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent,
+        RunPhase::Stopped | RunPhase::Running => {
             aidaemon_tools::semantics::ToolOutcomeStatus::CompletedWithNegativeResult
         }
     }
@@ -2343,7 +2446,15 @@ impl SpawnAgentTool {
         )
         .await;
         let measured = MeasuredRun::ended_now(started, &waits);
-        let window = run_window(&helper_name, &measured);
+        let failed = match &result {
+            Ok(run) => run.phase == RunPhase::Failed,
+            Err(error) => error.downcast_ref::<ChildTimedOut>().is_none(),
+        };
+        let window = if failed {
+            failed_run_window(&helper_name, &measured)
+        } else {
+            run_window(&helper_name, &measured)
+        };
         // Its header on the turn's card ends with how it ended and the time
         // the runtime measured: the owner reads the time there, never as
         // the parent's arithmetic.
@@ -2364,14 +2475,22 @@ impl SpawnAgentTool {
 
         match result {
             Ok(run) => {
-                let response = match run.outcome {
-                    TaskOutcome::Succeeded => run.response,
-                    TaskOutcome::Partial => {
+                // How it ended is its run record's phase, decided from typed
+                // facts; its reply is only the body.
+                let response = match run.phase {
+                    RunPhase::Succeeded => run.response,
+                    RunPhase::Stopped | RunPhase::Running => {
                         format!("\u{26a0}\u{fe0f} Sub-agent incomplete\n\n{}", run.response)
                     }
-                    TaskOutcome::Failed => {
+                    RunPhase::Failed => {
+                        let reason = run
+                            .evidence
+                            .failure
+                            .as_ref()
+                            .map(|failure| format!("{}\n\n", failure.reason()))
+                            .unwrap_or_default();
                         return Err(anyhow::anyhow!(
-                            "Sub-agent failed: {}\n{window}",
+                            "Sub-agent failed. {reason}Its own report: {}\n{window}",
                             run.response
                         ));
                     }
@@ -2392,7 +2511,7 @@ impl SpawnAgentTool {
                 // The child's run already closed with a typed outcome: that,
                 // not a scan of its reply's wording (a review listing "Bugs"
                 // read as a failure), is the receipt's outcome.
-                outcome.metadata.outcome_status = Some(child_receipt_status(run.outcome));
+                outcome.metadata.outcome_status = Some(child_receipt_status(run.phase));
                 Ok(outcome)
             }
             Err(error) => match error.downcast_ref::<ChildTimedOut>() {
@@ -2421,7 +2540,8 @@ impl SpawnAgentTool {
                                 format!("{prefix}\n\n{}\n\n{window}", salvaged.details),
                                 SourceTrust::Untrusted,
                             );
-                            result.metadata.outcome_status = Some(child_receipt_status(outcome));
+                            result.metadata.outcome_status =
+                                Some(child_receipt_status(crate::run_state::phase_of(outcome)));
                             return Ok(result);
                         }
                         if child_role == Some(AgentRole::Executor) {
