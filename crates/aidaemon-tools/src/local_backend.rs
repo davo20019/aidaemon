@@ -78,6 +78,72 @@ pub struct LocalBackend {
     canonical_workspace_root: PathBuf,
     home: BackendPath,
     allow_outside_workspace: bool,
+    /// Host variables a command inherits. Everything else in the daemon's
+    /// environment (provider keys, the encryption key) stays out.
+    env_allowlist: Vec<String>,
+}
+
+/// Host variables a local command inherits by default: what shells, build
+/// tools and version managers need to find things, and nothing that carries
+/// a credential. A name ending in `*` is a prefix. `[execution]
+/// env_allowlist` adds names.
+pub const LOCAL_ENV_ALLOWLIST: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "LC_*",
+    "TERM",
+    "COLORTERM",
+    "TZ",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_*",
+    "SSH_AUTH_SOCK",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "GOPATH",
+    "GOROOT",
+    "JAVA_HOME",
+    "NVM_DIR",
+    "PYENV_ROOT",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "HOMEBREW_PREFIX",
+    "HOMEBREW_CELLAR",
+    "HOMEBREW_REPOSITORY",
+    "__CF_USER_TEXT_ENCODING",
+    "SYSTEMROOT",
+    "SystemRoot",
+    "COMSPEC",
+    "PATHEXT",
+    "WINDIR",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    // Paths to the daemon's own config, env file and working directory
+    // (never their contents), for an `aidaemon` command run from a shell.
+    "AIDAEMON_RUNTIME_*",
+];
+
+fn env_name_allowed(allowlist: &[String], name: &str) -> bool {
+    allowlist.iter().any(|entry| match entry.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => entry == name,
+    })
+}
+
+fn default_env_allowlist() -> Vec<String> {
+    LOCAL_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect()
 }
 
 impl LocalBackend {
@@ -97,7 +163,18 @@ impl LocalBackend {
             canonical_workspace_root,
             home: BackendPath::new(home.to_string_lossy().into_owned()),
             allow_outside_workspace: true,
+            env_allowlist: default_env_allowlist(),
         }
+    }
+
+    /// Let commands also inherit these host variables (a trailing `*` is a
+    /// prefix), on top of [`LOCAL_ENV_ALLOWLIST`].
+    pub fn with_env_allowlist(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.env_allowlist.extend(names.into_iter().map(Into::into));
+        self
     }
 
     /// A backend rooted at `workspace_root` (`~` expanded; default: the
@@ -124,6 +201,7 @@ impl LocalBackend {
             canonical_workspace_root,
             home: BackendPath::new(home.to_string_lossy().into_owned()),
             allow_outside_workspace,
+            env_allowlist: default_env_allowlist(),
         })
     }
 
@@ -322,6 +400,11 @@ impl ExecutionBackend for LocalBackend {
                 command
             }
         };
+        command.env_clear();
+        command.envs(std::env::vars_os().filter(|(name, _)| {
+            name.to_str()
+                .is_some_and(|name| env_name_allowed(&self.env_allowlist, name))
+        }));
         command
             .current_dir(cwd_host)
             .envs(request.env)
