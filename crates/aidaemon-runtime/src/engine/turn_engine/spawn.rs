@@ -2243,3 +2243,29 @@ impl TurnEngine<'_> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_taint_record_counts_as_tainted() {
+        use crate::turn::memory_writer::RunTaint;
+        assert_eq!(
+            run_taint(false, &Err(anyhow::anyhow!("corrupt"))),
+            RunTaint::Tainted
+        );
+        assert_eq!(
+            run_taint(false, &Ok(vec!["turn-1".to_string()])),
+            RunTaint::Tainted
+        );
+        assert_eq!(run_taint(false, &Ok(Vec::new())), RunTaint::Clean);
+    }
+
+    #[test]
+    fn a_run_flagged_untrusted_counts_as_tainted_even_with_an_empty_record() {
+        use crate::turn::memory_writer::RunTaint;
+        assert_eq!(run_taint(true, &Ok(Vec::new())), RunTaint::Tainted);
+        assert_eq!(run_taint(false, &Ok(Vec::new())), RunTaint::Clean);
+    }
+}

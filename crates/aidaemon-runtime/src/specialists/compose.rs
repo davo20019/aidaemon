@@ -16,6 +16,13 @@ use crate::prompt::rules::format_goal_context;
 use crate::spawn::task_lead_execution_mode;
 use crate::turn::validation_state::ExecutorHandoff;
 
+/// Every helper's contract: its own run's duration is the daemon's to
+/// state. The owner reads only the run record's measured times, shown under
+/// the helper's result.
+pub const OWN_DURATION_RULE: &str = "Don't state how long your own run took, or when it \
+     started or ended: the daemon measures your run and puts the time under your result, so a \
+     number of your own would only disagree with it.";
+
 pub fn bounded_completed_task_results_context(
     ctx_json: &str,
     max_results: usize,
@@ -626,7 +633,7 @@ pub mod legacy {
              - NEVER return just \"I researched X\" or \"Generated a report about Y\". Return the actual content.\n\
              - Include specific outputs (file paths, data retrieved, commands run).\n\
              - A time or duration you report is one this task measured. An earlier run's measurement, from history or memory, is never this task's result; if you mention one, say which run it was.\n\
-             - Don't state how long your own run took: the daemon measures it and puts the time under your result, so a number of your own would only disagree with it.\n\
+             - {OWN_DURATION_RULE}\n\
              - When your task is to make something new (a fresh install, a new project or folder), something already in its place is not yours to reuse: leave it untouched, never report it as new, and finish not done (outcome blocked), saying what was there.\n\
              - If you create or write a file, include its FULL ABSOLUTE PATH in your result text.\n\
              - Format the result for a small chat screen: lead with the outcome, use short paragraphs or bullets, and label links, paths, verification results, versions, and IDs. Do not repeat the original request or task instructions, and do not dump the execution chronology.\n\
