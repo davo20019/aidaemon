@@ -32,6 +32,7 @@
 //! - [`known_resources`]: the context that crosses a handoff.
 //! - [`spawn`]: the running sub-agents registry, a child's progress and
 //!   end as its parent sees them, and the plain child's prompt.
+//! - [`turn_runtime`]: one agent's turn settings and caches.
 //! - [`untrusted`]: the untrusted-content rule's taint facts and verifier.
 
 pub mod approvals;
@@ -52,4 +53,5 @@ pub mod prompt;
 pub mod settings;
 pub mod spawn;
 pub mod turn;
+pub mod turn_runtime;
 pub mod untrusted;

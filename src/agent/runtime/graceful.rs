@@ -950,6 +950,7 @@ impl Agent {
         // Stamp the active turn so the normal TaskEnd carries turn identity
         // (recovery TaskEnd uses the checkpoint's original turn_id instead).
         let turn_id = self
+            .runtime
             .current_turn_ids
             .read()
             .await
@@ -1259,7 +1260,7 @@ impl Agent {
         iteration: usize,
         emission: DecisionPointEmission,
     ) {
-        if !self.record_decision_points {
+        if !self.runtime.record_decision_points {
             return;
         }
         emit_decision_point_event(

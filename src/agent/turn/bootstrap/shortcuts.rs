@@ -140,7 +140,13 @@ pub(super) async fn emit_bootstrap_direct_reply(
         .await?;
 
     if agent.harness_eval_enabled() {
-        let turn_id = agent.current_turn_ids.read().await.get(session_id).cloned();
+        let turn_id = agent
+            .runtime
+            .current_turn_ids
+            .read()
+            .await
+            .get(session_id)
+            .cloned();
         let mut harness_eval = HarnessEvalAccumulator::new(HarnessEvalSeed {
             task_id: task_id.to_string(),
             turn_id,

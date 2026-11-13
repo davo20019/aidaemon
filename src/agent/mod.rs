@@ -11,9 +11,7 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::config::{
-    AudioConfig, IterationLimitConfig, PathAliasConfig, PolicyConfig, SttConfig, VisionConfig,
-};
+use crate::config::{IterationLimitConfig, PathAliasConfig};
 use crate::events::{
     AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
     SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData, TaskStatus,
@@ -298,27 +296,6 @@ pub(in crate::agent) use agent_helpers::{
 /// `message_build` to emit an explicit boundary-movement event.
 type WindowBoundaryMemory = Arc<tokio::sync::RwLock<HashMap<String, (usize, Option<String>)>>>;
 
-/// Pillar A per-session core-prompt cache: `session_id` → last rendered
-/// [`core_prompt::CachedCore`]. On a HIT (aggregate hash unchanged) the cached
-/// bytes are reused verbatim with no re-render; on a MISS the changed
-/// component(s) are logged (`Core prompt invalidated component=...`) and the
-/// entry is replaced. In-memory, lost on restart.
-type CorePromptCache = Arc<tokio::sync::RwLock<HashMap<String, core_prompt::CachedCore>>>;
-
-/// Pillar B per-session/per-turn render cache: `session_id` → (`turn_id` →
-/// [`turn_render_cache::CachedRender`]). Reuses rendered turn bytes verbatim
-/// when `content_fp` + `renderer_version` + `mode` all match; on a miss the
-/// turn is re-rendered and the entry replaced. In-memory, lost on restart.
-type TurnRenderCache =
-    Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, turn_render_cache::CachedRender>>>>;
-
-/// Pillar B per-session in-memory anchor: `session_id` → anchor `turn_seq`. The
-/// archived region carried into each payload starts at this turn; eviction
-/// advances it. In-memory, lost on restart (one re-prefill per restart is
-/// accepted). Consumed by the message-build integration in Task 7; unused until
-/// then.
-type TurnAnchorMemory = Arc<tokio::sync::RwLock<HashMap<String, i64>>>;
-
 /// Immutable execution identity for one worker inside one autonomous mandate
 /// decision cycle. The lease token is Rust-side control state and must never be
 /// serialized, logged, or exposed to the model.
@@ -338,6 +315,9 @@ pub(crate) struct MandateExecutionFence {
 
 pub struct Agent {
     llm_runtime: SharedLlmRuntime,
+    /// The turn runtime's settings and caches (context window, policy,
+    /// media, prompt and render caches, turn ids).
+    runtime: aidaemon_runtime::turn_runtime::TurnRuntime,
     /// The gateway for model calls made outside the agent loop.
     side_calls: crate::llm_runtime::gateway::SideCallGateway,
     state: Arc<dyn StateStore>,
@@ -414,10 +394,6 @@ pub struct Agent {
     /// the same sender sends while it runs into the run (mid-turn steering).
     /// Set after channel startup via `set_task_registry()`.
     task_registry: std::sync::OnceLock<Arc<crate::tasks::TaskRegistry>>,
-    /// Context window management configuration.
-    context_window_config: crate::config::ContextWindowConfig,
-    /// Policy rollout and enforcement configuration.
-    policy_config: PolicyConfig,
     /// Configured path alias roots (for example, `projects/...`).
     path_aliases: PathAliasConfig,
     /// Where received attachments are saved: daemon storage, never a project.
@@ -439,14 +415,6 @@ pub struct Agent {
     /// Executor children so they can access Action tools that were filtered
     /// out of the TaskLead's own `tools` vec.
     root_tools: Option<Vec<Arc<dyn Tool>>>,
-    /// Emit structured decision points into the event store for self-diagnostics.
-    record_decision_points: bool,
-    /// Per-session conversation turn IDs. Populated at the start of each
-    /// `handle_message_impl` and read by `append_message_canonical` so every
-    /// message written during a turn is stamped with the same `turn_id`.
-    /// `message_build` uses this stamp to find the current-task
-    /// boundary without inferring from message content.
-    current_turn_ids: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     /// Some turn of this agent read (or started with) untrusted content.
     /// Kept in memory so a taint that could not be recorded still counts
     /// when a parent reads this child's result.
@@ -468,32 +436,12 @@ pub struct Agent {
     /// Loaded once at agent construction and shared with every child agent
     /// spawned from this hierarchy.
     pub(crate) specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
-    /// Pillar A per-session core-prompt cache (Task 7). Keyed by `session_id`;
-    /// reuses rendered core bytes verbatim across tasks when the session-static
-    /// inputs are unchanged, and logs the changed component on invalidation.
-    core_prompts: CorePromptCache,
-    /// Pillar B per-session/per-turn render cache (Task 5). Keyed by
-    /// `session_id` then `turn_id`; reuses rendered turn bytes verbatim across
-    /// builds when `content_fp` + `renderer_version` + `mode` are unchanged.
-    /// Consumed by the message-build integration (Pillar B Task 7).
-    turn_renders: TurnRenderCache,
-    /// Pillar B per-session anchor tracker (Task 6). Keyed by `session_id`;
-    /// maps to the anchor `turn_seq` of the oldest archived turn carried into
-    /// the payload. Eviction advances it. Consumed by the message-build
-    /// integration (Pillar B Task 7).
-    turn_anchors: TurnAnchorMemory,
     /// llama.cpp interactive KV-cache slot for the main generation loop.
     /// `Some(interactive_slot)` only when slot routing is enabled on the primary
     /// provider; `None` otherwise (and for all sub-agents). When set, it is
     /// applied to the main-loop `ChatOptions.id_slot` so the interactive
     /// conversation pins a dedicated slot that background tasks cannot evict.
     interactive_slot: Option<u32>,
-    /// Vision/image encoding settings for multimodal LLM requests.
-    vision_config: VisionConfig,
-    /// Native audio input settings for multimodal LLM requests.
-    audio_config: AudioConfig,
-    /// Local Whisper STT fallback when native audio is skipped.
-    stt_config: SttConfig,
     /// Per-task harness effectiveness accumulator (cleared after TaskEnd).
     harness_eval: Arc<RwLock<Option<HarnessEvalAccumulator>>>,
     /// Harness eval scoring configuration.
@@ -707,12 +655,20 @@ impl Agent {
         model: &str,
     ) -> (bool, usize, usize, usize, Option<i64>) {
         (
-            self.context_window_config.enabled,
-            crate::context_budget::model_context_budget(model, &self.context_window_config),
-            self.context_window_config
+            self.runtime.context_window_config.enabled,
+            crate::context_budget::model_context_budget(model, &self.runtime.context_window_config),
+            self.runtime
+                .context_window_config
                 .summarize_token_threshold_for(model),
-            self.context_window_config.summary_recent_tokens_for(model),
-            self.turn_anchors.read().await.get(session_id).copied(),
+            self.runtime
+                .context_window_config
+                .summary_recent_tokens_for(model),
+            self.runtime
+                .turn_anchors
+                .read()
+                .await
+                .get(session_id)
+                .copied(),
         )
     }
 
@@ -724,8 +680,8 @@ impl Agent {
         token_threshold: usize,
         recent_tokens: usize,
     ) {
-        self.context_window_config.summarize_token_threshold = token_threshold;
-        self.context_window_config.summary_recent_tokens = recent_tokens;
+        self.runtime.context_window_config.summarize_token_threshold = token_threshold;
+        self.runtime.context_window_config.summary_recent_tokens = recent_tokens;
         // The turn's post-reply compaction reads the writer's own copy.
         self.transcript_writes = memory_plugin::DaemonMemory::new(
             self.state.clone(),
@@ -733,7 +689,7 @@ impl Agent {
             self.event_store.clone(),
             self.llm_runtime.clone(),
             self.side_calls.clone(),
-            self.context_window_config.clone(),
+            self.runtime.context_window_config.clone(),
             0,
             false,
             "",
@@ -749,12 +705,7 @@ impl Agent {
     }
 
     pub(crate) fn render_options(&self, model: &str) -> turn_render::RenderOptions {
-        turn_render::RenderOptions {
-            vision: self.vision_config.clone(),
-            audio: self.audio_config.clone(),
-            stt: self.stt_config.clone(),
-            model: model.to_string(),
-        }
+        self.runtime.render_options(model)
     }
 
     pub(in crate::agent) async fn install_harness_eval(&self, accumulator: HarnessEvalAccumulator) {

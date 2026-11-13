@@ -743,6 +743,7 @@ impl Agent {
             tool_call_id: ctx.tool_call_id.map(str::to_string),
             lone_root_call: ctx.lone_root_call,
             turn_id: self
+                .runtime
                 .current_turn_ids
                 .read()
                 .await

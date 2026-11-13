@@ -809,7 +809,7 @@ impl Agent {
             }
             if epistemic_uncertainty >= 0.55
                 && guided_model
-                && self.policy_config.tool_filter_enforce
+                && self.runtime.policy_config.tool_filter_enforce
             {
                 tool_defs = self.filter_tool_definitions_for_policy(
                     &base_tool_defs,

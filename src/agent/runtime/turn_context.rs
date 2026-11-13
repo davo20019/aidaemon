@@ -656,7 +656,8 @@ impl Agent {
         if msg.turn_id.is_some() {
             return msg.turn_id.clone();
         }
-        self.current_turn_ids
+        self.runtime
+            .current_turn_ids
             .read()
             .await
             .get(&msg.session_id)
@@ -672,6 +673,7 @@ impl Agent {
             return self.state.append_message(msg).await;
         }
         let turn_id = self
+            .runtime
             .current_turn_ids
             .read()
             .await

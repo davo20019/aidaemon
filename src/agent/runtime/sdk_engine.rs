@@ -738,6 +738,7 @@ impl Agent {
                 .map(|parent| parent.trusted_roots.as_slice()),
         });
         let turn_id = self
+            .runtime
             .current_turn_ids
             .read()
             .await
@@ -897,7 +898,7 @@ impl Agent {
                     memory_turn.clone(),
                     crate::agent::memory_plugin::WriterSettings {
                         progressive_facts: false,
-                        summarization: self.context_window_config.enabled,
+                        summarization: self.runtime.context_window_config.enabled,
                         learning: self.memory.is_daemons_own(),
                     },
                     self.transcript_writes.clone(),
@@ -1669,7 +1670,11 @@ impl Agent {
         for tool in &self.tools {
             let _ = tool.on_task_end(&task_id, session_id).await;
         }
-        self.current_turn_ids.write().await.remove(session_id);
+        self.runtime
+            .current_turn_ids
+            .write()
+            .await
+            .remove(session_id);
         reply
     }
 }

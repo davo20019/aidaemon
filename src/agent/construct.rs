@@ -207,6 +207,14 @@ impl Agent {
         let transcript_writes = daemon_memory.writes();
         let memory: Arc<dyn super::memory_plugin::MemoryPlugin> = Arc::new(daemon_memory);
         Self {
+            runtime: aidaemon_runtime::turn_runtime::TurnRuntime::new(
+                context_window_config,
+                policy_config,
+                vision_config,
+                audio_config,
+                stt_config,
+                record_decision_points,
+            ),
             llm_runtime,
             side_calls,
             state,
@@ -255,28 +263,18 @@ impl Agent {
             billing_failed_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             self_ref: RwLock::new(None),
             task_registry: std::sync::OnceLock::new(),
-            context_window_config,
-            policy_config,
             path_aliases,
             inbox_dir,
             inherited_project_scope,
             approval_session_id: None,
             inherited_authority: None,
             root_tools: None, // Root agent — its own tools ARE the root tools
-            record_decision_points,
-            current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             read_untrusted: Arc::default(),
             window_keep_from_tracker: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             #[cfg(test)]
             execution_budget_override: None,
             specialists,
-            core_prompts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            turn_renders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            turn_anchors: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             interactive_slot,
-            vision_config,
-            audio_config,
-            stt_config,
             harness_eval: Arc::new(RwLock::new(None)),
             harness_eval_config,
         }
@@ -292,17 +290,17 @@ impl Agent {
 
     #[cfg(test)]
     pub fn set_test_vision_config(&mut self, vision: VisionConfig) {
-        self.vision_config = vision;
+        self.runtime.vision_config = vision;
     }
 
     #[cfg(test)]
     pub fn set_test_audio_config(&mut self, audio: AudioConfig) {
-        self.audio_config = audio;
+        self.runtime.audio_config = audio;
     }
 
     #[cfg(test)]
     pub fn set_test_stt_config(&mut self, stt: SttConfig) {
-        self.stt_config = stt;
+        self.runtime.stt_config = stt;
     }
 
     #[cfg(test)]
@@ -348,7 +346,7 @@ impl Agent {
     /// Offer every authorized tool, whatever the policy profile would prune.
     #[cfg(test)]
     pub(crate) fn set_test_tool_filter_enforce(&mut self, enforce: bool) {
-        self.policy_config.tool_filter_enforce = enforce;
+        self.runtime.policy_config.tool_filter_enforce = enforce;
     }
 
     #[cfg(test)]
@@ -475,6 +473,14 @@ impl Agent {
         let transcript_writes = daemon_memory.writes();
         let memory: Arc<dyn super::memory_plugin::MemoryPlugin> = Arc::new(daemon_memory);
         Self {
+            runtime: aidaemon_runtime::turn_runtime::TurnRuntime::new(
+                context_window_config,
+                policy_config,
+                vision_config,
+                audio_config,
+                stt_config,
+                record_decision_points,
+            ),
             llm_runtime,
             side_calls,
             state,
@@ -523,30 +529,20 @@ impl Agent {
             billing_failed_models,
             self_ref: RwLock::new(None),
             task_registry: std::sync::OnceLock::new(),
-            context_window_config,
-            policy_config,
             path_aliases,
             inbox_dir,
             inherited_project_scope,
             approval_session_id,
             inherited_authority: None,
             root_tools,
-            record_decision_points,
-            current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             read_untrusted: Arc::default(),
             window_keep_from_tracker: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             #[cfg(test)]
             execution_budget_override: None,
             specialists,
-            core_prompts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            turn_renders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            turn_anchors: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             // Sub-agents never pin the interactive slot — only the root agent's
             // main generation loop does. They default to the background slot.
             interactive_slot: None,
-            vision_config,
-            audio_config,
-            stt_config,
             harness_eval: Arc::new(RwLock::new(None)),
             harness_eval_config,
         }

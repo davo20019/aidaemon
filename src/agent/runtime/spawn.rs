@@ -814,7 +814,7 @@ impl Agent {
         };
         let _ = self.state.log_task_activity(&activity).await;
 
-        if self.record_decision_points {
+        if self.runtime.record_decision_points {
             let emitter = crate::events::EventEmitter::new(
                 self.event_store.clone(),
                 child_session.to_string(),
@@ -1088,7 +1088,7 @@ impl Agent {
         };
         let _ = self.state.log_task_activity(&activity).await;
 
-        if self.record_decision_points {
+        if self.runtime.record_decision_points {
             let emitter = crate::events::EventEmitter::new(
                 self.event_store.clone(),
                 child_session.to_string(),
@@ -1403,18 +1403,18 @@ impl Agent {
             hub,
             self.schedule_approved_sessions.clone(),
             self.billing_failed_models.clone(),
-            self.record_decision_points,
-            self.context_window_config.clone(),
-            self.policy_config.clone(),
+            self.runtime.record_decision_points,
+            self.runtime.context_window_config.clone(),
+            self.runtime.policy_config.clone(),
             self.path_aliases.clone(),
             self.inbox_dir.clone(),
             inherited_project_scope,
             approval_session_id,
             root_tools,
             child_specialists,
-            self.vision_config.clone(),
-            self.audio_config.clone(),
-            self.stt_config.clone(),
+            self.runtime.vision_config.clone(),
+            self.runtime.audio_config.clone(),
+            self.runtime.stt_config.clone(),
             self.harness_eval_config.clone(),
         );
         #[cfg(test)]

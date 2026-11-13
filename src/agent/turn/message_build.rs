@@ -502,7 +502,7 @@ pub(super) async fn build_turn_messages(
     let render_options = agent.render_options(model);
 
     let total_context_budget =
-        crate::context_budget::model_context_budget(model, &agent.context_window_config);
+        crate::context_budget::model_context_budget(model, &agent.runtime.context_window_config);
     // Pillar A: the system payload is now message zero (core) PLUS the task
     // context tail. Both occupy budget, so reserve for the sum.
     let system_tokens = crate::context_budget::estimate_tokens(core_prompt)
@@ -534,7 +534,7 @@ pub(super) async fn build_turn_messages(
     //
     // This replaces the legacy fetch → age-collapse → sliding-window →
     // JSON-conversion stages. The archived region is whole-turn rendered (never
-    // partially trimmed), anchored at `agent.turn_anchors[session_id]`, and
+    // partially trimmed), anchored at `agent.runtime.turn_anchors[session_id]`, and
     // carried byte-stable across the within-task loop via the per-turn render
     // cache. Only the current turn is full/append-only.
     // ============================================================
@@ -558,14 +558,25 @@ pub(super) async fn build_turn_messages(
         ARCHIVED_BUDGET_SAFETY_MARGIN,
     );
 
-    let current_turn_id: Option<String> =
-        agent.current_turn_ids.read().await.get(session_id).cloned();
+    let current_turn_id: Option<String> = agent
+        .runtime
+        .current_turn_ids
+        .read()
+        .await
+        .get(session_id)
+        .cloned();
 
     // Step 1: anchor resolve. Read the per-session anchor; on cold start /
     // restart, initialize via the BOUNDED reverse-walk page (NEVER a
     // full-session `get_turns_from_anchor(.., 0)`).
     let anchor: i64 = {
-        let existing = agent.turn_anchors.read().await.get(session_id).copied();
+        let existing = agent
+            .runtime
+            .turn_anchors
+            .read()
+            .await
+            .get(session_id)
+            .copied();
         match existing {
             Some(a) => a,
             None => {
@@ -645,6 +656,7 @@ pub(super) async fn build_turn_messages(
                 }
                 let resolved = init_anchor.unwrap_or(0);
                 agent
+                    .runtime
                     .turn_anchors
                     .write()
                     .await
@@ -759,7 +771,7 @@ pub(super) async fn build_turn_messages(
             .first()
             .map(|turn| turn.turn_seq)
             .unwrap_or(current_turn.turn_seq);
-        let mut anchors = agent.turn_anchors.write().await;
+        let mut anchors = agent.runtime.turn_anchors.write().await;
         let anchor = anchors.entry(session_id.to_string()).or_insert(floor);
         *anchor = (*anchor).max(floor);
         info!(
@@ -799,7 +811,7 @@ pub(super) async fn build_turn_messages(
         // unnecessary reverse walk during this process lifetime. Subsequent
         // typed follow-ups may see this task thread, but cannot resurrect an
         // older unrelated task merely because there is room in the context.
-        let mut anchors = agent.turn_anchors.write().await;
+        let mut anchors = agent.runtime.turn_anchors.write().await;
         let anchor = anchors
             .entry(session_id.to_string())
             .or_insert(current_turn.turn_seq);
@@ -838,7 +850,7 @@ pub(super) async fn build_turn_messages(
     {
         // One read-lock snapshot of this session's render cache for the decision;
         // writes happen after the loop to avoid holding the lock across renders.
-        let prev_cache = agent.turn_renders.read().await;
+        let prev_cache = agent.runtime.turn_renders.read().await;
         let session_cache = prev_cache.get(session_id);
         for (turn_idx, turn) in turns.iter().enumerate() {
             let terminal_state = TerminalState::from_task_status(turn.terminal_status);
@@ -958,11 +970,11 @@ pub(super) async fn build_turn_messages(
         // Advance the anchor, drop evicted renders, and prune their cache entries.
         let evicted: Vec<ArchivedRender> = archived_renders.drain(..plan.evicted_count).collect();
         {
-            let mut anchors = agent.turn_anchors.write().await;
+            let mut anchors = agent.runtime.turn_anchors.write().await;
             anchors.insert(session_id.to_string(), plan.new_anchor_turn_seq);
         }
         {
-            let mut cache = agent.turn_renders.write().await;
+            let mut cache = agent.runtime.turn_renders.write().await;
             if let Some(session_cache) = cache.get_mut(session_id) {
                 for r in &evicted {
                     if let Some(tid) = r.turn_id.as_deref() {
@@ -990,7 +1002,7 @@ pub(super) async fn build_turn_messages(
     // Step 4 (storage): persist the kept archived renders into the cache and
     // emit per-turn hit/miss logging.
     {
-        let mut cache = agent.turn_renders.write().await;
+        let mut cache = agent.runtime.turn_renders.write().await;
         let session_cache = cache.entry(session_id.to_string()).or_default();
         for r in &archived_renders {
             if r.cache_hit {
@@ -1306,7 +1318,7 @@ pub(super) async fn build_turn_messages(
     // Archived turns are whole-turn-evicted upstream (spec invariant 3) and must
     // never be trimmed here — only the current turn (everything from the current
     // user message onward) is handed to `fit_messages_with_source_quotas`.
-    if agent.context_window_config.enabled {
+    if agent.runtime.context_window_config.enabled {
         // Reserve for BOTH message zero (core) and the task context tail.
         let system_tokens = crate::context_budget::estimate_tokens(core_prompt)
             + crate::context_budget::estimate_tokens(task_context_tail);
@@ -1314,16 +1326,18 @@ pub(super) async fn build_turn_messages(
             model,
             system_tokens,
             tool_defs,
-            &agent.context_window_config,
+            &agent.runtime.context_window_config,
         );
         let policy_budget = policy_bundle.policy.context_budget;
-        if agent.policy_config.policy_shadow_mode && !agent.policy_config.policy_enforce {
+        if agent.runtime.policy_config.policy_shadow_mode
+            && !agent.runtime.policy_config.policy_enforce
+        {
             info!(
                 session_id,
                 iteration, model_budget, policy_budget, "Context budget shadow comparison"
             );
         }
-        let effective_budget = if agent.policy_config.policy_enforce
+        let effective_budget = if agent.runtime.policy_config.policy_enforce
             && agent.trust_tier_for_model(model) == crate::agent::trust_tier::ModelTrustTier::Guided
         {
             // Never exceed the model's budget; policy config can be mis-set.
@@ -1564,7 +1578,7 @@ pub(super) async fn build_turn_messages(
 
     // Final enforcement must happen after every prompt component has been inserted.
     // Earlier trimming cannot account for execution checkpoints and one-shot directives.
-    if agent.context_window_config.enabled {
+    if agent.runtime.context_window_config.enabled {
         let message_tokens = crate::context_budget::estimate_multimodal_message_tokens(&messages);
         let final_tool_budget = total_context_budget.saturating_sub(
             message_tokens + RESPONSE_RESERVE_TOKENS + TOKEN_ESTIMATE_SAFETY_MARGIN,
@@ -2056,6 +2070,7 @@ mod tests {
     async fn set_current_turn(harness: &crate::testing::TestHarness, session: &str, turn_id: &str) {
         harness
             .agent
+            .runtime
             .current_turn_ids
             .write()
             .await
@@ -2677,6 +2692,7 @@ mod tests {
             .expect("test harness");
         harness
             .agent
+            .runtime
             .context_window_config
             .model_budgets
             .insert("gemma-4-26b".to_string(), 16_384);
@@ -2799,6 +2815,7 @@ mod tests {
             .expect("test harness");
         harness
             .agent
+            .runtime
             .context_window_config
             .model_budgets
             .insert("gemma-4-26b".to_string(), 16_384);
@@ -3444,7 +3461,7 @@ mod tests {
         );
 
         // After a restart the in-memory anchor is gone; the dialogue survives.
-        harness.agent.turn_anchors.write().await.clear();
+        harness.agent.runtime.turn_anchors.write().await.clear();
         let after_restart =
             build_payload_with_continuity(&harness, session, "How old are they?", 1, false).await;
         assert!(serde_json::to_string(&after_restart)
@@ -3548,6 +3565,7 @@ mod tests {
 
         let floor = harness
             .agent
+            .runtime
             .turn_anchors
             .read()
             .await
@@ -3564,7 +3582,7 @@ mod tests {
 
         // Simulate a daemon restart. The in-memory anchor disappears, while
         // the typed new-task floor must remain authoritative in SQLite.
-        harness.agent.turn_anchors.write().await.clear();
+        harness.agent.runtime.turn_anchors.write().await.clear();
 
         seed_turn(
             &store,
@@ -3876,7 +3894,7 @@ mod tests {
     async fn eviction_advances_anchor_and_evicts_whole_turns() {
         let mut harness = setup_test_agent(MockProvider::new()).await.unwrap();
         // Tiny model budget so archived_budget is small but positive.
-        harness.agent.context_window_config.default_budget = 5900;
+        harness.agent.runtime.context_window_config.default_budget = 5900;
         let store = seed_store(&harness).await;
         // Several archived turns with sizeable content so they exceed the budget.
         let big = "lots of detail ".repeat(20);
@@ -3904,9 +3922,23 @@ mod tests {
         .await;
         set_current_turn(&harness, "s5", "tcur").await;
 
-        let anchor_before = harness.agent.turn_anchors.read().await.get("s5").copied();
+        let anchor_before = harness
+            .agent
+            .runtime
+            .turn_anchors
+            .read()
+            .await
+            .get("s5")
+            .copied();
         let messages = build_payload(&harness, "s5", "current request", 1).await;
-        let anchor_after = harness.agent.turn_anchors.read().await.get("s5").copied();
+        let anchor_after = harness
+            .agent
+            .runtime
+            .turn_anchors
+            .read()
+            .await
+            .get("s5")
+            .copied();
 
         assert!(anchor_after.is_some(), "anchor recorded");
         assert!(
@@ -4116,7 +4148,7 @@ mod tests {
     #[tokio::test]
     async fn render_cache_prunes_evicted_turns() {
         let mut harness = setup_test_agent(MockProvider::new()).await.unwrap();
-        harness.agent.context_window_config.default_budget = 5900;
+        harness.agent.runtime.context_window_config.default_budget = 5900;
         let store = seed_store(&harness).await;
         let big = "detail ".repeat(20);
         for i in 1..=4 {
@@ -4144,7 +4176,7 @@ mod tests {
         set_current_turn(&harness, "s9", "tcur").await;
 
         let _ = build_payload(&harness, "s9", "current request", 1).await;
-        let cache = harness.agent.turn_renders.read().await;
+        let cache = harness.agent.runtime.turn_renders.read().await;
         let session_cache = cache.get("s9");
         // The oldest evicted turn ids must NOT remain cached (no unbounded growth).
         if let Some(sc) = session_cache {
@@ -4154,7 +4186,14 @@ mod tests {
             );
         }
         // Anchor advanced past t1.
-        let anchor = harness.agent.turn_anchors.read().await.get("s9").copied();
+        let anchor = harness
+            .agent
+            .runtime
+            .turn_anchors
+            .read()
+            .await
+            .get("s9")
+            .copied();
         assert!(anchor.is_some());
     }
 
@@ -4205,6 +4244,7 @@ mod tests {
         // Every emitted historical marker belongs to a turn whose turn_seq >= anchor.
         let anchor = harness
             .agent
+            .runtime
             .turn_anchors
             .read()
             .await
