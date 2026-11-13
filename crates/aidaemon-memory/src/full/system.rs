@@ -234,9 +234,11 @@ impl MemorySystem for FullMemory {
         hooks.extend(extra);
         // Only the owner's own turns teach the jobs.
         if let Some(recorder) = &self.recorder
-            && turn.write && turn.scope == "owner" {
-                hooks.push(recorder.clone());
-            }
+            && turn.write
+            && turn.scope == "owner"
+        {
+            hooks.push(recorder.clone());
+        }
         MemoryParts {
             hooks,
             tools: if turn.read || turn.write {

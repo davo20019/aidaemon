@@ -11,7 +11,7 @@
 
 use std::io::{BufRead, Write};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn send(out: &mut impl Write, message: &Value) {
     let _ = writeln!(out, "{message}");

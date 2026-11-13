@@ -300,9 +300,10 @@ impl<R: Recall> MemoryInjection<R> {
             .lock()
             .ok()
             .and_then(|c| c.get(session_id).cloned())
-            && cached_query == query {
-                return note;
-            }
+            && cached_query == query
+        {
+            return note;
+        }
         let note = self.recall.render(session_id, query, self.limit).await;
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(session_id.to_string(), (query.to_string(), note.clone()));
@@ -423,9 +424,11 @@ mod tests {
         assert_eq!(got[0], "Alice Rivera prefers window seats");
         assert!(got.contains(&"Acme Corp travel policy requires economy seats".to_string()));
         assert!(!got.iter().any(|s| s.contains("Jordan")));
-        assert!(recall
-            .recall("telegram:synthetic-user-1", "zzz", 5)
-            .await
-            .is_empty());
+        assert!(
+            recall
+                .recall("telegram:synthetic-user-1", "zzz", 5)
+                .await
+                .is_empty()
+        );
     }
 }

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use aidaemon_channels::conformance::{
-    channel_checks, check_channel, ChannelHarness, TestChannelHarness,
+    ChannelHarness, TestChannelHarness, channel_checks, check_channel,
 };
 use aidaemon_channels::testing::{self, TestChannel};
 use aidaemon_channels::{
@@ -86,17 +86,17 @@ impl ChannelHarness for StubbornHarness {
     }
     async fn inject_direct_message(&self, text: &str) {
         let m = testing::message(self.direct_conversation(), "test:synthetic-user-1", text);
-        self.0 .0.inject_message(m);
+        self.0.0.inject_message(m);
     }
     async fn inject_group_message(&self, text: &str, addressed: bool) {
         let mut m = testing::message(testing::group("group:acme"), "test:synthetic-user-1", text);
         m.addressed = addressed;
-        self.0 .0.inject_message(m);
+        self.0.0.inject_message(m);
     }
     async fn press_button(&self, _prompt: &ApprovalPrompt, _choice_id: &str) {}
     async fn sent_messages(&self) -> Vec<String> {
         self.0
-             .0
+            .0
             .sent()
             .into_iter()
             .map(|m| m.message.text)

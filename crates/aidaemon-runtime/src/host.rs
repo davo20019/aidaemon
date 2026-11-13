@@ -18,8 +18,8 @@
 //! - [`TurnHost`]: all of the above plus the agent's turn runtime and who
 //!   the agent is; the turn's handlers in this crate run on it.
 
-use aidaemon_events::stores::{DialogueStateStore, MessageStore};
 use aidaemon_events::EventStore;
+use aidaemon_events::stores::{DialogueStateStore, MessageStore};
 use aidaemon_tools::ExecutionBackend;
 
 /// The conversation's durable state: per-session dialogue state and the
@@ -127,7 +127,7 @@ pub trait TurnServices: Send + Sync {
     async fn plan_store(&self) -> Option<std::sync::Arc<aidaemon_work::plans::PlanStore>>;
     /// The available MCP tool named `name`, if a connected server offers it.
     async fn mcp_tool(&self, name: &str)
-        -> Option<std::sync::Arc<dyn aidaemon_tools::OutcomeTool>>;
+    -> Option<std::sync::Arc<dyn aidaemon_tools::OutcomeTool>>;
     /// The MCP tools `user_message` calls for (their servers' triggers).
     async fn mcp_tools_matching(
         &self,

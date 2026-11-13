@@ -6,7 +6,7 @@ use aidaemon_events::{
 };
 
 use super::scoring::{
-    build_scores, contract_is_fulfilled, weighted_tokens_from_raw, HarnessEvalConfig,
+    HarnessEvalConfig, build_scores, contract_is_fulfilled, weighted_tokens_from_raw,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

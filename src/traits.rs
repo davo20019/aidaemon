@@ -13,9 +13,9 @@ mod tools;
 
 #[allow(unused_imports)]
 pub use aidaemon_events::conversation::{
-    extract_primary_message_content, first_primary_message_line, infer_message_annotations,
-    message_content_is_structural_only, AttachmentProvenance, ConversationSummary, Message,
-    MessageAnnotation, MessageAttachment, ToolCall,
+    AttachmentProvenance, ConversationSummary, Message, MessageAnnotation, MessageAttachment,
+    ToolCall, extract_primary_message_content, first_primary_message_line,
+    infer_message_annotations, message_content_is_structural_only,
 };
 #[allow(unused_imports)]
 pub use aidaemon_events::dialogue::{
@@ -32,30 +32,31 @@ pub use aidaemon_events::provider::{
     ChatOptions, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord, ToolChoiceMode,
 };
 #[allow(unused_imports)]
-pub(crate) use aidaemon_work::goals::{task_execution_graph, ExpiredAttemptRecovery};
-#[allow(unused_imports)]
 pub use aidaemon_work::goals::{
-    BackgroundSpawn, Goal, GoalRun, GoalSchedule, GoalTokenBudgetStatus, HandoffArtifact,
-    NotificationEntry, ScheduledFailureKind, ScheduledRecoveryDisposition, ScheduledRecoveryState,
-    ScheduledRunHealth, ScheduledRunState, Task, TaskActivity, TaskAttempt, TaskAttemptPatch,
-    TaskHandoff, TaskJournalEntry, TaskWorkspace, WorkGoalSummary, WorkProject, WorkTaskSummary,
-    WorkerProfile, DEFAULT_PROJECT_ID, REMOTE_CHANGE_ACTIVITY,
+    BackgroundSpawn, DEFAULT_PROJECT_ID, Goal, GoalRun, GoalSchedule, GoalTokenBudgetStatus,
+    HandoffArtifact, NotificationEntry, REMOTE_CHANGE_ACTIVITY, ScheduledFailureKind,
+    ScheduledRecoveryDisposition, ScheduledRecoveryState, ScheduledRunHealth, ScheduledRunState,
+    Task, TaskActivity, TaskAttempt, TaskAttemptPatch, TaskHandoff, TaskJournalEntry,
+    TaskWorkspace, WorkGoalSummary, WorkProject, WorkTaskSummary, WorkerProfile,
 };
 #[allow(unused_imports)]
+pub(crate) use aidaemon_work::goals::{ExpiredAttemptRecovery, task_execution_graph};
+#[allow(unused_imports)]
 pub use aidaemon_work::mandates::{
-    mandate_owner_label, owner_question_excerpt, review_failure_is_notified, Intention,
-    IntentionStatus, Mandate, MandateActivityLevel, MandateAuthority, MandateAuthorityGrant,
-    MandateAutonomyMode, MandateDecisionCycle, MandateDecisionOrigin, MandateDecisionOutcome,
-    MandateFinalizationRejectReason, MandateFinalizationStaleReason, MandateLearningNote,
-    MandateMutationAttempt, MandateMutationAttemptStatus, MandateMutationDispatchClaim,
-    MandateMutationEvidence, MandateMutationQuotaBlockReason, MandateMutationQuotaState,
-    MandateMutationReservation, MandateMutationTarget, MandateObjectiveControl,
-    MandateObjectiveMeasurement, MandateOperatingUpdates, MandateOperationKind,
-    MandateOperationScope, MandateReconciliationReason, MandateReconciliationResolution,
-    MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunNotification,
-    MandateRunNotificationKind, MandateRunProofCounts, MandateStatus, MandateStrategySnapshot,
-    MandateSuspension, MandateSuspensionKind, MandateTerminationKind, MandateWakeSignal,
-    MandateWakeSignalKind, ObjectiveMetricDirection, SAFE_FALLBACK_WAIT_RATIONALE,
+    Intention, IntentionStatus, Mandate, MandateActivityLevel, MandateAuthority,
+    MandateAuthorityGrant, MandateAutonomyMode, MandateDecisionCycle, MandateDecisionOrigin,
+    MandateDecisionOutcome, MandateFinalizationRejectReason, MandateFinalizationStaleReason,
+    MandateLearningNote, MandateMutationAttempt, MandateMutationAttemptStatus,
+    MandateMutationDispatchClaim, MandateMutationEvidence, MandateMutationQuotaBlockReason,
+    MandateMutationQuotaState, MandateMutationReservation, MandateMutationTarget,
+    MandateObjectiveControl, MandateObjectiveMeasurement, MandateOperatingUpdates,
+    MandateOperationKind, MandateOperationScope, MandateReconciliationReason,
+    MandateReconciliationResolution, MandateRunFinalizationRequest, MandateRunFinalizationResult,
+    MandateRunNotification, MandateRunNotificationKind, MandateRunProofCounts, MandateStatus,
+    MandateStrategySnapshot, MandateSuspension, MandateSuspensionKind, MandateTerminationKind,
+    MandateWakeSignal, MandateWakeSignalKind, ObjectiveMetricDirection,
+    SAFE_FALLBACK_WAIT_RATIONALE, mandate_owner_label, owner_question_excerpt,
+    review_failure_is_notified,
 };
 #[cfg(test)]
 pub use channels::ChannelCapabilities;
@@ -83,11 +84,10 @@ pub use people::{Person, PersonFact};
 pub use tools::ToolCalls;
 #[allow(unused_imports)]
 pub use tools::{
-    default_call_annotations, prepare_invocation, semantics_for_exact_read_actions, status_sender,
-    with_status, AgentRole, ApprovalCall, ApprovalScope, AuthorizationPreflightRecord,
-    AuthorizationPreflightStatus, DurableReplayDecision, EvidenceAuthority, EvidencePurpose,
-    EvidenceTemporalScope, FileGuard, GoalContext, NetworkReach, OwnerApprovalNeed,
-    PreparedToolInvocation, ReadFileResultMetadata, ReadFileSelectionMetadata,
+    AgentRole, ApprovalCall, ApprovalScope, AuthorizationPreflightRecord,
+    AuthorizationPreflightStatus, DurableReplayDecision, EGRESS_EFFECTS, EvidenceAuthority,
+    EvidencePurpose, EvidenceTemporalScope, FileGuard, GoalContext, NetworkReach,
+    OwnerApprovalNeed, PreparedToolInvocation, ReadFileResultMetadata, ReadFileSelectionMetadata,
     RuntimePreparationFailure, SameToolStreak, ScopeEscalation, SpecialistKind,
     StableObservationSubject, Tool, ToolAccessDenial, ToolAccessEnforcement,
     ToolArgumentContractViolation, ToolCallAccessManifest, ToolCallContext, ToolCallEffect,
@@ -97,7 +97,8 @@ pub use tools::{
     ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness, ToolResultContentSource,
     ToolResultPresentation, ToolResultProvenance, ToolRole, ToolSemanticFacet, ToolSemanticScope,
     ToolSemantics, ToolStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
-    TruncationInfo, TrustRoots, EGRESS_EFFECTS,
+    TruncationInfo, TrustRoots, default_call_annotations, prepare_invocation,
+    semantics_for_exact_read_actions, status_sender, with_status,
 };
 
 mod state_store;

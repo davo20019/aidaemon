@@ -1,6 +1,6 @@
 use super::*;
 use crate::events::ToolOutcomeEvidenceSource;
-use crate::testing::{setup_test_agent, MockProvider};
+use crate::testing::{MockProvider, setup_test_agent};
 use crate::types::{ChannelContext, UserRole};
 use serde_json::json;
 

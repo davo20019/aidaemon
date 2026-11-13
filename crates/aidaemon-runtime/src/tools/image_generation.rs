@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Digest;
 use tokio::sync::mpsc;
 
@@ -22,14 +22,14 @@ use aidaemon_channels::attachments::{save_tool_observation_image, sniff_image_mi
 use aidaemon_events::payloads::{ResourceInvalidatedData, ResourceRegisteredData};
 use aidaemon_events::{Event, EventStore, EventType};
 use aidaemon_providers::chatgpt_login::{
-    self as chatgpt_codex, ChatGptCredentialManager, CODEX_BACKEND_BASE_URL,
+    self as chatgpt_codex, CODEX_BACKEND_BASE_URL, ChatGptCredentialManager,
 };
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::semantics::{
     ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolMutationEffects, ToolOutcomeStatus, ToolVerificationMode,
 };
 use aidaemon_tools::status::StatusUpdate;
-use aidaemon_tools::OutcomeTool as Tool;
 
 const CHATGPT_IMAGE_MODEL: &str = "gpt-image-2";
 const CHATGPT_IMAGE_BACKEND: &str = "chatgpt_subscription";
@@ -1052,10 +1052,12 @@ mod tests {
         let attachment = &outcome.metadata.attachments[0];
         assert_eq!(attachment.mime_type, "image/png");
         assert_eq!(attachment.source_tool.as_deref(), Some("generate_image"));
-        assert!(attachment
-            .resource_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with("res_")));
+        assert!(
+            attachment
+                .resource_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("res_"))
+        );
         assert_eq!(
             std::fs::read(&attachment.local_path).expect("read saved image"),
             [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
@@ -1265,10 +1267,12 @@ mod tests {
             Some(ToolOutcomeStatus::FailedPermanent)
         );
         assert!(outcome.output.contains("unknown, expired, or invalidated"));
-        assert!(captured
-            .lock()
-            .expect("read captured backend requests")
-            .is_empty());
+        assert!(
+            captured
+                .lock()
+                .expect("read captured backend requests")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1312,15 +1316,19 @@ mod tests {
             Some(ToolOutcomeStatus::FailedPermanent)
         );
         assert!(outcome.output.contains("changed after registration"));
-        assert!(store
-            .get_resource("slack:test", "res_changed")
-            .await
-            .expect("query invalidated resource")
-            .is_none());
-        assert!(captured
-            .lock()
-            .expect("read captured backend requests")
-            .is_empty());
+        assert!(
+            store
+                .get_resource("slack:test", "res_changed")
+                .await
+                .expect("query invalidated resource")
+                .is_none()
+        );
+        assert!(
+            captured
+                .lock()
+                .expect("read captured backend requests")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1393,13 +1401,17 @@ mod tests {
             outcome.metadata.outcome_status,
             Some(ToolOutcomeStatus::FailedPermanent)
         );
-        assert!(outcome
-            .output
-            .contains("no actual image resources were supplied"));
+        assert!(
+            outcome
+                .output
+                .contains("no actual image resources were supplied")
+        );
         assert!(outcome.output.contains("reference_image_resource_ids"));
-        assert!(captured
-            .lock()
-            .expect("read captured backend requests")
-            .is_empty());
+        assert!(
+            captured
+                .lock()
+                .expect("read captured backend requests")
+                .is_empty()
+        );
     }
 }

@@ -88,9 +88,11 @@ pub async fn current_version(pool: &SqlitePool) -> Result<i64, Error> {
 /// Bring the schema up to [`latest_version`]. Idempotent, safe to call from
 /// several processes at once, and refuses databases written by newer code.
 pub(crate) async fn run(pool: &SqlitePool) -> Result<(), Error> {
-    debug_assert!(MIGRATIONS
-        .windows(2)
-        .all(|w| w[1].version == w[0].version + 1));
+    debug_assert!(
+        MIGRATIONS
+            .windows(2)
+            .all(|w| w[1].version == w[0].version + 1)
+    );
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS schema_migrations (

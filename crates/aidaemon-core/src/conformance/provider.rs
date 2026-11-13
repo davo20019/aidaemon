@@ -6,7 +6,7 @@ use serde_json::json;
 use super::ConformanceReport;
 use crate::message::Message;
 use crate::provider::{
-    collect_stream, ModelRequest, ModelResponse, Provider, StreamEvent, ToolChoice, ToolSpec,
+    ModelRequest, ModelResponse, Provider, StreamEvent, ToolChoice, ToolSpec, collect_stream,
 };
 
 /// Stable names of the checks run by [`check_provider`]. Per-request checks
@@ -295,7 +295,7 @@ async fn drain(
                     return Err(format!(
                         "stream yielded an error after {} event(s): {e}",
                         events.len()
-                    ))
+                    ));
                 }
             }
         }
@@ -317,12 +317,12 @@ fn well_formed(events: &[StreamEvent]) -> Result<(Vec<String>, ModelResponse), S
         match (event, &done) {
             (StreamEvent::Switched(_), None) => {}
             (StreamEvent::Switched(_), Some(_)) => {
-                return Err(format!("event {i} is a Switched after Done"))
+                return Err(format!("event {i} is a Switched after Done"));
             }
             (StreamEvent::TextDelta(d), None) => deltas.push(d.clone()),
             (StreamEvent::Done(r), None) => done = Some(r.clone()),
             (StreamEvent::TextDelta(_), Some(_)) => {
-                return Err(format!("event {i} is a TextDelta after Done"))
+                return Err(format!("event {i} is a TextDelta after Done"));
             }
             (StreamEvent::Done(_), Some(_)) => return Err(format!("event {i} is a second Done")),
         }
@@ -340,7 +340,7 @@ fn well_formed(events: &[StreamEvent]) -> Result<(Vec<String>, ModelResponse), S
 mod tests {
     use super::*;
     use crate::provider::{ProviderError, Usage};
-    use crate::testing::{call, text, tool_calls, ScriptedProvider, StreamingProvider};
+    use crate::testing::{ScriptedProvider, StreamingProvider, call, text, tool_calls};
     use futures::stream::{self, BoxStream};
 
     #[tokio::test]

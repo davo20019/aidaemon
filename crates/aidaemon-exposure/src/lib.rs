@@ -267,12 +267,16 @@ mod tests {
         listeners
             .register(ExposedService::ClientGateway, local)
             .unwrap();
-        assert!(listeners
-            .register(ExposedService::NodeGateway, local)
-            .is_err());
-        assert!(listeners
-            .register(ExposedService::NodeGateway, "0.0.0.0:8787".parse().unwrap())
-            .is_err());
+        assert!(
+            listeners
+                .register(ExposedService::NodeGateway, local)
+                .is_err()
+        );
+        assert!(
+            listeners
+                .register(ExposedService::NodeGateway, "0.0.0.0:8787".parse().unwrap())
+                .is_err()
+        );
         listeners
             .register(
                 ExposedService::NodeGateway,

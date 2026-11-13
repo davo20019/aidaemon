@@ -2,8 +2,8 @@
 //! for a transcript that carries the whole conversation, [`SummaryNote`] for
 //! an app that already leaves summarized turns out of the transcript.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,8 +12,8 @@ use aidaemon_core::{Hook, HookContext, Message, ModelRequest, Role, RunId, RunOu
 use async_trait::async_trait;
 
 use super::{
-    wait_threshold, CompactionLimits, Compactor, ConversationSource, ConversationSummary,
-    ConversationTurn, PendingTurns, Summarizer, SummaryStore,
+    CompactionLimits, Compactor, ConversationSource, ConversationSummary, ConversationTurn,
+    PendingTurns, Summarizer, SummaryStore, wait_threshold,
 };
 use crate::context_window::estimate_tokens;
 use crate::insert_after_system;
@@ -631,8 +631,8 @@ mod tests {
     /// the summary instead of the oldest turns.
     #[tokio::test]
     async fn an_agent_conversation_ages_into_a_summary() {
-        use aidaemon_core::testing::{text, ScriptedProvider};
         use aidaemon_core::Agent;
+        use aidaemon_core::testing::{ScriptedProvider, text};
 
         let (summarizer, count) = counting(Duration::ZERO);
         let compaction = Arc::new(ConversationCompaction::new(
@@ -680,10 +680,11 @@ mod tests {
         compaction.drain().await;
         assert!(count.load(Ordering::SeqCst) > 0);
         let last = seen.lock().unwrap().last().cloned().unwrap();
-        assert!(last
-            .messages
-            .iter()
-            .any(|m| m.is_hook_note() && m.content.contains("[Compacted Conversation State]")));
+        assert!(
+            last.messages
+                .iter()
+                .any(|m| m.is_hook_note() && m.content.contains("[Compacted Conversation State]"))
+        );
         assert_eq!(last.messages.last().unwrap().content, "fourth");
     }
 

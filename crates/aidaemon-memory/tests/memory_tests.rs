@@ -90,11 +90,13 @@ async fn supersession_hides_old_values_but_keeps_history() {
         );
 
         assert!(memory.forget(SCOPE, "person", "daughters").await.unwrap());
-        assert!(memory
-            .recall_facts(SCOPE, "daughters Mia", 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            memory
+                .recall_facts(SCOPE, "daughters Mia", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(!memory.forget(SCOPE, "person", "daughters").await.unwrap());
         assert_eq!(
             memory
@@ -140,17 +142,21 @@ async fn relevant_fact_outranks_unrelated_and_noise_is_dropped() {
         assert!(hits[0].signals.semantic > 0.3, "{name}");
         assert!(hits[0].signals.lexical > 0.3, "{name}");
 
-        assert!(memory
-            .recall_facts(SCOPE, "zebra migration patterns", 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            memory
+                .recall_facts(SCOPE, "zebra migration patterns", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         // Scopes are hard boundaries.
-        assert!(memory
-            .recall_facts("telegram:synthetic-user-2", "favorite color", 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            memory
+                .recall_facts("telegram:synthetic-user-2", "favorite color", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
@@ -700,16 +706,20 @@ async fn a_store_without_access_levels_fails_closed() {
             .len(),
         1
     );
-    assert!(memory
-        .recall_facts_for(SCOPE, "home city", 5, &group("c1"))
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(memory
-        .recall_episodes_for(SCOPE, "Moved to Lisbon", 5, &group("c1"))
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        memory
+            .recall_facts_for(SCOPE, "home city", 5, &group("c1"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        memory
+            .recall_episodes_for(SCOPE, "Moved to Lisbon", 5, &group("c1"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// The tools and injected recall use the session's audience, and a restricted
@@ -773,16 +783,18 @@ async fn tools_and_injection_follow_the_session_audience() {
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].fact.value, "Porto");
-    assert!(memory
-        .recall_facts_for(SCOPE, "home city", 5, &group("c2"))
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        memory
+            .recall_facts_for(SCOPE, "home city", 5, &group("c2"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
 async fn sqlite_v1_database_upgrades_and_keeps_its_rows() {
-    use aidaemon_memory::{encode_embedding, latest_version, MIGRATIONS};
+    use aidaemon_memory::{MIGRATIONS, encode_embedding, latest_version};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     let dir = tempfile::tempdir().unwrap();
@@ -903,11 +915,13 @@ async fn sqlite_v1_database_upgrades_and_keeps_its_rows() {
     let owner = memory.recall_facts(SCOPE, "home city", 5).await.unwrap();
     assert_eq!(owner.len(), 1, "the owner keeps seeing old rows");
     assert_eq!(owner[0].signals.semantic, 0.0, "vectors of another model");
-    assert!(memory
-        .recall_facts_for(SCOPE, "home city", 5, &group("c1"))
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        memory
+            .recall_facts_for(SCOPE, "home city", 5, &group("c1"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         memory
             .recall_episodes(SCOPE, "Moved Lisbon", 5)

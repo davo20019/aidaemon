@@ -318,9 +318,10 @@ impl McpRegistry {
 
         // Restore the db_id
         if let Some(id) = db_id
-            && let Some(entry) = self.servers.write().await.get_mut(name) {
-                entry.db_id = Some(id);
-            }
+            && let Some(entry) = self.servers.write().await.get_mut(name)
+        {
+            entry.db_id = Some(id);
+        }
 
         Ok(tool_names)
     }

@@ -11,17 +11,17 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aidaemon_core::{
-    collect_stream, Message, ModelRequest, ModelResponse, Provider, ProviderError, ResponseFormat,
-    Role, StreamEvent, ToolCall, ToolChoice, ToolSpec, Usage,
+    Message, ModelRequest, ModelResponse, Provider, ProviderError, ResponseFormat, Role,
+    StreamEvent, ToolCall, ToolChoice, ToolSpec, Usage, collect_stream,
 };
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::sse::SseEvent;
 use crate::transport::{
-    body_excerpt, build_client, drive_response, map_reqwest_error, map_status, parse_arguments,
-    raw_arguments, ConfigError, SseDecoder,
+    ConfigError, SseDecoder, body_excerpt, build_client, drive_response, map_reqwest_error,
+    map_status, parse_arguments, raw_arguments,
 };
 
 /// The Codex backend root.
@@ -326,10 +326,11 @@ fn chatgpt_error(
     body: &str,
 ) -> ProviderError {
     if status.as_u16() == 429
-        && let Some(error) = plan_limit(headers, body, SystemTime::now()) {
-            tracing::warn!(%error, "ChatGPT plan limit");
-            return error;
-        }
+        && let Some(error) = plan_limit(headers, body, SystemTime::now())
+    {
+        tracing::warn!(%error, "ChatGPT plan limit");
+        return error;
+    }
     map_status(status, headers, body)
 }
 
@@ -882,10 +883,12 @@ mod tests {
         let image = Image::base64("image/png", "AQID");
         let (_, input) = build_input(&[Message::user("what is this").with_images(vec![image])]);
         assert_eq!(input[0]["content"][1]["type"], "input_image");
-        assert!(input[0]["content"][1]["image_url"]
-            .as_str()
-            .unwrap()
-            .starts_with("data:image/png;base64,"));
+        assert!(
+            input[0]["content"][1]["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
     }
 
     #[test]
@@ -916,9 +919,11 @@ mod tests {
             build_body(&req, Some("high"))["reasoning"]["effort"],
             "none"
         );
-        assert!(build_body(&request(vec![]), None)
-            .get("reasoning")
-            .is_none());
+        assert!(
+            build_body(&request(vec![]), None)
+                .get("reasoning")
+                .is_none()
+        );
     }
 
     #[test]
@@ -965,10 +970,12 @@ mod tests {
         req.messages[0] = Message::system("sys 12:02");
         let second = build_body(&req, None);
         assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
-        assert!(!first["prompt_cache_key"]
-            .as_str()
-            .unwrap()
-            .contains("synthetic-user-1"));
+        assert!(
+            !first["prompt_cache_key"]
+                .as_str()
+                .unwrap()
+                .contains("synthetic-user-1")
+        );
     }
 
     /// The reasoning that led to a tool call goes back just before that call,

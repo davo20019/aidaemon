@@ -7,10 +7,10 @@ use std::time::Duration;
 use aidaemon_core::{Tool, ToolContext, ToolResult, ToolSpec};
 use aidaemon_policies::{MemoryParts, MemorySystem, MemoryTurn};
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::{MemoryPlugin, SystemMemory, DAEMON_MEMORY_TOOLS};
-use crate::testing::{setup_test_agent, MockProvider};
+use super::{DAEMON_MEMORY_TOOLS, MemoryPlugin, SystemMemory};
+use crate::testing::{MockProvider, setup_test_agent};
 use crate::types::{ChannelContext, UserRole};
 
 type Journal = Arc<Mutex<Vec<String>>>;

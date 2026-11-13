@@ -10,8 +10,8 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::{
-    validate_https_origin, ExposedService, ExposureAdapter, ExposureHealth, OriginStability,
-    ServiceListeners,
+    ExposedService, ExposureAdapter, ExposureHealth, OriginStability, ServiceListeners,
+    validate_https_origin,
 };
 
 /// Restart delays: `initial`, doubling up to `max`, back to `initial` once an
@@ -317,7 +317,7 @@ impl Runner {
                 return Ended::Failed {
                     reason: error.to_string(),
                     up_for: Duration::ZERO,
-                }
+                };
             }
         };
         let mut rx = handle.watch();

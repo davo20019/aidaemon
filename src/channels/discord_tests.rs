@@ -10,7 +10,7 @@ use aidaemon_channels::{
     ApprovalAnswer, ChannelEvent, CommandInvocation, Conversation, ConversationKind,
     InboundMessage, Sender,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
@@ -18,7 +18,7 @@ use super::*;
 use crate::channels::ChannelRuntimeDeps;
 use crate::runtime_ports::DaemonAgentRuntime;
 use crate::tasks::TaskRegistry;
-use crate::testing::{setup_test_agent, MockProvider};
+use crate::testing::{MockProvider, setup_test_agent};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::HubChannel;
 use crate::types::ApprovalResponse;
@@ -61,9 +61,10 @@ async fn serve(
                 break;
             }
             if let Some((key, value)) = header.split_once(':')
-                && key.eq_ignore_ascii_case("content-length") {
-                    length = value.trim().parse().unwrap_or(0);
-                }
+                && key.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap_or(0);
+            }
         }
         let mut body = vec![0u8; length];
         if reader.read_exact(&mut body).await.is_err() {

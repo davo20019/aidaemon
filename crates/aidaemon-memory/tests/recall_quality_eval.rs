@@ -35,7 +35,7 @@ use aidaemon_memory::records::{
     PersonalEntityCandidate, PersonalFactCandidate, PersonalMemoryWrite,
 };
 use aidaemon_memory::retrieval_eval::evaluate_ranked;
-use aidaemon_memory::sqlite::{migrate, Reranker, SqliteMemory};
+use aidaemon_memory::sqlite::{Reranker, SqliteMemory, migrate};
 use aidaemon_memory::stores::FactStore;
 use aidaemon_memory::{FactPrivacy, FastEmbedder};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};

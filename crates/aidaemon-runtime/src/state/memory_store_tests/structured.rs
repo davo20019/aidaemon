@@ -336,9 +336,11 @@ async fn direct_correction_supersedes_legacy_and_retrieval_prefers_active() {
         .unwrap();
     assert_eq!(active, "1988-02-04");
     assert_eq!(superseded, 1);
-    assert!(recalled
-        .iter()
-        .any(|fact| { fact.source.starts_with("canonical:") && fact.value == "February 4 1988" }));
+    assert!(
+        recalled.iter().any(|fact| {
+            fact.source.starts_with("canonical:") && fact.value == "February 4 1988"
+        })
+    );
     assert!(!recalled.iter().any(|fact| fact.value == "1991-03-06"));
 }
 
@@ -743,9 +745,11 @@ async fn forgetting_a_profile_key_retracts_the_canonical_record() {
     let (_dir, store) = store().await;
     write(&store, &owner("residence", "Springfield")).await;
     write(&store, &owner("birthplace", "Shelbyville")).await;
-    assert!(canonical(&store)
-        .await
-        .contains(&"residence=Springfield".to_string()));
+    assert!(
+        canonical(&store)
+            .await
+            .contains(&"residence=Springfield".to_string())
+    );
 
     // remember_fact's delete path: no legacy row exists, the canonical one does.
     assert!(store.delete_fact_by_key("user", "residence").await.unwrap());
@@ -919,10 +923,12 @@ async fn changing_or_forgetting_a_fact_ends_its_copies() {
         .await
         .unwrap();
     assert!(store.delete_fact_by_key("user", "office").await.unwrap());
-    assert!(!store
-        .get_facts(None)
-        .await
-        .unwrap()
-        .iter()
-        .any(|f| f.value == "Building 9"));
+    assert!(
+        !store
+            .get_facts(None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|f| f.value == "Building 9")
+    );
 }

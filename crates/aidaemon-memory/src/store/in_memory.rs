@@ -4,12 +4,12 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use super::{related_fact_scores, MemoryStore};
+use super::{MemoryStore, related_fact_scores};
 use crate::error::{MemoryError, Result};
 use crate::types::{
-    new_id, normalize_category, normalize_key, same_value, DecayReport, Episode, EpisodeRecord,
-    Fact, FactAccess, FactRecord, MemoryStats, NewEpisode, NewFact, RecordKind, RetentionConfig,
-    StaleEmbedding, StoredEmbedding, UpsertOutcome,
+    DecayReport, Episode, EpisodeRecord, Fact, FactAccess, FactRecord, MemoryStats, NewEpisode,
+    NewFact, RecordKind, RetentionConfig, StaleEmbedding, StoredEmbedding, UpsertOutcome, new_id,
+    normalize_category, normalize_key, same_value,
 };
 
 #[derive(Default)]

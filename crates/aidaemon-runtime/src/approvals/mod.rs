@@ -18,20 +18,20 @@ use std::time::Duration;
 use aidaemon_core as sdk;
 use aidaemon_policies::{ApprovalRules, RuleDecision, SessionGrants};
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use aidaemon_channels::hub::ApprovalRequest;
 use aidaemon_events::{DecisionType, EventEmitter};
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
 use aidaemon_tools::semantics::{
     ApprovalCall, ApprovalKind, ApprovalResponse, OwnerApprovalNeed, ScopeEscalation,
     ToolCallContext, UserRole,
 };
-use aidaemon_tools::OutcomeTool as Tool;
 
 use crate::host::DecisionRecorder;
-use crate::turn::tool_dispatch::{access_manifest_scope_check, names_sensitive_path, ScopeCheck};
+use crate::turn::tool_dispatch::{ScopeCheck, access_manifest_scope_check, names_sensitive_path};
 use crate::untrusted::UntrustedVerifier;
 
 pub mod broker;
@@ -300,9 +300,9 @@ impl TerminalApprovals {
     pub fn with_canonicalizer(
         mut self,
         canonicalize: impl Fn(sdk::RunId, &str, &serde_json::Value) -> JudgedTerminal
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
         judged: JudgedCalls,
     ) -> Self {
         self.canonicalize = Some(Arc::new(canonicalize));
@@ -550,9 +550,9 @@ impl ApprovalRules for AppApprovalRules {
             .await;
         if !matches!(need, OwnerApprovalNeed::Ask(_))
             && let Some(request) = self.write_outside_guess_request(tool.as_ref(), &call.arguments)
-            {
-                return RuleDecision::Ask(request);
-            }
+        {
+            return RuleDecision::Ask(request);
+        }
         rule_decision(need)
     }
 }
@@ -1526,9 +1526,11 @@ mod tests {
         );
         match rules.judge(&hook_ctx(), &call, &tool_info()).await {
             RuleDecision::Ask(request) => {
-                assert!(request
-                    .summary
-                    .contains("/tmp/synthetic-real/app/settings.php"));
+                assert!(
+                    request
+                        .summary
+                        .contains("/tmp/synthetic-real/app/settings.php")
+                );
                 assert!(request.summary.contains("/tmp/synthetic-guess"));
                 assert_eq!(
                     request.subject,

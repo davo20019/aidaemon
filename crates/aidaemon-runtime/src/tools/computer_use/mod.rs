@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::settings::{ComputerUseConfig, VisionConfig};
 use crate::tools::traits::{
@@ -39,10 +39,10 @@ use cache::SnapshotCache;
 use capability::pick_capable_model;
 use harness::{ComputerHarness, HarnessRequestContext};
 use pin_registry::ComputerUsePinRegistry;
-use policy::{classify_target, is_prohibited_bundle, ActionClass, ComputerActionKind};
+use policy::{ActionClass, ComputerActionKind, classify_target, is_prohibited_bundle};
 use telemetry::{ActionLog, ActionRecord, ElementTarget, MutationBudget, SessionTelemetry};
 use types::{
-    format_condensed_refresh, format_full_tree, AppSnapshot, ElementBounds, IndexedElement,
+    AppSnapshot, ElementBounds, IndexedElement, format_condensed_refresh, format_full_tree,
 };
 
 const TOOL_NAME: &str = "computer_use";
@@ -185,8 +185,7 @@ fn bounds_match(a: Option<ElementBounds>, b: Option<ElementBounds>) -> bool {
 /// observed derailment was the model *narrating* its next click as a code
 /// comment via edit_file (and grepping saved result files) instead of emitting
 /// the actual call — this reminds it that only a computer_use call does anything.
-const GUI_TASK_ANCHOR: &str =
-    "\n[NEXT] You are operating an app through computer_use. Do the next \
+const GUI_TASK_ANCHOR: &str = "\n[NEXT] You are operating an app through computer_use. Do the next \
 step by emitting a computer_use tool call NOW — prefer targeting by element_title (with occurrence \
 for repeats), e.g. click element_title=\"Like\". Do NOT write/edit files, run terminal or grep on \
 saved results, or describe the action in a comment: only a computer_use call changes anything on \
@@ -379,9 +378,10 @@ impl ComputerUseTool {
 
     fn parse_model_chain(facts: &ToolCallContext, current_model: &str) -> Vec<String> {
         if let Some(chain) = facts.model_chain.as_ref()
-            && !chain.is_empty() {
-                return chain.clone();
-            }
+            && !chain.is_empty()
+        {
+            return chain.clone();
+        }
         vec![current_model.to_string()]
     }
 
@@ -514,31 +514,32 @@ impl ComputerUseTool {
         let text = Self::apply_lock_banner(text, self.harness.screen_is_locked());
         let mut metadata = ToolCallMetadata::default();
         if let Some(snapshot) = snapshot
-            && !snapshot.png.is_empty() {
-                let attachment = save_tool_observation_image(
-                    &self.inbox_dir,
-                    &snapshot.png,
-                    "screenshot.png",
-                    "image/png",
-                    TOOL_NAME,
-                )
-                .map_err(|e| format!("Screenshot captured but failed to save: {e}"))?;
-                metadata.attachments.push(attachment);
+            && !snapshot.png.is_empty()
+        {
+            let attachment = save_tool_observation_image(
+                &self.inbox_dir,
+                &snapshot.png,
+                "screenshot.png",
+                "image/png",
+                TOOL_NAME,
+            )
+            .map_err(|e| format!("Screenshot captured but failed to save: {e}"))?;
+            metadata.attachments.push(attachment);
 
-                if self.config.mirror_screenshots_to_channel {
-                    let _ = self
-                        .media_tx
-                        .send(MediaMessage {
-                            session_id: session_id.to_string(),
-                            kind: MediaKind::Photo {
-                                data: snapshot.png.clone(),
-                            },
-                            caption: format!("Screenshot of {}", snapshot.app_name),
-                            result_tx: None,
-                        })
-                        .await;
-                }
+            if self.config.mirror_screenshots_to_channel {
+                let _ = self
+                    .media_tx
+                    .send(MediaMessage {
+                        session_id: session_id.to_string(),
+                        kind: MediaKind::Photo {
+                            data: snapshot.png.clone(),
+                        },
+                        caption: format!("Screenshot of {}", snapshot.app_name),
+                        result_tx: None,
+                    })
+                    .await;
             }
+        }
         Ok(ToolCallOutcome {
             output: format!("{text}{GUI_TASK_ANCHOR}"),
             metadata,
@@ -1574,17 +1575,20 @@ impl Tool for ComputerUseTool {
 
         let mut element_target = pending.element_target;
         if element_target.index.is_none()
-            && let Some(index) = optional_u32(&args, "element_index") {
-                element_target.index = Some(index);
-            }
-        if element_target.title.is_none() && !app.is_empty()
+            && let Some(index) = optional_u32(&args, "element_index")
+        {
+            element_target.index = Some(index);
+        }
+        if element_target.title.is_none()
+            && !app.is_empty()
             && let Ok(ctx) = Self::parse_context(&facts)
-                && let Ok(bundle_id) = self.resolve_bundle_id(app).await {
-                    let resolved = self.resolve_element_target(&args, &ctx, &bundle_id).await;
-                    if resolved.title.is_some() || resolved.role.is_some() {
-                        element_target = resolved;
-                    }
-                }
+            && let Ok(bundle_id) = self.resolve_bundle_id(app).await
+        {
+            let resolved = self.resolve_element_target(&args, &ctx, &bundle_id).await;
+            if resolved.title.is_some() || resolved.role.is_some() {
+                element_target = resolved;
+            }
+        }
 
         let click_method = pending.click_method.as_deref();
         let mut budget = pending.mutation_budget;

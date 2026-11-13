@@ -29,9 +29,9 @@ pub(crate) mod traits {
         HistoryCoverage, HistoryMessage, HistoryScope, HistoryToolActivity, TaskBookends,
     };
     pub use aidaemon_memory::stores::{FactStore, HistorySearchStore};
+    pub use aidaemon_tools::OutcomeTool as Tool;
     pub use aidaemon_tools::semantics::*;
     pub use aidaemon_tools::services::{DynamicCliAgent, DynamicCliAgentStore};
-    pub use aidaemon_tools::OutcomeTool as Tool;
     pub use aidaemon_work::stores::{GoalStore, NotificationStore};
     pub use aidaemon_work::traits::*;
 }

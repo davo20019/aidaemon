@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
 use aidaemon_core::{
     AccessManifest, Agent, AgentBuilder, Event, Hook, ReceiptStatus, Resolution, Role, RunStatus,
     Tool, ToolAnnotations, ToolContext, ToolOutput, ToolResult, ToolSpec,
@@ -12,7 +12,7 @@ use aidaemon_policies::{
     ProjectInstructions, Redactor, ScopeGuard, TracingSink, UntrustedOutput,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------- test tools ----------
 
@@ -80,10 +80,12 @@ impl Tool for Shell {
     }
     fn access(&self, arguments: &Value) -> AccessManifest {
         AccessManifest {
-            commands: vec![arguments["command"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()],
+            commands: vec![
+                arguments["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ],
             ..AccessManifest::default()
         }
     }
@@ -273,15 +275,18 @@ async fn project_instructions_are_injected_per_request_not_stored() {
     for request in provider.requests() {
         assert_eq!(request.messages[0].content, "You are a careful assistant.");
         assert_eq!(request.messages[1].role, Role::System);
-        assert!(request.messages[1]
-            .content
-            .contains("Run cargo fmt before finishing."));
+        assert!(
+            request.messages[1]
+                .content
+                .contains("Run cargo fmt before finishing.")
+        );
     }
-    assert!(!out
-        .state
-        .messages
-        .iter()
-        .any(|m| m.content.contains("Run cargo fmt")));
+    assert!(
+        !out.state
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Run cargo fmt"))
+    );
 }
 
 /// A log reader whose files each end by naming the next one.
@@ -432,9 +437,10 @@ async fn memory_injection_adds_a_note_once_per_user_message() {
     for request in provider.requests() {
         let note = &request.messages[1];
         assert_eq!(note.role, Role::System);
-        assert!(note
-            .content
-            .contains("Alice Rivera prefers morning meetings"));
+        assert!(
+            note.content
+                .contains("Alice Rivera prefers morning meetings")
+        );
     }
     assert_eq!(memory.backend().query_count(), 1, "cached across turns");
     assert!(!out.state.messages.iter().any(|m| m.role == Role::System));
@@ -467,10 +473,12 @@ async fn custom_recall_render_replaces_the_default_note() {
         requests[0].messages[1].content,
         "## Known Facts\n- Mia likes chess"
     );
-    assert!(!requests[1]
-        .messages
-        .iter()
-        .any(|m| m.content.contains("Known Facts") || m.content.contains("Recalled memory")));
+    assert!(
+        !requests[1]
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Known Facts") || m.content.contains("Recalled memory"))
+    );
 }
 
 #[tokio::test]
@@ -486,9 +494,11 @@ async fn default_recall_render_keeps_the_snippet_note() {
          helps with the current request, and prefer what the user says now.]\n- Alice Rivera \
          prefers morning meetings"
     );
-    assert!(aidaemon_policies::Recall::render(&recall, "s", "zzz", 5)
-        .await
-        .is_none());
+    assert!(
+        aidaemon_policies::Recall::render(&recall, "s", "zzz", 5)
+            .await
+            .is_none()
+    );
 }
 
 // ---------- tracing ----------
@@ -683,8 +693,10 @@ async fn policies_compose_in_one_agent_run() {
         Some("I could not finish: the cleanup command failed with exit status 1.")
     );
     for request in provider.requests() {
-        assert!(request.messages[1]
-            .content
-            .contains("Never touch generated files."));
+        assert!(
+            request.messages[1]
+                .content
+                .contains("Never touch generated files.")
+        );
     }
 }

@@ -85,11 +85,11 @@ fn cheap_first(router: Option<&Router>, mut models: Vec<String>) -> Vec<String> 
         router
             .select(aidaemon_providers::routing::Tier::Fast)
             .to_string()
-    })
-        && let Some(index) = models.iter().position(|model| *model == fast) {
-            let fast = models.remove(index);
-            models.insert(0, fast);
-        }
+    }) && let Some(index) = models.iter().position(|model| *model == fast)
+    {
+        let fast = models.remove(index);
+        models.insert(0, fast);
+    }
     models
 }
 
@@ -470,7 +470,7 @@ impl aidaemon_core::Provider for ModelRoutedBackend {
 mod tests {
     use super::*;
     use crate::chat_bridge::ChatJson;
-    use aidaemon_core::testing::{text, ScriptedProvider};
+    use aidaemon_core::testing::{ScriptedProvider, text};
 
     /// One call on the background chain, starting at `model`.
     async fn background_chat(

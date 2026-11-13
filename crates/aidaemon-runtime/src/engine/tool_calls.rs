@@ -84,10 +84,10 @@ pub fn grant_own_spill_reads(
         if let Some(hint) = aidaemon_tools::semantics::ToolTargetHint::new(
             aidaemon_tools::semantics::ToolTargetHintKind::ProjectScope,
             path,
-        )
-            && !manifest.adapter_read_targets.contains(&hint) {
-                manifest.adapter_read_targets.push(hint);
-            }
+        ) && !manifest.adapter_read_targets.contains(&hint)
+        {
+            manifest.adapter_read_targets.push(hint);
+        }
     }
 }
 
@@ -130,25 +130,27 @@ pub fn canonicalize_call(
     let mut call = CanonicalCall::stripped(tool, raw);
     let mut known = facts.known_project_dir.map(str::to_string);
     if !facts.workspace_grant
-        && let Ok(text) = serde_json::to_string(&call.arguments) {
-            if let Some(explicit) =
-                crate::turn::project_dir::project_dir_from_tool_args(facts.backend, name, &text)
-            {
-                known = Some(explicit.clone());
-                call.explicit_dir = Some(explicit);
-            }
-            if let Some((updated, injected)) =
-                crate::turn::project_dir::maybe_inject_project_dir_into_tool_args(
-                    facts.backend,
-                    name,
-                    &text,
-                    known.as_deref(),
-                )
-                && let Ok(updated) = serde_json::from_str(&updated) {
-                    call.arguments = updated;
-                    call.injected_dir = Some(injected);
-                }
+        && let Ok(text) = serde_json::to_string(&call.arguments)
+    {
+        if let Some(explicit) =
+            crate::turn::project_dir::project_dir_from_tool_args(facts.backend, name, &text)
+        {
+            known = Some(explicit.clone());
+            call.explicit_dir = Some(explicit);
         }
+        if let Some((updated, injected)) =
+            crate::turn::project_dir::maybe_inject_project_dir_into_tool_args(
+                facts.backend,
+                name,
+                &text,
+                known.as_deref(),
+            )
+            && let Ok(updated) = serde_json::from_str(&updated)
+        {
+            call.arguments = updated;
+            call.injected_dir = Some(injected);
+        }
+    }
     if terminal {
         call.stripped_read_roots = crate::turn::tool_dispatch::attenuate_unauthorized_read_roots(
             &mut call.arguments,
@@ -256,9 +258,10 @@ impl sdk::Hook for CanonicalCallHook {
         );
         if recorded.is_none() {
             if let Some(explicit) = &canonical.explicit_dir
-                && let Ok(mut known) = self.known_project_dir.lock() {
-                    *known = Some(explicit.clone());
-                }
+                && let Ok(mut known) = self.known_project_dir.lock()
+            {
+                *known = Some(explicit.clone());
+            }
             if !canonical.stripped_read_roots.is_empty() {
                 info!(
                     tool = %call.name,

@@ -106,9 +106,11 @@ mod tests {
             .await
             .expect("setup test agent");
         let (mandate, run) = install_due_mandate_root(&mut harness).await;
-        assert!(committed_non_action_mandate_summary(&harness.agent)
-            .await
-            .is_none());
+        assert!(
+            committed_non_action_mandate_summary(&harness.agent)
+                .await
+                .is_none()
+        );
 
         let fallback = crate::traits::MandateDecisionCycle::runtime_fallback_wait(
             &mandate,
@@ -138,9 +140,11 @@ mod tests {
             stored.origin,
             crate::traits::MandateDecisionOrigin::RuntimeFallback
         );
-        assert!(committed_non_action_mandate_summary(&harness.agent)
-            .await
-            .is_none());
+        assert!(
+            committed_non_action_mandate_summary(&harness.agent)
+                .await
+                .is_none()
+        );
     }
 
     #[test]

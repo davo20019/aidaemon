@@ -74,9 +74,10 @@ impl Authority {
     /// The error is the reason, as short text.
     pub fn permits(&self, tool: &str, annotations: ToolAnnotations) -> Result<(), String> {
         if let Some(tools) = &self.tools
-            && !tools.contains(tool) {
-                return Err("tool not available".into());
-            }
+            && !tools.contains(tool)
+        {
+            return Err("tool not available".into());
+        }
         if self.level == AccessLevel::ReadOnly && !annotations.read_only {
             return Err("read-only".into());
         }
@@ -174,17 +175,18 @@ impl Hook for AuthorityHook {
         tool: &ToolInfo,
     ) -> ToolDecision {
         if self.delegated
-            && let Err(reason) = self.authority.permits(&call.name, tool.annotations) {
-                return ToolDecision::Deny {
-                    reason: format!(
-                        "{AUTHORITY_BLOCKED} `{}` is outside the access this sub-agent was \
+            && let Err(reason) = self.authority.permits(&call.name, tool.annotations)
+        {
+            return ToolDecision::Deny {
+                reason: format!(
+                    "{AUTHORITY_BLOCKED} `{}` is outside the access this sub-agent was \
                          given ({reason}). Use a permitted tool or report the limitation: the \
                          agent that started this one chose that access, and only it can start \
                          a sub-agent with more (never more than its own).",
-                        call.name
-                    ),
-                };
-            }
+                    call.name
+                ),
+            };
+        }
         let narrowed = match &self.ceiling {
             Some(ceiling) => ceiling.ceiling().await.map(|c| self.authority.narrow(&c)),
             None => None,
@@ -218,10 +220,10 @@ impl Hook for AuthorityHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{call, spec, text, tool_calls, ScriptedProvider};
+    use crate::testing::{ScriptedProvider, call, spec, text, tool_calls};
     use crate::tool::{FnTool, Tool, ToolContext, ToolOutput, ToolResult};
     use crate::{Agent, ReceiptStatus};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|s| s.to_string()).collect()

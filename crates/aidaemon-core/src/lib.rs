@@ -50,9 +50,9 @@ pub mod testing;
 
 pub use agent::{Agent, AgentBuilder, InterruptResolver, Resolution};
 pub use approval::{
-    ApprovalCard, ApprovalRisk, AskReason, CallEffects, CardAction, EffectClass, EffectKey,
-    HighImpact, InterruptKind, OwnerApprovalRequest, SharedDeclines, AUTHORITY_BLOCKED,
-    EGRESS_BLOCKED, OWNER_DECLINED, OWNER_UNANSWERED, UNTRUSTED_BLOCKED,
+    AUTHORITY_BLOCKED, ApprovalCard, ApprovalRisk, AskReason, CallEffects, CardAction,
+    EGRESS_BLOCKED, EffectClass, EffectKey, HighImpact, InterruptKind, OWNER_DECLINED,
+    OWNER_UNANSWERED, OwnerApprovalRequest, SharedDeclines, UNTRUSTED_BLOCKED,
 };
 pub use audience::{ChannelVisibility, UserRole};
 pub use authority::{AccessLevel, Authority, AuthorityCeiling, AuthorityHook};
@@ -69,12 +69,12 @@ pub use hook::{
 };
 #[doc(hidden)]
 pub use limits::LimitGrants;
-pub use limits::{LimitKind, Limits, RunSnapshot, StopCondition, HARD_TURN_CAP};
+pub use limits::{HARD_TURN_CAP, LimitKind, Limits, RunSnapshot, StopCondition};
 pub use message::{Audio, Image, Message, MessageOrigin, Role, ToolCall};
 pub use outcome::{CallResult, FinishOutcome, RunOutcome, RunStatus};
 pub use provider::{
-    collect_stream, ModelRequest, ModelResponse, Provider, ProviderError, RequestOptions,
-    ResponseFormat, Retry, StreamEvent, ToolChoice, ToolSpec, Usage,
+    ModelRequest, ModelResponse, Provider, ProviderError, RequestOptions, ResponseFormat, Retry,
+    StreamEvent, ToolChoice, ToolSpec, Usage, collect_stream,
 };
 pub use quota::{Cooldown, QuotaGuard};
 pub use receipt::{InvocationStage, Receipt, ReceiptStatus};
@@ -86,17 +86,17 @@ pub use service::{
 /// Kernel bookkeeping types inside [`RunState`]; not part of the stable API.
 #[doc(hidden)]
 pub use state::{InFlight, PendingFinish};
-pub use state::{Interruption, Pending, RunId, RunState, RUN_STATE_SCHEMA};
+pub use state::{Interruption, Pending, RUN_STATE_SCHEMA, RunId, RunState};
 pub use store::{MemoryStore, RunStore, StoreError};
 pub use stuck::{StuckConfig, StuckSignal};
 pub use tool::{
-    check_argument_types, check_arguments, strip_reserved_arguments, AccessManifest, Extensions,
-    Finish, FnTool, Outbound, SameToolStreak, SourceTrust, Tool, ToolAnnotations, ToolContext,
-    ToolError, ToolInfo, ToolOutput, ToolResult,
+    AccessManifest, Extensions, Finish, FnTool, Outbound, SameToolStreak, SourceTrust, Tool,
+    ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput, ToolResult,
+    check_argument_types, check_arguments, strip_reserved_arguments,
 };
 
 pub use untrusted::{
-    is_untrusted_egress, UntrustedHook, UntrustedMode, UNTRUSTED_EGRESS_INTERRUPT,
+    UNTRUSTED_EGRESS_INTERRUPT, UntrustedHook, UntrustedMode, is_untrusted_egress,
 };
 
 /// Re-exported so tools can observe cancellation without adding the dependency.

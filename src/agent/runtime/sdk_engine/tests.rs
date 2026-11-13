@@ -319,12 +319,14 @@ async fn a_capped_plan_does_not_queue_an_automated_trigger() {
         "{}",
         reply.text
     );
-    assert!(harness
-        .state
-        .get_setting("deferred_provider_retries")
-        .await
-        .unwrap()
-        .is_none_or(|raw| raw == "[]"));
+    assert!(
+        harness
+            .state
+            .get_setting("deferred_provider_retries")
+            .await
+            .unwrap()
+            .is_none_or(|raw| raw == "[]")
+    );
 }
 
 #[tokio::test]
@@ -778,9 +780,11 @@ async fn sdk_engine_demands_open_checklist_items_until_receipts_close_them() {
         .iter()
         .filter_map(|raw| serde_json::from_str(raw).ok())
         .collect();
-    assert!(decisions
-        .iter()
-        .any(|d| d["metadata"]["condition"] == "ledger_expectations_required"));
+    assert!(
+        decisions
+            .iter()
+            .any(|d| d["metadata"]["condition"] == "ledger_expectations_required")
+    );
     let last = decisions
         .iter()
         .rfind(|d| d["metadata"]["condition"] == "ledger_closeout")
@@ -1077,12 +1081,14 @@ fn read_only_authority_admits_observing_and_administrative_calls_of_a_mixed_tool
         "administrative"
     );
     assert!(!permits(serde_json::json!({"write": true})), "mutation");
-    assert!(sdk::Authority::full()
-        .permits(
-            "shell_probe",
-            bridged.annotations_for(&serde_json::json!({"write": true}))
-        )
-        .is_ok());
+    assert!(
+        sdk::Authority::full()
+            .permits(
+                "shell_probe",
+                bridged.annotations_for(&serde_json::json!({"write": true}))
+            )
+            .is_ok()
+    );
 }
 
 /// The model cites receipts (mandate `evidence_receipt_ids`) by the
@@ -1145,7 +1151,7 @@ async fn live_tool_results_carry_the_receipt_footer() {
 /// spilled results, not another session's, and gains no write there.
 #[test]
 fn scoped_runs_read_their_own_spilled_results_only() {
-    use crate::agent::tool_execution::{access_manifest_scope_check, ScopeCheck};
+    use crate::agent::tool_execution::{ScopeCheck, access_manifest_scope_check};
     use crate::traits::{ToolCallAccessManifest, ToolTargetHint, ToolTargetHintKind};
     let hint = |kind, value: String| ToolTargetHint::new(kind, value).unwrap();
     let task = ToolCallAccessManifest {
@@ -1846,10 +1852,12 @@ fn compaction_cuts_at_a_round_boundary_and_keeps_tool_pairs() {
     let view = compacted_view(&run, Some(&compaction));
     assert_eq!(view.len(), run.len() - cut + 1);
     assert_eq!(view[0]["role"], "user");
-    assert!(view[0]["content"]
-        .as_str()
-        .unwrap()
-        .starts_with(COMPACTED_CONTEXT_MARKER));
+    assert!(
+        view[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(COMPACTED_CONTEXT_MARKER)
+    );
     assert_eq!(&view[1..], &run[cut..]);
     // No compaction leaves the run as is.
     assert_eq!(compacted_view(&run, None), run);
@@ -2264,11 +2272,13 @@ fn files_under_an_explicit_grant_are_trusted() {
     let elsewhere = tmp.path().join("other/x.md");
     let configured = vec![granted_str.clone()];
     let manifest = crate::traits::ToolCallAccessManifest {
-        write_targets: vec![crate::traits::ToolTargetHint::new(
-            crate::traits::ToolTargetHintKind::ProjectScope,
-            granted_str.clone(),
-        )
-        .unwrap()],
+        write_targets: vec![
+            crate::traits::ToolTargetHint::new(
+                crate::traits::ToolTargetHintKind::ProjectScope,
+                granted_str.clone(),
+            )
+            .unwrap(),
+        ],
         ..Default::default()
     };
     let cases = [
@@ -2321,12 +2331,14 @@ fn broad_grants_are_not_trusted_roots() {
     let mut broad = vec!["/".to_string(), "/tmp".to_string()];
     broad.extend(dirs::home_dir().map(|home| home.to_string_lossy().into_owned()));
     for dir in &broad {
-        assert!(super::turn_trust_roots(super::TrustRootSources {
-            bound_workspace: Some(dir),
-            workspace_grant: Some(dir),
-            ..Default::default()
-        })
-        .is_empty());
+        assert!(
+            super::turn_trust_roots(super::TrustRootSources {
+                bound_workspace: Some(dir),
+                workspace_grant: Some(dir),
+                ..Default::default()
+            })
+            .is_empty()
+        );
     }
 }
 
@@ -2360,12 +2372,14 @@ fn a_child_never_gains_trusted_roots_its_parent_lacked() {
     let inside = std::path::Path::new("/tmp/aidaemon-test/ws/sub/x.md");
     assert_eq!(read_trust(&roots, inside), Trusted);
     // A parent that trusted nothing hands down nothing.
-    assert!(super::turn_trust_roots(super::TrustRootSources {
-        cwd: Some("/tmp/aidaemon-test/ws"),
-        parent_roots: Some(&[]),
-        ..Default::default()
-    })
-    .is_empty());
+    assert!(
+        super::turn_trust_roots(super::TrustRootSources {
+            cwd: Some("/tmp/aidaemon-test/ws"),
+            parent_roots: Some(&[]),
+            ..Default::default()
+        })
+        .is_empty()
+    );
 }
 
 /// Whole path: a relative read of the owner's own file in a turn with no
@@ -2400,13 +2414,15 @@ async fn a_relative_read_of_an_owner_file_does_not_taint_the_turn() {
         .unwrap();
 
     assert_eq!(sent.load(Ordering::SeqCst), 1);
-    assert!(!harness
-        .provider
-        .call_log
-        .lock()
-        .await
-        .iter()
-        .any(is_verifier_call));
+    assert!(
+        !harness
+            .provider
+            .call_log
+            .lock()
+            .await
+            .iter()
+            .any(is_verifier_call)
+    );
 }
 
 /// Whole path: a request that names a file in a folder the owner never
@@ -2455,13 +2471,15 @@ async fn reading_an_ungranted_named_file_checks_the_first_egress() {
     let decisions = gate_decisions(&harness, "untrusted_egress_verified").await;
     assert_eq!(decisions.len(), 1, "{decisions:?}");
     assert_eq!(decisions[0]["tool"], "send_probe");
-    assert!(harness
-        .provider
-        .call_log
-        .lock()
-        .await
-        .iter()
-        .any(is_verifier_call));
+    assert!(
+        harness
+            .provider
+            .call_log
+            .lock()
+            .await
+            .iter()
+            .any(is_verifier_call)
+    );
 }
 
 /// History and traces replay other people's messages and past tool
@@ -2789,7 +2807,7 @@ async fn consistent_egress_after_untrusted_read_runs_once() {
 /// so the dispatcher reads the session's mode again.
 #[tokio::test]
 async fn readonly_during_verification_stops_the_approved_call() {
-    use crate::agent::authority::{set_session_mode, SessionMode};
+    use crate::agent::authority::{SessionMode, set_session_mode};
     use crate::runtime_ports::AgentIngress;
     use crate::testing::MockProvider;
     let (harness, sent) = untrusted_harness_with(MockProvider::with_delayed_responses(
@@ -2884,7 +2902,7 @@ async fn verifier_failure_denies_and_the_run_finishes() {
 
 #[tokio::test]
 async fn unrestricted_owner_sends_and_the_call_is_recorded() {
-    use crate::agent::authority::{set_session_mode, SessionMode};
+    use crate::agent::authority::{SessionMode, set_session_mode};
     use crate::runtime_ports::AgentIngress;
     use crate::testing::MockProvider;
     let (harness, sent) = untrusted_harness(vec![
@@ -2908,13 +2926,15 @@ async fn unrestricted_owner_sends_and_the_call_is_recorded() {
         .unwrap();
 
     assert_eq!(sent.load(Ordering::SeqCst), 1);
-    assert!(!harness
-        .provider
-        .call_log
-        .lock()
-        .await
-        .iter()
-        .any(is_verifier_call));
+    assert!(
+        !harness
+            .provider
+            .call_log
+            .lock()
+            .await
+            .iter()
+            .any(is_verifier_call)
+    );
     let recorded = gate_decisions(&harness, "untrusted_egress_unrestricted").await;
     assert_eq!(recorded.len(), 1, "{recorded:?}");
     assert_eq!(recorded[0]["tool"], "send_probe");
@@ -2939,13 +2959,15 @@ async fn checks_after_a_tainted_turn(relationship: &str) -> usize {
         .handle_inbound_message(owner_request("What does the synthetic page say?"))
         .await
         .unwrap();
-    assert!(!harness
-        .provider
-        .call_log
-        .lock()
-        .await
-        .iter()
-        .any(is_verifier_call));
+    assert!(
+        !harness
+            .provider
+            .call_log
+            .lock()
+            .await
+            .iter()
+            .any(is_verifier_call)
+    );
     harness
         .provider
         .push_responses(vec![
@@ -3725,16 +3747,20 @@ async fn a_goal_bound_workspace_is_trusted() {
     let (harness, sent) =
         goal_worker_reads_then_sends(Some(binding), &docs, &file.to_string_lossy()).await;
     assert_eq!(sent.load(Ordering::SeqCst), 1);
-    assert!(gate_decisions(&harness, "untrusted_egress_verified")
-        .await
-        .is_empty());
-    assert!(!harness
-        .provider
-        .call_log
-        .lock()
-        .await
-        .iter()
-        .any(is_verifier_call));
+    assert!(
+        gate_decisions(&harness, "untrusted_egress_verified")
+            .await
+            .is_empty()
+    );
+    assert!(
+        !harness
+            .provider
+            .call_log
+            .lock()
+            .await
+            .iter()
+            .any(is_verifier_call)
+    );
 }
 
 /// A path alias is a naming convenience, not a grant: with no

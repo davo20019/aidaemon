@@ -23,7 +23,7 @@ mod tests {
     use super::*;
     use crate::events::EventStoreForTests as _;
     use crate::events::{Event, EventType};
-    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::testing::{MockProvider, setup_test_agent};
     use crate::traits::store_prelude::*;
     use serde_json::json;
 
@@ -116,9 +116,11 @@ mod tests {
             .unwrap();
         assert_eq!(stored.last_turn_seq, Some(second.cursor));
         assert_eq!(stored.last_message_id, "a-5");
-        assert!(stored
-            .summary
-            .starts_with("## Active goals and open loops\nUpdated"));
+        assert!(
+            stored
+                .summary
+                .starts_with("## Active goals and open loops\nUpdated")
+        );
 
         let calls = harness.provider.call_log.lock().await;
         let second_prompt = calls[1].messages[1]["content"].as_str().unwrap();
@@ -154,12 +156,14 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "{result:?}");
-        assert!(harness
-            .state
-            .get_conversation_summary(session)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            harness
+                .state
+                .get_conversation_summary(session)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(failed_calls(&events, "summarization").await >= 1);
         assert_eq!(ok_calls(&events, "summarization").await, 0);
     }

@@ -118,9 +118,10 @@ impl PeopleStore for SqliteMemory {
         for r in &rows {
             let aliases_str: String = r.get("aliases_json");
             if let Ok(aliases) = serde_json::from_str::<Vec<String>>(&aliases_str)
-                && aliases.iter().any(|a| a.to_lowercase() == name_lower) {
-                    return Ok(Some(Self::row_to_person(r)));
-                }
+                && aliases.iter().any(|a| a.to_lowercase() == name_lower)
+            {
+                return Ok(Some(Self::row_to_person(r)));
+            }
         }
 
         Ok(None)
@@ -295,21 +296,23 @@ impl PeopleStore for SqliteMemory {
             let value: String = r.get("value");
             // Try to parse month-day from various formats (e.g., "March 15", "03-15", "2000-03-15")
             if let Some(upcoming_in) = days_until_date(&value, today)
-                && upcoming_in <= within_days as i64 && upcoming_in >= 0 {
-                    let person = Self::row_to_person(r);
-                    let fact = crate::records::PersonFact {
-                        id: r.get("fact_id"),
-                        person_id: r.get("person_id"),
-                        category: r.get("category"),
-                        key: r.get("key"),
-                        value: r.get("value"),
-                        source: r.get("source"),
-                        confidence: r.get("confidence"),
-                        created_at: parse_dt(r.get::<String, _>("fact_created")),
-                        updated_at: parse_dt(r.get::<String, _>("fact_updated")),
-                    };
-                    results.push((person, fact));
-                }
+                && upcoming_in <= within_days as i64
+                && upcoming_in >= 0
+            {
+                let person = Self::row_to_person(r);
+                let fact = crate::records::PersonFact {
+                    id: r.get("fact_id"),
+                    person_id: r.get("person_id"),
+                    category: r.get("category"),
+                    key: r.get("key"),
+                    value: r.get("value"),
+                    source: r.get("source"),
+                    confidence: r.get("confidence"),
+                    created_at: parse_dt(r.get::<String, _>("fact_created")),
+                    updated_at: parse_dt(r.get::<String, _>("fact_updated")),
+                };
+                results.push((person, fact));
+            }
         }
 
         Ok(results)

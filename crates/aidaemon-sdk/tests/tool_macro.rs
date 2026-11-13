@@ -4,12 +4,12 @@
 use aidaemon_sdk::conformance::check_tool;
 use aidaemon_sdk::testing::tool_context;
 use aidaemon_sdk::{
-    tool, AccessManifest, CallEffects, EffectClass, EffectKey, SourceTrust, Tool, ToolAnnotations,
-    ToolContext, ToolOutput,
+    AccessManifest, CallEffects, EffectClass, EffectKey, SourceTrust, Tool, ToolAnnotations,
+    ToolContext, ToolOutput, tool,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Look up an order: customer, item and total.
 ///
@@ -156,9 +156,11 @@ fn validate_refuses_what_the_schema_does_not_allow() {
         .validate(&json!({"order_id": "a", "amount_cents": 1, "extra": 1}))
         .unwrap_err();
     assert!(err.contains("extra"), "{err}");
-    assert!(IssueRefund
-        .validate(&json!({"order_id": "a", "amount_cents": -1}))
-        .is_err());
+    assert!(
+        IssueRefund
+            .validate(&json!({"order_id": "a", "amount_cents": -1}))
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -209,7 +211,7 @@ fn macro_made_tools_pass_the_conformance_kit() {
 
 #[tokio::test]
 async fn a_macro_made_tool_runs_in_an_agent() {
-    use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
+    use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
     let agent = aidaemon_sdk::Agent::builder("macro-test")
         .allow_unguarded()
         .model("scripted")

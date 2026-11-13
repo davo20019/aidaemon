@@ -28,22 +28,22 @@ mod test_support {
     pub(in crate::agent) use async_trait::async_trait;
 
     pub(in crate::agent) use aidaemon_runtime::engine::settings::{
-        turn_trust_roots, TrustRootSources,
+        TrustRootSources, turn_trust_roots,
     };
     pub(in crate::agent) use aidaemon_runtime::engine::turn_engine::stop::*;
     pub(in crate::agent) use aidaemon_runtime::engine::turn_engine::turn_hooks as hooks;
     pub(in crate::agent) use aidaemon_runtime::engine::turn_engine::turn_hooks::*;
     pub(in crate::agent) use aidaemon_runtime::engine::turn_engine::{
-        compaction, model_call, outcome, tool_calls,
+        TerminalCanonTurn, sdk_images, terminal_canonicalizer,
     };
     pub(in crate::agent) use aidaemon_runtime::engine::turn_engine::{
-        sdk_images, terminal_canonicalizer, TerminalCanonTurn,
+        compaction, model_call, outcome, tool_calls,
     };
 
     pub(in crate::agent) use serde_json::Value;
     pub(in crate::agent) use std::collections::HashSet;
-    pub(in crate::agent) use std::sync::atomic::{AtomicBool, Ordering};
     pub(in crate::agent) use std::sync::Arc;
+    pub(in crate::agent) use std::sync::atomic::{AtomicBool, Ordering};
     pub(in crate::agent) use std::time::Duration;
     pub(in crate::agent) use tokio::sync::mpsc;
 }

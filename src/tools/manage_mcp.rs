@@ -33,10 +33,12 @@ mod tests {
         let subject: Value = serde_json::from_str(&request.subject).unwrap();
         assert_eq!(subject["action"], "restart");
         assert_eq!(subject["name"], "fake");
-        assert!(subject["command"]
-            .as_str()
-            .unwrap()
-            .contains("fake_mcp_server"));
+        assert!(
+            subject["command"]
+                .as_str()
+                .unwrap()
+                .contains("fake_mcp_server")
+        );
         assert!(request.summary.starts_with("Restart MCP server 'fake'"));
 
         // Nothing would start: no card.

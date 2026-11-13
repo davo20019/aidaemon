@@ -644,8 +644,7 @@ pub fn parse_schedule(input: &str) -> anyhow::Result<String> {
 
     anyhow::bail!(
         "Unrecognized schedule format '{}'. Use natural shortcuts (e.g. 'daily at 9am', 'every 5m', 'in 2h', 'today at 11:09pm EST', 'after 90 minutes', '2026-03-14 09:30') or a 5-field cron expression. Interpreted in system timezone {}.",
-        input
-        ,
+        input,
         system_timezone_display()
     )
 }
@@ -794,9 +793,10 @@ fn parse_absolute_datetime_local(input: &str) -> Option<DateTime<Local>> {
     ];
     for fmt in dt_formats {
         if let Ok(naive) = NaiveDateTime::parse_from_str(input, fmt)
-            && let Some(dt) = resolve_local_naive(naive) {
-                return Some(dt);
-            }
+            && let Some(dt) = resolve_local_naive(naive)
+        {
+            return Some(dt);
+        }
     }
 
     if let Some(dt) = parse_named_month_datetime_local(input) {
@@ -807,9 +807,10 @@ fn parse_absolute_datetime_local(input: &str) -> Option<DateTime<Local>> {
     for fmt in date_formats {
         if let Ok(date) = NaiveDate::parse_from_str(input, fmt)
             && let Some(naive) = date.and_hms_opt(0, 0, 0)
-                && let Some(dt) = resolve_local_naive(naive) {
-                    return Some(dt);
-                }
+            && let Some(dt) = resolve_local_naive(naive)
+        {
+            return Some(dt);
+        }
     }
 
     None

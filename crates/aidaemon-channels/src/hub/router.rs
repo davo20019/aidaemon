@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{info, warn};
 
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
@@ -13,9 +13,9 @@ use super::{
 #[cfg(test)]
 use crate::ports::SessionRouteLease;
 use crate::ports::{AssistantNoteSink, OutboundRouter};
-use crate::queue::policy::{should_shed_due_to_overload, SessionFairnessBudget};
-use crate::queue::telemetry::{QueuePressure, QueueTelemetry};
 use crate::queue::QueuePolicyConfig;
+use crate::queue::policy::{SessionFairnessBudget, should_shed_due_to_overload};
+use crate::queue::telemetry::{QueuePressure, QueueTelemetry};
 
 /// Shared map of session_id → channel name.
 /// Written by channels when they receive incoming messages,
@@ -369,9 +369,10 @@ impl ChannelHub {
                 }
             };
         if let Some(channel_name) = map.get(&routed_session)
-            && let Some(ch) = channels.iter().find(|c| &c.name() == channel_name) {
-                return Some((ch.clone(), routed_session));
-            }
+            && let Some(ch) = channels.iter().find(|c| &c.name() == channel_name)
+        {
+            return Some((ch.clone(), routed_session));
+        }
         None
     }
 
@@ -639,13 +640,14 @@ impl ChannelHub {
             );
         }
         if let Some((response, _)) = outcome
-            && response_tx.send(response).is_err() {
-                had_error = true;
-                warn!(
-                    session_id = %request.session_id,
-                    "Approval response receiver dropped before response could be sent"
-                );
-            }
+            && response_tx.send(response).is_err()
+        {
+            had_error = true;
+            warn!(
+                session_id = %request.session_id,
+                "Approval response receiver dropped before response could be sent"
+            );
+        }
         had_error
     }
 
@@ -808,10 +810,10 @@ impl ChannelHub {
                 Ok(mut last) => {
                     if let Some((prev, prev_at)) = last.get(&routed_session)
                         && prev.trim() == text_norm
-                            && now.duration_since(*prev_at) < std::time::Duration::from_secs(10)
-                        {
-                            return Ok(());
-                        }
+                        && now.duration_since(*prev_at) < std::time::Duration::from_secs(10)
+                    {
+                        return Ok(());
+                    }
                     last.insert(routed_session.clone(), (text_norm.to_string(), now));
                     delivery_claim = Some((text_norm.to_string(), now));
                 }
@@ -827,19 +829,19 @@ impl ChannelHub {
         let result = channel.send_text(&routed_session, &presented).await;
         if result.is_err()
             && let Some((claimed_text, claimed_at)) = delivery_claim
-                && let Ok(mut last) = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    self.last_sent_text.write(),
-                )
-                .await
-                {
-                    let owns_claim = last
-                        .get(&routed_session)
-                        .is_some_and(|(text, at)| text == &claimed_text && *at == claimed_at);
-                    if owns_claim {
-                        last.remove(&routed_session);
-                    }
-                }
+            && let Ok(mut last) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.last_sent_text.write(),
+            )
+            .await
+        {
+            let owns_claim = last
+                .get(&routed_session)
+                .is_some_and(|(text, at)| text == &claimed_text && *at == claimed_at);
+            if owns_claim {
+                last.remove(&routed_session);
+            }
+        }
         result
     }
 
@@ -961,12 +963,13 @@ impl ChannelHub {
     pub async fn broadcast_text(&self, session_ids: &[String], text: &str) {
         for session_id in session_ids {
             if let Some((channel, routed_session)) = self.routed_channel(session_id).await
-                && let Err(e) = channel.send_text(&routed_session, text).await {
-                    warn!(
-                        channel = channel.name(),
-                        session_id, "Broadcast send failed: {}", e
-                    );
-                }
+                && let Err(e) = channel.send_text(&routed_session, text).await
+            {
+                warn!(
+                    channel = channel.name(),
+                    session_id, "Broadcast send failed: {}", e
+                );
+            }
         }
     }
 }
@@ -1066,8 +1069,8 @@ impl OutboundRouter for ChannelHub {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::RwLock;
 
     use async_trait::async_trait;

@@ -41,11 +41,7 @@ pub struct Report {
 
 fn mean(values: impl Iterator<Item = f64>) -> f64 {
     let (sum, n) = values.fold((0.0, 0usize), |(s, n), v| (s + v, n + 1));
-    if n == 0 {
-        0.0
-    } else {
-        sum / n as f64
-    }
+    if n == 0 { 0.0 } else { sum / n as f64 }
 }
 
 fn ratio(passes: usize, runs: usize) -> f64 {

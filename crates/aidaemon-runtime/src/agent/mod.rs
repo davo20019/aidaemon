@@ -20,19 +20,19 @@ use std::time::{Duration, Instant};
 
 use aidaemon_channels::context::ChannelContext;
 use aidaemon_channels::ports::OutboundRouter;
-use aidaemon_events::traits::AgentRole;
 use aidaemon_events::EventStore;
+use aidaemon_events::traits::AgentRole;
 use aidaemon_mcp::registry::McpRegistry;
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::semantics::UserRole;
 use aidaemon_tools::status::StatusUpdate;
-use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_work::goal_tokens::GoalTokenRegistry;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{info, warn};
 
 use crate::eval::HarnessEvalConfig;
-use crate::llm::gateway::SideCallGateway;
 use crate::llm::SharedLlmRuntime;
+use crate::llm::gateway::SideCallGateway;
 use crate::settings::{
     AudioConfig, ContextWindowConfig, IterationLimitConfig, PathAliasConfig, PolicyConfig,
     SttConfig, VisionConfig,

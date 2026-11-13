@@ -2,10 +2,10 @@
 //! agent and test harness.
 
 use super::*;
-use crate::testing::{setup_full_stack_test_agent_with_extra_tools, MockProvider, MockTool};
+use crate::testing::{MockProvider, MockTool, setup_full_stack_test_agent_with_extra_tools};
 use crate::traits::Tool;
 use crate::types::{WorkspaceAccessLevel, WorkspaceGrant};
-use aidaemon_runtime::engine::tool_roster::{validate_tool_definition_contract, ToolRoster as _};
+use aidaemon_runtime::engine::tool_roster::{ToolRoster as _, validate_tool_definition_contract};
 use aidaemon_runtime::turn::helpers::{
     restrict_desktop_control_for_visibility, sort_tool_definitions_by_name,
     tool_name_from_definition, visibility_allows_desktop_control,
@@ -188,11 +188,13 @@ async fn tool_definitions_skip_unavailable_tools() {
     assert!(!names.contains(&"cli_agent".to_string()));
     assert!(caps.contains_key("web_search"));
     assert!(!caps.contains_key("cli_agent"));
-    assert!(!harness
-        .agent
-        .tools()
-        .iter()
-        .any(|tool| tool.name() == "cli_agent" && tool.is_available()));
+    assert!(
+        !harness
+            .agent
+            .tools()
+            .iter()
+            .any(|tool| tool.name() == "cli_agent" && tool.is_available())
+    );
 }
 
 #[tokio::test]
@@ -230,14 +232,18 @@ async fn session_static_roster_empty_for_non_owner() {
         .unwrap();
     let channel_ctx = ChannelContext::private("test");
 
-    assert!(harness
-        .agent
-        .session_static_tool_roster(UserRole::Guest, &channel_ctx)
-        .is_empty());
-    assert!(harness
-        .agent
-        .session_static_tool_roster(UserRole::Public, &channel_ctx)
-        .is_empty());
+    assert!(
+        harness
+            .agent
+            .session_static_tool_roster(UserRole::Guest, &channel_ctx)
+            .is_empty()
+    );
+    assert!(
+        harness
+            .agent
+            .session_static_tool_roster(UserRole::Public, &channel_ctx)
+            .is_empty()
+    );
 }
 
 #[tokio::test]

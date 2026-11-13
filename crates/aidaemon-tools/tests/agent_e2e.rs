@@ -1,9 +1,9 @@
 //! End to end: a scripted model edits a file through the real agent loop,
 //! then reads it back to verify.
 
-use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, text, tool_calls};
 use aidaemon_core::{Agent, ReceiptStatus, Role};
-use aidaemon_tools::{default_tools, Workspace};
+use aidaemon_tools::{Workspace, default_tools};
 use serde_json::json;
 
 #[tokio::test]

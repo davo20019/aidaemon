@@ -1,5 +1,5 @@
 use super::*;
-use crate::testing::{setup_test_agent, MockProvider};
+use crate::testing::{MockProvider, setup_test_agent};
 use crate::traits::store_prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
@@ -750,9 +750,11 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
         .execute_tool_with_watchdog("http_request", arguments, &base_ctx(None))
         .await
         .unwrap_err();
-    assert!(missing
-        .to_string()
-        .contains("no action-bound mandate grant"));
+    assert!(
+        missing
+            .to_string()
+            .contains("no action-bound mandate grant")
+    );
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
     assert!(!saw_mandate_preapproval.load(AtomicOrdering::SeqCst));
 
@@ -870,12 +872,14 @@ async fn mandate_task_lead_mutation_is_denied_without_burning_quota() {
         "unexpected role-boundary error: {error}"
     );
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
-    assert!(harness
-        .state
-        .list_mandate_mutation_attempts_for_run(&run.id)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        harness
+            .state
+            .list_mandate_mutation_attempts_for_run(&run.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         harness
             .state
@@ -925,12 +929,14 @@ async fn mandate_executor_cannot_use_task_lead_control_plane() {
     }
 
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
-    assert!(harness
-        .state
-        .list_mandate_mutation_attempts_for_run(&run.id)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        harness
+            .state
+            .list_mandate_mutation_attempts_for_run(&run.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -962,31 +968,37 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
         }
     };
     grant.tool_call_id = Some("watchdog-mandate-call-2".to_string());
-    assert!(harness
-        .state
-        .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &run, &fence, 2))
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        harness
+            .state
+            .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &run, &fence, 2))
+            .await
+            .unwrap()
+            .is_some()
+    );
 
-    assert!(harness
-        .state
-        .transition_mandate_status(
-            &mandate.id,
-            crate::traits::MandateStatus::Active,
-            crate::traits::MandateStatus::Paused,
-        )
-        .await
-        .unwrap());
-    assert!(harness
-        .state
-        .transition_mandate_status(
-            &mandate.id,
-            crate::traits::MandateStatus::Paused,
-            crate::traits::MandateStatus::Active,
-        )
-        .await
-        .unwrap());
+    assert!(
+        harness
+            .state
+            .transition_mandate_status(
+                &mandate.id,
+                crate::traits::MandateStatus::Active,
+                crate::traits::MandateStatus::Paused,
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        harness
+            .state
+            .transition_mandate_status(
+                &mandate.id,
+                crate::traits::MandateStatus::Paused,
+                crate::traits::MandateStatus::Active,
+            )
+            .await
+            .unwrap()
+    );
 
     let blocked = harness
         .agent
@@ -1031,17 +1043,21 @@ async fn mandate_dispatch_rejects_a_blocked_run_even_with_a_live_attempt_and_gra
     let arguments = r#"{"text":"must not run while blocked"}"#;
     let mut grant = test_mandate_grant(&mandate, &decision, arguments);
     grant.tool_call_id = Some("watchdog-mandate-call-3".to_string());
-    assert!(harness
-        .state
-        .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &run, &fence, 3))
-        .await
-        .unwrap()
-        .is_some());
-    assert!(harness
-        .state
-        .finish_goal_run(&run.id, "blocked", Some("owner input required"))
-        .await
-        .unwrap());
+    assert!(
+        harness
+            .state
+            .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &run, &fence, 3))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        harness
+            .state
+            .finish_goal_run(&run.id, "blocked", Some("owner input required"))
+            .await
+            .unwrap()
+    );
 
     let error = harness
         .agent
@@ -1062,17 +1078,21 @@ async fn stale_mandate_child_cannot_rebind_to_the_next_goal_run() {
     let arguments = r#"{"text":"belongs only to cycle n"}"#;
     let mut grant = test_mandate_grant(&mandate, &decision, arguments);
     grant.tool_call_id = Some("watchdog-mandate-call-4".to_string());
-    assert!(harness
-        .state
-        .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &old_run, &fence, 4,))
-        .await
-        .unwrap()
-        .is_some());
-    assert!(harness
-        .state
-        .finish_goal_run(&old_run.id, "completed", Some("cycle n closed"))
-        .await
-        .unwrap());
+    assert!(
+        harness
+            .state
+            .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &old_run, &fence, 4,))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        harness
+            .state
+            .finish_goal_run(&old_run.id, "completed", Some("cycle n closed"))
+            .await
+            .unwrap()
+    );
     let next_root = uuid::Uuid::new_v4().to_string();
     let next_run = harness
         .state
@@ -1100,26 +1120,30 @@ async fn mandate_dispatch_rejects_a_lost_root_task_attempt() {
     let arguments = r#"{"text":"must not outlive its lease"}"#;
     let mut grant = test_mandate_grant(&mandate, &decision, arguments);
     grant.tool_call_id = Some("watchdog-mandate-call-5".to_string());
-    assert!(harness
-        .state
-        .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &run, &fence, 5))
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        harness
+            .state
+            .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &run, &fence, 5))
+            .await
+            .unwrap()
+            .is_some()
+    );
     let patch = crate::traits::TaskAttemptPatch {
         status: "blocked".to_string(),
         blocker: Some("lease owner stopped".to_string()),
         ..Default::default()
     };
-    assert!(harness
-        .state
-        .patch_task_from_attempt(
-            &fence.root_attempt.id,
-            &fence.root_attempt.lease_token,
-            &patch,
-        )
-        .await
-        .unwrap());
+    assert!(
+        harness
+            .state
+            .patch_task_from_attempt(
+                &fence.root_attempt.id,
+                &fence.root_attempt.lease_token,
+                &patch,
+            )
+            .await
+            .unwrap()
+    );
 
     let error = harness
         .agent

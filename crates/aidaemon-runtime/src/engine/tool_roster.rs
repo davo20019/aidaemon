@@ -10,7 +10,7 @@ use aidaemon_channels::context::ChannelContext;
 use aidaemon_core::ChannelVisibility;
 use aidaemon_events::traits::AgentRole;
 use aidaemon_tools::semantics::{ToolCapabilities, UserRole};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::host::TurnHost;
 use crate::policy::execution::{ApprovalMode, ExecutionPolicy, ModelProfile};
@@ -51,9 +51,10 @@ fn validate_required_fields_contract(parameters: &Value) -> Result<(), String> {
     }
 
     if let Some(additional) = parameters.get("additionalProperties")
-        && !additional.is_boolean() {
-            return Err("parameters.additionalProperties must be a boolean".to_string());
-        }
+        && !additional.is_boolean()
+    {
+        return Err("parameters.additionalProperties must be a boolean".to_string());
+    }
 
     Ok(())
 }

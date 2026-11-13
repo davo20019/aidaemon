@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use aidaemon_events::payloads::{
     ApprovalDeniedData, AssistantResponseData, DecisionPointData, DecisionType, ErrorData,
@@ -15,9 +15,9 @@ use aidaemon_events::payloads::{
 };
 use aidaemon_events::text::truncate_str;
 use aidaemon_events::{Event, EventStore, EventType};
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::sanitize::redact_secrets;
 use aidaemon_tools::semantics::{ToolCallContext, ToolCapabilities};
-use aidaemon_tools::OutcomeTool as Tool;
 
 pub struct DiagnoseTool {
     event_store: Arc<EventStore>,
@@ -414,17 +414,18 @@ impl DiagnoseTool {
                 }
                 DecisionType::ExecutionStateSnapshot => {
                     if let Some(condition) = Self::metadata_string(metadata, "condition")
-                        && condition == "execution_budget_exhausted" {
-                            let limit = Self::metadata_string(metadata, "budget_limit")
-                                .unwrap_or_else(|| "execution budget".to_string());
-                            let line = format!(
-                                "Event #{}: execution budget exhausted on {}.",
-                                event.id,
-                                Self::pretty_code(&limit)
-                            );
-                            Self::push_unique_line(&mut summary.validation_failures, line);
-                            summary.validation_failure_evidence.push(evidence.clone());
-                        }
+                        && condition == "execution_budget_exhausted"
+                    {
+                        let limit = Self::metadata_string(metadata, "budget_limit")
+                            .unwrap_or_else(|| "execution budget".to_string());
+                        let line = format!(
+                            "Event #{}: execution budget exhausted on {}.",
+                            event.id,
+                            Self::pretty_code(&limit)
+                        );
+                        Self::push_unique_line(&mut summary.validation_failures, line);
+                        summary.validation_failure_evidence.push(evidence.clone());
+                    }
                 }
                 _ => {}
             }
@@ -515,12 +516,13 @@ impl DiagnoseTool {
                 }
                 EventType::ToolResult => {
                     if let Ok(data) = event.parse_data::<ToolResultData>()
-                        && data.failed() {
-                            if first_error.is_none() {
-                                first_error = Some(ev.clone());
-                            }
-                            tool_failures.push(ev);
+                        && data.failed()
+                    {
+                        if first_error.is_none() {
+                            first_error = Some(ev.clone());
                         }
+                        tool_failures.push(ev);
+                    }
                 }
                 EventType::ApprovalDenied => approval_denied.push(ev),
                 EventType::DecisionPoint => {
@@ -532,22 +534,23 @@ impl DiagnoseTool {
                                 | DecisionType::AlternatingPatternDetection
                         ) || matches!(data.decision_type, DecisionType::StoppingCondition)
                             && data.summary.to_ascii_lowercase().contains("stall"))
-                        {
-                            loop_signals.push(ev);
-                        }
+                    {
+                        loop_signals.push(ev);
+                    }
                 }
                 EventType::TaskEnd => {
                     if let Ok(data) = event.parse_data::<TaskEndData>()
-                        && data.effective_outcome() == aidaemon_events::TaskOutcome::Failed {
-                            if data
-                                .error
-                                .as_deref()
-                                .is_some_and(|e| e.to_ascii_lowercase().contains("stall"))
-                            {
-                                loop_signals.push(ev.clone());
-                            }
-                            task_end_failed = Some((data, ev));
+                        && data.effective_outcome() == aidaemon_events::TaskOutcome::Failed
+                    {
+                        if data
+                            .error
+                            .as_deref()
+                            .is_some_and(|e| e.to_ascii_lowercase().contains("stall"))
+                        {
+                            loop_signals.push(ev.clone());
                         }
+                        task_end_failed = Some((data, ev));
+                    }
                 }
                 _ => {}
             }
@@ -1792,8 +1795,8 @@ mod tests {
     use aidaemon_tools::testing::CallWithFacts;
     use chrono::{Duration, Utc};
 
-    use aidaemon_events::payloads::DecisionPointData;
     use aidaemon_events::TaskStatus;
+    use aidaemon_events::payloads::DecisionPointData;
 
     async fn setup_tool() -> DiagnoseTool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()

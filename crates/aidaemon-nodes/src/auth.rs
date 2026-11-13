@@ -1,6 +1,6 @@
 use aidaemon_secrets::SecretStore;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, KeyInit, Mac};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
@@ -132,8 +132,8 @@ pub fn verify_session_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p256::ecdsa::signature::Signer;
     use p256::ecdsa::SigningKey;
+    use p256::ecdsa::signature::Signer;
     use p256::elliptic_curve::Generate;
 
     #[test]
@@ -150,12 +150,14 @@ mod tests {
             &encoded,
         )
         .unwrap();
-        assert!(verify_session_signature(
-            verifying_key.to_sec1_point(true).as_bytes(),
-            b"different",
-            &encoded,
-        )
-        .is_err());
+        assert!(
+            verify_session_signature(
+                verifying_key.to_sec1_point(true).as_bytes(),
+                b"different",
+                &encoded,
+            )
+            .is_err()
+        );
     }
 
     #[test]

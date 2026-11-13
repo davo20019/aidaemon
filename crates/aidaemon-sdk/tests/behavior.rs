@@ -1,7 +1,7 @@
 //! The shared behavior suite against the default preset (aidaemon's full
 //! memory system), one test per case.
 
-use aidaemon_sdk::testing::behavior::{cases, run_case, Subject, Verdict};
+use aidaemon_sdk::testing::behavior::{Subject, Verdict, cases, run_case};
 
 fn default_preset() -> Subject {
     Subject::new("default preset", |parts| async move {

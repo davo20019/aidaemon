@@ -12,9 +12,9 @@ pub use aidaemon_events::stores::{
     ConversationSummaryStore, DialogueStateStore, MessageStore, PromptSnapshotStore,
 };
 pub use aidaemon_mcp::registry::{DynamicMcpServerStore, McpRegistryStore};
+pub use aidaemon_memory::LearningStore;
 pub use aidaemon_memory::skills::SkillStore;
 pub use aidaemon_memory::stores::{EpisodeStore, FactStore, HistorySearchStore, PeopleStore};
-pub use aidaemon_memory::LearningStore;
 pub use aidaemon_skills::SkillsStore;
 pub use aidaemon_tools::services::{
     DynamicCliAgentStore, OAuthGatewayStore, OAuthStore, SettingsStore,

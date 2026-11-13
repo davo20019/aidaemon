@@ -8,7 +8,7 @@ use aidaemon_core::{
     ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::client::{Inner, McpError, McpOptions};
 
@@ -272,9 +272,10 @@ pub fn render_result(server: &str, result: &Value) -> ToolOutput {
         .cloned();
     let mut content = parts.join("\n");
     if content.trim().is_empty()
-        && let Some(structured) = &structured {
-            content = structured.to_string();
-        }
+        && let Some(structured) = &structured
+    {
+        content = structured.to_string();
+    }
 
     let mut details = Map::new();
     details.insert("server".into(), json!(server));

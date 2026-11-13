@@ -13,7 +13,7 @@
 use aidaemon_channels::ports::{MidRunIntent, MidRunReading, RunningWork};
 use aidaemon_core as sdk;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::llm::gateway::SideCallGateway;
@@ -320,13 +320,17 @@ mod tests {
     #[tokio::test]
     async fn a_failed_or_unreadable_reading_leaves_the_message_to_the_run() {
         let (gateway, _) = gateway_with(provider_failing("503")).await;
-        assert!(read_mid_run_message(&gateway, "how is it going?", &work())
-            .await
-            .is_none());
+        assert!(
+            read_mid_run_message(&gateway, "how is it going?", &work())
+                .await
+                .is_none()
+        );
         let (gateway, _) = gateway_with(provider_answering("it is a question")).await;
-        assert!(read_mid_run_message(&gateway, "how is it going?", &work())
-            .await
-            .is_none());
+        assert!(
+            read_mid_run_message(&gateway, "how is it going?", &work())
+                .await
+                .is_none()
+        );
     }
 
     #[test]

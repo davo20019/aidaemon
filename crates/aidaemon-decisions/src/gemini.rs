@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::{
     Answer, AnswerValue, ConfidenceSource, Decider, DeciderCapabilities, DecisionError,
@@ -305,8 +305,8 @@ fn parse_answers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::conformance;
     use crate::Question;
+    use crate::testing::conformance;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -477,10 +477,12 @@ mod tests {
         assert_eq!(topic.chosen(), Some("billing"));
         assert_eq!(topic.probabilities.as_ref().unwrap().len(), 2);
         assert!((response.answers["urgency"].score().unwrap() - 1.0).abs() < 1e-6);
-        assert!(response
-            .answers
-            .values()
-            .all(|a| a.confidence_source == ConfidenceSource::Calibrated));
+        assert!(
+            response
+                .answers
+                .values()
+                .all(|a| a.confidence_source == ConfidenceSource::Calibrated)
+        );
     }
 
     #[tokio::test]

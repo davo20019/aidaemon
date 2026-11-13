@@ -9,7 +9,7 @@
 //! ([`tools`]: `use_skill`, `skill_resources`, `manage_skills`).
 
 use serde::{Deserialize, Serialize};
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -308,22 +308,24 @@ pub fn remove_skill_file(dir: &Path, skill_name: &str) -> anyhow::Result<bool> {
                 let skill_md = path.join("SKILL.md");
                 if skill_md.exists()
                     && let Ok(content) = std::fs::read_to_string(&skill_md)
-                        && let Some(parsed) = Skill::parse(&content)
-                            && parsed.name == skill_name {
-                                std::fs::remove_dir_all(&path)?;
-                                return Ok(true);
-                            }
+                    && let Some(parsed) = Skill::parse(&content)
+                    && parsed.name == skill_name
+                {
+                    std::fs::remove_dir_all(&path)?;
+                    return Ok(true);
+                }
             } else if path.extension().and_then(|e| e.to_str()) == Some("md")
                 && let Ok(content) = std::fs::read_to_string(&path)
-                    && let Some(parsed) = Skill::parse(&content)
-                        && parsed.name == skill_name {
-                            std::fs::remove_file(&path)?;
-                            let marker = single_file_disabled_marker(&path);
-                            if marker.exists() {
-                                std::fs::remove_file(marker)?;
-                            }
-                            return Ok(true);
-                        }
+                && let Some(parsed) = Skill::parse(&content)
+                && parsed.name == skill_name
+            {
+                std::fs::remove_file(&path)?;
+                let marker = single_file_disabled_marker(&path);
+                if marker.exists() {
+                    std::fs::remove_file(marker)?;
+                }
+                return Ok(true);
+            }
         }
     }
 
@@ -366,12 +368,13 @@ fn scan_skill_resources(dir: &Path) -> Vec<ResourceEntry> {
             for file in files.flatten() {
                 let path = file.path();
                 if path.is_file()
-                    && let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        entries.push(ResourceEntry {
-                            path: format!("{}/{}", subdir_name, name),
-                            category: category.clone(),
-                        });
-                    }
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                {
+                    entries.push(ResourceEntry {
+                        path: format!("{}/{}", subdir_name, name),
+                        category: category.clone(),
+                    });
+                }
             }
         }
     }
@@ -585,10 +588,11 @@ impl SkillCache {
             metadata.is_file().hash(hasher);
             metadata.len().hash(hasher);
             if let Ok(modified) = metadata.modified()
-                && let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
-                    dur.as_secs().hash(hasher);
-                    dur.subsec_nanos().hash(hasher);
-                }
+                && let Ok(dur) = modified.duration_since(UNIX_EPOCH)
+            {
+                dur.as_secs().hash(hasher);
+                dur.subsec_nanos().hash(hasher);
+            }
 
             if metadata.is_dir() {
                 let mut children: Vec<PathBuf> = std::fs::read_dir(path)
@@ -779,7 +783,7 @@ pub fn build_system_prompt(
     prompt
 }
 
-pub use aidaemon_memory::render::{render_memory_section, MemoryContext, MemoryPromptReport};
+pub use aidaemon_memory::render::{MemoryContext, MemoryPromptReport, render_memory_section};
 
 /// Build the complete system prompt with all memory components.
 ///
@@ -1017,10 +1021,12 @@ mod tests {
         assert_eq!(skill.name, "test-skill");
         assert_eq!(skill.resources.len(), 2);
         assert!(skill.dir_path.is_some());
-        assert!(skill
-            .resources
-            .iter()
-            .any(|r| r.path == "references/guide.md"));
+        assert!(
+            skill
+                .resources
+                .iter()
+                .any(|r| r.path == "references/guide.md")
+        );
         assert!(skill.resources.iter().any(|r| r.path == "scripts/hello.sh"));
     }
 

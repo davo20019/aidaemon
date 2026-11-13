@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::telemetry::QueuePressure;
 use super::QueueLanePolicyConfig;
+use super::telemetry::QueuePressure;
 
 const MAX_SESSION_BUDGET_ENTRIES: usize = 2048;
 

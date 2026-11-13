@@ -1,8 +1,8 @@
 //! Text reports over the harness evaluation a task end records: one task,
 //! a summary over many, and the section `diagnose` adds.
 
-use crate::payloads::{HarnessEvalSnapshot, TaskEndData};
 use crate::TaskOutcome;
+use crate::payloads::{HarnessEvalSnapshot, TaskEndData};
 
 const WARN_OVERALL: f32 = 0.6;
 const WARN_ROUTING: f32 = 0.7;

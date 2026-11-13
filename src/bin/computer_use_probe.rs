@@ -84,11 +84,11 @@ fn run_windows() {
 fn run_inspect(app: &str) {
     use std::path::PathBuf;
 
+    use aidaemon::ComputerUseConfig;
     use aidaemon::computer_use::cache::SnapshotCache;
     use aidaemon::computer_use::harness::{ComputerHarness, HarnessRequestContext};
     use aidaemon::computer_use::macos::MacOsHarness;
     use aidaemon::computer_use::types::format_full_tree;
-    use aidaemon::ComputerUseConfig;
 
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -119,11 +119,11 @@ fn run_inspect(app: &str) {
 
 #[cfg(target_os = "macos")]
 fn run_click(app: &str, index: u32) {
+    use aidaemon::ComputerUseConfig;
     use aidaemon::computer_use::cache::SnapshotCache;
     use aidaemon::computer_use::harness::{ComputerHarness, HarnessRequestContext};
     use aidaemon::computer_use::macos::MacOsHarness;
     use aidaemon::computer_use::types::format_condensed_refresh;
-    use aidaemon::ComputerUseConfig;
 
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     rt.block_on(async {

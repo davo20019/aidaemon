@@ -10,21 +10,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::agent::Agent;
 use crate::channels::{ChannelHub, SessionMap};
 use crate::config::{IterationLimitConfig, ModelsConfig, ProviderKind};
 use crate::events::EventStore;
-use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
+use crate::llm_runtime::{SharedLlmRuntime, router_from_models};
 use crate::memory::embeddings::EmbeddingService;
 use crate::plans::PlanStore;
 use crate::providers::ProviderError;
 use crate::state::SqliteStateStore;
+use crate::tools::RememberFactTool;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::track_requirements::TrackRequirementsTool;
-use crate::tools::RememberFactTool;
 use crate::tools::{SystemInfoTool, TerminalTool};
 use crate::traits::{
     ChannelCapabilities, ChatOptions, HubChannel, ProviderResponse, TokenUsage, Tool, ToolCall,
@@ -389,9 +389,10 @@ impl MockProvider {
             ..options.clone()
         };
         if let crate::traits::ResponseMode::JsonSchema { name, .. } = &options.response_mode
-            && self.failing_response_schemas.contains(name) {
-                return Err(ProviderError::from_status(503, "synthetic schema lane outage").into());
-            }
+            && self.failing_response_schemas.contains(name)
+        {
+            return Err(ProviderError::from_status(503, "synthetic schema lane outage").into());
+        }
         if self.reject_non_default_options && provider_facing != ChatOptions::default() {
             return Err(ProviderError::from_status(400, "unsupported chat options").into());
         }
@@ -621,7 +622,7 @@ impl TestHarness {
 /// Build a fully-wired agent with mock provider and temp-file SQLite DB.
 ///
 /// Each call creates an isolated database, so tests can run in parallel.
-pub use aidaemon_tools::testing::{call_facts, call_with_facts, CallWithFacts};
+pub use aidaemon_tools::testing::{CallWithFacts, call_facts, call_with_facts};
 
 /// The `fake_mcp_server` test binary of `aidaemon-mcp`: built once per test
 /// process into its own target directory (so it never waits on the build

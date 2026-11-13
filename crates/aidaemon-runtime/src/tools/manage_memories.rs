@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::tools::traits::{
-    semantics_for_exact_read_actions, AutomationStore, Tool, ToolArgumentContractViolation,
-    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects, ToolOutcomeStatus,
+    AutomationStore, Tool, ToolArgumentContractViolation, ToolCallContext, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus,
+    semantics_for_exact_read_actions,
 };
 use crate::tools::traits::{ChannelVisibility, UserRole};
 
@@ -154,9 +154,10 @@ impl ManageMemoriesTool {
             .collect();
         if schedule_inputs.is_empty()
             && let Some(schedule) = args.schedule.as_deref().map(str::trim)
-                && !schedule.is_empty() {
-                    schedule_inputs.push(schedule.to_string());
-                }
+            && !schedule.is_empty()
+        {
+            schedule_inputs.push(schedule.to_string());
+        }
         if schedule_inputs.is_empty() {
             anyhow::bail!(
                 "'schedule' (or a non-empty 'schedules' list) is required for create_scheduled_goal"
@@ -183,7 +184,7 @@ impl ManageMemoriesTool {
                     return Ok(Answer(format!(
                         "Couldn't parse schedule '{}': {}",
                         schedule_raw, e
-                    )))
+                    )));
                 }
             };
             let next_local = match aidaemon_work::schedule::compute_next_run_local(&cron_expr) {
@@ -192,7 +193,7 @@ impl ManageMemoriesTool {
                     return Ok(Answer(format!(
                         "Couldn't compute next run for '{}': {}",
                         cron_expr, e
-                    )))
+                    )));
                 }
             };
             let is_one_shot = args
@@ -279,7 +280,7 @@ impl ManageMemoriesTool {
                 return Ok(Answer(format!(
                     "Invalid fire_policy '{}'. Use 'coalesce' or 'always_fire'.",
                     other
-                )))
+                )));
             }
         };
         let reminder = args
@@ -370,9 +371,10 @@ impl ManageMemoriesTool {
 
         // Fast path: exact match + domain check.
         if let Some(g) = self.state.get_goal(trimmed).await?
-            && g.domain == "personal" {
-                return Ok(trimmed.to_string());
-            }
+            && g.domain == "personal"
+        {
+            return Ok(trimmed.to_string());
+        }
 
         let goals = self.state.get_active_personal_goals(100).await?;
         let mut matches: Vec<&crate::tools::traits::Goal> =
@@ -417,9 +419,10 @@ impl ManageMemoriesTool {
 
         if let Some(ctx) = &goal.context
             && let Ok(v) = serde_json::from_str::<Value>(ctx)
-                && v.get("system_protected").and_then(|x| x.as_bool()) == Some(true) {
-                    return true;
-                }
+            && v.get("system_protected").and_then(|x| x.as_bool()) == Some(true)
+        {
+            return true;
+        }
 
         false
     }
@@ -775,21 +778,19 @@ impl ManageMemoriesTool {
                     }
                 });
 
-                let mut output =
-                    format!("**Active Personal Goals** ({} goals)\n\n", goals.len());
+                let mut output = format!("**Active Personal Goals** ({} goals)\n\n", goals.len());
                 output.push_str(
                     "Only goals marked `mandate-source compatible` may be supplied as a new mandate's source_goal_id. Existing mandates retain their current source; omit source_goal_id when creating a mandate without compatible provenance.\n\n",
                 );
                 for g in &goals {
                     let notes_count = g.progress_notes.as_ref().map_or(0, |n| n.len());
                     let age_str = Self::format_age(&g.created_at);
-                    let compatibility = if owner_session
-                        .is_some_and(|session| g.session_id == session)
-                    {
-                        "mandate-source compatible"
-                    } else {
-                        "not compatible with this mandate owner session"
-                    };
+                    let compatibility =
+                        if owner_session.is_some_and(|session| g.session_id == session) {
+                            "mandate-source compatible"
+                        } else {
+                            "not compatible with this mandate owner session"
+                        };
                     output.push_str(&format!(
                         "- **[ID: {}]** {} (priority: {}, created: {}, {} progress notes; {})\n",
                         g.id, g.description, g.priority, age_str, notes_count, compatibility
@@ -812,7 +813,9 @@ impl ManageMemoriesTool {
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("'goal' is required for create_personal_goal action"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("'goal' is required for create_personal_goal action")
+                    })?;
 
                 // Personal goals may be visible across the owner's private contexts, but the
                 // session that actually created them is an authorization boundary. Mandates use
@@ -838,10 +841,9 @@ impl ManageMemoriesTool {
                 ))
             }
             "complete_goal" => {
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for complete_goal action"))?;
+                let goal_id = args.goal_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'goal_id' is required for complete_goal action")
+                })?;
                 let resolved_goal_id = match self.resolve_personal_goal_id(goal_id).await {
                     Ok(id) => id,
                     Err(e) => return Ok(e.to_string()),
@@ -852,10 +854,9 @@ impl ManageMemoriesTool {
                 Ok(format!("Goal {} marked as completed.", resolved_goal_id))
             }
             "abandon_goal" => {
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for abandon_goal action"))?;
+                let goal_id = args.goal_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'goal_id' is required for abandon_goal action")
+                })?;
                 let resolved_goal_id = match self.resolve_personal_goal_id(goal_id).await {
                     Ok(id) => id,
                     Err(e) => return Ok(e.to_string()),
@@ -863,7 +864,10 @@ impl ManageMemoriesTool {
                 self.state
                     .update_personal_goal(&resolved_goal_id, Some("abandoned"), None)
                     .await?;
-                Ok(format!("Goal {} marked as abandoned. It will not be re-created by automatic analysis.", resolved_goal_id))
+                Ok(format!(
+                    "Goal {} marked as abandoned. It will not be re-created by automatic analysis.",
+                    resolved_goal_id
+                ))
             }
             "create_scheduled_goal" => {
                 let plan = match self.prepare_scheduled_goal(&args, facts).await? {
@@ -894,7 +898,12 @@ impl ManageMemoriesTool {
 
                 let has_recurring = parsed.iter().any(|p| !p.is_one_shot);
                 let mut goal = if has_recurring {
-                    crate::tools::traits::Goal::new_continuous_pending(&desc, &session_id, None, None)
+                    crate::tools::traits::Goal::new_continuous_pending(
+                        &desc,
+                        &session_id,
+                        None,
+                        None,
+                    )
                 } else {
                     crate::tools::traits::Goal::new_deferred_finite(&desc, &session_id)
                 };
@@ -925,9 +934,7 @@ impl ManageMemoriesTool {
                         is_one_shot: p.is_one_shot,
                         is_paused: paused,
                         last_run_at: None,
-                        next_run_at: p.next_local
-                            .with_timezone(&chrono::Utc)
-                            .to_rfc3339(),
+                        next_run_at: p.next_local.with_timezone(&chrono::Utc).to_rfc3339(),
                         created_at: now.clone(),
                         updated_at: now.clone(),
                     };
@@ -1151,7 +1158,9 @@ impl ManageMemoriesTool {
                     .as_deref()
                     .map(str::trim)
                     .filter(|q| !q.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("'query' is required for list_scheduled_matching action"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("'query' is required for list_scheduled_matching action")
+                    })?;
                 let goals = self.state.get_scheduled_goals().await?;
                 let mut matched: Vec<&crate::tools::traits::Goal> = goals
                     .iter()
@@ -1195,7 +1204,12 @@ impl ManageMemoriesTool {
                         .unwrap_or_else(|| "n/a".to_string());
                     output.push_str(&format!(
                         "- **{}** {} (type: {}, status: {}, schedules: {}, next: {})\n",
-                        g.id, desc, goal_type, g.status, schedules.len(), next_run
+                        g.id,
+                        desc,
+                        goal_type,
+                        g.status,
+                        schedules.len(),
+                        next_run
                     ));
                 }
                 Ok(output)
@@ -1214,7 +1228,9 @@ impl ManageMemoriesTool {
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("'schedule' is required for add_schedule action"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("'schedule' is required for add_schedule action")
+                    })?;
                 let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
                     Ok(id) => id,
                     Err(e) => return Ok(e.to_string()),
@@ -1233,10 +1249,7 @@ impl ManageMemoriesTool {
                 let cron_expr = match aidaemon_work::schedule::parse_schedule(schedule_raw) {
                     Ok(expr) => expr,
                     Err(e) => {
-                        return Ok(format!(
-                            "Couldn't parse schedule '{}': {}",
-                            schedule_raw, e
-                        ))
+                        return Ok(format!("Couldn't parse schedule '{}': {}", schedule_raw, e));
                     }
                 };
                 let next_local = match aidaemon_work::schedule::compute_next_run_local(&cron_expr) {
@@ -1245,7 +1258,7 @@ impl ManageMemoriesTool {
                         return Ok(format!(
                             "Couldn't compute next run for '{}': {}",
                             cron_expr, e
-                        ))
+                        ));
                     }
                 };
 
@@ -1263,12 +1276,12 @@ impl ManageMemoriesTool {
                             return Ok(format!(
                                 "Invalid fire_policy '{}'. Use 'coalesce' or 'always_fire'.",
                                 other
-                            ))
+                            ));
                         }
                     },
-                    is_one_shot: args
-                        .is_one_shot
-                        .unwrap_or_else(|| aidaemon_work::schedule::is_one_shot_schedule(&cron_expr)),
+                    is_one_shot: args.is_one_shot.unwrap_or_else(|| {
+                        aidaemon_work::schedule::is_one_shot_schedule(&cron_expr)
+                    }),
                     is_paused: args.is_paused.unwrap_or(false),
                     last_run_at: None,
                     next_run_at: next_local.with_timezone(&chrono::Utc).to_rfc3339(),
@@ -1285,10 +1298,9 @@ impl ManageMemoriesTool {
                 ))
             }
             "cancel_scheduled" => {
-                let goal_id_input = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for cancel_scheduled action"))?;
+                let goal_id_input = args.goal_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'goal_id' is required for cancel_scheduled action")
+                })?;
                 let goal_id_trimmed = goal_id_input.trim();
 
                 if goal_id_trimmed.eq_ignore_ascii_case("all") || goal_id_trimmed == "*" {
@@ -1416,10 +1428,9 @@ impl ManageMemoriesTool {
                 ))
             }
             "pause_scheduled" => {
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for pause_scheduled action"))?;
+                let goal_id = args.goal_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'goal_id' is required for pause_scheduled action")
+                })?;
                 let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
                     Ok(id) => id,
                     Err(e) => return Ok(e.to_string()),
@@ -1455,10 +1466,9 @@ impl ManageMemoriesTool {
                 Ok(format!("Paused scheduled goal {}.", resolved_goal_id))
             }
             "resume_scheduled" => {
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for resume_scheduled action"))?;
+                let goal_id = args.goal_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'goal_id' is required for resume_scheduled action")
+                })?;
                 let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
                     Ok(id) => id,
                     Err(e) => return Ok(e.to_string()),
@@ -1503,10 +1513,9 @@ impl ManageMemoriesTool {
                 Ok(format!("Resumed scheduled goal {}.", resolved_goal_id))
             }
             "retry_scheduled" => {
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for retry_scheduled action"))?;
+                let goal_id = args.goal_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'goal_id' is required for retry_scheduled action")
+                })?;
                 let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
                     Ok(id) => id,
                     Err(e) => return Ok(e.to_string()),
@@ -1618,7 +1627,9 @@ impl ManageMemoriesTool {
                     .as_deref()
                     .map(str::trim)
                     .filter(|q| !q.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("'query' is required for cancel_scheduled_matching action"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("'query' is required for cancel_scheduled_matching action")
+                    })?;
                 let goals = self.state.get_scheduled_goals().await?;
                 let mut matched: Vec<&crate::tools::traits::Goal> = goals
                     .iter()
@@ -1665,7 +1676,10 @@ impl ManageMemoriesTool {
                     out.push_str(&format!("\nCancelled:\n- {}", cancelled.join("\n- ")));
                 }
                 if !protected.is_empty() {
-                    out.push_str(&format!("\nProtected (not cancelled):\n- {}", protected.join("\n- ")));
+                    out.push_str(&format!(
+                        "\nProtected (not cancelled):\n- {}",
+                        protected.join("\n- ")
+                    ));
                 }
                 if !already_terminal.is_empty() {
                     out.push_str(&format!(
@@ -1684,7 +1698,9 @@ impl ManageMemoriesTool {
                     .as_deref()
                     .map(str::trim)
                     .filter(|q| !q.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("'query' is required for retry_scheduled_matching action"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("'query' is required for retry_scheduled_matching action")
+                    })?;
                 let goals = self.state.get_scheduled_goals().await?;
                 let mut matched: Vec<&crate::tools::traits::Goal> = goals
                     .iter()
@@ -1738,7 +1754,10 @@ impl ManageMemoriesTool {
                     out.push_str(&format!("\nRetried:\n- {}", retried.join("\n- ")));
                 }
                 if !non_failed.is_empty() {
-                    out.push_str(&format!("\nNot failed/stalled (unchanged):\n- {}", non_failed.join("\n- ")));
+                    out.push_str(&format!(
+                        "\nNot failed/stalled (unchanged):\n- {}",
+                        non_failed.join("\n- ")
+                    ));
                 }
                 if !cap_blocked.is_empty() {
                     out.push_str(&format!(
@@ -1752,10 +1771,9 @@ impl ManageMemoriesTool {
                 Ok(out)
             }
             "diagnose_scheduled" => {
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for diagnose_scheduled action"))?;
+                let goal_id = args.goal_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'goal_id' is required for diagnose_scheduled action")
+                })?;
                 let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
                     Ok(id) => id,
                     Err(e) => return Ok(e.to_string()),
@@ -1832,8 +1850,10 @@ impl ManageMemoriesTool {
                     }
                 }
 
-                if let Some(last_failed_task) = tasks.iter().filter(|t| t.status == "failed").max_by(
-                    |a, b| {
+                if let Some(last_failed_task) = tasks
+                    .iter()
+                    .filter(|t| t.status == "failed")
+                    .max_by(|a, b| {
                         let a_key = a
                             .completed_at
                             .clone()
@@ -1845,8 +1865,8 @@ impl ManageMemoriesTool {
                             .or_else(|| b.started_at.clone())
                             .unwrap_or_else(|| b.created_at.clone());
                         a_key.cmp(&b_key)
-                    },
-                ) {
+                    })
+                {
                     out.push_str(&format!(
                         "\n\n**Latest Failed Task**\n- Task ID: {}\n- Description: {}\n- Error: {}",
                         last_failed_task.id,
@@ -1867,7 +1887,10 @@ impl ManageMemoriesTool {
                         out.push_str("\n\n**Recent Activity**");
                         for a in activities.iter().rev().take(3).rev() {
                             let tool = a.tool_name.as_deref().unwrap_or("-");
-                            let ok = a.success.map(|v| if v { "ok" } else { "err" }).unwrap_or("n/a");
+                            let ok = a
+                                .success
+                                .map(|v| if v { "ok" } else { "err" })
+                                .unwrap_or("n/a");
                             let result = a
                                 .result
                                 .as_deref()
@@ -1891,20 +1914,24 @@ impl ManageMemoriesTool {
                 Ok(out)
             }
             "trigger_now" => {
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for trigger_now action"))?;
+                let goal_id = args.goal_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'goal_id' is required for trigger_now action")
+                })?;
                 // Keep this compatibility action on the same implementation as
                 // `scheduled_goal_runs(run_now)`. The former duplicate path did
                 // not copy goal context or establish a fresh rooted goal run,
                 // which could silently drop updated instructions and attach a
                 // manual task to stale ownership state.
-                aidaemon_work::tools::scheduled_goal_runs::ScheduledGoalRunsTool::new(self.state.clone())
-                    .run_now(goal_id, None)
-                    .await
+                aidaemon_work::tools::scheduled_goal_runs::ScheduledGoalRunsTool::new(
+                    self.state.clone(),
+                )
+                .run_now(goal_id, None)
+                .await
             }
-            other => Ok(format!("Unknown action: '{}'. Use list, forget, set_privacy, search, create_personal_goal, list_goals, complete_goal, abandon_goal, create_scheduled_goal, activate_scheduled, list_scheduled, list_scheduled_matching, add_schedule, cancel_scheduled, pause_scheduled, resume_scheduled, retry_scheduled, retry_failed_scheduled, cancel_scheduled_matching, retry_scheduled_matching, diagnose_scheduled, or trigger_now.", other)),
+            other => Ok(format!(
+                "Unknown action: '{}'. Use list, forget, set_privacy, search, create_personal_goal, list_goals, complete_goal, abandon_goal, create_scheduled_goal, activate_scheduled, list_scheduled, list_scheduled_matching, add_schedule, cancel_scheduled, pause_scheduled, resume_scheduled, retry_scheduled, retry_failed_scheduled, cancel_scheduled_matching, retry_scheduled_matching, diagnose_scheduled, or trigger_now.",
+                other
+            )),
         }
     }
 

@@ -1191,15 +1191,19 @@ mod tests {
 
     #[test]
     fn only_turn_streaming_is_ephemeral() {
-        assert!(!Event::TurnStatus {
-            turn_id: "t".into(),
-            status: TurnStatus::Thinking
-        }
-        .is_durable());
-        assert!(Event::AssistantMessage {
-            session_id: "s".into(),
-            text: "x".into()
-        }
-        .is_durable());
+        assert!(
+            !Event::TurnStatus {
+                turn_id: "t".into(),
+                status: TurnStatus::Thinking
+            }
+            .is_durable()
+        );
+        assert!(
+            Event::AssistantMessage {
+                session_id: "s".into(),
+                text: "x".into()
+            }
+            .is_durable()
+        );
     }
 }

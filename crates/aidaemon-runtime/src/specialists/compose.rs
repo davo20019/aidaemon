@@ -7,7 +7,7 @@ use std::sync::Arc;
 use aidaemon_agents::specialist::SpecialistKind;
 use aidaemon_events::traits::AgentRole;
 use aidaemon_tools::OutcomeTool;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -327,18 +327,19 @@ pub fn collect_executor_expected_targets(
         && let Some(target) = aidaemon_tools::semantics::ToolTargetHint::new(
             aidaemon_tools::semantics::ToolTargetHintKind::ProjectScope,
             scope,
-        ) {
-            targets.push(target);
-        }
+        )
+    {
+        targets.push(target);
+    }
 
     let mut add_dir = |dir: String| {
         if let Some(target) = aidaemon_tools::semantics::ToolTargetHint::new(
             aidaemon_tools::semantics::ToolTargetHintKind::Path,
             dir,
-        )
-            && !targets.iter().any(|existing| existing == &target) {
-                targets.push(target);
-            }
+        ) && !targets.iter().any(|existing| existing == &target)
+        {
+            targets.push(target);
+        }
     };
 
     for dir in extract_directory_paths(mission) {

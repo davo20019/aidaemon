@@ -281,7 +281,7 @@ mod tests {
     }
     #[tokio::test]
     async fn bound_goal_workspace_beats_mission_text_scope_extraction() {
-        use crate::testing::{setup_test_agent_root, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent_root};
         use crate::traits::store_prelude::*;
 
         // Root-mode agent: the binding applies to non-executor roles (the
@@ -361,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn relative_paths_in_mission_text_anchor_to_the_bound_goal_workspace() {
-        use crate::testing::{setup_test_agent_root, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent_root};
         use crate::traits::store_prelude::*;
 
         let mut harness = setup_test_agent_root(MockProvider::new())
@@ -422,7 +422,7 @@ mod tests {
 
     #[tokio::test]
     async fn executor_inherited_workspace_anchors_relative_handoff_paths() {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
 
         // `setup_test_agent` builds an executor-role agent: the workspace a
         // parent hands to it is its typed binding.
@@ -503,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_task_context_excludes_unrelated_parent_messages() {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
@@ -534,7 +534,7 @@ mod tests {
 
     #[tokio::test]
     async fn unresolved_dialogue_state_carries_original_completion_obligations() {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::{
             DialogueState, DialogueStateStore, OpenRequest, OpenRequestStatus, UserTurnKind,
             UserTurnSummary,
@@ -595,23 +595,27 @@ mod tests {
             .await;
 
         assert_eq!(turn_context.followup_mode, Some(FollowupMode::Followup));
-        assert!(turn_context
-            .goal_user_text
-            .contains(&state.open_request.unwrap().text));
+        assert!(
+            turn_context
+                .goal_user_text
+                .contains(&state.open_request.unwrap().text)
+        );
         assert_eq!(
             turn_context.completion_contract.task_kind,
             CompletionTaskKind::Diagnose
         );
         assert!(turn_context.completion_contract.expects_mutation);
-        assert!(turn_context
-            .completion_contract
-            .required_mutation_effects
-            .contains(crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE));
+        assert!(
+            turn_context
+                .completion_contract
+                .required_mutation_effects
+                .contains(crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE)
+        );
     }
 
     #[tokio::test]
     async fn internal_continuation_output_cannot_replace_request_verification_target() {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::{
             DialogueState, DialogueStateStore, MessageStore, OpenRequest, OpenRequestStatus,
         };
@@ -683,16 +687,18 @@ mod tests {
             CompletionTaskKind::Find
         );
         assert!(turn_context.completion_contract.requires_observation);
-        assert!(turn_context
-            .completion_contract
-            .verification_targets
-            .is_empty());
+        assert!(
+            turn_context
+                .completion_contract
+                .verification_targets
+                .is_empty()
+        );
         assert!(turn_context.goal_user_text.contains(original));
         assert!(turn_context.goal_user_text.contains("workspace-gca"));
     }
 
     async fn turn_context_after_request(antecedent: &str, current: &str) -> TurnContext {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::{
             DialogueState, DialogueStateStore, MessageStore, UserTurnKind, UserTurnSummary,
         };
@@ -784,7 +790,7 @@ mod tests {
 
     #[tokio::test]
     async fn followup_inherits_antecedent_scope_over_older_project_root() {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::{
             DialogueState, DialogueStateStore, MessageStore, UserTurnKind, UserTurnSummary,
         };
@@ -858,7 +864,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_turn_context_does_not_reuse_old_local_scope_for_external_followup() {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
@@ -909,7 +915,7 @@ mod tests {
     }
     #[tokio::test]
     async fn build_turn_context_keeps_detailed_schedule_request_separate_from_previous_task() {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
@@ -952,7 +958,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_turn_context_does_not_carry_prior_user_into_new_task_goal_text() {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
@@ -987,7 +993,7 @@ mod tests {
     #[tokio::test]
     async fn persistence_override_keeps_raw_tool_result_ephemeral() {
         use crate::events::{EventEmitter, EventType, ToolResultData};
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
@@ -1034,15 +1040,17 @@ mod tests {
         assert!(!tool_result.result.contains("historical evidence"));
 
         let working = harness.state.get_history(session_id, 10).await.unwrap();
-        assert!(working
-            .iter()
-            .any(|message| message.content.as_deref() == Some("verbatim historical evidence")));
+        assert!(
+            working
+                .iter()
+                .any(|message| message.content.as_deref() == Some("verbatim historical evidence"))
+        );
     }
 
     #[tokio::test]
     async fn tool_artifact_gets_durable_resource_identity() {
         use crate::events::{EventEmitter, EventType, ResourceRegisteredData};
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::{AttachmentProvenance, MessageAttachment, MessageStore};
 
         let harness = setup_test_agent(MockProvider::new())
@@ -1097,19 +1105,23 @@ mod tests {
             registered.produced_by_tool_call_id.as_deref(),
             Some("browser-call")
         );
-        assert!(harness
-            .agent
-            .event_store()
-            .get_resource(session_id, &registered.resource_id)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            harness
+                .agent
+                .event_store()
+                .get_resource(session_id, &registered.resource_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         let history = harness.state.get_history(session_id, 10).await.unwrap();
-        assert!(history[0]
-            .content
-            .as_deref()
-            .unwrap_or_default()
-            .contains(&registered.resource_id));
+        assert!(
+            history[0]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&registered.resource_id)
+        );
     }
 }

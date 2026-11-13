@@ -88,11 +88,13 @@ mod tests {
             response_rx.await.unwrap(),
             ApprovalResponse::AllowOnce
         ));
-        assert!(store
-            .get_pending_interactions("session-approval")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .get_pending_interactions("session-approval")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

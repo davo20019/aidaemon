@@ -57,69 +57,74 @@ pub fn format_goal_context(ctx_json: &str) -> String {
     let mut output = String::new();
 
     if let Some(facts) = ctx.get("relevant_facts").and_then(|v| v.as_array())
-        && !facts.is_empty() {
-            output.push_str("\n### Relevant Facts\n");
-            for f in facts {
-                let cat = f.get("category").and_then(|v| v.as_str()).unwrap_or("?");
-                let key = f.get("key").and_then(|v| v.as_str()).unwrap_or("?");
-                let val = f.get("value").and_then(|v| v.as_str()).unwrap_or("?");
-                output.push_str(&format!("- [{}] {}: {}\n", cat, key, val));
-            }
+        && !facts.is_empty()
+    {
+        output.push_str("\n### Relevant Facts\n");
+        for f in facts {
+            let cat = f.get("category").and_then(|v| v.as_str()).unwrap_or("?");
+            let key = f.get("key").and_then(|v| v.as_str()).unwrap_or("?");
+            let val = f.get("value").and_then(|v| v.as_str()).unwrap_or("?");
+            output.push_str(&format!("- [{}] {}: {}\n", cat, key, val));
         }
+    }
 
     if let Some(procs) = ctx.get("relevant_procedures").and_then(|v| v.as_array())
-        && !procs.is_empty() {
-            output.push_str("\n### Relevant Procedures\n");
-            for p in procs {
-                let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let trigger = p.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
-                output.push_str(&format!("- **{}** (trigger: {})\n", name, trigger));
-                if let Some(steps) = p.get("steps").and_then(|v| v.as_array()) {
-                    for (i, step) in steps.iter().enumerate() {
-                        let s = step.as_str().unwrap_or("?");
-                        output.push_str(&format!("  {}. {}\n", i + 1, s));
-                    }
+        && !procs.is_empty()
+    {
+        output.push_str("\n### Relevant Procedures\n");
+        for p in procs {
+            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let trigger = p.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
+            output.push_str(&format!("- **{}** (trigger: {})\n", name, trigger));
+            if let Some(steps) = p.get("steps").and_then(|v| v.as_array()) {
+                for (i, step) in steps.iter().enumerate() {
+                    let s = step.as_str().unwrap_or("?");
+                    output.push_str(&format!("  {}. {}\n", i + 1, s));
                 }
             }
         }
+    }
 
     if let Some(hints) = ctx.get("project_hints").and_then(|v| v.as_array())
-        && !hints.is_empty() {
-            output.push_str("\n### Project Hints\n");
-            for hint in hints.iter().filter_map(|h| h.as_str()) {
-                if !hint.trim().is_empty() {
-                    output.push_str(&format!("- {}\n", hint.trim()));
-                }
+        && !hints.is_empty()
+    {
+        output.push_str("\n### Project Hints\n");
+        for hint in hints.iter().filter_map(|h| h.as_str()) {
+            if !hint.trim().is_empty() {
+                output.push_str(&format!("- {}\n", hint.trim()));
             }
         }
+    }
 
     if let Some(messages) = ctx.get("recent_messages").and_then(|v| v.as_array())
-        && !messages.is_empty() {
-            output.push_str("\n### Recent Parent Conversation\n");
-            for row in messages {
-                let role = row.get("role").and_then(|v| v.as_str()).unwrap_or("?");
-                let content = row.get("content").and_then(|v| v.as_str()).unwrap_or("?");
-                output.push_str(&format!("- [{}] {}\n", role, content));
-            }
+        && !messages.is_empty()
+    {
+        output.push_str("\n### Recent Parent Conversation\n");
+        for row in messages {
+            let role = row.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+            let content = row.get("content").and_then(|v| v.as_str()).unwrap_or("?");
+            output.push_str(&format!("- [{}] {}\n", role, content));
         }
+    }
 
     if let Some(results) = ctx.get("task_results").and_then(|v| v.as_array())
-        && !results.is_empty() {
-            output.push_str("\n### Completed Task Results\n");
-            for r in results {
-                if let Some(s) = r.as_str() {
-                    // Compressed entry
-                    output.push_str(&format!("- {}\n", s));
-                } else {
-                    let desc = r.get("description").and_then(|v| v.as_str()).unwrap_or("?");
-                    let summary = r
-                        .get("result_summary")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(no summary)");
-                    output.push_str(&format!("- {}: {}\n", desc, summary));
-                }
+        && !results.is_empty()
+    {
+        output.push_str("\n### Completed Task Results\n");
+        for r in results {
+            if let Some(s) = r.as_str() {
+                // Compressed entry
+                output.push_str(&format!("- {}\n", s));
+            } else {
+                let desc = r.get("description").and_then(|v| v.as_str()).unwrap_or("?");
+                let summary = r
+                    .get("result_summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no summary)");
+                output.push_str(&format!("- {}: {}\n", desc, summary));
             }
         }
+    }
 
     if output.is_empty() {
         "(no relevant prior knowledge)".to_string()
@@ -475,8 +480,7 @@ pub fn channel_rules(
          Only update after explicit confirmation.\n",
     );
     }
-    let tool_names_rule =
-        "4. **Never mention tool names in responses.** \
+    let tool_names_rule = "4. **Never mention tool names in responses.** \
          Do not reference internal tool names like `remember_fact`, `terminal`, `web_search`, or any other tool \
          by its programmatic name in your replies. Describe actions in natural language instead \
          (e.g., \"I'll look that up\" not \"I'll use the web_search tool\"). Do not invent slash commands \

@@ -5,13 +5,13 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use aidaemon_core::{AccessManifest, ToolAnnotations};
 
-use super::{path_arg, workspace_parts, FilePolicy, SharedBackend, ToolText};
+use super::{FilePolicy, SharedBackend, ToolText, path_arg, workspace_parts};
 use crate::backend::{BackendMetadata, BackendPath};
-use crate::outcome::{core_tool, OutcomeTool};
+use crate::outcome::{OutcomeTool, core_tool};
 use crate::semantics::{
     AttachmentProvenance, MessageAttachment, ReadFileResultMetadata, ReadFileSelectionMetadata,
     ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
@@ -617,9 +617,10 @@ fn read_selected_lines(content: &str, selection: ReadSelection) -> SelectedLines
             for line in content.lines() {
                 total_lines += 1;
                 if lines.len() == count
-                    && let Some(dropped) = lines.pop_front() {
-                        stored_bytes = stored_bytes.saturating_sub(dropped.len() + 1);
-                    }
+                    && let Some(dropped) = lines.pop_front()
+                {
+                    stored_bytes = stored_bytes.saturating_sub(dropped.len() + 1);
+                }
                 let line = cap_line(line.to_string());
                 stored_bytes += line.len() + 1;
                 lines.push_back(line);

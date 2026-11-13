@@ -116,7 +116,9 @@ mod tests {
             Some(Some(200_000))
         );
         assert_eq!(
-            context_overflow("The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."),
+            context_overflow(
+                "The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."
+            ),
             Some(Some(1_048_576))
         );
         assert_eq!(

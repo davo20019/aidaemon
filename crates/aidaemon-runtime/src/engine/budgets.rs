@@ -212,8 +212,8 @@ pub fn task_budget_step(
 use std::sync::atomic::Ordering;
 
 use aidaemon_core as sdk;
-use aidaemon_events::conversation::Message;
 use aidaemon_events::TaskOutcome;
+use aidaemon_events::conversation::Message;
 use aidaemon_tools::semantics::UserRole;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -235,19 +235,20 @@ pub async fn serve_sdk_budget(host: &dyn TurnHost, scope: &TurnScope<'_>, check:
     let iteration = scope.model_calls.load(Ordering::Relaxed) as usize;
     let mut decision = sdk::ModelDecision::Accept;
     if let Some(usage) = usage
-        && let Some(stop) = sdk_charge_budgets(host, scope, &usage, iteration).await {
-            // Closeout grace: a final answer on the first call, or after
-            // real progress, still ships; otherwise the budget reply
-            // replaces it and no further work runs.
-            let grace = check.response.tool_calls.is_empty()
-                && (iteration == 1 || scope.succeeded_calls.load(Ordering::Relaxed) > 0);
-            if !grace {
-                scope.verdict.record_budget_stop(stop, TaskOutcome::Failed);
-                decision = sdk::ModelDecision::Stop {
-                    reason: GOAL_BUDGET_EXHAUSTED.to_string(),
-                };
-            }
+        && let Some(stop) = sdk_charge_budgets(host, scope, &usage, iteration).await
+    {
+        // Closeout grace: a final answer on the first call, or after
+        // real progress, still ships; otherwise the budget reply
+        // replaces it and no further work runs.
+        let grace = check.response.tool_calls.is_empty()
+            && (iteration == 1 || scope.succeeded_calls.load(Ordering::Relaxed) > 0);
+        if !grace {
+            scope.verdict.record_budget_stop(stop, TaskOutcome::Failed);
+            decision = sdk::ModelDecision::Stop {
+                reason: GOAL_BUDGET_EXHAUSTED.to_string(),
+            };
         }
+    }
     if decision == sdk::ModelDecision::Accept && !check.response.tool_calls.is_empty() {
         persist_sdk_tool_call_message(host, scope, &check.response).await;
     }

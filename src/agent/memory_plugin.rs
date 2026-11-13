@@ -48,15 +48,15 @@ pub(crate) use writer::{DaemonMemoryWriter, MemoryWrites, WriterSettings};
 
 #[cfg(test)]
 pub(crate) use aidaemon_runtime::turn::memory::MANAGE_MEMORIES_GOAL_ACTIONS;
+pub(crate) use aidaemon_runtime::turn::memory::{
+    DAEMON_MEMORY_TOOLS, MemoryParts, MemoryPlugin, MemoryTurn,
+};
+#[cfg(test)]
+pub(crate) use aidaemon_runtime::turn::memory::{
+    DaemonToolOffer, daemon_tool_offer, goal_actions_view,
+};
 #[cfg(test)]
 pub(crate) use aidaemon_runtime::turn::memory::{check_goal_action, memory_parts};
-#[cfg(test)]
-pub(crate) use aidaemon_runtime::turn::memory::{
-    daemon_tool_offer, goal_actions_view, DaemonToolOffer,
-};
-pub(crate) use aidaemon_runtime::turn::memory::{
-    MemoryParts, MemoryPlugin, MemoryTurn, DAEMON_MEMORY_TOOLS,
-};
 
 /// The memory system this daemon runs with.
 pub(crate) struct ConfiguredMemory {

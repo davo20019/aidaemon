@@ -14,9 +14,9 @@
 //!
 //! Live with ANTHROPIC_API_KEY or OPENAI_API_KEY, otherwise scripted:
 //! cargo run -p aidaemon-sdk --example sub_agent --features testing
-use aidaemon_sdk::agents::{run_all, AgentTool, ChildBudget};
+use aidaemon_sdk::agents::{AgentTool, ChildBudget, run_all};
 use aidaemon_sdk::prelude::*;
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
 use serde_json::json;
 
 /// Search the synthetic product catalog.

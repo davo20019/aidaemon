@@ -390,9 +390,9 @@ impl crate::state::types::MessageStore for SqliteStateStore {
             && !e
                 .to_string()
                 .contains("no such table: conversation_summaries")
-            {
-                return Err(e.into());
-            }
+        {
+            return Err(e.into());
+        }
         Ok(())
     }
 

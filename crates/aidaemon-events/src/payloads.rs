@@ -1829,9 +1829,10 @@ impl ToolCallData {
                 // Generic: show first argument value if simple
                 if let Some(obj) = arguments.as_object()
                     && let Some((_, first_val)) = obj.iter().next()
-                        && let Some(s) = first_val.as_str() {
-                            return truncate_str(s, 30);
-                        }
+                    && let Some(s) = first_val.as_str()
+                {
+                    return truncate_str(s, 30);
+                }
                 name.to_string()
             }
         }
@@ -2346,15 +2347,21 @@ mod tests {
         assert_eq!(roundtrip, receipt);
         assert_eq!(roundtrip.schema_version, ToolReceiptV1::SCHEMA_VERSION);
         assert_eq!(roundtrip.schema_version, 7);
-        assert!(roundtrip
-            .context_header()
-            .contains("durable_view=truncated"));
-        assert!(roundtrip
-            .context_header()
-            .contains("requested_range=lines:4-12"));
-        assert!(roundtrip
-            .context_header()
-            .contains("returned_range=lines:4-9"));
+        assert!(
+            roundtrip
+                .context_header()
+                .contains("durable_view=truncated")
+        );
+        assert!(
+            roundtrip
+                .context_header()
+                .contains("requested_range=lines:4-12")
+        );
+        assert!(
+            roundtrip
+                .context_header()
+                .contains("returned_range=lines:4-9")
+        );
         let replay = roundtrip.to_metadata();
         assert!(replay.receipt_replayed);
         assert_eq!(replay.outcome_status, Some(ToolOutcomeStatus::Succeeded));
@@ -2371,10 +2378,12 @@ mod tests {
         );
         assert!(replay.contract_rejected);
         assert_eq!(replay.effective_tool_name.as_deref(), Some("terminal"));
-        assert!(replay
-            .semantics
-            .mutation_effects
-            .contains(crate::traits::ToolMutationEffects::REMOTE_DEPLOY));
+        assert!(
+            replay
+                .semantics
+                .mutation_effects
+                .contains(crate::traits::ToolMutationEffects::REMOTE_DEPLOY)
+        );
 
         let legacy: ToolResultData = serde_json::from_value(json!({
             "tool_call_id": "call-legacy",

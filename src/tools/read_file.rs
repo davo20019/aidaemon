@@ -8,7 +8,7 @@ use crate::traits::{
 #[cfg(test)]
 use aidaemon_tools::render_read_file_output_within;
 #[cfg(test)]
-use aidaemon_tools::{render_read_file_output, MAX_READ_CHARS};
+use aidaemon_tools::{MAX_READ_CHARS, render_read_file_output};
 #[cfg(test)]
 use serde_json::json;
 
@@ -291,9 +291,11 @@ mod tests {
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
-        assert!(outcome
-            .output
-            .contains("range modes are mutually exclusive"));
+        assert!(
+            outcome
+                .output
+                .contains("range modes are mutually exclusive")
+        );
         assert!(outcome.metadata.contract_rejected);
         assert_eq!(
             outcome.metadata.outcome_status,
@@ -557,9 +559,11 @@ mod tests {
         assert!(outcome.output.contains("| line number 1 "));
         assert!(outcome.output.contains("NOT returned"));
         let end = metadata.returned_end_line.unwrap();
-        assert!(outcome
-            .output
-            .contains(&format!("\"start_line\": {}", end + 1)));
+        assert!(
+            outcome
+                .output
+                .contains(&format!("\"start_line\": {}", end + 1))
+        );
     }
 
     #[tokio::test]

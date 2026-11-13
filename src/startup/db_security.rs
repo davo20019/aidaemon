@@ -4,9 +4,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use rand::Rng;
 use rand::rand_core::UnwrapErr;
 use rand::rngs::SysRng;
-use rand::Rng;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tracing::{info, warn};
@@ -102,14 +102,16 @@ fn resolve_or_create_encryption_key(
     db_mode: DbMode,
 ) -> anyhow::Result<String> {
     if let Some(ref key) = config.state.encryption_key
-        && !key.trim().is_empty() {
-            return Ok(key.trim().to_string());
-        }
+        && !key.trim().is_empty()
+    {
+        return Ok(key.trim().to_string());
+    }
 
     if let Ok(key) = std::env::var(DB_ENCRYPTION_ENV_KEY)
-        && !key.trim().is_empty() {
-            return Ok(key.trim().to_string());
-        }
+        && !key.trim().is_empty()
+    {
+        return Ok(key.trim().to_string());
+    }
 
     if db_mode == DbMode::EncryptedOrUnknown {
         anyhow::bail!(
@@ -430,9 +432,10 @@ fn detect_db_mode(db_path: &Path) -> anyhow::Result<DbMode> {
 #[cfg(feature = "encryption")]
 fn resolve_env_file_path(config_path: &Path) -> PathBuf {
     if let Ok(path) = std::env::var(DB_ENV_FILE_ENV_KEY)
-        && !path.trim().is_empty() {
-            return PathBuf::from(path);
-        }
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
     config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -529,9 +532,10 @@ fn shm_path(db_path: &Path) -> PathBuf {
 #[cfg(feature = "encryption")]
 fn remove_if_exists(path: PathBuf) {
     if path.exists()
-        && let Err(e) = std::fs::remove_file(&path) {
-            warn!(path = %path.display(), error = %e, "Failed to remove stale SQLite sidecar file");
-        }
+        && let Err(e) = std::fs::remove_file(&path)
+    {
+        warn!(path = %path.display(), error = %e, "Failed to remove stale SQLite sidecar file");
+    }
 }
 
 fn set_file_mode_0600(path: &Path) -> anyhow::Result<()> {

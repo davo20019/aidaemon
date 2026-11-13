@@ -13,7 +13,7 @@ mod render;
 mod running;
 
 #[cfg(feature = "registry")]
-pub use proxied::{mcp_tool_capabilities, server_options, RegisteredMcpTool};
+pub use proxied::{RegisteredMcpTool, mcp_tool_capabilities, server_options};
 #[cfg(feature = "registry")]
 pub use running::{McpRegistry, McpServerConfig, McpServerEntry, ServerInfo};
 

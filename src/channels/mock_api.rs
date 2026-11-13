@@ -97,9 +97,10 @@ async fn serve(
                 break;
             }
             if let Some((key, value)) = header.split_once(':')
-                && key.eq_ignore_ascii_case("content-length") {
-                    length = value.trim().parse().unwrap_or(0);
-                }
+                && key.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap_or(0);
+            }
         }
         let mut body = vec![0u8; length];
         if reader.read_exact(&mut body).await.is_err() {

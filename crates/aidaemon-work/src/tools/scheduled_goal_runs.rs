@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::traits::{
-    semantics_for_exact_read_actions, ScheduledGoalRunsStore, Task, TaskActivity,
-    ToolArgumentContractViolation, ToolCallContext, ToolCallMetadata, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolResultPresentation,
+    ScheduledGoalRunsStore, Task, TaskActivity, ToolArgumentContractViolation, ToolCallContext,
+    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    ToolResultPresentation, semantics_for_exact_read_actions,
 };
 use aidaemon_tools::OutcomeTool as Tool;
 
@@ -86,7 +86,7 @@ impl ScheduledGoalRunsTool {
                 return Ok(format!(
                     "workspace_path does not exist or is not accessible: {} ({error})",
                     expanded.display()
-                ))
+                ));
             }
         };
         if !canonical.is_dir() {
@@ -269,12 +269,13 @@ impl ScheduledGoalRunsTool {
             goal.id, old_per_check, goal.budget_per_check, old_daily, goal.budget_daily
         );
         if let Some(budget_daily) = goal.budget_daily
-            && goal.tokens_used_today >= budget_daily {
-                out.push_str(&format!(
+            && goal.tokens_used_today >= budget_daily
+        {
+            out.push_str(&format!(
                     "\nNote: tokens_used_today={} already exceeds the new budget_daily={}, so new scheduled runs may be skipped until the UTC daily reset.",
                     goal.tokens_used_today, budget_daily
                 ));
-            }
+        }
         Ok(out)
     }
 
@@ -614,17 +615,18 @@ impl ScheduledGoalRunsTool {
                     effective_budget,
                     used_today,
                     crate::goal_tokens::SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
-                ) {
-                    let persisted = crate::goal_tokens::persist_goal_daily_budget_override(
-                        self.state.as_ref(),
-                        &goal.id,
-                        next_budget,
-                        extensions_count.saturating_add(1),
-                    )
-                    .await?;
-                    adaptive_extension = Some((effective_budget, persisted.budget_daily));
-                    effective_budget = persisted.budget_daily;
-                }
+                )
+            {
+                let persisted = crate::goal_tokens::persist_goal_daily_budget_override(
+                    self.state.as_ref(),
+                    &goal.id,
+                    next_budget,
+                    extensions_count.saturating_add(1),
+                )
+                .await?;
+                adaptive_extension = Some((effective_budget, persisted.budget_daily));
+                effective_budget = persisted.budget_daily;
+            }
 
             if used_today >= effective_budget {
                 return Ok(format!(
@@ -690,8 +692,7 @@ impl ScheduledGoalRunsTool {
             };
             return Ok(format!(
                 "{action}; no duplicate run was created.\n- Durable run ID: {run_id}\n- Open task(s): {}\n- Goal status: {}",
-                preview,
-                goal.status,
+                preview, goal.status,
             ));
         }
 
@@ -1227,92 +1228,91 @@ impl ScheduledGoalRunsTool {
         let args: ScheduledGoalRunsArgs = serde_json::from_str(arguments)?;
 
         match args.action.as_str() {
-	            "overview" => {
-	                self.overview(
-	                    args.limit.unwrap_or(50),
-	                    args.include_diagnostics.unwrap_or(false),
-	                )
-	                .await
-	            }
-	            "run_now" => {
-	                let goal_id = args
-	                    .goal_id
-	                    .as_deref()
-	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for run_now"))?;
-	                self.run_now(goal_id, args.schedule_id.as_deref()).await
-	            }
-	            "run_history" => {
-	                let goal_id = args
-	                    .goal_id
-	                    .as_deref()
-	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for run_history"))?;
-	                self.run_history(goal_id, args.limit.unwrap_or(10)).await
-	            }
-	            "last_failure" => {
-	                let goal_id = args
-	                    .goal_id
-	                    .as_deref()
-	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for last_failure"))?;
-	                self.last_failure(goal_id).await
-	            }
-	            "unblock_hints" => {
-	                let goal_id = args
-	                    .goal_id
-	                    .as_deref()
-	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for unblock_hints"))?;
-	                self.unblock_hints(goal_id).await
-	            }
-	            "set_budget" => {
-	                let is_owner = facts.user_role == Some(crate::traits::UserRole::Owner);
-	                if !is_owner {
-	                    return Ok("Only owners can change scheduled goal budgets.".to_string());
-	                }
-	                let goal_id = args
-	                    .goal_id
-	                    .as_deref()
-	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for set_budget"))?;
-	                self.set_budget(goal_id, args.budget_per_check, args.budget_daily)
-	                    .await
-	            }
-	            "update_instructions" => {
-	                let is_owner = facts.user_role == Some(crate::traits::UserRole::Owner);
-	                if !is_owner {
-	                    return Ok("Only owners can update scheduled goal instructions.".to_string());
-	                }
-	                let goal_id = args
-	                    .goal_id
-	                    .as_deref()
-	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for update_instructions"))?;
-	                let instructions = args.instructions.as_deref().ok_or_else(|| {
-	                    anyhow::anyhow!("'instructions' is required for update_instructions")
-	                })?;
-	                self.update_instructions(
-                        goal_id,
-                        instructions,
-                        args.run_requirement.as_deref(),
-                        args.insufficient_evidence.as_deref(),
-                    )
+            "overview" => {
+                self.overview(
+                    args.limit.unwrap_or(50),
+                    args.include_diagnostics.unwrap_or(false),
+                )
+                .await
+            }
+            "run_now" => {
+                let goal_id = args
+                    .goal_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for run_now"))?;
+                self.run_now(goal_id, args.schedule_id.as_deref()).await
+            }
+            "run_history" => {
+                let goal_id = args
+                    .goal_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for run_history"))?;
+                self.run_history(goal_id, args.limit.unwrap_or(10)).await
+            }
+            "last_failure" => {
+                let goal_id = args
+                    .goal_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for last_failure"))?;
+                self.last_failure(goal_id).await
+            }
+            "unblock_hints" => {
+                let goal_id = args
+                    .goal_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for unblock_hints"))?;
+                self.unblock_hints(goal_id).await
+            }
+            "set_budget" => {
+                let is_owner = facts.user_role == Some(crate::traits::UserRole::Owner);
+                if !is_owner {
+                    return Ok("Only owners can change scheduled goal budgets.".to_string());
+                }
+                let goal_id = args
+                    .goal_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for set_budget"))?;
+                self.set_budget(goal_id, args.budget_per_check, args.budget_daily)
                     .await
-	            }
-	            "bind_workspace" => {
-	                let is_guest = facts.user_role == Some(crate::traits::UserRole::Guest);
-	                if is_guest {
-	                    return Ok("Guests cannot bind scheduled goal workspaces.".to_string());
-	                }
-	                let goal_id = args
-	                    .goal_id
-	                    .as_deref()
-	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for bind_workspace"))?;
-	                let workspace_path = args.workspace_path.as_deref().ok_or_else(|| {
-	                    anyhow::anyhow!("'workspace_path' is required for bind_workspace")
-	                })?;
-	                self.bind_workspace(goal_id, workspace_path).await
-	            }
-	            other => Ok(format!(
-	                "Unknown action: '{}'. Use overview, run_now, run_history, last_failure, unblock_hints, set_budget, update_instructions, or bind_workspace.",
-	                other
-	            )),
-	        }
+            }
+            "update_instructions" => {
+                let is_owner = facts.user_role == Some(crate::traits::UserRole::Owner);
+                if !is_owner {
+                    return Ok("Only owners can update scheduled goal instructions.".to_string());
+                }
+                let goal_id = args.goal_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'goal_id' is required for update_instructions")
+                })?;
+                let instructions = args.instructions.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'instructions' is required for update_instructions")
+                })?;
+                self.update_instructions(
+                    goal_id,
+                    instructions,
+                    args.run_requirement.as_deref(),
+                    args.insufficient_evidence.as_deref(),
+                )
+                .await
+            }
+            "bind_workspace" => {
+                let is_guest = facts.user_role == Some(crate::traits::UserRole::Guest);
+                if is_guest {
+                    return Ok("Guests cannot bind scheduled goal workspaces.".to_string());
+                }
+                let goal_id = args
+                    .goal_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for bind_workspace"))?;
+                let workspace_path = args.workspace_path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'workspace_path' is required for bind_workspace")
+                })?;
+                self.bind_workspace(goal_id, workspace_path).await
+            }
+            other => Ok(format!(
+                "Unknown action: '{}'. Use overview, run_now, run_history, last_failure, unblock_hints, set_budget, update_instructions, or bind_workspace.",
+                other
+            )),
+        }
     }
 }
 

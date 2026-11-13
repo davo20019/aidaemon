@@ -128,11 +128,7 @@ pub fn resolve_terminal_lite_cwd_from_base(base: &Path, raw: &str) -> anyhow::Re
             .unwrap_or_else(|| base.join(rest))
     } else {
         let p = PathBuf::from(raw);
-        if p.is_absolute() {
-            p
-        } else {
-            base.join(p)
-        }
+        if p.is_absolute() { p } else { base.join(p) }
     };
     let canonical = resolved
         .canonicalize()

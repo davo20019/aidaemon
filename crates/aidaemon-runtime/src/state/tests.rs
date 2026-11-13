@@ -1,6 +1,6 @@
 use super::*;
-use crate::state::types::store_prelude::*;
 use crate::state::types::FactPrivacy;
+use crate::state::types::store_prelude::*;
 use crate::state::types::{
     BehaviorPattern, DynamicBot, DynamicMcpServer, DynamicSkill, Episode, ErrorSolution, Goal,
     GoalSchedule, Message, Procedure, SkillDraft, TokenUsage,
@@ -227,9 +227,11 @@ async fn episode_search_finds_older_than_500_without_counting_a_recall() {
     )
     .await
     .unwrap();
-    assert!(channel_results
-        .iter()
-        .all(|episode| episode.channel_id.as_deref() == Some("slack:C1")));
+    assert!(
+        channel_results
+            .iter()
+            .all(|episode| episode.channel_id.as_deref() == Some("slack:C1"))
+    );
 }
 
 #[tokio::test]
@@ -384,9 +386,11 @@ async fn clear_session_erases_exact_active_artifacts_and_detaches_claims() {
     .unwrap();
     assert!(claim.get::<Option<i64>, _>("source_span_id").is_none());
     assert!(claim.get::<Option<i64>, _>("source_event_id").is_none());
-    assert!(claim
-        .get::<String, _>("provenance")
-        .contains("source_session_wiped"));
+    assert!(
+        claim
+            .get::<String, _>("provenance")
+            .contains("source_session_wiped")
+    );
     let excerpt: Option<String> = sqlx::query_scalar("SELECT source_excerpt FROM facts WHERE id=?")
         .bind(fact)
         .fetch_one(&store.pool)
@@ -2208,15 +2212,17 @@ async fn mandate_cycle_budget_aggregates_lead_and_executor_and_serializes_calls(
         .unwrap();
     assert!(executor_acquired);
     assert_eq!((used, cap), (40, 100));
-    assert!(store
-        .mark_mandate_run_token_lease_dispatched(
-            &run.id,
-            &mandate.id,
-            mandate.version,
-            "executor-call",
-        )
-        .await
-        .unwrap());
+    assert!(
+        store
+            .mark_mandate_run_token_lease_dispatched(
+                &run.id,
+                &mandate.id,
+                mandate.version,
+                "executor-call",
+            )
+            .await
+            .unwrap()
+    );
     assert_eq!(
         store
             .settle_mandate_run_token_lease(&run.id, "executor-call", 60)
@@ -2288,15 +2294,17 @@ async fn expired_unsettled_mandate_call_exhausts_cycle_fail_closed() {
         .await
         .unwrap();
     assert!(acquired);
-    assert!(store
-        .mark_mandate_run_token_lease_dispatched(
-            &run.id,
-            &mandate.id,
-            mandate.version,
-            "crashed-provider-call",
-        )
-        .await
-        .unwrap());
+    assert!(
+        store
+            .mark_mandate_run_token_lease_dispatched(
+                &run.id,
+                &mandate.id,
+                mandate.version,
+                "crashed-provider-call",
+            )
+            .await
+            .unwrap()
+    );
     sqlx::query(
         "UPDATE mandate_run_token_budgets
          SET call_lease_expires_at = datetime('now', '-1 second')
@@ -2362,10 +2370,12 @@ async fn expired_undispatched_mandate_lease_recovers_without_charge() {
         .unwrap();
     assert!(recovered);
     assert_eq!((used, cap), (0, 100));
-    assert!(store
-        .release_mandate_run_token_lease(&run.id, "safe-retry")
-        .await
-        .unwrap());
+    assert!(
+        store
+            .release_mandate_run_token_lease(&run.id, "safe-retry")
+            .await
+            .unwrap()
+    );
 }
 
 // ==================== Dynamic Bot Tests ====================
@@ -2473,19 +2483,23 @@ async fn test_skill_draft_exists_for_procedure_after_dismissal() {
     };
 
     let draft_id = store.add_skill_draft(&draft).await.unwrap();
-    assert!(store
-        .skill_draft_exists_for_procedure("deploy-proc")
-        .await
-        .unwrap());
+    assert!(
+        store
+            .skill_draft_exists_for_procedure("deploy-proc")
+            .await
+            .unwrap()
+    );
 
     store
         .update_skill_draft_status(draft_id, "dismissed")
         .await
         .unwrap();
-    assert!(store
-        .skill_draft_exists_for_procedure("deploy-proc")
-        .await
-        .unwrap());
+    assert!(
+        store
+            .skill_draft_exists_for_procedure("deploy-proc")
+            .await
+            .unwrap()
+    );
 }
 
 // ==================== Dynamic MCP Server Tests ====================
@@ -2570,20 +2584,24 @@ async fn test_oauth_connection_crud() {
     assert_eq!(fetched.account_id, None);
 
     // Bind a stable remote identity independently from token expiry.
-    assert!(store
-        .update_oauth_account_id("twitter", Some("2018008573557551105"))
-        .await
-        .unwrap());
+    assert!(
+        store
+            .update_oauth_account_id("twitter", Some("2018008573557551105"))
+            .await
+            .unwrap()
+    );
     let bound = store
         .get_oauth_connection("twitter")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(bound.account_id.as_deref(), Some("2018008573557551105"));
-    assert!(!store
-        .update_oauth_account_id("missing", Some("synthetic-account"))
-        .await
-        .unwrap());
+    assert!(
+        !store
+            .update_oauth_account_id("missing", Some("synthetic-account"))
+            .await
+            .unwrap()
+    );
 
     // List all
     let all = store.list_oauth_connections().await.unwrap();
@@ -2632,11 +2650,13 @@ async fn test_oauth_connection_crud() {
 
     // Delete
     store.delete_oauth_connection("twitter").await.unwrap();
-    assert!(store
-        .get_oauth_connection("twitter")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .get_oauth_connection("twitter")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(store.list_oauth_connections().await.unwrap().len(), 0);
 }
 
@@ -2673,11 +2693,13 @@ async fn test_pending_oauth_flow_crud() {
     assert_eq!(all.len(), 1);
 
     store.delete_pending_oauth_flow("state-123").await.unwrap();
-    assert!(store
-        .get_pending_oauth_flow("state-123")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .get_pending_oauth_flow("state-123")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -2891,10 +2913,11 @@ async fn test_cli_agent_invocation_cleanup_stale() {
     let inv = invocations.iter().find(|i| i.id == inv_id).unwrap();
     assert!(inv.completed_at.is_some());
     assert_eq!(inv.success, Some(false));
-    assert!(inv
-        .output_summary
-        .as_ref()
-        .is_some_and(|s| s.contains("Auto-closed stale invocation")));
+    assert!(
+        inv.output_summary
+            .as_ref()
+            .is_some_and(|s| s.contains("Auto-closed stale invocation"))
+    );
 
     // Idempotent: second run should do nothing.
     let count2 = store.cleanup_stale_cli_agent_invocations(2).await.unwrap();
@@ -3130,18 +3153,20 @@ async fn migration_repairs_completed_task_overwritten_after_blocked_attempt() {
         .await
         .unwrap()
         .unwrap();
-    assert!(store
-        .patch_task_from_attempt(
-            &attempt.id,
-            &attempt.lease_token,
-            &crate::state::types::TaskAttemptPatch {
-                status: "blocked".to_string(),
-                blocker: Some("Preflight did not run".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap());
+    assert!(
+        store
+            .patch_task_from_attempt(
+                &attempt.id,
+                &attempt.lease_token,
+                &crate::state::types::TaskAttemptPatch {
+                    status: "blocked".to_string(),
+                    blocker: Some("Preflight did not run".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+    );
 
     sqlx::query(
         "UPDATE tasks SET status = 'completed', completed_at = datetime('now') WHERE id = ?",
@@ -4886,11 +4911,13 @@ async fn escalated_recovery_candidates_respect_pause_ownership_cooldown_and_cap(
     .unwrap();
 
     // Paused by the owner (no recovery-owned pause row): never a candidate.
-    assert!(store
-        .list_escalated_recovery_candidates(6 * 3600, 3)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .list_escalated_recovery_candidates(6 * 3600, 3)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     sqlx::query(
         "INSERT INTO scheduled_recovery_paused_schedules (schedule_id, goal_id, paused_at)
@@ -4915,11 +4942,13 @@ async fn escalated_recovery_candidates_respect_pause_ownership_cooldown_and_cap(
         .record_scheduled_recovery_attempt(&goal.id)
         .await
         .unwrap();
-    assert!(store
-        .list_escalated_recovery_candidates(6 * 3600, 3)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .list_escalated_recovery_candidates(6 * 3600, 3)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let state = store
         .get_scheduled_recovery_state(&goal.id)
         .await
@@ -4938,11 +4967,13 @@ async fn escalated_recovery_candidates_respect_pause_ownership_cooldown_and_cap(
     .execute(&pool)
     .await
     .unwrap();
-    assert!(store
-        .list_escalated_recovery_candidates(6 * 3600, 3)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .list_escalated_recovery_candidates(6 * 3600, 3)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         store
             .list_escalated_recovery_candidates(6 * 3600, 4)
@@ -4999,9 +5030,11 @@ async fn automated_sources_cannot_overwrite_owner_stated_facts() {
         .await
         .unwrap();
     let facts = store.get_facts(Some("user")).await.unwrap();
-    assert!(facts
-        .iter()
-        .any(|f| f.key == "pet_name" && f.value == "Max"));
+    assert!(
+        facts
+            .iter()
+            .any(|f| f.key == "pet_name" && f.value == "Max")
+    );
 }
 
 #[tokio::test]

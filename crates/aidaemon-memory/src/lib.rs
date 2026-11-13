@@ -119,39 +119,39 @@ mod writer;
 #[cfg(feature = "fastembed")]
 pub use embed::FastEmbedder;
 pub use embed::{
-    cosine, decode_embedding, decode_embedding_with_dim, encode_embedding, Embedder, HashEmbedder,
+    Embedder, HashEmbedder, cosine, decode_embedding, decode_embedding_with_dim, encode_embedding,
 };
 pub use error::{MemoryError, Result};
 pub use extract::{
-    parse_facts, EpisodeDraft, EpisodeSummarizer, ExtractedFact, Extraction, FactExtractor,
+    EpisodeDraft, EpisodeSummarizer, ExtractedFact, Extraction, FactExtractor, parse_facts,
 };
 pub use learning::{
+    BehaviorPattern, ErrorSolution, Expertise, LearningStore, Procedure, UserProfile,
     backfill_learning_embeddings, detect_domains, error_pattern, expertise_level,
     extract_trigger_pattern, generalize_procedure, new_error_solution, new_procedure,
     procedure_base_name, procedure_keyed_name, record_tool_sequence_patterns, summarize_solution,
-    tool_sequence_patterns, update_communication_profile, verbosity_from_messages, BehaviorPattern,
-    ErrorSolution, Expertise, LearningStore, Procedure, UserProfile,
+    tool_sequence_patterns, update_communication_profile, verbosity_from_messages,
 };
 pub use memory::{
-    AudienceResolver, IngestReport, Memory, MemoryBuilder, ScopeResolver, MAX_REEMBED_BATCH,
+    AudienceResolver, IngestReport, MAX_REEMBED_BATCH, Memory, MemoryBuilder, ScopeResolver,
 };
 pub use recall::MemoryRecall;
 pub use records::FactPrivacy;
 pub use scoring::{
-    episode_importance, episode_recall_boost, term_overlap, text_similarity, tokens,
-    turn_importance, word_overlap, HybridScorer, HybridWeights, Scorer, ScoringConfig,
+    HybridScorer, HybridWeights, Scorer, ScoringConfig, episode_importance, episode_recall_boost,
+    term_overlap, text_similarity, tokens, turn_importance, word_overlap,
 };
 pub use store::{
-    latest_version, related_fact_scores, InMemoryMemoryStore, MemoryStore, Migration,
-    SqliteMemoryStore, MIGRATIONS,
+    InMemoryMemoryStore, MIGRATIONS, MemoryStore, Migration, SqliteMemoryStore, latest_version,
+    related_fact_scores,
 };
 pub use system::ScopedMemory;
 pub use tools::{RecallTool, RememberTool};
 pub use types::{
-    episode_search_text, fact_search_text, normalize_category, normalize_key, same_value,
-    DecayReport, Episode, EpisodeRecord, Fact, FactAccess, FactRecord, MemoryStats, MergeConfig,
-    NewEpisode, NewFact, Provenance, RecallAudience, RecordKind, ReembedCursor, ReembedReport,
-    RetentionConfig, Score, ScoredEpisode, ScoredFact, Signals, StaleEmbedding, StoredEmbedding,
-    UpsertOutcome, MAX_FACT_VALUE_CHARS,
+    DecayReport, Episode, EpisodeRecord, Fact, FactAccess, FactRecord, MAX_FACT_VALUE_CHARS,
+    MemoryStats, MergeConfig, NewEpisode, NewFact, Provenance, RecallAudience, RecordKind,
+    ReembedCursor, ReembedReport, RetentionConfig, Score, ScoredEpisode, ScoredFact, Signals,
+    StaleEmbedding, StoredEmbedding, UpsertOutcome, episode_search_text, fact_search_text,
+    normalize_category, normalize_key, same_value,
 };
 pub use writer::{MemoryWriter, WriterReport};

@@ -654,9 +654,9 @@ impl SqliteMemory {
                     vector,
                 )
                 .await
-            {
-                tracing::warn!(%error, procedure_id = id, "Deferred procedure embedding projection");
-            }
+        {
+            tracing::warn!(%error, procedure_id = id, "Deferred procedure embedding projection");
+        }
         Ok(id)
     }
 
@@ -1017,9 +1017,9 @@ impl SqliteMemory {
             && let Err(error) = self
                 .upsert_owner_embedding("error_solution", row.0, "error", &error_pattern, vector)
                 .await
-            {
-                tracing::warn!(%error, error_solution_id = row.0, "Deferred error-solution embedding projection");
-            }
+        {
+            tracing::warn!(%error, error_solution_id = row.0, "Deferred error-solution embedding projection");
+        }
         Ok(row.0)
     }
 

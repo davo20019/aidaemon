@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-pub use aidaemon_channel_discord::bot::{spawn_discord_channel, DiscordBot as DiscordChannel};
+pub use aidaemon_channel_discord::bot::{DiscordBot as DiscordChannel, spawn_discord_channel};
 
 use crate::channels::ChannelRuntimeDeps;
 

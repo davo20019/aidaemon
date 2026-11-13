@@ -13,9 +13,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aidaemon_memory::sqlite::{migrate, SqliteMemory};
-use aidaemon_memory::stores::FactStore;
 use aidaemon_memory::HashEmbedder;
+use aidaemon_memory::sqlite::{SqliteMemory, migrate};
+use aidaemon_memory::stores::FactStore;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 const TOPICS: &[&str] = &[

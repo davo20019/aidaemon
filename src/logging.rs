@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Context;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::layer::{Context as LayerContext, Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 const DEFAULT_MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_LOG_BACKUPS: usize = 4;
@@ -303,8 +303,8 @@ mod tests {
 
     #[test]
     fn sqlcipher_key_pragma_events_are_suppressed() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct Count(Arc<AtomicUsize>);
         impl<S: tracing::Subscriber> Layer<S> for Count {

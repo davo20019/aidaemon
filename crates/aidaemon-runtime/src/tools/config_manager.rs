@@ -4,18 +4,18 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::warn;
 
 use std::sync::Arc;
 
 use aidaemon_secrets::SecretStore;
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::config_file::ConfigFile;
 use aidaemon_tools::semantics::{
-    semantics_for_exact_read_actions, OwnerApprovalNeed, ToolCallContext, ToolCallSemantics,
-    ToolCapabilities, ToolMutationEffects,
+    OwnerApprovalNeed, ToolCallContext, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    semantics_for_exact_read_actions,
 };
-use aidaemon_tools::OutcomeTool as Tool;
 
 mod config_path;
 use config_path::ConfigPath;
@@ -1616,7 +1616,7 @@ impl ConfigManagerTool {
             other => {
                 return Err(format!(
                     "`key` must be client_gateway or node_gateway, not `{other}`"
-                ))
+                ));
             }
         };
         let table: toml::Table = format!("v = {}", args.value.trim())
@@ -1668,7 +1668,7 @@ impl ConfigManagerTool {
             Err(e) => {
                 return Ok(ConfigReply::refused(format!(
                     "Refused: {e}. The config was NOT modified."
-                )))
+                )));
             }
         };
         let content = self.config.read().await?;
@@ -1765,8 +1765,7 @@ fn apply_instruction_for_key(key: &str) -> &'static str {
 
 /// The tool's one description: the schema the model reads and
 /// `description()` both use it.
-const TOOL_DESCRIPTION: &str =
-    "Read (secrets hidden)/update config.toml (backup+validate). key: dotted path, list entry as a[2].";
+const TOOL_DESCRIPTION: &str = "Read (secrets hidden)/update config.toml (backup+validate). key: dotted path, list entry as a[2].";
 
 fn manage_config_schema() -> Value {
     json!({
@@ -1870,9 +1869,13 @@ impl ConfigManagerTool {
         match args.action.as_str() {
             "list_provider_presets" => Ok(ConfigReply::done(Self::list_provider_presets_message())),
             "switch_provider" => self.switch_provider(&args).await.map(Into::into),
-            "list_failover_providers" => self.list_failover_providers().await.map(ConfigReply::done),
+            "list_failover_providers" => {
+                self.list_failover_providers().await.map(ConfigReply::done)
+            }
             "add_failover_provider" => self.add_failover_provider(&args).await.map(Into::into),
-            "remove_failover_provider" => self.remove_failover_provider(&args).await.map(Into::into),
+            "remove_failover_provider" => {
+                self.remove_failover_provider(&args).await.map(Into::into)
+            }
             "enable_stt" => self.enable_stt(&args).await.map(Into::into),
             "enable_client_gateway" => self.enable_client_gateway(&args).await,
             "enable_exposure" => self.enable_exposure(&args).await,
@@ -1946,7 +1949,7 @@ impl ConfigManagerTool {
             Err(e) => {
                 return Ok(ConfigReply::refused(format!(
                     "Error: {e}. The config was NOT modified."
-                )))
+                )));
             }
         };
 
@@ -1980,12 +1983,14 @@ impl ConfigManagerTool {
             return Ok(ConfigReply::refused(refusal));
         }
         if let Some(value) = &new_value
-            && !path.ends_in_index() && !self.config_reads(&doc, &path, value) {
-                return Ok(ConfigReply::refused(format!(
-                    "Refused: aidaemon does not read a setting at `{path}`, so it would have no effect. \
+            && !path.ends_in_index()
+            && !self.config_reads(&doc, &path, value)
+        {
+            return Ok(ConfigReply::refused(format!(
+                "Refused: aidaemon does not read a setting at `{path}`, so it would have no effect. \
                      The config was NOT modified. Check the key name with action 'read'."
-                )));
-            }
+            )));
+        }
 
         if let Err(e) = self.create_backup().await {
             warn!("Failed to create backup: {}", e);
@@ -2072,9 +2077,10 @@ impl ConfigManagerTool {
             return Self::requires_approval(&args.key);
         };
         if let Some(key) = path.last_key()
-            && APPROVAL_REQUIRED_KEYS.contains(&key) {
-                return true;
-            }
+            && APPROVAL_REQUIRED_KEYS.contains(&key)
+        {
+            return true;
+        }
         if args.action == "unset" {
             return path.last_key().is_none();
         }

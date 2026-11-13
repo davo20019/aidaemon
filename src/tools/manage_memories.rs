@@ -8,15 +8,15 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::testing::CallWithFacts;
-    use crate::traits::store_prelude::*;
     use crate::traits::ToolCalls as _;
     use crate::traits::ToolOutcomeStatus;
     use crate::traits::ToolSemantics;
+    use crate::traits::store_prelude::*;
     use crate::traits::{Goal, GoalSchedule, Task, TaskActivity};
     use crate::types::ChannelVisibility;
     use crate::types::FactPrivacy;
-    use serde_json::json;
     use serde_json::Value;
+    use serde_json::json;
     use std::sync::Arc;
 
     /// Memory-store actions declare no effects; privacy, goal and schedule
@@ -43,15 +43,20 @@ mod tests {
     async fn scheduled_actions_declare_goal_identity_contract() {
         let state = setup_state().await;
         let tool = test_tool(state);
-        assert!(tool
-            .validate_arguments(r#"{"action":"diagnose_scheduled"}"#)
-            .is_err());
-        assert!(tool
-            .validate_arguments(r#"{"action":"diagnose_scheduled","goal_id":"goal-synthetic"}"#)
-            .is_ok());
-        assert!(tool
-            .validate_arguments(r#"{"action":"list_scheduled"}"#)
-            .is_ok());
+        assert!(
+            tool.validate_arguments(r#"{"action":"diagnose_scheduled"}"#)
+                .is_err()
+        );
+        assert!(
+            tool.validate_arguments(
+                r#"{"action":"diagnose_scheduled","goal_id":"goal-synthetic"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            tool.validate_arguments(r#"{"action":"list_scheduled"}"#)
+                .is_ok()
+        );
     }
 
     /// Search action appends the relational neighborhood when results contain a
@@ -1254,15 +1259,18 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("create_personal_goal: the session fact is missing from the call context"));
-        assert!(state
-            .get_active_personal_goals(50)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            result.unwrap_err().to_string().contains(
+                "create_personal_goal: the session fact is missing from the call context"
+            )
+        );
+        assert!(
+            state
+                .get_active_personal_goals(50)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ==================== create_scheduled_goal tests ====================
@@ -1414,12 +1422,14 @@ mod tests {
                 .contains("requires approval through the agent kernel"),
             "{error}"
         );
-        assert!(state
-            .get_scheduled_goals()
-            .await
-            .unwrap()
-            .iter()
-            .all(|goal| goal.description != "Check confirmation transport"));
+        assert!(
+            state
+                .get_scheduled_goals()
+                .await
+                .unwrap()
+                .iter()
+                .all(|goal| goal.description != "Check confirmation transport")
+        );
     }
 
     /// The owner is asked exactly where the call would create a goal that

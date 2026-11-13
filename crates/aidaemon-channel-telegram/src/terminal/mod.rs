@@ -23,7 +23,7 @@ use aidaemon_tools::services::SettingsStore;
 use async_trait::async_trait;
 use tracing::warn;
 
-use crate::bot::{determine_role, send_markdown_chunks_or_fallback, TelegramBot};
+use crate::bot::{TelegramBot, determine_role, send_markdown_chunks_or_fallback};
 use crate::bot_api::{
     Bot, ButtonRequest, CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup,
     KeyboardButton, KeyboardMarkup, Message, ParseMode, WebAppInfo,
@@ -386,16 +386,16 @@ impl Cx<'_> {
             && let Some(cached) =
                 cli_agent_flags::load_agent_flags_cache(&*self.state, &namespace, user_id, &agent)
                     .await
-            {
-                let age = chrono::Utc::now().timestamp() - cached.updated_at_unix;
-                if (0..=AGENT_FLAGS_CACHE_TTL_SECS).contains(&age) {
-                    let pages = cli_agent_flags::format_agent_flag_docs(&agent, &cached.docs, true);
-                    for page in pages {
-                        send_markdown_chunks_or_fallback(bot, msg.chat.id, &page).await;
-                    }
-                    return;
+        {
+            let age = chrono::Utc::now().timestamp() - cached.updated_at_unix;
+            if (0..=AGENT_FLAGS_CACHE_TTL_SECS).contains(&age) {
+                let pages = cli_agent_flags::format_agent_flag_docs(&agent, &cached.docs, true);
+                for page in pages {
+                    send_markdown_chunks_or_fallback(bot, msg.chat.id, &page).await;
                 }
+                return;
             }
+        }
 
         let _ = bot
             .send_message(msg.chat.id, format!("Discovering flags for {}...", agent))
@@ -900,33 +900,35 @@ impl Cx<'_> {
                     used_saved_args = !agent_args.is_empty();
                 }
             }
-        } else if invoked_cmd == "/agent" && !agent_args.is_empty()
-            && let Some(agent_name) = agent.as_deref() {
-                let mut defaults = cli_agent_flags::load_terminal_agent_defaults(
+        } else if invoked_cmd == "/agent"
+            && !agent_args.is_empty()
+            && let Some(agent_name) = agent.as_deref()
+        {
+            let mut defaults = cli_agent_flags::load_terminal_agent_defaults(
+                &*self.state,
+                &namespace,
+                msg.chat.id.0,
+                user_id,
+            )
+            .await;
+            let changed = defaults.get(agent_name) != Some(&agent_args);
+            if changed {
+                defaults.insert(agent_name.to_string(), agent_args.clone());
+                if let Err(err) = cli_agent_flags::save_terminal_agent_defaults(
                     &*self.state,
                     &namespace,
                     msg.chat.id.0,
                     user_id,
+                    &defaults,
                 )
-                .await;
-                let changed = defaults.get(agent_name) != Some(&agent_args);
-                if changed {
-                    defaults.insert(agent_name.to_string(), agent_args.clone());
-                    if let Err(err) = cli_agent_flags::save_terminal_agent_defaults(
-                        &*self.state,
-                        &namespace,
-                        msg.chat.id.0,
-                        user_id,
-                        &defaults,
-                    )
-                    .await
-                    {
-                        warn!(error = %err, "Failed to persist /agent default flags");
-                    } else {
-                        saved_args_updated = true;
-                    }
+                .await
+                {
+                    warn!(error = %err, "Failed to persist /agent default flags");
+                } else {
+                    saved_args_updated = true;
                 }
             }
+        }
 
         let cwd = if cwd_parts.is_empty() {
             None
@@ -1019,9 +1021,10 @@ impl Cx<'_> {
                 query.append_pair("agent", agent);
             }
             if let Some(cwd) = cwd.as_deref()
-                && !cwd.trim().is_empty() {
-                    query.append_pair("cwd", cwd);
-                }
+                && !cwd.trim().is_empty()
+            {
+                query.append_pair("cwd", cwd);
+            }
             if let Some(relay_session_id) = prestarted_relay_session_id.as_deref() {
                 query.append_pair("relay_session_id", relay_session_id);
             }
@@ -1160,13 +1163,15 @@ impl Cx<'_> {
         }
 
         if invoked_cmd == "/agent" {
-            let reply_keyboard =
-                KeyboardMarkup::new(vec![vec![KeyboardButton::new("📱 Open in Mini App")
-                    .request(ButtonRequest::WebApp(WebAppInfo {
+            let reply_keyboard = KeyboardMarkup::new(vec![vec![
+                KeyboardButton::new("📱 Open in Mini App").request(ButtonRequest::WebApp(
+                    WebAppInfo {
                         url: web_app_url.clone(),
-                    }))]])
-                .resize_keyboard()
-                .one_time_keyboard();
+                    },
+                )),
+            ]])
+            .resize_keyboard()
+            .one_time_keyboard();
 
             let _ = bot
                 .send_message(
@@ -1473,13 +1478,13 @@ impl Cx<'_> {
             .reply_markup(keyboard)
             .await;
 
-        let reply_keyboard =
-            KeyboardMarkup::new(vec![vec![KeyboardButton::new("📱 Open in Mini App")
-                .request(ButtonRequest::WebApp(WebAppInfo {
-                    url: web_app_url.clone(),
-                }))]])
-            .resize_keyboard()
-            .one_time_keyboard();
+        let reply_keyboard = KeyboardMarkup::new(vec![vec![
+            KeyboardButton::new("📱 Open in Mini App").request(ButtonRequest::WebApp(WebAppInfo {
+                url: web_app_url.clone(),
+            })),
+        ]])
+        .resize_keyboard()
+        .one_time_keyboard();
 
         let _ = bot
             .send_message(
@@ -1523,12 +1528,13 @@ async fn sync_tenant_bot_token(
         if let Some(label) = label
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
-            && let Some(map) = payload.as_object_mut() {
-                map.insert(
-                    "label".to_string(),
-                    serde_json::Value::String(label.to_string()),
-                );
-            }
+            && let Some(map) = payload.as_object_mut()
+        {
+            map.insert(
+                "label".to_string(),
+                serde_json::Value::String(label.to_string()),
+            );
+        }
 
         let response = match client.post(url.clone()).json(&payload).send().await {
             Ok(response) => response,

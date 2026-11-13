@@ -189,9 +189,10 @@ impl EnvSecretStore {
             EnvFileLocation::FromVars { vars, default } => {
                 for var in vars {
                     if let Ok(path) = std::env::var(var)
-                        && !path.trim().is_empty() {
-                            return PathBuf::from(path);
-                        }
+                        && !path.trim().is_empty()
+                    {
+                        return PathBuf::from(path);
+                    }
                 }
                 default.clone()
             }
@@ -205,9 +206,10 @@ impl SecretStore for EnvSecretStore {
         let env_path = self.env_file_path();
         if env_path.exists() {
             if let Some(val) = read_env_secret_from_file(&env_path, &env_key)?
-                && !val.is_empty() {
-                    return Ok(Secret::new(val));
-                }
+                && !val.is_empty()
+            {
+                return Ok(Secret::new(val));
+            }
             anyhow::bail!(
                 "Keychain disabled and env var '{}' not found in '{}'",
                 env_key,
@@ -216,9 +218,10 @@ impl SecretStore for EnvSecretStore {
         }
 
         if let Ok(val) = std::env::var(&env_key)
-            && !val.is_empty() {
-                return Ok(Secret::new(val));
-            }
+            && !val.is_empty()
+        {
+            return Ok(Secret::new(val));
+        }
 
         anyhow::bail!(
             "Keychain disabled and env var '{}' not set for '{}'",
@@ -443,9 +446,10 @@ fn upsert_env_secret(env_path: &Path, field_name: &str, value: &str) -> anyhow::
     }
 
     if let Some(parent) = env_path.parent()
-        && !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
 
     let mut body = lines.join("\n");
     if !body.is_empty() {
@@ -540,9 +544,10 @@ fn read_env_secret_from_file(env_path: &Path, env_key: &str) -> anyhow::Result<O
     let mut found_via_loose_scan: Option<String> = None;
     for line in content.lines() {
         if is_env_key_assignment(line, env_key)
-            && let Some((_, raw_value)) = line.split_once('=') {
-                found_via_loose_scan = Some(decode_env_value_loose(raw_value));
-            }
+            && let Some((_, raw_value)) = line.split_once('=')
+        {
+            found_via_loose_scan = Some(decode_env_value_loose(raw_value));
+        }
     }
     Ok(found_via_loose_scan)
 }
@@ -701,9 +706,11 @@ mod tests {
         assert!(store.keychain_disabled());
         store.set("bot_token", "abc").unwrap();
         assert_eq!(store.get("bot_token").unwrap(), "abc");
-        assert!(std::fs::read_to_string(&env_path)
-            .unwrap()
-            .contains("BOT_TOKEN=abc"));
+        assert!(
+            std::fs::read_to_string(&env_path)
+                .unwrap()
+                .contains("BOT_TOKEN=abc")
+        );
         store.delete("bot_token").unwrap();
         assert!(!store.contains("bot_token"));
     }

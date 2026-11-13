@@ -11,7 +11,7 @@ pub use aidaemon_agents::specialist::SpecialistKind;
 /// call without running it lives on the [`ToolSemantics`] supertrait.
 pub use aidaemon_tools::OutcomeTool as Tool;
 
-pub use aidaemon_tools::status::{status_sender, with_status, ToolStatus};
+pub use aidaemon_tools::status::{ToolStatus, status_sender, with_status};
 
 /// Calling a tool directly from a test.
 #[cfg(test)]
@@ -348,7 +348,9 @@ mod tests {
         assert!(
             !ToolMutationEffects::LOCAL_DERIVED_WRITE.satisfies(ToolMutationEffects::REMOTE_DEPLOY)
         );
-        assert!(ToolMutationEffects::LOCAL_SOURCE_WRITE.satisfies(ToolMutationEffects::UNSPECIFIED));
+        assert!(
+            ToolMutationEffects::LOCAL_SOURCE_WRITE.satisfies(ToolMutationEffects::UNSPECIFIED)
+        );
         assert!(ToolMutationEffects::REMOTE_DEPLOY.satisfies(ToolMutationEffects::REMOTE_DEPLOY));
     }
 

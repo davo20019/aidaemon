@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tracing::{debug, warn};
 
-use crate::progressive::{may_extract, owner_writes_during_run, Exchange, ProgressiveExtractor};
+use crate::progressive::{Exchange, ProgressiveExtractor, may_extract, owner_writes_during_run};
 use crate::stores::MemoryStores;
 
 /// What a finished run did, for learning.
@@ -95,17 +95,18 @@ pub async fn learn_from_run(store: &dyn MemoryStores, run: RunLearning) -> anyho
     }
 
     if let Some(error) = run.first_error.clone()
-        && !run.recovery_actions.is_empty() {
-            let solution = crate::new_error_solution(
-                crate::error_pattern(&error),
-                domains.into_iter().next(),
-                crate::summarize_solution(&run.recovery_actions),
-                Some(run.recovery_actions.clone()),
-            );
-            if let Err(e) = store.insert_error_solution(&solution).await {
-                warn!(error_pattern = %solution.error_pattern, error = %e, "Failed to save error solution");
-            }
+        && !run.recovery_actions.is_empty()
+    {
+        let solution = crate::new_error_solution(
+            crate::error_pattern(&error),
+            domains.into_iter().next(),
+            crate::summarize_solution(&run.recovery_actions),
+            Some(run.recovery_actions.clone()),
+        );
+        if let Err(e) = store.insert_error_solution(&solution).await {
+            warn!(error_pattern = %solution.error_pattern, error = %e, "Failed to save error solution");
         }
+    }
 
     Ok(())
 }

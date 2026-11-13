@@ -131,9 +131,10 @@ pub fn is_path_blocked(path: &Path) -> bool {
         } else {
             // Exact filename check
             if let Some(name) = path.file_name()
-                && name.to_string_lossy() == *pattern {
-                    return true;
-                }
+                && name.to_string_lossy() == *pattern
+            {
+                return true;
+            }
             // Also check as path component
             if path_str.contains(&format!("/{}", pattern))
                 || path_str.contains(&format!("/{}/", pattern))
@@ -215,9 +216,11 @@ mod tests {
         assert_eq!(ready.filename, "fd_unit_probe_results.txt");
         assert_eq!(ready.size_bytes, 12);
         assert!(ready.recovered_into_inbox);
-        assert!(ready
-            .canonical_path
-            .starts_with(inbox.canonicalize().unwrap()));
+        assert!(
+            ready
+                .canonical_path
+                .starts_with(inbox.canonicalize().unwrap())
+        );
         let _ = std::fs::remove_file(&src);
     }
 

@@ -8,6 +8,6 @@ mod run_helpers {
 mod send_file_scope_tests;
 
 #[cfg(test)]
-pub(in crate::agent) use run_helpers::access_manifest_scope_check;
-#[cfg(test)]
 pub(in crate::agent) use run_helpers::ScopeCheck;
+#[cfg(test)]
+pub(in crate::agent) use run_helpers::access_manifest_scope_check;

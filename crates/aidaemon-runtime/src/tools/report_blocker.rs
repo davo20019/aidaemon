@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::info;
 
 use crate::tools::traits::{
@@ -10,9 +10,9 @@ use crate::tools::traits::{
     ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolRole,
 };
 use crate::turn::validation_state::{
+    ExecutorStepResult, PartialResult, StepValidationOutcome, TaskValidationOutcome,
     build_needs_approval_request, extract_executor_handoff_context,
-    persist_executor_result_context, ExecutorStepResult, PartialResult, StepValidationOutcome,
-    TaskValidationOutcome,
+    persist_executor_result_context,
 };
 
 /// Tool for executors to report they are blocked and cannot proceed.

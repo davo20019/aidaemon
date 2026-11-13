@@ -877,9 +877,11 @@ mod tests {
         assert!(joined.ends_with("--chdir /tmp/ws/sub -- sh -c echo hi"));
         let mut open = s.clone();
         open.allow_network = true;
-        assert!(!BubblewrapSandbox::new()
-            .args(&open)
-            .contains(&"--unshare-net".to_string()));
+        assert!(
+            !BubblewrapSandbox::new()
+                .args(&open)
+                .contains(&"--unshare-net".to_string())
+        );
     }
 
     #[test]
@@ -967,9 +969,11 @@ mod tests {
         let s = SandboxCommand::new("true", &inside);
         let joined = bwrap.args(&s).join(" ");
         assert!(!joined.contains(&aws), "{joined}");
-        assert!(!seatbelt
-            .profile(&s)
-            .contains(&sbpl_string(&home.join(".aws"))));
+        assert!(
+            !seatbelt
+                .profile(&s)
+                .contains(&sbpl_string(&home.join(".aws")))
+        );
 
         // The real defaults cover the usual locations under $HOME.
         let defaults = default_deny_read();

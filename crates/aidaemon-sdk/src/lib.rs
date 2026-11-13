@@ -92,7 +92,7 @@ pub mod structured;
 #[cfg(all(feature = "providers", feature = "policies"))]
 pub mod preset;
 #[cfg(all(feature = "providers", feature = "policies"))]
-pub use preset::{preset, Preset, PresetError};
+pub use preset::{Preset, PresetError, preset};
 
 #[cfg(feature = "runtime")]
 pub mod runtime;
@@ -223,7 +223,7 @@ pub mod prelude {
     pub use crate::tool;
 
     #[cfg(all(feature = "providers", feature = "policies"))]
-    pub use crate::preset::{preset, Preset, PresetError};
+    pub use crate::preset::{Preset, PresetError, preset};
 
     #[cfg(feature = "agents")]
     pub use crate::agents;

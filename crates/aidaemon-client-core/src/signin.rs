@@ -7,11 +7,11 @@
 use std::time::Duration;
 
 use aidaemon_client_protocol::{
-    challenge_message, AccessGrant, Challenge, ChallengeRequest, ClientKind, Enrollment,
-    EnrollmentState, RedeemRequest, ServerFrame, SessionRequest,
+    AccessGrant, Challenge, ChallengeRequest, ClientKind, Enrollment, EnrollmentState,
+    RedeemRequest, ServerFrame, SessionRequest, challenge_message,
 };
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::elliptic_curve::Generate;
@@ -197,9 +197,10 @@ pub async fn pair(
     )
     .await?;
     if let Some(expected) = &request.fingerprint
-        && &enrollment.fingerprint != expected {
-            anyhow::bail!("this is not the daemon the pairing code came from");
-        }
+        && &enrollment.fingerprint != expected
+    {
+        anyhow::bail!("this is not the daemon the pairing code came from");
+    }
     while matches!(
         enrollment.state,
         EnrollmentState::Open | EnrollmentState::Pending
@@ -243,9 +244,10 @@ impl GrantCache {
     ) -> Result<String, SignInError> {
         let margin = u64::try_from(RENEW_BEFORE.as_millis()).unwrap_or(60_000);
         if let Some(grant) = &self.grant
-            && grant.expires_at_ms > now_ms.saturating_add(margin) {
-                return Ok(grant.access_token.clone());
-            }
+            && grant.expires_at_ms > now_ms.saturating_add(margin)
+        {
+            return Ok(grant.access_token.clone());
+        }
         let grant = sign_in(http, device).await?;
         let token = grant.access_token.clone();
         self.grant = Some(grant);

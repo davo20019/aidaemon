@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider, SCRIPTED_MODEL};
+use aidaemon_core::testing::{SCRIPTED_MODEL, ScriptedProvider, call, spec, text, tool_calls};
 use aidaemon_core::{
     Agent, ApprovalRisk, BuildError, CallEffects, Event, FnTool, Hook, HookContext, InterruptKind,
     OwnerApprovalRequest, Provider, ReceiptStatus, RunId, RunStatus, ToolAnnotations, ToolCall,

@@ -10,12 +10,12 @@
 use std::convert::Infallible;
 
 use aidaemon_sdk::prelude::*;
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider, StreamingProvider};
+use aidaemon_sdk::testing::{ScriptedProvider, StreamingProvider, call, text, tool_calls};
 use aidaemon_sdk::{CancellationToken, RunId};
+use axum::Router;
 use axum::extract::{Query, State};
 use axum::response::sse::{Event as Sse, Sse as SseResponse};
 use axum::routing::get;
-use axum::Router;
 use futures::Stream;
 use serde::Deserialize;
 use serde_json::json;

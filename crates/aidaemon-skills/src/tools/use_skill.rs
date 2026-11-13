@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate as skills;
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::sanitize::sanitize_external_content;
 use aidaemon_tools::semantics::ToolCapabilities;
-use aidaemon_tools::OutcomeTool as Tool;
 
 pub struct UseSkillTool {
     skills_dir: PathBuf,
@@ -141,9 +141,11 @@ mod tests {
         let tool = UseSkillTool::new(dir.path().to_path_buf());
         let result = tool.call(r#"{"skill_name": "unsafe"}"#).await.unwrap();
         assert!(result.contains("[CONTENT FILTERED]"));
-        assert!(!result
-            .to_lowercase()
-            .contains("ignore previous instructions"));
+        assert!(
+            !result
+                .to_lowercase()
+                .contains("ignore previous instructions")
+        );
     }
 
     #[tokio::test]

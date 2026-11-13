@@ -20,7 +20,7 @@ pub(in crate::agent) async fn run_bootstrap(
 mod mandate_bootstrap_isolation_tests {
     use super::*;
     use crate::agent::*;
-    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::testing::{MockProvider, setup_test_agent};
     use crate::traits::{Mandate, MandateAuthority, MandateStore, MessageStore, TaskAttempt};
 
     fn attempt(id: &str, task_id: &str) -> TaskAttempt {

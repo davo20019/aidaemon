@@ -15,8 +15,8 @@ use super::{ModelBackend, SharedLlmRuntime};
 use crate::chat_bridge::sdk_backed::{
     to_chat_messages, to_chat_options, to_provider_response, to_sdk_messages, to_sdk_response,
 };
-use aidaemon_events::provider::TokenUsageStore;
 use aidaemon_events::EventStore;
+use aidaemon_events::provider::TokenUsageStore;
 
 /// Runs side calls: picks the model chain from the spec, applies its total
 /// deadline and records every attempt.
@@ -525,8 +525,8 @@ pub mod test_support {
 
     use super::SideCallGateway;
     use crate::llm::{ModelBackend, ProviderRuntimeTarget, SharedLlmRuntime};
-    use aidaemon_events::provider::TokenUsageStore;
     use aidaemon_events::EventStore;
+    use aidaemon_events::provider::TokenUsageStore;
     use aidaemon_providers::routing::ProviderKind;
 
     /// A provider that answers every request with `text`.

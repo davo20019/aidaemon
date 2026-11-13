@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::OutcomeTool as Tool;
 use crate::backend::{BackendPath, SharedExecutionBackend};
 use crate::semantics::{
     ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind, ToolVerificationMode,
 };
-use crate::OutcomeTool as Tool;
 
 use super::fs_utils;
 
@@ -342,20 +342,21 @@ async fn read_project_metadata(backend: SharedExecutionBackend, dir: &BackendPat
 
     // package.json
     if let Ok(content) = read_backend_text(&backend, &dir.join("package.json")).await
-        && let Ok(pkg) = serde_json::from_str::<Value>(&content) {
-            if let Some(name) = pkg["name"].as_str() {
-                metadata.push_str(&format!("- Name: {}\n", name));
-            }
-            if let Some(version) = pkg["version"].as_str() {
-                metadata.push_str(&format!("- Version: {}\n", version));
-            }
-            if let Some(deps) = pkg["dependencies"].as_object() {
-                metadata.push_str(&format!("- Dependencies: {}\n", deps.len()));
-            }
-            if let Some(dev_deps) = pkg["devDependencies"].as_object() {
-                metadata.push_str(&format!("- Dev dependencies: {}\n", dev_deps.len()));
-            }
+        && let Ok(pkg) = serde_json::from_str::<Value>(&content)
+    {
+        if let Some(name) = pkg["name"].as_str() {
+            metadata.push_str(&format!("- Name: {}\n", name));
         }
+        if let Some(version) = pkg["version"].as_str() {
+            metadata.push_str(&format!("- Version: {}\n", version));
+        }
+        if let Some(deps) = pkg["dependencies"].as_object() {
+            metadata.push_str(&format!("- Dependencies: {}\n", deps.len()));
+        }
+        if let Some(dev_deps) = pkg["devDependencies"].as_object() {
+            metadata.push_str(&format!("- Dev dependencies: {}\n", dev_deps.len()));
+        }
+    }
 
     // pyproject.toml
     if let Ok(content) = read_backend_text(&backend, &dir.join("pyproject.toml")).await {
@@ -370,9 +371,10 @@ async fn read_project_metadata(backend: SharedExecutionBackend, dir: &BackendPat
     // go.mod
     if let Ok(content) = read_backend_text(&backend, &dir.join("go.mod")).await
         && let Some(module) = content.lines().next()
-            && let Some(stripped) = module.strip_prefix("module ") {
-                metadata.push_str(&format!("- Module: {}\n", stripped));
-            }
+        && let Some(stripped) = module.strip_prefix("module ")
+    {
+        metadata.push_str(&format!("- Module: {}\n", stripped));
+    }
 
     metadata
 }
@@ -408,36 +410,41 @@ async fn get_git_summary(backend: SharedExecutionBackend, dir: &BackendPath) -> 
     // Current branch
     if let Ok(out) =
         fs_utils::run_cmd_backend(&*backend, "git rev-parse --abbrev-ref HEAD", Some(dir), 5).await
-        && out.exit_code == 0 {
-            info.push_str(&format!("- Branch: {}\n", out.stdout.trim()));
-        }
+        && out.exit_code == 0
+    {
+        info.push_str(&format!("- Branch: {}\n", out.stdout.trim()));
+    }
 
     // Status summary
     if let Ok(out) =
         fs_utils::run_cmd_backend(&*backend, "git status --porcelain", Some(dir), 5).await
-        && out.exit_code == 0 {
-            let lines: Vec<&str> = out.stdout.lines().collect();
-            if lines.is_empty() {
-                info.push_str("- Status: clean\n");
-            } else {
-                info.push_str(&format!("- Status: {} changed files\n", lines.len()));
-            }
+        && out.exit_code == 0
+    {
+        let lines: Vec<&str> = out.stdout.lines().collect();
+        if lines.is_empty() {
+            info.push_str("- Status: clean\n");
+        } else {
+            info.push_str(&format!("- Status: {} changed files\n", lines.len()));
         }
+    }
 
     // Last commit
     if let Ok(out) =
         fs_utils::run_cmd_backend(&*backend, "git log -1 --format='%h %s (%cr)'", Some(dir), 5)
             .await
-        && out.exit_code == 0 && !out.stdout.trim().is_empty() {
-            info.push_str(&format!("- Last commit: {}\n", out.stdout.trim()));
-        }
+        && out.exit_code == 0
+        && !out.stdout.trim().is_empty()
+    {
+        info.push_str(&format!("- Last commit: {}\n", out.stdout.trim()));
+    }
 
     // Remote
     if let Ok(out) = fs_utils::run_cmd_backend(&*backend, "git remote -v", Some(dir), 5).await
         && out.exit_code == 0
-            && let Some(first_line) = out.stdout.lines().next() {
-                info.push_str(&format!("- Remote: {}\n", first_line));
-            }
+        && let Some(first_line) = out.stdout.lines().next()
+    {
+        info.push_str(&format!("- Remote: {}\n", first_line));
+    }
 
     info
 }

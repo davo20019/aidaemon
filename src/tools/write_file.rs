@@ -129,9 +129,11 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("sensitive"), "got: {err}");
-        assert!(std::fs::read_to_string(&config)
-            .unwrap()
-            .contains("synthetic"));
+        assert!(
+            std::fs::read_to_string(&config)
+                .unwrap()
+                .contains("synthetic")
+        );
     }
 
     #[tokio::test]
@@ -385,12 +387,14 @@ mod tests {
             assert!(effects.complete, "{key}");
             assert_eq!(
                 effects.keys,
-                vec![aidaemon_tools::command_effects::path_effect(
-                    aidaemon_core::EffectClass::Write,
-                    &format!("{dir}/acme.md"),
-                    None
-                )
-                .unwrap()]
+                vec![
+                    aidaemon_tools::command_effects::path_effect(
+                        aidaemon_core::EffectClass::Write,
+                        &format!("{dir}/acme.md"),
+                        None
+                    )
+                    .unwrap()
+                ]
             );
         }
         // A relative path has no known working directory here.

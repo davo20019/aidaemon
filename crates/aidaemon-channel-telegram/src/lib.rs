@@ -28,6 +28,6 @@ pub mod terminal;
 mod webhook;
 
 pub use callback::MAX_CALLBACK_DATA;
-pub use channel::{TelegramChannel, MAX_DOWNLOAD_BYTES, TELEGRAM_MAX_MESSAGE_LEN};
+pub use channel::{MAX_DOWNLOAD_BYTES, TELEGRAM_MAX_MESSAGE_LEN, TelegramChannel};
 #[cfg(feature = "webhook")]
 pub use webhook::WebhookConfig;

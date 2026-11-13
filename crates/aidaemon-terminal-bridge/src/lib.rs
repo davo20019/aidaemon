@@ -23,15 +23,15 @@ use futures::{SinkExt, StreamExt};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use p256::ecdh::diffie_hellman;
-use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::elliptic_curve::Generate;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::{PublicKey, SecretKey};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, NativePtySystem, PtySize, PtySystem};
 use rand::rand_core::UnwrapErr;
 use rand::rngs::SysRng;
 use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -39,8 +39,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, error, info, warn};
 
@@ -605,9 +605,10 @@ fn decode_utf8_stream_chunk(carry: &mut Vec<u8>, incoming: &[u8]) -> String {
             Err(err) => {
                 let valid_up_to = err.valid_up_to();
                 if valid_up_to > 0
-                    && let Ok(prefix) = std::str::from_utf8(&carry[..valid_up_to]) {
-                        out.push_str(prefix);
-                    }
+                    && let Ok(prefix) = std::str::from_utf8(&carry[..valid_up_to])
+                {
+                    out.push_str(prefix);
+                }
                 if let Some(error_len) = err.error_len() {
                     let drain_to = valid_up_to.saturating_add(error_len).min(carry.len());
                     let invalid = &carry[valid_up_to..drain_to];
@@ -1294,16 +1295,18 @@ fn requested_fresh_start_from_client_hello(frame: &Value) -> bool {
     ];
     for key in key_order {
         if let Some(raw) = frame.get(key)
-            && let Some(value) = parse_boolish_client_hello_value(raw) {
-                return value;
-            }
+            && let Some(value) = parse_boolish_client_hello_value(raw)
+        {
+            return value;
+        }
     }
     if let Some(launch_obj) = frame.get("launch").and_then(Value::as_object) {
         for key in key_order {
             if let Some(raw) = launch_obj.get(key)
-                && let Some(value) = parse_boolish_client_hello_value(raw) {
-                    return value;
-                }
+                && let Some(value) = parse_boolish_client_hello_value(raw)
+            {
+                return value;
+            }
         }
     }
     false
@@ -1393,9 +1396,10 @@ fn build_child_env() -> Vec<(String, String)> {
     let mut out = Vec::new();
     for key in keys {
         if let Ok(v) = std::env::var(key)
-            && !v.is_empty() {
-                out.push((key.to_string(), v));
-            }
+            && !v.is_empty()
+        {
+            out.push((key.to_string(), v));
+        }
     }
     // PTY sessions should always advertise terminal capabilities even when
     // aidaemon is started from a non-interactive context.
@@ -1594,9 +1598,10 @@ fn should_decode_stdin_control_escapes(data: &str) -> bool {
     }
 
     if let Some(token_len) = escaped_control_token_len(trimmed)
-        && token_len == trimmed.len() {
-            return true;
-        }
+        && token_len == trimmed.len()
+    {
+        return true;
+    }
 
     if trimmed.ends_with("\\r") || trimmed.ends_with("\\n") {
         return true;
@@ -1747,10 +1752,11 @@ fn extract_jsonl_content(raw: &str) -> Option<String> {
                 .pointer("/item/content")
                 .or_else(|| v.pointer("/content"))
                 .or_else(|| v.pointer("/result"))
-                && let Some(text) = content.as_str() {
-                    last_content = Some(text.to_string());
-                    break;
-                }
+            && let Some(text) = content.as_str()
+        {
+            last_content = Some(text.to_string());
+            break;
+        }
     }
     last_content
 }
@@ -1808,25 +1814,27 @@ fn extract_review_candidate_from_json_objects(raw: &str) -> Option<ReviewRespons
             depth = depth.saturating_sub(1);
             if depth == 0 {
                 if let Some(s) = start
-                    && let Some(slice) = raw.get(s..=idx) {
-                        if let Some(candidate) = parse_review_candidate(slice) {
-                            return Some(candidate);
-                        }
-                        if let Ok(value) = serde_json::from_str::<Value>(slice) {
-                            for pointer in [
-                                "/result",
-                                "/output",
-                                "/content",
-                                "/message",
-                                "/item/content",
-                            ] {
-                                if let Some(text) = value.pointer(pointer).and_then(Value::as_str)
-                                    && let Some(candidate) = parse_review_candidate(text) {
-                                        return Some(candidate);
-                                    }
+                    && let Some(slice) = raw.get(s..=idx)
+                {
+                    if let Some(candidate) = parse_review_candidate(slice) {
+                        return Some(candidate);
+                    }
+                    if let Ok(value) = serde_json::from_str::<Value>(slice) {
+                        for pointer in [
+                            "/result",
+                            "/output",
+                            "/content",
+                            "/message",
+                            "/item/content",
+                        ] {
+                            if let Some(text) = value.pointer(pointer).and_then(Value::as_str)
+                                && let Some(candidate) = parse_review_candidate(text)
+                            {
+                                return Some(candidate);
                             }
                         }
                     }
+                }
                 start = None;
             }
         }
@@ -3246,9 +3254,10 @@ async fn mint_connect_token_from_bot_proof(
 
             if status.is_success() && parsed.ok {
                 if let Some(token) = parsed.daemon_connect_token
-                    && !token.trim().is_empty() {
-                        return Ok(token);
-                    }
+                    && !token.trim().is_empty()
+                {
+                    return Ok(token);
+                }
                 last_error = Some(anyhow::anyhow!(
                     "daemon token endpoint response missing token (status {})",
                     status
@@ -3856,8 +3865,8 @@ impl TerminalBridge {
     /// automatically, so they are logged at WARN instead of ERROR to avoid drowning the logs
     /// in false alarms (the broker resets long-lived sockets every few minutes by design).
     fn is_expected_disconnect(err: &anyhow::Error) -> bool {
-        use tokio_tungstenite::tungstenite::error::ProtocolError;
         use tokio_tungstenite::tungstenite::Error as WsError;
+        use tokio_tungstenite::tungstenite::error::ProtocolError;
         match err.downcast_ref::<WsError>() {
             Some(WsError::ConnectionClosed)
             | Some(WsError::AlreadyClosed)
@@ -4280,37 +4289,38 @@ impl TerminalBridge {
 
         // Native-started sessions still run through the same shell bootstrap path.
         if let Some(active) = self.sessions.get_mut(&session_id)
-            && let Some(agent_name) = active.crypto.agent.clone() {
-                if active
-                    .crypto
-                    .agent_args
-                    .iter()
-                    .any(|arg| !is_safe_agent_bootstrap_arg(arg))
-                {
-                    anyhow::bail!("unsafe agent argument rejected for shell bootstrap");
-                }
-                let mut command_parts = Vec::with_capacity(1 + active.crypto.agent_args.len());
-                command_parts.push(shell_token(&agent_name));
-                command_parts.extend(active.crypto.agent_args.iter().map(|arg| shell_token(arg)));
-                active
-                    .shell
-                    .write_stdin(&format!("{}\n", command_parts.join(" ")))
-                    .await?;
-                active.crypto.bootstrapped_agent = true;
+            && let Some(agent_name) = active.crypto.agent.clone()
+        {
+            if active
+                .crypto
+                .agent_args
+                .iter()
+                .any(|arg| !is_safe_agent_bootstrap_arg(arg))
+            {
+                anyhow::bail!("unsafe agent argument rejected for shell bootstrap");
             }
+            let mut command_parts = Vec::with_capacity(1 + active.crypto.agent_args.len());
+            command_parts.push(shell_token(&agent_name));
+            command_parts.extend(active.crypto.agent_args.iter().map(|arg| shell_token(arg)));
+            active
+                .shell
+                .write_stdin(&format!("{}\n", command_parts.join(" ")))
+                .await?;
+            active.crypto.bootstrapped_agent = true;
+        }
 
         if let Some(owner_user_id) = self.owner_user_id()
             && let Err(err) = self
                 .host
                 .set_last_active_relay_session_id(owner_user_id, &session_id)
                 .await
-            {
-                warn!(
-                    error = %err,
-                    session_id = %session_id,
-                    "Failed to persist last active relay session after native start"
-                );
-            }
+        {
+            warn!(
+                error = %err,
+                session_id = %session_id,
+                "Failed to persist last active relay session after native start"
+            );
+        }
 
         Ok(session_id)
     }
@@ -4646,12 +4656,12 @@ impl TerminalBridge {
                             },
                         )
                         .is_some()
-                    {
-                        warn!(
-                            session_id = %session_id,
-                            "Terminal bridge high-priority outbound queue saturated; dropped oldest progress frame"
-                        );
-                    }
+                {
+                    warn!(
+                        session_id = %session_id,
+                        "Terminal bridge high-priority outbound queue saturated; dropped oldest progress frame"
+                    );
+                }
             }
             ShellEvent::ReviewResult {
                 session_id,
@@ -4669,12 +4679,12 @@ impl TerminalBridge {
                             },
                         )
                         .is_some()
-                    {
-                        warn!(
-                            session_id = %session_id,
-                            "Terminal bridge high-priority outbound queue saturated; dropped oldest result frame"
-                        );
-                    }
+                {
+                    warn!(
+                        session_id = %session_id,
+                        "Terminal bridge high-priority outbound queue saturated; dropped oldest result frame"
+                    );
+                }
             }
             ShellEvent::ReviewError {
                 session_id,
@@ -4694,12 +4704,12 @@ impl TerminalBridge {
                             },
                         )
                         .is_some()
-                    {
-                        warn!(
-                            session_id = %session_id,
-                            "Terminal bridge high-priority outbound queue saturated; dropped oldest error frame"
-                        );
-                    }
+                {
+                    warn!(
+                        session_id = %session_id,
+                        "Terminal bridge high-priority outbound queue saturated; dropped oldest error frame"
+                    );
+                }
             }
             ShellEvent::ReviewStream {
                 session_id,
@@ -5001,13 +5011,13 @@ impl TerminalBridge {
                 .host
                 .set_last_active_relay_session_id(owner_user_id, relay_session_id)
                 .await
-            {
-                warn!(
-                    error = %err,
-                    relay_session_id,
-                    "Failed to persist last active relay session id"
-                );
-            }
+        {
+            warn!(
+                error = %err,
+                relay_session_id,
+                "Failed to persist last active relay session id"
+            );
+        }
         let resume_from_seq = frame
             .get("resume_from_seq")
             .and_then(|v| v.as_u64())
@@ -5025,34 +5035,35 @@ impl TerminalBridge {
         let mut remap_reason: Option<&'static str> = None;
         if let Some(explicit_relay_session_id) = requested_relay_session_id.as_deref()
             && explicit_relay_session_id != relay_session_id
-                && self.sessions.contains_key(explicit_relay_session_id)
-            {
-                remap_source_session_id = Some(explicit_relay_session_id.to_string());
-                remap_reason = Some("explicit relay_session_id from client hello");
-            }
+            && self.sessions.contains_key(explicit_relay_session_id)
+        {
+            remap_source_session_id = Some(explicit_relay_session_id.to_string());
+            remap_reason = Some("explicit relay_session_id from client hello");
+        }
         if remap_source_session_id.is_none()
-            && let Some(telegram_session_id) = telegram_session_id.as_deref() {
-                match self
-                    .host
-                    .resolve_relay_for_telegram_session(telegram_session_id)
-                    .await
-                {
-                    Ok(Some(mapped)) => {
-                        if mapped != relay_session_id && self.sessions.contains_key(&mapped) {
-                            remap_source_session_id = Some(mapped);
-                            remap_reason = Some("telegram session binding");
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!(
-                            error = %err,
-                            telegram_session_id = %telegram_session_id,
-                            "Failed to resolve Telegram-to-relay mapping during client hello"
-                        );
+            && let Some(telegram_session_id) = telegram_session_id.as_deref()
+        {
+            match self
+                .host
+                .resolve_relay_for_telegram_session(telegram_session_id)
+                .await
+            {
+                Ok(Some(mapped)) => {
+                    if mapped != relay_session_id && self.sessions.contains_key(&mapped) {
+                        remap_source_session_id = Some(mapped);
+                        remap_reason = Some("telegram session binding");
                     }
                 }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        telegram_session_id = %telegram_session_id,
+                        "Failed to resolve Telegram-to-relay mapping during client hello"
+                    );
+                }
             }
+        }
         if let Some(from_session_id) = remap_source_session_id.as_deref() {
             if let Err(err) = self
                 .remap_active_session_id(from_session_id, relay_session_id)
@@ -5086,18 +5097,21 @@ impl TerminalBridge {
         // Only tear down an already-bootstrapped session when the client explicitly
         // asks for a fresh start. A plain Mini App reopen resets local replay cursors
         // to zero, so resume_from_seq == 0 alone must not trigger session teardown.
-        if requested_fresh_start && requested_agent.is_some() && resume_from_seq == 0
+        if requested_fresh_start
+            && requested_agent.is_some()
+            && resume_from_seq == 0
             && let Some(active) = self.sessions.get(relay_session_id)
-                && active.crypto.bootstrapped_agent {
-                    info!(
-                        relay_session_id,
-                        old_agent = active.crypto.agent.as_deref().unwrap_or("none"),
-                        new_agent = requested_agent.as_deref().unwrap_or("none"),
-                        "Tearing down stale session for explicit fresh agent start"
-                    );
-                    self.remove_session(relay_session_id, "fresh agent start")
-                        .await;
-                }
+            && active.crypto.bootstrapped_agent
+        {
+            info!(
+                relay_session_id,
+                old_agent = active.crypto.agent.as_deref().unwrap_or("none"),
+                new_agent = requested_agent.as_deref().unwrap_or("none"),
+                "Tearing down stale session for explicit fresh agent start"
+            );
+            self.remove_session(relay_session_id, "fresh agent start")
+                .await;
+        }
 
         if let Some(active) = self.sessions.get_mut(relay_session_id) {
             active.crypto.cipher = cipher;
@@ -5112,14 +5126,14 @@ impl TerminalBridge {
                     .host
                     .bind_telegram_session_to_relay(telegram_session_id, relay_session_id)
                     .await
-                {
-                    warn!(
-                        error = %err,
-                        telegram_session_id = %telegram_session_id,
-                        relay_session_id = %relay_session_id,
-                        "Failed to persist Telegram-to-relay session mapping"
-                    );
-                }
+            {
+                warn!(
+                    error = %err,
+                    telegram_session_id = %telegram_session_id,
+                    relay_session_id = %relay_session_id,
+                    "Failed to persist Telegram-to-relay session mapping"
+                );
+            }
             Self::send_plain_json(
                 ws_write,
                 json!({
@@ -5207,14 +5221,14 @@ impl TerminalBridge {
                 .host
                 .bind_telegram_session_to_relay(telegram_session_id, relay_session_id)
                 .await
-            {
-                warn!(
-                    error = %err,
-                    telegram_session_id = %telegram_session_id,
-                    relay_session_id = %relay_session_id,
-                    "Failed to persist Telegram-to-relay session mapping"
-                );
-            }
+        {
+            warn!(
+                error = %err,
+                telegram_session_id = %telegram_session_id,
+                relay_session_id = %relay_session_id,
+                "Failed to persist Telegram-to-relay session mapping"
+            );
+        }
 
         Self::send_plain_json(
             ws_write,
@@ -5874,14 +5888,14 @@ impl TerminalBridge {
                 .host
                 .set_last_active_relay_session_id(owner_user_id, to_session_id)
                 .await
-            {
-                warn!(
-                    error = %err,
-                    from_session_id = %from_session_id,
-                    to_session_id = %to_session_id,
-                    "Failed to persist remapped relay session id"
-                );
-            }
+        {
+            warn!(
+                error = %err,
+                from_session_id = %from_session_id,
+                to_session_id = %to_session_id,
+                "Failed to persist remapped relay session id"
+            );
+        }
 
         Ok(())
     }
@@ -6433,9 +6447,10 @@ fn run_local_attach_interactive(
         .unwrap_or("unknown");
     eprintln!("{} session {}. Press Ctrl+] to detach.", verb, session_id);
     if let Some(code) = first_value.get("resume_code").and_then(|v| v.as_str())
-        && !code.trim().is_empty() {
-            eprintln!("Telegram command: /agent resume {}", code.trim());
-        }
+        && !code.trim().is_empty()
+    {
+        eprintln!("Telegram command: /agent resume {}", code.trim());
+    }
 
     if let Some((cols, rows)) = local_terminal_size() {
         let _ = send_local_attach_resize_and_redraw(&mut writer, cols, rows);
@@ -6612,8 +6627,8 @@ mod tests {
 
     #[test]
     fn test_is_expected_disconnect_classifies_routine_resets() {
-        use tokio_tungstenite::tungstenite::error::ProtocolError;
         use tokio_tungstenite::tungstenite::Error as WsError;
+        use tokio_tungstenite::tungstenite::error::ProtocolError;
 
         // Routine disconnects that the reconnect loop recovers from automatically.
         assert!(TerminalBridge::is_expected_disconnect(&anyhow::anyhow!(
@@ -6673,8 +6688,8 @@ mod tests {
         use axum::http::StatusCode;
         use axum::routing::post;
         use axum::{Json, Router};
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         #[derive(Clone)]
         struct TestState {
@@ -6946,9 +6961,11 @@ mod tests {
 
         assert!(stored.saved_inside_session_workspace);
         assert!(stored.fallback_reason.is_none());
-        assert!(stored
-            .path
-            .starts_with(session_upload_dir(session_dir.path())));
+        assert!(
+            stored
+                .path
+                .starts_with(session_upload_dir(session_dir.path()))
+        );
         assert_eq!(
             std::fs::read(&stored.path).expect("read stored image"),
             b"png-bytes"
@@ -7324,9 +7341,11 @@ mod tests {
         let codex = review_launch_args("codex", &profiles["codex"].args);
         assert!(codex.windows(2).any(|w| w == ["--sandbox", "read-only"]));
         let claude = review_launch_args("claude", &profiles["claude"].args);
-        assert!(claude
-            .windows(2)
-            .any(|w| w == ["--permission-mode", "plan"]));
+        assert!(
+            claude
+                .windows(2)
+                .any(|w| w == ["--permission-mode", "plan"])
+        );
     }
 
     #[test]
@@ -7356,10 +7375,12 @@ mod tests {
             raw,
         );
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap_or_default()
-            .contains("no structured JSON review payload"));
+        assert!(
+            result
+                .err()
+                .unwrap_or_default()
+                .contains("no structured JSON review payload")
+        );
     }
 
     #[test]

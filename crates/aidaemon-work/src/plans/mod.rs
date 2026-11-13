@@ -13,7 +13,7 @@ mod store;
 #[allow(dead_code)]
 mod tracking;
 
-pub use store::{migrate_task_plans, PlanStore};
+pub use store::{PlanStore, migrate_task_plans};
 
 /// Start of the user-facing render in this tool's output. The agent loop
 /// locates it to lift the checklist onto the live status surface, so any
@@ -1305,9 +1305,10 @@ mod tests {
         assert!(plan.settle_open_steps());
         assert!(plan.is_finished());
         assert_eq!(plan.steps[2].not_done, Some(NotDoneReason::LeftOpen));
-        assert!(plan
-            .render_compact_checklist()
-            .contains("nothing was left working on it"));
+        assert!(
+            plan.render_compact_checklist()
+                .contains("nothing was left working on it")
+        );
     }
 
     #[test]
@@ -1470,18 +1471,20 @@ mod tests {
         assert!(plan.settle_background_job("job-a", JobEnd::Succeeded));
         assert_eq!(plan.steps[1].status, StepStatus::Completed);
         assert_eq!(plan.steps[3].status, StepStatus::Background);
-        assert!(plan
-            .render_compact_checklist()
-            .starts_with("⏳ Continuing in the background · 2 of 4 done"));
+        assert!(
+            plan.render_compact_checklist()
+                .starts_with("⏳ Continuing in the background · 2 of 4 done")
+        );
 
         // The other fails: its step and the shared one failed, never done.
         assert!(plan.settle_background_job("job-b", JobEnd::Failed));
         assert_eq!(plan.steps[2].status, StepStatus::Failed);
         assert_eq!(plan.steps[3].status, StepStatus::Failed);
         assert_eq!(plan.status, PlanStatus::Failed);
-        assert!(plan
-            .render_compact_checklist()
-            .starts_with("❌ Stopped · 2 of 4 done"));
+        assert!(
+            plan.render_compact_checklist()
+                .starts_with("❌ Stopped · 2 of 4 done")
+        );
         // A job nothing waits on changes nothing.
         assert!(!plan.settle_background_job("job-c", JobEnd::Succeeded));
     }
@@ -1506,9 +1509,10 @@ mod tests {
         plan.steps[1].status = StepStatus::Deferred;
         plan.steps[2].status = StepStatus::Deferred;
         plan.status = PlanStatus::PartiallyCompleted;
-        assert!(plan
-            .render_compact_checklist()
-            .starts_with("⚠️ Stopped short"));
+        assert!(
+            plan.render_compact_checklist()
+                .starts_with("⚠️ Stopped short")
+        );
 
         let jobs = vec!["job-a".to_string(), "job-b".to_string()];
         assert!(plan.wait_on_background_jobs(&jobs));
@@ -1523,9 +1527,10 @@ mod tests {
         );
 
         assert!(plan.settle_background_job("job-a", JobEnd::Succeeded));
-        assert!(plan
-            .render_compact_checklist()
-            .starts_with("⏳ Continuing in the background"));
+        assert!(
+            plan.render_compact_checklist()
+                .starts_with("⏳ Continuing in the background")
+        );
         assert!(plan.settle_background_job("job-b", JobEnd::Succeeded));
         assert_eq!(plan.steps[1].status, StepStatus::Completed);
         assert_eq!(plan.steps[2].status, StepStatus::Completed);

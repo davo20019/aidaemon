@@ -4,7 +4,7 @@
 
 use aidaemon_tools::services::SettingsStore;
 use chrono::Utc;
-use rand::{rng as thread_rng, RngExt};
+use rand::{RngExt, rng as thread_rng};
 use serde::{Deserialize, Serialize};
 
 const HANDOFF_KEY_PREFIX: &str = "terminal_attach_handoff:";

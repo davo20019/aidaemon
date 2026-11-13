@@ -50,38 +50,38 @@ mod tracing_sink;
 mod untrusted;
 
 pub use approval::{ApprovalGrants, ApprovalMode, ApprovalPolicy, ApprovalRules, RuleDecision};
-pub use context_window::{estimate_tokens, ContextWindow};
+pub use context_window::{ContextWindow, estimate_tokens};
 pub use conversation::{
-    compaction_threshold, elide_middle, render_summary_note, turns_to_summarize, verbatim_tokens,
-    wait_threshold, CompactionJobs, CompactionLimits, Compactor, ConversationCompaction,
+    COMPACTED_STATE_HEADINGS, CompactionJobs, CompactionLimits, Compactor, ConversationCompaction,
     ConversationSource, ConversationSummary, ConversationTurn, InMemorySummaries, PendingTurns,
-    ProviderSummarizer, Summarizer, SummaryNote, SummaryStore, COMPACTED_STATE_HEADINGS,
+    ProviderSummarizer, Summarizer, SummaryNote, SummaryStore, compaction_threshold, elide_middle,
+    render_summary_note, turns_to_summarize, verbatim_tokens, wait_threshold,
 };
 pub use egress::EgressGuard;
 pub use grants::SessionGrants;
 pub use instructions::{
-    InstructionSource, NestedInstructions, ProjectInstructions, OBSTACLE_GUIDANCE,
+    InstructionSource, NestedInstructions, OBSTACLE_GUIDANCE, ProjectInstructions,
 };
-pub use loop_guard::{same_tool_loop, SameToolStreakGuard, StreakLimits};
+pub use loop_guard::{SameToolStreakGuard, StreakLimits, same_tool_loop};
 pub use memory::{
     HistoryIntake, HostTurn, InMemoryRecall, Learning, MemoryInjection, MemoryParts, MemorySystem,
     MemoryTurn, PastMessage, PastRole, Recall, TurnLearning,
 };
 pub use opt_out::{
-    OptOutRecorder, PrivateTurnGuard, SkipLearningTool, StoresJudge, PRIVATE_TURN_STORE_REFUSAL,
-    SKIP_LEARNING_TOOL,
+    OptOutRecorder, PRIVATE_TURN_STORE_REFUSAL, PrivateTurnGuard, SKIP_LEARNING_TOOL,
+    SkipLearningTool, StoresJudge,
 };
 #[cfg(feature = "otel")]
-pub use otel::{otlp_provider, OtelSink};
+pub use otel::{OtelSink, otlp_provider};
 pub use path::{resolve_path, resolve_path_from, resolves_within};
-pub use redact::{secret_patterns, Redactor};
+pub use redact::{Redactor, secret_patterns};
 pub use scope::{ScopeGuard, UndeclaredAccess};
 pub use shell::{
     catastrophic_reason, command_segments, contains_shell_operator, credential_path_segment,
     irreversible_delete_reason, scan_shell,
 };
 pub use tracing_sink::TracingSink;
-pub use untrusted::{wrap_untrusted, UntrustedOutput, UNTRUSTED_PREFIX, UNTRUSTED_SUFFIX};
+pub use untrusted::{UNTRUSTED_PREFIX, UNTRUSTED_SUFFIX, UntrustedOutput, wrap_untrusted};
 
 use aidaemon_core::{Message, Role};
 

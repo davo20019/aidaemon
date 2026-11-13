@@ -5,17 +5,17 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aidaemon_channel_telegram::{TelegramChannel, MAX_CALLBACK_DATA};
+use aidaemon_channel_telegram::{MAX_CALLBACK_DATA, TelegramChannel};
 use aidaemon_channels::{
     ApprovalChoice, ApprovalPrompt, Channel, ChannelError, ChannelEvent, Conversation,
     ConversationKind, MessageRef, OutboundMessage,
 };
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
 use axum::response::IntoResponse;
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -629,7 +629,9 @@ async fn send_converts_markdown_and_targets_threads() {
     assert_eq!(call.body["parse_mode"], json!("HTML"));
     assert_eq!(
         call.body["text"],
-        json!("<b>Done</b> for Alice Rivera: <code>a &lt; b</code> &amp; <a href=\"https://example.com\">docs</a>")
+        json!(
+            "<b>Done</b> for Alice Rivera: <code>a &lt; b</code> &amp; <a href=\"https://example.com\">docs</a>"
+        )
     );
     assert_eq!(r.message_id, "5000");
 }

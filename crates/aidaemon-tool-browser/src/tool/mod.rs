@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -11,11 +11,11 @@ use tracing::{info, warn};
 use crate::settings::BrowserSettings;
 use aidaemon_channels::hub::{MediaKind, MediaMessage};
 use aidaemon_events::conversation::MessageAttachment;
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::semantics::{
     ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolMutationEffects, ToolTargetHintKind, ToolVerificationMode,
 };
-use aidaemon_tools::OutcomeTool as Tool;
 
 use policy::BrowserRiskClass;
 
@@ -940,9 +940,10 @@ impl BrowserTool {
         };
         if blocked.is_loopback()
             && let Some(key) = policy::local_site_key(url)
-                && self.local_site_allowed(session_id, &key).await {
-                    return Ok(());
-                }
+            && self.local_site_allowed(session_id, &key).await
+        {
+            return Ok(());
+        }
         Err(blocked)
     }
 
@@ -986,16 +987,17 @@ impl BrowserTool {
         session_id: &str,
     ) -> Result<(), String> {
         if let Some(current_url) = page.url().await
-            && let Err(blocked) = self.check_network(session_id, &current_url).await {
-                warn!(
-                    class = blocked.class.label(),
-                    "observation/JS action refused: current page is on a blocked host"
-                );
-                return Err(format!(
-                    "Action blocked: current page is a {}",
-                    blocked.class.label()
-                ));
-            }
+            && let Err(blocked) = self.check_network(session_id, &current_url).await
+        {
+            warn!(
+                class = blocked.class.label(),
+                "observation/JS action refused: current page is on a blocked host"
+            );
+            return Err(format!(
+                "Action blocked: current page is a {}",
+                blocked.class.label()
+            ));
+        }
         Ok(())
     }
 
@@ -1040,23 +1042,24 @@ impl BrowserTool {
         // which may carry a path/query/token.
         let final_url = page.url().await;
         if let Some(final_url) = final_url.as_deref()
-            && let Err(blocked) = self.check_network(session_id, final_url).await {
-                warn!(
-                    class = blocked.class.label(),
-                    "navigation landed on a blocked host after redirect; blocking"
-                );
-                // Neutralize the committed state: the page is currently sitting on
-                // the blocked host, so a subsequent get_text/screenshot/execute_js
-                // could read/capture/evaluate the blocked content even though we're
-                // about to return an error. Reset to about:blank so nothing on the
-                // blocked host remains observable. Best-effort: a failure here does
-                // not change the outcome (the action is still blocked).
-                let _ = page.goto("about:blank").await;
-                return Err(format!(
-                    "Navigation blocked: redirected to a {}",
-                    blocked.class.label()
-                ));
-            }
+            && let Err(blocked) = self.check_network(session_id, final_url).await
+        {
+            warn!(
+                class = blocked.class.label(),
+                "navigation landed on a blocked host after redirect; blocking"
+            );
+            // Neutralize the committed state: the page is currently sitting on
+            // the blocked host, so a subsequent get_text/screenshot/execute_js
+            // could read/capture/evaluate the blocked content even though we're
+            // about to return an error. Reset to about:blank so nothing on the
+            // blocked host remains observable. Best-effort: a failure here does
+            // not change the outcome (the action is still blocked).
+            let _ = page.goto("about:blank").await;
+            return Err(format!(
+                "Navigation blocked: redirected to a {}",
+                blocked.class.label()
+            ));
+        }
 
         if let Some(final_url) = final_url {
             self.sessions
@@ -1224,21 +1227,22 @@ impl BrowserTool {
         // A later capture is kept for looking at, not sent.
         let subject = kind.subject();
         if let Some(fence) = fence
-            && let Err(delivered) = fence.claim_delivery(&subject).await {
-                return Ok(DispatchResult {
-                    text: format!(
-                        "Screenshot captured, not sent: {} already sent the owner a screenshot \
+            && let Err(delivered) = fence.claim_delivery(&subject).await
+        {
+            return Ok(DispatchResult {
+                text: format!(
+                    "Screenshot captured, not sent: {} already sent the owner a screenshot \
                          of {} at {} in this request, and each is sent once. This capture is \
                          only for you to look at.\nSaved to: {}",
-                        delivered.by,
-                        short_page_name(&display_url),
-                        delivered.owner_time(),
-                        saved_attachment.local_path
-                    ),
-                    attachments: vec![saved_attachment],
-                    semantics: None,
-                });
-            }
+                    delivered.by,
+                    short_page_name(&display_url),
+                    delivered.owner_time(),
+                    saved_attachment.local_path
+                ),
+                attachments: vec![saved_attachment],
+                semantics: None,
+            });
+        }
         if let Err(reason) = (deliverable.send)().await {
             if let Some(fence) = fence {
                 fence.release_delivery(&subject).await;
@@ -1492,11 +1496,12 @@ impl BrowserTool {
         // A same-tab click may have navigated. Refresh the last-known URL so a
         // later point-of-action prompt names the actual site origin.
         if let Some(current_url) = page.url().await
-            && self.check_network(session_id, &current_url).await.is_ok() {
-                self.sessions
-                    .update_active_tab_url(session_id, current_url)
-                    .await;
-            }
+            && self.check_network(session_id, &current_url).await.is_ok()
+        {
+            self.sessions
+                .update_active_tab_url(session_id, current_url)
+                .await;
+        }
 
         match new_tab_id {
             Some(tab_id) => Ok(format!(
@@ -1677,11 +1682,12 @@ impl BrowserTool {
         // Arbitrary JavaScript can change `location`. Preserve the last observed
         // public URL so the next approval prompt names the resulting origin.
         if let Some(current_url) = page.url().await
-            && self.check_network(session_id, &current_url).await.is_ok() {
-                self.sessions
-                    .update_active_tab_url(session_id, current_url)
-                    .await;
-            }
+            && self.check_network(session_id, &current_url).await.is_ok()
+        {
+            self.sessions
+                .update_active_tab_url(session_id, current_url)
+                .await;
+        }
 
         let value_str = match result {
             Some(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| format!("{:?}", v)),
@@ -1814,7 +1820,7 @@ impl BrowserTool {
                 return Err(format!(
                     "Invalid mode '{}'. Use 'visible' or 'headless'.",
                     mode
-                ))
+                ));
             }
         };
 
@@ -2135,18 +2141,19 @@ impl BrowserTool {
         // does, so a redirect to a blocked host can't leave a live tab pointed
         // at an internal address. Close the tab and report the host class only.
         if let Some(ref final_url) = current_url
-            && let Err(blocked) = self.check_network(session_id, final_url).await {
-                warn!(
-                    class = blocked.class.label(),
-                    "new tab landed on a blocked host after redirect; closing"
-                );
-                // Best-effort backend cleanup — the tab was never registered.
-                let _ = self.backend.close_target(&target_id).await;
-                return Err(format!(
-                    "Navigation blocked: redirected to a {}",
-                    blocked.class.label()
-                ));
-            }
+            && let Err(blocked) = self.check_network(session_id, final_url).await
+        {
+            warn!(
+                class = blocked.class.label(),
+                "new tab landed on a blocked host after redirect; closing"
+            );
+            // Best-effort backend cleanup — the tab was never registered.
+            let _ = self.backend.close_target(&target_id).await;
+            return Err(format!(
+                "Navigation blocked: redirected to a {}",
+                blocked.class.label()
+            ));
+        }
 
         let preview = if url.is_some() {
             page_text_preview(page.as_ref()).await
@@ -2269,15 +2276,16 @@ impl BrowserTool {
                 ));
             }
             if let Some(url) = url
-                && let Err(blocked) = self.check_network(session_id, url).await {
-                    // A local site goes on to the owner's approval gate.
-                    if policy::local_site_key(url).is_none() {
-                        return Ok(DispatchResult::text_only(format!(
-                            "Error: {}",
-                            blocked.message()
-                        )));
-                    }
+                && let Err(blocked) = self.check_network(session_id, url).await
+            {
+                // A local site goes on to the owner's approval gate.
+                if policy::local_site_key(url).is_none() {
+                    return Ok(DispatchResult::text_only(format!(
+                        "Error: {}",
+                        blocked.message()
+                    )));
                 }
+            }
         }
 
         let action_args = ActionArgs {
@@ -2354,14 +2362,15 @@ impl Tool for BrowserTool {
             facts.trusted_session,
         );
         if let Some(args) = local_site
-            && let Some(key) = self.unapproved_local_site(&args).await {
-                let expires_at = matches!(response, ApprovalResponse::AllowOnce)
-                    .then(|| tokio::time::Instant::now() + LOCAL_SITE_ONCE);
-                self.sessions
-                    .approve_local_site(args.session_id, key, expires_at)
-                    .await;
-                return;
-            }
+            && let Some(key) = self.unapproved_local_site(&args).await
+        {
+            let expires_at = matches!(response, ApprovalResponse::AllowOnce)
+                .then(|| tokio::time::Instant::now() + LOCAL_SITE_ONCE);
+            self.sessions
+                .approve_local_site(args.session_id, key, expires_at)
+                .await;
+            return;
+        }
         let Some((request, point_of_action)) =
             self.kernel_approval_need(call.arguments, facts).await
         else {
@@ -2772,8 +2781,7 @@ mod prompt_tests {
 
     #[test]
     fn read_only_dom_extraction_is_observation_semantics() {
-        let script =
-            "JSON.stringify([...document.querySelectorAll('button')].map((b,i)=>({i,text:b.innerText})))";
+        let script = "JSON.stringify([...document.querySelectorAll('button')].map((b,i)=>({i,text:b.innerText})))";
         let semantics = browser_call_semantics(Some("execute_js"), "", "", script, "");
         assert!(semantics.observes_state());
         assert!(!semantics.mutates_state());
@@ -2808,9 +2816,11 @@ mod prompt_tests {
         let semantics =
             browser_call_semantics(Some("render_pdf"), "", "", "", "investor-brief.pdf");
         assert!(semantics.mutates_state());
-        assert!(semantics
-            .mutation_effects
-            .contains(ToolMutationEffects::LOCAL_WORKSPACE_WRITE));
+        assert!(
+            semantics
+                .mutation_effects
+                .contains(ToolMutationEffects::LOCAL_WORKSPACE_WRITE)
+        );
         assert_eq!(semantics.target_hints.len(), 1);
         assert_eq!(semantics.target_hints[0].value, "investor-brief.pdf");
     }

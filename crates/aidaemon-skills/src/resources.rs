@@ -166,9 +166,11 @@ mod tests {
             .read_resource("nonexistent", "references/guide.md")
             .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No directory registered"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No directory registered")
+        );
     }
 }

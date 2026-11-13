@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::plans::{ChecklistItem, PlanStatus, PlanStore, StepStatus};
 use crate::traits::{
@@ -15,10 +15,10 @@ use crate::traits::{
 use aidaemon_events::dialogue::RequestVerificationTargetKind;
 use aidaemon_tools::OutcomeTool as Tool;
 
-pub use crate::plans::checklist_args::{
-    parse_expectation_target, parse_expectation_targets, unbound_targets_of, UNBOUND_TARGETS_KEY,
-};
 pub use crate::plans::CHECKLIST_HEADER;
+pub use crate::plans::checklist_args::{
+    UNBOUND_TARGETS_KEY, parse_expectation_target, parse_expectation_targets, unbound_targets_of,
+};
 
 /// Union of the exact receipt subjects every registered tool advertises via
 /// `ToolSemantics::stable_observation_subjects`. Checklist resource-ID targets are bound
@@ -466,7 +466,7 @@ impl TrackRequirementsTool {
                 return Ok(
                     "track_requirements: no session context available; checklist not saved."
                         .to_string(),
-                )
+                );
             }
         };
         let task_id = facts.task_id.clone();
@@ -508,7 +508,7 @@ impl TrackRequirementsTool {
                 Some(_) => {
                     return Ok(format!(
                         "track_requirements: item {item_index} dependencies must be an array."
-                    ))
+                    ));
                 }
             };
             let mut required_mutation_effects = ToolMutationEffects::NONE;
@@ -534,8 +534,8 @@ impl TrackRequirementsTool {
                 Ok((targets, _)) => targets,
                 Err(error) => {
                     return Ok(format!(
-                    "track_requirements: item {item_index} has invalid evidence targets: {error}."
-                ))
+                        "track_requirements: item {item_index} has invalid evidence targets: {error}."
+                    ));
                 }
             };
             items.push(ChecklistItem {
@@ -676,23 +676,23 @@ impl crate::traits::ToolSemantics for TrackRequirementsTool {
                 .as_str()
                 .and_then(aidaemon_events::ExecutorClaimedOutcome::from_protocol_name)
                 .is_none()
-            {
-                return Err(ToolArgumentContractViolation::new(format!(
-                    "outcome must be one of {}",
-                    aidaemon_events::ExecutorClaimedOutcome::PROTOCOL_NAMES.join(", ")
-                )));
-            }
+        {
+            return Err(ToolArgumentContractViolation::new(format!(
+                "outcome must be one of {}",
+                aidaemon_events::ExecutorClaimedOutcome::PROTOCOL_NAMES.join(", ")
+            )));
+        }
         if let Some(short_of) = value.get("short_of")
             && short_of
                 .as_str()
                 .and_then(aidaemon_events::ShortResource::from_protocol_name)
                 .is_none()
-            {
-                return Err(ToolArgumentContractViolation::new(format!(
-                    "short_of must be one of {}",
-                    aidaemon_events::ShortResource::PROTOCOL_NAMES.join(", ")
-                )));
-            }
+        {
+            return Err(ToolArgumentContractViolation::new(format!(
+                "short_of must be one of {}",
+                aidaemon_events::ShortResource::PROTOCOL_NAMES.join(", ")
+            )));
+        }
         if let Some(items) = value.get("items").and_then(Value::as_array) {
             for (index, item) in items.iter().enumerate() {
                 parse_expectation_targets(item.get("targets")).map_err(|error| {
@@ -747,9 +747,10 @@ mod tests {
     async fn checklist_outcome_is_typed() {
         let (tool, _plan_store) = test_tool().await;
         let item = r#"{"text":"Probe","status":"completed"}"#;
-        assert!(tool
-            .validate_arguments(&format!(r#"{{"items":[{item}],"outcome":"finished"}}"#))
-            .is_err());
+        assert!(
+            tool.validate_arguments(&format!(r#"{{"items":[{item}],"outcome":"finished"}}"#))
+                .is_err()
+        );
         let blocked = format!(r#"{{"items":[{item}],"outcome":"blocked"}}"#);
         assert!(tool.validate_arguments(&blocked).is_ok());
         let declared = executor_expectations_from_checklist_arguments("task-synthetic", &blocked)
@@ -774,11 +775,12 @@ mod tests {
                 .short_of,
             Some(aidaemon_events::ShortResource::DockerDiskSpace)
         );
-        assert!(tool
-            .validate_arguments(&format!(
+        assert!(
+            tool.validate_arguments(&format!(
                 r#"{{"items":[{item}],"outcome":"blocked","short_of":"low disk"}}"#
             ))
-            .is_err());
+            .is_err()
+        );
     }
 
     #[tokio::test]

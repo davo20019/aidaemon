@@ -10,7 +10,7 @@ use std::sync::Arc;
 use aidaemon_sdk::memory::{HashEmbedder, Memory, ScopedMemory, SqliteMemoryStore};
 use aidaemon_sdk::policies::MemoryTurn;
 use aidaemon_sdk::testing::behavior::{self, BoxError, Parts, Subject};
-use aidaemon_sdk::{preset, Agent};
+use aidaemon_sdk::{Agent, preset};
 
 mod notebook;
 #[cfg(test)]

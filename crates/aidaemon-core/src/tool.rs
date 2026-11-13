@@ -582,10 +582,11 @@ fn check_value(schema: &Value, value: &Value, at: &str, required_keys: bool) -> 
         }
     }
     if let Some(options) = schema.get("enum").and_then(Value::as_array)
-        && !options.contains(value) {
-            let listed: Vec<String> = options.iter().map(Value::to_string).collect();
-            return Err(format!("`{at}` must be one of {}", listed.join(", ")));
-        }
+        && !options.contains(value)
+    {
+        let listed: Vec<String> = options.iter().map(Value::to_string).collect();
+        return Err(format!("`{at}` must be one of {}", listed.join(", ")));
+    }
     if let Value::Object(object) = value {
         let required: Vec<&str> = schema
             .get("required")
@@ -637,11 +638,12 @@ fn check_value(schema: &Value, value: &Value, at: &str, required_keys: bool) -> 
         }
     }
     if let (Value::Array(items), Some(item_schema)) = (value, schema.get("items"))
-        && item_schema.is_object() {
-            for (index, item) in items.iter().enumerate() {
-                check_value(item_schema, item, &format!("{at}[{index}]"), required_keys)?;
-            }
+        && item_schema.is_object()
+    {
+        for (index, item) in items.iter().enumerate() {
+            check_value(item_schema, item, &format!("{at}[{index}]"), required_keys)?;
         }
+    }
     Ok(())
 }
 

@@ -1,9 +1,9 @@
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::OutcomeTool as Tool;
 use crate::backend::SharedExecutionBackend;
 use crate::semantics::{ToolCapabilities, ToolRole};
-use crate::OutcomeTool as Tool;
 use crate::{BackendPath, ExecutionRequest};
 
 /// Where the daemon's process says its config file is.
@@ -221,19 +221,22 @@ where
     let mut lines = Vec::new();
 
     if let Ok(workdir) = lookup(RUNTIME_WORKDIR_ENV_KEY)
-        && !workdir.trim().is_empty() {
-            lines.push(format!("  Working dir         {}", workdir));
-        }
+        && !workdir.trim().is_empty()
+    {
+        lines.push(format!("  Working dir         {}", workdir));
+    }
 
     if let Ok(config_path) = lookup(RUNTIME_CONFIG_PATH_ENV_KEY)
-        && !config_path.trim().is_empty() {
-            lines.push(format!("  Config path         {}", config_path));
-        }
+        && !config_path.trim().is_empty()
+    {
+        lines.push(format!("  Config path         {}", config_path));
+    }
 
     if let Ok(env_path) = lookup(RUNTIME_ENV_FILE_ENV_KEY)
-        && !env_path.trim().is_empty() {
-            lines.push(format!("  Env file            {}", env_path));
-        }
+        && !env_path.trim().is_empty()
+    {
+        lines.push(format!("  Env file            {}", env_path));
+    }
 
     let secret_backend = match lookup("AIDAEMON_NO_KEYCHAIN") {
         Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Some("env-file / environment"),

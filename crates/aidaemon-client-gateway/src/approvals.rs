@@ -6,10 +6,10 @@
 //! run resumes exactly as it would from the chat.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use aidaemon_channels::approval_render::{approval_use_session_button, card_headline, ApprovalAsk};
+use aidaemon_channels::approval_render::{ApprovalAsk, approval_use_session_button, card_headline};
 use aidaemon_channels::hub::{ApprovalTap, TapAnswer, TapClosed, TappedApproval};
 use aidaemon_client_protocol as wire;
 use aidaemon_client_protocol::{
@@ -20,7 +20,7 @@ use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse};
 use tokio::sync::oneshot;
 
 use crate::bus::now_ms;
-use crate::{Publisher, APP_CHANNEL};
+use crate::{APP_CHANNEL, Publisher};
 
 /// How many settled approvals are remembered for `conflict` replies.
 const SETTLED_KEPT: usize = 512;
@@ -112,13 +112,15 @@ impl Approvals {
             ));
         }
         if let Some(ceiling) = ceiling
-            && decision != ApprovalDecision::Deny && open.approval.risk > ceiling {
-                return Err(ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "This approval is above what this device may allow: open it on your phone \
+            && decision != ApprovalDecision::Deny
+            && open.approval.risk > ceiling
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "This approval is above what this device may allow: open it on your phone \
                      or computer (denying it from here is fine)",
-                ));
-            }
+            ));
+        }
         let Some(answer) = open.answer.take() else {
             return Err(ProtocolError::new(
                 ErrorCode::Conflict,

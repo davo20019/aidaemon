@@ -7,11 +7,11 @@ use aidaemon_core::{AccessManifest, ToolAnnotations};
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::backend::{BackendFileType, BackendPath};
-use crate::fs::{workspace_parts, FilePolicy, SharedBackend, ToolText, DEFAULT_IGNORE_DIRS};
-use crate::outcome::{core_tool, OutcomeTool};
+use crate::fs::{DEFAULT_IGNORE_DIRS, FilePolicy, SharedBackend, ToolText, workspace_parts};
+use crate::outcome::{OutcomeTool, core_tool};
 use crate::semantics::{
     ToolCallContext, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolRole,
     ToolTargetHintKind, ToolVerificationMode,
@@ -141,7 +141,9 @@ impl SearchFiles {
             .unwrap_or(DEFAULT_MAX_RESULTS);
 
         if content_pattern.is_none() && glob_pattern.is_none() {
-            anyhow::bail!("At least one of 'pattern' (content regex) or 'glob' (filename pattern) is required");
+            anyhow::bail!(
+                "At least one of 'pattern' (content regex) or 'glob' (filename pattern) is required"
+            );
         }
 
         let backend = self.backend.clone();
@@ -155,15 +157,16 @@ impl SearchFiles {
                 .trim_end()
                 .trim_end_matches([')', ':', ',', ';', '.'])
                 .trim_end();
-            if trimmed != path_str && !trimmed.is_empty()
+            if trimmed != path_str
+                && !trimmed.is_empty()
                 && let Ok(candidate) = backend.resolve_path(trimmed).await
-                    && backend
-                        .metadata(&candidate)
-                        .await
-                        .is_ok_and(|metadata| metadata.is_dir())
-                    {
-                        search_dir = candidate;
-                    }
+                && backend
+                    .metadata(&candidate)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                search_dir = candidate;
+            }
         }
         let search_metadata = backend
             .metadata(&search_dir)
@@ -380,11 +383,15 @@ struct SearchStats {
 fn whole_machine_search_hint(shell: &str) -> String {
     #[cfg(target_os = "macos")]
     {
-        format!("For a whole-machine filename search, use the {shell} tool with Spotlight instead of crawling: mdfind -name \"<filename>\" (instant, indexed).")
+        format!(
+            "For a whole-machine filename search, use the {shell} tool with Spotlight instead of crawling: mdfind -name \"<filename>\" (instant, indexed)."
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {
-        format!("For a whole-machine filename search, use the {shell} tool with the file index if available: locate \"<filename>\" (or plocate), falling back to find / -name.")
+        format!(
+            "For a whole-machine filename search, use the {shell} tool with the file index if available: locate \"<filename>\" (or plocate), falling back to find / -name."
+        )
     }
 }
 
@@ -522,9 +529,10 @@ async fn walk_dir(
 
             // Check glob match on filename
             if let Some(matcher) = glob_matcher
-                && !matcher.is_match(&file_name) {
-                    continue;
-                }
+                && !matcher.is_match(&file_name)
+            {
+                continue;
+            }
 
             stats.files_scanned += 1;
 

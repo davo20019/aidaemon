@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use aidaemon_channels::download::{DownloadClient, DownloadRequest};
 use aidaemon_channels::ChannelError;
+use aidaemon_channels::download::{DownloadClient, DownloadRequest};
 use reqwest::{Method, StatusCode, Url};
 use serde_json::Value;
 
@@ -169,7 +169,7 @@ impl Rest {
                     _ => {
                         return Err(ChannelError::RateLimited {
                             retry_after_secs: wait.map(|s| s.max(0.0).ceil() as u64),
-                        })
+                        });
                     }
                 }
             }

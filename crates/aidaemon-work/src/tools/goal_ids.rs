@@ -88,10 +88,12 @@ mod tests {
             ambiguous.find("abc12345").unwrap() < ambiguous.find("abc99999").unwrap(),
             "{ambiguous}"
         );
-        assert!(pick_goal("zzz", &goals, "Scheduled goal")
-            .unwrap_err()
-            .to_string()
-            .starts_with("Scheduled goal not found"));
+        assert!(
+            pick_goal("zzz", &goals, "Scheduled goal")
+                .unwrap_err()
+                .to_string()
+                .starts_with("Scheduled goal not found")
+        );
         assert!(pick_goal("  ", &goals, "Goal").is_err());
     }
 }

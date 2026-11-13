@@ -4,7 +4,7 @@ use sqlx::Row;
 
 use super::*;
 use crate::embedding_index::{
-    content_hash, EmbeddingHit, EmbeddingIndex, EmbeddingItem, EmbeddingSearchFilter, MemoryOwner,
+    EmbeddingHit, EmbeddingIndex, EmbeddingItem, EmbeddingSearchFilter, MemoryOwner, content_hash,
 };
 use crate::stores::{
     GraphEdgeUpsert, GraphEntityUpsert, GraphNeighbor, GraphSearchScope, MemoryGraphStore,
@@ -369,17 +369,18 @@ impl SqliteMemory {
                 .await?;
 
         if let Some(blob) = row.get::<Option<Vec<u8>>, _>("embedding")
-            && let Ok(embedding) = decode_embedding(&blob) {
-                self.embedding_index
-                    .upsert(EmbeddingItem {
-                        owner: MemoryOwner::new("claim", claim_id),
-                        purpose: "recall".to_string(),
-                        model: self.embedding_service.model_id(),
-                        content_hash: content_hash(&claim_text),
-                        embedding,
-                    })
-                    .await?;
-            }
+            && let Ok(embedding) = decode_embedding(&blob)
+        {
+            self.embedding_index
+                .upsert(EmbeddingItem {
+                    owner: MemoryOwner::new("claim", claim_id),
+                    purpose: "recall".to_string(),
+                    model: self.embedding_service.model_id(),
+                    content_hash: content_hash(&claim_text),
+                    embedding,
+                })
+                .await?;
+        }
 
         self.project_claim_graph(claim_id, &category, &key, &privacy, channel_id.as_deref())
             .await?;
@@ -434,17 +435,18 @@ impl SqliteMemory {
                 .fetch_one(&self.pool)
                 .await?;
         if let Some(blob) = row.get::<Option<Vec<u8>>, _>("embedding")
-            && let Ok(embedding) = decode_embedding(&blob) {
-                self.embedding_index
-                    .upsert(EmbeddingItem {
-                        owner: MemoryOwner::new("span", span_id),
-                        purpose: "recall".to_string(),
-                        model: self.embedding_service.model_id(),
-                        content_hash: content_hash(&summary),
-                        embedding,
-                    })
-                    .await?;
-            }
+            && let Ok(embedding) = decode_embedding(&blob)
+        {
+            self.embedding_index
+                .upsert(EmbeddingItem {
+                    owner: MemoryOwner::new("span", span_id),
+                    purpose: "recall".to_string(),
+                    model: self.embedding_service.model_id(),
+                    content_hash: content_hash(&summary),
+                    embedding,
+                })
+                .await?;
+        }
         Ok(())
     }
 

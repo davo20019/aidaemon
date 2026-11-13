@@ -10,7 +10,7 @@
 use aidaemon_core as sdk;
 use async_trait::async_trait;
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::error::{MalformedResponseReason, ProviderError, ProviderErrorKind};
 use aidaemon_events::conversation::ToolCall;

@@ -8,8 +8,8 @@ use tokio::sync::watch;
 use aidaemon_core::{MessageOrigin, Role};
 
 use super::{
-    compaction_threshold, turns_to_summarize, verbatim_tokens, ConversationSource,
-    ConversationSummary, ConversationTurn, Summarizer, SummaryStore,
+    ConversationSource, ConversationSummary, ConversationTurn, Summarizer, SummaryStore,
+    compaction_threshold, turns_to_summarize, verbatim_tokens,
 };
 
 /// Starts the part of a summary that holds what the user said, unsummarized.
@@ -439,11 +439,13 @@ mod tests {
         assert_eq!(first.message_count, 4);
         assert_eq!(first.last_message_id.as_deref(), Some("m4"));
         // Two turns left: under the threshold.
-        assert!(compactor
-            .compact("s", &source, limits(500, 200))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            compactor
+                .compact("s", &source, limits(500, 200))
+                .await
+                .unwrap()
+                .is_none()
+        );
         let grown = Numbered {
             turns: 12,
             ..source

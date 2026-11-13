@@ -18,8 +18,8 @@ use aidaemon_client_protocol::{
 };
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::keystore::KeyStore;
 use crate::signin::{self, GrantCache, SignInError};

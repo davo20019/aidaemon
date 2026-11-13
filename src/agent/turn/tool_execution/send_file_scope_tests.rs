@@ -25,16 +25,14 @@ fn a_confined_child_can_send_its_own_screenshot_but_nothing_else() {
         &inbox.to_string_lossy(),
     );
     let task = crate::traits::ToolCallAccessManifest {
-        read_targets: vec![ToolTargetHint::new(
-            ToolTargetHintKind::ProjectScope,
-            project.to_string_lossy(),
-        )
-        .unwrap()],
-        write_targets: vec![ToolTargetHint::new(
-            ToolTargetHintKind::ProjectScope,
-            project.to_string_lossy(),
-        )
-        .unwrap()],
+        read_targets: vec![
+            ToolTargetHint::new(ToolTargetHintKind::ProjectScope, project.to_string_lossy())
+                .unwrap(),
+        ],
+        write_targets: vec![
+            ToolTargetHint::new(ToolTargetHintKind::ProjectScope, project.to_string_lossy())
+                .unwrap(),
+        ],
         ..Default::default()
     };
     let check = |path: &std::path::Path| {

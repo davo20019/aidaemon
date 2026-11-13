@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::telegram_api::{Bot, CallbackQuery, ChatId};
 pub(crate) use aidaemon_channel_telegram::bot::TelegramBot;
 use aidaemon_channel_telegram::bot::{
-    determine_role, HostCommand, KeyChoice, TelegramHost, TelegramWebhookSettings,
+    HostCommand, KeyChoice, TelegramHost, TelegramWebhookSettings, determine_role,
 };
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -107,7 +107,7 @@ impl DaemonTelegramHost {
 
     /// Test the key against its provider and save it only if it is accepted.
     async fn install_key(&self, slot_id: &str, label: &str, key: &str) -> String {
-        use super::set_key::{check_key, key_targets, save_key, KeyCheck, KeySlot};
+        use super::set_key::{KeyCheck, KeySlot, check_key, key_targets, save_key};
         let slot = KeySlot::from_id(slot_id);
         let target = tokio::fs::read_to_string(&self.runtime.config_path)
             .await
@@ -463,10 +463,11 @@ impl Cx<'_> {
             updated = true;
         }
         if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut())
-            && let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
-                first.insert("allowed_user_ids".to_string(), ids_toml);
-                updated = true;
-            }
+            && let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut())
+        {
+            first.insert("allowed_user_ids".to_string(), ids_toml);
+            updated = true;
+        }
 
         if !updated {
             anyhow::bail!("No [telegram] or [[telegram_bots]] section found in config");
@@ -574,7 +575,7 @@ impl Cx<'_> {
                         return format!(
                             "Could not request approval for cloudflared re-authentication: {}\nRun `cloudflared tunnel login` manually if needed.",
                             err
-                        )
+                        );
                     }
                 };
                 if matches!(login_approval, ApprovalResponse::Deny) {
@@ -689,9 +690,9 @@ impl Cx<'_> {
                 if !wrangler_present
                     && let Some(spec) =
                         crate::wizard::installer_for_missing_tool("wrangler", has_brew, has_npm)
-                    {
-                        install_specs.push(("wrangler".to_string(), spec));
-                    }
+                {
+                    install_specs.push(("wrangler".to_string(), spec));
+                }
 
                 let mut install_report = String::new();
                 if !install_specs.is_empty() {
@@ -726,7 +727,7 @@ impl Cx<'_> {
                             return format!(
                                 "{}\n\nCould not request approval for dependency installation: {}\nRun manual next steps above, then /restart to apply webhook listeners.",
                                 apply_text, err
-                            )
+                            );
                         }
                     };
 
@@ -796,7 +797,7 @@ impl Cx<'_> {
                             return format!(
                                 "{}\n\nCould not request approval for cloudflared authentication: {}\nRun `cloudflared tunnel login` manually, then rerun /setup lowlatency apply <base-domain>.",
                                 apply_text, err
-                            )
+                            );
                         }
                     };
                     if matches!(login_approval, ApprovalResponse::Deny) {
@@ -882,7 +883,7 @@ impl Cx<'_> {
                                     zone_name,
                                     mismatched_hosts.join(", "),
                                     err
-                                )
+                                );
                             }
                         };
                         if matches!(approval, ApprovalResponse::Deny) {
@@ -1087,7 +1088,7 @@ impl Cx<'_> {
                         return format!(
                             "{}\n\nCould not request approval for automatic Cloudflare setup: {}\nRun manual next steps above, then /restart to apply webhook listeners.",
                             apply_text, err
-                        )
+                        );
                     }
                 };
                 if matches!(approval, ApprovalResponse::Deny) {
@@ -1268,7 +1269,7 @@ impl Cx<'_> {
                     "failed to inspect cloudflared cert at `{}`: {}",
                     cert_path.display(),
                     err
-                ))
+                ));
             }
         };
         if !metadata.is_file() {
@@ -1313,7 +1314,7 @@ impl Cx<'_> {
                         "failed to inspect cloudflared backup path `{}`: {}",
                         backup_path.display(),
                         err
-                    ))
+                    ));
                 }
             }
 
@@ -1326,7 +1327,7 @@ impl Cx<'_> {
                         cert_path.display(),
                         backup_path.display(),
                         err
-                    ))
+                    ));
                 }
             }
         }
@@ -1761,44 +1762,45 @@ impl Cx<'_> {
         // Try to spawn the bot immediately if we have a hub reference
         let hub_ref = self.channel_hub_weak();
         if let Some(weak_hub) = hub_ref
-            && let Some(hub) = weak_hub.upgrade() {
-                // Create the new channel with same config as this one
-                let new_channel = Arc::new(new_telegram_bot(
-                    token,
-                    self.allowed_user_ids
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone(),
-                    TelegramWebhookConfig::default(),
-                    self.owner_user_ids.clone(),
-                    self.runtime_deps(),
-                    self.terminal.web_app_url().to_string(),
-                    self.terminal.lite_allowed_prefixes(),
-                ));
+            && let Some(hub) = weak_hub.upgrade()
+        {
+            // Create the new channel with same config as this one
+            let new_channel = Arc::new(new_telegram_bot(
+                token,
+                self.allowed_user_ids
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+                TelegramWebhookConfig::default(),
+                self.owner_user_ids.clone(),
+                self.runtime_deps(),
+                self.terminal.web_app_url().to_string(),
+                self.terminal.lite_allowed_prefixes(),
+            ));
 
-                // Give the new channel a reference to the hub too
-                new_channel.set_channel_hub(weak_hub);
+            // Give the new channel a reference to the hub too
+            new_channel.set_channel_hub(weak_hub);
 
-                // Register with the hub
-                let channel_name = hub
-                    .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
-                    .await;
-                info!(channel = %channel_name, "Registered new Telegram bot with hub");
+            // Register with the hub
+            let channel_name = hub
+                .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
+                .await;
+            info!(channel = %channel_name, "Registered new Telegram bot with hub");
 
-                // Spawn the bot in the background using helper to avoid type cycles
-                spawn_telegram_channel(new_channel);
+            // Spawn the bot in the background using helper to avoid type cycles
+            spawn_telegram_channel(new_channel);
 
-                return format!(
-                    "✓ Bot @{} connected and started!\n\n\
+            return format!(
+                "✓ Bot @{} connected and started!\n\n\
                     The bot is now active and ready to receive messages.\n\
                     Use /bots to see all connected bots.{}",
-                    bot_username,
-                    mini_app_sync_warning
-                        .as_deref()
-                        .map(|value| format!("\n\n{}", value))
-                        .unwrap_or_default()
-                );
-            }
+                bot_username,
+                mini_app_sync_warning
+                    .as_deref()
+                    .map(|value| format!("\n\n{}", value))
+                    .unwrap_or_default()
+            );
+        }
 
         // Fallback: hub not available, require restart
         format!(
@@ -1863,36 +1865,37 @@ impl Cx<'_> {
         // Try to spawn the bot immediately if we have a hub reference
         let hub_ref = self.channel_hub_weak();
         if let Some(weak_hub) = hub_ref
-            && let Some(hub) = weak_hub.upgrade() {
-                // Create the new Discord channel with empty allowed_user_ids —
-                // the bot will auto-claim the first DM user.
-                let new_channel = Arc::new(super::discord::new_discord_bot(
-                    token,
-                    vec![], // Empty: auto-claim on first DM
-                    vec![], // Owner set on auto-claim
-                    None,   // No guild_id for dynamic bots
-                    self.runtime_deps(),
-                ));
+            && let Some(hub) = weak_hub.upgrade()
+        {
+            // Create the new Discord channel with empty allowed_user_ids —
+            // the bot will auto-claim the first DM user.
+            let new_channel = Arc::new(super::discord::new_discord_bot(
+                token,
+                vec![], // Empty: auto-claim on first DM
+                vec![], // Owner set on auto-claim
+                None,   // No guild_id for dynamic bots
+                self.runtime_deps(),
+            ));
 
-                // Give the new channel a reference to the hub
-                new_channel.set_channel_hub(weak_hub);
+            // Give the new channel a reference to the hub
+            new_channel.set_channel_hub(weak_hub);
 
-                // Register with the hub
-                let channel_name = hub
-                    .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
-                    .await;
-                info!(channel = %channel_name, "Registered new Discord bot with hub");
+            // Register with the hub
+            let channel_name = hub
+                .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
+                .await;
+            info!(channel = %channel_name, "Registered new Discord bot with hub");
 
-                // Spawn the bot in the background
-                spawn_discord_channel(new_channel);
+            // Spawn the bot in the background
+            spawn_discord_channel(new_channel);
 
-                return format!(
-                    "✓ Discord bot {} connected and started!\n\n\
+            return format!(
+                "✓ Discord bot {} connected and started!\n\n\
                     Send a DM to the bot on Discord to claim it as yours.\n\
                     Use /bots to see all connected bots.",
-                    bot_name
-                );
-            }
+                bot_name
+            );
+        }
 
         // Fallback: hub not available, require restart
         format!(
@@ -1967,37 +1970,38 @@ impl Cx<'_> {
         // Try to spawn the bot immediately if we have a hub reference
         let hub_ref = self.channel_hub_weak();
         if let Some(weak_hub) = hub_ref
-            && let Some(hub) = weak_hub.upgrade() {
-                // Create the new Slack channel with same config as this Telegram channel
-                let new_channel = Arc::new(super::slack::new_slack_bot(
-                    app_token,
-                    bot_token,
-                    allowed_user_ids_str, // Slack uses String user IDs
-                    Vec::new(),           // Empty preserves legacy allowed-user owner behavior
-                    Vec::new(),           // Dynamic bot starts without delegated workspaces
-                    false,                // use_threads default
-                    self.runtime_deps(),
-                ));
+            && let Some(hub) = weak_hub.upgrade()
+        {
+            // Create the new Slack channel with same config as this Telegram channel
+            let new_channel = Arc::new(super::slack::new_slack_bot(
+                app_token,
+                bot_token,
+                allowed_user_ids_str, // Slack uses String user IDs
+                Vec::new(),           // Empty preserves legacy allowed-user owner behavior
+                Vec::new(),           // Dynamic bot starts without delegated workspaces
+                false,                // use_threads default
+                self.runtime_deps(),
+            ));
 
-                // Give the new channel a reference to the hub
-                new_channel.set_channel_hub(weak_hub);
+            // Give the new channel a reference to the hub
+            new_channel.set_channel_hub(weak_hub);
 
-                // Register with the hub
-                let channel_name = hub
-                    .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
-                    .await;
-                info!(channel = %channel_name, "Registered new Slack bot with hub");
+            // Register with the hub
+            let channel_name = hub
+                .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
+                .await;
+            info!(channel = %channel_name, "Registered new Slack bot with hub");
 
-                // Spawn the bot in the background
-                spawn_slack_channel(new_channel);
+            // Spawn the bot in the background
+            spawn_slack_channel(new_channel);
 
-                return format!(
-                    "✓ Slack bot {} ({}) connected and started!\n\n\
+            return format!(
+                "✓ Slack bot {} ({}) connected and started!\n\n\
                     The bot is now active and ready to receive messages.\n\
                     Use /bots to see all connected bots.",
-                    bot_name, team_name
-                );
-            }
+                bot_name, team_name
+            );
+        }
 
         // Fallback: hub not available, require restart
         format!(
@@ -2217,9 +2221,10 @@ allowed_user_ids = []
                 .collect(),
         );
         if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut())
-            && let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
-                first.insert("allowed_user_ids".to_string(), ids_toml);
-            }
+            && let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut())
+        {
+            first.insert("allowed_user_ids".to_string(), ids_toml);
+        }
         let new_content = toml::to_string_pretty(&toml::Value::Table(doc)).unwrap();
         tokio::fs::write(&config_path, &new_content).await.unwrap();
 

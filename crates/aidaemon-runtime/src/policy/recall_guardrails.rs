@@ -3,7 +3,7 @@ use serde_json::Value;
 
 #[cfg(test)]
 use aidaemon_memory::render::{
-    build_critical_facts_prompt_block, extract_critical_fact_summary, CriticalFactSummary,
+    CriticalFactSummary, build_critical_facts_prompt_block, extract_critical_fact_summary,
 };
 use aidaemon_tools::text::contains_keyword_as_words;
 

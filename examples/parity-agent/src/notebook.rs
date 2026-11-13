@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aidaemon_sdk::policies::{MemoryInjection, MemoryParts, MemorySystem, MemoryTurn, Recall};
 use aidaemon_sdk::{FnTool, SourceTrust, ToolAnnotations, ToolOutput, ToolSpec};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Clone)]
 pub struct Notebook(PathBuf);

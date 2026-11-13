@@ -6,8 +6,8 @@
 //! that only return canned text.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aidaemon_core::testing::spec;
 use aidaemon_core::{
@@ -18,9 +18,9 @@ use aidaemon_core::{
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::runner::{run_agent, AgentFactory, FactoryError, Subject, Trajectory};
+use crate::runner::{AgentFactory, FactoryError, Subject, Trajectory, run_agent};
 use crate::scenario::{Expect, NoExtension, Scenario};
 
 fn arg(args: &Value, key: &str) -> String {

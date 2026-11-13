@@ -4,8 +4,8 @@
 use aidaemon_sdk::policies::{
     ApprovalMode, ApprovalPolicy, EgressGuard, ScopeGuard, UntrustedOutput,
 };
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
-use aidaemon_sdk::tools::{default_tools, Workspace};
+use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
+use aidaemon_sdk::tools::{Workspace, default_tools};
 use aidaemon_sdk::{Agent, Authority, AuthorityHook, ReceiptStatus, Role};
 use serde_json::json;
 

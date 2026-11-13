@@ -19,7 +19,7 @@ use crate::types::{
 };
 
 pub use in_memory::InMemoryMemoryStore;
-pub use migrations::{latest_version, Migration, MIGRATIONS};
+pub use migrations::{MIGRATIONS, Migration, latest_version};
 pub use sqlite::SqliteMemoryStore;
 
 /// Strength of two facts sharing a key namespace (`alice_rivera:*`).

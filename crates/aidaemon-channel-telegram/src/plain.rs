@@ -58,44 +58,52 @@ fn convert_inline_formatting_to_plain(s: &str) -> String {
 
     while i < len {
         if chars[i] == '`'
-            && let Some(end) = find_char(&chars, '`', i + 1) {
-                result.extend(chars[i + 1..end].iter());
-                i = end + 1;
-                continue;
-            }
+            && let Some(end) = find_char(&chars, '`', i + 1)
+        {
+            result.extend(chars[i + 1..end].iter());
+            i = end + 1;
+            continue;
+        }
 
-        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*'
-            && let Some(end) = find_double_char(&chars, '*', i + 2) {
-                result.extend(chars[i + 2..end].iter());
-                i = end + 2;
-                continue;
-            }
+        if i + 1 < len
+            && chars[i] == '*'
+            && chars[i + 1] == '*'
+            && let Some(end) = find_double_char(&chars, '*', i + 2)
+        {
+            result.extend(chars[i + 2..end].iter());
+            i = end + 2;
+            continue;
+        }
 
         if chars[i] == '['
-            && let Some((text, url, end)) = parse_link(&chars, i) {
-                result.push_str(&text);
-                if !url.is_empty() {
-                    result.push_str(" (");
-                    result.push_str(&url);
-                    result.push(')');
-                }
-                i = end;
-                continue;
+            && let Some((text, url, end)) = parse_link(&chars, i)
+        {
+            result.push_str(&text);
+            if !url.is_empty() {
+                result.push_str(" (");
+                result.push_str(&url);
+                result.push(')');
             }
+            i = end;
+            continue;
+        }
 
         if chars[i] == '_'
-            && let Some(end) = find_char(&chars, '_', i + 1) {
-                result.extend(chars[i + 1..end].iter());
-                i = end + 1;
-                continue;
-            }
+            && let Some(end) = find_char(&chars, '_', i + 1)
+        {
+            result.extend(chars[i + 1..end].iter());
+            i = end + 1;
+            continue;
+        }
 
-        if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*')
-            && let Some(end) = find_single_star(&chars, i + 1) {
-                result.extend(chars[i + 1..end].iter());
-                i = end + 1;
-                continue;
-            }
+        if chars[i] == '*'
+            && (i + 1 >= len || chars[i + 1] != '*')
+            && let Some(end) = find_single_star(&chars, i + 1)
+        {
+            result.extend(chars[i + 1..end].iter());
+            i = end + 1;
+            continue;
+        }
 
         result.push(chars[i]);
         i += 1;

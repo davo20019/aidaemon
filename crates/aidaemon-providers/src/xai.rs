@@ -14,13 +14,13 @@ use aidaemon_core::{
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use reqwest::header::HeaderMap;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
-use crate::transport::{
-    build_client, header_map, map_reqwest_error, map_status, parse_arguments, raw_arguments,
-    ConfigError, Secret, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TIMEOUT,
-};
 use crate::OpenAiCompatible;
+use crate::transport::{
+    ConfigError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TIMEOUT, Secret, build_client, header_map,
+    map_reqwest_error, map_status, parse_arguments, raw_arguments,
+};
 
 /// xAI's API root.
 pub const XAI_DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
@@ -577,11 +577,13 @@ mod tests {
                 built.endpoint
             );
         }
-        assert!(Xai::builder()
-            .api_key("k")
-            .header("bad header", "x")
-            .build()
-            .is_err());
+        assert!(
+            Xai::builder()
+                .api_key("k")
+                .header("bad header", "x")
+                .build()
+                .is_err()
+        );
         let default = Xai::builder().api_key("k").build().unwrap();
         assert_eq!(default.name(), "xai");
         assert_eq!(default.endpoint, "https://api.x.ai/v1/responses");
@@ -661,16 +663,20 @@ mod tests {
         ]);
         assert_eq!(input[0]["content"][0]["type"], "input_text");
         assert_eq!(input[0]["content"][1]["type"], "input_image");
-        assert!(input[0]["content"][1]["image_url"]
-            .as_str()
-            .unwrap()
-            .starts_with("data:image/png;base64,"));
+        assert!(
+            input[0]["content"][1]["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input[3]["role"], "user");
-        assert!(input[3]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("c1"));
+        assert!(
+            input[3]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("c1")
+        );
         assert_eq!(
             input[3]["content"][1]["image_url"],
             "https://example.com/shot.png"
@@ -744,9 +750,11 @@ mod tests {
         req.max_output_tokens = Some(50);
         assert!(capped.fallback_request(&req).is_none(), "request cap wins");
         let uncapped = Xai::builder().api_key("k").build().unwrap();
-        assert!(uncapped
-            .fallback_request(&request(vec![Message::user("hi")]))
-            .is_none());
+        assert!(
+            uncapped
+                .fallback_request(&request(vec![Message::user("hi")]))
+                .is_none()
+        );
     }
 
     #[test]

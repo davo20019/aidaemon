@@ -787,9 +787,9 @@ fn requirement_target_matches(
                     tool_target_hint_matches_contract_target(&hint, &contract_target)
                 })
             })
-        {
-            return true;
-        }
+    {
+        return true;
+    }
 
     let mut haystacks = vec![raw_arguments.to_string()];
     if let Some(command) = extract_command_from_args(raw_arguments) {
@@ -1193,15 +1193,17 @@ mod tests {
             .as_mut()
             .unwrap()
             .exit_codes = vec![0];
-        assert!(matching_evidence_requirement_indices(
-            &mismatched,
-            "run_command",
-            &metadata.semantics,
-            raw_arguments,
-            "untrusted process text says exit=0",
-            &metadata,
-        )
-        .is_empty());
+        assert!(
+            matching_evidence_requirement_indices(
+                &mismatched,
+                "run_command",
+                &metadata.semantics,
+                raw_arguments,
+                "untrusted process text says exit=0",
+                &metadata,
+            )
+            .is_empty()
+        );
         let evaluations = evaluate_evidence_requirements(
             &mismatched,
             "run_command",
@@ -1626,15 +1628,17 @@ mod tests {
             ..aidaemon_events::traits::ToolCallMetadata::default()
         };
 
-        assert!(matching_evidence_requirement_indices(
-            &contract,
-            "synthetic_observer",
-            &semantics,
-            "{}",
-            "validation rejected",
-            &metadata,
-        )
-        .is_empty());
+        assert!(
+            matching_evidence_requirement_indices(
+                &contract,
+                "synthetic_observer",
+                &semantics,
+                "{}",
+                "validation rejected",
+                &metadata,
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1872,15 +1876,17 @@ mod tests {
             write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/synthetic-result.txt")],
             adapter_read_targets: Vec::new(),
         };
-        assert!(access_manifest_scope_violation(
-            "cli_agent",
-            &valid,
-            Some(&task),
-            &[],
-            None,
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_none());
+        assert!(
+            access_manifest_scope_violation(
+                "cli_agent",
+                &valid,
+                Some(&task),
+                &[],
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_none()
+        );
 
         let invalid = aidaemon_events::traits::ToolCallAccessManifest {
             write_targets: vec![hint(ToolTargetHintKind::Path, "/workspace/project")],
@@ -1930,15 +1936,17 @@ mod tests {
             read_targets: vec![hint(ToolTargetHintKind::Path, "/etc/hosts")],
             ..call
         };
-        assert!(access_manifest_scope_violation(
-            "terminal",
-            &undeclared,
-            Some(&task),
-            &[],
-            None,
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_some());
+        assert!(
+            access_manifest_scope_violation(
+                "terminal",
+                &undeclared,
+                Some(&task),
+                &[],
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -1993,29 +2001,33 @@ mod tests {
             write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/output-root/.keep")],
             adapter_read_targets: Vec::new(),
         };
-        assert!(access_manifest_scope_violation(
-            "write_file",
-            &call,
-            Some(&task),
-            &[],
-            None,
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_none());
+        assert!(
+            access_manifest_scope_violation(
+                "write_file",
+                &call,
+                Some(&task),
+                &[],
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_none()
+        );
 
         let read_escape = aidaemon_events::traits::ToolCallAccessManifest {
             read_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/elsewhere/secret")],
             ..call
         };
-        assert!(access_manifest_scope_violation(
-            "write_file",
-            &read_escape,
-            Some(&task),
-            &[],
-            None,
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_some());
+        assert!(
+            access_manifest_scope_violation(
+                "write_file",
+                &read_escape,
+                Some(&task),
+                &[],
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -2034,15 +2046,17 @@ mod tests {
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
-        assert!(access_manifest_scope_violation(
-            "terminal",
-            &call,
-            Some(&task),
-            &[],
-            None,
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_some());
+        assert!(
+            access_manifest_scope_violation(
+                "terminal",
+                &call,
+                Some(&task),
+                &[],
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -2059,15 +2073,17 @@ mod tests {
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
-        assert!(access_manifest_scope_violation(
-            "terminal",
-            &call,
-            Some(&task),
-            &[],
-            None,
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_none());
+        assert!(
+            access_manifest_scope_violation(
+                "terminal",
+                &call,
+                Some(&task),
+                &[],
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2083,15 +2099,17 @@ mod tests {
             adapter_read_targets: Vec::new(),
         };
 
-        assert!(access_manifest_scope_violation(
-            "synthetic",
-            &call,
-            None,
-            &[],
-            None,
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_none());
+        assert!(
+            access_manifest_scope_violation(
+                "synthetic",
+                &call,
+                None,
+                &[],
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2105,44 +2123,52 @@ mod tests {
         };
         let scopes = vec![workspace.to_string()];
         // Inside the authorized workspace: `Cargo.toml` and `./src/../Cargo.toml`.
-        assert!(access_manifest_scope_violation(
-            "read_file",
-            &call("Cargo.toml"),
-            None,
-            &scopes,
-            Some(workspace),
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_none());
-        assert!(access_manifest_scope_violation(
-            "read_file",
-            &call("./src/../Cargo.toml"),
-            None,
-            &scopes,
-            Some(workspace),
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_none());
+        assert!(
+            access_manifest_scope_violation(
+                "read_file",
+                &call("Cargo.toml"),
+                None,
+                &scopes,
+                Some(workspace),
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_none()
+        );
+        assert!(
+            access_manifest_scope_violation(
+                "read_file",
+                &call("./src/../Cargo.toml"),
+                None,
+                &scopes,
+                Some(workspace),
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_none()
+        );
         // Escapes still resolve outside and are rejected.
-        assert!(access_manifest_scope_violation(
-            "read_file",
-            &call("../outside.txt"),
-            None,
-            &scopes,
-            Some(workspace),
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_some());
+        assert!(
+            access_manifest_scope_violation(
+                "read_file",
+                &call("../outside.txt"),
+                None,
+                &scopes,
+                Some(workspace),
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_some()
+        );
         // Without a cwd a relative target cannot be proven inside any grant.
-        assert!(access_manifest_scope_violation(
-            "read_file",
-            &call("Cargo.toml"),
-            None,
-            &scopes,
-            None,
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_some());
+        assert!(
+            access_manifest_scope_violation(
+                "read_file",
+                &call("Cargo.toml"),
+                None,
+                &scopes,
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -2150,50 +2176,57 @@ mod tests {
         let task = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: None,
             read_targets: Vec::new(),
-            write_targets: vec![ToolTargetHint::new(
-                ToolTargetHintKind::ProjectScope,
-                "/tmp/synthetic-disposable",
-            )
-            .expect("write")],
+            write_targets: vec![
+                ToolTargetHint::new(
+                    ToolTargetHintKind::ProjectScope,
+                    "/tmp/synthetic-disposable",
+                )
+                .expect("write"),
+            ],
             adapter_read_targets: Vec::new(),
         };
         let read_back = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: None,
-            read_targets: vec![ToolTargetHint::new(
-                ToolTargetHintKind::Path,
-                "/tmp/synthetic-disposable/result.txt",
-            )
-            .expect("read")],
+            read_targets: vec![
+                ToolTargetHint::new(
+                    ToolTargetHintKind::Path,
+                    "/tmp/synthetic-disposable/result.txt",
+                )
+                .expect("read"),
+            ],
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
-        assert!(access_manifest_scope_violation(
-            "terminal",
-            &read_back,
-            Some(&task),
-            &[],
-            None,
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_none());
+        assert!(
+            access_manifest_scope_violation(
+                "terminal",
+                &read_back,
+                Some(&task),
+                &[],
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_none()
+        );
         // Explicit read grants do not remove the write-implies-read-back grant.
         let explicit_reads = aidaemon_events::traits::ToolCallAccessManifest {
-            read_targets: vec![ToolTargetHint::new(
-                ToolTargetHintKind::Path,
-                "/tmp/synthetic-input.txt",
-            )
-            .expect("read")],
+            read_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/synthetic-input.txt")
+                    .expect("read"),
+            ],
             ..task.clone()
         };
-        assert!(access_manifest_scope_violation(
-            "terminal",
-            &read_back,
-            Some(&explicit_reads),
-            &[],
-            None,
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_none());
+        assert!(
+            access_manifest_scope_violation(
+                "terminal",
+                &read_back,
+                Some(&explicit_reads),
+                &[],
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_none()
+        );
         // The implication is one-way: a read grant never authorizes a write.
         let read_only_task = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: None,
@@ -2207,20 +2240,22 @@ mod tests {
             write_targets: read_back.read_targets.clone(),
             adapter_read_targets: Vec::new(),
         };
-        assert!(access_manifest_scope_violation(
-            "terminal",
-            &write_attempt,
-            Some(&read_only_task),
-            &[],
-            None,
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_some());
+        assert!(
+            access_manifest_scope_violation(
+                "terminal",
+                &write_attempt,
+                Some(&read_only_task),
+                &[],
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_some()
+        );
     }
 
     #[test]
     fn explicit_read_grants_still_cover_paths_the_task_may_write() {
-        use super::{access_manifest_scope_check, ScopeCheck};
+        use super::{ScopeCheck, access_manifest_scope_check};
         let hint = |kind, value: &str| ToolTargetHint::new(kind, value).expect("target");
         let task = aidaemon_events::traits::ToolCallAccessManifest {
             read_targets: vec![hint(
@@ -2237,15 +2272,17 @@ mod tests {
             read_targets: vec![hint(ToolTargetHintKind::Path, path)],
             ..Default::default()
         };
-        assert!(access_manifest_scope_check(
-            "read_file",
-            &call("/tmp/aidaemon-test/data/avg.txt"),
-            Some(&task),
-            &[],
-            None,
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_none());
+        assert!(
+            access_manifest_scope_check(
+                "read_file",
+                &call("/tmp/aidaemon-test/data/avg.txt"),
+                Some(&task),
+                &[],
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_none()
+        );
         assert!(matches!(
             access_manifest_scope_check(
                 "read_file",
@@ -2263,16 +2300,14 @@ mod tests {
     fn unauthorized_declared_read_roots_are_stripped_not_fatal() {
         let task = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
-            read_targets: vec![ToolTargetHint::new(
-                ToolTargetHintKind::Path,
-                "/tmp/synthetic-out/result.txt",
-            )
-            .expect("read")],
-            write_targets: vec![ToolTargetHint::new(
-                ToolTargetHintKind::ProjectScope,
-                "/tmp/synthetic-out",
-            )
-            .expect("write")],
+            read_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/synthetic-out/result.txt")
+                    .expect("read"),
+            ],
+            write_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::ProjectScope, "/tmp/synthetic-out")
+                    .expect("write"),
+            ],
             adapter_read_targets: Vec::new(),
         };
         let mut arguments = serde_json::json!({
@@ -2310,11 +2345,10 @@ mod tests {
         // An authorized root is kept.
         let scoped = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: None,
-            read_targets: vec![ToolTargetHint::new(
-                ToolTargetHintKind::ProjectScope,
-                "/tmp/synthetic-out",
-            )
-            .expect("read")],
+            read_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::ProjectScope, "/tmp/synthetic-out")
+                    .expect("read"),
+            ],
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
@@ -2334,14 +2368,16 @@ mod tests {
 
         // Without any authority boundary nothing is attenuated.
         let mut arguments = serde_json::json!({ "read_roots": ["/tmp"] });
-        assert!(attenuate_unauthorized_read_roots(
-            &mut arguments,
-            None,
-            &[],
-            None,
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_empty());
+        assert!(
+            attenuate_unauthorized_read_roots(
+                &mut arguments,
+                None,
+                &[],
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_empty()
+        );
     }
 
     /// A handoff's reply is the launch's own first line, which names the
@@ -2427,15 +2463,17 @@ mod scope_escalation_tests {
         }
         // The string-returning wrapper still reports the violation for
         // callers that only need the reason.
-        assert!(access_manifest_scope_violation(
-            "terminal",
-            &call,
-            Some(&task),
-            &[],
-            Some(root),
-            &aidaemon_tools::path_class::DaemonPaths::default()
-        )
-        .is_some());
+        assert!(
+            access_manifest_scope_violation(
+                "terminal",
+                &call,
+                Some(&task),
+                &[],
+                Some(root),
+                &aidaemon_tools::path_class::DaemonPaths::default()
+            )
+            .is_some()
+        );
     }
 
     /// A fresh project under `/tmp/aidaemon-test/<uuid>`, with a sibling.

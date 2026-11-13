@@ -291,36 +291,38 @@ impl Ownership {
     ) -> Option<Contested> {
         if let (Self::Lines { lines: held, gaps }, Some(current), Some(proposed)) =
             (self, current, proposed)
-            && held.len() == lines(current).len() {
-                let mut claims: Vec<Claim> = Vec::new();
-                let mut hunks = Vec::new();
-                for hunk in diff_lines(current, proposed) {
-                    let touched: Vec<Claim> = held[hunk.before.clone()]
-                        .iter()
-                        .chain(&gaps[hunk.before.start..=hunk.before.end])
-                        .filter(|claim| claim.is_foreign_to(writer))
-                        .copied()
-                        .collect();
-                    let foreign = !touched.is_empty();
-                    for claim in touched {
-                        if !claims.contains(&claim) {
-                            claims.push(claim);
-                        }
-                    }
-                    if foreign {
-                        hunks.push(hunk);
+            && held.len() == lines(current).len()
+        {
+            let mut claims: Vec<Claim> = Vec::new();
+            let mut hunks = Vec::new();
+            for hunk in diff_lines(current, proposed) {
+                let touched: Vec<Claim> = held[hunk.before.clone()]
+                    .iter()
+                    .chain(&gaps[hunk.before.start..=hunk.before.end])
+                    .filter(|claim| claim.is_foreign_to(writer))
+                    .copied()
+                    .collect();
+                let foreign = !touched.is_empty();
+                for claim in touched {
+                    if !claims.contains(&claim) {
+                        claims.push(claim);
                     }
                 }
-                return (!hunks.is_empty()).then_some(Contested {
-                    claims,
-                    hunks,
-                    whole_file: false,
-                });
+                if foreign {
+                    hunks.push(hunk);
+                }
             }
+            return (!hunks.is_empty()).then_some(Contested {
+                claims,
+                hunks,
+                whole_file: false,
+            });
+        }
         if let (Some(current), Some(proposed)) = (current, proposed)
-            && current == proposed {
-                return None;
-            }
+            && current == proposed
+        {
+            return None;
+        }
         let claims: Vec<Claim> = self
             .claims()
             .into_iter()

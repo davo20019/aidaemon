@@ -12,9 +12,9 @@ mod enabled {
     use std::sync::{Arc, OnceLock};
 
     use aidaemon_core as sdk;
-    use aidaemon_policies::{otlp_provider, OtelSink, Redactor};
+    use aidaemon_policies::{OtelSink, Redactor, otlp_provider};
 
-    use crate::config::{resolve_from_keychain, TelemetryConfig};
+    use crate::config::{TelemetryConfig, resolve_from_keychain};
 
     // The provider owns the export thread and must outlive every run.
     struct Exporter {

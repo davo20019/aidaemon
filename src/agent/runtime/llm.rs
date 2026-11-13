@@ -14,7 +14,7 @@ mod tests {
 
     use crate::llm_runtime::ProviderRuntimeTarget;
     use crate::providers::ProviderError;
-    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::testing::{MockProvider, setup_test_agent};
     use crate::traits::store_prelude::*;
     use crate::traits::{ChatOptions, Goal, Mandate, MandateAuthority, ProviderResponse, Task};
 
@@ -499,16 +499,18 @@ mod tests {
                 .unwrap()
                 .0
         );
-        assert!(harness
-            .state
-            .mark_mandate_run_token_lease_dispatched(
-                &run.id,
-                &mandate.id,
-                mandate.version,
-                "one-provider-attempt",
-            )
-            .await
-            .unwrap());
+        assert!(
+            harness
+                .state
+                .mark_mandate_run_token_lease_dispatched(
+                    &run.id,
+                    &mandate.id,
+                    mandate.version,
+                    "one-provider-attempt",
+                )
+                .await
+                .unwrap()
+        );
         let provider = Arc::new(ScriptedProvider::with_results(vec![
             Err(ProviderError::from_status(500, "ambiguous provider failure").into()),
             Ok(MockProvider::text_response("retry must not run")),

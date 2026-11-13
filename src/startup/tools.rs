@@ -12,7 +12,6 @@ use crate::mcp::McpRegistry;
 use crate::nodes::tool::{
     ManageNodeMonitorsTool, ReadNodeHealthTool, ReadNodeSensorsTool, SendNodeAudioTool,
 };
-use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 #[cfg(feature = "browser")]
 use crate::tools::BrowserTool;
@@ -20,6 +19,7 @@ use crate::tools::BrowserTool;
 use crate::tools::ComputerUseTool;
 #[cfg(feature = "slack")]
 use crate::tools::ReadChannelHistoryTool;
+use crate::tools::terminal::ApprovalRequest;
 use crate::tools::{
     CheckEnvironmentTool, CliAgentTool, ConfigManagerTool, DiagnoseTool, EditFileTool,
     GenerateImageTool, GitCommitTool, GitInfoTool, GoalTraceTool, HealthProbeTool, HttpRequestTool,
@@ -30,8 +30,8 @@ use crate::tools::{
     ShareMemoryTool, SpawnAgentTool, SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool,
     WebSearchTool, WriteFileTool,
 };
-use crate::traits::store_prelude::*;
 use crate::traits::Tool;
+use crate::traits::store_prelude::*;
 use crate::types::MediaMessage;
 use sqlx::SqlitePool;
 

@@ -243,7 +243,7 @@ impl ProgressClock {
 impl Drop for InFlight {
     fn drop(&mut self) {
         {
-            let mut state = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
             state.in_flight = state.in_flight.saturating_sub(1);
         }
         self.0.touch();
@@ -265,9 +265,10 @@ impl Drop for OwnerWaiting {
         let mut state = self.clock.0.lock().unwrap_or_else(|e| e.into_inner());
         state.open = state.open.saturating_sub(1);
         if state.open == 0
-            && let Some(since) = state.since.take() {
-                state.waited += since.elapsed();
-            }
+            && let Some(since) = state.since.take()
+        {
+            state.waited += since.elapsed();
+        }
     }
 }
 

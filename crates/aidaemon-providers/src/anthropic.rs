@@ -4,18 +4,18 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aidaemon_core::{
-    collect_stream, Image, Message, ModelRequest, ModelResponse, Provider, ProviderError,
-    ResponseFormat, Role, StreamEvent, ToolCall, ToolChoice, Usage,
+    Image, Message, ModelRequest, ModelResponse, Provider, ProviderError, ResponseFormat, Role,
+    StreamEvent, ToolCall, ToolChoice, Usage, collect_stream,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use reqwest::header::HeaderMap;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::sse::SseEvent;
 use crate::transport::{
-    body_excerpt, build_client, drive, header_map, parse_arguments, ConfigError, Secret,
-    SseDecoder, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TIMEOUT,
+    ConfigError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TIMEOUT, Secret, SseDecoder, body_excerpt,
+    build_client, drive, header_map, parse_arguments,
 };
 
 pub const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -359,10 +359,9 @@ fn build_body(
         .filter(|m| !m.content.is_empty())
         .map(|m| json!({"type": "text", "text": m.content}))
         .collect();
-    if caching
-        && let Some(last) = system.last_mut() {
-            last["cache_control"] = ephemeral();
-        }
+    if caching && let Some(last) = system.last_mut() {
+        last["cache_control"] = ephemeral();
+    }
 
     // Anthropic rejects thinking with a forced tool choice, and a forced
     // choice is a contract the caller relies on: it wins.
@@ -387,10 +386,9 @@ fn build_body(
     }
 
     let mut messages = wire_messages(&request.messages[leading..]);
-    if caching
-        && let Some(last) = messages.last_mut() {
-            tail_breakpoint(last);
-        }
+    if caching && let Some(last) = messages.last_mut() {
+        tail_breakpoint(last);
+    }
     let mut body = json!({
         "model": request.model,
         "max_tokens": max_tokens,
@@ -408,13 +406,14 @@ fn build_body(
         (None, None) => {}
     }
     if let ResponseFormat::JsonSchema { schema, .. } = &request.options.response_format
-        && takes_structured_output(&request.model) {
-            if !body["output_config"].is_object() {
-                body["output_config"] = json!({});
-            }
-            body["output_config"]["format"] =
-                json!({"type": "json_schema", "schema": output_schema(schema)});
+        && takes_structured_output(&request.model)
+    {
+        if !body["output_config"].is_object() {
+            body["output_config"] = json!({});
         }
+        body["output_config"]["format"] =
+            json!({"type": "json_schema", "schema": output_schema(schema)});
+    }
     if !system.is_empty() {
         body["system"] = Value::Array(system);
     }
@@ -430,10 +429,9 @@ fn build_body(
                 })
             })
             .collect();
-        if caching
-            && let Some(last) = tools.last_mut() {
-                last["cache_control"] = ephemeral();
-            }
+        if caching && let Some(last) = tools.last_mut() {
+            last["cache_control"] = ephemeral();
+        }
         body["tools"] = Value::Array(tools);
         body["tool_choice"] = match &request.tool_choice {
             ToolChoice::Auto => json!({"type": "auto"}),
@@ -634,7 +632,7 @@ impl SseDecoder for MessagesDecoder {
                 return Err(ProviderError::Transient(format!(
                     "malformed stream event ({err}): {}",
                     body_excerpt(&event.data)
-                )))
+                )));
             }
         };
         let kind = data
@@ -780,9 +778,10 @@ impl SseDecoder for MessagesDecoder {
         // A tool-use turn continued with thinking must replay its signed
         // thinking blocks; they ride on the first tool call.
         if let Some(first) = tool_calls.first_mut()
-            && !thinking_blocks.is_empty() {
-                first.provider_data = Some(json!({ THINKING_BLOCKS_KEY: thinking_blocks }));
-            }
+            && !thinking_blocks.is_empty()
+        {
+            first.provider_data = Some(json!({ THINKING_BLOCKS_KEY: thinking_blocks }));
+        }
         Ok(ModelResponse {
             text: std::mem::take(&mut self.text),
             tool_calls,
@@ -889,9 +888,11 @@ mod output_format_tests {
         );
         assert!(sent["properties"]["intent"].get("maxLength").is_none());
         assert!(sent["properties"]["steps"].get("maxItems").is_none());
-        assert!(sent["properties"]["steps"]["items"]["properties"]["n"]
-            .get("minimum")
-            .is_none());
+        assert!(
+            sent["properties"]["steps"]["items"]["properties"]["n"]
+                .get("minimum")
+                .is_none()
+        );
         assert_eq!(
             sent["properties"]["intent"]["enum"],
             json!(["join", "answer"])

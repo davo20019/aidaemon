@@ -8,16 +8,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aidaemon_channels::{ChannelError, ChannelEvent};
 use futures::{SinkExt, StreamExt};
 use reqwest::Method;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_util::sync::CancellationToken;
 
-use crate::mapping::{map_command, map_interaction, map_message, THREAD_CHANNEL_TYPES};
 use crate::DiscordChannel;
+use crate::mapping::{THREAD_CHANNEL_TYPES, map_command, map_interaction, map_message};
 
 const OP_DISPATCH: u64 = 0;
 const OP_HEARTBEAT: u64 = 1;
@@ -253,7 +253,7 @@ impl DiscordChannel {
                     total: 1,
                     announce: false,
                     gate: None,
-                }))
+                }));
             }
             ShardMode::Fixed(count) => Some(count),
             ShardMode::Recommended => None,
@@ -821,7 +821,7 @@ where
                 }
             },
             Some(Ok(Message::Close(frame))) => {
-                return Err(StreamEnd::Closed(frame.map(|f| u16::from(f.code))))
+                return Err(StreamEnd::Closed(frame.map(|f| u16::from(f.code))));
             }
             Some(Ok(_)) => {}
             Some(Err(e)) => {

@@ -4,15 +4,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use aidaemon_core::redaction::{redact_registered, register_secret, SecretTooShort};
-use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_core::redaction::{SecretTooShort, redact_registered, register_secret};
+use aidaemon_core::testing::{ScriptedProvider, call, text, tool_calls};
 use aidaemon_core::{
     Agent, ApprovalRisk, Event, FnTool, Hook, HookContext, InterruptKind, MemoryStore,
     OwnerApprovalRequest, Resolution, RunId, RunStatus, RunStore, ToolAnnotations, ToolCall,
     ToolDecision, ToolInfo, ToolOutput, ToolSpec,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Asks the owner before every `write` call, quoting its arguments.
 struct AskBeforeWrite;

@@ -60,17 +60,17 @@ pub use approvals::{ApprovalStore, MemoryApprovalStore, StoredApproval};
 pub use channel::{
     ApprovalAnswer, ApprovalChoice, ApprovalDetails, ApprovalPrompt, Attachment, AttachmentKind,
     Channel, ChannelCapabilities, ChannelError, ChannelEvent, CommandInvocation, CommandSpec,
-    Conversation, ConversationKind, InboundMessage, MessageRef, OutboundFile, OutboundMessage,
-    ProgressPhase, RunEnding, RunProgress, Sender, ToolProgress, ToolState,
-    DEFAULT_MAX_DOWNLOAD_BYTES,
+    Conversation, ConversationKind, DEFAULT_MAX_DOWNLOAD_BYTES, InboundMessage, MessageRef,
+    OutboundFile, OutboundMessage, ProgressPhase, RunEnding, RunProgress, Sender, ToolProgress,
+    ToolState,
 };
-pub use commands::{builtin_commands, CommandContext, CommandHandler, CommandReply};
+pub use commands::{CommandContext, CommandHandler, CommandReply, builtin_commands};
 pub use names::DisplayNameCache;
-pub use policy::{AccessPolicy, Admission, SenderRole, DEFAULT_REFUSAL};
+pub use policy::{AccessPolicy, Admission, DEFAULT_REFUSAL, SenderRole};
 pub use router::EventRouter;
 pub use runner::{
-    AttachmentConfig, ChannelRunner, ChannelRunnerBuilder, RunnerBuildError, RunnerConfig,
-    APPROVE_CHOICE, DENY_CHOICE,
+    APPROVE_CHOICE, AttachmentConfig, ChannelRunner, ChannelRunnerBuilder, DENY_CHOICE,
+    RunnerBuildError, RunnerConfig,
 };
-pub use session::{session_id, MemorySessionIndex, SessionIndex};
+pub use session::{MemorySessionIndex, SessionIndex, session_id};
 pub use split::split_message;

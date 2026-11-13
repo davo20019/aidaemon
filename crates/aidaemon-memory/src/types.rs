@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{MemoryError, Result};
 use crate::records::FactPrivacy;
-use crate::sqlite::{memory_visible, ExactChannelIds, FACT_RESTATEMENT_MIN_SIMILARITY};
+use crate::sqlite::{ExactChannelIds, FACT_RESTATEMENT_MIN_SIMILARITY, memory_visible};
 
 /// Longest fact value accepted, in characters.
 pub const MAX_FACT_VALUE_CHARS: usize = 4_000;

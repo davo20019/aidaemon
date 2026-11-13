@@ -104,9 +104,12 @@ impl SqliteMemory {
                 ("Language", "language_preference"),
             ] {
                 if let Some(value) = person.get::<Option<String>, _>(column)
-                    && !value.trim().is_empty() && value != "[]" && value != "{}" {
-                        let _ = writeln!(content, "- {label}: {}", one_line(&value));
-                    }
+                    && !value.trim().is_empty()
+                    && value != "[]"
+                    && value != "{}"
+                {
+                    let _ = writeln!(content, "- {label}: {}", one_line(&value));
+                }
             }
             let facts = sqlx::query(
                 "SELECT category, key, value FROM person_facts
@@ -379,26 +382,36 @@ mod tests {
 
         let file = |name: &str| files.iter().find(|f| f.name == name).unwrap();
         assert_eq!(file("facts.md").entries, 1);
-        assert!(file("facts.md")
-            .content
-            .contains("**iguana**: Quibble the second"));
+        assert!(
+            file("facts.md")
+                .content
+                .contains("**iguana**: Quibble the second")
+        );
         assert!(!file("facts.md").content.contains("Zorblat"));
         assert!(file("facts-history.md").content.contains("Zorblat"));
-        assert!(!file("facts-history.md")
-            .content
-            .contains("Removed on request"));
-        assert!(file("personal.md")
-            .content
-            .contains("## Jordan Lee (person)"));
+        assert!(
+            !file("facts-history.md")
+                .content
+                .contains("Removed on request")
+        );
+        assert!(
+            file("personal.md")
+                .content
+                .contains("## Jordan Lee (person)")
+        );
         assert!(file("personal.md").content.contains("birthday: 1990-03-15"));
         assert!(file("personal.md").content.contains("parent_of: Mia"));
         assert!(file("people.md").content.contains("## Alice Rivera"));
         assert!(file("people.md").content.contains("snack: pretzels"));
-        assert!(file("episodes.md")
-            .content
-            .contains("Planned the Acme launch."));
-        assert!(file("learned.md")
-            .content
-            .contains("**release** when shipping"));
+        assert!(
+            file("episodes.md")
+                .content
+                .contains("Planned the Acme launch.")
+        );
+        assert!(
+            file("learned.md")
+                .content
+                .contains("**release** when shipping")
+        );
     }
 }

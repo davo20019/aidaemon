@@ -9,7 +9,7 @@ use aidaemon_core::{Agent, InvocationStage, Provider, ReceiptStatus, RunOutcome}
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::scenario::{status_name, Expect, NoExtension, Scenario};
+use crate::scenario::{Expect, NoExtension, Scenario, status_name};
 
 /// Error type factories may return.
 pub type FactoryError = Box<dyn std::error::Error + Send + Sync>;
@@ -232,7 +232,9 @@ pub(crate) async fn run_agent(
         (Some((_, scripted)), _) => scripted.clone(),
         (None, Some(live)) => live,
         (None, None) => {
-            return Err("scenario has no `script` and the factory supplied no live provider".into())
+            return Err(
+                "scenario has no `script` and the factory supplied no live provider".into(),
+            );
         }
     };
     let agent = factory
@@ -347,21 +349,23 @@ pub fn check_trajectory<O, X>(expect: &Expect<X>, trajectory: &Trajectory<O>) ->
     let actual_status = trajectory.status.as_str();
 
     if let Some(expected) = expect.status
-        && expected.as_str() != actual_status {
-            failures.push(format!(
-                "status: expected `{}`, got `{actual_status}` ({})",
-                expected.as_str(),
-                trajectory.status_detail
-            ));
-        }
+        && expected.as_str() != actual_status
+    {
+        failures.push(format!(
+            "status: expected `{}`, got `{actual_status}` ({})",
+            expected.as_str(),
+            trajectory.status_detail
+        ));
+    }
 
     if let Some(expected) = expect.succeeded
-        && trajectory.succeeded != expected {
-            failures.push(format!(
-                "succeeded: expected `{expected}`, got `{}` (status {actual_status}, unmet: {:?})",
-                trajectory.succeeded, trajectory.unmet
-            ));
-        }
+        && trajectory.succeeded != expected
+    {
+        failures.push(format!(
+            "succeeded: expected `{expected}`, got `{}` (status {actual_status}, unmet: {:?})",
+            trajectory.succeeded, trajectory.unmet
+        ));
+    }
 
     let text = trajectory.final_text.as_deref().unwrap_or_default();
     let lower = text.to_lowercase();
@@ -450,12 +454,13 @@ pub fn check_trajectory<O, X>(expect: &Expect<X>, trajectory: &Trajectory<O>) ->
     }
 
     if let Some(max) = expect.max_turns
-        && trajectory.turns > max {
-            failures.push(format!(
-                "max_turns: used {} turns, limit {max}",
-                trajectory.turns
-            ));
-        }
+        && trajectory.turns > max
+    {
+        failures.push(format!(
+            "max_turns: used {} turns, limit {max}",
+            trajectory.turns
+        ));
+    }
     if let Some(max) = expect.max_billable_tokens {
         let used = trajectory.billable_tokens;
         if used > max {

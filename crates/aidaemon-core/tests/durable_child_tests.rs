@@ -1,20 +1,20 @@
 //! A parent run paused durably for its child's approval: the snapshot goes
 //! through JSON into agents built afresh, as after a restart.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
 use aidaemon_core::{
     Agent, ApprovalRisk, Authority, AuthorityHook, CallEffects, CoreError, EffectClass, EffectKey,
-    Hook, HookContext, InterruptKind, MemoryStore, ModelResponse, OwnerApprovalRequest,
-    ReceiptStatus, Resolution, Role, RunOutcome, RunState, RunStatus, RunStore, SharedDeclines,
-    SourceTrust, Tool, ToolAnnotations, ToolCall, ToolContext, ToolDecision, ToolError, ToolInfo,
-    ToolOutput, ToolResult, ToolSpec, OWNER_DECLINED, RUN_STATE_SCHEMA,
+    Hook, HookContext, InterruptKind, MemoryStore, ModelResponse, OWNER_DECLINED,
+    OwnerApprovalRequest, RUN_STATE_SCHEMA, ReceiptStatus, Resolution, Role, RunOutcome, RunState,
+    RunStatus, RunStore, SharedDeclines, SourceTrust, Tool, ToolAnnotations, ToolCall, ToolContext,
+    ToolDecision, ToolError, ToolInfo, ToolOutput, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Notify;
 
 const SESSION: &str = "telegram:synthetic-user-1";

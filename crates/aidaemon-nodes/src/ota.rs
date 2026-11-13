@@ -115,8 +115,8 @@ impl FirmwareRelease {
 
     #[cfg(test)]
     pub(crate) fn signed_for_test(image: &[u8], version: &str, sequence: u64) -> Self {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use p256::ecdsa::signature::Signer;
         use p256::ecdsa::{Signature, SigningKey};
         use p256::elliptic_curve::Generate;
@@ -142,8 +142,8 @@ impl FirmwareRelease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
     use p256::elliptic_curve::Generate;
@@ -181,26 +181,25 @@ mod tests {
 
         let mut tampered_manifest = manifest;
         tampered_manifest.version = "0.4.1".to_string();
-        assert!(FirmwareRelease::validate(
-            tampered_manifest,
-            image.to_vec(),
-            &public_key,
-            2_621_440,
-        )
-        .is_err());
+        assert!(
+            FirmwareRelease::validate(tampered_manifest, image.to_vec(), &public_key, 2_621_440,)
+                .is_err()
+        );
     }
 
     #[test]
     fn rejects_tampered_image_and_wrong_board() {
         let image = b"synthetic ESP application image";
         let (manifest, public_key) = signed_release(image);
-        assert!(FirmwareRelease::validate(
-            manifest.clone(),
-            b"tampered".to_vec(),
-            &public_key,
-            2_621_440,
-        )
-        .is_err());
+        assert!(
+            FirmwareRelease::validate(
+                manifest.clone(),
+                b"tampered".to_vec(),
+                &public_key,
+                2_621_440,
+            )
+            .is_err()
+        );
         let mut wrong_board = manifest;
         wrong_board.board = "different_board".to_string();
         assert!(

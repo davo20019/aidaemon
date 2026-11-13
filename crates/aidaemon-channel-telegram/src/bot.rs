@@ -10,8 +10,9 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock as StdRwLock, Weak};
 use std::time::Duration;
 
-pub use aidaemon_channels::bot::determine_role;
+use aidaemon_channels::Channel as _;
 use aidaemon_channels::bot::BotDeps;
+pub use aidaemon_channels::bot::determine_role;
 use aidaemon_channels::context::ChannelContext;
 use aidaemon_channels::hub::{
     ChannelCapabilities, ChannelHub, HubChannel, MediaKind, MediaMessage,
@@ -19,9 +20,8 @@ use aidaemon_channels::hub::{
 use aidaemon_channels::live_status::{HubSurfaceSink, SurfaceSink};
 use aidaemon_channels::ports::{AgentResponseEnvelope, InboundMessageTiming};
 use aidaemon_channels::prompts::Prompts;
-use aidaemon_channels::slash::{build_help_text, shared_commands, CommandCategory, CommandDef};
-use aidaemon_channels::turns::{repeat_while_working, Delivered, Turn, TurnRunner, TurnSurface};
-use aidaemon_channels::Channel as _;
+use aidaemon_channels::slash::{CommandCategory, CommandDef, build_help_text, shared_commands};
+use aidaemon_channels::turns::{Delivered, Turn, TurnRunner, TurnSurface, repeat_while_working};
 use aidaemon_core::ChannelVisibility;
 use aidaemon_events::conversation::MessageAttachment;
 use aidaemon_events::payloads::ResponseDeliveryState;
@@ -30,7 +30,7 @@ use aidaemon_tools::semantics::{
 };
 use aidaemon_tools::status::StatusUpdate;
 use async_trait::async_trait;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::bot_api::{
@@ -806,12 +806,13 @@ impl TelegramBot {
             // Remove an answered approval after a moment, so it isn't
             // mistaken for one still waiting.
             if answered.approval
-                && let Some(delay) = Self::resolved_approval_dismiss_delay() {
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let _ = transport.delete(&message).await;
-                    });
-                }
+                && let Some(delay) = Self::resolved_approval_dismiss_delay()
+            {
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = transport.delete(&message).await;
+                });
+            }
         }
     }
 
@@ -1044,7 +1045,9 @@ impl TelegramBot {
                 voice.mime_type.as_deref().unwrap_or("audio/ogg"),
             )
         } else {
-            anyhow::bail!("Unsupported message type. I can process text, files, photos, audio, video, and voice messages.");
+            anyhow::bail!(
+                "Unsupported message type. I can process text, files, photos, audio, video, and voice messages."
+            );
         };
         let (filename, mime_type) = (filename.to_string(), mime_type.to_string());
 
@@ -1191,9 +1194,10 @@ impl TelegramBot {
                 // Some Telegram clients/wrappers may nest the actual payload under another key.
                 for key in ["data", "payload", "message", "web_app_data", "webAppData"] {
                     if let Some(nested) = map.get(key)
-                        && let Some(action) = Self::parse_web_app_action_value(nested) {
-                            return Some(action);
-                        }
+                        && let Some(action) = Self::parse_web_app_action_value(nested)
+                    {
+                        return Some(action);
+                    }
                 }
                 None
             }
@@ -1343,9 +1347,10 @@ impl TelegramBot {
                 }
             }
             if body_text.is_empty()
-                && let Some(caption) = msg.caption() {
-                    body_text = caption.to_string();
-                }
+                && let Some(caption) = msg.caption()
+            {
+                body_text = caption.to_string();
+            }
         } else if body_text.is_empty() {
             let _ = bot
                 .send_message(msg.chat.id, "I can only process text messages.")

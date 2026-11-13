@@ -317,9 +317,11 @@ mod tests {
         // heartbeat wraps descriptions; the fast path uses goal.description,
         // but make sure the wrapped form does NOT match (it goes through the
         // normal pipeline).
-        assert!(parse_reminder(
-            "Execute scheduled goal: Remind me to call my daughter? [SYSTEM: already scheduled]"
-        )
-        .is_none());
+        assert!(
+            parse_reminder(
+                "Execute scheduled goal: Remind me to call my daughter? [SYSTEM: already scheduled]"
+            )
+            .is_none()
+        );
     }
 }

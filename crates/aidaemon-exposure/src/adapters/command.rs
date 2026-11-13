@@ -181,8 +181,10 @@ mod tests {
             watcher.on_line(Stream::Stdout, "starting..."),
             Some(ExposureHealth::Down { .. })
         ));
-        assert!(watcher
-            .on_line(Stream::Stdout, "{\"url\": \"https://x.example.com\"}")
-            .is_none());
+        assert!(
+            watcher
+                .on_line(Stream::Stdout, "{\"url\": \"https://x.example.com\"}")
+                .is_none()
+        );
     }
 }

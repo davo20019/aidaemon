@@ -25,9 +25,9 @@ use aidaemon_sdk::policies::{
 };
 use aidaemon_sdk::prelude::*;
 use aidaemon_sdk::providers::{Anthropic, OpenAiCompatible};
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
 use aidaemon_sdk::{Authority, AuthorityHook, FnTool, MemoryStore, ReceiptStatus};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const DEFAULT_TICKET: &str = "Hi, this is Alice Rivera (order ORD-1001). The Acme Blender \
     arrived with a cracked jar. I'd like a refund for the full amount, please.";

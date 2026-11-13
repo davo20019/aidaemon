@@ -2,7 +2,7 @@
 //! handoff and step-result records kept in a task's context.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use aidaemon_events::traits::ToolTargetHint;
 use aidaemon_work::goals::Task;
@@ -155,12 +155,13 @@ impl ExecutorHandoff {
         }
 
         if let Some(allowed_tools) = &self.allowed_tools
-            && !allowed_tools.is_empty() {
-                lines.push(format!(
-                    "- allowed tools for this executor: {}",
-                    allowed_tools.join(", ")
-                ));
-            }
+            && !allowed_tools.is_empty()
+        {
+            lines.push(format!(
+                "- allowed tools for this executor: {}",
+                allowed_tools.join(", ")
+            ));
+        }
 
         lines.push(
             "- If finishing requires acting outside the allowed targets, stop and use report_blocker."
@@ -277,9 +278,10 @@ pub fn derive_executor_step_result(
     error: Option<&str>,
 ) -> ExecutorStepResult {
     if let Some(task) = task
-        && let Some(existing) = extract_executor_result_context(task.context.as_deref()) {
-            return existing;
-        }
+        && let Some(existing) = extract_executor_result_context(task.context.as_deref())
+    {
+        return existing;
+    }
 
     let handoff = task.and_then(|task| extract_executor_handoff_context(task.context.as_deref()));
     let artifacts = handoff
@@ -343,7 +345,7 @@ pub fn derive_executor_step_result(
                 artifacts: Vec::new(),
                 blocker: error.to_string(),
                 remaining_work: vec![
-                    "Resolve the blocker and resume with a narrower task.".to_string()
+                    "Resolve the blocker and resume with a narrower task.".to_string(),
                 ],
             }),
         };
@@ -555,11 +557,15 @@ mod tests {
         assert_eq!(request.outcome, ValidationOutcome::NeedsApproval);
         assert_eq!(request.approval_state, ApprovalState::Required);
         assert!(description.contains("Approval needed: extend the task budget"));
-        assert!(warnings
-            .iter()
-            .any(|warning| warning.contains("Explicit owner approval")));
-        assert!(warnings
-            .iter()
-            .any(|warning| warning.contains("Next step after approval")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("Explicit owner approval"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("Next step after approval"))
+        );
     }
 }

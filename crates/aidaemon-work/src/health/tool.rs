@@ -3,16 +3,16 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tracing::info;
 
 use super::{HealthProbe, HealthProbeStore, ProbeConfig, ProbeExecutor, ProbeType};
 use crate::schedule::{compute_next_run, parse_schedule};
-use aidaemon_tools::semantics::{
-    semantics_for_exact_read_actions, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
-};
 use aidaemon_tools::OutcomeTool as Tool;
+use aidaemon_tools::semantics::{
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, semantics_for_exact_read_actions,
+};
 
 pub struct HealthProbeTool {
     store: Arc<HealthProbeStore>,

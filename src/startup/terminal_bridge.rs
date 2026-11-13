@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use aidaemon_channel_telegram::terminal::LocalAgentStart;
 #[cfg(feature = "terminal-bridge")]
-pub use aidaemon_terminal_bridge::{
-    run_local_attach_cli, run_local_share_cli, run_local_start_cli,
-};
-#[cfg(feature = "terminal-bridge")]
 use aidaemon_terminal_bridge::{
     AttachHandoff, BridgeHost, BridgeSettings, ReviewAgentSettings, RuntimeBot,
+};
+#[cfg(feature = "terminal-bridge")]
+pub use aidaemon_terminal_bridge::{
+    run_local_attach_cli, run_local_share_cli, run_local_start_cli,
 };
 #[cfg(feature = "terminal-bridge")]
 use async_trait::async_trait;

@@ -6,22 +6,22 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::OutcomeTool as Tool;
 use crate::config_file::ConfigFile;
 use crate::http_request::HttpRequestTool;
 use crate::semantics::{
-    semantics_for_exact_read_actions, ApprovalScope, OwnerApprovalNeed, StableObservationSubject,
-    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolCollectionObservation, ToolMutationEffects, ToolObservationEvidence, ToolSemanticFacet,
-    ToolTargetHint, ToolTargetHintKind,
+    ApprovalScope, OwnerApprovalNeed, StableObservationSubject, ToolCallContext, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolCollectionObservation,
+    ToolMutationEffects, ToolObservationEvidence, ToolSemanticFacet, ToolTargetHint,
+    ToolTargetHintKind, semantics_for_exact_read_actions,
 };
-use crate::services::oauth::{OAuthGateway, OAuthProviderConfig, OAuthType};
 use crate::services::OAuthStore;
+use crate::services::oauth::{OAuthGateway, OAuthProviderConfig, OAuthType};
 use crate::status::StatusUpdate;
-use crate::OutcomeTool as Tool;
 
 #[derive(Deserialize, Default)]
 struct ManageOAuthArgs {
@@ -485,9 +485,9 @@ impl ManageOAuthTool {
                         .as_deref()
                         .map(str::trim)
                         .and_then(crate::command_effects::url_effect)
-                    {
-                        effects.keys.push(host);
-                    }
+                {
+                    effects.keys.push(host);
+                }
                 effects
             }
             _ => CallEffects::unknown(),
@@ -1013,14 +1013,14 @@ impl ManageOAuthTool {
                             Some(OAuthGateway::expired_flow_message().to_string()),
                         )
                         .await
-                    {
-                        warn!(
-                            service = %service,
-                            state = %state,
-                            error = %err,
-                            "Failed to expire timed out OAuth flow"
-                        );
-                    }
+                {
+                    warn!(
+                        service = %service,
+                        state = %state,
+                        error = %err,
+                        "Failed to expire timed out OAuth flow"
+                    );
+                }
                 Self::send_connect_progress(
                     status_tx.as_ref(),
                     OAuthGateway::expired_flow_message().to_string(),
@@ -1196,9 +1196,10 @@ impl ManageOAuthTool {
 
         providers_table.remove(service);
         if providers_table.is_empty()
-            && let Some(oauth_table) = doc.get_mut("oauth").and_then(toml::Value::as_table_mut) {
-                oauth_table.remove("providers");
-            }
+            && let Some(oauth_table) = doc.get_mut("oauth").and_then(toml::Value::as_table_mut)
+        {
+            oauth_table.remove("providers");
+        }
         self.save_config_doc(&doc).await?;
 
         let _ = self.gateway.unregister_provider(service).await;
@@ -1362,11 +1363,10 @@ impl ManageOAuthTool {
         match args.action.as_str() {
             "providers" => self.handle_providers().await,
             "describe_provider" => {
-                let service = Self::validate_service_name(
-                    args.service
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("'describe_provider' requires 'service'"))?,
-                )?;
+                let service =
+                    Self::validate_service_name(args.service.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("'describe_provider' requires 'service'")
+                    })?)?;
                 self.handle_describe_provider(&service).await
             }
             "list" => self.handle_list().await,
@@ -1392,11 +1392,10 @@ impl ManageOAuthTool {
                 .await
             }
             "connect" => {
-                let service = Self::validate_service_name(
-                    args.service
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("'connect' requires 'service' parameter"))?,
-                )?;
+                let service =
+                    Self::validate_service_name(args.service.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("'connect' requires 'service' parameter")
+                    })?)?;
                 let session_id = if args.call_session.is_empty() {
                     "unknown"
                 } else {
@@ -1405,11 +1404,10 @@ impl ManageOAuthTool {
                 self.handle_connect(&service, session_id, status_tx).await
             }
             "remove" => {
-                let service = Self::validate_service_name(
-                    args.service
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("'remove' requires 'service' parameter"))?,
-                )?;
+                let service =
+                    Self::validate_service_name(args.service.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("'remove' requires 'service' parameter")
+                    })?)?;
                 self.handle_remove(
                     &service,
                     args.confirm_disconnect.unwrap_or(false),
@@ -1418,35 +1416,33 @@ impl ManageOAuthTool {
                 .await
             }
             "register_provider" => {
-                let service = Self::validate_service_name(
-                    args.service.as_deref().ok_or_else(|| {
+                let service =
+                    Self::validate_service_name(args.service.as_deref().ok_or_else(|| {
                         anyhow::anyhow!("'register_provider' requires 'service' parameter")
-                    })?,
-                )?;
+                    })?)?;
                 self.handle_register_provider(&service, &args, kernel_approved)
                     .await
             }
             "remove_provider" => {
-                let service = Self::validate_service_name(
-                    args.service.as_deref().ok_or_else(|| {
+                let service =
+                    Self::validate_service_name(args.service.as_deref().ok_or_else(|| {
                         anyhow::anyhow!("'remove_provider' requires 'service' parameter")
-                    })?,
-                )?;
+                    })?)?;
                 self.handle_remove_provider(&service, kernel_approved).await
             }
             "set_credentials" => {
-                let service = Self::validate_service_name(
-                    args.service.as_deref().ok_or_else(|| {
+                let service =
+                    Self::validate_service_name(args.service.as_deref().ok_or_else(|| {
                         anyhow::anyhow!("'set_credentials' requires 'service' parameter")
-                    })?,
-                )?;
+                    })?)?;
                 let client_id = args
                     .client_id
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'set_credentials' requires 'client_id'"))?;
-                let client_secret = args.client_secret.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("'set_credentials' requires 'client_secret'")
-                })?;
+                let client_secret = args
+                    .client_secret
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'set_credentials' requires 'client_secret'"))?;
                 self.handle_set_credentials(&service, client_id, client_secret)
                     .await
             }
@@ -1501,12 +1497,13 @@ impl crate::semantics::ToolSemantics for ManageOAuthTool {
                 );
             }
             if let Some(service) = args.service.as_deref()
-                && let Ok(service) = Self::validate_service_name(service) {
-                    semantics = semantics.with_target_hint(
-                        ToolTargetHintKind::ResourceId,
-                        HttpRequestTool::auth_profile_resource_id(&service),
-                    );
-                }
+                && let Ok(service) = Self::validate_service_name(service)
+            {
+                semantics = semantics.with_target_hint(
+                    ToolTargetHintKind::ResourceId,
+                    HttpRequestTool::auth_profile_resource_id(&service),
+                );
+            }
         }
         semantics
     }
@@ -1552,10 +1549,10 @@ mod tests {
     use std::time::Duration;
 
     use axum::{
+        Json, Router,
         extract::Form,
         http::HeaderMap,
         routing::{get, post},
-        Json, Router,
     };
     use tempfile::NamedTempFile;
     use tokio::net::TcpListener;
@@ -1781,10 +1778,11 @@ mod tests {
         }));
         let service_semantics = tool.call_semantics(r#"{"action":"refresh","service":"twitter"}"#);
         let resource_id = HttpRequestTool::auth_profile_resource_id("twitter");
-        assert!(service_semantics
-            .target_hints
-            .iter()
-            .any(|hint| hint.kind == ToolTargetHintKind::ResourceId && hint.value == resource_id));
+        assert!(
+            service_semantics.target_hints.iter().any(|hint| hint.kind
+                == ToolTargetHintKind::ResourceId
+                && hint.value == resource_id)
+        );
 
         let outcome = tool
             .call_with_status_outcome(r#"{"action":"list"}"#, None)
@@ -2029,10 +2027,10 @@ allowed_domains = ["api.linear.app"]
                 .expect("loopback warning");
         assert!(warning.contains("reachable public URL"));
 
-        assert!(ManageOAuthTool::callback_access_warning(
-            "https://auth.example.com/oauth/callback"
-        )
-        .is_none());
+        assert!(
+            ManageOAuthTool::callback_access_warning("https://auth.example.com/oauth/callback")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2293,9 +2291,11 @@ allowed_domains = ["api.linear.app"]
         )
         .await
         .unwrap_err();
-        assert!(mismatch
-            .to_string()
-            .contains("Authenticated identity mismatch"));
+        assert!(
+            mismatch
+                .to_string()
+                .contains("Authenticated identity mismatch")
+        );
         let unchanged = tool
             .state_store
             .get_oauth_connection("twitter")
@@ -2333,12 +2333,13 @@ allowed_domains = ["api.linear.app"]
             .unwrap();
 
         assert!(result.contains("confirm_disconnect=true"));
-        assert!(tool
-            .state_store
-            .get_oauth_connection("twitter")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            tool.state_store
+                .get_oauth_connection("twitter")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2373,12 +2374,13 @@ allowed_domains = ["api.linear.app"]
                 .contains("requires approval through the agent kernel"),
             "{unapproved}"
         );
-        assert!(tool
-            .state_store
-            .get_oauth_connection("twitter")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            tool.state_store
+                .get_oauth_connection("twitter")
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         let result = call_approved(
             &tool,
@@ -2388,11 +2390,12 @@ allowed_domains = ["api.linear.app"]
         .unwrap();
 
         assert!(result.contains("Disconnected from twitter"));
-        assert!(tool
-            .state_store
-            .get_oauth_connection("twitter")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            tool.state_store
+                .get_oauth_connection("twitter")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -7,7 +7,9 @@ use aidaemon::nodes::simulator::NodeSimulator;
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 8 {
-        eprintln!("Usage: k10_provision <serial-port> <gateway-url> <offer-id> <offer-secret> <wifi-ssid> <wifi-password> <device-label> [--wifi <ssid> <password>]... [--gateway-fallback <https-origin>]...");
+        eprintln!(
+            "Usage: k10_provision <serial-port> <gateway-url> <offer-id> <offer-secret> <wifi-ssid> <wifi-password> <device-label> [--wifi <ssid> <password>]... [--gateway-fallback <https-origin>]..."
+        );
         std::process::exit(2);
     }
     let mut wifi_networks = vec![serde_json::json!({"ssid": args[5], "password": args[6]})];
@@ -130,8 +132,8 @@ async fn main() -> anyhow::Result<()> {
         && let Some(reason) = text
             .lines()
             .find_map(|line| line.trim().strip_prefix("PROVISIONING_REJECTED:"))
-        {
-            anyhow::bail!("K10 rejected provisioning: {reason}");
-        }
+    {
+        anyhow::bail!("K10 rejected provisioning: {reason}");
+    }
     anyhow::bail!("K10 did not confirm provisioning before the deadline")
 }

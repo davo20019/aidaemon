@@ -3,8 +3,8 @@
 //! approvals settled by whoever answers first, auth and version checks, and
 //! resuming or starting from a snapshot.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use aidaemon_channels::hub::{
@@ -22,7 +22,7 @@ use aidaemon_tools::semantics::{ApprovalKind as CardKind, ApprovalResponse};
 use aidaemon_tools::status::StatusUpdate;
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Replies "Done." — or, for a message that says "approve", asks the owner
@@ -786,9 +786,11 @@ async fn an_answer_from_the_chat_settles_the_card_for_clients() {
             matches!(e, Event::ApprovalRequested { .. })
         })
         .await;
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, Event::TurnStarted { origin, .. } if origin == "test")));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::TurnStarted { origin, .. } if origin == "test"))
+    );
     let Event::ApprovalRequested { approval } = events.last().unwrap() else {
         unreachable!()
     };
@@ -851,8 +853,8 @@ impl aidaemon_channels::turns::TurnSurface for Quiet {
 // Pairing
 // ---------------------------------------------------------------------------
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::elliptic_curve::Generate;
@@ -1155,10 +1157,12 @@ async fn the_web_client_is_served() {
         .await
         .unwrap();
     assert_eq!(page.status(), 200);
-    assert!(page.headers()["content-security-policy"]
-        .to_str()
-        .unwrap()
-        .contains("default-src 'self'"));
+    assert!(
+        page.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("default-src 'self'")
+    );
     assert!(page.text().await.unwrap().contains("/client/v1/app/app.js"));
     let script = f
         .http()
@@ -1166,10 +1170,12 @@ async fn the_web_client_is_served() {
         .send()
         .await
         .unwrap();
-    assert!(script.headers()["content-type"]
-        .to_str()
-        .unwrap()
-        .starts_with("text/javascript"));
+    assert!(
+        script.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/javascript")
+    );
     assert!(script.text().await.unwrap().contains("./ui.js"));
     // Each module the page imports is served; nothing else is.
     for (module, holds) in [
@@ -1349,10 +1355,10 @@ async fn view_actions_within(socket: &mut Socket, wait: Duration) -> Vec<ViewAct
                 seq,
                 ..
             } = serde_json::from_str(&text).unwrap()
-            {
-                assert_eq!(seq, None, "view actions are never logged");
-                actions.push(action);
-            }
+        {
+            assert_eq!(seq, None, "view actions are never logged");
+            actions.push(action);
+        }
     }
     actions
 }
@@ -1389,9 +1395,11 @@ async fn a_view_action_reaches_only_the_capable_sender() {
             session_id: session_id.clone()
         }]
     );
-    assert!(view_actions_within(&mut plain, Duration::from_millis(300))
-        .await
-        .is_empty());
+    assert!(
+        view_actions_within(&mut plain, Duration::from_millis(300))
+            .await
+            .is_empty()
+    );
     assert!(
         view_actions_within(&mut watcher, Duration::from_millis(300))
             .await

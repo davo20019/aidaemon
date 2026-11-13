@@ -10,18 +10,19 @@ use aidaemon_events::conversation::{Message, ToolCall};
 use aidaemon_events::traits::{ToolCallAccessManifest, ToolCallSemantics};
 use aidaemon_events::{AssistantResponseData, EventType, ToolCallInfo, ToolResultData};
 use futures::future::BoxFuture;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::host::TurnHost;
 use crate::markers::INTENT_GATE_MARKER;
 use crate::policy::metrics::POLICY_METRICS;
 use crate::turn::completion_contract::{
-    completion_contract_from_persisted, infer_structural_completion_contract_anchored,
-    inherit_unfinished_request_contract, scope_contract_for_delegated_executor, CompletionContract,
+    CompletionContract, completion_contract_from_persisted,
+    infer_structural_completion_contract_anchored, inherit_unfinished_request_contract,
+    scope_contract_for_delegated_executor,
 };
 use crate::turn::followup::{
-    find_previous_turns, has_project_scope_divergence_with_aliases, sanitize_carryover_blocks,
-    FollowupMode, TurnContextReason,
+    FollowupMode, TurnContextReason, find_previous_turns,
+    has_project_scope_divergence_with_aliases, sanitize_carryover_blocks,
 };
 use crate::turn::helpers::truncate_for_resume;
 use crate::turn::project_scope::{
@@ -588,38 +589,39 @@ pub trait TurnHistory: TurnHost {
         let mut inherited_completion_contract = false;
         let mut inherited_outstanding_obligations = false;
         if followup_mode != FollowupMode::NewTask
-            && let Some(request) = related_open_request(dialogue_state.as_ref(), followup_mode) {
-                let mut unfinished_contract = request
-                    .completion_contract
-                    .as_ref()
-                    .map(completion_contract_from_persisted)
-                    .unwrap_or_else(|| {
-                        infer_structural_completion_contract_anchored(
-                            self.execution_backend(),
-                            &request.text,
-                            self.project_roots(),
-                            workspace_anchor,
-                        )
-                    });
-                // Legacy persisted contracts predate container-level lineage.
-                // The open-request lifecycle already owns an exact task edge,
-                // so upgrade that authoritative relationship before adoption.
-                if unfinished_contract.scope_task_id.is_none() {
-                    unfinished_contract.scope_task_id = request.task_id.clone();
-                }
-                inherited_completion_contract = request.completion_contract.is_some();
-                inherited_outstanding_obligations = dialogue_state
-                    .as_ref()
-                    .is_some_and(|state| state.has_unresolved_request_obligation());
-                completion_contract = if !inherited_outstanding_obligations {
-                    crate::turn::completion_contract::inherit_request_constraints(
-                        completion_contract,
-                        &unfinished_contract,
+            && let Some(request) = related_open_request(dialogue_state.as_ref(), followup_mode)
+        {
+            let mut unfinished_contract = request
+                .completion_contract
+                .as_ref()
+                .map(completion_contract_from_persisted)
+                .unwrap_or_else(|| {
+                    infer_structural_completion_contract_anchored(
+                        self.execution_backend(),
+                        &request.text,
+                        self.project_roots(),
+                        workspace_anchor,
                     )
-                } else {
-                    inherit_unfinished_request_contract(completion_contract, &unfinished_contract)
-                };
+                });
+            // Legacy persisted contracts predate container-level lineage.
+            // The open-request lifecycle already owns an exact task edge,
+            // so upgrade that authoritative relationship before adoption.
+            if unfinished_contract.scope_task_id.is_none() {
+                unfinished_contract.scope_task_id = request.task_id.clone();
             }
+            inherited_completion_contract = request.completion_contract.is_some();
+            inherited_outstanding_obligations = dialogue_state
+                .as_ref()
+                .is_some_and(|state| state.has_unresolved_request_obligation());
+            completion_contract = if !inherited_outstanding_obligations {
+                crate::turn::completion_contract::inherit_request_constraints(
+                    completion_contract,
+                    &unfinished_contract,
+                )
+            } else {
+                inherit_unfinished_request_contract(completion_contract, &unfinished_contract)
+            };
+        }
         if self.role() == aidaemon_events::traits::AgentRole::Executor {
             completion_contract = scope_contract_for_delegated_executor(completion_contract);
         }

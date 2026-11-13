@@ -141,27 +141,26 @@ impl SessionContext {
         }
 
         // Last completed task
-        if !active_task_is_uploaded_artifact
-            && let Some(task) = &self.last_completed_task {
-                let status_str = match task.status {
-                    TaskStatus::Completed => "completed",
-                    TaskStatus::Cancelled => "CANCELLED",
-                    TaskStatus::Failed => "FAILED",
-                    TaskStatus::Interrupted => "INTERRUPTED",
-                };
-                let error_suffix = task
-                    .error
-                    .as_ref()
-                    .map(|e| format!(" - Error: {}", truncate_str(e, 50)))
-                    .unwrap_or_default();
-                lines.push(format!(
-                    "- **Last task:** \"{}\" - {} ({}s){}",
-                    truncate_str(&task.description, 50),
-                    status_str,
-                    task.duration_secs,
-                    error_suffix
-                ));
-            }
+        if !active_task_is_uploaded_artifact && let Some(task) = &self.last_completed_task {
+            let status_str = match task.status {
+                TaskStatus::Completed => "completed",
+                TaskStatus::Cancelled => "CANCELLED",
+                TaskStatus::Failed => "FAILED",
+                TaskStatus::Interrupted => "INTERRUPTED",
+            };
+            let error_suffix = task
+                .error
+                .as_ref()
+                .map(|e| format!(" - Error: {}", truncate_str(e, 50)))
+                .unwrap_or_default();
+            lines.push(format!(
+                "- **Last task:** \"{}\" - {} ({}s){}",
+                truncate_str(&task.description, 50),
+                status_str,
+                task.duration_secs,
+                error_suffix
+            ));
+        }
 
         // Last error
         if let Some(error) = &self.last_error {
@@ -310,9 +309,10 @@ impl SessionContextCompiler {
                 }
                 EventType::ToolCall => {
                     if let Ok(data) = event.parse_data::<ToolCallData>()
-                        && let Some(task_id) = &data.task_id {
-                            *task_tool_calls.entry(task_id.clone()).or_insert(0) += 1;
-                        }
+                        && let Some(task_id) = &data.task_id
+                    {
+                        *task_tool_calls.entry(task_id.clone()).or_insert(0) += 1;
+                    }
                 }
                 EventType::ToolResult => {
                     if let Ok(data) = event.parse_data::<ToolResultData>() {
@@ -332,16 +332,17 @@ impl SessionContextCompiler {
                 }
                 EventType::DecisionPoint => {
                     if let Ok(data) = event.parse_data::<DecisionPointData>()
-                        && data.severity.is_warning_or_higher() {
-                            recent_diagnostics.push(RecentDiagnostic {
-                                severity: data.severity.as_str().to_string(),
-                                code: data
-                                    .code
-                                    .unwrap_or_else(|| data.decision_type.as_str().to_string()),
-                                summary: truncate_str(&data.summary, 80).to_string(),
-                                timestamp: event.created_at,
-                            });
-                        }
+                        && data.severity.is_warning_or_higher()
+                    {
+                        recent_diagnostics.push(RecentDiagnostic {
+                            severity: data.severity.as_str().to_string(),
+                            code: data
+                                .code
+                                .unwrap_or_else(|| data.decision_type.as_str().to_string()),
+                            summary: truncate_str(&data.summary, 80).to_string(),
+                            timestamp: event.created_at,
+                        });
+                    }
                 }
                 EventType::SubAgentSpawn => {
                     if let Ok(data) = event.parse_data::<SubAgentSpawnData>() {

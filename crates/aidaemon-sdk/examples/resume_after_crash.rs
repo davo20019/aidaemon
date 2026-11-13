@@ -6,10 +6,10 @@
 //!
 //! Live with ANTHROPIC_API_KEY or OPENAI_API_KEY, otherwise scripted:
 //! cargo run -p aidaemon-sdk --example resume_after_crash --features testing
+use aidaemon_sdk::CancellationToken;
 use aidaemon_sdk::prelude::*;
 use aidaemon_sdk::store::SqliteStore;
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
-use aidaemon_sdk::CancellationToken;
+use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
 use serde_json::json;
 
 const CRASH: &str = "AIDAEMON_EXAMPLE_CRASH";

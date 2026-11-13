@@ -384,20 +384,19 @@ impl ClientGateway {
         };
         // A reply worth retrying for is not remembered.
         let keep = !matches!(&reply, ServerFrame::Error { error, .. } if error.retryable);
-        if keep
-            && let Ok(text) = serde_json::to_string(&reply) {
-                match log
-                    .remember_reply(OWNER, request_id, bus::now_ms(), &text)
-                    .await
-                {
-                    Ok(kept) => {
-                        if let Ok(frame) = serde_json::from_str(&kept) {
-                            return frame;
-                        }
+        if keep && let Ok(text) = serde_json::to_string(&reply) {
+            match log
+                .remember_reply(OWNER, request_id, bus::now_ms(), &text)
+                .await
+            {
+                Ok(kept) => {
+                    if let Ok(frame) = serde_json::from_str(&kept) {
+                        return frame;
                     }
-                    Err(error) => warn!(%error, "Could not remember a client reply"),
                 }
+                Err(error) => warn!(%error, "Could not remember a client reply"),
             }
+        }
         reply
     }
 
@@ -421,12 +420,13 @@ impl ClientGateway {
             Command::Unknown => None,
         };
         if let Some(scope) = needs
-            && !caller.principal.may(scope) {
-                return Err(ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    format!("This device may not {scope:?}"),
-                ));
-            }
+            && !caller.principal.may(scope)
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                format!("This device may not {scope:?}"),
+            ));
+        }
         match command {
             Command::SendMessage {
                 session_id,
@@ -560,7 +560,7 @@ impl ClientGateway {
                     ErrorCode::Forbidden,
                     "Sessions of other chats are read-only here: post from that chat, or start \
                      a new session",
-                ))
+                ));
             }
         };
         self.runner.register_session(&session_id, APP_CHANNEL).await;
@@ -652,7 +652,7 @@ impl ClientGateway {
                     return Err(ProtocolError::new(
                         ErrorCode::NotFound,
                         format!("No message {before} in this session's history"),
-                    ))
+                    ));
                 }
             }
         }

@@ -1617,70 +1617,69 @@ impl FactStore for SqliteMemory {
         //   (prevents cross-concept supersession in the same category)
         if source == "agent"
             && let Some(ref new_emb_blob) = embedding_blob
-                && let Ok(new_vec) = decode_embedding(new_emb_blob) {
-                    let others = sqlx::query(
-                        "SELECT id, key, value, embedding FROM facts
+            && let Ok(new_vec) = decode_embedding(new_emb_blob)
+        {
+            let others = sqlx::query(
+                "SELECT id, key, value, embedding FROM facts
                          WHERE category = ? AND superseded_at IS NULL
                            AND key != ?
                            AND embedding IS NOT NULL",
-                    )
-                    .bind(category_clean)
-                    .bind(&key_for_write)
-                    .fetch_all(&self.pool)
-                    .await
-                    .unwrap_or_default();
+            )
+            .bind(category_clean)
+            .bind(&key_for_write)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default();
 
-                    // Build keyword set from the new fact's key + value for
-                    // lexical overlap guard.  Only words ≥3 chars to skip
-                    // noise like "a", "is", "my".
-                    let new_words: std::collections::HashSet<String> = key_clean
-                        .split(|c: char| !c.is_alphanumeric())
-                        .chain(value.split(|c: char| !c.is_alphanumeric()))
-                        .filter(|w| w.len() >= 3)
-                        .map(|w| w.to_ascii_lowercase())
-                        .collect();
+            // Build keyword set from the new fact's key + value for
+            // lexical overlap guard.  Only words ≥3 chars to skip
+            // noise like "a", "is", "my".
+            let new_words: std::collections::HashSet<String> = key_clean
+                .split(|c: char| !c.is_alphanumeric())
+                .chain(value.split(|c: char| !c.is_alphanumeric()))
+                .filter(|w| w.len() >= 3)
+                .map(|w| w.to_ascii_lowercase())
+                .collect();
 
-                    for row in &others {
-                        let other_id: i64 = row.get("id");
-                        let other_key: String = row.get("key");
-                        let other_value: String = row.get("value");
-                        let blob: Vec<u8> = row.get("embedding");
+            for row in &others {
+                let other_id: i64 = row.get("id");
+                let other_key: String = row.get("key");
+                let other_value: String = row.get("value");
+                let blob: Vec<u8> = row.get("embedding");
 
-                        // Lexical overlap guard: at least one meaningful word
-                        // from the new fact must appear in the other fact.
-                        let other_text =
-                            format!("{} {}", other_key, other_value).to_ascii_lowercase();
-                        let has_overlap = new_words.iter().any(|w| other_text.contains(w.as_str()));
-                        if !has_overlap {
-                            continue;
-                        }
+                // Lexical overlap guard: at least one meaningful word
+                // from the new fact must appear in the other fact.
+                let other_text = format!("{} {}", other_key, other_value).to_ascii_lowercase();
+                let has_overlap = new_words.iter().any(|w| other_text.contains(w.as_str()));
+                if !has_overlap {
+                    continue;
+                }
 
-                        if let Ok(other_vec) = decode_embedding(&blob) {
-                            let sim = cosine_similarity(&new_vec, &other_vec);
-                            // High similarity on full-fact embedding (value-aware)
-                            // means these facts describe the same concept.  Only
-                            // supersede if the values actually differ (otherwise
-                            // it's a harmless duplicate that adds context).
-                            if sim > 0.82 && other_value != value {
-                                tracing::info!(
-                                    category = category_clean,
-                                    new_key = key_clean,
-                                    new_value = value,
-                                    conflicting_key = other_key.as_str(),
-                                    conflicting_value = other_value.as_str(),
-                                    similarity = sim,
-                                    "Conflict sweep: superseding stale fact with different key"
-                                );
-                                let _ =
-                                    sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
-                                        .bind(&now)
-                                        .bind(other_id)
-                                        .execute(&self.pool)
-                                        .await;
-                            }
-                        }
+                if let Ok(other_vec) = decode_embedding(&blob) {
+                    let sim = cosine_similarity(&new_vec, &other_vec);
+                    // High similarity on full-fact embedding (value-aware)
+                    // means these facts describe the same concept.  Only
+                    // supersede if the values actually differ (otherwise
+                    // it's a harmless duplicate that adds context).
+                    if sim > 0.82 && other_value != value {
+                        tracing::info!(
+                            category = category_clean,
+                            new_key = key_clean,
+                            new_value = value,
+                            conflicting_key = other_key.as_str(),
+                            conflicting_value = other_value.as_str(),
+                            similarity = sim,
+                            "Conflict sweep: superseding stale fact with different key"
+                        );
+                        let _ = sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
+                            .bind(&now)
+                            .bind(other_id)
+                            .execute(&self.pool)
+                            .await;
                     }
                 }
+            }
+        }
 
         if let Err(error) = self.sync_fact_memory_written_at(category_clean, &now).await {
             tracing::warn!(%error, category = category_clean, "Deferred fact memory projection");

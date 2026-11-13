@@ -13,28 +13,23 @@ use crate::traits::{
 };
 use sha2::{Digest, Sha256};
 
-const MANDATE_COLUMNS: &str =
-    "id, goal_id, source_goal_id, name, objective, status, autonomy_mode, authority_json, strategy_json, \
+const MANDATE_COLUMNS: &str = "id, goal_id, source_goal_id, name, objective, status, autonomy_mode, authority_json, strategy_json, \
      objective_control_json, suspension_json, constraints_json, \
      success_criteria_json, stop_conditions_json, min_review_secs, max_review_secs, \
      default_review_secs, review_effort, next_review_at, review_lease_token, review_lease_expires_at, \
      expires_at, confirmed_at, version, owner_principal_id, created_by_session, created_at, updated_at";
 
-const DECISION_COLUMNS: &str =
-    "id, mandate_id, goal_run_id, mandate_version, outcome, origin, activity_level, rationale, belief_snapshot, \
+const DECISION_COLUMNS: &str = "id, mandate_id, goal_run_id, mandate_version, outcome, origin, activity_level, rationale, belief_snapshot, \
      evidence_receipt_ids_json, question, owner_alert, termination_kind, termination_match, \
      reconsider_at, action_attempts, created_at, updated_at";
 
-const INTENTION_COLUMNS: &str =
-    "id, mandate_id, decision_cycle_id, goal_run_id, description, rationale, \
+const INTENTION_COLUMNS: &str = "id, mandate_id, decision_cycle_id, goal_run_id, description, rationale, \
      value_criterion, expected_benefit, risk, invalidation_criteria, status, created_at, updated_at, completed_at";
 
-const LEARNING_NOTE_COLUMNS: &str =
-    "id, mandate_id, mandate_version, learned_in_decision_cycle_id, summary, \
+const LEARNING_NOTE_COLUMNS: &str = "id, mandate_id, mandate_version, learned_in_decision_cycle_id, summary, \
      evidence_receipt_ids_json, created_at";
 
-const MUTATION_ATTEMPT_COLUMNS: &str =
-    "id, mandate_id, mandate_version, decision_cycle_id, goal_run_id, intention_id, \
+const MUTATION_ATTEMPT_COLUMNS: &str = "id, mandate_id, mandate_version, decision_cycle_id, goal_run_id, intention_id, \
      root_task_id, root_task_attempt_id, task_id, task_attempt_id, reserved_action_attempt, \
      action_digest, tool_call_id, tool_name, mutation_effects_json, targets_json, \
      account_identifiers_json, status, outcome_evidence, http_status, exit_code, \
@@ -2721,21 +2716,22 @@ impl<S: WorkDatabase> MandateStore for S {
             .validate_content_bounds()
             .map_err(anyhow::Error::msg)?;
         if let Some(updates) = operating_updates
-            && let Some(note) = updates.learning_note.as_ref() {
-                note.validate().map_err(anyhow::Error::msg)?;
-                anyhow::ensure!(
-                    note.mandate_id == decision.mandate_id
-                        && note.mandate_version == decision.mandate_version
-                        && note.learned_in_decision_cycle_id == decision.id,
-                    "learning note does not belong to this decision"
-                );
-                anyhow::ensure!(
-                    note.evidence_receipt_ids
-                        .iter()
-                        .all(|id| decision.evidence_receipt_ids.contains(id)),
-                    "learning evidence must be a subset of current decision evidence"
-                );
-            }
+            && let Some(note) = updates.learning_note.as_ref()
+        {
+            note.validate().map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                note.mandate_id == decision.mandate_id
+                    && note.mandate_version == decision.mandate_version
+                    && note.learned_in_decision_cycle_id == decision.id,
+                "learning note does not belong to this decision"
+            );
+            anyhow::ensure!(
+                note.evidence_receipt_ids
+                    .iter()
+                    .all(|id| decision.evidence_receipt_ids.contains(id)),
+                "learning evidence must be a subset of current decision evidence"
+            );
+        }
         anyhow::ensure!(
             decision.action_attempts == 0,
             "a new decision cannot pre-spend actions"
@@ -2749,11 +2745,12 @@ impl<S: WorkDatabase> MandateStore for S {
         // the transaction-fenced mandate snapshot, so a racing policy update
         // still fails closed.
         if let Some(intention) = intention
-            && let Some(mandate) = self.get_mandate(&decision.mandate_id).await? {
-                intention
-                    .validate_value_against(&mandate)
-                    .map_err(anyhow::Error::msg)?;
-            }
+            && let Some(mandate) = self.get_mandate(&decision.mandate_id).await?
+        {
+            intention
+                .validate_value_against(&mandate)
+                .map_err(anyhow::Error::msg)?;
+        }
         if decision.outcome == MandateDecisionOutcome::Ask {
             anyhow::ensure!(
                 decision
@@ -2985,15 +2982,15 @@ impl<S: WorkDatabase> MandateStore for S {
         let mut next_review_at =
             clamped_next_review_at(&mandate, decision.reconsider_at.as_deref(), now)?;
         if decision.outcome != MandateDecisionOutcome::Stop
-            && let Some(control) = mandate.objective_control.as_ref() {
-                let measurement_due =
-                    now + chrono::Duration::seconds(control.measurement_cadence_secs);
-                let selected = chrono::DateTime::parse_from_rfc3339(&next_review_at)?
-                    .with_timezone(&chrono::Utc);
-                if selected > measurement_due {
-                    next_review_at = measurement_due.to_rfc3339();
-                }
+            && let Some(control) = mandate.objective_control.as_ref()
+        {
+            let measurement_due = now + chrono::Duration::seconds(control.measurement_cadence_secs);
+            let selected =
+                chrono::DateTime::parse_from_rfc3339(&next_review_at)?.with_timezone(&chrono::Utc);
+            if selected > measurement_due {
+                next_review_at = measurement_due.to_rfc3339();
             }
+        }
         let persisted_reconsider_at = if decision.outcome == MandateDecisionOutcome::Stop {
             None
         } else {
@@ -3075,23 +3072,24 @@ impl<S: WorkDatabase> MandateStore for S {
         }
 
         if let Some(updates) = operating_updates
-            && let Some(note) = updates.learning_note.as_ref() {
-                sqlx::query(
-                    "INSERT INTO mandate_learning_notes (
+            && let Some(note) = updates.learning_note.as_ref()
+        {
+            sqlx::query(
+                "INSERT INTO mandate_learning_notes (
                         id, mandate_id, mandate_version, learned_in_decision_cycle_id,
                         summary, evidence_receipt_ids_json, created_at
                      ) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(&note.id)
-                .bind(&note.mandate_id)
-                .bind(note.mandate_version)
-                .bind(&note.learned_in_decision_cycle_id)
-                .bind(&note.summary)
-                .bind(serde_json::to_string(&note.evidence_receipt_ids)?)
-                .bind(&note.created_at)
-                .execute(&mut *tx)
-                .await?;
-            }
+            )
+            .bind(&note.id)
+            .bind(&note.mandate_id)
+            .bind(note.mandate_version)
+            .bind(&note.learned_in_decision_cycle_id)
+            .bind(&note.summary)
+            .bind(serde_json::to_string(&note.evidence_receipt_ids)?)
+            .bind(&note.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         // The durable decision remains provisional until the root task itself
         // is durably successful and the proof finalizer closes the run. This
@@ -4804,20 +4802,24 @@ mod tests {
             chrono::DateTime::parse_from_rfc3339(&awakened.next_review_at).unwrap()
                 <= chrono::Utc::now() + chrono::Duration::seconds(1)
         );
-        assert!(store
-            .wake_mandates_for_signal(&signal)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .wake_mandates_for_signal(&signal)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let mut wrong_account = signal;
         wrong_account.dedupe_key = "mention:43".to_string();
         wrong_account.account_id = Some("account:synthetic-2".to_string());
-        assert!(store
-            .wake_mandates_for_signal(&wrong_account)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .wake_mandates_for_signal(&wrong_account)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn review_root(goal: &Goal, run_id: &str, task_id: &str) -> Task {
@@ -4905,17 +4907,19 @@ mod tests {
         let mut worker_task = review_root(goal, &run.id, &worker_task_id);
         worker_task.description = "Perform one governed HTTP mutation".to_string();
         worker_task.task_order = 1;
-        assert!(store
-            .create_mandate_task_from_attempt(
-                &worker_task,
-                &mandate.id,
-                mandate.version,
-                &run.id,
-                &root_attempt.id,
-                16,
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .create_mandate_task_from_attempt(
+                    &worker_task,
+                    &mandate.id,
+                    mandate.version,
+                    &run.id,
+                    &root_attempt.id,
+                    16,
+                )
+                .await
+                .unwrap()
+        );
         let worker_attempt = store
             .claim_mandate_task_from_attempt(
                 &worker_task_id,
@@ -4996,22 +5000,26 @@ mod tests {
             result: Some("verified".to_string()),
             ..Default::default()
         };
-        assert!(store
-            .patch_task_from_attempt(
-                &fence.worker_attempt.id,
-                &fence.worker_attempt.lease_token,
-                &complete,
-            )
-            .await
-            .unwrap());
-        assert!(store
-            .patch_task_from_attempt(
-                &fence.root_attempt.id,
-                &fence.root_attempt.lease_token,
-                &complete,
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .patch_task_from_attempt(
+                    &fence.worker_attempt.id,
+                    &fence.worker_attempt.lease_token,
+                    &complete,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .patch_task_from_attempt(
+                    &fence.root_attempt.id,
+                    &fence.root_attempt.lease_token,
+                    &complete,
+                )
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -5081,10 +5089,12 @@ mod tests {
 
         let (bad_goal, mut bad_mandate) = controller("owner-session", 2);
         bad_mandate.source_goal_id = Some("missing-personal-goal".to_string());
-        assert!(store
-            .create_mandate_controller(&bad_goal, &bad_mandate)
-            .await
-            .is_err());
+        assert!(
+            store
+                .create_mandate_controller(&bad_goal, &bad_mandate)
+                .await
+                .is_err()
+        );
         assert!(store.get_goal(&bad_goal.id).await.unwrap().is_none());
 
         let same_owner_source = Goal::new_personal("Grow an audience", "owner-session");
@@ -5101,10 +5111,12 @@ mod tests {
         store.create_goal(&foreign_source).await.unwrap();
         let (foreign_goal, mut foreign_mandate) = controller("owner-session", 2);
         foreign_mandate.source_goal_id = Some(foreign_source.id);
-        assert!(store
-            .create_mandate_controller(&foreign_goal, &foreign_mandate)
-            .await
-            .is_err());
+        assert!(
+            store
+                .create_mandate_controller(&foreign_goal, &foreign_mandate)
+                .await
+                .is_err()
+        );
         assert!(store.get_goal(&foreign_goal.id).await.unwrap().is_none());
     }
 
@@ -5118,10 +5130,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store
-            .is_mandate_session_authorized(&mandate.id, "beta_bot:12345")
-            .await
-            .unwrap());
+        assert!(
+            store
+                .is_mandate_session_authorized(&mandate.id, "beta_bot:12345")
+                .await
+                .unwrap()
+        );
         assert_eq!(
             store
                 .list_mandates(Some("beta_bot:12345"), false)
@@ -5132,10 +5146,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [mandate.id.as_str()]
         );
-        assert!(!store
-            .is_mandate_session_authorized(&mandate.id, "beta_bot:67890")
-            .await
-            .unwrap());
+        assert!(
+            !store
+                .is_mandate_session_authorized(&mandate.id, "beta_bot:67890")
+                .await
+                .unwrap()
+        );
 
         let (group_goal, group_mandate) = controller("alpha_bot:-10012345", 1);
         assert_ne!(
@@ -5146,10 +5162,12 @@ mod tests {
             .create_mandate_controller(&group_goal, &group_mandate)
             .await
             .unwrap();
-        assert!(!store
-            .is_mandate_session_authorized(&group_mandate.id, "beta_bot:-10012345")
-            .await
-            .unwrap());
+        assert!(
+            !store
+                .is_mandate_session_authorized(&group_mandate.id, "beta_bot:-10012345")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -5218,10 +5236,12 @@ mod tests {
             vec!["receipt-from-another-run".to_string()],
             &chrono::Utc::now().to_rfc3339(),
         );
-        assert!(store
-            .record_mandate_objective_measurement(&unproven)
-            .await
-            .is_err());
+        assert!(
+            store
+                .record_mandate_objective_measurement(&unproven)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -5229,10 +5249,12 @@ mod tests {
         let (store, _database) = test_store().await;
         let (bad_goal, mut bad_mandate) = controller("owner-session", 2);
         bad_mandate.objective = "é".repeat(1_025);
-        assert!(store
-            .create_mandate_controller(&bad_goal, &bad_mandate)
-            .await
-            .is_err());
+        assert!(
+            store
+                .create_mandate_controller(&bad_goal, &bad_mandate)
+                .await
+                .is_err()
+        );
         assert!(store.get_goal(&bad_goal.id).await.unwrap().is_none());
 
         let (goal, mandate) = controller("owner-session", 2);
@@ -5244,10 +5266,12 @@ mod tests {
             &"é".repeat(1_025),
             mandate.version,
         );
-        assert!(store
-            .record_mandate_decision(&oversized_decision, None, None)
-            .await
-            .is_err());
+        assert!(
+            store
+                .record_mandate_decision(&oversized_decision, None, None)
+                .await
+                .is_err()
+        );
 
         let act = MandateDecisionCycle::new(
             &mandate.id,
@@ -5263,15 +5287,19 @@ mod tests {
             &"é".repeat(513),
             "A bounded governed action is useful",
         );
-        assert!(store
-            .record_mandate_decision(&act, Some(&oversized_intention), None)
-            .await
-            .is_err());
-        assert!(store
-            .get_mandate_decision_for_run(&run.id)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .record_mandate_decision(&act, Some(&oversized_intention), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .get_mandate_decision_for_run(&run.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -5306,10 +5334,16 @@ mod tests {
         attempted_pause.version += 1;
         attempted_pause.status = MandateStatus::Paused;
         assert!(store.update_mandate(&attempted_pause).await.is_err());
-        assert!(store
-            .transition_mandate_status(&mandate.id, MandateStatus::Active, MandateStatus::Paused,)
-            .await
-            .unwrap());
+        assert!(
+            store
+                .transition_mandate_status(
+                    &mandate.id,
+                    MandateStatus::Active,
+                    MandateStatus::Paused,
+                )
+                .await
+                .unwrap()
+        );
         assert_eq!(
             store.get_goal(&goal.id).await.unwrap().unwrap().status,
             "paused"
@@ -5342,16 +5376,24 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!store
-            .transition_mandate_status(&mandate.id, MandateStatus::Paused, MandateStatus::Active,)
-            .await
-            .unwrap());
+        assert!(
+            !store
+                .transition_mandate_status(
+                    &mandate.id,
+                    MandateStatus::Paused,
+                    MandateStatus::Active,
+                )
+                .await
+                .unwrap()
+        );
         // Confirmation is a CAS against the exact policy version displayed to
         // the owner; a stale or speculative callback cannot activate it.
-        assert!(!store
-            .confirm_mandate(&mandate.id, mandate.version + 1, None)
-            .await
-            .unwrap());
+        assert!(
+            !store
+                .confirm_mandate(&mandate.id, mandate.version + 1, None)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             store
                 .get_mandate(&mandate.id)
@@ -5361,14 +5403,18 @@ mod tests {
                 .status,
             MandateStatus::Paused
         );
-        assert!(store
-            .confirm_mandate(&mandate.id, mandate.version, None)
-            .await
-            .unwrap());
-        assert!(!store
-            .confirm_mandate(&mandate.id, mandate.version, None)
-            .await
-            .unwrap());
+        assert!(
+            store
+                .confirm_mandate(&mandate.id, mandate.version, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .confirm_mandate(&mandate.id, mandate.version, None)
+                .await
+                .unwrap()
+        );
 
         let confirmed = store.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(confirmed.status, MandateStatus::Active);
@@ -5422,10 +5468,12 @@ mod tests {
             store.get_goal(&goal.id).await.unwrap().unwrap().status,
             "cancelled"
         );
-        assert!(!store
-            .confirm_mandate(&mandate.id, mandate.version, None)
-            .await
-            .unwrap());
+        assert!(
+            !store
+                .confirm_mandate(&mandate.id, mandate.version, None)
+                .await
+                .unwrap()
+        );
         assert!(
             !store
                 .transition_mandate_status(
@@ -5459,10 +5507,12 @@ mod tests {
 
         let attempted_run_id = uuid::Uuid::new_v4().to_string();
         let duplicate_root = review_root(&goal, &attempted_run_id, "duplicate-root-id");
-        assert!(store
-            .create_mandate_review_run(&mandate.id, lease, &attempted_run_id, &duplicate_root,)
-            .await
-            .is_err());
+        assert!(
+            store
+                .create_mandate_review_run(&mandate.id, lease, &attempted_run_id, &duplicate_root,)
+                .await
+                .is_err()
+        );
         let orphan_count =
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM goal_runs WHERE id = ?")
                 .bind(&attempted_run_id)
@@ -5515,11 +5565,13 @@ mod tests {
             .find(|run| run.id == interrupted.id)
             .unwrap();
         assert_eq!(old_run.status, "failed");
-        assert!(old_run
-            .outcome_summary
-            .as_deref()
-            .unwrap()
-            .contains("interrupted mandate dispatch"));
+        assert!(
+            old_run
+                .outcome_summary
+                .as_deref()
+                .unwrap()
+                .contains("interrupted mandate dispatch")
+        );
 
         let run_id = uuid::Uuid::new_v4().to_string();
         let root = review_root(&goal, &run_id, &uuid::Uuid::new_v4().to_string());
@@ -5580,36 +5632,42 @@ mod tests {
         let mut child = review_root(&goal, &run.id, &child_id);
         child.task_order = 1;
         child.description = "Pending governed child".to_string();
-        assert!(store
-            .create_mandate_task_from_attempt(
-                &child,
-                &mandate.id,
-                mandate.version,
-                &run.id,
-                &root_attempt.id,
-                16,
-            )
-            .await
-            .unwrap());
-        assert!(store
-            .patch_task_from_attempt(
-                &root_attempt.id,
-                &root_attempt.lease_token,
-                &crate::traits::TaskAttemptPatch {
-                    status: "completed".to_string(),
-                    result: Some("decision recorded; child queued".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .create_mandate_task_from_attempt(
+                    &child,
+                    &mandate.id,
+                    mandate.version,
+                    &run.id,
+                    &root_attempt.id,
+                    16,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .patch_task_from_attempt(
+                    &root_attempt.id,
+                    &root_attempt.lease_token,
+                    &crate::traits::TaskAttemptPatch {
+                        status: "completed".to_string(),
+                        result: Some("decision recorded; child queued".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
 
         // The immediate finalizer gets a short uncontended window.
-        assert!(store
-            .claim_due_mandates(1, "grace-probe", 300)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .claim_due_mandates(1, "grace-probe", 300)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             store
                 .get_mandate(&mandate.id)
@@ -5631,11 +5689,13 @@ mod tests {
             .execute(&store.pool)
             .await
             .unwrap();
-        assert!(store
-            .claim_due_mandates(1, "reconciliation-probe", 300)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .claim_due_mandates(1, "reconciliation-probe", 300)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // The child never reserved a mutation, so nothing external can have
         // happened: the run fails and the mandate retries, unsuspended.
@@ -5702,11 +5762,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store
-            .claim_due_mandates(1, "orphan-recovery", 300)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .claim_due_mandates(1, "orphan-recovery", 300)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let recovered_mandate = store.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(recovered_mandate.status, MandateStatus::Active);
@@ -5768,10 +5830,12 @@ mod tests {
                 .unwrap()
         );
 
-        assert!(!store
-            .keep_mandate_controller_active(&mandate.id, mandate.version)
-            .await
-            .unwrap());
+        assert!(
+            !store
+                .keep_mandate_controller_active(&mandate.id, mandate.version)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             store.get_goal(&goal.id).await.unwrap().unwrap().status,
             "cancelled"
@@ -5821,24 +5885,28 @@ mod tests {
                 .unwrap()
         }
 
-        assert!(store
-            .patch_task_from_attempt(
-                &fence.worker_attempt.id,
-                &fence.worker_attempt.lease_token,
-                &blocked("the target is unreachable"),
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .patch_task_from_attempt(
+                    &fence.worker_attempt.id,
+                    &fence.worker_attempt.lease_token,
+                    &blocked("the target is unreachable"),
+                )
+                .await
+                .unwrap()
+        );
         assert_eq!(run_status(&store, &run.id).await, "running");
 
-        assert!(store
-            .patch_task_from_attempt(
-                &fence.root_attempt.id,
-                &fence.root_attempt.lease_token,
-                &blocked("the lead cannot continue"),
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .patch_task_from_attempt(
+                    &fence.root_attempt.id,
+                    &fence.root_attempt.lease_token,
+                    &blocked("the lead cannot continue"),
+                )
+                .await
+                .unwrap()
+        );
         assert_eq!(run_status(&store, &run.id).await, "blocked");
     }
 
@@ -5871,18 +5939,26 @@ mod tests {
         stale_update.version += 1;
         stale_update.objective = "A stale owner snapshot".to_string();
 
-        assert!(store
-            .transition_mandate_status(&mandate.id, MandateStatus::Active, MandateStatus::Paused,)
-            .await
-            .unwrap());
+        assert!(
+            store
+                .transition_mandate_status(
+                    &mandate.id,
+                    MandateStatus::Active,
+                    MandateStatus::Paused,
+                )
+                .await
+                .unwrap()
+        );
         let paused = store.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(paused.status, MandateStatus::Paused);
         assert_eq!(paused.version, mandate.version + 1);
-        assert!(store
-            .get_current_goal_run(&goal.id)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_current_goal_run(&goal.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             store.get_goal_runs(&goal.id).await.unwrap()[0].status,
             "cancelled"
@@ -5891,31 +5967,41 @@ mod tests {
             store.list_intentions(&mandate.id, 1).await.unwrap()[0].status,
             IntentionStatus::Suspended
         );
-        assert!(store
-            .reserve_mandate_action_attempt(&reservation(
-                &mandate,
-                &act,
-                &run,
-                &fence,
-                1,
-                1,
-                chrono::Utc::now(),
-            ))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&reservation(
+                    &mandate,
+                    &act,
+                    &run,
+                    &fence,
+                    1,
+                    1,
+                    chrono::Utc::now(),
+                ))
+                .await
+                .unwrap()
+                .is_none()
+        );
 
-        assert!(store
-            .transition_mandate_status(&mandate.id, MandateStatus::Paused, MandateStatus::Active,)
-            .await
-            .unwrap());
+        assert!(
+            store
+                .transition_mandate_status(
+                    &mandate.id,
+                    MandateStatus::Paused,
+                    MandateStatus::Active,
+                )
+                .await
+                .unwrap()
+        );
         let resumed = store.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(resumed.version, mandate.version + 2);
-        assert!(store
-            .get_current_goal_run(&goal.id)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_current_goal_run(&goal.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // The update was prepared before the lifecycle epoch changed, so its
         // CAS must fail instead of restoring its stale active status/policy.
@@ -5967,11 +6053,13 @@ mod tests {
         let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
         let now = chrono::Utc::now();
         let unclaimed = reservation(&mandate, &act, &run, &fence, 1, 41, now);
-        assert!(store
-            .reserve_mandate_action_attempt(&unclaimed)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&unclaimed)
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         let mut updated = store.get_mandate(&mandate.id).await.unwrap().unwrap();
         updated.version += 1;
@@ -6029,23 +6117,33 @@ mod tests {
         let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
         let now = chrono::Utc::now();
         let claimed = reservation(&mandate, &act, &run, &fence, 1, 42, now);
-        assert!(store
-            .reserve_mandate_action_attempt(&claimed)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(store
-            .claim_mandate_mutation_dispatch(&dispatch_claim(
-                &claimed,
-                now + chrono::Duration::milliseconds(1),
-            ))
-            .await
-            .unwrap());
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&claimed)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .claim_mandate_mutation_dispatch(&dispatch_claim(
+                    &claimed,
+                    now + chrono::Duration::milliseconds(1),
+                ))
+                .await
+                .unwrap()
+        );
 
-        assert!(store
-            .transition_mandate_status(&mandate.id, MandateStatus::Active, MandateStatus::Paused,)
-            .await
-            .unwrap());
+        assert!(
+            store
+                .transition_mandate_status(
+                    &mandate.id,
+                    MandateStatus::Active,
+                    MandateStatus::Paused,
+                )
+                .await
+                .unwrap()
+        );
         let attempts = store
             .list_mandate_mutation_attempts_for_run(&run.id)
             .await
@@ -6081,18 +6179,20 @@ mod tests {
             suspended.suspension.as_ref().map(|value| value.kind),
             Some(MandateSuspensionKind::ReconciliationRequired)
         );
-        assert!(store
-            .resolve_mandate_suspension(
-                &mandate.id,
-                suspended.version,
-                MandateSuspensionKind::ReconciliationRequired,
-                None,
-                Some(MandateReconciliationResolution::ConfirmedNoEffect),
-                "I inspected the exact target and confirmed no effect occurred.",
-                "owner-session",
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .resolve_mandate_suspension(
+                    &mandate.id,
+                    suspended.version,
+                    MandateSuspensionKind::ReconciliationRequired,
+                    None,
+                    Some(MandateReconciliationResolution::ConfirmedNoEffect),
+                    "I inspected the exact target and confirmed no effect occurred.",
+                    "owner-session",
+                )
+                .await
+                .unwrap()
+        );
         let resumed = store.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(resumed.status, MandateStatus::Active);
         assert!(resumed.suspension.is_none());
@@ -6133,18 +6233,22 @@ mod tests {
         let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
         let now = chrono::Utc::now();
         let claimed = reservation(&mandate, &act, &run, &fence, 1, 43, now);
-        assert!(store
-            .reserve_mandate_action_attempt(&claimed)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(store
-            .claim_mandate_mutation_dispatch(&dispatch_claim(
-                &claimed,
-                now + chrono::Duration::milliseconds(1),
-            ))
-            .await
-            .unwrap());
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&claimed)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .claim_mandate_mutation_dispatch(&dispatch_claim(
+                    &claimed,
+                    now + chrono::Duration::milliseconds(1),
+                ))
+                .await
+                .unwrap()
+        );
 
         let mut updated = store.get_mandate(&mandate.id).await.unwrap().unwrap();
         updated.version += 1;
@@ -6194,28 +6298,34 @@ mod tests {
         winners.extend(right.unwrap());
         assert_eq!(winners.len(), 1);
         let lease_token = winners[0].review_lease_token.clone().unwrap();
-        assert!(!store
-            .release_mandate_review_lease(
-                &mandate.id,
-                "wrong-token",
-                &(chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
-            )
-            .await
-            .unwrap());
+        assert!(
+            !store
+                .release_mandate_review_lease(
+                    &mandate.id,
+                    "wrong-token",
+                    &(chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+                )
+                .await
+                .unwrap()
+        );
 
         let retry_at = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
-        assert!(store
-            .release_mandate_review_lease(&mandate.id, &lease_token, &retry_at)
-            .await
-            .unwrap());
+        assert!(
+            store
+                .release_mandate_review_lease(&mandate.id, &lease_token, &retry_at)
+                .await
+                .unwrap()
+        );
         let released = store.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(released.next_review_at, retry_at);
         assert!(released.review_lease_token.is_none());
-        assert!(store
-            .claim_due_mandates(1, "heartbeat-c", 300)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .claim_due_mandates(1, "heartbeat-c", 300)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -6228,11 +6338,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store
-            .claim_due_mandates(1, "heartbeat", 300)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .claim_due_mandates(1, "heartbeat", 300)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             store
                 .get_mandate(&mandate.id)
@@ -6260,22 +6372,28 @@ mod tests {
             "Nothing useful yet",
             mandate.version + 1,
         );
-        assert!(store
-            .record_mandate_decision(&stale, None, None)
-            .await
-            .is_err());
-        assert!(store
-            .get_mandate_decision_for_run(&run.id)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(store
-            .get_mandate(&mandate.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .review_lease_token
-            .is_some());
+        assert!(
+            store
+                .record_mandate_decision(&stale, None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .get_mandate_decision_for_run(&run.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_mandate(&mandate.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .review_lease_token
+                .is_some()
+        );
 
         let mut wait = MandateDecisionCycle::new(
             &mandate.id,
@@ -6385,9 +6503,11 @@ mod tests {
             .record_mandate_decision(&act, Some(&intention), None)
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("not an exact owner-authored success criterion"));
+        assert!(
+            error
+                .to_string()
+                .contains("not an exact owner-authored success criterion")
+        );
 
         intention.value_criterion = mandate.success_criteria.first().cloned();
         store
@@ -6431,42 +6551,50 @@ mod tests {
         let now = chrono::Utc::now();
         let first = reservation(&mandate, &act, &run, &fence, 1, 10, now);
 
-        assert!(store
-            .reserve_mandate_action_attempt(&first)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(store
-            .reserve_mandate_action_attempt(&first)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(store
-            .reserve_mandate_action_attempt(&reservation(
-                &mandate,
-                &act,
-                &run,
-                &fence,
-                2,
-                11,
-                now + chrono::Duration::seconds(901),
-            ))
-            .await
-            .unwrap()
-            .is_some());
-        assert!(store
-            .reserve_mandate_action_attempt(&reservation(
-                &mandate,
-                &act,
-                &run,
-                &fence,
-                3,
-                12,
-                now + chrono::Duration::seconds(1_802),
-            ))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&first)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&first)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&reservation(
+                    &mandate,
+                    &act,
+                    &run,
+                    &fence,
+                    2,
+                    11,
+                    now + chrono::Duration::seconds(901),
+                ))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&reservation(
+                    &mandate,
+                    &act,
+                    &run,
+                    &fence,
+                    3,
+                    12,
+                    now + chrono::Duration::seconds(1_802),
+                ))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -6494,11 +6622,15 @@ mod tests {
             .unwrap();
         let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
         let now = chrono::Utc::now();
-        assert!(store
-            .reserve_mandate_action_attempt(&reservation(&mandate, &act, &run, &fence, 1, 20, now,))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&reservation(
+                    &mandate, &act, &run, &fence, 1, 20, now,
+                ))
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         let mut owner_update = store.get_mandate(&mandate.id).await.unwrap().unwrap();
         owner_update.version += 1;
@@ -6507,19 +6639,21 @@ mod tests {
             .push("New owner constraint".to_string());
         store.update_mandate(&owner_update).await.unwrap();
 
-        assert!(store
-            .reserve_mandate_action_attempt(&reservation(
-                &mandate,
-                &act,
-                &run,
-                &fence,
-                2,
-                21,
-                now + chrono::Duration::seconds(901),
-            ))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&reservation(
+                    &mandate,
+                    &act,
+                    &run,
+                    &fence,
+                    2,
+                    21,
+                    now + chrono::Duration::seconds(901),
+                ))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -6765,19 +6899,23 @@ mod tests {
             let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
             let now = chrono::Utc::now();
             let reserved = reservation(&mandate, &act, &run, &fence, 1, 451, now);
-            assert!(store
-                .reserve_mandate_action_attempt(&reserved)
-                .await
-                .unwrap()
-                .is_some());
-            if claim_before_finalization {
-                assert!(store
-                    .claim_mandate_mutation_dispatch(&dispatch_claim(
-                        &reserved,
-                        now + chrono::Duration::milliseconds(1),
-                    ))
+            assert!(
+                store
+                    .reserve_mandate_action_attempt(&reserved)
                     .await
-                    .unwrap());
+                    .unwrap()
+                    .is_some()
+            );
+            if claim_before_finalization {
+                assert!(
+                    store
+                        .claim_mandate_mutation_dispatch(&dispatch_claim(
+                            &reserved,
+                            now + chrono::Duration::milliseconds(1),
+                        ))
+                        .await
+                        .unwrap()
+                );
             }
             complete_mutation_fence(&store, &fence).await;
 
@@ -6887,10 +7025,12 @@ mod tests {
             vec!["sha256:not-a-receipt".to_string()],
             &chrono::Utc::now().to_rfc3339(),
         );
-        assert!(store
-            .record_mandate_objective_measurement(&invented)
-            .await
-            .is_err());
+        assert!(
+            store
+                .record_mandate_objective_measurement(&invented)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -6929,10 +7069,12 @@ mod tests {
         let mut spoofed = fallback.clone();
         spoofed.id = uuid::Uuid::new_v4().to_string();
         spoofed.evidence_receipt_ids = vec!["call_anything".to_string()];
-        assert!(store
-            .record_mandate_decision(&spoofed, None, None)
-            .await
-            .is_err());
+        assert!(
+            store
+                .record_mandate_decision(&spoofed, None, None)
+                .await
+                .is_err()
+        );
 
         let root_attempt = store
             .claim_task_with_lease(
@@ -6944,18 +7086,20 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(store
-            .patch_task_from_attempt(
-                &root_attempt.id,
-                &root_attempt.lease_token,
-                &crate::traits::TaskAttemptPatch {
-                    status: "completed".to_string(),
-                    result: Some("task lead returned without a decision".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .patch_task_from_attempt(
+                    &root_attempt.id,
+                    &root_attempt.lease_token,
+                    &crate::traits::TaskAttemptPatch {
+                        status: "completed".to_string(),
+                        result: Some("task lead returned without a decision".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
         let result = store
             .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
                 mandate_id: mandate.id.clone(),
@@ -6990,18 +7134,20 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(store
-            .patch_task_from_attempt(
-                &root_attempt.id,
-                &root_attempt.lease_token,
-                &crate::traits::TaskAttemptPatch {
-                    status: "completed".to_string(),
-                    result: Some("task lead returned without a decision".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .patch_task_from_attempt(
+                    &root_attempt.id,
+                    &root_attempt.lease_token,
+                    &crate::traits::TaskAttemptPatch {
+                        status: "completed".to_string(),
+                        result: Some("task lead returned without a decision".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
         let finalized_at = chrono::Utc::now();
 
         let result = store
@@ -7084,18 +7230,20 @@ mod tests {
             .execute(&store.pool)
             .await
             .unwrap();
-        assert!(store
-            .patch_task_from_attempt(
-                &root_attempt.id,
-                &root_attempt.lease_token,
-                &crate::traits::TaskAttemptPatch {
-                    status: "completed".to_string(),
-                    result: Some("invalid decision state simulated".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .patch_task_from_attempt(
+                    &root_attempt.id,
+                    &root_attempt.lease_token,
+                    &crate::traits::TaskAttemptPatch {
+                        status: "completed".to_string(),
+                        result: Some("invalid decision state simulated".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
 
         let result = store
             .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
@@ -7198,18 +7346,20 @@ mod tests {
                 store.get_goal(&goal.id).await.unwrap().unwrap().status,
                 "active"
             );
-            assert!(store
-                .patch_task_from_attempt(
-                    &root_attempt.id,
-                    &root_attempt.lease_token,
-                    &crate::traits::TaskAttemptPatch {
-                        status: "completed".to_string(),
-                        result: Some("non-action decision durably recorded".to_string()),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap());
+            assert!(
+                store
+                    .patch_task_from_attempt(
+                        &root_attempt.id,
+                        &root_attempt.lease_token,
+                        &crate::traits::TaskAttemptPatch {
+                            status: "completed".to_string(),
+                            result: Some("non-action decision durably recorded".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+            );
             let result = store
                 .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
                     mandate_id: mandate.id.clone(),
@@ -7342,18 +7492,20 @@ mod tests {
             MandateActivityLevel::Urgent
         );
 
-        assert!(store
-            .patch_task_from_attempt(
-                &root_attempt.id,
-                &root_attempt.lease_token,
-                &crate::traits::TaskAttemptPatch {
-                    status: "completed".to_string(),
-                    result: Some("receipt-backed STOP recorded".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .patch_task_from_attempt(
+                    &root_attempt.id,
+                    &root_attempt.lease_token,
+                    &crate::traits::TaskAttemptPatch {
+                        status: "completed".to_string(),
+                        result: Some("receipt-backed STOP recorded".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
         let finalized = store
             .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
                 mandate_id: mandate.id.clone(),
@@ -7420,11 +7572,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(store
-                .claim_due_mandates(1, "post-crash-reconciler", 300)
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                store
+                    .claim_due_mandates(1, "post-crash-reconciler", 300)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(
                 store
                     .get_mandate(&mandate.id)
@@ -7671,18 +7825,20 @@ mod tests {
             .record_mandate_decision(&decision, None, Some(&root_attempt.id))
             .await
             .unwrap();
-        assert!(store
-            .patch_task_from_attempt(
-                &root_attempt.id,
-                &root_attempt.lease_token,
-                &crate::traits::TaskAttemptPatch {
-                    status: "completed".to_string(),
-                    result: Some("ASK recorded".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .patch_task_from_attempt(
+                    &root_attempt.id,
+                    &root_attempt.lease_token,
+                    &crate::traits::TaskAttemptPatch {
+                        status: "completed".to_string(),
+                        result: Some("ASK recorded".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
         store
             .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
                 mandate_id: mandate.id.clone(),
@@ -7736,18 +7892,20 @@ mod tests {
         store
             .record_mandate_decision(&decision, None, Some(&root_attempt.id))
             .await?;
-        assert!(store
-            .patch_task_from_attempt(
-                &root_attempt.id,
-                &root_attempt.lease_token,
-                &crate::traits::TaskAttemptPatch {
-                    status: "completed".to_string(),
-                    result: Some("WAIT recorded".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .patch_task_from_attempt(
+                    &root_attempt.id,
+                    &root_attempt.lease_token,
+                    &crate::traits::TaskAttemptPatch {
+                        status: "completed".to_string(),
+                        result: Some("WAIT recorded".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
         store
             .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
                 mandate_id: mandate.id.clone(),
@@ -7832,11 +7990,13 @@ mod tests {
         park_mandate_on_ask(&store, &goal, &mandate, "May I also read reply counts?").await;
 
         // Not yet due: the owner still has the full reconsider window.
-        assert!(store
-            .claim_due_mandates(10, "synthetic-heartbeat", 300)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .claim_due_mandates(10, "synthetic-heartbeat", 300)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             store
                 .get_mandate(&mandate.id)
@@ -7903,11 +8063,13 @@ mod tests {
         .await
         .unwrap();
         make_review_due(&store, &mandate).await;
-        assert!(store
-            .claim_due_mandates(10, "synthetic-heartbeat", 300)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .claim_due_mandates(10, "synthetic-heartbeat", 300)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             store
                 .get_mandate(&mandate.id)
@@ -8018,25 +8180,31 @@ mod tests {
         let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
         let base = chrono::Utc::now();
         let first = reservation(&mandate, &act, &run, &fence, 1, 201, base);
-        assert!(store
-            .reserve_mandate_action_attempt(&first)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(store
-            .claim_mandate_mutation_dispatch(&dispatch_claim(
-                &first,
-                base + chrono::Duration::milliseconds(1),
-            ))
-            .await
-            .unwrap());
-        assert!(!store
-            .claim_mandate_mutation_dispatch(&dispatch_claim(
-                &first,
-                base + chrono::Duration::milliseconds(2),
-            ))
-            .await
-            .unwrap());
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&first)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .claim_mandate_mutation_dispatch(&dispatch_claim(
+                    &first,
+                    base + chrono::Duration::milliseconds(1),
+                ))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .claim_mandate_mutation_dispatch(&dispatch_claim(
+                    &first,
+                    base + chrono::Duration::milliseconds(2),
+                ))
+                .await
+                .unwrap()
+        );
         assert!(
             finish_attempt(
                 &store,
@@ -8056,11 +8224,13 @@ mod tests {
             202,
             base + chrono::Duration::seconds(899),
         );
-        assert!(store
-            .reserve_mandate_action_attempt(&too_soon)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&too_soon)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let cooldown = store
             .get_mandate_mutation_quota_state(
                 &mandate.id,
@@ -8084,11 +8254,13 @@ mod tests {
             203,
             base + chrono::Duration::seconds(900),
         );
-        assert!(store
-            .reserve_mandate_action_attempt(&second)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&second)
+                .await
+                .unwrap()
+                .is_some()
+        );
         let full = store
             .get_mandate_mutation_quota_state(
                 &mandate.id,
@@ -8107,14 +8279,16 @@ mod tests {
             crate::traits::ToolTargetHintKind::Url,
             "https://api.x.com/2/tweets",
         );
-        assert!(crate::authority::authorize_mandate_observation(
-            &mandate,
-            "http_request",
-            r#"{"method":"GET","url":"https://api.x.com/2/tweets"}"#,
-            &observation,
-            &(base + chrono::Duration::seconds(901)),
-        )
-        .is_ok());
+        assert!(
+            crate::authority::authorize_mandate_observation(
+                &mandate,
+                "http_request",
+                r#"{"method":"GET","url":"https://api.x.com/2/tweets"}"#,
+                &observation,
+                &(base + chrono::Duration::seconds(901)),
+            )
+            .is_ok()
+        );
 
         let expired = store
             .get_mandate_mutation_quota_state(
@@ -8156,18 +8330,22 @@ mod tests {
         let first_fence = claim_mutation_fence(&store, &goal, &mandate, &first_run).await;
         let base = chrono::Utc::now();
         let first = reservation(&mandate, &first_act, &first_run, &first_fence, 1, 301, base);
-        assert!(store
-            .reserve_mandate_action_attempt(&first)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(store
-            .claim_mandate_mutation_dispatch(&dispatch_claim(
-                &first,
-                base + chrono::Duration::milliseconds(1),
-            ))
-            .await
-            .unwrap());
+        assert!(
+            store
+                .reserve_mandate_action_attempt(&first)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .claim_mandate_mutation_dispatch(&dispatch_claim(
+                    &first,
+                    base + chrono::Duration::milliseconds(1),
+                ))
+                .await
+                .unwrap()
+        );
         assert!(
             finish_attempt(
                 &store,
@@ -8178,14 +8356,26 @@ mod tests {
             )
             .await
         );
-        assert!(store
-            .transition_mandate_status(&mandate.id, MandateStatus::Active, MandateStatus::Paused,)
-            .await
-            .unwrap());
-        assert!(store
-            .transition_mandate_status(&mandate.id, MandateStatus::Paused, MandateStatus::Active,)
-            .await
-            .unwrap());
+        assert!(
+            store
+                .transition_mandate_status(
+                    &mandate.id,
+                    MandateStatus::Active,
+                    MandateStatus::Paused,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .transition_mandate_status(
+                    &mandate.id,
+                    MandateStatus::Paused,
+                    MandateStatus::Active,
+                )
+                .await
+                .unwrap()
+        );
         let current = store.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert!(current.version > mandate.version);
         let second_run = start_existing_claimed_run(&store, &goal, &current).await;
@@ -8261,13 +8451,15 @@ mod tests {
             .await
             .unwrap()
             .expect("reserved mutation");
-        assert!(store
-            .claim_mandate_mutation_dispatch(&dispatch_claim(
-                &reservation,
-                now + chrono::Duration::milliseconds(1),
-            ))
-            .await
-            .unwrap());
+        assert!(
+            store
+                .claim_mandate_mutation_dispatch(&dispatch_claim(
+                    &reservation,
+                    now + chrono::Duration::milliseconds(1),
+                ))
+                .await
+                .unwrap()
+        );
 
         let semantics = crate::traits::ToolCallSemantics::mutation_with(
             crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY,
@@ -8351,18 +8543,22 @@ mod tests {
             let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
             let base = chrono::Utc::now();
             let first = reservation(&mandate, &act, &run, &fence, 1, 401, base);
-            assert!(store
-                .reserve_mandate_action_attempt(&first)
-                .await
-                .unwrap()
-                .is_some());
-            assert!(store
-                .claim_mandate_mutation_dispatch(&dispatch_claim(
-                    &first,
-                    base + chrono::Duration::milliseconds(1),
-                ))
-                .await
-                .unwrap());
+            assert!(
+                store
+                    .reserve_mandate_action_attempt(&first)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                store
+                    .claim_mandate_mutation_dispatch(&dispatch_claim(
+                        &first,
+                        base + chrono::Duration::milliseconds(1),
+                    ))
+                    .await
+                    .unwrap()
+            );
             assert!(
                 finish_attempt(
                     &store,
@@ -8383,18 +8579,22 @@ mod tests {
                     402,
                     base + chrono::Duration::seconds(900),
                 );
-                assert!(store
-                    .reserve_mandate_action_attempt(&second)
-                    .await
-                    .unwrap()
-                    .is_some());
-                assert!(store
-                    .claim_mandate_mutation_dispatch(&dispatch_claim(
-                        &second,
-                        base + chrono::Duration::milliseconds(900_001),
-                    ))
-                    .await
-                    .unwrap());
+                assert!(
+                    store
+                        .reserve_mandate_action_attempt(&second)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    store
+                        .claim_mandate_mutation_dispatch(&dispatch_claim(
+                            &second,
+                            base + chrono::Duration::milliseconds(900_001),
+                        ))
+                        .await
+                        .unwrap()
+                );
                 assert!(
                     finish_attempt(
                         &store,
@@ -8428,11 +8628,13 @@ mod tests {
                     store.get_goal_runs(&goal.id).await.unwrap()[0].status,
                     "failed"
                 );
-                assert!(store
-                    .get_current_goal_run(&goal.id)
-                    .await
-                    .unwrap()
-                    .is_none());
+                assert!(
+                    store
+                        .get_current_goal_run(&goal.id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
                 assert_eq!(
                     store.list_intentions(&mandate.id, 1).await.unwrap()[0].status,
                     IntentionStatus::Suspended

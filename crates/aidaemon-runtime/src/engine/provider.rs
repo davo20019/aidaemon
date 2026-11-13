@@ -8,7 +8,7 @@
 
 use aidaemon_core as sdk;
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use super::calls::{HostCall, ModelCall};
@@ -380,8 +380,10 @@ mod tests {
     fn user_images_become_multimodal_content() {
         let request = sdk::ModelRequest {
             model: "m".into(),
-            messages: vec![sdk::Message::user("what is this")
-                .with_images([sdk::Image::url("https://example.com/a.png")])],
+            messages: vec![
+                sdk::Message::user("what is this")
+                    .with_images([sdk::Image::url("https://example.com/a.png")]),
+            ],
             tools: Vec::new(),
             tool_choice: sdk::ToolChoice::Auto,
             max_output_tokens: None,
@@ -578,9 +580,11 @@ mod tests {
         assert_tool_pairs_valid(&fitted);
         assert!(fitted.len() < 5 + run.len());
         // The newest call survives.
-        assert!(serde_json::to_string(&fitted)
-            .unwrap()
-            .contains("output 19"));
+        assert!(
+            serde_json::to_string(&fitted)
+                .unwrap()
+                .contains("output 19")
+        );
     }
 
     #[test]

@@ -12,8 +12,8 @@ mod diagnose;
 /// SDK tools as daemon tools (no SDK tool is wrapped yet; 8.4 moves them).
 #[allow(dead_code)]
 mod file_policy;
-pub(crate) use file_policy::daemon_file_policy;
 pub use file_policy::DaemonPaths;
+pub(crate) use file_policy::daemon_file_policy;
 #[cfg(test)]
 pub(crate) use file_policy::{guarded_call, guarded_call_protecting};
 mod goal_trace;

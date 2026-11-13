@@ -11,7 +11,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::embed::Embedder;
-use crate::learning::{embedding_of, error_pattern, ErrorSolution, Procedure};
+use crate::learning::{ErrorSolution, Procedure, embedding_of, error_pattern};
 use crate::stores::MemoryStores;
 use crate::text::truncate_chars;
 
@@ -602,7 +602,10 @@ fn failure_pattern(
             0.72,
         ),
         "stall" => pattern(
-            format!("{code}:{}", details.stall_mode.as_deref().unwrap_or("generic")),
+            format!(
+                "{code}:{}",
+                details.stall_mode.as_deref().unwrap_or("generic")
+            ),
             "summarize_progress_or_change_strategy",
             format!(
                 "When iterations stop producing new evidence, stop looping, summarize what is known, and change strategy instead of continuing the same pattern.{recovery_suffix}"
@@ -1092,7 +1095,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use aidaemon_core::testing::{text, ScriptedProvider};
+    use aidaemon_core::testing::{ScriptedProvider, text};
 
     use super::*;
 
@@ -1228,9 +1231,11 @@ mod tests {
             "repetitive_call_detection:terminal"
         );
         assert_eq!(patterns[0].action, "stop_retrying_identical_calls");
-        assert!(patterns[0]
-            .description
-            .ends_with("Previous successful recoveries switched to edit_file."));
+        assert!(
+            patterns[0]
+                .description
+                .ends_with("Previous successful recoveries switched to edit_file.")
+        );
         assert!((patterns[0].confidence - (0.74 + 0.08 + 0.03)).abs() < 1e-5);
         assert!(
             (failure_confidence(0.95, Some(TaskEnding::Failed), Some("x")) - 0.96).abs() < 1e-6
@@ -1317,8 +1322,8 @@ mod tests {
     mod learner {
         use std::sync::Arc;
 
-        use sqlx::sqlite::SqlitePoolOptions;
         use sqlx::SqlitePool;
+        use sqlx::sqlite::SqlitePoolOptions;
 
         use super::super::*;
         use crate::sqlite::SqliteMemory;
@@ -1480,12 +1485,16 @@ mod tests {
             .await
             .unwrap();
             let embedder = HashEmbedder::new(384);
-            assert!(crate::backfill_learning_embeddings(&memory, &embedder)
-                .await
-                .unwrap());
-            assert!(!crate::backfill_learning_embeddings(&memory, &embedder)
-                .await
-                .unwrap());
+            assert!(
+                crate::backfill_learning_embeddings(&memory, &embedder)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !crate::backfill_learning_embeddings(&memory, &embedder)
+                    .await
+                    .unwrap()
+            );
             let embedded: (Option<Vec<u8>>,) =
                 sqlx::query_as("SELECT error_embedding FROM error_solutions")
                     .fetch_one(&pool)

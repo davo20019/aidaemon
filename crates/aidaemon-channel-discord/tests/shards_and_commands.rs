@@ -11,10 +11,10 @@ use aidaemon_channels::{
     AccessPolicy, Channel, ChannelError, ChannelEvent, ChannelRunner, CommandContext, CommandReply,
     DEFAULT_REFUSAL,
 };
-use aidaemon_core::testing::{text, ScriptedProvider};
 use aidaemon_core::Agent;
+use aidaemon_core::testing::{ScriptedProvider, text};
 use common::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;

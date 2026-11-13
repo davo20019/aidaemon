@@ -265,11 +265,12 @@ impl State {
                 }) else {
                     // Its start was before this client's window.
                     if let Some(session_id) = session_id
-                        && !text.is_empty() {
-                            self.session(&session_id)
-                                .lines
-                                .push(Line::Assistant { text });
-                        }
+                        && !text.is_empty()
+                    {
+                        self.session(&session_id)
+                            .lines
+                            .push(Line::Assistant { text });
+                    }
                     return;
                 };
                 view.live = None;

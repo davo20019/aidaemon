@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use crate::config::AppConfig;
 use crate::events::{Consolidator, EventStore, Pruner};
-use crate::llm_runtime::gateway::SideCallGateway;
 use crate::llm_runtime::SharedLlmRuntime;
+use crate::llm_runtime::gateway::SideCallGateway;
 use crate::memory::embeddings::EmbeddingService;
 use crate::plans::PlanStore;
 use crate::traits::StateStore;

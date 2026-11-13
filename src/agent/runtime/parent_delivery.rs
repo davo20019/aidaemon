@@ -10,7 +10,7 @@ mod tests {
     use crate::agent::TurnNotes;
     use crate::channels::ChannelHub;
     use crate::runtime_ports::OutboundRouter;
-    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::testing::{MockProvider, setup_test_agent};
     use crate::tools::command_risk::{PermissionMode, RiskLevel};
     use crate::traits::{ChannelCapabilities, HubChannel};
     use crate::types::{ApprovalResponse, MediaMessage};

@@ -595,75 +595,74 @@ impl GoalCycle {
             // the recurring schedule's `last_run_at` has not advanced.
             // See docs/2026-06-30-telegram-edge-case-findings.md (2026-07-04
             // escalation: 5 duplicate tweets from repeated goal dispatch).
-            if is_scheduled_goal
-                && let Some(current_run) = current_goal_run.as_ref() {
-                    let mutating_success_task_ids =
-                        self.goal_run_mutating_success_tasks(&current_run.id).await;
-                    if !mutating_success_task_ids.is_empty() {
-                        info!(
-                            goal_id = %goal_id,
-                            run_id = %current_run.id,
-                            pending_count = eligible_tasks.len(),
-                            "Goal run already has a successful mutating action; \
-                             closing out orphaned pending tasks instead of re-dispatching"
-                        );
-                        // The receipt is authoritative evidence that the task's
-                        // external mutation succeeded, even if a downstream
-                        // verification/tracking hiccup left its task status as
-                        // interrupted or failed.
-                        for task_id in &mutating_success_task_ids {
-                            let Ok(Some(mut done)) = self.state.get_task(task_id).await else {
-                                continue;
-                            };
-                            if !done.satisfies_run_completion() {
-                                done.status = "completed".to_string();
-                                done.error = None;
-                                done.blocker = None;
-                                done.result = Some(
-                                    "Auto-reconciled: this task has a successful mutating \
-                                     tool receipt in the current goal run."
-                                        .to_string(),
-                                );
-                                done.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                                let _ = self.state.update_task(&done).await;
-                            }
-                        }
-                        for task in &eligible_tasks {
-                            let mut done = (*task).clone();
+            if is_scheduled_goal && let Some(current_run) = current_goal_run.as_ref() {
+                let mutating_success_task_ids =
+                    self.goal_run_mutating_success_tasks(&current_run.id).await;
+                if !mutating_success_task_ids.is_empty() {
+                    info!(
+                        goal_id = %goal_id,
+                        run_id = %current_run.id,
+                        pending_count = eligible_tasks.len(),
+                        "Goal run already has a successful mutating action; \
+                         closing out orphaned pending tasks instead of re-dispatching"
+                    );
+                    // The receipt is authoritative evidence that the task's
+                    // external mutation succeeded, even if a downstream
+                    // verification/tracking hiccup left its task status as
+                    // interrupted or failed.
+                    for task_id in &mutating_success_task_ids {
+                        let Ok(Some(mut done)) = self.state.get_task(task_id).await else {
+                            continue;
+                        };
+                        if !done.satisfies_run_completion() {
                             done.status = "completed".to_string();
+                            done.error = None;
+                            done.blocker = None;
                             done.result = Some(
-                                "Auto-closed: a mutating action for this goal's current cycle \
-                                 already succeeded (see task_activity log); skipped to avoid a \
-                                 duplicate side effect."
+                                "Auto-reconciled: this task has a successful mutating \
+                                     tool receipt in the current goal run."
                                     .to_string(),
                             );
                             done.completed_at = Some(chrono::Utc::now().to_rfc3339());
                             let _ = self.state.update_task(&done).await;
                         }
-                        if self
-                            .state
-                            .get_tasks_for_goal_run(&current_run.id)
-                            .await
-                            .is_ok_and(|run_tasks| {
-                                !run_tasks.is_empty()
-                                    && run_tasks.iter().all(|task| task.satisfies_run_completion())
-                            })
-                        {
-                            let _ = self
-                                .state
-                                .finish_goal_run(
-                                    &current_run.id,
-                                    "completed",
-                                    Some(
-                                        "Auto-reconciled from a successful mutating receipt in \
-                                         this goal run; duplicate dispatch was suppressed.",
-                                    ),
-                                )
-                                .await;
-                        }
-                        continue;
                     }
+                    for task in &eligible_tasks {
+                        let mut done = (*task).clone();
+                        done.status = "completed".to_string();
+                        done.result = Some(
+                            "Auto-closed: a mutating action for this goal's current cycle \
+                                 already succeeded (see task_activity log); skipped to avoid a \
+                                 duplicate side effect."
+                                .to_string(),
+                        );
+                        done.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        let _ = self.state.update_task(&done).await;
+                    }
+                    if self
+                        .state
+                        .get_tasks_for_goal_run(&current_run.id)
+                        .await
+                        .is_ok_and(|run_tasks| {
+                            !run_tasks.is_empty()
+                                && run_tasks.iter().all(|task| task.satisfies_run_completion())
+                        })
+                    {
+                        let _ = self
+                            .state
+                            .finish_goal_run(
+                                &current_run.id,
+                                "completed",
+                                Some(
+                                    "Auto-reconciled from a successful mutating receipt in \
+                                         this goal run; duplicate dispatch was suppressed.",
+                                ),
+                            )
+                            .await;
+                    }
+                    continue;
                 }
+            }
 
             // Try to atomically claim the first pending task and spawn a task lead.
             let first_task = eligible_tasks[0];

@@ -3,11 +3,11 @@
 
 use std::sync::Arc;
 
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
 use aidaemon_core::{Agent, FnTool, ToolAnnotations, ToolOutput};
 use aidaemon_policies::OtelSink;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn attr(span: &SpanData, key: &str) -> Option<String> {
     span.attributes

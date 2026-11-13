@@ -8,7 +8,7 @@ use std::sync::Arc;
 use aidaemon_core::{
     Message, ModelRequest, ModelResponse, Provider, Receipt, Role, ToolChoice, ToolSpec, Usage,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::{MemoryError, Result};
 use crate::scoring::episode_importance;
@@ -272,9 +272,10 @@ fn json_in_text(text: &str) -> Option<Value> {
     for (open, close) in [('{', '}'), ('[', ']')] {
         if let (Some(start), Some(end)) = (trimmed.find(open), trimmed.rfind(close))
             && start < end
-                && let Ok(value) = serde_json::from_str::<Value>(&trimmed[start..=end]) {
-                    return Some(value);
-                }
+            && let Ok(value) = serde_json::from_str::<Value>(&trimmed[start..=end])
+        {
+            return Some(value);
+        }
     }
     None
 }

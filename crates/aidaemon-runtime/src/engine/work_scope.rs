@@ -60,9 +60,9 @@ pub trait WorkScope: TurnHost {
                 .get_mandate_for_goal(goal_id)
                 .await?
                 .is_some()
-            {
-                return Ok(Some(goal_id.to_string()));
-            }
+        {
+            return Ok(Some(goal_id.to_string()));
+        }
         for task_id in [self.task_id(), call_task_id].into_iter().flatten() {
             if let Some(task) = self.tasks().get_task(task_id).await?
                 && self
@@ -70,9 +70,9 @@ pub trait WorkScope: TurnHost {
                     .get_mandate_for_goal(&task.goal_id)
                     .await?
                     .is_some()
-                {
-                    return Ok(Some(task.goal_id));
-                }
+            {
+                return Ok(Some(task.goal_id));
+            }
         }
         Ok(None)
     }
@@ -201,14 +201,15 @@ pub trait WorkScope: TurnHost {
         };
 
         if let Some(goal_id) = expected_goal_id
-            && task.goal_id != goal_id {
-                anyhow::bail!(
-                    "Task '{}' belongs to goal '{}', not '{}'.",
-                    task_id,
-                    task.goal_id,
-                    goal_id
-                );
-            }
+            && task.goal_id != goal_id
+        {
+            anyhow::bail!(
+                "Task '{}' belongs to goal '{}', not '{}'.",
+                task_id,
+                task.goal_id,
+                goal_id
+            );
+        }
 
         match task.status.as_str() {
             "claimed" => Ok(()),

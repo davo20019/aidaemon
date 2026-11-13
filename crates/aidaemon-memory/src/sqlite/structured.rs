@@ -114,31 +114,33 @@ fn legacy_person_name(value: &str) -> Option<(String, Vec<String>)> {
 
     let mut aliases = Vec::new();
     if let Some(start) = display.find('"')
-        && let Some(relative_end) = display[start + 1..].find('"') {
-            let end = start + 1 + relative_end;
-            let alias = display[start + 1..end].trim();
-            if !alias.is_empty() {
-                aliases.push(alias.to_string());
-            }
+        && let Some(relative_end) = display[start + 1..].find('"')
+    {
+        let end = start + 1 + relative_end;
+        let alias = display[start + 1..end].trim();
+        if !alias.is_empty() {
+            aliases.push(alias.to_string());
+        }
+        display.replace_range(start..=end, "");
+    }
+    if let (Some(start), Some(end)) = (display.find('('), display.rfind(')'))
+        && end > start
+    {
+        let note = display[start + 1..end].trim();
+        let lower = note.to_ascii_lowercase();
+        let alias = lower
+            .strip_prefix("nickname ")
+            .or_else(|| lower.strip_prefix("aka "))
+            .or_else(|| lower.strip_prefix("also known as "))
+            .map(|prefix_removed| {
+                let offset = note.len().saturating_sub(prefix_removed.len());
+                note[offset..].trim()
+            });
+        if let Some(alias) = alias.filter(|alias| !alias.is_empty()) {
+            aliases.push(alias.to_string());
             display.replace_range(start..=end, "");
         }
-    if let (Some(start), Some(end)) = (display.find('('), display.rfind(')'))
-        && end > start {
-            let note = display[start + 1..end].trim();
-            let lower = note.to_ascii_lowercase();
-            let alias = lower
-                .strip_prefix("nickname ")
-                .or_else(|| lower.strip_prefix("aka "))
-                .or_else(|| lower.strip_prefix("also known as "))
-                .map(|prefix_removed| {
-                    let offset = note.len().saturating_sub(prefix_removed.len());
-                    note[offset..].trim()
-                });
-            if let Some(alias) = alias.filter(|alias| !alias.is_empty()) {
-                aliases.push(alias.to_string());
-                display.replace_range(start..=end, "");
-            }
-        }
+    }
     let canonical = display.split_whitespace().collect::<Vec<_>>().join(" ");
     (!canonical.is_empty()).then_some((canonical, aliases))
 }
@@ -461,19 +463,20 @@ async fn resolve_entity(
             return Ok(Some(id));
         }
         if status == "merged"
-            && let Some(target_id) = row.get::<Option<i64>, _>("merged_into_entity_id") {
-                let target_is_active: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(
+            && let Some(target_id) = row.get::<Option<i64>, _>("merged_into_entity_id")
+        {
+            let target_is_active: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
                          SELECT 1 FROM memory_entities WHERE id = ? AND status = 'active'
                      )",
-                )
-                .bind(target_id)
-                .fetch_one(&mut **tx)
-                .await?;
-                if target_is_active {
-                    return Ok(Some(target_id));
-                }
+            )
+            .bind(target_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            if target_is_active {
+                return Ok(Some(target_id));
             }
+        }
         review(
             tx,
             "inactive_entity_reference",

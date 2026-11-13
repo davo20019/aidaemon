@@ -3,7 +3,7 @@
 //! invents is dropped, and the tool sees the dispatcher's fact.
 
 use super::*;
-use crate::testing::{setup_test_agent, MockProvider};
+use crate::testing::{MockProvider, setup_test_agent};
 use std::sync::Mutex as StdMutex;
 
 type Seen = Arc<StdMutex<Vec<(Value, crate::traits::ToolCallContext)>>>;

@@ -2,8 +2,8 @@
 //! goal run's durable token balance (a short lease), and a worker's run
 //! commits its decision before it may end.
 
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use tracing::warn;

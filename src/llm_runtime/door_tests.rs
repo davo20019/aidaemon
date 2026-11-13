@@ -86,9 +86,10 @@ fn nothing_outside_the_gateway_reaches_a_provider() {
 /// means the files were read, not skipped.
 #[test]
 fn the_scan_sees_the_gateway() {
-    assert!(scanned_files()
-        .any(|path| path == "crates/aidaemon-runtime/src/llm/gateway.rs"
-            && reaches_a_provider(&path)));
+    assert!(
+        scanned_files().any(|path| path == "crates/aidaemon-runtime/src/llm/gateway.rs"
+            && reaches_a_provider(&path))
+    );
 }
 
 /// What reaches a decision backend directly. Callers ask through

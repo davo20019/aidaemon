@@ -42,9 +42,10 @@ fn is_legacy_system_maintenance_goal(goal: &Goal) -> bool {
 
     if let Some(ctx) = goal.context.as_deref()
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(ctx)
-            && let Some(system_goal) = value.get("system_goal").and_then(|v| v.as_str()) {
-                return matches!(system_goal, "knowledge_maintenance" | "memory_health");
-            }
+        && let Some(system_goal) = value.get("system_goal").and_then(|v| v.as_str())
+    {
+        return matches!(system_goal, "knowledge_maintenance" | "memory_health");
+    }
 
     goal.description == LEGACY_KNOWLEDGE_MAINTENANCE_GOAL_DESC
         || goal.description == LEGACY_MEMORY_HEALTH_GOAL_DESC

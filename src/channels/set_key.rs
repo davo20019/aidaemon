@@ -4,9 +4,9 @@
 
 use std::path::Path;
 
+use aidaemon_providers::OPENAI_DEFAULT_BASE_URL;
 pub(crate) use aidaemon_providers::key_check::KeyCheck;
 use aidaemon_providers::key_check::KeyEndpoint;
-use aidaemon_providers::OPENAI_DEFAULT_BASE_URL;
 
 use crate::config::{ProviderConfig, ProviderKind};
 

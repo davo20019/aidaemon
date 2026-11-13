@@ -47,20 +47,20 @@ use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use aidaemon_agents::{AgentTool, ChildBudget};
-use aidaemon_channels::testing::{direct, message, TestChannel};
-use aidaemon_channels::{AccessPolicy, ChannelRunner, EventRouter, APPROVE_CHOICE};
-use serde_json::{json, Value};
+use aidaemon_channels::testing::{TestChannel, direct, message};
+use aidaemon_channels::{APPROVE_CHOICE, AccessPolicy, ChannelRunner, EventRouter};
+use serde_json::{Value, json};
 
-use super::{call, text, tool_calls, ScriptedProvider, SCRIPTED_USAGE};
+use super::{SCRIPTED_USAGE, ScriptedProvider, call, text, tool_calls};
 use crate::{
-    tool, Agent, AgentBuilder, CancellationToken, FnTool, Limits, Message, ModelRequest, Preset,
+    Agent, AgentBuilder, CancellationToken, FnTool, Limits, Message, ModelRequest, Preset,
     ReceiptStatus, Resolution, Role, RunOutcome, RunStatus, Tool, ToolAnnotations, ToolOutput,
-    ToolSpec,
+    ToolSpec, tool,
 };
 
 /// An error from a subject's factory.

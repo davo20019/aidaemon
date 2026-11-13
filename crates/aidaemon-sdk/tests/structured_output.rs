@@ -1,8 +1,8 @@
 //! Typed structured output against the scripted provider: the schema sent,
 //! the one repair attempt, and giving up after it.
 
-use aidaemon_sdk::structured::{complete_typed, AgentStructuredExt, StructuredError};
-use aidaemon_sdk::testing::{call, spec, text, tool_calls, ScriptedProvider};
+use aidaemon_sdk::structured::{AgentStructuredExt, StructuredError, complete_typed};
+use aidaemon_sdk::testing::{ScriptedProvider, call, spec, text, tool_calls};
 use aidaemon_sdk::{
     Agent, FnTool, Message, ModelRequest, ResponseFormat, Role, ToolAnnotations, ToolOutput,
 };

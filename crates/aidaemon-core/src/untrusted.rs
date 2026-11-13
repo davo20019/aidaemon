@@ -107,16 +107,16 @@ impl Hook for UntrustedHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{call, spec, text, tool_calls, ScriptedProvider};
+    use crate::testing::{ScriptedProvider, call, spec, text, tool_calls};
     use crate::tool::{FnTool, SourceTrust, Tool, ToolAnnotations, ToolOutput};
     use crate::{
         AccessLevel, Agent, Authority, AuthorityHook, BuildError, CancellationToken,
         InterruptResolver, Interruption, ReceiptStatus, Resolution, RunState, RunStatus, Safeguard,
     };
     use async_trait::async_trait;
-    use serde_json::{json, Value};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use serde_json::{Value, json};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn mark(tool: &str, content: &str) -> String {
         format!("<untrusted tool=\"{tool}\">{content}</untrusted>")
@@ -444,10 +444,11 @@ mod tests {
             .unwrap();
         let send = &out.receipts()[1];
         assert_eq!(send.status, ReceiptStatus::Denied);
-        assert!(send
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.starts_with(crate::OWNER_DECLINED)));
+        assert!(
+            send.reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(crate::OWNER_DECLINED))
+        );
         assert_eq!(out.state.declined, vec![key]);
         assert_eq!(sent.load(Ordering::SeqCst), 0);
     }

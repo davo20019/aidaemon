@@ -9,11 +9,11 @@ use aidaemon_policies::contains_shell_operator;
 use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use std::sync::LazyLock;
 use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -34,12 +34,12 @@ use aidaemon_events::{
 use aidaemon_tools::semantics::ApprovalResponse;
 use aidaemon_tools::status::StatusUpdate;
 use aidaemon_tools::{
-    backend::SharedExecutionBackend, BackendKind, ExecutionRequest, ProcessHandle,
+    BackendKind, ExecutionRequest, ProcessHandle, backend::SharedExecutionBackend,
 };
 
 use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
 use super::semantic_command_risk::assess_command;
-use aidaemon_tools::command_risk::{approval_floor_reason, PermissionMode, RiskLevel};
+use aidaemon_tools::command_risk::{PermissionMode, RiskLevel, approval_floor_reason};
 use aidaemon_tools::daemon_guard::detect_daemonization_primitives;
 use aidaemon_tools::process_control::{send_sigkill, send_sigterm};
 
@@ -845,21 +845,19 @@ async fn deliver_background_text(
             ),
         }
     }
-    if !delivered
-        && let Some(state) = state {
-            let entry = crate::tools::traits::NotificationEntry::new(
-                goal_id, session_id, "progress", message,
+    if !delivered && let Some(state) = state {
+        let entry =
+            crate::tools::traits::NotificationEntry::new(goal_id, session_id, "progress", message);
+        if let Err(e) = state.enqueue_notification(&entry).await {
+            warn!(
+                pid,
+                error = %e,
+                session_id = %session_id,
+                goal_id = %goal_id,
+                "Failed to enqueue background deliverable status text"
             );
-            if let Err(e) = state.enqueue_notification(&entry).await {
-                warn!(
-                    pid,
-                    error = %e,
-                    session_id = %session_id,
-                    goal_id = %goal_id,
-                    "Failed to enqueue background deliverable status text"
-                );
-            }
         }
+    }
 }
 
 pub struct TerminalTool {
@@ -1198,9 +1196,11 @@ fn is_broad_scan_root(path: &str) -> bool {
         return true;
     }
     if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty() && p == home.trim_end_matches('/') {
-            return true;
-        }
+        && !home.is_empty()
+        && p == home.trim_end_matches('/')
+    {
+        return true;
+    }
     false
 }
 
@@ -1472,11 +1472,21 @@ fn signal_name(signal: i32) -> &'static str {
 /// opaque failure.
 fn signal_remedy_hint(signal: i32) -> &'static str {
     match signal {
-        9 => "SIGKILL is usually the OS running the process out of memory, or a hard resource limit — retry with a lower concurrency/memory footprint (e.g. a single-threaded build) or split the work.",
-        6 => "SIGABRT is the program aborting itself on an unrecoverable startup error — re-run the underlying binary directly (not through a wrapper like npm/npx) or add its verbose flag to see the assertion or missing-dependency message it printed before aborting.",
-        11 => "SIGSEGV is a crash inside the program — often a corrupt install or an ABI mismatch; reinstalling the tool's dependencies is the usual fix.",
-        13 => "SIGPIPE means the process wrote to a closed pipe — usually harmless downstream of a command that exited early; check the first command in the pipeline.",
-        _ => "re-run the underlying program directly with a verbose flag to see what it reported before it was terminated.",
+        9 => {
+            "SIGKILL is usually the OS running the process out of memory, or a hard resource limit — retry with a lower concurrency/memory footprint (e.g. a single-threaded build) or split the work."
+        }
+        6 => {
+            "SIGABRT is the program aborting itself on an unrecoverable startup error — re-run the underlying binary directly (not through a wrapper like npm/npx) or add its verbose flag to see the assertion or missing-dependency message it printed before aborting."
+        }
+        11 => {
+            "SIGSEGV is a crash inside the program — often a corrupt install or an ABI mismatch; reinstalling the tool's dependencies is the usual fix."
+        }
+        13 => {
+            "SIGPIPE means the process wrote to a closed pipe — usually harmless downstream of a command that exited early; check the first command in the pipeline."
+        }
+        _ => {
+            "re-run the underlying program directly with a verbose flag to see what it reported before it was terminated."
+        }
     }
 }
 
@@ -1534,12 +1544,13 @@ fn disk_space(_path: &std::path::Path) -> Option<(u64, u64)> {
 /// The exit code line and, for a failure, the low-disk note.
 fn push_exit_status(output: &mut String, exit_code: Option<i32>) {
     if let Some(code) = exit_code
-        && code != 0 {
-            output.push_str(&format!("\n[exit code: {}]", code));
-            if let Some(note) = low_disk_note() {
-                output.push_str(&note);
-            }
+        && code != 0
+    {
+        output.push_str(&format!("\n[exit code: {}]", code));
+        if let Some(note) = low_disk_note() {
+            output.push_str(&note);
         }
+    }
 }
 
 fn confined_opaque_failure_hint(
@@ -1703,9 +1714,10 @@ async fn confined_terminal_execution_request_inner(
     // below so no command has to discover or declare it.
     let managed_scratch = provision_managed_scratch(backend).await;
     if let Some(scratch) = managed_scratch.as_ref()
-        && !writes.contains(scratch) {
-            writes.push(scratch.clone());
-        }
+        && !writes.contains(scratch)
+    {
+        writes.push(scratch.clone());
+    }
 
     // Task data authority and executable runtime support are separate lanes.
     // A native sandbox still needs to execute owner-installed toolchains, but
@@ -2057,9 +2069,10 @@ fn macos_manifest_sandbox_policy(
         // syntax without reopening ambient temporary write authority.
         let mut temp_dirs = vec![std::env::temp_dir()];
         if let Ok(canonical) = std::fs::canonicalize(&temp_dirs[0])
-            && !temp_dirs.iter().any(|path| path == &canonical) {
-                temp_dirs.push(canonical);
-            }
+            && !temp_dirs.iter().any(|path| path == &canonical)
+        {
+            temp_dirs.push(canonical);
+        }
         // `/tmp` and `/var/tmp` are symlink/alias spellings on Darwin, and
         // shells launched by different service managers can inherit either
         // spelling. Keep the aliases in the same narrowly scoped transient
@@ -2410,14 +2423,15 @@ async fn add_macos_developer_runtime_support(
                     Duration::from_secs(5),
                 )
                 .await
-                && output.exit_code == 0 {
-                    sdk_root = output
-                        .stdout_lossy()
-                        .lines()
-                        .map(str::trim)
-                        .find(|path| path.starts_with('/'))
-                        .map(str::to_string);
-                }
+            && output.exit_code == 0
+        {
+            sdk_root = output
+                .stdout_lossy()
+                .lines()
+                .map(str::trim)
+                .find(|path| path.starts_with('/'))
+                .map(str::to_string);
+        }
     }
     if sdk_root.is_none() {
         for candidate in [
@@ -2502,11 +2516,12 @@ async fn native_sandbox_runtime_support(
             if let Some(prefix) = std::path::Path::new(location)
                 .parent()
                 .and_then(|bin| bin.parent())
-                && prefix.join("conda-meta").is_dir() {
-                    let prefix = prefix.to_string_lossy().to_string();
-                    support.add_read(prefix.clone());
-                    support.add_executable(prefix);
-                }
+                && prefix.join("conda-meta").is_dir()
+            {
+                let prefix = prefix.to_string_lossy().to_string();
+                support.add_read(prefix.clone());
+                support.add_executable(prefix);
+            }
         }
         // Standard prefix layout: an executable under `<prefix>/bin` loads
         // shared libraries from the sibling `<prefix>/lib` (and helpers from
@@ -2575,21 +2590,21 @@ async fn native_sandbox_runtime_support(
                     .lines()
                     .map(str::trim)
                     .find(|line| line.starts_with('/'))
-                {
-                    let actual = aidaemon_tools::BackendPath::new(actual.to_string());
-                    if let Some(bin_dir) = actual.parent() {
-                        support.prefer_path_prefix(bin_dir.to_string());
-                        // Rust compiler tools load libraries and target data
-                        // from the sibling toolchain tree, not just `bin/`.
-                        if let Some(toolchain_root) = bin_dir.parent() {
-                            support.add_read(toolchain_root.to_string());
-                            support.add_executable(toolchain_root.to_string());
-                        } else {
-                            support.add_read(bin_dir.to_string());
-                            support.add_executable(bin_dir.to_string());
-                        }
+            {
+                let actual = aidaemon_tools::BackendPath::new(actual.to_string());
+                if let Some(bin_dir) = actual.parent() {
+                    support.prefer_path_prefix(bin_dir.to_string());
+                    // Rust compiler tools load libraries and target data
+                    // from the sibling toolchain tree, not just `bin/`.
+                    if let Some(toolchain_root) = bin_dir.parent() {
+                        support.add_read(toolchain_root.to_string());
+                        support.add_executable(toolchain_root.to_string());
+                    } else {
+                        support.add_read(bin_dir.to_string());
+                        support.add_executable(bin_dir.to_string());
                     }
                 }
+            }
         }
 
         // Git aborts (exit 128) when its ordinary configuration files exist
@@ -2731,12 +2746,12 @@ async fn add_manifest_runtime_environment(
     // directory backs TMPDIR/caches below.
     if future_scratch_root
         && let Some(path) = preferred_root.as_ref()
-            && let Err(error) = backend
-                .create_dir_all(&aidaemon_tools::BackendPath::new(path.clone()))
-                .await
-            {
-                tracing::warn!(path = %path, %error, "Failed to prepare declared future write root");
-            }
+        && let Err(error) = backend
+            .create_dir_all(&aidaemon_tools::BackendPath::new(path.clone()))
+            .await
+    {
+        tracing::warn!(path = %path, %error, "Failed to prepare declared future write root");
+    }
     let mut scratch_root = (preferred_is_directory || future_scratch_root)
         .then(|| preferred_root.clone())
         .flatten();
@@ -3264,7 +3279,9 @@ impl TerminalTool {
         // Log permission mode on startup
         match permission_mode {
             PermissionMode::Yolo => {
-                warn!("⚠️  YOLO mode enabled: all command approvals persist forever, including critical commands");
+                warn!(
+                    "⚠️  YOLO mode enabled: all command approvals persist forever, including critical commands"
+                );
             }
             PermissionMode::Cautious => {
                 info!("Cautious mode: all command approvals are session-only");
@@ -3404,7 +3421,9 @@ impl TerminalTool {
     pub fn with_confinement(mut self, confinement: aidaemon_tools::TerminalConfinement) -> Self {
         match confinement {
             aidaemon_tools::TerminalConfinement::Host => {
-                info!("Terminal runs commands on the host (set [terminal] confinement = \"sandbox\" to confine them)")
+                info!(
+                    "Terminal runs commands on the host (set [terminal] confinement = \"sandbox\" to confine them)"
+                )
             }
             aidaemon_tools::TerminalConfinement::Sandbox => {
                 info!("Terminal runs commands inside the OS sandbox with task-scoped policy")
@@ -3806,8 +3825,9 @@ impl TerminalTool {
         // Approval history is useful context for the owner, but it never
         // changes the decision or lowers risk.
         if let Some(ref pool) = self.pool
-            && let Ok(Some((pattern, similarity))) = find_matching_pattern(pool, command).await {
-                approval_warnings.push(format!(
+            && let Ok(Some((pattern, similarity))) = find_matching_pattern(pool, command).await
+        {
+            approval_warnings.push(format!(
                     "Similar command history: '{}' (similarity {:.0}%, approvals {}, denials {}, confidence {:.0}%, trusted {})",
                     pattern.pattern,
                     similarity * 100.0,
@@ -3816,7 +3836,7 @@ impl TerminalTool {
                     pattern.confidence() * 100.0,
                     pattern.is_trusted(),
                 ));
-            }
+        }
         Some(LadderAsk {
             risk: approval_risk,
             warnings: approval_warnings,
@@ -4128,9 +4148,9 @@ impl TerminalTool {
                     .bind(capability)
                     .execute(pool)
                     .await
-                    {
-                        warn!(prefix = %key, capability = %capability, "Failed to persist capability grant: {}", e);
-                    }
+                {
+                    warn!(prefix = %key, capability = %capability, "Failed to persist capability grant: {}", e);
+                }
             }
         }
     }
@@ -4157,9 +4177,9 @@ impl TerminalTool {
                     .bind(&key)
                     .execute(pool)
                     .await
-                    {
-                        warn!(prefix = %key, "Failed to persist allowed prefix: {}", e);
-                    }
+                {
+                    warn!(prefix = %key, "Failed to persist allowed prefix: {}", e);
+                }
             }
         }
     }
@@ -4203,11 +4223,10 @@ impl TerminalTool {
                 .insert(key.to_string(), pid);
         }
 
-        if !detached
-            && let Some(task_id) = owner_task_id {
-                let mut task_map = self.task_processes.lock().await;
-                task_map.entry(task_id.to_string()).or_default().insert(pid);
-            }
+        if !detached && let Some(task_id) = owner_task_id {
+            let mut task_map = self.task_processes.lock().await;
+            task_map.entry(task_id.to_string()).or_default().insert(pid);
+        }
     }
 
     async fn remove_indexes_for_process(&self, pid: u32, proc: &RunningProcess) {
@@ -4219,17 +4238,18 @@ impl TerminalTool {
         }
 
         if !proc.detached
-            && let Some(task_id) = proc.owner_task_id.as_ref() {
-                let mut task_map = self.task_processes.lock().await;
-                let mut remove_task_key = false;
-                if let Some(pids) = task_map.get_mut(task_id) {
-                    pids.remove(&pid);
-                    remove_task_key = pids.is_empty();
-                }
-                if remove_task_key {
-                    task_map.remove(task_id);
-                }
+            && let Some(task_id) = proc.owner_task_id.as_ref()
+        {
+            let mut task_map = self.task_processes.lock().await;
+            let mut remove_task_key = false;
+            if let Some(pids) = task_map.get_mut(task_id) {
+                pids.remove(&pid);
+                remove_task_key = pids.is_empty();
             }
+            if remove_task_key {
+                task_map.remove(task_id);
+            }
+        }
     }
 
     async fn resolve_duplicate_running_pid(&self, dedupe_key: &str) -> Option<u32> {
@@ -4444,9 +4464,9 @@ impl TerminalTool {
                 .bind(self.backend.approval_scope())
                 .execute(pool)
                 .await
-                {
-                    warn!("Failed to persist trust-all mode: {}", e);
-                }
+            {
+                warn!("Failed to persist trust-all mode: {}", e);
+            }
         }
         Ok(
             "Trust-all mode enabled. All commands will now run without approval prompts."
@@ -4768,9 +4788,8 @@ impl TerminalTool {
                 }
                 to_update.push((c.pid, len, sampled, made_progress, confirmations));
 
-                if conclusive_stall
-                    && let Some(task_id) = c.owner_task_id.as_deref() {
-                        watchdog_events.push((
+                if conclusive_stall && let Some(task_id) = c.owner_task_id.as_deref() {
+                    watchdog_events.push((
                             c.session_id.clone(),
                             task_id.to_string(),
                             DecisionPointData {
@@ -4816,7 +4835,7 @@ impl TerminalTool {
                                 },
                             },
                         ));
-                    }
+                }
             } else {
                 to_update.push((c.pid, len, sampled, made_progress, 0));
             }
@@ -5000,21 +5019,21 @@ impl TerminalTool {
                 };
                 let mut delivered = false;
                 if let Some(hub) = self.get_hub()
-                    && hub.send_text(&session_id, &message).await.is_ok() {
-                        delivered = true;
+                    && hub.send_text(&session_id, &message).await.is_ok()
+                {
+                    delivered = true;
+                }
+                if !delivered && let Some(ref state) = self.notifications {
+                    let entry = crate::tools::traits::NotificationEntry::new(
+                        &goal_id,
+                        &session_id,
+                        "progress",
+                        &message,
+                    );
+                    if let Err(e) = state.enqueue_notification(&entry).await {
+                        warn!(pid, error = %e, "Failed to enqueue idle-reap notice");
                     }
-                if !delivered
-                    && let Some(ref state) = self.notifications {
-                        let entry = crate::tools::traits::NotificationEntry::new(
-                            &goal_id,
-                            &session_id,
-                            "progress",
-                            &message,
-                        );
-                        if let Err(e) = state.enqueue_notification(&entry).await {
-                            warn!(pid, error = %e, "Failed to enqueue idle-reap notice");
-                        }
-                    }
+                }
             }
             reaped += 1;
         }
@@ -5295,9 +5314,10 @@ impl TerminalTool {
                     output.push_str(&self_heal_note);
                 }
                 if confined
-                    && let Some(hint) = confined_opaque_failure_hint(exit_code, &stdout, &stderr) {
-                        output.push_str(&hint);
-                    }
+                    && let Some(hint) = confined_opaque_failure_hint(exit_code, &stdout, &stderr)
+                {
+                    output.push_str(&hint);
+                }
                 // A signal-killed child reports no exit code, so the hint above
                 // (which keys on a non-zero code) stays silent for what is often
                 // the most confusing failure. Name the signal explicitly: it is
@@ -5305,13 +5325,14 @@ impl TerminalTool {
                 // killed it" (a sandbox denial the kernel enforces by SIGKILL, an
                 // out-of-memory kill, or a crash), which point at different fixes.
                 if exit_code != Some(0)
-                    && let Some(signal) = terminating_signal {
-                        output.push_str(&format!(
+                    && let Some(signal) = terminating_signal
+                {
+                    output.push_str(&format!(
                             "\n[SYSTEM diagnostic] The command was terminated by signal {signal} ({}), not by exiting on its own. This is the OS killing the process, not the task failing: {}",
                             signal_name(signal),
                             signal_remedy_hint(signal),
                         ));
-                    }
+                }
                 let mut metadata = foreground_terminal_metadata(exit_code);
                 metadata.truncation = truncation;
                 metadata.semantics = command_semantics.clone();
@@ -5756,23 +5777,23 @@ impl TerminalTool {
                                                 String::new(),
                                                 max_output_chars,
                                             )
+                                    {
+                                        for message in answer
+                                            .messages
+                                            .iter()
+                                            .filter(|message| !message.trim().is_empty())
                                         {
-                                            for message in answer
-                                                .messages
-                                                .iter()
-                                                .filter(|message| !message.trim().is_empty())
-                                            {
-                                                deliver_background_text(
-                                                    hub_for_notify.as_ref(),
-                                                    state_for_notify.as_ref(),
-                                                    &session_for_notify,
-                                                    &goal_id_for_notify,
-                                                    message,
-                                                    pid,
-                                                )
-                                                .await;
-                                            }
+                                            deliver_background_text(
+                                                hub_for_notify.as_ref(),
+                                                state_for_notify.as_ref(),
+                                                &session_for_notify,
+                                                &goal_id_for_notify,
+                                                message,
+                                                pid,
+                                            )
+                                            .await;
                                         }
+                                    }
                                 }
                                 return;
                             }
@@ -5871,28 +5892,29 @@ impl TerminalTool {
                             };
 
                             if let DeliverableAttribution::One(path) = &deliverable_attribution
-                                && exit_code == Some(0) {
-                                    info!(
-                                        pid,
-                                        session_id = %session_for_notify,
-                                        "Attributed a produced-output file; delivering it directly (no re-engagement)"
-                                    );
-                                    deliver_attributed_background_file(
-                                        &backend_for_notify,
-                                        path,
-                                        &session_for_notify,
-                                        &command_summary,
-                                        &inbox_dir_for_notify,
-                                        &outbox_dirs_for_notify,
-                                        &delivered_deliverables_for_notify,
-                                        plan_store_for_notify.as_ref(),
-                                        hub_for_notify.as_ref(),
-                                        state_for_notify.as_ref(),
-                                        &goal_id_for_notify,
-                                        pid,
-                                    )
-                                    .await;
-                                }
+                                && exit_code == Some(0)
+                            {
+                                info!(
+                                    pid,
+                                    session_id = %session_for_notify,
+                                    "Attributed a produced-output file; delivering it directly (no re-engagement)"
+                                );
+                                deliver_attributed_background_file(
+                                    &backend_for_notify,
+                                    path,
+                                    &session_for_notify,
+                                    &command_summary,
+                                    &inbox_dir_for_notify,
+                                    &outbox_dirs_for_notify,
+                                    &delivered_deliverables_for_notify,
+                                    plan_store_for_notify.as_ref(),
+                                    hub_for_notify.as_ref(),
+                                    state_for_notify.as_ref(),
+                                    &goal_id_for_notify,
+                                    pid,
+                                )
+                                .await;
+                            }
                             // The runs its turn left running are answered
                             // together: until the last of them ends this
                             // one's end is on the card only, and the last
@@ -6259,25 +6281,26 @@ impl TerminalTool {
                             // and own their cleanup.
                             if let Some(reaped) = running_for_notify.lock().await.remove(&pid) {
                                 if let Some(ref key) = reaped.dedupe_key
-                                    && key == &dedupe_key_for_notify {
-                                        let mut dedupe =
-                                            running_by_dedupe_key_for_notify.lock().await;
-                                        if dedupe.get(key).copied() == Some(pid) {
-                                            dedupe.remove(key);
-                                        }
+                                    && key == &dedupe_key_for_notify
+                                {
+                                    let mut dedupe = running_by_dedupe_key_for_notify.lock().await;
+                                    if dedupe.get(key).copied() == Some(pid) {
+                                        dedupe.remove(key);
                                     }
+                                }
                                 if !reaped.detached
-                                    && let Some(ref task_id) = owner_task_id_for_notify {
-                                        let mut task_map = task_processes_for_notify.lock().await;
-                                        let mut remove_task_key = false;
-                                        if let Some(pids) = task_map.get_mut(task_id) {
-                                            pids.remove(&pid);
-                                            remove_task_key = pids.is_empty();
-                                        }
-                                        if remove_task_key {
-                                            task_map.remove(task_id);
-                                        }
+                                    && let Some(ref task_id) = owner_task_id_for_notify
+                                {
+                                    let mut task_map = task_processes_for_notify.lock().await;
+                                    let mut remove_task_key = false;
+                                    if let Some(pids) = task_map.get_mut(task_id) {
+                                        pids.remove(&pid);
+                                        remove_task_key = pids.is_empty();
                                     }
+                                    if remove_task_key {
+                                        task_map.remove(task_id);
+                                    }
+                                }
                                 info!(
                                     pid,
                                     "Notifier removed finished process from running map after delivery"
@@ -6562,9 +6585,10 @@ impl TerminalTool {
         let mut notify_session_id = exec_ctx.session_id.clone();
         if let (Some(state), Some(goal_id)) = (self.goals.as_ref(), exec_ctx.goal_id.as_deref())
             && let Ok(Some(goal)) = state.get_goal(goal_id).await
-                && !goal.session_id.trim().is_empty() {
-                    notify_session_id = goal.session_id;
-                }
+            && !goal.session_id.trim().is_empty()
+        {
+            notify_session_id = goal.session_id;
+        }
 
         let mut outcome = match TerminalAction::parse(&args.action) {
             TerminalAction::Check => {
@@ -6770,10 +6794,10 @@ impl TerminalTool {
                             .read_dir(path)
                             .await
                             .is_ok_and(|entries| entries.is_empty());
-                        if still_empty
-                            && let Err(error) = self.backend.remove_empty_dir(path).await {
-                                tracing::debug!(path = %path, %error, "Could not undo runtime-created future write root");
-                            }
+                        if still_empty && let Err(error) = self.backend.remove_empty_dir(path).await
+                        {
+                            tracing::debug!(path = %path, %error, "Could not undo runtime-created future write root");
+                        }
                     }
                 }
                 run_outcome?
@@ -6919,11 +6943,13 @@ fn command_grant_keys(command: &str) -> Vec<String> {
             .map(str::to_string)
             .collect()
     } else {
-        vec![trimmed
-            .split_whitespace()
-            .next()
-            .unwrap_or(trimmed)
-            .to_string()]
+        vec![
+            trimmed
+                .split_whitespace()
+                .next()
+                .unwrap_or(trimmed)
+                .to_string(),
+        ]
     }
 }
 
@@ -7606,13 +7632,13 @@ fn validate_terminal_argument_contract(
         (Some(_), Some(_)) => {
             return Err(ToolArgumentContractViolation::new(
                 "terminal action=run accepts exactly one of command or script",
-            ))
+            ));
         }
         (Some(_), None) | (None, Some(_)) => {}
         (None, None) => {
             return Err(ToolArgumentContractViolation::new(
                 "terminal action=run requires command or script",
-            ))
+            ));
         }
     }
     Ok(())
@@ -8271,18 +8297,24 @@ mod tests {
         let completion = background_process_semantics(&observed_only);
         assert!(completion.mutates_state());
         assert!(completion.observes_state());
-        assert!(completion
-            .mutation_effects
-            .satisfies(ToolMutationEffects::PROCESS_STATE));
+        assert!(
+            completion
+                .mutation_effects
+                .satisfies(ToolMutationEffects::PROCESS_STATE)
+        );
 
         let writes = ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE);
         let completion = background_process_semantics(&writes);
-        assert!(completion
-            .mutation_effects
-            .satisfies(ToolMutationEffects::LOCAL_SOURCE_WRITE));
-        assert!(completion
-            .mutation_effects
-            .satisfies(ToolMutationEffects::PROCESS_STATE));
+        assert!(
+            completion
+                .mutation_effects
+                .satisfies(ToolMutationEffects::LOCAL_SOURCE_WRITE)
+        );
+        assert!(
+            completion
+                .mutation_effects
+                .satisfies(ToolMutationEffects::PROCESS_STATE)
+        );
         assert_eq!(completion, background_process_semantics(&writes));
     }
 
@@ -8326,9 +8358,11 @@ mod tests {
             semantics.verification_mode,
             crate::tools::traits::ToolVerificationMode::ResultContent
         );
-        assert!(semantics
-            .mutation_effects
-            .intersects(crate::tools::traits::ToolMutationEffects::LOCAL_WORKSPACE_WRITE));
+        assert!(
+            semantics
+                .mutation_effects
+                .intersects(crate::tools::traits::ToolMutationEffects::LOCAL_WORKSPACE_WRITE)
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -8600,10 +8634,12 @@ mod tests {
             }
             other => panic!("expected plain shell command, got {other:?}"),
         }
-        assert!(request
-            .cwd
-            .as_ref()
-            .is_some_and(|cwd| cwd.as_str().ends_with("tmp")));
+        assert!(
+            request
+                .cwd
+                .as_ref()
+                .is_some_and(|cwd| cwd.as_str().ends_with("tmp"))
+        );
         assert!(request.stdin.is_none());
         let script = host_terminal_execution_request(&backend, "echo one\necho two", true, None)
             .await
@@ -8675,10 +8711,15 @@ mod tests {
         );
         let described = TerminalTool::describe_capabilities(&caps);
         assert!(described.contains("outbound network access"));
-        assert!(described
-            .contains("read outside task scope: /Users/alice/Library/Preferences/.wrangler"));
-        assert!(described
-            .contains("write outside task scope: /Users/alice/Library/Preferences/.wrangler/logs"));
+        assert!(
+            described
+                .contains("read outside task scope: /Users/alice/Library/Preferences/.wrangler")
+        );
+        assert!(
+            described.contains(
+                "write outside task scope: /Users/alice/Library/Preferences/.wrangler/logs"
+            )
+        );
         let plain: TerminalArgs =
             serde_json::from_str(r#"{"action":"run","command":"ls"}"#).unwrap();
         assert!(
@@ -8731,11 +8772,13 @@ mod tests {
             .split("(allow file-read-metadata file-test-existence")
             .nth(1)
             .expect("metadata grant section");
-        assert!(!section
-            .split("\n(")
-            .next()
-            .unwrap_or("")
-            .contains("file-read*"));
+        assert!(
+            !section
+                .split("\n(")
+                .next()
+                .unwrap_or("")
+                .contains("file-read*")
+        );
         assert!(!policy.contains("(subpath \"/Users/alice/node_modules\")"));
     }
 
@@ -8839,18 +8882,22 @@ mod tests {
             r#"{"action":"run","command":"/usr/bin/touch /tmp/synthetic-target","working_dir":"/tmp","write_paths":["/tmp/synthetic-target"]}"#
         )
         .is_ok());
-        assert!(validate_terminal_argument_contract(
-            r#"{"action":"run","command":"/usr/bin/false","working_dir":"/tmp"}"#
-        )
-        .is_ok());
+        assert!(
+            validate_terminal_argument_contract(
+                r#"{"action":"run","command":"/usr/bin/false","working_dir":"/tmp"}"#
+            )
+            .is_ok()
+        );
         assert!(validate_terminal_argument_contract(
             r#"{"action":"run","command":"/opt/homebrew/bin/python3 -c 'print(\"SYNTHETIC_OK\")'","working_dir":"/tmp","read_paths":[],"write_paths":[]}"#
         )
         .is_ok());
-        assert!(validate_terminal_argument_contract(
-            r#"{"action":"run","command":"python3 -c 'print(1)'"}"#
-        )
-        .is_ok());
+        assert!(
+            validate_terminal_argument_contract(
+                r#"{"action":"run","command":"python3 -c 'print(1)'"}"#
+            )
+            .is_ok()
+        );
         assert!(validate_terminal_argument_contract(
             r#"{"action":"run","script":"/usr/bin/false\nprintf SYNTHETIC_UNREACHED","working_dir":"/tmp"}"#
         )
@@ -9089,8 +9136,7 @@ mod tests {
         let cwd = parent.path().to_string_lossy().to_string();
         let root = parent.path().join("synthetic-heredoc-root");
         assert!(!root.exists());
-        let script =
-            "touch \"$TMPDIR/probe\"\ncat <<'EOF' > \"$PWD/synthetic-heredoc-root/value.txt\"\nSYNTHETIC_HEREDOC_OK\nEOF\n";
+        let script = "touch \"$TMPDIR/probe\"\ncat <<'EOF' > \"$PWD/synthetic-heredoc-root/value.txt\"\nSYNTHETIC_HEREDOC_OK\nEOF\n";
         let request = confined_terminal_script_execution_request(
             &backend,
             script,
@@ -9295,9 +9341,10 @@ mod tests {
                     if let Some(prefix) = std::path::Path::new(location)
                         .parent()
                         .and_then(|bin| bin.parent())
-                        && prefix.join("conda-meta").is_dir() {
-                            conda_prefix = Some((program, prefix.to_string_lossy().to_string()));
-                        }
+                        && prefix.join("conda-meta").is_dir()
+                    {
+                        conda_prefix = Some((program, prefix.to_string_lossy().to_string()));
+                    }
                 }
             }
             if conda_prefix.is_some() {
@@ -9312,10 +9359,12 @@ mod tests {
             .expect("support");
         assert!(support.read_paths.iter().any(|path| path == &prefix));
         assert!(support.executable_paths.iter().any(|path| path == &prefix));
-        assert!(!support
-            .read_paths
-            .iter()
-            .any(|path| path == &backend.home_hint().to_string()));
+        assert!(
+            !support
+                .read_paths
+                .iter()
+                .any(|path| path == &backend.home_hint().to_string())
+        );
     }
 
     #[tokio::test]
@@ -9331,21 +9380,25 @@ mod tests {
         let git = native_sandbox_runtime_support(&backend, "git status")
             .await
             .expect("git support");
-        assert!(git
-            .read_paths
-            .iter()
-            .any(|path| path == &gitconfig.to_string()));
-        assert!(!git
-            .read_paths
-            .iter()
-            .any(|path| path == &backend.home_hint().to_string()));
+        assert!(
+            git.read_paths
+                .iter()
+                .any(|path| path == &gitconfig.to_string())
+        );
+        assert!(
+            !git.read_paths
+                .iter()
+                .any(|path| path == &backend.home_hint().to_string())
+        );
         let other = native_sandbox_runtime_support(&backend, "/usr/bin/true")
             .await
             .expect("other support");
-        assert!(!other
-            .read_paths
-            .iter()
-            .any(|path| path == &gitconfig.to_string()));
+        assert!(
+            !other
+                .read_paths
+                .iter()
+                .any(|path| path == &gitconfig.to_string())
+        );
     }
 
     #[tokio::test]
@@ -9631,16 +9684,19 @@ mod tests {
         );
         assert!(post.mutates_state());
         assert!(post.observes_state());
-        assert!(post
-            .mutation_effects
-            .contains(ToolMutationEffects::REMOTE_MUTATION));
+        assert!(
+            post.mutation_effects
+                .contains(ToolMutationEffects::REMOTE_MUTATION)
+        );
 
         let fetch = terminal_call_semantics(
             r#"{"action":"run","command":"curl -sSL https://example.invalid"}"#,
         );
-        assert!(!fetch
-            .mutation_effects
-            .contains(ToolMutationEffects::REMOTE_MUTATION));
+        assert!(
+            !fetch
+                .mutation_effects
+                .contains(ToolMutationEffects::REMOTE_MUTATION)
+        );
     }
 
     /// Trust markers in the arguments stand in for nothing: a command the
@@ -9912,10 +9968,12 @@ mod tests {
             .expect("a dangerous command asks the owner");
         assert_eq!(request.risk, aidaemon_core::ApprovalRisk::High);
         assert_eq!(request.subject, "git push synthetic-remote main");
-        assert!(request
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("external_mutation")));
+        assert!(
+            request
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("external_mutation"))
+        );
         assert!(request.warnings[0].starts_with("Execution target:"));
         // The card shows the command collapsed under a plain sentence, and
         // warns only about what it sends.
@@ -11195,16 +11253,20 @@ mod tests {
         assert!(!root.exists());
         // The receipt is the only thing that can close a checklist obligation
         // the executor declared `destructive`.
-        assert!(outcome
-            .metadata
-            .semantics
-            .mutation_effects
-            .contains(ToolMutationEffects::DESTRUCTIVE));
-        assert!(outcome
-            .metadata
-            .semantics
-            .mutation_effects
-            .contains(ToolMutationEffects::LOCAL_WORKSPACE_WRITE));
+        assert!(
+            outcome
+                .metadata
+                .semantics
+                .mutation_effects
+                .contains(ToolMutationEffects::DESTRUCTIVE)
+        );
+        assert!(
+            outcome
+                .metadata
+                .semantics
+                .mutation_effects
+                .contains(ToolMutationEffects::LOCAL_WORKSPACE_WRITE)
+        );
 
         // A run that leaves its declared target in place gains no
         // destructive typing: the effect comes from the observed transition,
@@ -11225,11 +11287,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.metadata.exit_code, Some(0), "{}", outcome.output);
-        assert!(!outcome
-            .metadata
-            .semantics
-            .mutation_effects
-            .contains(ToolMutationEffects::DESTRUCTIVE));
+        assert!(
+            !outcome
+                .metadata
+                .semantics
+                .mutation_effects
+                .contains(ToolMutationEffects::DESTRUCTIVE)
+        );
         let _ = std::fs::remove_dir_all(&keep);
     }
 
@@ -11615,16 +11679,18 @@ mod tests {
         assert_eq!(jobs[0].title, "Background command: a shell loop");
         assert_eq!(jobs[0].task_id.as_deref(), Some("turn-count"));
         assert!(!jobs[0].title.contains("pid"));
-        assert!(tool
-            .background_jobs("telegram:another-chat")
-            .await
-            .is_empty());
+        assert!(
+            tool.background_jobs("telegram:another-chat")
+                .await
+                .is_empty()
+        );
 
         assert!(tool.stop_background_job(&jobs[0].key).await);
-        assert!(tool
-            .background_jobs("telegram:synthetic-count")
-            .await
-            .is_empty());
+        assert!(
+            tool.background_jobs("telegram:synthetic-count")
+                .await
+                .is_empty()
+        );
         // Gone already: stopping it again reads as stopped.
         assert!(tool.stop_background_job(&jobs[0].key).await);
     }
@@ -11668,9 +11734,11 @@ mod tests {
         assert!(!outcome.metadata.completion_notifications_enabled);
         assert!(!outcome.output.contains("No completion notification"));
         // The run wakes the sub-agent when the job ends: it must not poll.
-        assert!(outcome
-            .output
-            .contains("the run holds it until this command ends"));
+        assert!(
+            outcome
+                .output
+                .contains("the run holds it until this command ends")
+        );
         assert!(outcome.output.contains("no loop polling its pid"));
         assert_eq!(tool.jobs_ended_by_task_end("child-task").await, 1);
         assert_eq!(tool.jobs_ended_by_task_end("other-task").await, 0);
@@ -11867,11 +11935,13 @@ mod tests {
             outcome.metadata.outcome_status,
             Some(ToolOutcomeStatus::Backgrounded)
         );
-        assert!(outcome
-            .metadata
-            .semantics
-            .mutation_effects
-            .satisfies(ToolMutationEffects::PROCESS_STATE));
+        assert!(
+            outcome
+                .metadata
+                .semantics
+                .mutation_effects
+                .satisfies(ToolMutationEffects::PROCESS_STATE)
+        );
 
         // An immediate failure inside the startup check is still synchronous.
         let outcome = tool
@@ -12453,7 +12523,7 @@ mod tests {
     fn test_format_truncation_multibyte_utf8() {
         // "é" is 2 bytes in UTF-8, "日" is 3 bytes, "🎉" is 4 bytes
         let output = "aé日🎉".repeat(50); // mixed multi-byte chars
-                                          // Truncate at various positions that may land mid-char
+        // Truncate at various positions that may land mid-char
         for max in [1, 2, 3, 4, 5, 10, 50, 100] {
             let (result, truncation) = format_output(&output, "", max);
             // Must not panic and must be valid UTF-8 (String guarantees this)
@@ -12622,9 +12692,11 @@ mod tests {
             .await
             .unwrap();
         assert!(outcome.metadata.background_handoff);
-        assert!(outcome
-            .output
-            .starts_with("Started in the background: counting script."));
+        assert!(
+            outcome
+                .output
+                .starts_with("Started in the background: counting script.")
+        );
         assert!(
             chat.wait_for(Duration::from_secs(10), |text| text
                 .starts_with("⏳ Running in the background: counting script")
@@ -13216,7 +13288,8 @@ mod tests {
             })
             .count();
         assert_eq!(
-            result_count, 1,
+            result_count,
+            1,
             "duplicate background completions should not deliver the same result twice; messages={:?}",
             pending
                 .iter()
@@ -14033,11 +14106,12 @@ mod tests {
             "{request:?}"
         );
         // The same command from the owner runs without asking.
-        assert!(tool
-            .owner_approval_request(&args, &owner_trust())
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            tool.owner_approval_request(&args, &owner_trust())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -14096,8 +14170,8 @@ mod tests {
     /// Helper that creates a TerminalTool with an open-ended approval channel
     /// (receiver kept alive) so approval requests don't immediately error.
     /// Returns (tool, approval_rx) — keep approval_rx alive for the test duration.
-    async fn make_tool_with_open_approval_channel(
-    ) -> (TerminalTool, tokio::sync::mpsc::Receiver<ApprovalRequest>) {
+    async fn make_tool_with_open_approval_channel()
+    -> (TerminalTool, tokio::sync::mpsc::Receiver<ApprovalRequest>) {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
@@ -14259,12 +14333,14 @@ mod call_effects_tests {
         assert!(!effects.complete);
         assert_eq!(
             effects.keys,
-            vec![aidaemon_tools::command_effects::path_effect(
-                EffectClass::Write,
-                &format!("{dir}/site/homepage.png"),
-                None
-            )
-            .unwrap()]
+            vec![
+                aidaemon_tools::command_effects::path_effect(
+                    EffectClass::Write,
+                    &format!("{dir}/site/homepage.png"),
+                    None
+                )
+                .unwrap()
+            ]
         );
         assert!(!run("bash run.sh").understood);
         assert!(!run(&format!("cp $(ls {dir}) {dir}/b")).understood);
@@ -14308,12 +14384,14 @@ mod call_effects_tests {
         assert!(!effects.complete);
         assert_eq!(
             effects.keys,
-            vec![aidaemon_tools::command_effects::path_effect(
-                EffectClass::Write,
-                &format!("{dir}/out.txt"),
-                None
-            )
-            .unwrap()]
+            vec![
+                aidaemon_tools::command_effects::path_effect(
+                    EffectClass::Write,
+                    &format!("{dir}/out.txt"),
+                    None
+                )
+                .unwrap()
+            ]
         );
         // Without a working directory the target is undeterminable.
         assert!(run("echo x > out.txt").keys.is_empty());

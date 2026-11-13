@@ -576,9 +576,11 @@ mod tests {
             .collect();
         assert_eq!(flood.len(), 60);
         assert!(flood.windows(2).all(|w| w[0].score == w[1].score));
-        assert!(flood
-            .windows(2)
-            .all(|w| facts[w[0].index].updated_at > facts[w[1].index].updated_at));
+        assert!(
+            flood
+                .windows(2)
+                .all(|w| facts[w[0].index].updated_at > facts[w[1].index].updated_at)
+        );
     }
 
     #[test]

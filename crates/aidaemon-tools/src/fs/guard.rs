@@ -7,7 +7,7 @@ use std::sync::Arc;
 use aidaemon_core::{Hook, HookContext, ToolCall, ToolDecision, ToolInfo};
 use async_trait::async_trait;
 
-use super::{workspace_parts, FilePolicy, SharedBackend};
+use super::{FilePolicy, SharedBackend, workspace_parts};
 use crate::backend::BackendPath;
 use crate::semantics::FileGuard;
 use crate::workspace::Workspace;

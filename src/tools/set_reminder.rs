@@ -5,9 +5,9 @@ pub use aidaemon_runtime::tools::set_reminder::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::store_prelude::*;
     use crate::traits::ToolCalls as _;
     use crate::traits::ToolOutcomeStatus;
+    use crate::traits::store_prelude::*;
     use serde_json::json;
     use std::sync::Arc;
 

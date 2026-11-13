@@ -534,16 +534,20 @@ mod tests {
             .unwrap();
         assert!(delta.render_for_prompt().contains("widget instructions"));
         assert!(!delta.render_for_prompt().contains("root instructions"));
-        assert!(tracker
-            .loaded_source_paths()
-            .iter()
-            .any(|path| path.ends_with("crates/widget/AGENTS.md")));
+        assert!(
+            tracker
+                .loaded_source_paths()
+                .iter()
+                .any(|path| path.ends_with("crates/widget/AGENTS.md"))
+        );
 
-        assert!(tracker
-            .discover_for_targets(backend, &[target])
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            tracker
+                .discover_for_targets(backend, &[target])
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -562,11 +566,13 @@ mod tests {
                 .unwrap();
         let target = outside.join("src/main.rs").to_string_lossy().to_string();
 
-        assert!(tracker
-            .discover_for_targets(backend, &[target])
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            tracker
+                .discover_for_targets(backend, &[target])
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(unix)]
@@ -586,9 +592,11 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(instructions
-            .render_for_prompt()
-            .contains("shared in-root instructions"));
+        assert!(
+            instructions
+                .render_for_prompt()
+                .contains("shared in-root instructions")
+        );
         assert!(instructions.source_paths()[0].ends_with("AGENTS.md"));
     }
 

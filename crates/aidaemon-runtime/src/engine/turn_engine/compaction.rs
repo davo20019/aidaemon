@@ -7,7 +7,7 @@
 //! tool call from its result. Quota fitting (`fit_run_values`) stays as the
 //! fallback when a summary cannot be produced.
 
-use super::model_call::{with_idle_timeout, STREAMING_MAX_MODEL_CALL};
+use super::model_call::{STREAMING_MAX_MODEL_CALL, with_idle_timeout};
 use super::*;
 pub use crate::engine::compaction::*;
 

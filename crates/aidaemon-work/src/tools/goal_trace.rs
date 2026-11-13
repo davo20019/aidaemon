@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::traits::{GoalTraceStore, TaskActivity, ToolCapabilities};
 use aidaemon_tools::OutcomeTool as Tool;
@@ -320,9 +320,10 @@ impl GoalTraceTool {
                     out.push_str(&format!("\n  error: {}", Self::truncate(err, 180)));
                 }
             } else if t.status == "blocked"
-                && let Some(blocker) = &t.blocker {
-                    out.push_str(&format!("\n  blocker: {}", Self::truncate(blocker, 180)));
-                }
+                && let Some(blocker) = &t.blocker
+            {
+                out.push_str(&format!("\n  blocker: {}", Self::truncate(blocker, 180)));
+            }
         }
 
         Ok(out)

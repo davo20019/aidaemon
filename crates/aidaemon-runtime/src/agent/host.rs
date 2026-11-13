@@ -1,7 +1,7 @@
 //! The agent as the turn engine's host.
 
-use aidaemon_events::stores::{DialogueStateStore, MessageStore};
 use aidaemon_events::EventStore;
+use aidaemon_events::stores::{DialogueStateStore, MessageStore};
 use aidaemon_tools::ExecutionBackend;
 
 use super::Agent;

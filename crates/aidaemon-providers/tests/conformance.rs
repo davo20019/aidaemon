@@ -5,11 +5,11 @@ mod common;
 
 use std::time::Duration;
 
-use aidaemon_core::conformance::{check_provider, PROVIDER_CALLS_PER_REQUEST};
-use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider, StreamingProvider};
 use aidaemon_core::ModelResponse;
+use aidaemon_core::conformance::{PROVIDER_CALLS_PER_REQUEST, check_provider};
+use aidaemon_core::testing::{ScriptedProvider, StreamingProvider, call, text, tool_calls};
 use aidaemon_providers::{Anthropic, OpenAiCompatible};
-use common::{data_events, named_events, MockResponse, MockServer};
+use common::{MockResponse, MockServer, data_events, named_events};
 use serde_json::json;
 
 /// The kit sends `plain` then `with_tool`, each [`PROVIDER_CALLS_PER_REQUEST`]
@@ -220,9 +220,11 @@ async fn provider_errors_are_reported_not_panicked() {
         .unwrap();
     let report = check_provider(&provider).await;
     assert!(!report.is_ok());
-    assert!(report
-        .failure("provider.stream_well_formed/plain")
-        .is_some_and(|r| r.contains("error")));
+    assert!(
+        report
+            .failure("provider.stream_well_formed/plain")
+            .is_some_and(|r| r.contains("error"))
+    );
 }
 
 fn chatgpt_text() -> String {

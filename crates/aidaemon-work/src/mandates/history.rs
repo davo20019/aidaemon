@@ -6,7 +6,7 @@
 //! bodies, outputs, errors, credentials, and internal lease identifiers never
 //! enter the block.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::traits::{
     Intention, MandateDecisionCycle, MandateLearningNote, MandateMutationAttempt,

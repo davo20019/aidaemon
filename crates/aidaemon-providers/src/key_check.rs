@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::routing::ProviderKind;
 use crate::OPENAI_DEFAULT_BASE_URL;
+use crate::routing::ProviderKind;
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_KEY_CHARS: usize = 1024;
@@ -159,7 +159,7 @@ pub async fn check_key(target: &KeyEndpoint, key: &str) -> KeyCheck {
     let response = match send(key).await {
         Ok(response) => response,
         Err(error) if error.is_timeout() => {
-            return KeyCheck::Unverified("the provider timed out".to_string())
+            return KeyCheck::Unverified("the provider timed out".to_string());
         }
         Err(_) => return KeyCheck::Unverified("could not reach the provider".to_string()),
     };

@@ -7,7 +7,7 @@ use aidaemon_channels::context::ChannelContext;
 use aidaemon_events::conversation::Message;
 use aidaemon_events::{DecisionType, EventType};
 use aidaemon_tools::semantics::{ToolCapabilities, UserRole};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use crate::eval::{HarnessEvalAccumulator, HarnessEvalSeed};
@@ -303,9 +303,9 @@ async fn finalize_turn_assessment(
             &turn_context.completion_contract,
         )
         .await
-        {
-            warn!(session_id, %error, "Failed to persist finalized completion contract");
-        }
+    {
+        warn!(session_id, %error, "Failed to persist finalized completion contract");
+    }
 
     Ok(turn_context)
 }

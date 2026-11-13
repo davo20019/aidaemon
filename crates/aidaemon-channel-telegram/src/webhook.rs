@@ -141,9 +141,11 @@ mod tests {
     fn generated_secrets_are_valid_for_telegram() {
         let secret = generate_secret();
         assert_eq!(secret.len(), 48);
-        assert!(secret
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        assert!(
+            secret
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        );
         assert_ne!(secret, generate_secret());
     }
 }

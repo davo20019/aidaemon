@@ -640,18 +640,20 @@ impl RunStates {
     /// one the chat keeps after this. Ignored once the card is known.
     pub fn card_before(&self, id: &str, before: Option<String>) {
         if let Some(entry) = self.lock().get_mut(id)
-            && matches!(entry.state.card, RunCard::Pending { .. }) {
-                entry.state.card = RunCard::Pending { before };
-            }
+            && matches!(entry.state.card, RunCard::Pending { .. })
+        {
+            entry.state.card = RunCard::Pending { before };
+        }
     }
 
     /// Run `id`'s line is drawn on card `message_id`, the card its starting
     /// turn kept. Set once: a later card belongs to a later turn.
     pub fn keep_card(&self, id: &str, message_id: &str) {
         if let Some(entry) = self.lock().get_mut(id)
-            && matches!(entry.state.card, RunCard::Pending { .. }) {
-                entry.state.card = RunCard::Kept(message_id.to_string());
-            }
+            && matches!(entry.state.card, RunCard::Pending { .. })
+        {
+            entry.state.card = RunCard::Kept(message_id.to_string());
+        }
     }
 
     /// Record how run `id` ended, with what the runtime measured, and push
@@ -920,15 +922,16 @@ mod tests {
         assert_eq!(ended.phase, RunPhase::Succeeded);
         let pushed = rx.try_recv().expect("pushed at the transition");
         assert_eq!(pushed.state, ended);
-        assert!(runs
-            .finish(
+        assert!(
+            runs.finish(
                 "job-1",
                 RunEnd::Failed(RunFailure::NoCause),
                 measure(),
                 RunEvidence::default(),
                 report()
             )
-            .is_none());
+            .is_none()
+        );
         assert!(!runs.step("job-1", Step::Output("4".into())));
         assert_eq!(runs.get("job-1").unwrap().phase, RunPhase::Succeeded);
         assert!(runs.running("chat-a").is_empty());
@@ -1122,9 +1125,11 @@ mod tests {
         );
         assert_eq!(RunEnd::of_exit(None).phase(), RunPhase::Stopped);
         assert!(RunEnd::of_exit(None).failure().is_some());
-        assert!(RunEnd::of_exit(Some(1))
-            .line(&RunEvidence::default())
-            .is_some_and(|line| line.contains("exit status 1")));
+        assert!(
+            RunEnd::of_exit(Some(1))
+                .line(&RunEvidence::default())
+                .is_some_and(|line| line.contains("exit status 1"))
+        );
     }
 
     /// `/tasks` lists a background helper from its run record: the step

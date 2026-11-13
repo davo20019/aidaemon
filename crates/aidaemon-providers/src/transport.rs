@@ -7,8 +7,8 @@ use std::time::Duration;
 use aidaemon_core::{ModelResponse, ProviderError, StreamEvent};
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
-use reqwest::header::HeaderMap;
 use reqwest::StatusCode;
+use reqwest::header::HeaderMap;
 use serde_json::Value;
 
 use crate::sse::{SseEvent, SseParser};

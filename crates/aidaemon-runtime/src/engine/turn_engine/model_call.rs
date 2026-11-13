@@ -4,7 +4,7 @@
 use super::*;
 #[cfg(any(test, feature = "testing"))]
 pub use crate::engine::hooks::{
-    raised_output_ceiling, thinking_cutoff_effort, MAX_RAISED_OUTPUT_TOKENS,
+    MAX_RAISED_OUTPUT_TOKENS, raised_output_ceiling, thinking_cutoff_effort,
 };
 
 /// Per-call ceilings: the default, a foreground turn's, a mandate run's.
@@ -24,16 +24,14 @@ pub const MAX_CONTEXT_OVERFLOW_RETRIES: u32 = 2;
 /// Heads a user message taken into a running turn. It joins the request
 /// the turn serves rather than replacing it: several questions sent back to
 /// back all arrive this way, and each still needs its answer.
-pub const STEERING_MARKER: &str =
-    "[The user sent this while you were working. It adds to the current request: \
+pub const STEERING_MARKER: &str = "[The user sent this while you were working. It adds to the current request: \
      still answer or finish everything they asked before it, unless this message \
      changes or cancels that.]";
 
 /// Follows [`STEERING_MARKER`] once the run has declared a checklist. Only
 /// the model can tell whether a message changes the work, and the checklist
 /// is its own statement of that work, so this asks and nothing enforces it.
-pub const STEERING_CHECKLIST_NOTE: &str =
-    "[You declared a checklist for this request. If this message adds, changes or cancels \
+pub const STEERING_CHECKLIST_NOTE: &str = "[You declared a checklist for this request. If this message adds, changes or cancels \
      work, call track_requirements with the full revised list before continuing. If it only \
      clarifies or grants permission, leave the list as it is.]";
 
@@ -223,9 +221,10 @@ impl TurnEngine<'_> {
             .spawn_family
             .active_coordination()
             .and_then(|coordination| coordination.parent_note(scope.session_id))
-            && let Ok(mut extra) = scope.extra_system.lock() {
-                extra.push(note);
-            }
+            && let Ok(mut extra) = scope.extra_system.lock()
+        {
+            extra.push(note);
+        }
         self.sdk_note_delivered_notices(scope).await;
         let run = {
             let raised: Vec<String> = scope
@@ -294,15 +293,15 @@ impl TurnEngine<'_> {
                     && let Some(summary) =
                         crate::engine::mandate_run::committed_non_action_mandate_summary(self.host)
                             .await
-                    {
-                        info!(
-                            task_id = scope.task_id,
-                            "SDK engine: mandate review closed from a committed non-action decision"
-                        );
-                        scope
-                            .verdict
-                            .record_budget_stop(summary, TaskOutcome::Succeeded);
-                    }
+                {
+                    info!(
+                        task_id = scope.task_id,
+                        "SDK engine: mandate review closed from a committed non-action decision"
+                    );
+                    scope
+                        .verdict
+                        .record_budget_stop(summary, TaskOutcome::Succeeded);
+                }
                 return Err(error);
             }
         };
@@ -538,9 +537,10 @@ impl TurnEngine<'_> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = usage;
         if let Some(note) = response.response_note.clone()
-            && let Ok(mut latest) = scope.verdict.response_note.lock() {
-                *latest = Some(note);
-            }
+            && let Ok(mut latest) = scope.verdict.response_note.lock()
+        {
+            *latest = Some(note);
+        }
         scope
             .last_batch_size
             .store(response.tool_calls.len(), Ordering::Relaxed);
@@ -685,8 +685,8 @@ impl TurnEngine<'_> {
         est_input_tokens: u32,
     ) -> Result<Option<crate::engine::mandate_run::MandateRunTokenLease>, sdk::ProviderError> {
         use crate::engine::mandate_run::{
-            acquire_mandate_run_token_lease, mandate_output_token_ceiling,
-            release_mandate_run_token_lease_without_dispatch, MandateRunTokenAdmission,
+            MandateRunTokenAdmission, acquire_mandate_run_token_lease,
+            mandate_output_token_ceiling, release_mandate_run_token_lease_without_dispatch,
         };
         let lease_secs = i64::try_from(MANDATE_MAX_MODEL_CALL.as_secs())
             .unwrap_or(900)

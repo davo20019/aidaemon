@@ -212,7 +212,7 @@ where
                 response: first,
                 usage,
                 repaired: false,
-            })
+            });
         }
         Err(error) => error,
     };
@@ -386,7 +386,7 @@ where
                 value,
                 outcome,
                 repaired: false,
-            })
+            });
         }
         Err(error) => error,
     };

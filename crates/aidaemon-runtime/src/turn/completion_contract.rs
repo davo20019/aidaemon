@@ -145,9 +145,10 @@ impl CompletionContract {
             .scope_task_id
             .as_deref()
             .filter(|prior| *prior != task_id)
-            && !self.adopted_from_task_ids.iter().any(|id| id == prior) {
-                self.adopted_from_task_ids.push(prior.to_string());
-            }
+            && !self.adopted_from_task_ids.iter().any(|id| id == prior)
+        {
+            self.adopted_from_task_ids.push(prior.to_string());
+        }
         self.scope_task_id = Some(task_id.to_string());
     }
 
@@ -308,10 +309,10 @@ pub fn inherit_unfinished_request_contract(
 ) -> CompletionContract {
     if let Some(origin) = unfinished.scope_task_id.as_ref()
         && current.scope_task_id.as_ref() != Some(origin)
-            && !current.adopted_from_task_ids.contains(origin)
-        {
-            current.adopted_from_task_ids.push(origin.clone());
-        }
+        && !current.adopted_from_task_ids.contains(origin)
+    {
+        current.adopted_from_task_ids.push(origin.clone());
+    }
     for origin in &unfinished.adopted_from_task_ids {
         if current.scope_task_id.as_ref() != Some(origin)
             && !current.adopted_from_task_ids.contains(origin)
@@ -443,10 +444,10 @@ pub fn inherit_request_constraints(
 ) -> CompletionContract {
     if let Some(origin) = antecedent.scope_task_id.as_ref()
         && current.scope_task_id.as_ref() != Some(origin)
-            && !current.adopted_from_task_ids.contains(origin)
-        {
-            current.adopted_from_task_ids.push(origin.clone());
-        }
+        && !current.adopted_from_task_ids.contains(origin)
+    {
+        current.adopted_from_task_ids.push(origin.clone());
+    }
     for origin in &antecedent.adopted_from_task_ids {
         if current.scope_task_id.as_ref() != Some(origin)
             && !current.adopted_from_task_ids.contains(origin)
@@ -1073,14 +1074,16 @@ impl CompletionProgress {
                 } else {
                     effects.contains(required_effect)
                 };
-                if observed_matches && self.mutation_obligation_ids.contains(&obligation_id)
+                if observed_matches
+                    && self.mutation_obligation_ids.contains(&obligation_id)
                     && let Err(error) = self.proof_graph.satisfy_with_evidence(
                         &obligation_id,
                         &receipt_id,
                         Some(tool_call_id.to_string()),
-                    ) {
-                        tracing::warn!(%error, %obligation_id, "Completion proof was rejected");
-                    }
+                    )
+                {
+                    tracing::warn!(%error, %obligation_id, "Completion proof was rejected");
+                }
             }
             let generic_id = self.scoped_node_id("obligation:mutation:any");
             if self.proof_graph_initialized
@@ -1092,41 +1095,42 @@ impl CompletionProgress {
                     &generic_id,
                     &receipt_id,
                     Some(tool_call_id.to_string()),
-                ) {
-                    tracing::warn!(%error, "Generic mutation completion proof was rejected");
-                }
+                )
+            {
+                tracing::warn!(%error, "Generic mutation completion proof was rejected");
+            }
         }
         if contract.requires_reverification_after_mutation {
             self.verification_pending = true;
             if self.proof_graph_initialized
-                && let Some(receipt_id) = self.record_receipt_node(tool_call_id) {
-                    let mut invalidated = self
-                        .verification_obligation_id
+                && let Some(receipt_id) = self.record_receipt_node(tool_call_id)
+            {
+                let mut invalidated = self
+                    .verification_obligation_id
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                invalidated.extend(
+                    contract
+                        .evidence_requirements
                         .iter()
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    invalidated.extend(
-                        contract
-                            .evidence_requirements
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(index, requirement)| {
-                                matches!(
-                                    requirement.temporal_scope,
-                                    aidaemon_events::traits::EvidenceTemporalScope::Current
-                                        | aidaemon_events::traits::EvidenceTemporalScope::Both
-                                )
-                                .then(|| self.evidence_obligation_ids.get(index).cloned())
-                                .flatten()
-                            }),
-                    );
-                    for obligation_id in invalidated {
-                        if let Err(error) = self.proof_graph.invalidate(&receipt_id, &obligation_id)
-                        {
-                            tracing::warn!(%error, %obligation_id, "Verification invalidation was rejected");
-                        }
+                        .enumerate()
+                        .filter_map(|(index, requirement)| {
+                            matches!(
+                                requirement.temporal_scope,
+                                aidaemon_events::traits::EvidenceTemporalScope::Current
+                                    | aidaemon_events::traits::EvidenceTemporalScope::Both
+                            )
+                            .then(|| self.evidence_obligation_ids.get(index).cloned())
+                            .flatten()
+                        }),
+                );
+                for obligation_id in invalidated {
+                    if let Err(error) = self.proof_graph.invalidate(&receipt_id, &obligation_id) {
+                        tracing::warn!(%error, %obligation_id, "Verification invalidation was rejected");
                     }
                 }
+            }
         }
     }
 
@@ -2601,9 +2605,11 @@ mod tests {
 
         assert_eq!(inherited.task_kind, CompletionTaskKind::Change);
         assert!(inherited.expects_mutation);
-        assert!(inherited
-            .required_mutation_effects
-            .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE));
+        assert!(
+            inherited
+                .required_mutation_effects
+                .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE)
+        );
         assert!(inherited.requires_observation);
         assert!(inherited.requires_reverification_after_mutation);
         assert!(inherited.explicit_verification_requested);
@@ -2731,9 +2737,11 @@ mod tests {
 
         let inherited = inherit_request_constraints(current, &antecedent);
         assert!(inherited.forbids_tool_use);
-        assert!(inherited
-            .forbidden_tool_scopes
-            .contains(&aidaemon_events::traits::ToolSemanticScope::UserMemory));
+        assert!(
+            inherited
+                .forbidden_tool_scopes
+                .contains(&aidaemon_events::traits::ToolSemanticScope::UserMemory)
+        );
         assert_eq!(inherited.required_response_fields, ["current_field"]);
         assert!(inherited.evidence_requirements.is_empty());
         assert!(inherited.verification_targets.is_empty());
@@ -2791,10 +2799,12 @@ mod tests {
                 .node_kind("task:task-other/request"),
             Some(ExecutionNodeKind::Request)
         );
-        assert!(current_progress
-            .proof_graph
-            .node_kind("task:task-other/request")
-            .is_none());
+        assert!(
+            current_progress
+                .proof_graph
+                .node_kind("task:task-other/request")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2826,9 +2836,11 @@ mod tests {
         let contract = infer_completion_contract(enriched, &[]);
         assert_eq!(contract.task_kind, CompletionTaskKind::Deliver);
         assert!(contract.expects_mutation);
-        assert!(contract
-            .required_mutation_effects
-            .contains(ToolMutationEffects::EXTERNAL_DELIVERY));
+        assert!(
+            contract
+                .required_mutation_effects
+                .contains(ToolMutationEffects::EXTERNAL_DELIVERY)
+        );
     }
 
     #[test]
@@ -2862,8 +2874,7 @@ mod tests {
     #[test]
     fn enriched_current_request_mutation_still_expects_mutation() {
         // The fix must not suppress a mutation expressed in the CURRENT request.
-        let enriched =
-            "Original request:\nWhat files are in ~/projects?\n\nCurrent request:\nCreate a \
+        let enriched = "Original request:\nWhat files are in ~/projects?\n\nCurrent request:\nCreate a \
              README in that folder.";
         let contract = infer_completion_contract(enriched, &[]);
         assert_eq!(contract.task_kind, CompletionTaskKind::Change);
@@ -2903,9 +2914,11 @@ mod tests {
         let contract = infer_completion_contract("Email this note to Alice.", &[]);
         assert_eq!(contract.task_kind, CompletionTaskKind::Deliver);
         assert!(contract.expects_mutation);
-        assert!(contract
-            .required_mutation_effects
-            .contains(ToolMutationEffects::EXTERNAL_DELIVERY));
+        assert!(
+            contract
+                .required_mutation_effects
+                .contains(ToolMutationEffects::EXTERNAL_DELIVERY)
+        );
         assert!(!contract.requires_observation);
         assert!(!contract.requires_reverification_after_mutation);
     }
@@ -3214,9 +3227,11 @@ mod tests {
             Compose and POST exactly one tweet, then verify it once.";
         let contract = infer_completion_contract(request, &[]);
 
-        assert!(!contract
-            .forbidden_mutation_actions
-            .contains(&ForbiddenMutationAction::Post));
+        assert!(
+            !contract
+                .forbidden_mutation_actions
+                .contains(&ForbiddenMutationAction::Post)
+        );
     }
 
     #[test]
@@ -3260,17 +3275,22 @@ mod tests {
             "Build the existing project and report any compiler errors.",
             &[],
         );
-        assert!(!build
-            .required_mutation_effects
-            .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE));
+        assert!(
+            !build
+                .required_mutation_effects
+                .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE)
+        );
 
         let edit = infer_completion_contract("Remove the unused function from the code.", &[]);
-        assert!(edit
-            .required_mutation_effects
-            .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE));
-        assert!(!edit
-            .required_mutation_effects
-            .contains(ToolMutationEffects::DESTRUCTIVE));
+        assert!(
+            edit.required_mutation_effects
+                .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE)
+        );
+        assert!(
+            !edit
+                .required_mutation_effects
+                .contains(ToolMutationEffects::DESTRUCTIVE)
+        );
     }
 
     #[test]

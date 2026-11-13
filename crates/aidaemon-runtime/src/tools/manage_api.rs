@@ -6,17 +6,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use aidaemon_skills::tools::{ApiSafeProbe, LearnedApiArtifact, ManageSkillsTool};
 use aidaemon_skills::SkillsStore;
+use aidaemon_skills::tools::{ApiSafeProbe, LearnedApiArtifact, ManageSkillsTool};
 use aidaemon_tools::config_file::ConfigFile;
 use aidaemon_tools::http_request::HttpRequestTool;
+use aidaemon_tools::services::OAuthStore;
 use aidaemon_tools::services::manage_http_auth::ManageHttpAuthTool;
 use aidaemon_tools::services::manage_oauth::ManageOAuthTool;
 use aidaemon_tools::services::oauth::{OAuthGateway, SharedHttpProfiles};
-use aidaemon_tools::services::OAuthStore;
 use aidaemon_tools::status::StatusUpdate;
 use aidaemon_tools::web_search::{SearchBackend, SearchConfig, SearchResult};
 
@@ -1386,12 +1386,16 @@ mod tests {
         let OwnerApprovalNeed::Ask(request) = judge_onboard(&tool, both, false).await else {
             panic!("must ask");
         };
-        assert!(request
-            .summary
-            .starts_with("Update manual API auth profile"));
-        assert!(request
-            .subject
-            .ends_with("manage_api probe POST https://docs.example.invalid/graphql"));
+        assert!(
+            request
+                .summary
+                .starts_with("Update manual API auth profile")
+        );
+        assert!(
+            request
+                .subject
+                .ends_with("manage_api probe POST https://docs.example.invalid/graphql")
+        );
     }
 
     /// An OAuth onboarding that registers a provider carries the

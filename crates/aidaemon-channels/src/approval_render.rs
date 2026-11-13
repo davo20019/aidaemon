@@ -763,10 +763,12 @@ mod tests {
         assert!(pages.len() > 1);
         assert!(pages.iter().all(|page| page.len() <= 4_096));
         assert!(pages.last().unwrap().contains(final_marker));
-        assert!(pages
-            .last()
-            .unwrap()
-            .contains("Approve and activate this plan, or cancel"));
+        assert!(
+            pages
+                .last()
+                .unwrap()
+                .contains("Approve and activate this plan, or cancel")
+        );
         assert!(pages.iter().any(|page| page.contains("<unescaped>")));
     }
 

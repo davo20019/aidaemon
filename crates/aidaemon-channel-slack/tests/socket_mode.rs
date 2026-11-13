@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use aidaemon_channel_slack::SlackChannel;
 use aidaemon_channels::{Channel, ChannelError, ChannelEvent, ConversationKind};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use support::*;
 use tokio::sync::mpsc;
 use tokio::time::timeout;

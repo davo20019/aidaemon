@@ -15,10 +15,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 
+use crate::Embedder;
 use crate::episodes::TranscriptEntry;
 use crate::history::{ActivityLog, LoggedTurn, TurnRole, UncapturedSessions};
 use crate::stores::MemoryStores;
-use crate::Embedder;
 
 /// A background model call the jobs make.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

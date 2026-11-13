@@ -352,10 +352,11 @@ pub fn prune_spill_dir() {
             };
             for file in files.flatten() {
                 if let Ok(meta) = file.metadata()
-                    && meta.is_file() {
-                        let mtime = meta.modified().unwrap_or(now);
-                        entries.push((file.path(), mtime, meta.len()));
-                    }
+                    && meta.is_file()
+                {
+                    let mtime = meta.modified().unwrap_or(now);
+                    entries.push((file.path(), mtime, meta.len()));
+                }
             }
         }
     }

@@ -236,10 +236,12 @@ async fn ask_renders_buttons_with_encoded_values() {
     assert_eq!(buttons[0]["text"]["text"], "Approve");
     assert_eq!(buttons[1]["text"]["text"], "Deny");
     for (button, choice) in buttons.iter().zip(["approve", "deny"]) {
-        assert!(button["action_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("aidaemon_approval"));
+        assert!(
+            button["action_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("aidaemon_approval")
+        );
         let value: serde_json::Value =
             serde_json::from_str(button["value"].as_str().unwrap()).unwrap();
         assert_eq!(value, json!({ "p": "prompt-42", "c": choice }));

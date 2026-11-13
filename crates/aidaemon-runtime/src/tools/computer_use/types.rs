@@ -191,10 +191,11 @@ pub fn format_condensed_refresh(snapshot: &AppSnapshot, focus_index: Option<u32>
     out.push_str(&format!("snapshot_generation={}\n", snapshot.generation));
     out.push_str("[condensed refresh after mutation]\n");
     if let Some(idx) = focus_index
-        && let Some(el) = snapshot.elements.iter().find(|e| e.index == idx) {
-            out.push_str("focus_element:\n");
-            out.push_str(&format_element_line(el));
-        }
+        && let Some(el) = snapshot.elements.iter().find(|e| e.index == idx)
+    {
+        out.push_str("focus_element:\n");
+        out.push_str(&format_element_line(el));
+    }
     // List ALL interactive (clickable) controls, not just the first few. After a
     // click the layout's other buttons (e.g. a calculator's "9", "+", "=") must
     // still be visible by index, otherwise the model re-runs the full, expensive

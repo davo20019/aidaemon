@@ -3,9 +3,9 @@
 
 use super::*;
 pub use crate::engine::hooks::{
-    read_only_tool_names, same_tool_streaks, tool_spec, tool_spec_from_schema, AfterCallRecord,
-    BudgetGate, CutoffAdjust, DispatchGate, LedgerStop, ModelRetry, StuckNotice, TextOnlyNext,
-    SAME_TOOL_LIMITS,
+    AfterCallRecord, BudgetGate, CutoffAdjust, DispatchGate, LedgerStop, ModelRetry,
+    SAME_TOOL_LIMITS, StuckNotice, TextOnlyNext, read_only_tool_names, same_tool_streaks,
+    tool_spec, tool_spec_from_schema,
 };
 
 /// Where a hook sits in the turn's `before_tool` chain.
@@ -102,9 +102,10 @@ pub struct ModelPin {
 impl sdk::Hook for ModelPin {
     async fn before_model(&self, _ctx: &sdk::HookContext<'_>, request: &mut sdk::ModelRequest) {
         if let Some(computer_use) = &self.computer_use
-            && let Some(model) = computer_use.pinned_model(&self.task_id).await {
-                request.model = model;
-            }
+            && let Some(model) = computer_use.pinned_model(&self.task_id).await
+        {
+            request.model = model;
+        }
     }
 }
 

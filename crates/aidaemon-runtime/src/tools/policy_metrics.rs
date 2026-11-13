@@ -1,7 +1,7 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::tools::traits::{Tool, ToolCapabilities, ToolRole};
 
@@ -254,45 +254,65 @@ mod tests {
 
         assert!(parsed.get("metrics").is_some());
         assert!(parsed.get("derived").is_some());
-        assert!(parsed
-            .get("metrics")
-            .and_then(|m| m.get("response_direct_return_total"))
-            .is_some());
-        assert!(parsed
-            .get("metrics")
-            .and_then(|m| m.get("response_fallthrough_total"))
-            .is_some());
-        assert!(parsed
-            .get("metrics")
-            .and_then(|m| m.get("orchestration_route_tools_required_total"))
-            .is_some());
-        assert!(parsed
-            .get("metrics")
-            .and_then(|m| m.get("tokens_failed_tasks_total"))
-            .is_some());
-        assert!(parsed
-            .get("metrics")
-            .and_then(|m| m.get("est_input_token_samples"))
-            .is_some());
-        assert!(parsed
-            .get("metrics")
-            .and_then(|m| m.get("est_tool_tokens_total"))
-            .is_some());
-        assert!(parsed
-            .get("metrics")
-            .and_then(|m| m.get("no_progress_iterations_total"))
-            .is_some());
-        assert!(parsed
-            .get("metrics")
-            .and_then(|m| m.get("cross_scope_blocked_total"))
-            .is_some());
-        assert!(parsed
-            .get("metrics")
-            .and_then(|m| m.get("deferred_no_tool_forced_required_total"))
-            .is_some());
-        assert!(parsed
-            .get("metrics")
-            .and_then(|m| m.get("deferred_no_tool_model_switch_total"))
-            .is_some());
+        assert!(
+            parsed
+                .get("metrics")
+                .and_then(|m| m.get("response_direct_return_total"))
+                .is_some()
+        );
+        assert!(
+            parsed
+                .get("metrics")
+                .and_then(|m| m.get("response_fallthrough_total"))
+                .is_some()
+        );
+        assert!(
+            parsed
+                .get("metrics")
+                .and_then(|m| m.get("orchestration_route_tools_required_total"))
+                .is_some()
+        );
+        assert!(
+            parsed
+                .get("metrics")
+                .and_then(|m| m.get("tokens_failed_tasks_total"))
+                .is_some()
+        );
+        assert!(
+            parsed
+                .get("metrics")
+                .and_then(|m| m.get("est_input_token_samples"))
+                .is_some()
+        );
+        assert!(
+            parsed
+                .get("metrics")
+                .and_then(|m| m.get("est_tool_tokens_total"))
+                .is_some()
+        );
+        assert!(
+            parsed
+                .get("metrics")
+                .and_then(|m| m.get("no_progress_iterations_total"))
+                .is_some()
+        );
+        assert!(
+            parsed
+                .get("metrics")
+                .and_then(|m| m.get("cross_scope_blocked_total"))
+                .is_some()
+        );
+        assert!(
+            parsed
+                .get("metrics")
+                .and_then(|m| m.get("deferred_no_tool_forced_required_total"))
+                .is_some()
+        );
+        assert!(
+            parsed
+                .get("metrics")
+                .and_then(|m| m.get("deferred_no_tool_model_switch_total"))
+                .is_some()
+        );
     }
 }

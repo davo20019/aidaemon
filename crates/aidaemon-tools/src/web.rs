@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use reqwest::redirect::Policy;
 use reqwest::{Client, StatusCode, Url};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use aidaemon_core::{
     AccessManifest, CallEffects, EffectClass, EffectKey, Hook, HookContext, Tool, ToolAnnotations,
@@ -24,7 +24,7 @@ use aidaemon_core::{
 };
 
 use crate::fs::ToolText;
-use crate::outcome::{spec_of, OutcomeTool};
+use crate::outcome::{OutcomeTool, spec_of};
 use crate::semantics::{
     NetworkReach, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
     ToolCapabilities, ToolTargetHintKind, ToolVerificationMode,
@@ -84,7 +84,7 @@ pub fn validate_url_for_ssrf(url: &str) -> Result<(), String> {
             return Err(format!(
                 "Blocked scheme '{}': only http/https allowed",
                 scheme
-            ))
+            ));
         }
     }
 
@@ -142,9 +142,10 @@ pub fn validate_url_for_ssrf(url: &str) -> Result<(), String> {
         Err(_) => {
             // If we can't resolve, it might be a raw IP - try parsing it
             if let Ok(ip) = host.parse::<IpAddr>()
-                && is_blocked_ip(ip) {
-                    return Err(format!("Blocked IP address: {}", ip));
-                }
+                && is_blocked_ip(ip)
+            {
+                return Err(format!("Blocked IP address: {}", ip));
+            }
             // If resolution fails and it's not an IP, let the request fail naturally
         }
     }
@@ -412,10 +413,10 @@ pub fn classify_blocked_host(url: &str) -> Option<BlockedHostClass> {
     // Named loopback / metadata hosts (mirrors BLOCKED_HOSTS in validate_url_for_ssrf).
     match host_lower.as_str() {
         "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0" => {
-            return Some(BlockedHostClass::Loopback)
+            return Some(BlockedHostClass::Loopback);
         }
         "metadata.google.internal" | "metadata.goog" | "169.254.169.254" => {
-            return Some(BlockedHostClass::LinkLocalMetadata)
+            return Some(BlockedHostClass::LinkLocalMetadata);
         }
         _ => {}
     }
@@ -448,9 +449,10 @@ pub fn classify_blocked_host(url: &str) -> Option<BlockedHostClass> {
         Err(_) => {
             // Couldn't resolve via DNS — try parsing the host as a raw IP.
             if let Ok(ip) = host.parse::<IpAddr>()
-                && let Some(class) = classify_blocked_ip(ip) {
-                    return Some(class);
-                }
+                && let Some(class) = classify_blocked_ip(ip)
+            {
+                return Some(class);
+            }
             // Unresolvable non-IP host: let the request fail naturally (matches
             // validate_url_for_ssrf). Not classified as blocked here.
         }
@@ -795,9 +797,10 @@ impl WebFetch {
     /// Check the policy, send the request and read the capped body.
     async fn fetch(&self, url: &str, follow: bool, read_error_body: bool) -> anyhow::Result<Fetch> {
         if !self.allow_private
-            && let Err(reason) = validate_url_for_ssrf(url) {
-                return Ok(Fetch::Blocked(reason));
-            }
+            && let Err(reason) = validate_url_for_ssrf(url)
+        {
+            return Ok(Fetch::Blocked(reason));
+        }
         let response = self.client_for(url, follow)?.get(url).send().await?;
         let status = response.status();
         let final_url = response.url().to_string();
@@ -951,7 +954,7 @@ impl OutcomeTool for WebFetch {
             Fetch::Blocked(reason) => {
                 return Ok(ToolCallOutcome::from_output(format!(
                     "Request blocked: {reason}"
-                )))
+                )));
             }
             Fetch::Response(fetched) => fetched,
         };
@@ -1049,12 +1052,12 @@ impl Tool for WebFetch {
         let fetched = match result {
             Ok(Fetch::Blocked(reason)) => {
                 return Ok(fail(format!("Request blocked: {reason}"))
-                    .with_details(json!({"url": url.as_str(), "host": host})))
+                    .with_details(json!({"url": url.as_str(), "host": host})));
             }
             Ok(Fetch::Response(fetched)) => fetched,
             Err(e) => {
                 return Ok(fail(format!("request to {url} failed: {e}"))
-                    .with_details(json!({"url": url.as_str(), "host": host})))
+                    .with_details(json!({"url": url.as_str(), "host": host})));
             }
         };
         let Fetched {
@@ -1478,9 +1481,10 @@ mod tests {
             .call(json!({"url": format!("{base}/big")}), &ctx())
             .await
             .unwrap();
-        assert!(out
-            .content
-            .contains("[Content truncated to 1000 characters.]"));
+        assert!(
+            out.content
+                .contains("[Content truncated to 1000 characters.]")
+        );
         assert_eq!(out.details["truncated"], true);
 
         let out = tool
@@ -1618,13 +1622,15 @@ mod tests {
     #[test]
     fn validates_scheme_and_declares_host() {
         let tool = WebFetch::new();
-        assert!(tool
-            .validate(&json!({"url": "file:///etc/passwd"}))
-            .is_err());
+        assert!(
+            tool.validate(&json!({"url": "file:///etc/passwd"}))
+                .is_err()
+        );
         assert!(tool.validate(&json!({"url": "not a url"})).is_err());
-        assert!(tool
-            .validate(&json!({"url": "https://example.com/x"}))
-            .is_ok());
+        assert!(
+            tool.validate(&json!({"url": "https://example.com/x"}))
+                .is_ok()
+        );
         assert_eq!(
             tool.access(&json!({"url": "https://docs.example.com/a?b=c"}))
                 .hosts,
@@ -1909,11 +1915,12 @@ mod format_tests {
         assert!(!text.contains("OUTPUT TRUNCATED"));
         let info = truncation.expect("truncation info");
         assert_eq!(info.total_chars, 9000);
-        assert!(info
-            .remediation_hint
-            .as_deref()
-            .unwrap_or("")
-            .contains("max_chars"));
+        assert!(
+            info.remediation_hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("max_chars")
+        );
     }
 }
 

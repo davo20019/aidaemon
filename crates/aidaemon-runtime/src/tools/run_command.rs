@@ -1,6 +1,6 @@
 use crate::tools::traits::ToolSemantics;
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 use crate::tools::traits::{
@@ -21,8 +21,7 @@ impl RunCommandTool {
         Self { backend }
     }
 }
-const SAFE_NPM_PREFIX_HINT: &str =
-    "`npm test`, `npm ls`, `npm outdated`, `npm audit` (note: `npm run` and `npx` require `terminal` approval)";
+const SAFE_NPM_PREFIX_HINT: &str = "`npm test`, `npm ls`, `npm outdated`, `npm audit` (note: `npm run` and `npx` require `terminal` approval)";
 
 /// Safe command prefixes that don't require terminal approval flow.
 ///
@@ -285,7 +284,9 @@ impl RunCommandTool {
         // Reject shell operators
         if aidaemon_policies::contains_shell_operator(trimmed) {
             return Ok(routing_rejection(
-                format!("Shell operators (;, |, &&, ||, $(), etc.) are not allowed in run_command. Use 'terminal' for complex commands. {NOT_RUN_ROUTE}"),
+                format!(
+                    "Shell operators (;, |, &&, ||, $(), etc.) are not allowed in run_command. Use 'terminal' for complex commands. {NOT_RUN_ROUTE}"
+                ),
                 "terminal",
             ));
         }
@@ -421,9 +422,10 @@ impl RunCommandTool {
         let mut actual_access_manifest = self.call_access_manifest(arguments);
         for path in adapter_read_paths {
             if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path)
-                && !actual_access_manifest.read_targets.contains(&target) {
-                    actual_access_manifest.read_targets.push(target);
-                }
+                && !actual_access_manifest.read_targets.contains(&target)
+            {
+                actual_access_manifest.read_targets.push(target);
+            }
         }
         Ok(ToolCallOutcome {
             output,

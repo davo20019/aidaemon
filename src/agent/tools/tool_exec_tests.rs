@@ -4,7 +4,7 @@
 use super::*;
 use crate::types::WorkspaceGrant;
 pub(super) use aidaemon_runtime::engine::dispatcher::{
-    sanitize_workspace_tool_outcome, ToolDispatch as _,
+    ToolDispatch as _, sanitize_workspace_tool_outcome,
 };
 pub(super) use aidaemon_runtime::engine::tool_exec::{ToolExecCtx, UnknownToolError};
 
@@ -176,8 +176,10 @@ mod scoped_workspace_tests {
         )
         .await
         .unwrap();
-        assert!(std::path::Path::new(allowed["path"].as_str().unwrap())
-            .starts_with(std::path::Path::new(&grant.project_root)));
+        assert!(
+            std::path::Path::new(allowed["path"].as_str().unwrap())
+                .starts_with(std::path::Path::new(&grant.project_root))
+        );
 
         let missing_parent = scoped_workspace_arguments(
             "write_file",

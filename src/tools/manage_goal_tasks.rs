@@ -8,14 +8,14 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::store_prelude::*;
     use crate::traits::Goal;
     use crate::traits::StateStore;
     use crate::traits::Task;
     use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
-    use serde_json::json;
+    use crate::traits::store_prelude::*;
     use serde_json::Value;
+    use serde_json::json;
     use std::sync::Arc;
 
     async fn setup_test_state() -> (Arc<dyn StateStore>, String) {
@@ -1320,10 +1320,12 @@ mod tests {
         let results = ctx["task_results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["description"], "Build the frontend");
-        assert!(results[0]["result_summary"]
-            .as_str()
-            .unwrap()
-            .contains("React frontend"));
+        assert!(
+            results[0]["result_summary"]
+                .as_str()
+                .unwrap()
+                .contains("React frontend")
+        );
     }
 
     #[tokio::test]
@@ -1614,8 +1616,10 @@ mod tests {
             .output;
         assert!(!result.contains("Cannot create task"), "{result}");
         let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
-        assert!(tasks
-            .iter()
-            .any(|task| task.description == "Publish exactly one synthetic post"));
+        assert!(
+            tasks
+                .iter()
+                .any(|task| task.description == "Publish exactly one synthetic post")
+        );
     }
 }

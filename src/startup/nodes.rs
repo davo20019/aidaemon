@@ -6,7 +6,7 @@ use crate::config::AppConfig;
 use crate::nodes::channel::NodeChannel;
 use crate::nodes::gateway::{NodeGatewayState, NodeRateLimiter};
 use crate::nodes::service::{AgentNodeConversationIngress, NodeService};
-use crate::nodes::{auth, NodeStore};
+use crate::nodes::{NodeStore, auth};
 use crate::traits::HubChannel;
 
 pub async fn start(

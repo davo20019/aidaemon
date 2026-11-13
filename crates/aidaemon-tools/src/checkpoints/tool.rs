@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::semantics::{ToolCallSemantics, ToolCapabilities, ToolRole};
 use crate::OutcomeTool as Tool;
+use crate::semantics::{ToolCallSemantics, ToolCapabilities, ToolRole};
 
 /// Read-only owner tool for inspecting external workspace checkpoints.
 pub struct ListCheckpointsTool;

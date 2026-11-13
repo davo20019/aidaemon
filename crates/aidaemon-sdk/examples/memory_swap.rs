@@ -8,11 +8,11 @@
 //! cargo run -p aidaemon-sdk --example memory_swap --features "testing memory"
 use std::sync::{Arc, Mutex};
 
+use aidaemon_sdk::FnTool;
 use aidaemon_sdk::memory::{HashEmbedder, InMemoryMemoryStore, Memory, ScopedMemory};
 use aidaemon_sdk::policies::{MemoryInjection, MemoryParts, MemorySystem, MemoryTurn, Recall};
 use aidaemon_sdk::prelude::*;
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
-use aidaemon_sdk::FnTool;
+use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
 use serde_json::json;
 
 /// A notebook: a `remember` tool writes a line, and every line is shown to

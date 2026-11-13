@@ -6,17 +6,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, text, tool_calls};
 use aidaemon_core::{
     AccessManifest, Agent, HookContext, ReceiptStatus, Resolution, RunStatus, Tool,
     ToolAnnotations, ToolCall, ToolContext, ToolDecision, ToolInfo, ToolOutput, ToolResult,
     ToolSpec,
 };
 use aidaemon_policies::{
-    resolve_path, ApprovalMode, ApprovalPolicy, ApprovalRules, RuleDecision, ScopeGuard,
+    ApprovalMode, ApprovalPolicy, ApprovalRules, RuleDecision, ScopeGuard, resolve_path,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct Env {
     _tmp: tempfile::TempDir,

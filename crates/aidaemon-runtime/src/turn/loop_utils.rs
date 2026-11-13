@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use aidaemon_events::traits::ToolOutcomeStatus;
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::sync::LazyLock;
 use tracing::warn;
@@ -205,9 +205,10 @@ fn classify_json_error(value: &Value) -> Option<ToolFailureClass> {
             ] {
                 if let Some(status_value) = map.get(key)
                     && let Some(status) = extract_status_from_value(status_value)
-                        && let Some(kind) = classify_http_status(status) {
-                            return Some(kind);
-                        }
+                    && let Some(kind) = classify_http_status(status)
+                {
+                    return Some(kind);
+                }
             }
 
             if map.get("success").and_then(Value::as_bool) == Some(false)
@@ -215,9 +216,10 @@ fn classify_json_error(value: &Value) -> Option<ToolFailureClass> {
             {
                 if let Some(error_value) = map.get("error")
                     && !error_value.is_null()
-                        && let Some(kind) = classify_json_error(error_value) {
-                            return Some(kind);
-                        }
+                    && let Some(kind) = classify_json_error(error_value)
+                {
+                    return Some(kind);
+                }
                 if let Some(message) = map.get("message").and_then(Value::as_str) {
                     let lower = message.to_ascii_lowercase();
                     if looks_like_error_signal(&lower) {
@@ -228,12 +230,13 @@ fn classify_json_error(value: &Value) -> Option<ToolFailureClass> {
             }
 
             if let Some(error_value) = map.get("error")
-                && !error_value.is_null() {
-                    if let Some(kind) = classify_json_error(error_value) {
-                        return Some(kind);
-                    }
-                    return Some(ToolFailureClass::Semantic);
+                && !error_value.is_null()
+            {
+                if let Some(kind) = classify_json_error(error_value) {
+                    return Some(kind);
                 }
+                return Some(ToolFailureClass::Semantic);
+            }
 
             if let Some(errors_value) = map.get("errors") {
                 match errors_value {
@@ -287,9 +290,10 @@ fn extract_http_status_from_text(text: &str) -> Option<u16> {
     let caps = HTTP_STATUS_RE.captures(text)?;
     for idx in 1..caps.len() {
         if let Some(m) = caps.get(idx)
-            && let Ok(code) = m.as_str().parse::<u16>() {
-                return Some(code);
-            }
+            && let Ok(code) = m.as_str().parse::<u16>()
+        {
+            return Some(code);
+        }
     }
     None
 }
@@ -340,17 +344,19 @@ fn classify_embedded_json_error(text: &str) -> Option<ToolFailureClass> {
                 }
                 depth -= 1;
                 if depth == 0
-                    && let Some(s) = start.take() {
-                        let end = idx + ch.len_utf8();
-                        if let Ok(value) = serde_json::from_str::<Value>(&text[s..end])
-                            && let Some(kind) = classify_json_error(&value) {
-                                return Some(kind);
-                            }
-                        candidates += 1;
-                        if candidates >= 8 {
-                            break;
-                        }
+                    && let Some(s) = start.take()
+                {
+                    let end = idx + ch.len_utf8();
+                    if let Ok(value) = serde_json::from_str::<Value>(&text[s..end])
+                        && let Some(kind) = classify_json_error(&value)
+                    {
+                        return Some(kind);
                     }
+                    candidates += 1;
+                    if candidates >= 8 {
+                        break;
+                    }
+                }
             }
             _ => {}
         }
@@ -362,11 +368,7 @@ fn classify_embedded_json_error(text: &str) -> Option<ToolFailureClass> {
 fn extract_nonzero_exit_code(text: &str) -> Option<i32> {
     let captures = EXIT_CODE_RE.captures(text)?;
     let parsed = captures.get(1)?.as_str().parse::<i32>().ok()?;
-    if parsed == 0 {
-        None
-    } else {
-        Some(parsed)
-    }
+    if parsed == 0 { None } else { Some(parsed) }
 }
 
 /// Tools whose results are file/data content, not tool execution status.
@@ -478,15 +480,16 @@ pub fn classify_tool_result_failure(
     }
 
     if (cleaned.starts_with('{') || cleaned.starts_with('['))
-        && let Ok(value) = serde_json::from_str::<Value>(cleaned) {
-            if let Some(kind) = classify_json_error(&value) {
-                return Some(kind);
-            }
-            // Valid structured output with no error-bearing value is a
-            // successful data result. Do not scan JSON field names such as
-            // `watchdog_timeout_seconds` as if they were failure prose.
-            return None;
+        && let Ok(value) = serde_json::from_str::<Value>(cleaned)
+    {
+        if let Some(kind) = classify_json_error(&value) {
+            return Some(kind);
         }
+        // Valid structured output with no error-bearing value is a
+        // successful data result. Do not scan JSON field names such as
+        // `watchdog_timeout_seconds` as if they were failure prose.
+        return None;
+    }
 
     if let Some(kind) = classify_embedded_json_error(cleaned) {
         return Some(kind);
@@ -804,16 +807,16 @@ pub fn merge_consecutive_messages(messages: &mut Vec<Value>) {
                     .get("tool_calls")
                     .and_then(|v| v.as_array())
                     .cloned()
+            {
+                if let Some(prev_tcs) = messages[i - 1]
+                    .get_mut("tool_calls")
+                    .and_then(|v| v.as_array_mut())
                 {
-                    if let Some(prev_tcs) = messages[i - 1]
-                        .get_mut("tool_calls")
-                        .and_then(|v| v.as_array_mut())
-                    {
-                        prev_tcs.extend(curr_tcs);
-                    } else {
-                        messages[i - 1]["tool_calls"] = json!(curr_tcs);
-                    }
+                    prev_tcs.extend(curr_tcs);
+                } else {
+                    messages[i - 1]["tool_calls"] = json!(curr_tcs);
                 }
+            }
             messages.remove(i);
         } else {
             i += 1;
@@ -824,8 +827,8 @@ pub fn merge_consecutive_messages(messages: &mut Vec<Value>) {
 #[cfg(test)]
 mod tool_error_detection_tests {
     use super::{
-        classify_tool_result_failure, classify_tool_result_failure_with_args,
-        classify_tool_result_failure_with_context, ToolFailureClass,
+        ToolFailureClass, classify_tool_result_failure, classify_tool_result_failure_with_args,
+        classify_tool_result_failure_with_context,
     };
 
     #[test]
@@ -1446,14 +1449,14 @@ pub fn fixup_message_ordering(messages: &mut Vec<Value>) {
             && let Some(first_user_rel) = messages[first_non_system..]
                 .iter()
                 .position(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-            {
-                let abs_end = first_non_system + first_user_rel;
-                warn!(
-                    dropped = abs_end - first_non_system,
-                    "Dropping leading non-user messages to satisfy provider ordering"
-                );
-                messages.drain(first_non_system..abs_end);
-            }
+        {
+            let abs_end = first_non_system + first_user_rel;
+            warn!(
+                dropped = abs_end - first_non_system,
+                "Dropping leading non-user messages to satisfy provider ordering"
+            );
+            messages.drain(first_non_system..abs_end);
+        }
     }
 
     // Pass 5: Gemini-specific - ensure assistant messages with tool_calls only follow

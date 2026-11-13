@@ -6,7 +6,7 @@ use tracing::{info, warn};
 use crate::channels::DiscordChannel;
 #[cfg(feature = "slack")]
 use crate::channels::SlackChannel;
-use crate::channels::{new_telegram_bot, ChannelHub, ChannelRuntimeDeps, TelegramBot};
+use crate::channels::{ChannelHub, ChannelRuntimeDeps, TelegramBot, new_telegram_bot};
 use crate::config::AppConfig;
 use crate::traits::HubChannel;
 
@@ -55,17 +55,18 @@ impl ChannelBundle {
     pub async fn send_startup_notifications(&self, config: &AppConfig) {
         if let Some(first_tg) = self.telegram_bots.first()
             && let Some(first_config) = config.all_telegram_bots().first()
-                && !first_config.allowed_user_ids.is_empty() {
-                    let mode = if first_config.webhook.enabled {
-                        "webhook"
-                    } else {
-                        "polling"
-                    };
-                    let msg = format!("aidaemon is online ({})", mode);
-                    for user_id in &first_config.allowed_user_ids {
-                        let _ = first_tg.send_text(&user_id.to_string(), &msg).await;
-                    }
-                }
+            && !first_config.allowed_user_ids.is_empty()
+        {
+            let mode = if first_config.webhook.enabled {
+                "webhook"
+            } else {
+                "polling"
+            };
+            let msg = format!("aidaemon is online ({})", mode);
+            for user_id in &first_config.allowed_user_ids {
+                let _ = first_tg.send_text(&user_id.to_string(), &msg).await;
+            }
+        }
     }
 
     /// The first Telegram bot and its allowed users, who get the startup
@@ -186,9 +187,10 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
     for bot_config in config.all_telegram_bots() {
         if bot_config.webhook.enabled
             && let Some(addr) = &bot_config.webhook.listen_addr
-                && let Some(port) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
-                    occupied_ports.insert(port);
-                }
+            && let Some(port) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok())
+        {
+            occupied_ports.insert(port);
+        }
     }
 
     let mut seen_bot_credentials = std::collections::HashSet::new();
@@ -314,7 +316,10 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                             "telegram",
                             &bot.bot_token,
                         ) {
-                            warn!(bot_id = bot.id, "Skipping duplicate dynamic Telegram bot credential already registered from config or state");
+                            warn!(
+                                bot_id = bot.id,
+                                "Skipping duplicate dynamic Telegram bot credential already registered from config or state"
+                            );
                             continue;
                         }
                         let allowed_user_ids: Vec<u64> = parse_u64_ids(&bot.allowed_user_ids);
@@ -346,7 +351,10 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                             "discord",
                             &bot.bot_token,
                         ) {
-                            warn!(bot_id = bot.id, "Skipping duplicate dynamic Discord bot credential already registered from config or state");
+                            warn!(
+                                bot_id = bot.id,
+                                "Skipping duplicate dynamic Discord bot credential already registered from config or state"
+                            );
                             continue;
                         }
                         let allowed_user_ids: Vec<u64> = parse_u64_ids(&bot.allowed_user_ids);
@@ -374,7 +382,10 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                             "slack",
                             &bot.bot_token,
                         ) {
-                            warn!(bot_id = bot.id, "Skipping duplicate dynamic Slack bot credential already registered from config or state");
+                            warn!(
+                                bot_id = bot.id,
+                                "Skipping duplicate dynamic Slack bot credential already registered from config or state"
+                            );
                             continue;
                         }
                         if let Some(app_token) = &bot.app_token {

@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -21,7 +21,7 @@ use crate::api::{ApiError, BotApi, InlineKeyboardButton, SentMessage, Update, Us
 use crate::callback::CallbackCodec;
 use crate::format::{html_to_plain, render_html, split_html};
 use crate::mapping::{
-    conversation_for_chat, map_message, parse_conversation_id, sender_for, BotIdentity,
+    BotIdentity, conversation_for_chat, map_message, parse_conversation_id, sender_for,
 };
 
 /// Telegram's message length limit (UTF-16 code units).

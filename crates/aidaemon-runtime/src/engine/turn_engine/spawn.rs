@@ -20,9 +20,9 @@ use aidaemon_events::traits::AgentRole;
 use aidaemon_events::{
     DecisionPointData, DecisionType, EventType, SubAgentCompleteData, SubAgentSpawnData,
 };
+use aidaemon_tools::OutcomeTool;
 use aidaemon_tools::semantics::{ToolRole, UserRole};
 use aidaemon_tools::status::StatusUpdate;
-use aidaemon_tools::OutcomeTool;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -34,8 +34,8 @@ use crate::spawn::*;
 use crate::specialists::compose;
 use crate::turn::memory_writer::RunTaint;
 use crate::turn::validation_state::{
-    derive_executor_step_result, persist_executor_handoff_context, persist_executor_result_context,
-    ExecutorHandoff, TaskValidationOutcome,
+    ExecutorHandoff, TaskValidationOutcome, derive_executor_step_result,
+    persist_executor_handoff_context, persist_executor_result_context,
 };
 
 /// What a task lead is made of: its planning tools, its prompt, the full
@@ -425,9 +425,10 @@ impl TurnEngine<'_> {
         goal_id: &str,
     ) -> Option<tokio_util::sync::CancellationToken> {
         if let Some(registry) = self.goal_tokens()
-            && let Some(token) = registry.child_token(goal_id).await {
-                return Some(token);
-            }
+            && let Some(token) = registry.child_token(goal_id).await
+        {
+            return Some(token);
+        }
 
         self.cancel_token().map(|t| t.child_token())
     }
@@ -1140,15 +1141,13 @@ impl TurnEngine<'_> {
                         && let Some(profile_id) = task_attempt
                             .as_ref()
                             .and_then(|attempt| attempt.worker_profile_id.as_deref())
-                            && profile_id != "profile-executor"
-                                && let Some(profile) =
-                                    self.work().get_worker_profile(profile_id).await?
-                                    && let Some(assigned_kind) =
-                                        SpecialistKind::from_str(&profile.specialist)
-                                    {
-                                        specialist_kind = assigned_kind;
-                                        self.sync_worker_profile(specialist_kind).await?;
-                                    }
+                        && profile_id != "profile-executor"
+                        && let Some(profile) = self.work().get_worker_profile(profile_id).await?
+                        && let Some(assigned_kind) = SpecialistKind::from_str(&profile.specialist)
+                    {
+                        specialist_kind = assigned_kind;
+                        self.sync_worker_profile(specialist_kind).await?;
+                    }
                     let has_cli_agent = full_tools
                         .iter()
                         .any(|t| t.name() == "cli_agent" && t.is_available());
@@ -1185,9 +1184,10 @@ impl TurnEngine<'_> {
                     }
                     // The claimed attempt's blocker report.
                     if let Some(tid) = task_id
-                        && let Some(attempt) = task_attempt.clone() {
-                            tools.push(self.report_blocker_tool(tid, attempt, mandate.is_some()));
-                        }
+                        && let Some(attempt) = task_attempt.clone()
+                    {
+                        tools.push(self.report_blocker_tool(tid, attempt, mandate.is_some()));
+                    }
                     // The kind resolved here writes the prompt and is passed
                     // to `spawn_child_inner`, which applies its tools and
                     // budget: one resolution for both.
@@ -1581,15 +1581,17 @@ impl TurnEngine<'_> {
         } else {
             compose::resolve_specialist_kind(original_child_role, arg_specialist, mission, task)
         };
-        if mandate_execution.is_none() && resolved_kind.is_none()
+        if mandate_execution.is_none()
+            && resolved_kind.is_none()
             && let Some(profile_id) = task_attempt
                 .as_ref()
                 .and_then(|attempt| attempt.worker_profile_id.as_deref())
-                && profile_id != "profile-executor"
-                    && let Some(profile) = self.work().get_worker_profile(profile_id).await?
-                        && let Some(assigned_kind) = SpecialistKind::from_str(&profile.specialist) {
-                            specialist_kind = assigned_kind;
-                        }
+            && profile_id != "profile-executor"
+            && let Some(profile) = self.work().get_worker_profile(profile_id).await?
+            && let Some(assigned_kind) = SpecialistKind::from_str(&profile.specialist)
+        {
+            specialist_kind = assigned_kind;
+        }
         let child_session = compose::build_specialist_session_id(specialist_kind, Uuid::new_v4());
         if mandate_execution.is_none() {
             self.sync_worker_profile(specialist_kind).await?;
@@ -1764,19 +1766,20 @@ impl TurnEngine<'_> {
         let saved_task_id = task_id.clone();
         let child_is_mandate_execution = mandate_execution.is_some();
         if role == AgentRole::Executor
-            && let Some(task_id) = saved_task_id.as_deref() {
-                let handoff = compose::build_executor_handoff(
-                    task_id,
-                    mission,
-                    task,
-                    &scoped_tools,
-                    effective_project_scope.as_deref(),
-                );
-                if let Some(attempt) = task_attempt.as_ref() {
-                    self.prepare_executor_task_handoff(task_id, attempt, &handoff, &child_session)
-                        .await;
-                }
+            && let Some(task_id) = saved_task_id.as_deref()
+        {
+            let handoff = compose::build_executor_handoff(
+                task_id,
+                mission,
+                task,
+                &scoped_tools,
+                effective_project_scope.as_deref(),
+            );
+            if let Some(attempt) = task_attempt.as_ref() {
+                self.prepare_executor_task_handoff(task_id, attempt, &handoff, &child_session)
+                    .await;
             }
+        }
         let cancel_token =
             cancel_token_override.or_else(|| self.cancel_token().map(|t| t.child_token()));
         let effective_approval_session_id = self
@@ -2149,31 +2152,32 @@ impl TurnEngine<'_> {
             && let Some(child_snapshot) = child_task_end
                 .as_ref()
                 .and_then(|data| data.harness_eval.clone())
-            {
-                self.turn_runtime()
-                    .with_harness_eval(|eval| eval.rollup_sub_agent(&child_snapshot))
-                    .await;
-            }
+        {
+            self.turn_runtime()
+                .with_harness_eval(|eval| eval.rollup_sub_agent(&child_snapshot))
+                .await;
+        }
 
         if role == AgentRole::Executor
-            && let Some(task_id) = saved_task_id.as_deref() {
-                let error_text = result.as_ref().err().map(|error| error.to_string());
-                if let Err(finalize_error) = self
-                    .finalize_executor_task_outcome(
-                        task_id,
-                        task_attempt.as_ref(),
-                        result.as_ref().ok().map(String::as_str),
-                        error_text.as_deref(),
-                        &child_session,
-                    )
-                    .await
-                {
-                    result = Err(anyhow::anyhow!(
-                        "Executor returned, but its durable task outcome could not be persisted: \
+            && let Some(task_id) = saved_task_id.as_deref()
+        {
+            let error_text = result.as_ref().err().map(|error| error.to_string());
+            if let Err(finalize_error) = self
+                .finalize_executor_task_outcome(
+                    task_id,
+                    task_attempt.as_ref(),
+                    result.as_ref().ok().map(String::as_str),
+                    error_text.as_deref(),
+                    &child_session,
+                )
+                .await
+            {
+                result = Err(anyhow::anyhow!(
+                    "Executor returned, but its durable task outcome could not be persisted: \
                          {finalize_error}"
-                    ));
-                }
+                ));
             }
+        }
 
         let duration = start.elapsed();
 
@@ -2216,28 +2220,30 @@ impl TurnEngine<'_> {
         // Spawn background knowledge extraction for completed executor tasks.
         if !child_is_mandate_execution
             && let Some(ref task_id) = saved_task_id
-                && result.is_ok()
-                    && let Ok(Some(completed_task)) = self.work().get_task(task_id).await
-                        && completed_task.status == "completed" && self.memory_is_daemons_own() {
-                            let taint = run_taint(child_flagged_untrusted, &child_tainted_turns);
-                            let model = match tokio::time::timeout(
-                                Duration::from_secs(2),
-                                self.fallback_model_lock().read(),
-                            )
-                            .await
-                            {
-                                Ok(guard) => guard.clone(),
-                                Err(_) => {
-                                    warn!(
-                                        task_id = %task_id,
-                                        "Timed out acquiring fallback_model lock for task knowledge extraction"
-                                    );
-                                    self.llm_runtime().snapshot().primary_model()
-                                }
-                            };
-                            self.transcript_writes()
-                                .learn_from_task(completed_task, model, taint);
-                        }
+            && result.is_ok()
+            && let Ok(Some(completed_task)) = self.work().get_task(task_id).await
+            && completed_task.status == "completed"
+            && self.memory_is_daemons_own()
+        {
+            let taint = run_taint(child_flagged_untrusted, &child_tainted_turns);
+            let model = match tokio::time::timeout(
+                Duration::from_secs(2),
+                self.fallback_model_lock().read(),
+            )
+            .await
+            {
+                Ok(guard) => guard.clone(),
+                Err(_) => {
+                    warn!(
+                        task_id = %task_id,
+                        "Timed out acquiring fallback_model lock for task knowledge extraction"
+                    );
+                    self.llm_runtime().snapshot().primary_model()
+                }
+            };
+            self.transcript_writes()
+                .learn_from_task(completed_task, model, taint);
+        }
 
         let trust = child_result_trust(child_flagged_untrusted, &child_tainted_turns);
         result.map(|response| SpawnChildResult {

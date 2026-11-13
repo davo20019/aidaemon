@@ -6,7 +6,7 @@ pub use aidaemon_runtime::tools::manage_automations::*;
 mod tests {
     use super::*;
     use crate::testing::CallWithFacts;
-    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::testing::{MockProvider, setup_test_agent};
     use crate::tools::ManageMandatesTool;
     use crate::tools::ManageMemoriesTool;
     use crate::traits::StateStore;
@@ -14,8 +14,8 @@ mod tests {
     use crate::types::ChannelVisibility;
     use crate::types::UserRole;
     use aidaemon_work::automations;
-    use serde_json::json;
     use serde_json::Value;
+    use serde_json::json;
     use std::sync::Arc;
 
     fn owner() -> ToolCallContext {
@@ -160,10 +160,11 @@ mod tests {
     #[tokio::test]
     async fn one_list_shows_both_kinds_with_cadence_state_and_next_run() {
         let f = fixture().await;
-        assert!(f
-            .reminder("Oven", "every weekday at 8am")
-            .await
-            .starts_with("Reminder set"));
+        assert!(
+            f.reminder("Oven", "every weekday at 8am")
+                .await
+                .starts_with("Reminder set")
+        );
         let work = f.scheduled_work("Inbox digest", "every day at 9am").await;
         assert!(work.contains("Confirmed and activated"), "{work}");
         let watch = f.watching("Status watch").await;

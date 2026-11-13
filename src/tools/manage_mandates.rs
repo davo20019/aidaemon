@@ -57,11 +57,13 @@ mod tests {
                 .contains("requires approval through the agent kernel"),
             "{error}"
         );
-        assert!(state
-            .list_mandates(Some("owner-session"), true)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            state
+                .list_mandates(Some("owner-session"), true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // A guest, or the owner outside a private chat, is answered without
         // a card or a commit.
@@ -109,10 +111,10 @@ mod tests {
 
     use super::*;
     use crate::testing::CallWithFacts;
-    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::testing::{MockProvider, setup_test_agent};
     use crate::traits::*;
     use crate::types::ChannelVisibility;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -162,14 +164,16 @@ mod tests {
             .start_goal_run(&goal.id, "scheduled", Some(&schedule.id), None)
             .await
             .unwrap();
-        assert!(state
-            .finish_goal_run(
-                &run.id,
-                "completed",
-                Some("Published and verified the post.")
-            )
-            .await
-            .unwrap());
+        assert!(
+            state
+                .finish_goal_run(
+                    &run.id,
+                    "completed",
+                    Some("Published and verified the post.")
+                )
+                .await
+                .unwrap()
+        );
         let tool = ManageMandatesTool::new(state.clone());
         let output = tool
             .call_with(
@@ -329,15 +333,21 @@ mod tests {
         assert!(scheduled_position < mandate_section_position);
 
         let observations = &outcome.metadata.observations;
-        assert!(observations
-            .iter()
-            .any(|observation| observation.subject.value == scheduled_id));
-        assert!(observations
-            .iter()
-            .any(|observation| observation.subject.value == controller_id));
-        assert!(observations
-            .iter()
-            .any(|observation| observation.subject.value == sibling_id));
+        assert!(
+            observations
+                .iter()
+                .any(|observation| observation.subject.value == scheduled_id)
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|observation| observation.subject.value == controller_id)
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|observation| observation.subject.value == sibling_id)
+        );
         let scheduled_collection = outcome
             .metadata
             .collection_observations
@@ -565,11 +575,13 @@ mod tests {
             decision.rationale,
             "No worthwhile action is available in this review."
         );
-        assert!(state
-            .list_mandate_learning_notes(&mandate.id, 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            state
+                .list_mandate_learning_notes(&mandate.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A started review run for a bounded mandate with one action slot, its
@@ -831,9 +843,9 @@ mod tests {
         let finish = outcome.finish.expect("a committed WAIT ends the review");
         assert_eq!(finish.outcome, aidaemon_core::FinishOutcome::Succeeded);
         assert_eq!(finish.reply, decision.non_action_summary());
-        assert!(finish.reply.as_deref().is_some_and(
-            |reply| reply.starts_with("WAIT recorded: Nothing new is worth saying yet")
-        ));
+        assert!(finish.reply.as_deref().is_some_and(|reply| {
+            reply.starts_with("WAIT recorded: Nothing new is worth saying yet")
+        }));
 
         let unfenced = review_run(false).await;
         let outcome = tool_for(&unfenced)
@@ -975,24 +987,30 @@ mod tests {
         ));
         assert!(request.summary.contains("Steward @aidaemon_ai"));
         // Judging stores nothing.
-        assert!(state
-            .list_mandates(Some("owner-session"), true)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            state
+                .list_mandates(Some("owner-session"), true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(request.warnings.iter().any(|warning| {
             warning.contains("Access summary:")
                 && warning.contains("publish public posts and replies on X")
                 && warning.contains("Only account 12345 through the saved X connection")
         }));
-        assert!(request
-            .warnings
-            .iter()
-            .any(|warning| warning == "Review depth: Balanced — standard checks before acting"));
-        assert!(request
-            .warnings
-            .iter()
-            .any(|warning| warning == "Ends: 1 hour after you approve"));
+        assert!(
+            request
+                .warnings
+                .iter()
+                .any(|warning| warning == "Review depth: Balanced — standard checks before acting")
+        );
+        assert!(
+            request
+                .warnings
+                .iter()
+                .any(|warning| warning == "Ends: 1 hour after you approve")
+        );
         assert!(request.warnings.iter().all(|warning| {
             !warning.contains("http_request")
                 && !warning.contains("auth_profile:")
@@ -1038,11 +1056,13 @@ mod tests {
         assert_eq!(controller.goal_type, "continuous");
         assert_eq!(controller.budget_per_check, Some(250_000));
         assert_eq!(controller.budget_daily, Some(2_000_000));
-        assert!(state
-            .get_schedules_for_goal(&controller.id)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            state
+                .get_schedules_for_goal(&controller.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1232,10 +1252,12 @@ mod tests {
         else {
             panic!("create asks the owner");
         };
-        assert!(!silent
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("Tell you:")));
+        assert!(
+            !silent
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Tell you:"))
+        );
 
         tool.call_with(&create(true), approved_owner_facts())
             .await
@@ -1309,18 +1331,24 @@ mod tests {
             warning
                 .contains("Only account synthetic-1 through the saved synthetic social connection")
         }));
-        assert!(request
-            .warnings
-            .iter()
-            .any(|warning| warning == "Review depth: Thorough — extra care before acting"));
-        assert!(request
-            .warnings
-            .iter()
-            .any(|warning| warning.starts_with("Owner checkpoints:")));
-        assert!(request
-            .warnings
-            .iter()
-            .any(|warning| warning.starts_with("Recovery policy:")));
+        assert!(
+            request
+                .warnings
+                .iter()
+                .any(|warning| warning == "Review depth: Thorough — extra care before acting")
+        );
+        assert!(
+            request
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("Owner checkpoints:"))
+        );
+        assert!(
+            request
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("Recovery policy:"))
+        );
 
         let result = tool.call_with(args, approved_owner_facts()).await.unwrap();
         assert!(result.contains("Autopilot enabled for mandate"));
@@ -1393,11 +1421,13 @@ mod tests {
             error.contains("changed after the owner was asked"),
             "{error}"
         );
-        assert!(state
-            .list_mandates(Some("owner-session"), true)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            state
+                .list_mandates(Some("owner-session"), true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1627,21 +1657,27 @@ mod tests {
         assert_eq!(value["execution_mode"], "ongoing_mandate");
         assert_eq!(value["writes_performed"], false);
         assert_eq!(value["ready_to_confirm"], false);
-        assert!(value["required_inputs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|field| field == "operation_scopes"));
-        assert!(value["required_inputs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|field| field == "success_criteria"));
-        assert!(state
-            .list_mandates(Some("owner-session"), true)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            value["required_inputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "operation_scopes")
+        );
+        assert!(
+            value["required_inputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "success_criteria")
+        );
+        assert!(
+            state
+                .list_mandates(Some("owner-session"), true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1669,15 +1705,19 @@ mod tests {
         let value: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(value["proposal"]["duration_minutes"], 1_440);
         assert!(value["proposal"]["expires_at"].is_null());
-        assert!(value["proposal"]["timing_normalization"]
-            .as_str()
-            .unwrap()
-            .contains("redundant expires_at value was ignored"));
-        assert!(state
-            .list_mandates(Some("owner-session"), true)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            value["proposal"]["timing_normalization"]
+                .as_str()
+                .unwrap()
+                .contains("redundant expires_at value was ignored")
+        );
+        assert!(
+            state
+                .list_mandates(Some("owner-session"), true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1733,9 +1773,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("legacy per-review token capacity"));
+        assert!(
+            error
+                .to_string()
+                .contains("legacy per-review token capacity")
+        );
     }
 
     #[tokio::test]
@@ -1762,9 +1804,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("cannot fund 48 default review cycle"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot fund 48 default review cycle")
+        );
 
         let defaulted = tool
             .call_with(
@@ -1953,10 +1997,11 @@ mod tests {
         else {
             panic!("an update asks the owner");
         };
-        assert!(request
-            .warnings
-            .iter()
-            .any(|warning| { warning == "Review depth: Thorough — extra care before acting" }));
+        assert!(
+            request.warnings.iter().any(|warning| {
+                warning == "Review depth: Thorough — extra care before acting"
+            })
+        );
         // Judging changes nothing.
         assert_eq!(
             state
@@ -2156,9 +2201,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("unconfirmed mandate cannot be resumed"));
+        assert!(
+            error
+                .to_string()
+                .contains("unconfirmed mandate cannot be resumed")
+        );
     }
 
     /// `cancel` takes effect without an approval prompt, so the tool itself
@@ -2322,18 +2369,20 @@ mod tests {
             .record_mandate_decision(&ask, None, Some(&root_attempt.id))
             .await
             .unwrap();
-        assert!(state
-            .patch_task_from_attempt(
-                &root_attempt.id,
-                &root_attempt.lease_token,
-                &crate::traits::TaskAttemptPatch {
-                    status: "completed".to_string(),
-                    result: Some("ASK decision durably recorded".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap());
+        assert!(
+            state
+                .patch_task_from_attempt(
+                    &root_attempt.id,
+                    &root_attempt.lease_token,
+                    &crate::traits::TaskAttemptPatch {
+                        status: "completed".to_string(),
+                        result: Some("ASK decision durably recorded".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
         assert!(matches!(
             state
                 .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
@@ -2359,10 +2408,12 @@ mod tests {
                 owner_facts(),
             )
             .await;
-        assert!(missing
-            .unwrap_err()
-            .to_string()
-            .contains("guidance is required"));
+        assert!(
+            missing
+                .unwrap_err()
+                .to_string()
+                .contains("guidance is required")
+        );
 
         let resumed = tool
             .call_with(&format!(
@@ -2385,11 +2436,13 @@ mod tests {
         assert!(resumed_review_at >= chrono::Utc::now() - chrono::Duration::seconds(2));
         let controller = state.get_goal(&goal.id).await.unwrap().unwrap();
         assert_eq!(controller.status, "active");
-        assert!(controller
-            .context
-            .as_deref()
-            .unwrap()
-            .contains("Prefer thoughtful replies"));
+        assert!(
+            controller
+                .context
+                .as_deref()
+                .unwrap()
+                .contains("Prefer thoughtful replies")
+        );
 
         // An unanswered ASK resumes on its own, so an answer can arrive while
         // the mandate is already active. It still lands as bounded guidance.
@@ -2471,11 +2524,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("no longer executable"));
-        assert!(state
-            .get_mandate_decision_for_run(&current_run.id)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            state
+                .get_mandate_decision_for_run(&current_run.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The live "every hour check a page and tell me only if it is down"

@@ -40,7 +40,7 @@
 #![allow(dead_code)]
 
 pub use aidaemon_tools::web::local_site_key;
-use aidaemon_tools::web::{classify_blocked_host, BlockedHostClass};
+use aidaemon_tools::web::{BlockedHostClass, classify_blocked_host};
 
 // ─── Network policy glue (SSRF) ─────────────────────────────────────────────────
 //

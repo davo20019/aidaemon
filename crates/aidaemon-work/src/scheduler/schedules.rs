@@ -226,9 +226,11 @@ impl GoalCycle {
             context["recovery_for_run"] = serde_json::json!(recovery.last_failed_run_id);
             context["terminal_recovery"] = serde_json::json!(true);
             context["recovery_attempt"] = serde_json::json!(attempt);
-            context["recovery_cause"] = serde_json::json!(recovery
-                .latest_failure_kind
-                .map(crate::traits::ScheduledFailureKind::as_str));
+            context["recovery_cause"] = serde_json::json!(
+                recovery
+                    .latest_failure_kind
+                    .map(crate::traits::ScheduledFailureKind::as_str)
+            );
             let task = crate::traits::Task {
                 id: recovery_task_id.clone(),
                 goal_id: goal_id.clone(),
@@ -323,47 +325,48 @@ impl GoalCycle {
         // goal becomes visible instead of being skipped forever. The alert is
         // gated on `notified_at` so we don't re-alert on every tick while the
         // goal stays idle (e.g. blocked by an open task via coalescing).
-        if goal.goal_type == "continuous" && goal.notified_at.is_none()
+        if goal.goal_type == "continuous"
+            && goal.notified_at.is_none()
             && let Some(ref last_action) = goal.last_useful_action
-                && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_action) {
-                    let days_idle =
-                        (chrono::Utc::now() - ts.with_timezone(&chrono::Utc)).num_days();
-                    if days_idle > 30 {
+            && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_action)
+        {
+            let days_idle = (chrono::Utc::now() - ts.with_timezone(&chrono::Utc)).num_days();
+            if days_idle > 30 {
+                warn!(
+                    goal_id = %goal.id,
+                    description = %goal.description,
+                    days_idle,
+                    "Continuous goal idle >30 days; alerting user and continuing to fire"
+                );
+                let msg = format!(
+                    "Heads up: your recurring goal \"{}\" hasn't made progress in {} days. \
+                             It's still scheduled and will keep trying — reply if you'd like to pause or cancel it.",
+                    self.presenter.goal_label(&goal.description),
+                    days_idle
+                );
+                let entry = crate::traits::NotificationEntry::new(
+                    &goal.id,
+                    &goal.session_id,
+                    "evergreen_alert",
+                    &msg,
+                );
+                match self.state.enqueue_goal_notification(&entry).await {
+                    Ok(_) => {
+                        // Keep the in-memory copy consistent so the later
+                        // update_goal (after task creation) doesn't clobber
+                        // notified_at back to NULL and re-alert next tick.
+                        goal.notified_at = Some(now_ts.clone());
+                    }
+                    Err(error) => {
                         warn!(
                             goal_id = %goal.id,
-                            description = %goal.description,
-                            days_idle,
-                            "Continuous goal idle >30 days; alerting user and continuing to fire"
+                            %error,
+                            "Failed to atomically enqueue idle-goal alert"
                         );
-                        let msg = format!(
-                            "Heads up: your recurring goal \"{}\" hasn't made progress in {} days. \
-                             It's still scheduled and will keep trying — reply if you'd like to pause or cancel it.",
-                            self.presenter.goal_label(&goal.description),
-                            days_idle
-                        );
-                        let entry = crate::traits::NotificationEntry::new(
-                            &goal.id,
-                            &goal.session_id,
-                            "evergreen_alert",
-                            &msg,
-                        );
-                        match self.state.enqueue_goal_notification(&entry).await {
-                            Ok(_) => {
-                                // Keep the in-memory copy consistent so the later
-                                // update_goal (after task creation) doesn't clobber
-                                // notified_at back to NULL and re-alert next tick.
-                                goal.notified_at = Some(now_ts.clone());
-                            }
-                            Err(error) => {
-                                warn!(
-                                    goal_id = %goal.id,
-                                    %error,
-                                    "Failed to atomically enqueue idle-goal alert"
-                                );
-                            }
-                        }
                     }
                 }
+            }
+        }
 
         // Only work belonging to an open goal run can apply backpressure to a
         // new scheduled firing. Historical blocked tasks are intentionally
@@ -542,51 +545,50 @@ impl GoalCycle {
         }
 
         let run_root_task_id = uuid::Uuid::new_v4().to_string();
-        if coalesce
-            && let Some(open_run) = self.state.get_current_goal_run(&goal.id).await? {
-                let run_tasks = self.state.get_tasks_for_goal_run(&open_run.id).await?;
-                if !run_tasks.is_empty() {
-                    let active_or_human_blocked = run_tasks
-                        .iter()
-                        .any(|task| task_blocks_later_schedule_fire(&open_run, task));
-                    if active_or_human_blocked {
-                        warn!(
-                            goal_id = %goal.id,
-                            run_id = %open_run.id,
-                            "Skipped schedule fire because the previous goal run is still open"
-                        );
-                        return Ok(());
-                    }
-                    let status = if run_tasks.iter().any(task_is_terminal_schedule_failure) {
-                        "failed"
-                    } else {
-                        "completed"
-                    };
-                    // A blocked child of the superseded occurrence is an
-                    // audit record now; mark it so it never reads as open
-                    // work waiting on an owner.
-                    for task in run_tasks.iter().filter(|task| task.status == "blocked") {
-                        let mut superseded = task.clone();
-                        superseded.status = "superseded".to_string();
-                        superseded.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                        superseded.result = Some(format!(
-                            "Superseded by the next scheduled occurrence. Prior blocker: {}",
-                            task.blocker.as_deref().unwrap_or("none")
-                        ));
-                        if let Err(error) = self.state.update_task(&superseded).await {
-                            warn!(task_id = %task.id, %error, "Failed to supersede blocked task");
-                        }
-                    }
-                    let _ = self
-                        .state
-                        .finish_goal_run(
-                            &open_run.id,
-                            status,
-                            Some("Closed before the next scheduled firing."),
-                        )
-                        .await?;
+        if coalesce && let Some(open_run) = self.state.get_current_goal_run(&goal.id).await? {
+            let run_tasks = self.state.get_tasks_for_goal_run(&open_run.id).await?;
+            if !run_tasks.is_empty() {
+                let active_or_human_blocked = run_tasks
+                    .iter()
+                    .any(|task| task_blocks_later_schedule_fire(&open_run, task));
+                if active_or_human_blocked {
+                    warn!(
+                        goal_id = %goal.id,
+                        run_id = %open_run.id,
+                        "Skipped schedule fire because the previous goal run is still open"
+                    );
+                    return Ok(());
                 }
+                let status = if run_tasks.iter().any(task_is_terminal_schedule_failure) {
+                    "failed"
+                } else {
+                    "completed"
+                };
+                // A blocked child of the superseded occurrence is an
+                // audit record now; mark it so it never reads as open
+                // work waiting on an owner.
+                for task in run_tasks.iter().filter(|task| task.status == "blocked") {
+                    let mut superseded = task.clone();
+                    superseded.status = "superseded".to_string();
+                    superseded.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    superseded.result = Some(format!(
+                        "Superseded by the next scheduled occurrence. Prior blocker: {}",
+                        task.blocker.as_deref().unwrap_or("none")
+                    ));
+                    if let Err(error) = self.state.update_task(&superseded).await {
+                        warn!(task_id = %task.id, %error, "Failed to supersede blocked task");
+                    }
+                }
+                let _ = self
+                    .state
+                    .finish_goal_run(
+                        &open_run.id,
+                        status,
+                        Some("Closed before the next scheduled firing."),
+                    )
+                    .await?;
             }
+        }
         let goal_run = self
             .state
             .start_goal_run(
@@ -729,9 +731,10 @@ impl GoalCycle {
         // Clean up one-shot schedules after successful task creation.
         // (Recurring schedules were already advanced before task creation.)
         if schedule.is_one_shot
-            && let Err(e) = self.state.delete_goal_schedule(&schedule.id).await {
-                warn!(schedule_id = %schedule.id, error = %e, "Failed to delete one-shot schedule after fire");
-            }
+            && let Err(e) = self.state.delete_goal_schedule(&schedule.id).await
+        {
+            warn!(schedule_id = %schedule.id, error = %e, "Failed to delete one-shot schedule after fire");
+        }
 
         info!(
             goal_id = %goal.id,
@@ -749,17 +752,18 @@ impl GoalCycle {
         let local_hour = chrono::Timelike::hour(&chrono::Local::now());
         if !aidaemon_events::session::is_group_session(&goal.session_id)
             && crate::traits::NotificationEntry::routine_delivery_allowed_at_local_hour(local_hour)
-            && let Some(hub_arc) = self.hub.clone() {
-                let short_desc = self.presenter.goal_label(&goal.description);
-                running_surface_id = hub_arc
-                    .send_text_tracked(
-                        &goal.session_id,
-                        &format!("⏳ **Scheduled run in progress**\n\n{}", short_desc),
-                    )
-                    .await
-                    .ok()
-                    .flatten();
-            }
+            && let Some(hub_arc) = self.hub.clone()
+        {
+            let short_desc = self.presenter.goal_label(&goal.description);
+            running_surface_id = hub_arc
+                .send_text_tracked(
+                    &goal.session_id,
+                    &format!("⏳ **Scheduled run in progress**\n\n{}", short_desc),
+                )
+                .await
+                .ok()
+                .flatten();
+        }
 
         // Dispatch immediately instead of waiting for the orphan-recovery pass
         // (which only picks up tasks older than 60s, so every scheduled run

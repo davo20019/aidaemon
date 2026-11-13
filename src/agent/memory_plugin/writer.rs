@@ -10,7 +10,7 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
     use aidaemon_core as sdk;
-    use aidaemon_core::testing::{text, ScriptedProvider};
+    use aidaemon_core::testing::{ScriptedProvider, text};
     use async_trait::async_trait;
 
     use super::{DaemonMemoryWriter, MemoryWrites, WriterSettings};

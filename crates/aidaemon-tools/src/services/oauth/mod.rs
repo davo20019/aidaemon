@@ -13,10 +13,10 @@ use std::time::Duration;
 
 use base64::Engine;
 use sha2::Digest;
-use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::{info, warn};
 
-use aidaemon_secrets::{names, SecretStore};
+use aidaemon_secrets::{SecretStore, names};
 use serde::Deserialize;
 
 use crate::http_request::{HttpAuthProfile, HttpAuthType};
@@ -1253,7 +1253,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
-    use axum::{extract::Form, routing::post, Json, Router};
+    use axum::{Json, Router, extract::Form, routing::post};
     use tempfile::NamedTempFile;
     use tokio::net::TcpListener;
 
@@ -1581,18 +1581,22 @@ mod tests {
             .unwrap();
 
         assert!(result.contains("Connected to Linear"));
-        assert!(gateway
-            .state_store
-            .get_pending_oauth_flow(&state)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(gateway
-            .state_store
-            .get_oauth_connection("linear")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            gateway
+                .state_store
+                .get_pending_oauth_flow(&state)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            gateway
+                .state_store
+                .get_oauth_connection("linear")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -1649,12 +1653,14 @@ mod tests {
 
         gateway.cleanup_expired_flows().await;
 
-        assert!(gateway
-            .state_store
-            .get_pending_oauth_flow("expired-state")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            gateway
+                .state_store
+                .get_pending_oauth_flow("expired-state")
+                .await
+                .unwrap()
+                .is_none()
+        );
         let message = gateway
             .handle_callback("expired-state", Some("unused"), None)
             .await
@@ -1731,10 +1737,12 @@ mod tests {
         let profile = profiles.get("twitter").expect("twitter profile rebuilt");
         assert_eq!(profile.token.as_deref(), Some("refreshed-access"));
         assert_eq!(profile.user_id.as_deref(), Some("stable-account-123"));
-        assert!(profile
-            .allowed_domains
-            .iter()
-            .any(|domain| domain == "api.x.com"));
+        assert!(
+            profile
+                .allowed_domains
+                .iter()
+                .any(|domain| domain == "api.x.com")
+        );
     }
 
     #[tokio::test]
@@ -1980,9 +1988,11 @@ mod tests {
             }
         );
         assert_eq!(readiness.state(), "reauth-required");
-        assert!(readiness
-            .describe()
-            .contains("reauth-required (missing: refresh token)"));
+        assert!(
+            readiness
+                .describe()
+                .contains("reauth-required (missing: refresh token)")
+        );
     }
 
     #[test]

@@ -941,9 +941,11 @@ mod tests {
                 "https://node-lan.example.test".to_string(),
             ]
         );
-        assert!(heartbeat_without_audio_authorization
-            .firmware_update
-            .is_none());
+        assert!(
+            heartbeat_without_audio_authorization
+                .firmware_update
+                .is_none()
+        );
         store
             .set_authorization(
                 &enrollment.node_id,
@@ -1100,9 +1102,11 @@ mod tests {
             "the capability snapshot must not invent an unreported volume control"
         );
         let events = simulator.text_turn("hello").await.unwrap();
-        assert!(events
-            .iter()
-            .any(|event| event.event_type == "turn.thinking"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "turn.thinking")
+        );
         let complete = events
             .iter()
             .find(|event| event.event_type == "turn.complete")
@@ -1112,9 +1116,11 @@ mod tests {
             .media_turn(b"bounded fake wav fixture", "audio/wav", Some(800))
             .await
             .unwrap();
-        assert!(media_events
-            .iter()
-            .any(|event| event.event_type == "turn.complete"));
+        assert!(
+            media_events
+                .iter()
+                .any(|event| event.event_type == "turn.complete")
+        );
         assert_eq!(
             std::fs::read_dir(media_dir.path()).unwrap().count(),
             0,
@@ -1176,24 +1182,30 @@ mod tests {
             .authenticate(simulator.identity.access_token.as_deref().unwrap())
             .await
             .unwrap();
-        assert!(service
-            .authorize(&context, crate::domain::NodeAction::ReceiveActuatorCommand)
-            .await
-            .is_err());
+        assert!(
+            service
+                .authorize(&context, crate::domain::NodeAction::ReceiveActuatorCommand)
+                .await
+                .is_err()
+        );
         let old_token = simulator.identity.access_token.clone().unwrap();
         let rotated = simulator.rotate_credential().await.unwrap();
         assert!(rotated.sessions_closed);
         assert!(service.authenticate(&old_token).await.is_err());
         simulator.open_session().await.unwrap();
-        assert!(service
-            .authenticate(simulator.identity.access_token.as_deref().unwrap())
-            .await
-            .is_ok());
+        assert!(
+            service
+                .authenticate(simulator.identity.access_token.as_deref().unwrap())
+                .await
+                .is_ok()
+        );
         store.revoke_node(&context.node_id).await.unwrap();
-        assert!(service
-            .authenticate(simulator.identity.access_token.as_deref().unwrap())
-            .await
-            .is_err());
+        assert!(
+            service
+                .authenticate(simulator.identity.access_token.as_deref().unwrap())
+                .await
+                .is_err()
+        );
         server.abort();
     }
 }

@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::OutcomeTool as Tool;
 use crate::backend::{ExecutionRequest, SharedExecutionBackend};
 use crate::semantics::{ToolCapabilities, ToolRole};
-use crate::OutcomeTool as Tool;
 
 pub struct SystemInfoTool {
     backend: crate::backend::SharedExecutionBackend,

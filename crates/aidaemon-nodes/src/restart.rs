@@ -13,9 +13,10 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::Row;
 
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::owner_answers::OwnerAnsweredCalls;
 use aidaemon_tools::semantics::{
     ApprovalCall, EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, OwnerApprovalNeed,
@@ -24,7 +25,6 @@ use aidaemon_tools::semantics::{
     ToolSemanticScope, ToolSemantics, ToolVerificationMode,
 };
 use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse, UserRole};
-use aidaemon_tools::OutcomeTool as Tool;
 
 use super::domain::NodeAction;
 use super::store::NodeStore;
@@ -441,9 +441,13 @@ impl NodeRestartTool {
         let interpretation = match state {
             "confirmed" => "The Node reported from a new boot after receiving the restart.",
             "pending" => "The restart is waiting for the Node's next heartbeat.",
-            "delivered" => "The Node was sent the restart, but no heartbeat from a new boot has arrived yet.",
+            "delivered" => {
+                "The Node was sent the restart, but no heartbeat from a new boot has arrived yet."
+            }
             "expired" => "The Node never collected the restart, so it was not sent.",
-            "timed_out" => "The restart was sent, but no heartbeat from a new boot arrived in time. Do not claim the Node restarted.",
+            "timed_out" => {
+                "The restart was sent, but no heartbeat from a new boot arrived in time. Do not claim the Node restarted."
+            }
             _ => "No restart has been requested for this Node.",
         };
         let output = serde_json::to_string_pretty(&json!({
@@ -648,17 +652,17 @@ impl ToolSemantics for NodeRestartTool {
 mod tests {
     use super::*;
     use crate::config::NodesConfig;
-    use crate::domain::{AuthenticatedNodeContext, NodeAction, CHILD_COMPANION_POLICY};
+    use crate::domain::{AuthenticatedNodeContext, CHILD_COMPANION_POLICY, NodeAction};
     use crate::ota::FirmwareRelease;
     use crate::protocol::{CapabilityObservation, HeartbeatRequest, HeartbeatResponse};
     use crate::service::NodeService;
+    use aidaemon_tools::OutcomeTool as Tool;
     use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse, UserRole};
     use aidaemon_tools::semantics::{OwnerApprovalNeed, ToolCallContext, ToolSemantics};
-    use aidaemon_tools::testing::{call_through_kernel, CallWithFacts};
-    use aidaemon_tools::OutcomeTool as Tool;
+    use aidaemon_tools::testing::{CallWithFacts, call_through_kernel};
     use chrono::{Duration, Utc};
-    use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::Row;
+    use sqlx::sqlite::SqlitePoolOptions;
 
     const BOOT: &str = "k10-runtime";
     const NODE: &str = "node-test";
@@ -839,12 +843,14 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("device_restart"), "{error}");
-        assert!(fixture
-            .store
-            .latest_device_restart(None)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            fixture
+                .store
+                .latest_device_restart(None)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1076,12 +1082,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(fixture
-            .store
-            .latest_device_restart(None)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            fixture
+                .store
+                .latest_device_restart(None)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

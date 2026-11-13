@@ -346,9 +346,10 @@ impl crate::engine::turn_engine::TurnEngine<'_> {
                     }
                     let hub = self.hub().read().await.clone();
                     if let Some(hub) = hub.and_then(|weak| weak.upgrade())
-                        && let Err(error) = hub.send_text(&request.session_id, &reply).await {
-                            tracing::warn!(%error, session_id = %request.session_id, "Failed to deliver deferred retry reply");
-                        }
+                        && let Err(error) = hub.send_text(&request.session_id, &reply).await
+                    {
+                        tracing::warn!(%error, session_id = %request.session_id, "Failed to deliver deferred retry reply");
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(%error, session_id = %request.session_id, "Deferred provider retry errored");

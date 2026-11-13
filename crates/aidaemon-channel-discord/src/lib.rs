@@ -44,17 +44,17 @@ use aidaemon_channels::download::DownloadClient;
 use aidaemon_channels::split::truncate_for_edit;
 use aidaemon_channels::{
     ApprovalPrompt, Attachment, Channel, ChannelCapabilities, ChannelError, ChannelEvent,
-    CommandInvocation, CommandSpec, Conversation, DisplayNameCache, MessageRef, OutboundFile,
-    OutboundMessage, DEFAULT_MAX_DOWNLOAD_BYTES,
+    CommandInvocation, CommandSpec, Conversation, DEFAULT_MAX_DOWNLOAD_BYTES, DisplayNameCache,
+    MessageRef, OutboundFile, OutboundMessage,
 };
 use async_trait::async_trait;
 use reqwest::Method;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub use format::split_message;
-pub use mapping::{decode_custom_id, encode_custom_id, CUSTOM_ID_MAX};
+pub use mapping::{CUSTOM_ID_MAX, decode_custom_id, encode_custom_id};
 pub use rest::validate_token;
 
 /// Discord's limit for a file sent by a bot without boosts, in bytes.

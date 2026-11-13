@@ -10,8 +10,8 @@ use std::time::Duration;
 use reqwest::Client;
 use tracing::warn;
 
-pub use error::{describe_reset, ProviderRecoveryRoute};
 pub use error::{MalformedResponseReason, ModelFailure, ProviderError, ProviderErrorKind};
+pub use error::{ProviderRecoveryRoute, describe_reset};
 pub use sdk_backed::ChatJson;
 
 /// Build an HTTP client with a panic-safe fallback when system proxy discovery

@@ -38,7 +38,7 @@ pub mod registry;
 mod tool;
 
 pub use client::{
-    McpError, McpOptions, McpServer, McpServerSpec, ServerInfo, StderrCallback,
-    MAX_STDERR_LINE_BYTES, PROTOCOL_VERSION, SAFE_ENV_KEYS, SUPPORTED_PROTOCOL_VERSIONS,
+    MAX_STDERR_LINE_BYTES, McpError, McpOptions, McpServer, McpServerSpec, PROTOCOL_VERSION,
+    SAFE_ENV_KEYS, SUPPORTED_PROTOCOL_VERSIONS, ServerInfo, StderrCallback,
 };
-pub use tool::{map_annotations, normalize_schema, render_result, tool_name, McpTool};
+pub use tool::{McpTool, map_annotations, normalize_schema, render_result, tool_name};

@@ -1,16 +1,16 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aidaemon_core::{
     Agent, ModelRequest, ModelResponse, Provider, ProviderError, ReceiptStatus, Usage,
 };
 use aidaemon_eval::examples::{
-    example_tools, ExampleExpect, ExampleFactory, ExampleSubject, TRAIL_CODE,
+    ExampleExpect, ExampleFactory, ExampleSubject, TRAIL_CODE, example_tools,
 };
 use aidaemon_eval::{
-    compare, CallRecord, CaseResult, EvalError, ExpectedStatus, FactoryError, FnFactory,
-    NoExtension, Report, Scenario, Subject, Suite, Trajectory,
+    CallRecord, CaseResult, EvalError, ExpectedStatus, FactoryError, FnFactory, NoExtension,
+    Report, Scenario, Subject, Suite, Trajectory, compare,
 };
 use async_trait::async_trait;
 

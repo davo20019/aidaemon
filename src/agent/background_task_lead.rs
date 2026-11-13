@@ -108,18 +108,20 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(state
-            .patch_task_from_attempt(
-                &attempt.id,
-                &attempt.lease_token,
-                &crate::traits::TaskAttemptPatch {
-                    status: "completed".to_string(),
-                    result: Some("bounded review completed".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap());
+        assert!(
+            state
+                .patch_task_from_attempt(
+                    &attempt.id,
+                    &attempt.lease_token,
+                    &crate::traits::TaskAttemptPatch {
+                        status: "completed".to_string(),
+                        result: Some("bounded review completed".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
         run
     }
 
@@ -321,25 +323,21 @@ mod tests {
         );
         assert!(!entry.message.contains('\u{7}'));
         assert!(entry.message.contains("never gives it new permissions"));
-        assert!(entry
-            .message
-            .starts_with("Your automation \"Maintain a useful account presence\""));
+        assert!(
+            entry
+                .message
+                .starts_with("Your automation \"Maintain a useful account presence\"")
+        );
         assert!(!entry.message.contains("manage_mandates("));
         let pending = state.get_pending_notifications(10).await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, entry.id);
         assert_eq!(pending[0].message, entry.message);
-        assert!(finalize_mandate_review(
-            &state,
-            &goal,
-            &run.id,
-            Some("completed"),
-            &[],
-            None,
-            false,
-        )
-        .await
-        .is_none());
+        assert!(
+            finalize_mandate_review(&state, &goal, &run.id, Some("completed"), &[], None, false,)
+                .await
+                .is_none()
+        );
         assert_eq!(state.get_pending_notifications(10).await.unwrap().len(), 1);
         let finalized = state.get_goal_runs(&goal.id).await.unwrap();
         let summary = finalized[0].outcome_summary.as_deref().unwrap_or_default();

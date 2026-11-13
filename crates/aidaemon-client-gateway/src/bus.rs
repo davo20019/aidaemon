@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use aidaemon_client_protocol::{Event, ServerFrame};
 use aidaemon_store_sqlite::SqliteClientEventLog;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 use tracing::warn;
 
 /// v1 has one owner; the log is keyed by owner for when it has more.

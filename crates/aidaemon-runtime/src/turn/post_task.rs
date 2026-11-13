@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 
 use aidaemon_events::TaskOutcome;
 
-use crate::turn::loop_utils::{semantic_failure_limit, MAX_CONSECUTIVE_SAME_TOOL};
+use crate::turn::loop_utils::{MAX_CONSECUTIVE_SAME_TOOL, semantic_failure_limit};
 
 #[derive(Clone)]
 pub struct LearningContext {

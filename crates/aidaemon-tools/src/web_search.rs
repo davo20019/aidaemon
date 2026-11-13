@@ -3,13 +3,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use serde::Deserialize;
 
-use crate::semantics::ToolCapabilities;
-use crate::web::{build_browser_client, read_body_capped, MAX_FETCH_BODY_BYTES};
 use crate::OutcomeTool as Tool;
+use crate::semantics::ToolCapabilities;
+use crate::web::{MAX_FETCH_BODY_BYTES, build_browser_client, read_body_capped};
 
 /// Which search backends `web_search` uses (`[search]` in the daemon's config).
 #[derive(Deserialize, Clone)]
@@ -358,10 +358,9 @@ fn decode_ddg_redirect(href: &str) -> String {
             .host_str()
             .is_some_and(|h| h == "duckduckgo.com" || h.ends_with(".duckduckgo.com"))
             && url.path() == "/l/";
-        if is_ddg_redirect
-            && let Some((_, target)) = url.query_pairs().find(|(k, _)| k == "uddg") {
-                return target.into_owned();
-            }
+        if is_ddg_redirect && let Some((_, target)) = url.query_pairs().find(|(k, _)| k == "uddg") {
+            return target.into_owned();
+        }
         return absolute;
     }
 

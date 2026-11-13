@@ -11,12 +11,12 @@
 //! `SQLITE_BUSY_SNAPSHOT` at once (the busy timeout cannot help a stale
 //! snapshot). `BEGIN IMMEDIATE` takes the write lock up front and waits.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 const WORKERS: usize = 8;
 const OPS_PER_WORKER: usize = 200;

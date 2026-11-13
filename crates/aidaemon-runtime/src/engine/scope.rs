@@ -2,8 +2,8 @@
 //! and update while the run goes, built once per turn by the host.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 use serde_json::Value;
 

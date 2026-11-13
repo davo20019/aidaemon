@@ -6,21 +6,21 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::LazyLock;
 use tracing::{info, warn};
 
 use super::skill_registry::{self, RegistryEntry};
 use crate::SkillsStore;
 use crate::{self as skills, Skill};
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::http_request::HttpRequestTool;
 use aidaemon_tools::http_request::SharedHttpProfiles;
 use aidaemon_tools::semantics::{
-    semantics_for_exact_read_actions, ToolCallContext, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects,
+    ToolCallContext, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    semantics_for_exact_read_actions,
 };
 use aidaemon_tools::web::{build_browser_client, validate_url_for_ssrf};
-use aidaemon_tools::OutcomeTool as Tool;
 
 pub struct ManageSkillsTool {
     skills_dir: PathBuf,
@@ -241,9 +241,10 @@ impl ManageSkillsTool {
 
         let mut candidate_registry_urls = Vec::new();
         if let Some(preferred) = preferred_registry_url
-            && self.registry_urls.iter().any(|url| url == preferred) {
-                candidate_registry_urls.push(preferred.to_string());
-            }
+            && self.registry_urls.iter().any(|url| url == preferred)
+        {
+            candidate_registry_urls.push(preferred.to_string());
+        }
         for url in &self.registry_urls {
             if !candidate_registry_urls.iter().any(|item| item == url) {
                 candidate_registry_urls.push(url.clone());
@@ -264,9 +265,9 @@ impl ManageSkillsTool {
                     if let Some(preferred_url) = preferred_url
                         && let Some(index) =
                             matches.iter().position(|entry| entry.url == preferred_url)
-                        {
-                            return Ok(Some((registry_url.clone(), matches.remove(index))));
-                        }
+                    {
+                        return Ok(Some((registry_url.clone(), matches.remove(index))));
+                    }
 
                     if let Some(entry) = matches.into_iter().next() {
                         return Ok(Some((registry_url.clone(), entry)));
@@ -440,13 +441,13 @@ impl ManageSkillsTool {
                     if !ref_value.starts_with("#/")
                         && let Ok((document_url, fragment)) =
                             Self::split_ref_target(base_url, ref_value)
-                        {
-                            found.push(ExternalRefOccurrence {
-                                path: path.clone(),
-                                document_url,
-                                fragment,
-                            });
-                        }
+                    {
+                        found.push(ExternalRefOccurrence {
+                            path: path.clone(),
+                            document_url,
+                            fragment,
+                        });
+                    }
                     return;
                 }
                 for (key, child) in map {
@@ -483,19 +484,20 @@ impl ManageSkillsTool {
 
     fn merge_ref_overrides(node: &mut Value, replacement: &Value) {
         if let Value::Object(existing) = node
-            && let Value::Object(target) = replacement {
-                let existing_overrides: Vec<(String, Value)> = existing
-                    .iter()
-                    .filter(|(key, _)| key.as_str() != "$ref")
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect();
-                let mut merged = target.clone();
-                for (key, value) in existing_overrides {
-                    merged.insert(key, value);
-                }
-                *existing = merged;
-                return;
+            && let Value::Object(target) = replacement
+        {
+            let existing_overrides: Vec<(String, Value)> = existing
+                .iter()
+                .filter(|(key, _)| key.as_str() != "$ref")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let mut merged = target.clone();
+            for (key, value) in existing_overrides {
+                merged.insert(key, value);
             }
+            *existing = merged;
+            return;
+        }
 
         *node = replacement.clone();
     }
@@ -927,9 +929,10 @@ impl ManageSkillsTool {
             }
             if let Some(source) = source.as_ref()
                 && let Ok(joined) = source.join(&server_url)
-                    && joined.scheme() == "https" {
-                        urls.push(joined);
-                    }
+                && joined.scheme() == "https"
+            {
+                urls.push(joined);
+            }
         }
         urls
     }
@@ -1408,9 +1411,10 @@ impl ManageSkillsTool {
             .filter_map(|endpoint| Self::normalize_graphql_endpoint(source_url, &endpoint))
             .collect::<Vec<String>>();
         if Self::looks_like_graphql_endpoint_url(source_url)
-            && let Some(normalized) = Self::normalize_graphql_endpoint(source_url, source_url) {
-                endpoints.push(normalized);
-            }
+            && let Some(normalized) = Self::normalize_graphql_endpoint(source_url, source_url)
+        {
+            endpoints.push(normalized);
+        }
         endpoints.sort();
         endpoints.dedup();
         endpoints
@@ -1819,19 +1823,19 @@ impl ManageSkillsTool {
                 if Self::looks_like_graphql_endpoint_url(source_url)
                     && let Some(summary) =
                         self.try_graphql_introspection(source_url, profile).await?
-                    {
-                        return Ok(LearnApiBuildOutcome {
-                            generated: Self::build_graphql_skill(
-                                explicit_name,
-                                profile,
-                                source_url,
-                                &summary,
-                            ),
-                            crawl_count: 0,
-                            discovered_spec_url: None,
-                            safe_probe: Some(Self::safe_probe_from_graphql(&summary)),
-                        });
-                    }
+                {
+                    return Ok(LearnApiBuildOutcome {
+                        generated: Self::build_graphql_skill(
+                            explicit_name,
+                            profile,
+                            source_url,
+                            &summary,
+                        ),
+                        crawl_count: 0,
+                        discovered_spec_url: None,
+                        safe_probe: Some(Self::safe_probe_from_graphql(&summary)),
+                    });
+                }
 
                 let bundle = self.crawl_docs_bundle(source_url).await?;
                 let raw_docs = if bundle.combined_text.trim().is_empty() {
@@ -1872,19 +1876,19 @@ impl ManageSkillsTool {
                 if Self::looks_like_graphql_endpoint_url(source_url)
                     && let Some(summary) =
                         self.try_graphql_introspection(source_url, profile).await?
-                    {
-                        return Ok(LearnApiBuildOutcome {
-                            generated: Self::build_graphql_skill(
-                                explicit_name,
-                                profile,
-                                source_url,
-                                &summary,
-                            ),
-                            crawl_count: 0,
-                            discovered_spec_url: None,
-                            safe_probe: Some(Self::safe_probe_from_graphql(&summary)),
-                        });
-                    }
+                {
+                    return Ok(LearnApiBuildOutcome {
+                        generated: Self::build_graphql_skill(
+                            explicit_name,
+                            profile,
+                            source_url,
+                            &summary,
+                        ),
+                        crawl_count: 0,
+                        discovered_spec_url: None,
+                        safe_probe: Some(Self::safe_probe_from_graphql(&summary)),
+                    });
+                }
 
                 let raw_content = self.fetch_remote_text(source_url).await?;
                 if Self::parse_openapi_value(&raw_content).is_some() {
@@ -2173,8 +2177,7 @@ impl ManageSkillsTool {
         if let Some(conflicting_name) = Self::find_conflicting_skill(&existing, &skill.name) {
             return Ok(format!(
                 "Skill '{}' conflicts with existing skill '{}' (same canonical filename). Remove or rename the existing skill first.",
-                skill.name,
-                conflicting_name
+                skill.name, conflicting_name
             ));
         }
 
@@ -2697,8 +2700,7 @@ impl ManageSkillsTool {
         if let Some(conflicting_name) = Self::find_conflicting_skill(&existing, &skill.name) {
             return Ok(format!(
                 "Skill '{}' conflicts with existing skill '{}' (same canonical filename). Remove or rename the existing skill first.",
-                skill.name,
-                conflicting_name
+                skill.name, conflicting_name
             ));
         }
 
@@ -2801,7 +2803,7 @@ impl ManageSkillsTool {
                 return Ok(format!(
                     "Skill '{}' has no source URL and cannot be updated.",
                     existing.skill.name
-                ))
+                ));
             }
         };
 
@@ -2946,8 +2948,7 @@ impl ManageSkillsTool {
                 {
                     return Ok(format!(
                         "Skill draft '{}' conflicts with existing skill '{}' (same canonical filename). Dismiss this draft or remove/rename the existing skill first.",
-                        skill.name,
-                        conflicting_name
+                        skill.name, conflicting_name
                     ));
                 }
 
@@ -3118,18 +3119,22 @@ impl ManageSkillsTool {
 
         match args.action.as_str() {
             "add" => {
-                let url = args.url.as_deref()
+                let url = args
+                    .url
+                    .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'url' parameter required for 'add' action"))?;
                 self.handle_add_url(url).await
             }
             "add_inline" => {
-                let content = args.content.as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'content' parameter required for 'add_inline' action"))?;
+                let content = args.content.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'content' parameter required for 'add_inline' action")
+                })?;
                 self.handle_add_inline(content).await
             }
             "learn_api" => {
-                let url = args.url.as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'url' parameter required for 'learn_api' action"))?;
+                let url = args.url.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'url' parameter required for 'learn_api' action")
+                })?;
                 self.handle_learn_api(
                     args.name.as_deref(),
                     args.profile.as_deref(),
@@ -3140,44 +3145,48 @@ impl ManageSkillsTool {
             }
             "list" => self.handle_list().await,
             "remove" => {
-                let name = args.name.as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'remove' action"))?;
+                let name = args.name.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'name' parameter required for 'remove' action")
+                })?;
                 self.handle_remove(name).await
             }
             "remove_all" => {
-                let names = args
-                    .names
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'names' parameter required for 'remove_all' action"))?;
-                self.handle_remove_all(names, args.dry_run.unwrap_or(false)).await
+                let names = args.names.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'names' parameter required for 'remove_all' action")
+                })?;
+                self.handle_remove_all(names, args.dry_run.unwrap_or(false))
+                    .await
             }
             "enable" => {
-                let name = args.name.as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'enable' action"))?;
+                let name = args.name.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'name' parameter required for 'enable' action")
+                })?;
                 self.handle_enable(name).await
             }
             "disable" => {
-                let name = args.name.as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'disable' action"))?;
+                let name = args.name.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'name' parameter required for 'disable' action")
+                })?;
                 self.handle_disable(name).await
             }
-            "browse" => {
-                self.handle_browse(args.query.as_deref()).await
-            }
+            "browse" => self.handle_browse(args.query.as_deref()).await,
             "install" => {
-                let name = args.name.as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'install' action"))?;
+                let name = args.name.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'name' parameter required for 'install' action")
+                })?;
                 self.handle_install(name).await
             }
             "update" => {
-                let name = args.name.as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'update' action"))?;
+                let name = args.name.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'name' parameter required for 'update' action")
+                })?;
                 self.handle_update(name).await
             }
-            "review" => {
-                self.handle_review(args.draft_id, args.approve).await
-            }
-            other => Ok(format!("Unknown action '{}'. Valid actions: add, add_inline, learn_api, list, remove, remove_all, enable, disable, browse, install, update, review", other)),
+            "review" => self.handle_review(args.draft_id, args.approve).await,
+            other => Ok(format!(
+                "Unknown action '{}'. Valid actions: add, add_inline, learn_api, list, remove, remove_all, enable, disable, browse, install, update, review",
+                other
+            )),
         }
     }
 }
@@ -3286,9 +3295,10 @@ impl ManageSkillsTool {
             "install" => {
                 for registry in registries {
                     if let Some(key) = url_effect(registry)
-                        && !effects.keys.contains(&key) {
-                            effects.keys.push(key);
-                        }
+                        && !effects.keys.contains(&key)
+                    {
+                        effects.keys.push(key);
+                    }
                 }
             }
             _ => {}
@@ -3519,26 +3529,30 @@ Widgets can be filtered by team and status.
         .unwrap();
 
         assert!(!generated.skill.body.contains("Reference notes:"));
-        assert!(!generated
-            .skill
-            .body
-            .contains("Ignore previous instructions"));
-        assert!(!generated
-            .skill
-            .body
-            .contains("Widgets can be filtered by team and status."));
+        assert!(
+            !generated
+                .skill
+                .body
+                .contains("Ignore previous instructions")
+        );
+        assert!(
+            !generated
+                .skill
+                .body
+                .contains("Widgets can be filtered by team and status.")
+        );
     }
 
     #[test]
     fn learn_api_rejects_http_urls() {
-        assert!(ManageSkillsTool::validate_https_learning_url(
-            "http://docs.example.com/openapi.json"
-        )
-        .is_err());
-        assert!(ManageSkillsTool::validate_https_learning_url(
-            "https://docs.example.com/openapi.json"
-        )
-        .is_ok());
+        assert!(
+            ManageSkillsTool::validate_https_learning_url("http://docs.example.com/openapi.json")
+                .is_err()
+        );
+        assert!(
+            ManageSkillsTool::validate_https_learning_url("https://docs.example.com/openapi.json")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3572,15 +3586,19 @@ mutation CreateWidget {
 
         assert_eq!(generated.kind, ApiLearnKind::Docs);
         assert!(generated.skill.body.contains("GraphQL patterns:"));
-        assert!(generated
-            .skill
-            .body
-            .contains("endpoint: https://api.example.com/graphql"));
+        assert!(
+            generated
+                .skill
+                .body
+                .contains("endpoint: https://api.example.com/graphql")
+        );
         assert!(generated.skill.body.contains("operation: query Viewer"));
-        assert!(generated
-            .skill
-            .body
-            .contains("operation: mutation CreateWidget"));
+        assert!(
+            generated
+                .skill
+                .body
+                .contains("operation: mutation CreateWidget")
+        );
     }
 
     #[test]
@@ -3736,10 +3754,11 @@ mutation CreateWidget {
             "Add skill from URL 'https://example.com/skill.md'"
         );
         assert_eq!(add.risk, aidaemon_core::ApprovalRisk::High);
-        assert!(add
-            .warnings
-            .iter()
-            .any(|w| w.contains("can influence AI behavior")));
+        assert!(
+            add.warnings
+                .iter()
+                .any(|w| w.contains("can influence AI behavior"))
+        );
         let injected = ask(
             json!({"action":"add","url":"https://example.com/skill.md","_session_id":"synthetic"}),
             false,
@@ -3759,10 +3778,12 @@ mutation CreateWidget {
         )
         .expect("learn_api asks");
         assert!(learn.summary.contains("Learn API from URL"));
-        assert!(ask(json!({"action":"update","name":"updatable"}), false)
-            .expect("update asks")
-            .summary
-            .contains("Update skill 'updatable'"));
+        assert!(
+            ask(json!({"action":"update","name":"updatable"}), false)
+                .expect("update asks")
+                .summary
+                .contains("Update skill 'updatable'")
+        );
         // Install fetches only from configured registries; without one it
         // fails without fetching anything.
         assert!(ask(json!({"action":"install","name":"synthetic"}), true).is_some());

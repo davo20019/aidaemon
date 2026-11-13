@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::semantics::{
     ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole,
 };
-use aidaemon_tools::OutcomeTool as Tool;
 
 use crate::records::{
     FactPrivacy, PersonalAliasCandidate, PersonalEntityCandidate, PersonalFactCandidate,
@@ -373,10 +373,11 @@ impl Tool for RememberFactTool {
                     });
                     owner_added = true;
                 } else if matches!(key.as_str(), "name" | "full_name")
-                    && let Some(owner) = structured.entities.first_mut() {
-                        owner.canonical_name = entry.value.clone();
-                        owner.canonical_name_confirmed = true;
-                    }
+                    && let Some(owner) = structured.entities.first_mut()
+                {
+                    owner.canonical_name = entry.value.clone();
+                    owner.canonical_name_confirmed = true;
+                }
                 match key.as_str() {
                     "name" | "full_name" => structured.aliases.push(PersonalAliasCandidate {
                         entity_local_id: "owner".to_string(),
@@ -543,7 +544,7 @@ impl aidaemon_tools::semantics::ToolSemantics for RememberFactTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::full::tools::test_support::{memory, ToolCalls as _};
+    use crate::full::tools::test_support::{ToolCalls as _, memory};
     use crate::sqlite::SqliteMemory;
     use aidaemon_tools::semantics::ToolSemantics;
 
@@ -575,12 +576,16 @@ mod tests {
         assert!(out.contains("qa_codename = SYNTH-CODE-7"), "{out}");
 
         let facts = state.get_facts(None).await.unwrap();
-        assert!(facts
-            .iter()
-            .any(|f| f.key == "qa_codename" && f.value == "SYNTH-CODE-7"));
-        assert!(facts
-            .iter()
-            .any(|f| f.key == "favorite_test_number" && f.value == "1729"));
+        assert!(
+            facts
+                .iter()
+                .any(|f| f.key == "qa_codename" && f.value == "SYNTH-CODE-7")
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|f| f.key == "favorite_test_number" && f.value == "1729")
+        );
     }
 
     #[tokio::test]

@@ -129,18 +129,19 @@ impl AlertManager {
         if is_healthy
             && let (Some(threshold), Some(latency)) =
                 (probe.latency_threshold_ms, result.latency_ms)
-                && latency > threshold {
-                    // Check cooldown
-                    let should_alert = state
-                        .last_alert_at
-                        .map(|last| now - last >= self.alert_cooldown)
-                        .unwrap_or(true);
+            && latency > threshold
+        {
+            // Check cooldown
+            let should_alert = state
+                .last_alert_at
+                .map(|last| now - last >= self.alert_cooldown)
+                .unwrap_or(true);
 
-                    if should_alert {
-                        self.send_latency_alert(probe, result, threshold).await;
-                        state.last_alert_at = Some(now);
-                    }
-                }
+            if should_alert {
+                self.send_latency_alert(probe, result, threshold).await;
+                state.last_alert_at = Some(now);
+            }
+        }
 
         state.last_status = Some(result.status.clone());
     }

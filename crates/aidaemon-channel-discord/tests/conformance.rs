@@ -6,16 +6,16 @@
 mod common;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use aidaemon_channels::conformance::{check_channel, ChannelHarness};
+use aidaemon_channels::conformance::{ChannelHarness, check_channel};
 use aidaemon_channels::{ApprovalPrompt, Attachment, Conversation, ConversationKind};
-use common::{channel, MockHttp, BOT_ID, CHANNEL_ID, GUILD_ID};
+use common::{BOT_ID, CHANNEL_ID, GUILD_ID, MockHttp, channel};
 use futures::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{Notify, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 const DM_CHANNEL: &str = "100000000000000400";

@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::bus::now_ms;
-use crate::{Publisher, APP_CHANNEL};
+use crate::{APP_CHANNEL, Publisher};
 
 /// Ids clients see for the daemon's numbered things, unique across
 /// restarts (the registry's numbers start again at each boot).

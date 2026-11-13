@@ -19,4 +19,4 @@ pub use settings::{BrowserSettings, SessionIsolation};
 mod tool;
 
 #[cfg(feature = "chromium")]
-pub use tool::{policy, BrowserTool};
+pub use tool::{BrowserTool, policy};

@@ -8,7 +8,7 @@ use aidaemon_policies::{Learning, MemoryParts, MemorySystem, MemoryTurn, TurnLea
 use async_trait::async_trait;
 
 use super::opt_out::SKIP_LEARNING_TOOL;
-use super::{set_next_message_private, SystemMemory};
+use super::{SystemMemory, set_next_message_private};
 use crate::runtime_ports::{AgentIngress, InboundMessageRequest};
 use crate::testing::{MockProvider, TestHarness};
 use crate::traits::store_prelude::*;

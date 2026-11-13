@@ -11,15 +11,15 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crate::DiscordChannel as SdkDiscord;
-use aidaemon_channels::bot::{determine_role, BotDeps, SharedCommandDispatch};
+use aidaemon_channels::bot::{BotDeps, SharedCommandDispatch, determine_role};
 use aidaemon_channels::context::ChannelContext;
 use aidaemon_channels::hub::{
     ChannelCapabilities, ChannelHub, DynamicBotStore, HubChannel, MediaKind, MediaMessage,
 };
 use aidaemon_channels::prompts::Prompts;
-use aidaemon_channels::slash::{build_help_text, shared_commands, CommandCategory, CommandDef};
+use aidaemon_channels::slash::{CommandCategory, CommandDef, build_help_text, shared_commands};
 use aidaemon_channels::split_message;
-use aidaemon_channels::turns::{repeat_while_working, Turn, TurnRunner, TurnSurface};
+use aidaemon_channels::turns::{Turn, TurnRunner, TurnSurface, repeat_while_working};
 use aidaemon_channels::{
     Channel as _, ChannelEvent, CommandSpec, Conversation, ConversationKind, InboundMessage,
     OutboundFile, OutboundMessage,
@@ -287,10 +287,11 @@ impl DiscordBot {
         };
         while let Some(event) = events.recv().await {
             if let Some(username) = transport.bot_username()
-                && username != self.get_bot_username() {
-                    info!(username = %username, "Discord bot connected");
-                    self.set_bot_username(username);
-                }
+                && username != self.get_bot_username()
+            {
+                info!(username = %username, "Discord bot connected");
+                self.set_bot_username(username);
+            }
             let this = self.clone();
             tokio::spawn(async move { this.handle_event(event).await });
         }

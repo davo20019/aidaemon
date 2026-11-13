@@ -23,8 +23,8 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use aidaemon_core::conformance::ConformanceReport;
 use aidaemon_core::RunId;
+use aidaemon_core::conformance::ConformanceReport;
 
 use crate::approvals::{ApprovalStore, StoredApproval};
 use crate::channel::{Conversation, ConversationKind, MessageRef};

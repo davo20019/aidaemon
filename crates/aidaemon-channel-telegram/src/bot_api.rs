@@ -14,7 +14,7 @@ use crate::TelegramChannel as Adapter;
 use aidaemon_channels::ChannelError;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A failed Bot API call.
 #[derive(Debug)]
@@ -546,7 +546,7 @@ mod tests {
             ]] })
         );
         let reply = KeyboardMarkup::new(vec![vec![
-            KeyboardButton::new("Open").request(ButtonRequest::WebApp(WebAppInfo { url }))
+            KeyboardButton::new("Open").request(ButtonRequest::WebApp(WebAppInfo { url })),
         ]])
         .resize_keyboard()
         .one_time_keyboard();

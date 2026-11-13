@@ -1,7 +1,7 @@
 //! JSON Schemas from Rust types, shaped the way model providers take them.
 
-use schemars::generate::SchemaSettings;
 use schemars::JsonSchema;
+use schemars::generate::SchemaSettings;
 use serde_json::Value;
 
 /// The JSON Schema for `T`, inlined (no `$defs`/`$ref` unless the type is

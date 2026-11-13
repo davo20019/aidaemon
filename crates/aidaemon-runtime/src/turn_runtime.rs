@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::eval::{HarnessEvalAccumulator, HarnessEvalConfig};
-use crate::policy::trust_tier::{classify_model_trust, ModelTrustTier, TrustTierSetting};
+use crate::policy::trust_tier::{ModelTrustTier, TrustTierSetting, classify_model_trust};
 use crate::prompt::core::CachedCore;
 use crate::settings::{AudioConfig, ContextWindowConfig, PolicyConfig, SttConfig, VisionConfig};
 use crate::turn::turn_render::RenderOptions;

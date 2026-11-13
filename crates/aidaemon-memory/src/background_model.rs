@@ -12,8 +12,8 @@
 //!   otherwise wait for the model only inside their own deadline, never
 //!   queueing work that outlives them.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task;
@@ -220,13 +220,15 @@ mod tests {
             .unwrap();
 
         // A slow inference outlives its caller's deadline...
-        assert!(call_within(
-            &model,
-            Duration::from_millis(50),
-            Duration::from_millis(800)
-        )
-        .await
-        .is_none());
+        assert!(
+            call_within(
+                &model,
+                Duration::from_millis(50),
+                Duration::from_millis(800)
+            )
+            .await
+            .is_none()
+        );
         // ...and the next caller is refused at once instead of waiting
         // behind it for its whole deadline.
         let started = std::time::Instant::now();

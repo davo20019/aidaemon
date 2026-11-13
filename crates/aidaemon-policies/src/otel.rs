@@ -12,8 +12,8 @@
 //! and the session id is hashed. [`OtelSink::with_content`] opts in to
 //! prompts and replies and requires a redactor.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
@@ -23,8 +23,8 @@ use opentelemetry::trace::{
 };
 use opentelemetry::{Context, KeyValue};
 use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider, Span};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider, Span};
 
 /// Longest text put on a span when content capture is on.
 const MAX_CONTENT_CHARS: usize = 32_000;

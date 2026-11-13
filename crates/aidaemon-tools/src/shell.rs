@@ -5,13 +5,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use aidaemon_core::{
     AccessManifest, Tool, ToolAnnotations, ToolContext, ToolOutput, ToolResult, ToolSpec,
 };
 
-use crate::exec::{best_available_sandbox, Sandbox, SandboxCommand};
+use crate::exec::{Sandbox, SandboxCommand, best_available_sandbox};
 use crate::util::{fail, parse_args};
 use crate::workspace::Workspace;
 
@@ -264,7 +264,7 @@ impl Tool for Shell {
                     return Ok(fail(format!(
                         "cwd `{}` is not an existing directory",
                         self.workspace.display(&p)
-                    )))
+                    )));
                 }
                 Err(e) => return Ok(fail(e.to_string())),
             },
@@ -336,7 +336,7 @@ impl Tool for Shell {
 mod tests {
     use super::*;
     use crate::exec::LocalSandbox;
-    use crate::testutil::{ctx, ws, ScopedVar};
+    use crate::testutil::{ScopedVar, ctx, ws};
 
     fn shell(ws: &Workspace) -> Shell {
         Shell::new(ws.clone(), Arc::new(LocalSandbox))
@@ -374,10 +374,11 @@ mod tests {
             .call(json!({"command": "pwd", "cwd": "sub"}), &ctx())
             .await
             .unwrap();
-        assert!(out
-            .content
-            .trim_end()
-            .contains(&ws.root().join("sub").display().to_string()));
+        assert!(
+            out.content
+                .trim_end()
+                .contains(&ws.root().join("sub").display().to_string())
+        );
         let out = tool
             .call(json!({"command": "pwd", "cwd": "../"}), &ctx())
             .await

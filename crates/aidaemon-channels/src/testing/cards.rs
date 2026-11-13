@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::hub::{ChannelCapabilities, ChannelHub, HubChannel, MediaMessage, SessionMap};
 use aidaemon_tools::semantics::{ApprovalResponse, PermissionMode, RiskLevel};

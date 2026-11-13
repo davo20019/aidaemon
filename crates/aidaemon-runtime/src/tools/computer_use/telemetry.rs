@@ -122,17 +122,18 @@ impl SessionTelemetry {
             stats.last_mutations_used = budget.used;
         }
         if record.action == "click"
-            && let Some(target) = record.target {
-                let label = target.label().unwrap_or_else(|| "?".to_string());
-                let index = target.index.unwrap_or(0);
-                let entry = format!("{index}:{label}");
-                stats.click_targets.push(entry);
-                const MAX_CLICK_HISTORY: usize = 30;
-                if stats.click_targets.len() > MAX_CLICK_HISTORY {
-                    let drain = stats.click_targets.len() - MAX_CLICK_HISTORY;
-                    stats.click_targets.drain(0..drain);
-                }
+            && let Some(target) = record.target
+        {
+            let label = target.label().unwrap_or_else(|| "?".to_string());
+            let index = target.index.unwrap_or(0);
+            let entry = format!("{index}:{label}");
+            stats.click_targets.push(entry);
+            const MAX_CLICK_HISTORY: usize = 30;
+            if stats.click_targets.len() > MAX_CLICK_HISTORY {
+                let drain = stats.click_targets.len() - MAX_CLICK_HISTORY;
+                stats.click_targets.drain(0..drain);
             }
+        }
     }
 
     pub async fn finish_task(&self, task_id: &str) -> Option<SessionSummary> {
@@ -209,16 +210,18 @@ pub fn log_action(log: &ActionLog<'_>) {
             "computer_use action"
         );
         if let Some(budget) = log.budget
-            && budget.near_limit() && !budget.at_limit() {
-                tracing::warn!(
-                    target: "computer_use",
-                    task_id = log.task_id,
-                    mutations_used = budget.used,
-                    mutations_max = budget.max,
-                    mutations_remaining = budget.remaining(),
-                    "computer_use mutation budget nearly exhausted"
-                );
-            }
+            && budget.near_limit()
+            && !budget.at_limit()
+        {
+            tracing::warn!(
+                target: "computer_use",
+                task_id = log.task_id,
+                mutations_used = budget.used,
+                mutations_max = budget.max,
+                mutations_remaining = budget.remaining(),
+                "computer_use mutation budget nearly exhausted"
+            );
+        }
     } else {
         tracing::warn!(
             target: "computer_use",

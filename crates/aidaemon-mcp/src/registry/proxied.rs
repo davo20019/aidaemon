@@ -5,11 +5,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tracing::info;
 
+use aidaemon_tools::OutcomeTool;
 use aidaemon_tools::semantics::{
     ToolCallContext, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolDispatchFacts,
     ToolMutationEffects, ToolSemantics, TrustRoots,
 };
-use aidaemon_tools::OutcomeTool;
 
 /// A tool proxied from an MCP server as the registry offers it: the
 /// transport's [`crate::McpTool`] does the call; this keeps the name, schema

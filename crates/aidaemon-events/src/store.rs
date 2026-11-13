@@ -11,7 +11,7 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::{Row, SqlitePool};
 use tracing::{info, warn};
 
-use super::conversation_turn::{group_rows_into_turns, FetchedRow, FetchedTurn};
+use super::conversation_turn::{FetchedRow, FetchedTurn, group_rows_into_turns};
 use super::{
     DecisionPointData, DecisionType, Event, EventType, InteractionRequestedData,
     InteractionResolvedData, LlmCallData, PolicyDecisionData, ResourceRegisteredData, RunAggregate,
@@ -1219,16 +1219,18 @@ impl EventStore {
         }
         tx.commit().await?;
         if matches!(event_type_str, "user_message" | "assistant_response")
-            && let Err(error) = self.host.project_history(&self.pool, event_id).await {
-                // Never couple the canonical append transaction to FTS health.
-                tracing::debug!(%error, event_id, "Deferred exact-history projection");
-            }
+            && let Err(error) = self.host.project_history(&self.pool, event_id).await
+        {
+            // Never couple the canonical append transaction to FTS health.
+            tracing::debug!(%error, event_id, "Deferred exact-history projection");
+        }
         if let Some(generated_response) = generated_response {
             let _ = GENERATED_RESPONSE_CAPTURE.try_with(|capture| {
                 if capture.session_id == event.session_id
-                    && let Ok(mut responses) = capture.responses.lock() {
-                        responses.push(generated_response);
-                    }
+                    && let Ok(mut responses) = capture.responses.lock()
+                {
+                    responses.push(generated_response);
+                }
             });
         }
         Ok(event_id)
@@ -1787,9 +1789,9 @@ impl EventStore {
                 if event.event_type == EventType::ToolCall
                     && let Ok(call) =
                         serde_json::from_value::<super::ToolCallData>(event.data.clone())
-                    {
-                        calls.insert(call.tool_call_id.clone(), call);
-                    }
+                {
+                    calls.insert(call.tool_call_id.clone(), call);
+                }
             }
             for event in &child_events {
                 if event.event_type != EventType::ToolResult {
@@ -2231,13 +2233,12 @@ impl EventStore {
                     result,
                     task_id,
                     &format!("obligation:mutation:{effect_name}"),
-                )
-                    && let Some(effect) =
-                        crate::traits::ToolMutationEffects::from_protocol_name(effect_name)
-                    {
-                        closure.observed_mutation_effects =
-                            closure.observed_mutation_effects.union(effect);
-                    }
+                ) && let Some(effect) =
+                    crate::traits::ToolMutationEffects::from_protocol_name(effect_name)
+                {
+                    closure.observed_mutation_effects =
+                        closure.observed_mutation_effects.union(effect);
+                }
             }
             if result.succeeded()
                 && receipt.invocation_stage.reached_dispatch()
@@ -4054,11 +4055,7 @@ impl EventStore {
 }
 
 fn to_u64(value: i64) -> u64 {
-    if value <= 0 {
-        0
-    } else {
-        value as u64
-    }
+    if value <= 0 { 0 } else { value as u64 }
 }
 
 fn normalize_tool_error_text(raw: &str) -> std::borrow::Cow<'_, str> {
@@ -4117,9 +4114,10 @@ impl EventEmitter {
         // Inject task_id if present and not already in data
         if let Some(task_id) = &self.current_task_id
             && let Some(obj) = json_data.as_object_mut()
-                && !obj.contains_key("task_id") {
-                    obj.insert("task_id".to_string(), serde_json::json!(task_id));
-                }
+            && !obj.contains_key("task_id")
+        {
+            obj.insert("task_id".to_string(), serde_json::json!(task_id));
+        }
 
         let event = Event::new(&self.session_id, event_type, json_data);
         self.store.append(event).await
@@ -4151,9 +4149,10 @@ impl EventEmitter {
         call_id: &str,
     ) -> anyhow::Result<i64> {
         if data.task_id.trim().is_empty()
-            && let Some(task_id) = &self.current_task_id {
-                data.task_id = task_id.clone();
-            }
+            && let Some(task_id) = &self.current_task_id
+        {
+            data.task_id = task_id.clone();
+        }
         let event = Event::new(
             &self.session_id,
             EventType::LlmCall,
@@ -4325,11 +4324,13 @@ mod tests {
                 },
             ]
         );
-        assert!(store
-            .spawned_children("task-child-a")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .spawned_children("task-child-a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             store
                 .task_ids_for_turns(
@@ -4340,11 +4341,13 @@ mod tests {
                 .unwrap(),
             vec!["task-parent".to_string()]
         );
-        assert!(store
-            .task_ids_for_turns("specialist:a", &[])
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .task_ids_for_turns("specialist:a", &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -5147,10 +5150,12 @@ mod tests {
             );
             assert!(operation.dispatched);
         }
-        assert!(run.operations["call-tests"]
-            .targets
-            .iter()
-            .any(|hint| hint.value == "/srv/app/tests"));
+        assert!(
+            run.operations["call-tests"]
+                .targets
+                .iter()
+                .any(|hint| hint.value == "/srv/app/tests")
+        );
     }
 
     /// The walk follows the tree as deep as spawning allowed it to grow:
@@ -5272,11 +5277,18 @@ mod tests {
             .unwrap();
         assert_eq!(found.call.arguments["command"], "/usr/bin/false");
         assert_eq!(found.result.receipt.unwrap().exit_code, Some(1));
-        assert!(store
-            .continuation_tool_evidence("session-a", "task-parent", "call-exact", "result-other",)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .continuation_tool_evidence(
+                    "session-a",
+                    "task-parent",
+                    "call-exact",
+                    "result-other",
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(store
             .continuation_tool_evidence("session-a", "task-other", "call-exact", "result-exact",)
             .await
@@ -5621,10 +5633,12 @@ mod tests {
             ..TokenUsage::default()
         };
 
-        assert!(store
-            .append_llm_call_with_token_usage(event, Some(&usage), call_id)
-            .await
-            .is_err());
+        assert!(
+            store
+                .append_llm_call_with_token_usage(event, Some(&usage), call_id)
+                .await
+                .is_err()
+        );
         let event_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_type = 'llm_call'")
                 .fetch_one(&store.pool)
@@ -6077,16 +6091,18 @@ mod tests {
             .await
             .expect("terminalize active task");
         assert_eq!(closed.as_deref(), Some("task-supervisor"));
-        assert!(store
-            .terminalize_active_task(
-                "s-supervisor",
-                TaskStatus::Failed,
-                Some("duplicate".to_string()),
-                None,
-            )
-            .await
-            .expect("idempotent terminalization")
-            .is_none());
+        assert!(
+            store
+                .terminalize_active_task(
+                    "s-supervisor",
+                    TaskStatus::Failed,
+                    Some("duplicate".to_string()),
+                    None,
+                )
+                .await
+                .expect("idempotent terminalization")
+                .is_none()
+        );
 
         let events = store
             .query_task_events_for_session("s-supervisor", "task-supervisor")
@@ -6484,11 +6500,13 @@ mod tests {
                 2,
             )
         );
-        assert!(store
-            .get_active_task("s-terminal-race")
-            .await
-            .expect("active lookup")
-            .is_none());
+        assert!(
+            store
+                .get_active_task("s-terminal-race")
+                .await
+                .expect("active lookup")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -6987,7 +7005,7 @@ mod turn_anchored_tests {
         append_user(&store, "sess", "turn-A", "a-user").await; // id1
         append_assistant(&store, "sess", "turn-A", "a-asst").await; // id2
         append_user(&store, "sess", "turn-B", "b-user").await; // id3
-                                                               // Late write under already-finished turn-A (id4 > id3) — a background notifier.
+        // Late write under already-finished turn-A (id4 > id3) — a background notifier.
         append_tool(&store, "sess", "turn-A", "late-tool").await; // id4
         let turns = store.get_turns_from_anchor("sess", 0).await.unwrap();
         // turn-A's turn_seq is MIN(id)=1 < turn-B's 3, so turn-A still sorts first;

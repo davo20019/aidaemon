@@ -9,23 +9,23 @@ use std::time::Duration;
 use aidaemon_channels::context::WorkspaceGrant;
 use aidaemon_core::ChannelVisibility;
 use aidaemon_tools::semantics::{
-    prepare_invocation, ApprovalScope, GoalContext, PreparedToolInvocation,
-    ToolArgumentContractViolation, ToolCallContext, ToolCallMetadata, ToolCallOutcome,
-    ToolCallSemantics, ToolDispatchFacts, ToolInvocationStage, ToolOutcomeStatus, UserRole,
+    ApprovalScope, GoalContext, PreparedToolInvocation, ToolArgumentContractViolation,
+    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolDispatchFacts,
+    ToolInvocationStage, ToolOutcomeStatus, UserRole, prepare_invocation,
 };
-use aidaemon_tools::status::{with_status, StatusUpdate};
+use aidaemon_tools::status::{StatusUpdate, with_status};
 use aidaemon_tools::{ExecutionBackend, OutcomeTool};
 use aidaemon_work::authority::{
-    authorize_mandate_action, authorize_mandate_observation, mutation_audit_scope,
-    validate_mandate_grant, MandateAuthorityDecision,
+    MandateAuthorityDecision, authorize_mandate_action, authorize_mandate_observation,
+    mutation_audit_scope, validate_mandate_grant,
 };
 use aidaemon_work::mandates::policy::{
-    classify_mandate_call, role_allows_mandate_call, MandateCallClass,
+    MandateCallClass, classify_mandate_call, role_allows_mandate_call,
 };
 use aidaemon_work::mandates::{
     MandateDecisionOutcome, MandateMutationDispatchClaim, MandateMutationReservation,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::engine::tool_calls::strip_model_arguments;
@@ -108,9 +108,10 @@ pub fn sanitize_workspace_tool_outcome(
         *error = sanitize_workspace_tool_text(error, grant);
     }
     if let Some(truncation) = outcome.metadata.truncation.as_mut()
-        && let Some(hint) = truncation.remediation_hint.as_mut() {
-            *hint = sanitize_workspace_tool_text(hint, grant);
-        }
+        && let Some(hint) = truncation.remediation_hint.as_mut()
+    {
+        *hint = sanitize_workspace_tool_text(hint, grant);
+    }
     if let Some(read_file) = outcome.metadata.read_file.as_mut() {
         read_file.display_path = sanitize_workspace_tool_text(&read_file.display_path, grant);
         for line in &mut read_file.selected_lines {
@@ -639,15 +640,17 @@ pub trait ToolDispatch: TurnHost {
         // Only a tool that records it gets the trust its launch was judged
         // with (the terminal).
         if dispatch.records_launch_trust
-            && let Some((roots, cwd)) = ctx.trust_roots {
-                facts.trust_roots = Some(roots.to_vec());
-                facts.trust_cwd = Some(cwd.to_string());
-            }
+            && let Some((roots, cwd)) = ctx.trust_roots
+        {
+            facts.trust_roots = Some(roots.to_vec());
+            facts.trust_cwd = Some(cwd.to_string());
+        }
         // A child inherits this turn's authority, not a re-resolution.
         if dispatch.spawns_child_agents
-            && let Some(turn_authority) = ctx.turn_authority {
-                facts.extensions.insert(turn_authority.clone());
-            }
+            && let Some(turn_authority) = ctx.turn_authority
+        {
+            facts.extensions.insert(turn_authority.clone());
+        }
         // Goal context for the tools that need it. Background delivery routes
         // async/timeout notifications to the *origin* session
         // (goal.session_id), since internal child-agent sessions are not
@@ -659,17 +662,19 @@ pub trait ToolDispatch: TurnHost {
                 // Executors typically carry a task, not a goal: resolve it
                 // via the task so background notifications stay deliverable.
                 if let Some(executor_task_id) = self.task_id()
-                    && let Ok(Some(task)) = self.tasks().get_task(executor_task_id).await {
-                        facts.goal_id = Some(task.goal_id);
-                    }
+                    && let Ok(Some(task)) = self.tasks().get_task(executor_task_id).await
+                {
+                    facts.goal_id = Some(task.goal_id);
+                }
             }
             if dispatch.goal_context == GoalContext::MandateRun
-                && let Some(fence) = self.mandate_execution() {
-                    facts.goal_run_id = Some(fence.goal_run_id.clone());
-                    facts.task_attempt_id = Some(fence.attempt_id.clone());
-                    facts.mandate_id = Some(fence.mandate_id.clone());
-                    facts.mandate_version = Some(fence.mandate_version);
-                }
+                && let Some(fence) = self.mandate_execution()
+            {
+                facts.goal_run_id = Some(fence.goal_run_id.clone());
+                facts.task_attempt_id = Some(fence.attempt_id.clone());
+                facts.mandate_id = Some(fence.mandate_id.clone());
+                facts.mandate_version = Some(fence.mandate_version);
+            }
         }
         if dispatch.needs_live_model {
             let runtime = self.llm_runtime().snapshot();
@@ -759,11 +764,12 @@ pub trait ToolDispatch: TurnHost {
             && self.exec_dispatch_facts(name, ctx).checkpoints_writes;
         if let Some(grant) = active_workspace_grant {
             if checkpoints_writes
-                && let Some(manager) = aidaemon_tools::checkpoints::active_manager() {
-                    manager
-                        .begin_for_tool(name, &enriched_args, &call_facts)
-                        .await?;
-                }
+                && let Some(manager) = aidaemon_tools::checkpoints::active_manager()
+            {
+                manager
+                    .begin_for_tool(name, &enriched_args, &call_facts)
+                    .await?;
+            }
             let mut exec_ctx = call_facts.clone();
             exec_ctx.mandate_preapproved = self
                 .claim_mandate_dispatch(under_mandate, name, arguments, ctx)
@@ -788,11 +794,12 @@ pub trait ToolDispatch: TurnHost {
                 Err(rejection) => return Ok(*rejection),
             };
             if checkpoints_writes
-                && let Some(manager) = aidaemon_tools::checkpoints::active_manager() {
-                    manager
-                        .begin_for_access_manifest(name, &prepared.access_manifest, &call_facts)
-                        .await?;
-                }
+                && let Some(manager) = aidaemon_tools::checkpoints::active_manager()
+            {
+                manager
+                    .begin_for_access_manifest(name, &prepared.access_manifest, &call_facts)
+                    .await?;
+            }
             let mut exec_ctx = call_facts.clone();
             exec_ctx.mandate_preapproved = self
                 .claim_mandate_dispatch(under_mandate, name, arguments, ctx)
@@ -804,17 +811,16 @@ pub trait ToolDispatch: TurnHost {
                 .map(|outcome| finalize_dispatched_outcome(&prepared, outcome));
             if result.as_ref().is_ok_and(|outcome| {
                 outcome.metadata.background_started || outcome.metadata.detached
-            })
-                && let (Some(manager), Some(task_id)) =
-                    (aidaemon_tools::checkpoints::active_manager(), task_id)
-                {
-                    manager
-                        .mark_task_unsafe(
-                            task_id,
-                            "mutation continued in a background or detached process",
-                        )
-                        .await;
-                }
+            }) && let (Some(manager), Some(task_id)) =
+                (aidaemon_tools::checkpoints::active_manager(), task_id)
+            {
+                manager
+                    .mark_task_unsafe(
+                        task_id,
+                        "mutation continued in a background or detached process",
+                    )
+                    .await;
+            }
             return result;
         }
 

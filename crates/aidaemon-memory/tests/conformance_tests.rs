@@ -5,7 +5,7 @@ mod common;
 
 use std::sync::Arc;
 
-use aidaemon_core::conformance::{check_tool, ConformanceReport};
+use aidaemon_core::conformance::{ConformanceReport, check_tool};
 use aidaemon_memory::conformance::{check_store, store_checks};
 use aidaemon_memory::{
     HashEmbedder, InMemoryMemoryStore, Memory, MemoryStore, RecallTool, RememberTool,

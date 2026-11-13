@@ -22,8 +22,8 @@
 //! holds only targets of operations that succeeded. It grants nothing: tool
 //! authority and trust still come only from the explicit authority.
 
-use aidaemon_events::run_aggregate::RunAggregate;
 use aidaemon_events::EventStore;
+use aidaemon_events::run_aggregate::RunAggregate;
 use aidaemon_tools::semantics::{ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind};
 
 use crate::authority::InheritedAuthority;

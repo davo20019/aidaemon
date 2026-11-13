@@ -241,12 +241,14 @@ mod tests {
             assert!(effects.complete, "{key}");
             assert_eq!(
                 effects.keys,
-                vec![aidaemon_tools::command_effects::path_effect(
-                    aidaemon_core::EffectClass::Write,
-                    &format!("{dir}/acme.md"),
-                    None
-                )
-                .unwrap()]
+                vec![
+                    aidaemon_tools::command_effects::path_effect(
+                        aidaemon_core::EffectClass::Write,
+                        &format!("{dir}/acme.md"),
+                        None
+                    )
+                    .unwrap()
+                ]
             );
         }
         // A relative path has no known working directory here.

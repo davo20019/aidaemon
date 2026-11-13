@@ -234,21 +234,27 @@ mod workspace_grant_tests {
 
         let mut wrong_channel = ctx.clone();
         wrong_channel.channel_id = Some("slack:C_OTHER".to_string());
-        assert!(wrong_channel
-            .active_workspace_grant(UserRole::Guest)
-            .is_none());
+        assert!(
+            wrong_channel
+                .active_workspace_grant(UserRole::Guest)
+                .is_none()
+        );
 
         let mut wrong_workspace = ctx.clone();
         wrong_workspace.workspace_id = Some("T_OTHER".to_string());
-        assert!(wrong_workspace
-            .active_workspace_grant(UserRole::Guest)
-            .is_none());
+        assert!(
+            wrong_workspace
+                .active_workspace_grant(UserRole::Guest)
+                .is_none()
+        );
 
         let mut wrong_sender = ctx.clone();
         wrong_sender.sender_id = Some("slack:U_OTHER".to_string());
-        assert!(wrong_sender
-            .active_workspace_grant(UserRole::Guest)
-            .is_none());
+        assert!(
+            wrong_sender
+                .active_workspace_grant(UserRole::Guest)
+                .is_none()
+        );
 
         assert!(ctx.active_workspace_grant(UserRole::Public).is_none());
         assert!(ctx.active_workspace_grant(UserRole::Owner).is_none());

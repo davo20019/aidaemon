@@ -1,8 +1,8 @@
 //! Small helpers the turn's handlers share: status sends, the heartbeat,
 //! bounded text, and the provider tool array's canonical order.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aidaemon_tools::status::StatusUpdate;

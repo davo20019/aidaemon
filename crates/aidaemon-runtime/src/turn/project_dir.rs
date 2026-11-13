@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use aidaemon_events::traits::{ToolCallSemantics, ToolTargetHintKind};
 
@@ -110,10 +110,11 @@ fn resolve_injected_working_dir(
     let resolved = aidaemon_tools::fs_utils::validate_path(backend, project_dir).ok();
     if let Some(path) = resolved
         && !path.is_dir()
-            && let Some(parent) = path.parent()
-                && parent.is_dir() {
-                    return parent.to_string_lossy().to_string();
-                }
+        && let Some(parent) = path.parent()
+        && parent.is_dir()
+    {
+        return parent.to_string_lossy().to_string();
+    }
     project_dir.to_string()
 }
 
@@ -501,15 +502,19 @@ mod tests {
             r#"{"path":"crates/widget/src/lib.rs"}"#,
             &read_semantics,
         );
-        assert!(targets
-            .iter()
-            .any(|target| target == "crates/widget/src/lib.rs"));
-        assert!(project_instruction_targets_for_tool_call(
-            "search_files",
-            r#"{"path":"crates/widget","glob":"*.rs"}"#,
-            &read_semantics,
-        )
-        .is_empty());
+        assert!(
+            targets
+                .iter()
+                .any(|target| target == "crates/widget/src/lib.rs")
+        );
+        assert!(
+            project_instruction_targets_for_tool_call(
+                "search_files",
+                r#"{"path":"crates/widget","glob":"*.rs"}"#,
+                &read_semantics,
+            )
+            .is_empty()
+        );
     }
 
     #[test]

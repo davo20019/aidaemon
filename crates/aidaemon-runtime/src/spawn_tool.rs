@@ -8,8 +8,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::FutureExt as _;
 use serde::Deserialize;
-use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 use crate::run_state::{RunEnd, RunPhase};
@@ -21,12 +21,12 @@ use aidaemon_channels::context::ChannelContext;
 use aidaemon_channels::ports::OutboundRouter;
 use aidaemon_core::ChannelVisibility;
 use aidaemon_core::SourceTrust;
-use aidaemon_events::traits::AgentRole;
 use aidaemon_events::TaskOutcome;
+use aidaemon_events::traits::AgentRole;
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::semantics::UserRole;
 use aidaemon_tools::semantics::{ToolCallContext, ToolCallOutcome, ToolCapabilities};
 use aidaemon_tools::status::StatusUpdate;
-use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_work::stores::NotificationStore as StateStore;
 
 /// A tool that allows the LLM to spawn a sub-agent for a focused task.
@@ -52,8 +52,7 @@ pub struct SpawnAgentTool {
 
 /// Fallback description used when the parent runtime isn't wired yet
 /// (early bootstrap) or when the registry is empty.
-pub const STATIC_SPECIALIST_ARG_DESCRIPTION: &str =
-    "Optional. Pick the specialist profile matching this task. \
+pub const STATIC_SPECIALIST_ARG_DESCRIPTION: &str = "Optional. Pick the specialist profile matching this task. \
      Omit to use the broad executor profile.";
 
 /// Format the per-kind `(name, description)` pairs from
@@ -309,9 +308,10 @@ pub fn render_run_result(
         parts.push(body.trim_end().to_string());
     }
     if state.reason().is_none()
-        && let Some(evidence) = state.evidence.after_report(has_body) {
-            parts.push(evidence);
-        }
+        && let Some(evidence) = state.evidence.after_report(has_body)
+    {
+        parts.push(evidence);
+    }
     if let Some(delivered) =
         crate::coordination::owner_delivery_lines(state.evidence.delivered.as_deref())
     {
@@ -2132,12 +2132,14 @@ impl SpawnAgentTool {
                             };
                             // Nothing to salvage: release the executor's claimed
                             // task, as a waited-on executor does.
-                            if salvaged.is_none() && child_role == Some(AgentRole::Executor)
-                                && let Some(task_id) = durable_task_id.as_deref() {
-                                    agent
-                                        .mark_executor_task_timeout(task_id, timeout_secs)
-                                        .await;
-                                }
+                            if salvaged.is_none()
+                                && child_role == Some(AgentRole::Executor)
+                                && let Some(task_id) = durable_task_id.as_deref()
+                            {
+                                agent
+                                    .mark_executor_task_timeout(task_id, timeout_secs)
+                                    .await;
+                            }
                             match salvaged {
                                 Some(outcome) => (
                                     match outcome.status.as_str() {
@@ -2191,9 +2193,10 @@ impl SpawnAgentTool {
             }
 
             if let Some(state) = state.as_ref()
-                && let Err(error) = state.finish_background_spawn(&background_id).await {
-                    warn!(%error, "Could not clear a background sub-agent's record");
-                }
+                && let Err(error) = state.finish_background_spawn(&background_id).await
+            {
+                warn!(%error, "Could not clear a background sub-agent's record");
+            }
             agent.release_background_cancel_token(&background_id).await;
 
             if let Some(task_id) = executor_task_id_for_bg {
@@ -2588,9 +2591,10 @@ pub async fn run_card(
 /// place, else send it as a new card. `true` when the chat shows it.
 pub async fn update_checklist_card(hub: &dyn OutboundRouter, session_id: &str, card: &str) -> bool {
     if let Some(id) = hub.checklist_surface(session_id).await
-        && matches!(hub.edit_text(session_id, &id, card).await, Ok(true)) {
-            return true;
-        }
+        && matches!(hub.edit_text(session_id, &id, card).await, Ok(true))
+    {
+        return true;
+    }
     match hub.send_text_tracked(session_id, card).await {
         Ok(Some(id)) => {
             hub.register_checklist_surface(session_id, &id).await;

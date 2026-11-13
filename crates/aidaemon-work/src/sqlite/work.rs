@@ -1,8 +1,8 @@
 use super::*;
 use crate::traits::{
-    GoalRun, HandoffArtifact, TaskAttempt, TaskAttemptPatch, TaskHandoff, TaskJournalEntry,
-    TaskWorkspace, WorkCoordinationStore, WorkGoalSummary, WorkProject, WorkTaskSummary,
-    WorkerProfile, DEFAULT_PROJECT_ID,
+    DEFAULT_PROJECT_ID, GoalRun, HandoffArtifact, TaskAttempt, TaskAttemptPatch, TaskHandoff,
+    TaskJournalEntry, TaskWorkspace, WorkCoordinationStore, WorkGoalSummary, WorkProject,
+    WorkTaskSummary, WorkerProfile,
 };
 
 const DEFAULT_LEASE_SECS: i64 = 180;
@@ -2211,21 +2211,23 @@ mod tests {
         assert!(store.goal_run_has_live_attempt(&run.id).await.unwrap());
 
         // A terminal patch ends the attempt and with it the ownership claim.
-        assert!(store
-            .patch_task_from_attempt(
-                &attempt.id,
-                &attempt.lease_token,
-                &TaskAttemptPatch {
-                    status: "completed".to_string(),
-                    result: Some("done".to_string()),
-                    error: None,
-                    blocker: None,
-                    context: None,
-                    handoff: None,
-                },
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .patch_task_from_attempt(
+                    &attempt.id,
+                    &attempt.lease_token,
+                    &TaskAttemptPatch {
+                        status: "completed".to_string(),
+                        result: Some("done".to_string()),
+                        error: None,
+                        blocker: None,
+                        context: None,
+                        handoff: None,
+                    },
+                )
+                .await
+                .unwrap()
+        );
         assert!(!store.goal_run_has_live_attempt(&run.id).await.unwrap());
     }
 
@@ -2255,16 +2257,20 @@ mod tests {
             run.id
         );
 
-        assert!(store
-            .finish_goal_run(&run.id, "failed", Some("terminal failure"))
-            .await
-            .unwrap());
+        assert!(
+            store
+                .finish_goal_run(&run.id, "failed", Some("terminal failure"))
+                .await
+                .unwrap()
+        );
         let reconciled = store.get_tasks_for_goal_run(&run.id).await.unwrap();
         assert_eq!(reconciled[0].status, "cancelled");
-        assert!(reconciled[0]
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("Parent scheduled occurrence")));
+        assert!(
+            reconciled[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Parent scheduled occurrence"))
+        );
     }
 
     #[tokio::test]
@@ -2290,10 +2296,12 @@ mod tests {
 
         // The lead is still running inside its root task when it completes
         // the run; its own root is the caller, not an open obligation.
-        assert!(store
-            .finish_goal_run(&run.id, "completed", Some("published"))
-            .await
-            .expect("an active root lead must be able to complete its run"));
+        assert!(
+            store
+                .finish_goal_run(&run.id, "completed", Some("published"))
+                .await
+                .expect("an active root lead must be able to complete its run")
+        );
     }
 
     #[tokio::test]
@@ -2313,10 +2321,12 @@ mod tests {
         done.status = "completed".to_string();
         store.create_task(&done).await.unwrap();
 
-        assert!(store
-            .finish_goal_run(&run.id, "completed", Some("published"))
-            .await
-            .expect("superseded work is resolved, as Task::satisfies_run_completion says"));
+        assert!(
+            store
+                .finish_goal_run(&run.id, "completed", Some("published"))
+                .await
+                .expect("superseded work is resolved, as Task::satisfies_run_completion says")
+        );
     }
 
     #[tokio::test]
@@ -2333,10 +2343,12 @@ mod tests {
             .unwrap();
         store.create_task(&root).await.unwrap();
 
-        assert!(store
-            .finish_goal_run(&run.id, "completed", Some("premature"))
-            .await
-            .is_err());
+        assert!(
+            store
+                .finish_goal_run(&run.id, "completed", Some("premature"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2349,11 +2361,13 @@ mod tests {
         store.create_task(&first).await.unwrap();
         store.create_task(&second).await.unwrap();
 
-        assert!(store
-            .claim_task_with_lease(&second.id, "worker-b", Some("profile-review"), 180)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .claim_task_with_lease(&second.id, "worker-b", Some("profile-review"), 180)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let first_attempt = store
             .claim_task_with_lease(&first.id, "worker-a", Some("profile-code"), 180)
             .await
@@ -2369,10 +2383,12 @@ mod tests {
             )),
             ..Default::default()
         };
-        assert!(store
-            .patch_task_from_attempt(&first_attempt.id, &first_attempt.lease_token, &patch,)
-            .await
-            .unwrap());
+        assert!(
+            store
+                .patch_task_from_attempt(&first_attempt.id, &first_attempt.lease_token, &patch,)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             store
                 .get_latest_task_handoff(&first.id)
@@ -2382,23 +2398,27 @@ mod tests {
                 .verification,
             vec!["check passed"]
         );
-        assert!(store
-            .claim_task_with_lease(&second.id, "worker-b", Some("profile-review"), 180)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(!store
-            .patch_task_from_attempt(
-                &first_attempt.id,
-                &first_attempt.lease_token,
-                &TaskAttemptPatch {
-                    status: "failed".to_string(),
-                    error: Some("late write".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .claim_task_with_lease(&second.id, "worker-b", Some("profile-review"), 180)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !store
+                .patch_task_from_attempt(
+                    &first_attempt.id,
+                    &first_attempt.lease_token,
+                    &TaskAttemptPatch {
+                        status: "failed".to_string(),
+                        error: Some("late write".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2457,10 +2477,12 @@ mod tests {
         .execute(&store.pool)
         .await
         .unwrap();
-        assert!(store
-            .retry_work_task(&failed.id, "owner", Some("telegram"))
-            .await
-            .unwrap());
+        assert!(
+            store
+                .retry_work_task(&failed.id, "owner", Some("telegram"))
+                .await
+                .unwrap()
+        );
         let retried = store.get_task(&failed.id).await.unwrap().unwrap();
         assert_eq!(retried.status, "pending");
         assert!(retried.result.is_none());
@@ -2480,11 +2502,13 @@ mod tests {
         .execute(&store.pool)
         .await
         .unwrap();
-        assert!(store
-            .claim_task_with_lease(&stale_pending.id, "worker-a", None, 180)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .claim_task_with_lease(&stale_pending.id, "worker-a", None, 180)
+                .await
+                .unwrap()
+                .is_some()
+        );
         let claimed = store.get_task(&stale_pending.id).await.unwrap().unwrap();
         assert_eq!(claimed.status, "claimed");
         assert!(claimed.result.is_none());
@@ -2532,14 +2556,18 @@ mod tests {
         assert_eq!(safe_after.retry_count, 1);
         let ambiguous_after = store.get_task(&ambiguous.id).await.unwrap().unwrap();
         assert_eq!(ambiguous_after.status, "blocked");
-        assert!(ambiguous_after
-            .blocker
-            .unwrap()
-            .contains("Verify external side effects"));
-        assert!(!store
-            .heartbeat_task_attempt(&safe_attempt.id, &safe_attempt.lease_token, 180,)
-            .await
-            .unwrap());
+        assert!(
+            ambiguous_after
+                .blocker
+                .unwrap()
+                .contains("Verify external side effects")
+        );
+        assert!(
+            !store
+                .heartbeat_task_attempt(&safe_attempt.id, &safe_attempt.lease_token, 180,)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2553,35 +2581,43 @@ mod tests {
         store.create_task(&first).await.unwrap();
         store.create_task(&second).await.unwrap();
         store.create_task(&third).await.unwrap();
-        assert!(store
-            .claim_task_with_lease(&first.id, "one", Some("profile-code"), 180)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(store
-            .claim_task_with_lease(&second.id, "two", Some("profile-code"), 180)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(store
-            .claim_task_with_lease(&third.id, "three", Some("profile-code"), 180)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .claim_task_with_lease(&first.id, "one", Some("profile-code"), 180)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .claim_task_with_lease(&second.id, "two", Some("profile-code"), 180)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .claim_task_with_lease(&third.id, "three", Some("profile-code"), 180)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let generic_attempt = store
             .claim_task_with_lease(&third.id, "three", Some("profile-executor"), 180)
             .await
             .unwrap()
             .unwrap();
-        assert!(!store
-            .bind_task_attempt_worker(
-                &generic_attempt.id,
-                &generic_attempt.lease_token,
-                "three",
-                Some("profile-code"),
-            )
-            .await
-            .unwrap());
+        assert!(
+            !store
+                .bind_task_attempt_worker(
+                    &generic_attempt.id,
+                    &generic_attempt.lease_token,
+                    "three",
+                    Some("profile-code"),
+                )
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2690,10 +2726,17 @@ mod tests {
         store.create_task(&assigned).await.unwrap();
         store.create_task(&workspace).await.unwrap();
 
-        assert!(store
-            .assign_task_worker_profile(&assigned.id, "profile-review", "owner", Some("telegram"))
-            .await
-            .unwrap());
+        assert!(
+            store
+                .assign_task_worker_profile(
+                    &assigned.id,
+                    "profile-review",
+                    "owner",
+                    Some("telegram")
+                )
+                .await
+                .unwrap()
+        );
         let attempt = store
             .claim_task_with_lease(&assigned.id, "worker-a", Some("profile-code"), 180)
             .await
@@ -2710,10 +2753,17 @@ mod tests {
         code_profile.version += 1;
         code_profile.updated_at = chrono::Utc::now().to_rfc3339();
         store.upsert_worker_profile(&code_profile).await.unwrap();
-        assert!(store
-            .assign_task_worker_profile(&workspace.id, "profile-code", "owner", Some("telegram"))
-            .await
-            .unwrap());
+        assert!(
+            store
+                .assign_task_worker_profile(
+                    &workspace.id,
+                    "profile-code",
+                    "owner",
+                    Some("telegram")
+                )
+                .await
+                .unwrap()
+        );
         assert_eq!(
             store
                 .get_task_workspace_policy(&workspace.id)
@@ -2721,10 +2771,12 @@ mod tests {
                 .unwrap(),
             "worktree"
         );
-        assert!(store
-            .set_task_workspace_policy(&workspace.id, "shared")
-            .await
-            .unwrap());
+        assert!(
+            store
+                .set_task_workspace_policy(&workspace.id, "shared")
+                .await
+                .unwrap()
+        );
         assert_eq!(
             store
                 .get_task_workspace_policy(&workspace.id)
@@ -2741,10 +2793,12 @@ mod tests {
             .create_work_project("Operations", Some("production work"))
             .await
             .unwrap();
-        assert!(store
-            .set_session_work_project("session-ops", &project.id)
-            .await
-            .unwrap());
+        assert!(
+            store
+                .set_session_work_project("session-ops", &project.id)
+                .await
+                .unwrap()
+        );
         let goal = Goal::new_finite("operate service", "session-ops");
         store.create_goal(&goal).await.unwrap();
         let first_run = store.get_current_goal_run(&goal.id).await.unwrap().unwrap();
@@ -2756,19 +2810,21 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(store
-            .patch_task_from_attempt(
-                &attempt.id,
-                &attempt.lease_token,
-                &TaskAttemptPatch {
-                    status: "blocked".to_string(),
-                    blocker: Some("Need approval".to_string()),
-                    handoff: Some(handoff(&blocked.id, &attempt.id, "Waiting for approval")),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .patch_task_from_attempt(
+                    &attempt.id,
+                    &attempt.lease_token,
+                    &TaskAttemptPatch {
+                        status: "blocked".to_string(),
+                        blocker: Some("Need approval".to_string()),
+                        handoff: Some(handoff(&blocked.id, &attempt.id, "Waiting for approval")),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
         let escalation = crate::traits::NotificationEntry::new(
             &goal.id,
             &goal.session_id,
@@ -2777,22 +2833,28 @@ mod tests {
         )
         .with_task(&blocked.id);
         store.enqueue_notification(&escalation).await.unwrap();
-        assert!(store
-            .get_pending_notifications(20)
-            .await
-            .unwrap()
-            .iter()
-            .any(|entry| entry.id == escalation.id));
-        assert!(store
-            .unblock_task(&blocked.id, "Approved by owner", "owner", Some("telegram"))
-            .await
-            .unwrap());
-        assert!(!store
-            .get_pending_notifications(20)
-            .await
-            .unwrap()
-            .iter()
-            .any(|entry| entry.id == escalation.id));
+        assert!(
+            store
+                .get_pending_notifications(20)
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.id == escalation.id)
+        );
+        assert!(
+            store
+                .unblock_task(&blocked.id, "Approved by owner", "owner", Some("telegram"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .get_pending_notifications(20)
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.id == escalation.id)
+        );
         let journal = store.get_task_journal(&blocked.id, 20).await.unwrap();
         assert!(journal.iter().any(|entry| entry.entry_type == "unblocked"));
 
@@ -2887,12 +2949,16 @@ mod tests {
             .list_work_goals(DEFAULT_PROJECT_ID, false, 100)
             .await
             .unwrap();
-        assert!(goals
-            .iter()
-            .any(|item| item.run_id.as_deref() == Some(first_scheduled.id.as_str())));
-        assert!(goals
-            .iter()
-            .any(|item| item.run_id.as_deref() == Some(second_scheduled.id.as_str())));
+        assert!(
+            goals
+                .iter()
+                .any(|item| item.run_id.as_deref() == Some(first_scheduled.id.as_str()))
+        );
+        assert!(
+            goals
+                .iter()
+                .any(|item| item.run_id.as_deref() == Some(second_scheduled.id.as_str()))
+        );
     }
 
     #[tokio::test]
@@ -2902,10 +2968,12 @@ mod tests {
         store.create_goal(&goal).await.unwrap();
         let cancelled = task(&goal.id, "no longer needed", None);
         store.create_task(&cancelled).await.unwrap();
-        assert!(store
-            .cancel_work_task(&cancelled.id, "owner", Some("telegram"))
-            .await
-            .unwrap());
+        assert!(
+            store
+                .cancel_work_task(&cancelled.id, "owner", Some("telegram"))
+                .await
+                .unwrap()
+        );
 
         let done = store
             .list_work_tasks(DEFAULT_PROJECT_ID, Some("done"), 100)
@@ -2914,11 +2982,13 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].task_id, cancelled.id);
         assert_eq!(done[0].lane, "done");
-        assert!(store
-            .list_work_tasks(DEFAULT_PROJECT_ID, Some("needs_attention"), 100)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .list_work_tasks(DEFAULT_PROJECT_ID, Some("needs_attention"), 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2942,11 +3012,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store
-            .list_work_tasks(DEFAULT_PROJECT_ID, None, 100)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .list_work_tasks(DEFAULT_PROJECT_ID, None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let goals = store
             .list_work_goals(DEFAULT_PROJECT_ID, false, 100)
             .await
@@ -2992,10 +3064,12 @@ mod tests {
                 .start_goal_run(&goal.id, "scheduled", Some(&active_schedule.id), None)
                 .await
                 .unwrap();
-            assert!(store
-                .finish_goal_run(&run.id, "failed", Some("synthetic failed run"))
-                .await
-                .unwrap());
+            assert!(
+                store
+                    .finish_goal_run(&run.id, "failed", Some("synthetic failed run"))
+                    .await
+                    .unwrap()
+            );
             let recovery = store
                 .get_scheduled_recovery_state(&goal.id)
                 .await
@@ -3023,14 +3097,17 @@ mod tests {
             store.get_goal(&goal.id).await.unwrap().unwrap().status,
             "active"
         );
-        assert!(store
-            .get_pending_notifications(20)
-            .await
-            .unwrap()
-            .iter()
-            .any(|notification| {
-                notification.goal_id == goal.id && notification.notification_type == "escalation"
-            }));
+        assert!(
+            store
+                .get_pending_notifications(20)
+                .await
+                .unwrap()
+                .iter()
+                .any(|notification| {
+                    notification.goal_id == goal.id
+                        && notification.notification_type == "escalation"
+                })
+        );
 
         let recovery_run = store
             .start_goal_run(&goal.id, "scheduled", Some(&active_schedule.id), None)
@@ -3079,14 +3156,16 @@ mod tests {
         recovery_task.result = Some("synthetic recovery verified".to_string());
         recovery_task.completed_at = Some(chrono::Utc::now().to_rfc3339());
         store.update_task(&recovery_task).await.unwrap();
-        assert!(store
-            .finish_goal_run(
-                &recovery_run.id,
-                "completed",
-                Some("synthetic verified recovery"),
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .finish_goal_run(
+                    &recovery_run.id,
+                    "completed",
+                    Some("synthetic verified recovery"),
+                )
+                .await
+                .unwrap()
+        );
         let healthy = store
             .get_scheduled_recovery_state(&goal.id)
             .await
@@ -3160,10 +3239,12 @@ mod tests {
                 .start_goal_run(&goal.id, "scheduled", Some(&schedule.id), None)
                 .await
                 .unwrap();
-            assert!(store
-                .finish_goal_run(&run.id, "failed", Some("synthetic failed run"))
-                .await
-                .unwrap());
+            assert!(
+                store
+                    .finish_goal_run(&run.id, "failed", Some("synthetic failed run"))
+                    .await
+                    .unwrap()
+            );
         }
         let escalated = store
             .get_scheduled_recovery_state(&goal.id)
@@ -3209,10 +3290,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(store
-            .bind_task_attempt_worker(&attempt.id, &attempt.lease_token, worker_session, None)
-            .await
-            .unwrap());
+        assert!(
+            store
+                .bind_task_attempt_worker(&attempt.id, &attempt.lease_token, worker_session, None)
+                .await
+                .unwrap()
+        );
 
         // The receipt is emitted under the worker session with an agent-loop
         // task id that exists nowhere in the tasks table.
@@ -3245,14 +3328,16 @@ mod tests {
         recovery_task.result = Some("synthetic recovery verified".to_string());
         recovery_task.completed_at = Some(chrono::Utc::now().to_rfc3339());
         store.update_task(&recovery_task).await.unwrap();
-        assert!(store
-            .finish_goal_run(
-                &recovery_run.id,
-                "completed",
-                Some("verified via session edge")
-            )
-            .await
-            .unwrap());
+        assert!(
+            store
+                .finish_goal_run(
+                    &recovery_run.id,
+                    "completed",
+                    Some("verified via session edge")
+                )
+                .await
+                .unwrap()
+        );
 
         let healthy = store
             .get_scheduled_recovery_state(&goal.id)

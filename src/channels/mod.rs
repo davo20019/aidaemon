@@ -25,10 +25,10 @@ use std::sync::Arc;
 
 pub use aidaemon_channels::hub::{ChannelHub, SessionMap};
 #[cfg(feature = "discord")]
-pub use discord::{spawn_discord_channel, DiscordChannel};
+pub use discord::{DiscordChannel, spawn_discord_channel};
 #[cfg(feature = "slack")]
-pub use slack::{spawn_slack_channel, SlackChannel};
-pub(crate) use telegram::{new_telegram_bot, TelegramBot};
+pub use slack::{SlackChannel, spawn_slack_channel};
+pub(crate) use telegram::{TelegramBot, new_telegram_bot};
 
 /// Shared application services/configuration consumed by every chat transport.
 /// Transport constructors take this named bundle plus protocol-specific values,

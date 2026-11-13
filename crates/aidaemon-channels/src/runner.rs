@@ -67,7 +67,7 @@ use aidaemon_core::{
     RunStatus, RunStore,
 };
 use base64::Engine as _;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -79,14 +79,14 @@ use crate::channel::{
     InboundMessage, MessageRef, OutboundMessage, RunEnding,
 };
 use crate::commands::{
-    builtin_commands, invalid_spec, is_builtin, CommandContext, CommandHandler, CommandReply,
+    CommandContext, CommandHandler, CommandReply, builtin_commands, invalid_spec, is_builtin,
 };
-use crate::inbound_files::{list_line, save_attachment, sniff_image, ATTACHMENTS_HEADING};
+use crate::inbound_files::{ATTACHMENTS_HEADING, list_line, save_attachment, sniff_image};
 use crate::latex::strip_latex_keeping_code;
 use crate::policy::{AccessPolicy, Admission, SenderRole};
 use crate::render::{self, Progress};
 use crate::router::EventRouter;
-use crate::session::{session_id, MemorySessionIndex, SessionIndex};
+use crate::session::{MemorySessionIndex, SessionIndex, session_id};
 use crate::split::split_message;
 
 /// Choice id of the "Approve" button.
@@ -845,24 +845,25 @@ impl Inner {
             }
             None => {
                 if let Some((command, args)) = command_parts(&message.text)
-                    && let Some(handler) = self.commands.get(&command).cloned() {
-                        let context = CommandContext {
-                            channel: name,
-                            conversation: message.conversation.clone(),
-                            sender: message.sender.clone(),
-                            role,
-                            session_id: session,
-                            args: args.to_string(),
-                            name: command,
-                        };
-                        let call = CommandCall {
-                            context,
-                            origin,
-                            invocation: None,
-                        };
-                        self.spawn_command(handler, call);
-                        return;
-                    }
+                    && let Some(handler) = self.commands.get(&command).cloned()
+                {
+                    let context = CommandContext {
+                        channel: name,
+                        conversation: message.conversation.clone(),
+                        sender: message.sender.clone(),
+                        role,
+                        session_id: session,
+                        args: args.to_string(),
+                        name: command,
+                    };
+                    let call = CommandCall {
+                        context,
+                        origin,
+                        invocation: None,
+                    };
+                    self.spawn_command(handler, call);
+                    return;
+                }
                 self.submit(
                     session,
                     Job::Message {
@@ -901,13 +902,14 @@ impl Inner {
                         ));
                     }
                     if slot.queue.len() >= self.config.max_queued_per_session
-                        && let Some(dropped) = slot.queue.pop_front() {
-                            notices.push((
-                                dropped.origin().clone(),
-                                "Too many messages are waiting, so I dropped the oldest one."
-                                    .to_string(),
-                            ));
-                        }
+                        && let Some(dropped) = slot.queue.pop_front()
+                    {
+                        notices.push((
+                            dropped.origin().clone(),
+                            "Too many messages are waiting, so I dropped the oldest one."
+                                .to_string(),
+                        ));
+                    }
                     slot.queue.push_back(job);
                     None
                 }
@@ -984,18 +986,19 @@ impl Inner {
         let usable =
             |state: &RunState| state.pending.is_none() && state.agent_id == self.agent.id();
         if let Some(store) = &self.store
-            && let Some(run_id) = self.index.latest_run(session).await {
-                match store.load_state(run_id).await {
-                    Ok(Some(state)) if usable(&state) => return Some(state),
-                    Ok(Some(_)) => {
-                        tracing::warn!(session, %run_id, "latest run cannot be continued; starting fresh")
-                    }
-                    Ok(None) => tracing::warn!(session, %run_id, "latest run not found in store"),
-                    Err(err) => {
-                        tracing::warn!(session, error = %err, "loading session state failed")
-                    }
+            && let Some(run_id) = self.index.latest_run(session).await
+        {
+            match store.load_state(run_id).await {
+                Ok(Some(state)) if usable(&state) => return Some(state),
+                Ok(Some(_)) => {
+                    tracing::warn!(session, %run_id, "latest run cannot be continued; starting fresh")
+                }
+                Ok(None) => tracing::warn!(session, %run_id, "latest run not found in store"),
+                Err(err) => {
+                    tracing::warn!(session, error = %err, "loading session state failed")
                 }
             }
+        }
         let sessions = self.sessions.lock().expect("sessions poisoned");
         sessions
             .get(session)
@@ -1218,11 +1221,13 @@ impl Inner {
                 Err(_) => return Loaded::Listed("not loaded (the download timed out)"),
             },
         };
-        if wants_image && bytes.len() as u64 <= config.max_image_bytes
-            && let Some(media_type) = sniff_image(&bytes) {
-                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                return Loaded::Image(Image::base64(media_type, data));
-            }
+        if wants_image
+            && bytes.len() as u64 <= config.max_image_bytes
+            && let Some(media_type) = sniff_image(&bytes)
+        {
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            return Loaded::Image(Image::base64(media_type, data));
+        }
         let Some(dir) = save_dir.cloned() else {
             return Loaded::Listed("not loaded (not a supported image)");
         };
@@ -1246,9 +1251,10 @@ impl Inner {
     /// Persist the outcome and make it the session's continuation.
     async fn remember(&self, session: &str, generation: u64, outcome: &RunOutcome) {
         if let Some(store) = &self.store
-            && let Err(err) = store.save_state(&outcome.state).await {
-                tracing::warn!(session, error = %err, "saving run state failed");
-            }
+            && let Err(err) = store.save_state(&outcome.state).await
+        {
+            tracing::warn!(session, error = %err, "saving run state failed");
+        }
         if outcome.state.pending.is_some() || self.generation(session) != generation {
             return;
         }
@@ -1257,9 +1263,10 @@ impl Inner {
         }
         let mut sessions = self.sessions.lock().expect("sessions poisoned");
         if let Some(slot) = sessions.get_mut(session)
-            && slot.generation == generation {
-                slot.last_state = Some(outcome.state.clone());
-            }
+            && slot.generation == generation
+        {
+            slot.last_state = Some(outcome.state.clone());
+        }
     }
 
     /// Execute a run while showing progress and typing.
@@ -1427,9 +1434,10 @@ impl Inner {
         };
         // Only while still open: an answer may have settled it during `ask`.
         if let (Some(store), Some(record)) = (&self.approval_store, updated)
-            && let Err(err) = store.save(&record).await {
-                tracing::warn!(prompt = %prompt_id, error = %err, "saving approval failed");
-            }
+            && let Err(err) = store.save(&record).await
+        {
+            tracing::warn!(prompt = %prompt_id, error = %err, "saving approval failed");
+        }
 
         self.arm_expiry(prompt_id, self.config.approval_timeout);
     }
@@ -1485,17 +1493,19 @@ impl Inner {
 
     async fn persist_approval(&self, pending: &PendingApproval) {
         if let (Some(store), Some(record)) = (&self.approval_store, self.stored_approval(pending))
-            && let Err(err) = store.save(&record).await {
-                tracing::warn!(prompt = %pending.prompt_id, error = %err, "saving approval failed");
-            }
+            && let Err(err) = store.save(&record).await
+        {
+            tracing::warn!(prompt = %pending.prompt_id, error = %err, "saving approval failed");
+        }
     }
 
     /// Drop the durable record of an approval that has been settled.
     async fn forget_approval(&self, prompt_id: &str) {
         if let Some(store) = &self.approval_store
-            && let Err(err) = store.remove(prompt_id).await {
-                tracing::warn!(prompt = prompt_id, error = %err, "removing approval failed");
-            }
+            && let Err(err) = store.remove(prompt_id).await
+        {
+            tracing::warn!(prompt = prompt_id, error = %err, "removing approval failed");
+        }
     }
 
     /// Bring back the approvals open at the last stop, each with its session

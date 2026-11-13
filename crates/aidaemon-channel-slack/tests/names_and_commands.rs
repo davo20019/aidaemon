@@ -11,9 +11,9 @@ use aidaemon_channels::{
     AccessPolicy, Channel, ChannelEvent, ChannelRunner, CommandContext, CommandReply,
     DEFAULT_REFUSAL,
 };
-use aidaemon_core::testing::{text, ScriptedProvider};
 use aidaemon_core::Agent;
-use serde_json::{json, Value};
+use aidaemon_core::testing::{ScriptedProvider, text};
+use serde_json::{Value, json};
 use support::*;
 use tokio::sync::mpsc;
 use tokio::time::timeout;

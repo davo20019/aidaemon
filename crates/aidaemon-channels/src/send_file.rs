@@ -5,20 +5,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::hub::{MediaKind, MediaMessage};
 use aidaemon_events::payloads::{ResourceInvalidatedData, ResourceRegisteredData};
 use aidaemon_events::{Event, EventStore, EventType};
+use aidaemon_tools::BackendKind;
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::backend::SharedExecutionBackend;
-use aidaemon_tools::file_delivery::{prepare_delivery, DeliveryError};
+use aidaemon_tools::file_delivery::{DeliveryError, prepare_delivery};
 use aidaemon_tools::semantics::{
     ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolMutationEffects, ToolOutcomeStatus, ToolSemantics, ToolTargetHintKind,
 };
-use aidaemon_tools::BackendKind;
-use aidaemon_tools::OutcomeTool as Tool;
 
 pub struct SendFileTool {
     backend: SharedExecutionBackend,
@@ -243,7 +243,7 @@ impl SendFileTool {
                 Err(error) => {
                     return Ok(SendReply::failed(format!(
                         "Error: Invalid execution path: {error}"
-                    )))
+                    )));
                 }
             };
             let metadata = match backend.metadata(&backend_path).await {
@@ -251,7 +251,7 @@ impl SendFileTool {
                 Err(_) => {
                     return Ok(SendReply::failed(format!(
                         "Error: File not found: {file_path}"
-                    )))
+                    )));
                 }
             };
             if !metadata.is_file() {
@@ -1035,11 +1035,13 @@ mod tests {
         );
         assert!(outcome.output.contains("changed after it was registered"));
         assert!(rx.try_recv().is_err(), "changed content must not be queued");
-        assert!(store
-            .get_resource("sess-resource", "res_changed")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_resource("sess-resource", "res_changed")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

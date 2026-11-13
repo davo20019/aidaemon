@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
 use aidaemon_core::{
     Agent, ApprovalRisk, CallEffects, CancellationToken, EffectClass, EffectKey, FnTool, Hook,
     HookContext, InterruptKind, InterruptResolver, Interruption, OwnerApprovalRequest,
@@ -12,7 +12,7 @@ use aidaemon_core::{
     ToolDecision, ToolInfo, ToolOutput,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const SEND: ToolAnnotations = ToolAnnotations {
     egress: true,
@@ -300,7 +300,7 @@ async fn declined_survives_serde_and_segments() {
     // adds to it.
     let other = key(EffectClass::Delete, "/tmp/aidaemon-test/report");
     let second = AskBeforeSend::new(InterruptKind::OwnerApproval(owner_request(vec![
-        other.clone()
+        other.clone(),
     ])));
     let (b, _) = agent_with_effect(second.clone(), send_once(), other.clone());
     let mut state = restored;
@@ -351,8 +351,10 @@ fn effect_key_overlap_rules() {
     assert!(del.overlaps(&key(EffectClass::Delete, "/tmp")));
     assert!(key(EffectClass::Delete, "/tmp").overlaps(&del));
     assert!(key(EffectClass::Write, "/").overlaps(&key(EffectClass::Write, "/etc/hosts")));
-    assert!(key(EffectClass::Configuration, "/etc/x/")
-        .overlaps(&key(EffectClass::Configuration, "/etc/x/y")));
+    assert!(
+        key(EffectClass::Configuration, "/etc/x/")
+            .overlaps(&key(EffectClass::Configuration, "/etc/x/y"))
+    );
 
     assert!(!key(EffectClass::Write, "/tmp/x").overlaps(&del));
 
@@ -606,11 +608,13 @@ fn build_requires_approval_and_egress_safeguards() {
         base().attest(Safeguard::Approval).build(),
         Err(BuildError::MissingSafeguard(Safeguard::Egress))
     ));
-    assert!(base()
-        .attest(Safeguard::Approval)
-        .hook(Guards(&[Safeguard::Egress]))
-        .build()
-        .is_ok());
+    assert!(
+        base()
+            .attest(Safeguard::Approval)
+            .hook(Guards(&[Safeguard::Egress]))
+            .build()
+            .is_ok()
+    );
     assert_eq!(Safeguard::Approval.to_string(), "approval");
     assert_eq!(Safeguard::Egress.to_string(), "egress");
 }
@@ -747,7 +751,7 @@ fn deny_after_cancel_records_decline() {
 
 #[test]
 fn untrusted_egress_is_judged_by_kind() {
-    use aidaemon_core::{is_untrusted_egress, UNTRUSTED_EGRESS_INTERRUPT};
+    use aidaemon_core::{UNTRUSTED_EGRESS_INTERRUPT, is_untrusted_egress};
     let reason = format!("{UNTRUSTED_EGRESS_INTERRUPT} `send` acts outside the workspace");
     let untrusted = Interruption {
         call: call("c1", "send", json!({})),
@@ -785,11 +789,13 @@ async fn trailing_dot_host_is_the_same_declined_host() {
         .unwrap();
     let shell = &out.receipts()[1];
     assert_eq!(shell.status, ReceiptStatus::Denied);
-    assert!(shell
-        .reason
-        .as_deref()
-        .unwrap()
-        .starts_with("[OWNER DECLINED]"));
+    assert!(
+        shell
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("[OWNER DECLINED]")
+    );
     assert_eq!(*hook.seen.lock().unwrap(), vec!["http".to_string()]);
     assert_eq!(ran.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -857,11 +863,12 @@ async fn decline_binds_a_later_call_in_the_same_batch() {
         .unwrap();
     let r = out.receipts();
     assert_eq!(r[1].tool, "shell");
-    assert!(r[1]
-        .reason
-        .as_deref()
-        .unwrap()
-        .starts_with("[OWNER DECLINED] The owner declined"));
+    assert!(
+        r[1].reason
+            .as_deref()
+            .unwrap()
+            .starts_with("[OWNER DECLINED] The owner declined")
+    );
     assert_eq!(*hook.seen.lock().unwrap(), vec!["http".to_string()]);
     assert_eq!(ran.load(Ordering::SeqCst), 0);
 }
@@ -884,8 +891,9 @@ async fn empty_subject_decline_binds_nothing() {
     // useful, or (trimmed to "") match another blank-subject request.
     assert!(out.state.declined.is_empty(), "{:?}", out.state.declined);
     let send = &out.receipts()[0];
-    assert!(send
-        .reason
-        .as_deref()
-        .is_some_and(|r| r.starts_with(aidaemon_core::OWNER_DECLINED)));
+    assert!(
+        send.reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with(aidaemon_core::OWNER_DECLINED))
+    );
 }

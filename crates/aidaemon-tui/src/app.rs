@@ -27,11 +27,11 @@ use aidaemon_client_protocol::{
     Pane, Risk, ServerFrame, ViewAction,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use ratatui::Frame;
 
 /// What this client asks for in `hello`.
 pub const CAPABILITIES: &[Capability] = &[Capability::ViewActions];
@@ -372,11 +372,12 @@ impl App {
                 },
             ..
         } = frame
-            && self.awaiting_new {
-                self.awaiting_new = false;
-                self.selected = Some(session_id.clone());
-                self.fetched.insert(session_id.clone());
-            }
+            && self.awaiting_new
+        {
+            self.awaiting_new = false;
+            self.selected = Some(session_id.clone());
+            self.fetched.insert(session_id.clone());
+        }
     }
 
     /// Show session `id`; the history request when it was never fetched.
@@ -567,12 +568,12 @@ impl App {
                             .options
                             .iter()
                             .find(|decision| key_of(**decision).0 == pressed)
-                        {
-                            return Some(Action::Send(Command::ResolveApproval {
-                                approval_id: approval.id.clone(),
-                                decision: *decision,
-                            }));
-                        }
+                    {
+                        return Some(Action::Send(Command::ResolveApproval {
+                            approval_id: approval.id.clone(),
+                            decision: *decision,
+                        }));
+                    }
                     self.input.push(pressed);
                     None
                 }
@@ -1035,12 +1036,13 @@ impl App {
                 _ => {}
             }
             if let CardAction::Command { looks_inside, .. } = &card.action
-                && !looks_inside.is_empty() {
-                    lines.push(TextLine::from(format!(
-                        "Only looks inside: {}",
-                        looks_inside.join(", ")
-                    )));
-                }
+                && !looks_inside.is_empty()
+            {
+                lines.push(TextLine::from(format!(
+                    "Only looks inside: {}",
+                    looks_inside.join(", ")
+                )));
+            }
         }
         for warning in &approval.warnings {
             lines.push(TextLine::from(format!("• {warning}")));

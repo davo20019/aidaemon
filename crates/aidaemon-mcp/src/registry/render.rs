@@ -69,16 +69,18 @@ pub(super) fn format_tool_call_result(result: &Value) -> anyhow::Result<String> 
     if let Some(content) = result.get("content").and_then(Value::as_array) {
         for block in content {
             if let Some(rendered) = render_mcp_content_block(block)
-                && !rendered.trim().is_empty() {
-                    rendered_blocks.push(rendered);
-                }
+                && !rendered.trim().is_empty()
+            {
+                rendered_blocks.push(rendered);
+            }
         }
     }
 
     if rendered_blocks.is_empty()
-        && let Some(structured) = result.get("structuredContent").filter(|v| !v.is_null()) {
-            rendered_blocks.push(format!("[MCP structured content]\n{}", structured));
-        }
+        && let Some(structured) = result.get("structuredContent").filter(|v| !v.is_null())
+    {
+        rendered_blocks.push(format!("[MCP structured content]\n{}", structured));
+    }
 
     let rendered = rendered_blocks.join("\n");
     let is_error = result

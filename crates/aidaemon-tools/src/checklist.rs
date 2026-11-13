@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use aidaemon_core::{
     CallEffects, Hook, HookContext, StopDecision, Tool, ToolAnnotations, ToolContext, ToolOutput,
@@ -243,14 +243,14 @@ fn validate(previous: &[ChecklistItem], items: &[ChecklistItem]) -> Result<(), S
                             "item {n} (\"{}\"): a superseded item needs `superseded_by`, the \
                              number of another item in this list that replaces it.",
                             item.text
-                        ))
+                        ));
                     }
                     Some(t) if t.status == ItemStatus::Superseded => {
                         return Err(format!(
                             "item {n} (\"{}\"): it is superseded by an item that is itself \
                              superseded; point it at the final replacement.",
                             item.text
-                        ))
+                        ));
                     }
                     Some(_) => {}
                 }
@@ -494,7 +494,7 @@ impl Hook for ChecklistGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider};
+    use aidaemon_core::testing::{ScriptedProvider, call, text, tool_calls};
     use aidaemon_core::{Agent, Role};
 
     #[test]

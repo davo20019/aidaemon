@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
 use aidaemon_core::{
     Agent, ApprovalRisk, Event, FnTool, Hook, HookContext, InterruptKind, MemoryStore,
     OwnerApprovalRequest, Resolution, RunState, RunStatus, ToolAnnotations, ToolCall, ToolDecision,

@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aidaemon_core::card::{
-    run_attempts, superseded_line, superseded_runs, ActivityKind, CardEnd, HelperView, PlanCard,
-    RunPhase, Step,
+    ActivityKind, CardEnd, HelperView, PlanCard, RunPhase, Step, run_attempts, superseded_line,
+    superseded_runs,
 };
 use aidaemon_tools::status::StatusUpdate;
 

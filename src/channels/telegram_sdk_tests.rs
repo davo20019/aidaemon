@@ -5,14 +5,14 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::Uri;
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::*;
-use crate::testing::{setup_test_agent, MockProvider};
+use crate::testing::{MockProvider, setup_test_agent};
 
 const TOKEN: &str = "000000:SYNTHETIC";
 const OWNER: u64 = 100000001;
@@ -228,10 +228,12 @@ async fn an_approval_is_asked_with_buttons_and_answered_by_a_press() {
     assert!(matches!(answer, ApprovalResponse::AllowOnce));
     mock.wait_for("answercallbackquery", |_| true).await;
     let edited = mock.wait_for("editmessagetext", |_| true).await;
-    assert!(edited["text"]
-        .as_str()
-        .unwrap()
-        .contains("Allowed this once"));
+    assert!(
+        edited["text"]
+            .as_str()
+            .unwrap()
+            .contains("Allowed this once")
+    );
     running.abort();
 }
 
@@ -385,10 +387,10 @@ async fn a_good_key_is_saved_and_never_reaches_the_agent() {
     );
     assert!(harness.provider.call_log.lock().await.is_empty());
     let calls = mock.calls.lock().unwrap();
-    assert!(!calls
-        .iter()
-        .any(|(method, body)| method == "sendmessage"
-            && body.to_string().contains("synthetic-good-key")));
+    assert!(
+        !calls.iter().any(|(method, body)| method == "sendmessage"
+            && body.to_string().contains("synthetic-good-key"))
+    );
 }
 
 #[allow(clippy::await_holding_lock)]

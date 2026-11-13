@@ -1073,16 +1073,18 @@ mod tests {
 
         let wrong_target = ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY)
             .with_target_hint(ToolTargetHintKind::Path, "/tmp/other.pdf");
-        assert!(store
-            .reconcile_checklist_after_tool_success(
-                "s1",
-                &wrong_target,
-                "receipt-wrong",
-                "delivered",
-            )
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .reconcile_checklist_after_tool_success(
+                    "s1",
+                    &wrong_target,
+                    "receipt-wrong",
+                    "delivered",
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let exact = ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY)
             .with_target_hint(ToolTargetHintKind::Path, "/tmp/report.pdf");
@@ -1117,11 +1119,13 @@ mod tests {
             .await
             .unwrap();
         let delivery = ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY);
-        assert!(store
-            .reconcile_checklist_after_tool_success("s1", &delivery, "receipt-1", "delivered",)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .reconcile_checklist_after_tool_success("s1", &delivery, "receipt-1", "delivered",)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1379,10 +1383,11 @@ mod tests {
                 "step {index} waits on both launches"
             );
         }
-        assert!(plan
-            .card()
-            .text
-            .starts_with("⏳ Continuing in the background · 1 of 4 done"));
+        assert!(
+            plan.card()
+                .text
+                .starts_with("⏳ Continuing in the background · 1 of 4 done")
+        );
 
         let plan = store
             .settle_background_job("chat", "job-drupal", JobEnd::Succeeded)
@@ -1399,10 +1404,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(plan
-            .steps
-            .iter()
-            .all(|step| step.status == StepStatus::Completed));
+        assert!(
+            plan.steps
+                .iter()
+                .all(|step| step.status == StepStatus::Completed)
+        );
         assert_eq!(plan.status, PlanStatus::Completed);
         let card = plan.card().text;
         assert!(card.starts_with("✅ Done · 4 of 4 steps"), "{card}");

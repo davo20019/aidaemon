@@ -370,11 +370,10 @@ mod tests {
         let parent_access = ToolCallAccessManifest {
             execution_cwd: None,
             read_targets: Vec::new(),
-            write_targets: vec![ToolTargetHint::new(
-                ToolTargetHintKind::ProjectScope,
-                "/Users/someone/projects",
-            )
-            .unwrap()],
+            write_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::ProjectScope, "/Users/someone/projects")
+                    .unwrap(),
+            ],
             adapter_read_targets: Vec::new(),
         };
         let parent = InheritedAuthority {

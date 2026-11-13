@@ -7,13 +7,13 @@ use std::sync::Arc;
 use aidaemon_core::{ChannelVisibility, Message, ModelRequest, Provider, UserRole};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::records::{ExtractedMemoryGraph, Fact, FactPrivacy, PersonalMemoryWrite};
 use crate::stores::FactStore;
-use crate::task_learning::{FactLifetime, FACT_LIFETIME_INSTRUCTION};
+use crate::task_learning::{FACT_LIFETIME_INSTRUCTION, FactLifetime};
 
 /// How the user's message relates to a proposed fact. Only [`Asserted`]
 /// facts are stored; a missing or unrecognized stance is [`Unstated`].
@@ -890,7 +890,7 @@ mod tests {
 
     use std::sync::Mutex;
 
-    use aidaemon_core::testing::{text, ScriptedProvider};
+    use aidaemon_core::testing::{ScriptedProvider, text};
     use async_trait::async_trait;
 
     #[derive(Debug, Clone, PartialEq)]

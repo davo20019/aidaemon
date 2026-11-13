@@ -1,8 +1,7 @@
 use crate::testing::{
-    setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
+    MockProvider, MockTool, setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
     setup_test_agent_root_with_extra_tools_and_llm_timeout,
-    setup_test_agent_with_extra_tools_and_llm_timeout, setup_test_agent_with_models, MockProvider,
-    MockTool,
+    setup_test_agent_with_extra_tools_and_llm_timeout, setup_test_agent_with_models,
 };
 use crate::traits::{
     ChatOptions, EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ProviderResponse,
@@ -13,9 +12,9 @@ use crate::traits::{
 };
 use crate::types::{ChannelContext, UserRole};
 use async_trait::async_trait;
-use serde_json::{json, Value};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 struct RejectingArgumentTool {
@@ -352,10 +351,12 @@ async fn inbound_transport_lifecycle_is_persisted_before_agent_work() {
     assert_eq!(metadata.get("receiver_to_queue_ms"), Some(&json!(1000)));
     assert_eq!(metadata.get("queue_wait_ms"), Some(&json!(2000)));
     assert_eq!(metadata.get("receiver_to_dispatch_ms"), Some(&json!(3000)));
-    assert!(metadata
-        .get("dispatch_to_task_start_ms")
-        .and_then(Value::as_i64)
-        .is_some_and(|millis| millis >= 0));
+    assert!(
+        metadata
+            .get("dispatch_to_task_start_ms")
+            .and_then(Value::as_i64)
+            .is_some_and(|millis| millis >= 0)
+    );
 }
 
 #[tokio::test]
@@ -411,9 +412,11 @@ async fn unavailable_relationship_assessments_fail_closed_to_fresh_context() {
                 .and_then(Value::as_str)
                 .is_some_and(|content| content.contains("quantity=sixty-four"))
     }));
-    assert!(!second_messages
-        .iter()
-        .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")));
+    assert!(
+        !second_messages
+            .iter()
+            .any(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+    );
 }
 
 #[tokio::test]
@@ -1078,10 +1081,12 @@ async fn nested_project_instructions_are_injected_before_first_write_executes() 
     );
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
 
-    assert!(!calls[0]
-        .messages
-        .iter()
-        .any(|message| message.to_string().contains("JIT_ONLY_WIDGET_RULE")));
+    assert!(
+        !calls[0]
+            .messages
+            .iter()
+            .any(|message| message.to_string().contains("JIT_ONLY_WIDGET_RULE"))
+    );
     assert!(calls.iter().skip(1).any(|call| {
         let payload = Value::Array(call.messages.clone()).to_string();
         payload.contains("JIT_ONLY_WIDGET_RULE") && payload.contains("deliberately NOT executed")

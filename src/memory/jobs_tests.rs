@@ -6,8 +6,8 @@ use crate::llm_runtime::gateway::SideCallGateway;
 use crate::memory::jobs_host::memory_jobs;
 use crate::traits::Message;
 use aidaemon_memory::full::MemoryJobs;
-use aidaemon_runtime::history::uncaptured_sessions_sql;
 use aidaemon_runtime::history::EventHistory;
+use aidaemon_runtime::history::uncaptured_sessions_sql;
 use sqlx::SqlitePool;
 
 use crate::config::ProviderKind;
@@ -15,8 +15,8 @@ use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::embeddings::EmbeddingService;
 use crate::state::SqliteStateStore;
 use crate::testing::MockProvider;
-use crate::traits::store_prelude::*;
 use crate::traits::MessageAnnotation;
+use crate::traits::store_prelude::*;
 use chrono::Utc;
 use serde_json::json;
 use std::sync::Arc;
@@ -132,9 +132,10 @@ async fn insert_owner_session_events(
             "channel_visibility": "private"
         });
         if index == 0
-            && let Some(origin) = execution_origin {
-                data["execution_origin"] = json!(origin);
-            }
+            && let Some(origin) = execution_origin
+        {
+            data["execution_origin"] = json!(origin);
+        }
         sqlx::query(
             "INSERT INTO events (session_id, event_type, data, created_at)
              VALUES (?, 'user_message', ?, ?)",

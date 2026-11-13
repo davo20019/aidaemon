@@ -16,7 +16,7 @@ use crate::turn::completion_contract::{CompletionContract, CompletionProgress};
 use crate::turn::loop_utils::MAX_CONSECUTIVE_SAME_TOOL;
 use crate::turn::post_task::{self, LearningContext};
 use crate::turn::system_directives::SystemDirective;
-use crate::turn::validation_state::{build_needs_approval_request, ApprovalState};
+use crate::turn::validation_state::{ApprovalState, build_needs_approval_request};
 
 #[derive(Debug, Clone, Copy)]
 pub enum GoalBudgetCheckSource {
@@ -277,11 +277,7 @@ pub fn thousands(n: i64) -> String {
         }
         out.push(digit);
     }
-    if n < 0 {
-        format!("-{out}")
-    } else {
-        out
-    }
+    if n < 0 { format!("-{out}") } else { out }
 }
 
 /// Ask the owner to approve one budget extension past the automatic
@@ -661,58 +657,57 @@ pub async fn enforce_scheduled_run_budget_control(
         ctx.status,
         ctx.max_budget_extensions,
         ctx.hard_token_cap,
-    )
-        && let Some(registry) = host.goal_tokens() {
-            let updated = registry
-                .auto_extend_run_budget(ctx.goal_id, new_budget)
-                .await;
-            if let Some(status) = updated.as_ref() {
-                host.persist_scheduled_run_state(ctx.goal_id, status).await;
-            }
-            let extension = updated
-                .as_ref()
-                .map(|status| status.budget_extensions_count)
-                .unwrap_or_else(|| ctx.status.budget_extensions_count.saturating_add(1));
-            info!(
-                ctx.session_id,
-                goal_id = %ctx.goal_id,
+    ) && let Some(registry) = host.goal_tokens()
+    {
+        let updated = registry
+            .auto_extend_run_budget(ctx.goal_id, new_budget)
+            .await;
+        if let Some(status) = updated.as_ref() {
+            host.persist_scheduled_run_state(ctx.goal_id, status).await;
+        }
+        let extension = updated
+            .as_ref()
+            .map(|status| status.budget_extensions_count)
+            .unwrap_or_else(|| ctx.status.budget_extensions_count.saturating_add(1));
+        info!(
+            ctx.session_id,
+            goal_id = %ctx.goal_id,
+            old_budget,
+            new_budget,
+            extension,
+            "Auto-extended scheduled run budget"
+        );
+        // This is routine internal adaptation, not an owner-attention
+        // event. Keep it in the directive/event ledger instead of the
+        // channel status stream so an unattended run cannot wake the
+        // owner merely because it resized its own budget.
+        ctx.pending_system_messages
+            .push(SystemDirective::ScheduledRunBudgetAdaptationRequired {
                 old_budget,
                 new_budget,
                 extension,
-                "Auto-extended scheduled run budget"
-            );
-            // This is routine internal adaptation, not an owner-attention
-            // event. Keep it in the directive/event ledger instead of the
-            // channel status stream so an unattended run cannot wake the
-            // owner merely because it resized its own budget.
-            ctx.pending_system_messages.push(
-                SystemDirective::ScheduledRunBudgetAdaptationRequired {
-                    old_budget,
-                    new_budget,
-                    extension,
-                    max_extensions: ctx.max_budget_extensions,
-                },
-            );
-            crate::turn::task_end::emit_decision_point(
-                host,
-                ctx.emitter,
-                ctx.task_id,
-                ctx.iteration,
-                DecisionType::BudgetAutoExtension,
-                "Auto-extended scheduled run budget on continued progress".to_string(),
-                json!({
-                    "condition": "scheduled_run_budget_extension",
-                    "goal_id": ctx.goal_id,
-                    "old_budget": old_budget,
-                    "new_budget": new_budget,
-                    "extension": extension,
-                    "max_extensions": ctx.max_budget_extensions,
-                    "tokens_used": ctx.status.tokens_used,
-                }),
-            )
-            .await;
-            return ScheduledRunBudgetControlOutcome::Continue;
-        }
+                max_extensions: ctx.max_budget_extensions,
+            });
+        crate::turn::task_end::emit_decision_point(
+            host,
+            ctx.emitter,
+            ctx.task_id,
+            ctx.iteration,
+            DecisionType::BudgetAutoExtension,
+            "Auto-extended scheduled run budget on continued progress".to_string(),
+            json!({
+                "condition": "scheduled_run_budget_extension",
+                "goal_id": ctx.goal_id,
+                "old_budget": old_budget,
+                "new_budget": new_budget,
+                "extension": extension,
+                "max_extensions": ctx.max_budget_extensions,
+                "tokens_used": ctx.status.tokens_used,
+            }),
+        )
+        .await;
+        return ScheduledRunBudgetControlOutcome::Continue;
+    }
 
     ScheduledRunBudgetControlOutcome::Exhausted {
         tokens_used: ctx.status.tokens_used,
@@ -865,11 +860,12 @@ pub async fn fanout_token_alert(
 
         if let Some(hub_weak) = &hub
             && let Some(hub_arc) = hub_weak.upgrade()
-                && hub_arc.send_text(&target, message).await.is_ok() {
-                    let _ = host
-                        .notifications()
-                        .mark_notification_delivered(&entry.id)
-                        .await;
-                }
+            && hub_arc.send_text(&target, message).await.is_ok()
+        {
+            let _ = host
+                .notifications()
+                .mark_notification_delivered(&entry.id)
+                .await;
+        }
     }
 }

@@ -8,8 +8,8 @@ use aidaemon_client_core::Update;
 use aidaemon_client_protocol::*;
 use aidaemon_tui::app::{Action, App, Focus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 fn event(seq: u64, event: Event) -> ServerFrame {
     ServerFrame::Event {

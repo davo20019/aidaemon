@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use aidaemon_sdk::secrets::{MemorySecretStore, SecretStore};
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
 use aidaemon_sdk::{Agent, FnTool, ToolAnnotations, ToolOutput, ToolSpec};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const TOKEN: &str = "tok_live_9f8e7d6c5b4a3210abcd";
 

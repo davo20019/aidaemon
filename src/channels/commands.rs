@@ -318,11 +318,12 @@ mod mode_command_tests {
         ctx.dispatch("/private", "off", session, None, UserRole::Owner)
             .await;
         assert!(!take_next_message_private(state.as_ref(), session, None).await);
-        assert!(ctx
-            .dispatch("/private", "bogus", session, None, UserRole::Owner)
-            .await
-            .unwrap()
-            .starts_with("Usage"));
+        assert!(
+            ctx.dispatch("/private", "bogus", session, None, UserRole::Owner)
+                .await
+                .unwrap()
+                .starts_with("Usage")
+        );
     }
 
     /// In a shared chat `/private` belongs to the person who sent it: only

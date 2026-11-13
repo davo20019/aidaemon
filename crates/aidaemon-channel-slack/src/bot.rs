@@ -11,16 +11,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aidaemon_channels::Channel as _;
 use aidaemon_channels::bot::{BotDeps, SharedCommandDispatch};
 use aidaemon_channels::context::{ChannelContext, WorkspaceAccessLevel, WorkspaceGrant};
 use aidaemon_channels::hub::{
     ChannelCapabilities, ChannelHub, HubChannel, MediaKind, MediaMessage,
 };
 use aidaemon_channels::prompts::Prompts;
-use aidaemon_channels::slash::{build_help_text, shared_commands, CommandCategory, CommandDef};
+use aidaemon_channels::slash::{CommandCategory, CommandDef, build_help_text, shared_commands};
 use aidaemon_channels::tasks::QueuedMessage;
 use aidaemon_channels::turns::{Turn, TurnRunner, TurnSurface};
-use aidaemon_channels::Channel as _;
 use aidaemon_core::ChannelVisibility;
 use aidaemon_events::attachments::sanitize_filename;
 use aidaemon_events::conversation::MessageAttachment;
@@ -217,9 +217,9 @@ fn normalize_file_shared_message(
             .or_else(|| file_event.get("user"))
             .and_then(Value::as_str)
             .or_else(|| file.get("user").and_then(Value::as_str))
-        {
-            message_object.insert("user".to_string(), Value::String(user_id.to_string()));
-        }
+    {
+        message_object.insert("user".to_string(), Value::String(user_id.to_string()));
+    }
 
     let has_files = message_object
         .get("files")
@@ -560,7 +560,7 @@ impl SlackBot {
             Err(_) => {
                 return format!(
                     "Could not parse the command. Quote paths containing spaces.\n\n{USAGE}"
-                )
+                );
             }
         };
         if tokens.len() < 2 {
@@ -591,7 +591,7 @@ impl SlackBot {
                         _ => {
                             return format!(
                                 "Hours must be between 1 and {MAX_WORKSPACE_GRANT_HOURS}."
-                            )
+                            );
                         }
                     }
                 } else {
@@ -835,9 +835,10 @@ impl SlackBot {
                     *guard = Some(user_id.to_string());
                 }
                 if let Some(team_id) = resp.get("team_id").and_then(|v| v.as_str())
-                    && let Ok(mut guard) = self.team_id.write() {
-                        *guard = Some(team_id.to_string());
-                    }
+                    && let Ok(mut guard) = self.team_id.write()
+                {
+                    *guard = Some(team_id.to_string());
+                }
                 // Extract bot name from response (field is "user")
                 if let Some(bot_name) = resp.get("user").and_then(|v| v.as_str()) {
                     self.set_bot_name(bot_name.to_string());
@@ -971,9 +972,10 @@ impl SlackBot {
 
         // Check cache (with TTL)
         if let Some((names, fetched_at)) = self.channel_members_cache.read().await.get(channel_id)
-            && fetched_at.elapsed() < MEMBERS_TTL {
-                return names.clone();
-            }
+            && fetched_at.elapsed() < MEMBERS_TTL
+        {
+            return names.clone();
+        }
 
         // Call conversations.members API (limit 50)
         let resp = match self
@@ -1087,16 +1089,17 @@ impl SlackBot {
             && let Some(delay) = aidaemon_channels::rate_limit::retry_after_from_headers(
                 resp.headers(),
                 aidaemon_channels::rate_limit::default_retry_after_cap(),
-            ) {
-                aidaemon_channels::rate_limit::sleep_after_rate_limit("slack", delay).await;
-                resp = self
-                    .http
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", self.bot_token))
-                    .query(params)
-                    .send()
-                    .await?;
-            }
+            )
+        {
+            aidaemon_channels::rate_limit::sleep_after_rate_limit("slack", delay).await;
+            resp = self
+                .http
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", self.bot_token))
+                .query(params)
+                .send()
+                .await?;
+        }
 
         let status = resp.status();
         let response_text = resp.text().await?;
@@ -1286,17 +1289,18 @@ impl SlackBot {
             && let Some(delay) = aidaemon_channels::rate_limit::retry_after_from_headers(
                 resp.headers(),
                 aidaemon_channels::rate_limit::default_retry_after_cap(),
-            ) {
-                aidaemon_channels::rate_limit::sleep_after_rate_limit("slack", delay).await;
-                resp = self
-                    .http
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {}", self.bot_token))
-                    .header("Content-Type", "application/json; charset=utf-8")
-                    .body(body_bytes)
-                    .send()
-                    .await?;
-            }
+            )
+        {
+            aidaemon_channels::rate_limit::sleep_after_rate_limit("slack", delay).await;
+            resp = self
+                .http
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.bot_token))
+                .header("Content-Type", "application/json; charset=utf-8")
+                .body(body_bytes)
+                .send()
+                .await?;
+        }
         let result: Value = resp.json().await?;
         if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             let error = result
@@ -1548,23 +1552,25 @@ impl SlackBot {
 
         // Check for file attachments (skip for Public users)
         let mut inbound_attachments = Vec::new();
-        if self.deps.files_enabled && user_role != UserRole::Public
-            && let Some(files) = event.get("files").and_then(|v| v.as_array()) {
-                match self.handle_incoming_files(files).await {
-                    Ok(attachments) => inbound_attachments = attachments,
-                    Err(e) => {
-                        let reply_thread = self.reply_thread_ts(&ts, thread_ts.as_deref());
-                        let _ = self
-                            .post_message(
-                                &channel_id,
-                                &format!("File error: {}", e),
-                                reply_thread.as_deref(),
-                            )
-                            .await;
-                        return;
-                    }
+        if self.deps.files_enabled
+            && user_role != UserRole::Public
+            && let Some(files) = event.get("files").and_then(|v| v.as_array())
+        {
+            match self.handle_incoming_files(files).await {
+                Ok(attachments) => inbound_attachments = attachments,
+                Err(e) => {
+                    let reply_thread = self.reply_thread_ts(&ts, thread_ts.as_deref());
+                    let _ = self
+                        .post_message(
+                            &channel_id,
+                            &format!("File error: {}", e),
+                            reply_thread.as_deref(),
+                        )
+                        .await;
+                    return;
                 }
             }
+        }
 
         // Build the text to send to the agent
         let agent_text = if inbound_attachments.is_empty() {
@@ -2076,13 +2082,14 @@ impl SlackBot {
                 anyhow::bail!("Failed to download Slack file: HTTP {}", resp.status());
             }
             if let Some(content_length) = resp.content_length()
-                && content_length > max_bytes {
-                    anyhow::bail!(
-                        "File too large ({:.1} MB). Maximum is {} MB.",
-                        content_length as f64 / 1_048_576.0,
-                        self.deps.max_file_size_mb
-                    );
-                }
+                && content_length > max_bytes
+            {
+                anyhow::bail!(
+                    "File too large ({:.1} MB). Maximum is {} MB.",
+                    content_length as f64 / 1_048_576.0,
+                    self.deps.max_file_size_mb
+                );
+            }
             let bytes = resp.bytes().await?;
             if bytes.len() as u64 > max_bytes {
                 anyhow::bail!(
@@ -2340,20 +2347,21 @@ impl TurnSurface for SlackSurface {
     /// still in force.
     async fn before_queued(&self, mut queued: QueuedMessage) -> QueuedMessage {
         if queued.user_role == UserRole::Guest
-            && let Some(original) = queued.channel_ctx.workspace_grant.clone() {
-                queued.channel_ctx.workspace_grant = match revalidate_queued_workspace_grant(
-                    self.host.as_ref(),
-                    &original,
-                )
-                .await
-                {
-                    Ok(grant) => grant,
-                    Err(error) => {
-                        warn!(%error, "Could not revalidate queued workspace grant; denying scoped access");
-                        None
-                    }
-                };
-            }
+            && let Some(original) = queued.channel_ctx.workspace_grant.clone()
+        {
+            queued.channel_ctx.workspace_grant = match revalidate_queued_workspace_grant(
+                self.host.as_ref(),
+                &original,
+            )
+            .await
+            {
+                Ok(grant) => grant,
+                Err(error) => {
+                    warn!(%error, "Could not revalidate queued workspace grant; denying scoped access");
+                    None
+                }
+            };
+        }
         queued
     }
 }
@@ -2447,15 +2455,16 @@ async fn slack_post_message(
         && let Some(delay) = aidaemon_channels::rate_limit::retry_after_from_headers(
             resp.headers(),
             aidaemon_channels::rate_limit::default_retry_after_cap(),
-        ) {
-            aidaemon_channels::rate_limit::sleep_after_rate_limit("slack", delay).await;
-            resp = http
-                .post(format!("{api_base}/chat.postMessage"))
-                .header("Authorization", format!("Bearer {}", bot_token))
-                .json(&body)
-                .send()
-                .await?;
-        }
+        )
+    {
+        aidaemon_channels::rate_limit::sleep_after_rate_limit("slack", delay).await;
+        resp = http
+            .post(format!("{api_base}/chat.postMessage"))
+            .header("Authorization", format!("Bearer {}", bot_token))
+            .json(&body)
+            .send()
+            .await?;
+    }
     let result: Value = resp.json().await?;
     if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         let error = result

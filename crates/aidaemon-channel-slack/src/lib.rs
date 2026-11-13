@@ -37,12 +37,12 @@ use aidaemon_channels::download::{DownloadClient, DownloadRequest};
 use aidaemon_channels::split::truncate_for_edit;
 use aidaemon_channels::{
     ApprovalPrompt, Attachment, Channel, ChannelCapabilities, ChannelError, ChannelEvent,
-    CommandInvocation, Conversation, DisplayNameCache, MessageRef, OutboundFile, OutboundMessage,
-    DEFAULT_MAX_DOWNLOAD_BYTES,
+    CommandInvocation, Conversation, DEFAULT_MAX_DOWNLOAD_BYTES, DisplayNameCache, MessageRef,
+    OutboundFile, OutboundMessage,
 };
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -51,8 +51,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::events::{
-    map_events_api, map_interactive, map_slash_command, split_conversation_id, ApprovalValue,
-    MapContext, SeenMessages, APPROVAL_ACTION_PREFIX,
+    APPROVAL_ACTION_PREFIX, ApprovalValue, MapContext, SeenMessages, map_events_api,
+    map_interactive, map_slash_command, split_conversation_id,
 };
 use crate::format::{escape_mrkdwn, markdown_to_mrkdwn, split_mrkdwn, truncate_chars};
 use aidaemon_channels::approval_render::COLLAPSED_FENCE;
@@ -496,21 +496,22 @@ impl SlackChannel {
             let payload = envelope.get("payload").unwrap_or(&Value::Null);
             let kind = envelope.get("type").and_then(Value::as_str);
             if let (Sink::Envelopes(envelopes), Some(kind)) = (sink, kind)
-                && !matches!(kind, "hello" | "disconnect") {
-                    let envelope = SlackEnvelope {
-                        kind: kind.to_string(),
-                        payload: payload.clone(),
-                    };
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return SessionEnd::Stop,
-                        sent = envelopes.send(envelope) => {
-                            if sent.is_err() {
-                                return SessionEnd::Stop;
-                            }
+                && !matches!(kind, "hello" | "disconnect")
+            {
+                let envelope = SlackEnvelope {
+                    kind: kind.to_string(),
+                    payload: payload.clone(),
+                };
+                tokio::select! {
+                    _ = shutdown.cancelled() => return SessionEnd::Stop,
+                    sent = envelopes.send(envelope) => {
+                        if sent.is_err() {
+                            return SessionEnd::Stop;
                         }
                     }
-                    continue;
                 }
+                continue;
+            }
             let Sink::Events(events) = sink else {
                 // hello and disconnect, handled below.
                 match kind {

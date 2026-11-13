@@ -17,14 +17,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use aidaemon_sdk::CancellationToken;
 use aidaemon_sdk::channels::{
-    AccessPolicy, ApprovalAnswer, ApprovalPrompt, Channel, ChannelCapabilities, ChannelError,
-    ChannelEvent, ChannelRunner, Conversation, ConversationKind, EventRouter, InboundMessage,
-    MessageRef, OutboundMessage, ProgressPhase, RunProgress, Sender, ToolState, APPROVE_CHOICE,
+    APPROVE_CHOICE, AccessPolicy, ApprovalAnswer, ApprovalPrompt, Channel, ChannelCapabilities,
+    ChannelError, ChannelEvent, ChannelRunner, Conversation, ConversationKind, EventRouter,
+    InboundMessage, MessageRef, OutboundMessage, ProgressPhase, RunProgress, Sender, ToolState,
 };
 use aidaemon_sdk::prelude::*;
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
-use aidaemon_sdk::CancellationToken;
+use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::sync::mpsc;

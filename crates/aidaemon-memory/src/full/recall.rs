@@ -14,8 +14,8 @@ use tracing::{info, warn};
 
 use crate::records::Fact;
 use crate::render::{
-    build_critical_facts_prompt_block, extract_critical_fact_summary, render_memory_section,
-    MemoryContext, RecallGoal,
+    MemoryContext, RecallGoal, build_critical_facts_prompt_block, extract_critical_fact_summary,
+    render_memory_section,
 };
 use crate::stores::MemoryStores;
 

@@ -1,13 +1,13 @@
 //! Outbound secret scan as a `before_tool` hook.
 
 use aidaemon_core::{
-    EffectClass, Hook, HookContext, Safeguard, ToolCall, ToolDecision, ToolInfo, EGRESS_BLOCKED,
+    EGRESS_BLOCKED, EffectClass, Hook, HookContext, Safeguard, ToolCall, ToolDecision, ToolInfo,
 };
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::redact::{secret_patterns, MIN_LITERAL_LEN};
+use crate::redact::{MIN_LITERAL_LEN, secret_patterns};
 
 /// Refuses outbound calls whose arguments carry a secret. Declares
 /// [`Safeguard::Egress`].
@@ -126,13 +126,13 @@ impl Hook for EgressGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::redact::{secret_patterns, Redactor};
+    use crate::redact::{Redactor, secret_patterns};
     use aidaemon_core::{
         AccessManifest, CallEffects, EffectKey, HookContext, RunId, ToolAnnotations, ToolCall,
         ToolDecision, ToolInfo, Usage,
     };
     use regex::Regex;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn hook_ctx() -> HookContext<'static> {
         HookContext {
@@ -346,8 +346,9 @@ mod tests {
         assert_eq!(EgressGuard::new().pattern_sources(), shared);
         // Every built-in shape the redactor hides, the guard blocks.
         let r = Redactor::new();
-        assert!(r
-            .redact("AKIAABCDEFGHIJKLMNOP")
-            .contains("[REDACTED:aws_access_key]"));
+        assert!(
+            r.redact("AKIAABCDEFGHIJKLMNOP")
+                .contains("[REDACTED:aws_access_key]")
+        );
     }
 }

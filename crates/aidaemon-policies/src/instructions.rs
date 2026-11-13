@@ -550,15 +550,15 @@ mod tests {
 
     mod nested {
         use super::super::*;
-        use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
+        use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
         use aidaemon_core::{
             AccessManifest, Agent, Provider, ReceiptStatus, Tool, ToolAnnotations, ToolContext,
             ToolResult, ToolSpec,
         };
-        use serde_json::{json, Value};
+        use serde_json::{Value, json};
         use std::fs;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// Reads the `path` it is given, and declares it.
         struct Reader(Arc<AtomicUsize>);
@@ -701,10 +701,11 @@ mod tests {
                 .run("s", "go")
                 .await
                 .unwrap();
-            assert!(out
-                .receipts()
-                .iter()
-                .all(|r| r.status == ReceiptStatus::Succeeded));
+            assert!(
+                out.receipts()
+                    .iter()
+                    .all(|r| r.status == ReceiptStatus::Succeeded)
+            );
             assert_eq!(reads.load(Ordering::SeqCst), 4);
             assert!(!system_text(&provider.requests()[1]).contains("outside rules"));
         }

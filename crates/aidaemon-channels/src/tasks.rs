@@ -3,8 +3,8 @@
 //! and duplicate suppression. Internal to aidaemon, no stability promise.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
@@ -256,14 +256,15 @@ impl TaskRegistry {
     pub async fn cancel(&self, task_id: u64) -> bool {
         let mut tasks = self.tasks.write().await;
         if let Some(handle) = tasks.get_mut(&task_id)
-            && matches!(handle.entry.status, TaskStatus::Running) {
-                handle.cancel_token.cancel();
-                if let Some(ref typing) = handle.typing_cancel {
-                    typing.cancel();
-                }
-                handle.entry.status = TaskStatus::Cancelling;
-                return true;
+            && matches!(handle.entry.status, TaskStatus::Running)
+        {
+            handle.cancel_token.cancel();
+            if let Some(ref typing) = handle.typing_cancel {
+                typing.cancel();
             }
+            handle.entry.status = TaskStatus::Cancelling;
+            return true;
+        }
         false
     }
 
@@ -473,9 +474,10 @@ impl TaskRegistry {
             seen.retain(|_, ts| (now - *ts).num_seconds() < DEDUP_WINDOW_SECS);
 
             if let Some(first_seen) = seen.get(&key)
-                && (now - *first_seen).num_seconds() < DEDUP_WINDOW_SECS {
-                    return None; // Duplicate — silently drop
-                }
+                && (now - *first_seen).num_seconds() < DEDUP_WINDOW_SECS
+            {
+                return None; // Duplicate — silently drop
+            }
             seen.insert(key, now);
         }
 
@@ -611,9 +613,10 @@ impl TaskRegistry {
             let mut seen = self.recently_seen.write().await;
             seen.retain(|_, ts| (now - *ts).num_seconds() < DEDUP_WINDOW_SECS);
             if let Some(first_seen) = seen.get(&key)
-                && (now - *first_seen).num_seconds() < DEDUP_WINDOW_SECS {
-                    return QueueOutcome::Duplicate;
-                }
+                && (now - *first_seen).num_seconds() < DEDUP_WINDOW_SECS
+            {
+                return QueueOutcome::Duplicate;
+            }
             seen.insert(key, now);
         }
         let mut queues = self.queues.write().await;
@@ -749,10 +752,12 @@ mod tests {
         assert_eq!(registry.queue_len(session).await, 2);
 
         // A different role never takes the same sender's messages.
-        assert!(registry
-            .take_steering_messages(session, UserRole::Owner, &ctx)
-            .await
-            .is_empty());
+        assert!(
+            registry
+                .take_steering_messages(session, UserRole::Owner, &ctx)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -765,10 +770,12 @@ mod tests {
         registry
             .queue_message(session, queued("and the docs"), None)
             .await;
-        assert!(registry
-            .take_steering_messages(session, UserRole::Public, &ctx)
-            .await
-            .is_empty());
+        assert!(
+            registry
+                .take_steering_messages(session, UserRole::Public, &ctx)
+                .await
+                .is_empty()
+        );
         assert_eq!(registry.queue_len(session).await, 2);
     }
 
@@ -780,10 +787,12 @@ mod tests {
         with_file.attachments.push(MessageAttachment::default());
         let ctx = with_file.channel_ctx.clone();
         registry.queue_message(session, with_file, None).await;
-        assert!(registry
-            .take_steering_messages(session, UserRole::Public, &ctx)
-            .await
-            .is_empty());
+        assert!(
+            registry
+                .take_steering_messages(session, UserRole::Public, &ctx)
+                .await
+                .is_empty()
+        );
         assert_eq!(registry.queue_len(session).await, 1);
     }
 
@@ -1284,10 +1293,12 @@ mod tests {
         let session = "test-session";
         let (task_id, _token) = registry.register(session, "task").await;
 
-        assert!(registry
-            .finalize_and_drain(task_id, session, None)
-            .await
-            .is_none());
+        assert!(
+            registry
+                .finalize_and_drain(task_id, session, None)
+                .await
+                .is_none()
+        );
         assert!(!registry.has_running_task(session).await);
     }
 }

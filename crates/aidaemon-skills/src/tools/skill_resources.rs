@@ -2,11 +2,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{self as skills, ResourceResolver};
-use aidaemon_tools::semantics::ToolCapabilities;
 use aidaemon_tools::OutcomeTool as Tool;
+use aidaemon_tools::semantics::ToolCapabilities;
 
 pub struct SkillResourcesTool {
     skills_dir: PathBuf,
@@ -150,8 +150,8 @@ impl aidaemon_tools::semantics::ToolSemantics for SkillResourcesTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resources::ResourceEntry;
     use crate::Skill;
+    use crate::resources::ResourceEntry;
     use aidaemon_tools::testing::ToolCalls as _;
 
     fn make_skill_with_resources(name: &str, resources: Vec<ResourceEntry>) -> Skill {

@@ -7,21 +7,21 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use aidaemon_secrets::SecretStore;
 
+use crate::OutcomeTool as Tool;
 use crate::config_file::ConfigFile;
 use crate::http_request::{HttpAuthProfile, HttpAuthType, HttpRequestTool, SharedHttpProfiles};
 use crate::semantics::{
-    semantics_for_exact_read_actions, ApprovalScope, OwnerApprovalNeed, ToolCallContext,
-    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolCollectionObservation, ToolMutationEffects, ToolObservationEvidence, ToolSemanticFacet,
-    ToolTargetHint, ToolTargetHintKind,
+    ApprovalScope, OwnerApprovalNeed, ToolCallContext, ToolCallMetadata, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolCollectionObservation, ToolMutationEffects,
+    ToolObservationEvidence, ToolSemanticFacet, ToolTargetHint, ToolTargetHintKind,
+    semantics_for_exact_read_actions,
 };
 use crate::services::OAuthStore;
-use crate::OutcomeTool as Tool;
 
 const MAX_VERIFY_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 20;
@@ -520,9 +520,9 @@ impl ManageHttpAuthTool {
                         .map(str::trim)
                         .filter(|url| !url.is_empty())
                         .and_then(crate::command_effects::url_effect)
-                    {
-                        effects.keys.push(host);
-                    }
+                {
+                    effects.keys.push(host);
+                }
                 effects
             }
             _ => CallEffects::unknown(),
@@ -1187,16 +1187,17 @@ impl Tool for ManageHttpAuthTool {
             ));
         } else if matches!(args.action.as_str(), "describe" | "verify")
             && let Some(profile) = args.profile.as_deref()
-                && let Ok(profile) = Self::validate_profile_name(profile)
-                    && let Some(subject) = ToolTargetHint::new(
-                        ToolTargetHintKind::ResourceId,
-                        HttpRequestTool::auth_profile_resource_id(&profile),
-                    ) {
-                        observations.push(ToolObservationEvidence::new(
-                            subject,
-                            &[ToolSemanticFacet::Authorization],
-                        ));
-                    }
+            && let Ok(profile) = Self::validate_profile_name(profile)
+            && let Some(subject) = ToolTargetHint::new(
+                ToolTargetHintKind::ResourceId,
+                HttpRequestTool::auth_profile_resource_id(&profile),
+            )
+        {
+            observations.push(ToolObservationEvidence::new(
+                subject,
+                &[ToolSemanticFacet::Authorization],
+            ));
+        }
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
@@ -1306,12 +1307,13 @@ impl crate::semantics::ToolSemantics for ManageHttpAuthTool {
                 );
             }
             if let Some(profile) = args.profile.as_deref()
-                && let Ok(profile) = Self::validate_profile_name(profile) {
-                    semantics = semantics.with_target_hint(
-                        ToolTargetHintKind::ResourceId,
-                        HttpRequestTool::auth_profile_resource_id(&profile),
-                    );
-                }
+                && let Ok(profile) = Self::validate_profile_name(profile)
+            {
+                semantics = semantics.with_target_hint(
+                    ToolTargetHintKind::ResourceId,
+                    HttpRequestTool::auth_profile_resource_id(&profile),
+                );
+            }
         }
         semantics
     }

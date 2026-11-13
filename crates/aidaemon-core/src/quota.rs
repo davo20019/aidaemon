@@ -188,7 +188,7 @@ impl Provider for QuotaGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{text, ScriptedProvider};
+    use crate::testing::{ScriptedProvider, text};
     use crate::{Failover, FailoverStep};
 
     fn request(model: &str) -> ModelRequest {
@@ -309,12 +309,14 @@ mod tests {
         let rejected = QuotaGuard::new(ScriptedProvider::with_results(vec![Err(
             ProviderError::Auth("revoked".into()),
         )]));
-        assert!(rejected
-            .stream(&request("m"))
-            .next()
-            .await
-            .unwrap()
-            .is_err());
+        assert!(
+            rejected
+                .stream(&request("m"))
+                .next()
+                .await
+                .unwrap()
+                .is_err()
+        );
         assert_eq!(rejected.active().len(), 1);
         rejected.clear();
         assert!(rejected.active().is_empty());

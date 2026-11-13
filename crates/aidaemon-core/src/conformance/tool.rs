@@ -287,7 +287,7 @@ fn check_required_declared(params: &Value) -> Result<(), String> {
             return Err(format!(
                 "\"properties\" must be an object, got {}",
                 abbreviate(other)
-            ))
+            ));
         }
     };
     let Some(required) = required_keys(params) else {
@@ -410,9 +410,10 @@ fn sample_number(obj: &Map<String, Value>, integer: bool) -> Value {
         (None, None) => 1.0,
     };
     if let Some(max) = max
-        && n > max {
-            n = max;
-        }
+        && n > max
+    {
+        n = max;
+    }
     if integer {
         Value::from(n.ceil() as i64)
     } else {
@@ -446,9 +447,9 @@ fn sample_string(obj: &Map<String, Value>, key: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ToolSpec;
     use crate::testing::spec;
     use crate::tool::{FnTool, ToolAnnotations, ToolOutput};
-    use crate::ToolSpec;
     use serde_json::json;
 
     fn tool(spec: ToolSpec, annotations: ToolAnnotations) -> impl Tool {

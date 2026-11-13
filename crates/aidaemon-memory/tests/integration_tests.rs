@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider, SCRIPTED_USAGE};
+use aidaemon_core::testing::{SCRIPTED_USAGE, ScriptedProvider, call, text, tool_calls};
 use aidaemon_core::{
     Agent, Message, ModelRequest, ModelResponse, Provider, ProviderError, Role, ToolCall,
 };
@@ -81,12 +81,14 @@ async fn extractor_parses_good_json_and_stores_with_provenance() {
         Some("my daughters Mia and Zoe")
     );
     let employer = facts.iter().find(|f| f.key == "employer").unwrap();
-    assert!(employer
-        .source
-        .excerpt
-        .as_deref()
-        .unwrap()
-        .contains("Acme Corp"));
+    assert!(
+        employer
+            .source
+            .excerpt
+            .as_deref()
+            .unwrap()
+            .contains("Acme Corp")
+    );
 
     // The request forced the typed tool and carried the transcript.
     let request = &provider.requests()[0];
@@ -201,9 +203,11 @@ async fn known_keys_let_corrections_supersede() {
         )
         .await
         .unwrap();
-    assert!(provider.requests()[1].messages[1]
-        .content
-        .contains("pet/dog_name"));
+    assert!(
+        provider.requests()[1].messages[1]
+            .content
+            .contains("pet/dog_name")
+    );
     let facts = memory.facts(SESSION).await.unwrap();
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0].value, "Max");
@@ -258,10 +262,11 @@ async fn summarizer_creates_a_scored_episode() {
             "m",
         )),
     );
-    assert!(bad
-        .summarize_session(SESSION, &messages, &[])
-        .await
-        .is_err());
+    assert!(
+        bad.summarize_session(SESSION, &messages, &[])
+            .await
+            .is_err()
+    );
 }
 
 /// A provider that waits for a signal before answering, to prove the hook
@@ -618,11 +623,13 @@ async fn memory_recall_injects_into_requests_never_into_state() {
         "irrelevant fact injected"
     );
 
-    assert!(outcome
-        .state
-        .messages
-        .iter()
-        .all(|m| !m.content.contains("Recalled memory")));
+    assert!(
+        outcome
+            .state
+            .messages
+            .iter()
+            .all(|m| !m.content.contains("Recalled memory"))
+    );
     assert_eq!(outcome.state.messages.len(), 2);
 }
 
@@ -790,7 +797,7 @@ async fn a_memory_without_an_extractor_says_it_cannot_learn_from_history() {
 #[tokio::test]
 async fn sqlite_memory_runs_in_a_database_of_its_own() {
     use aidaemon_memory::records::{Episode, FactPrivacy};
-    use aidaemon_memory::sqlite::{migrate, SqliteMemory};
+    use aidaemon_memory::sqlite::{SqliteMemory, migrate};
     use aidaemon_memory::stores::FactStore;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 

@@ -417,8 +417,7 @@ mod tests {
 
     #[test]
     fn scheduled_completion_is_compact_and_hides_local_path() {
-        let input =
-            "Published /Users/synthetic/projects/blog/src/content/posts/2026-08-12-example.md. \
+        let input = "Published /Users/synthetic/projects/blog/src/content/posts/2026-08-12-example.md. \
                      Evidence was repository guidance and clean git status. npm run deploy built \
                      successfully with Vite 7.3.1 and uploaded 5 assets. Exact public URL \
                      https://blog.example.com/posts/example/ returned HTTP 200.";
@@ -432,7 +431,9 @@ mod tests {
 
         assert!(output.starts_with("✅ **Scheduled run complete**"));
         assert!(output.contains("Published `2026-08-12-example.md`."));
-        assert!(output.contains("[Open blog.example.com](https://blog.example.com/posts/example/)"));
+        assert!(
+            output.contains("[Open blog.example.com](https://blog.example.com/posts/example/)")
+        );
         assert!(!output.contains("Checks"));
         assert!(output.contains("_It will run again on its schedule._"));
         assert!(!output.contains("/Users/synthetic"));

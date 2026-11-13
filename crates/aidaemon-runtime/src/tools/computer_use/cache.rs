@@ -251,9 +251,11 @@ mod tests {
         let mut cache = SnapshotCache::default();
         let snap = cache.store(key(), sample_snapshot());
         assert!(cache.validate_generation(&key(), snap.generation).is_ok());
-        assert!(cache
-            .validate_generation(&key(), snap.generation - 1)
-            .is_err());
+        assert!(
+            cache
+                .validate_generation(&key(), snap.generation - 1)
+                .is_err()
+        );
     }
 
     #[test]
@@ -346,9 +348,11 @@ mod tests {
                 .unwrap(),
             2
         );
-        assert!(cache
-            .resolve_descriptor(&key(), g, None, Some("like"), 1)
-            .is_ok());
+        assert!(
+            cache
+                .resolve_descriptor(&key(), g, None, Some("like"), 1)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -184,7 +184,7 @@ fn due_mandate_controller(session_id: &str) -> (Goal, Mandate) {
 
 #[tokio::test]
 async fn queued_notices_reach_owner_history_and_timeouts_stay_answerable() {
-    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::testing::{MockProvider, setup_test_agent};
     use crate::traits::{DialogueStateStore, NotificationEntry, QuestionKind};
 
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
@@ -214,13 +214,15 @@ async fn queued_notices_reach_owner_history_and_timeouts_stay_answerable() {
     coordinator
         .record_delivered_notification(&stalled, &stalled.message)
         .await;
-    assert!(harness
-        .state
-        .get_dialogue_state(session_id)
-        .await
-        .unwrap()
-        .and_then(|state| state.open_question)
-        .is_none());
+    assert!(
+        harness
+            .state
+            .get_dialogue_state(session_id)
+            .await
+            .unwrap()
+            .and_then(|state| state.open_question)
+            .is_none()
+    );
 
     // The ASK-timeout notice says the question can still be answered, so
     // the owner's next reply must be bound to the (already resumed) mandate.
@@ -286,12 +288,16 @@ async fn due_mandate_creates_a_distinct_run_without_a_goal_schedule() {
     let tasks = state.get_tasks_for_goal_run(&run.id).await.unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(run.root_task_id.as_deref(), Some(tasks[0].id.as_str()));
-    assert!(tasks[0]
-        .description
-        .starts_with("Run one bounded autonomous review"));
-    assert!(tasks[0]
-        .description
-        .contains("isolated built-in mandate protocol"));
+    assert!(
+        tasks[0]
+            .description
+            .starts_with("Run one bounded autonomous review")
+    );
+    assert!(
+        tasks[0]
+            .description
+            .contains("isolated built-in mandate protocol")
+    );
     assert!(!tasks[0].description.contains(&mandate.objective));
     assert!(!tasks[0].description.contains("allowed tools"));
     let context: serde_json::Value =
@@ -300,23 +306,29 @@ async fn due_mandate_creates_a_distinct_run_without_a_goal_schedule() {
     assert_eq!(context["mandate_version"], mandate.version);
     assert_eq!(context["provenance"], "runtime_mandate_fence_only");
     assert_eq!(context.as_object().unwrap().len(), 3);
-    assert!(state
-        .get_schedules_for_goal(&goal.id)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(state
-        .get_scheduled_run_state(&goal.id)
-        .await
-        .unwrap()
-        .is_none());
-    assert!(state
-        .get_mandate(&mandate.id)
-        .await
-        .unwrap()
-        .unwrap()
-        .review_lease_token
-        .is_some());
+    assert!(
+        state
+            .get_schedules_for_goal(&goal.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        state
+            .get_scheduled_run_state(&goal.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .get_mandate(&mandate.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .review_lease_token
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -345,11 +357,13 @@ async fn mandate_budget_deferral_waits_for_the_next_utc_reset() {
     let coordinator = HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
     coordinator.check_due_mandates().await;
 
-    assert!(state
-        .get_current_goal_run(&goal.id)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        state
+            .get_current_goal_run(&goal.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let deferred = state.get_mandate(&mandate.id).await.unwrap().unwrap();
     assert!(deferred.review_lease_token.is_none());
     let retry_at = chrono::DateTime::parse_from_rfc3339(&deferred.next_review_at)
@@ -392,14 +406,16 @@ async fn open_mandate_run_prevents_a_duplicate_review_after_lease_release() {
     let first_run = state.get_current_goal_run(&goal.id).await.unwrap().unwrap();
     let claimed = state.get_mandate(&mandate.id).await.unwrap().unwrap();
     let lease_token = claimed.review_lease_token.as_deref().unwrap();
-    assert!(state
-        .release_mandate_review_lease(
-            &mandate.id,
-            lease_token,
-            &(chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
-        )
-        .await
-        .unwrap());
+    assert!(
+        state
+            .release_mandate_review_lease(
+                &mandate.id,
+                lease_token,
+                &(chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
+            )
+            .await
+            .unwrap()
+    );
 
     coordinator.check_due_mandates().await;
 
@@ -471,12 +487,14 @@ async fn generic_orphan_dispatch_leaves_non_root_mandate_tasks_untouched() {
         completed_at: None,
     };
     state.create_task(&non_root).await.unwrap();
-    assert!(state
-        .get_tasks_for_goal_run(&run.id)
-        .await
-        .unwrap()
-        .iter()
-        .any(|task| task.id == non_root.id));
+    assert!(
+        state
+            .get_tasks_for_goal_run(&run.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.id == non_root.id)
+    );
 
     coordinator.dispatch_pending_tasks().await;
 
@@ -488,11 +506,13 @@ async fn generic_orphan_dispatch_leaves_non_root_mandate_tasks_untouched() {
     assert_eq!(after.status, "pending");
     assert!(after.agent_id.is_none());
     assert!(after.started_at.is_none());
-    assert!(state
-        .get_current_task_attempt(&non_root.id)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        state
+            .get_current_task_attempt(&non_root.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(
         state
             .get_pending_notifications(10)
@@ -790,11 +810,13 @@ async fn test_reminder_fast_path_one_shot_delivers_and_completes() {
     let g = state.get_goal(&goal.id).await.unwrap().unwrap();
     assert_eq!(g.status, "completed");
     assert!(g.notified_at.is_some());
-    assert!(state
-        .get_schedules_for_goal(&goal.id)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        state
+            .get_schedules_for_goal(&goal.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     // A completed task records the run; nothing is left pending for the
     // task-lead pipeline.
@@ -1407,9 +1429,11 @@ async fn test_blocked_scheduled_run_does_not_coalesce_later_occurrence() {
     let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
     assert_eq!(tasks.len(), 2);
     assert!(tasks.iter().any(|task| task.id == blocked_task.id));
-    assert!(tasks
-        .iter()
-        .any(|task| task.description.starts_with("Scheduled check:")));
+    assert!(
+        tasks
+            .iter()
+            .any(|task| task.description.starts_with("Scheduled check:"))
+    );
 
     let runs = state.get_goal_runs(&goal.id).await.unwrap();
     let retired = runs
@@ -1601,9 +1625,10 @@ async fn escalated_goal_gets_one_automatic_recovery_run_whose_root_survives_disp
         root.status, "cancelled",
         "recovery root must not be retired as stale"
     );
-    assert!(root
-        .description
-        .contains("automatic recovery attempt 1 of 3"));
+    assert!(
+        root.description
+            .contains("automatic recovery attempt 1 of 3")
+    );
     let state_after = state
         .get_scheduled_recovery_state(&goal.id)
         .await
@@ -2158,12 +2183,16 @@ async fn heartbeat_recovers_stranded_manual_run_before_dispatch() {
     assert_eq!(state.get_goal_runs(&goal.id).await.unwrap()[0].id, run.id);
 
     let notifications = state.get_pending_notifications(10).await.unwrap();
-    assert!(notifications
-        .iter()
-        .all(|entry| entry.notification_type != "status_update"));
-    assert!(notifications
-        .iter()
-        .any(|entry| entry.notification_type == "stalled"));
+    assert!(
+        notifications
+            .iter()
+            .all(|entry| entry.notification_type != "status_update")
+    );
+    assert!(
+        notifications
+            .iter()
+            .any(|entry| entry.notification_type == "stalled")
+    );
 }
 
 #[tokio::test]
@@ -2245,11 +2274,13 @@ async fn active_task_lead_owns_retries_and_pending_dispatch() {
             .status,
         "pending"
     );
-    assert!(state
-        .get_pending_notifications(10)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        state
+            .get_pending_notifications(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -2649,10 +2680,12 @@ async fn test_manual_run_is_not_suppressed_by_prior_run_mutating_success() {
         pending_after.status, "completed",
         "the previous run's mutation receipt must not auto-close a new manual run"
     );
-    assert!(!pending_after
-        .result
-        .as_deref()
-        .is_some_and(|result| result.contains("mutating action")));
+    assert!(
+        !pending_after
+            .result
+            .as_deref()
+            .is_some_and(|result| result.contains("mutating action"))
+    );
     assert_eq!(
         state
             .get_current_goal_run(&goal.id)

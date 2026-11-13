@@ -8,17 +8,17 @@ use aidaemon_core::{Message, Receipt, RunOutcome, Usage};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::embed::{cosine, Embedder};
+use crate::embed::{Embedder, cosine};
 use crate::error::{MemoryError, Result};
 use crate::extract::{EpisodeSummarizer, FactExtractor};
-use crate::scoring::{text_similarity, HybridScorer, Scorer, ScoringConfig};
+use crate::scoring::{HybridScorer, Scorer, ScoringConfig, text_similarity};
 use crate::sqlite::facts_make_the_same_claim;
 use crate::store::MemoryStore;
 use crate::types::{
-    episode_search_text, fact_search_text, normalize_category, normalize_key, truncate_chars,
     DecayReport, Episode, Fact, FactAccess, FactRecord, MemoryStats, MergeConfig, NewEpisode,
     NewFact, Provenance, RecallAudience, RecordKind, ReembedCursor, ReembedReport, RetentionConfig,
-    ScoredEpisode, ScoredFact, Signals, StoredEmbedding, UpsertOutcome,
+    ScoredEpisode, ScoredFact, Signals, StoredEmbedding, UpsertOutcome, episode_search_text,
+    fact_search_text, normalize_category, normalize_key, truncate_chars,
 };
 
 /// Maps a session id (from `ToolContext` / `HookContext`) to a memory

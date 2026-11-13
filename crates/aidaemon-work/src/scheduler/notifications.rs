@@ -288,40 +288,40 @@ impl GoalCycle {
             }
             delivery_attempts = delivery_attempts.saturating_add(1);
             if entry.notification_type == "escalation"
-                && let Some(task_id) = entry.task_id.as_deref() {
-                    // Give the coordinator a brief chance to reconcile the
-                    // executor handoff, then verify the linked task is still
-                    // blocked. This prevents a stale critical notification
-                    // from racing a same-turn unblock or completion.
-                    if !task_escalation_has_settled(&entry.created_at, Utc::now()) {
-                        continue;
-                    }
-                    match self.state.get_task(task_id).await {
-                        Ok(Some(task)) if task.status == "blocked" => {}
-                        Ok(_) => {
-                            if let Err(error) =
-                                self.state.mark_notification_delivered(&entry.id).await
-                            {
-                                warn!(
-                                    notification_id = %entry.id,
-                                    task_id,
-                                    error = %error,
-                                    "Failed to close stale task escalation"
-                                );
-                            }
-                            continue;
-                        }
-                        Err(error) => {
+                && let Some(task_id) = entry.task_id.as_deref()
+            {
+                // Give the coordinator a brief chance to reconcile the
+                // executor handoff, then verify the linked task is still
+                // blocked. This prevents a stale critical notification
+                // from racing a same-turn unblock or completion.
+                if !task_escalation_has_settled(&entry.created_at, Utc::now()) {
+                    continue;
+                }
+                match self.state.get_task(task_id).await {
+                    Ok(Some(task)) if task.status == "blocked" => {}
+                    Ok(_) => {
+                        if let Err(error) = self.state.mark_notification_delivered(&entry.id).await
+                        {
                             warn!(
                                 notification_id = %entry.id,
                                 task_id,
                                 error = %error,
-                                "Deferred task escalation because task state could not be verified"
+                                "Failed to close stale task escalation"
                             );
-                            continue;
                         }
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(
+                            notification_id = %entry.id,
+                            task_id,
+                            error = %error,
+                            "Deferred task escalation because task state could not be verified"
+                        );
+                        continue;
                     }
                 }
+            }
             let sanitized = self.presenter.user_facing(&entry.message);
             let delivered = if let Some(hub) = self.hub.clone() {
                 let message = self

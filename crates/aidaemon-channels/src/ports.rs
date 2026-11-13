@@ -81,10 +81,11 @@ impl AgentResponseEnvelope {
         platform_message_ids: Vec<String>,
         error_code: Option<String>,
     ) -> aidaemon_events::ResponseDeliveryData {
-        debug_assert!(self
-            .referenced_receipts
-            .iter()
-            .all(|reference| !reference.receipt_id.trim().is_empty()));
+        debug_assert!(
+            self.referenced_receipts
+                .iter()
+                .all(|reference| !reference.receipt_id.trim().is_empty())
+        );
         aidaemon_events::ResponseDeliveryData {
             response_id: self.response_id.clone(),
             task_id: self.task_id.clone(),
@@ -308,7 +309,7 @@ pub trait OutboundRouter: Send + Sync {
     ) -> anyhow::Result<bool>;
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()>;
     async fn send_media_strict(&self, session_id: &str, media: &MediaMessage)
-        -> anyhow::Result<()>;
+    -> anyhow::Result<()>;
     /// Delete a message this daemon sent. `Ok(false)` when the channel
     /// cannot delete it; the default suits routers that never can.
     async fn delete_message(&self, _session_id: &str, _message_id: &str) -> anyhow::Result<bool> {
@@ -330,11 +331,7 @@ pub trait OutboundRouter: Send + Sync {
         after: Option<&str>,
     ) -> Option<String> {
         let now = self.checklist_surface(session_id).await;
-        if now.as_deref() == after {
-            None
-        } else {
-            now
-        }
+        if now.as_deref() == after { None } else { now }
     }
     /// Record a plan card sent outside a turn (see [`Self::checklist_surface`]).
     async fn register_checklist_surface(&self, _session_id: &str, _message_id: &str) {}

@@ -150,9 +150,11 @@ mod tests {
             "https://synthetic-host.example-tailnet.ts.net:8443"
         );
         let stopped = STATUS.replace("\"Running\"", "\"NeedsLogin\"");
-        assert!(tailnet_origin(&stopped, 443)
-            .unwrap_err()
-            .contains("tailscale up"));
+        assert!(
+            tailnet_origin(&stopped, 443)
+                .unwrap_err()
+                .contains("tailscale up")
+        );
     }
 
     #[test]
@@ -163,9 +165,11 @@ mod tests {
                 stability: OriginStability::Stable,
             },
         };
-        assert!(watcher
-            .on_line(Stream::Stdout, "Press Ctrl+C to exit.")
-            .is_none());
+        assert!(
+            watcher
+                .on_line(Stream::Stdout, "Press Ctrl+C to exit.")
+                .is_none()
+        );
         assert!(matches!(
             watcher.on_line(Stream::Stdout, "Available within your tailnet:"),
             Some(ExposureHealth::Up(_))

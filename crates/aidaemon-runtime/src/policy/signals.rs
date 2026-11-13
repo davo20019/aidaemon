@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::execution::{score_risk_from_capabilities, PolicyBundle};
+use super::execution::{PolicyBundle, score_risk_from_capabilities};
 use aidaemon_tools::semantics::ToolCapabilities;
 use aidaemon_tools::text::contains_keyword_as_words;
 

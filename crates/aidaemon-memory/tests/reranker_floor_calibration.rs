@@ -21,10 +21,10 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use aidaemon_memory::FactPrivacy;
 use aidaemon_memory::records::Fact;
 use aidaemon_memory::search::LexicalIndex;
 use aidaemon_memory::sqlite::build_fact_embedding_text;
-use aidaemon_memory::FactPrivacy;
 use chrono::{TimeZone, Utc};
 
 /// `(category, key, value)`.

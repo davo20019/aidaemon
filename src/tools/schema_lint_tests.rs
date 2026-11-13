@@ -282,7 +282,8 @@ fn tools_do_not_embed_truncation_notices_in_output() {
         let source = fs::read_to_string(&file).expect("read tool source");
         let stripped = source.replace("render_truncation_notice(", "");
         assert!(
-            !stripped.contains("truncation_notice(") && !stripped.contains("truncation_notice_with_hint("),
+            !stripped.contains("truncation_notice(")
+                && !stripped.contains("truncation_notice_with_hint("),
             "{} embeds a truncation notice in tool output; set metadata.truncation instead \
              (render_truncation_notice is allowed only for delivery paths that bypass the agent loop)",
             file.display()

@@ -4,13 +4,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Datelike;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::semantics::{
-    semantics_for_exact_read_actions, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, semantics_for_exact_read_actions,
 };
 use aidaemon_tools::services::SettingsStore;
-use aidaemon_tools::OutcomeTool as Tool;
 
 use crate::records::{Person, PersonFact};
 
@@ -320,9 +320,10 @@ impl ManagePeopleTool {
 
             // Filter by relationship if specified
             if let Some(ref filter) = args.relationship
-                && p.relationship.as_deref() != Some(filter.as_str()) {
-                    continue;
-                }
+                && p.relationship.as_deref() != Some(filter.as_str())
+            {
+                continue;
+            }
 
             result.push_str(&format!(
                 "- **{}** (ID: {}) — {} | style: {}{}\n",
@@ -497,9 +498,11 @@ impl ManagePeopleTool {
                     continue;
                 }
                 if let Some(days) = Self::days_until_date(&fact.value, today)
-                    && days >= 0 && days <= within_days as i64 {
-                        rows.push((days, person.clone(), fact));
-                    }
+                    && days >= 0
+                    && days <= within_days as i64
+                {
+                    rows.push((days, person.clone(), fact));
+                }
             }
         }
 
@@ -594,10 +597,11 @@ impl ManagePeopleTool {
         };
 
         if let Some(ref name) = args.name
-            && args.id.is_some() {
-                // Only update name if id was used to identify (name is being changed)
-                person.name = name.clone();
-            }
+            && args.id.is_some()
+        {
+            // Only update name if id was used to identify (name is being changed)
+            person.name = name.clone();
+        }
         if let Some(ref rel) = args.relationship {
             person.relationship = Some(rel.clone());
         }
@@ -660,7 +664,7 @@ impl ManagePeopleTool {
                 return Ok(format!(
                     "Person '{}' not found. Add them first.",
                     person_name
-                ))
+                ));
             }
         };
 
@@ -694,7 +698,7 @@ impl ManagePeopleTool {
                 return Ok(
                     "Missing required field: platform_id (e.g., 'slack:U123', 'telegram:456')"
                         .to_string(),
-                )
+                );
             }
         };
         let display_name = args.display_name.as_deref().unwrap_or("");
@@ -886,7 +890,7 @@ impl ManagePeopleTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::full::tools::test_support::{memory, Settings, ToolCalls as _};
+    use crate::full::tools::test_support::{Settings, ToolCalls as _, memory};
     use aidaemon_tools::semantics::ToolSemantics;
 
     #[test]

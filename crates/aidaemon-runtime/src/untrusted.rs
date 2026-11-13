@@ -9,7 +9,7 @@
 
 use aidaemon_core as sdk;
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::warn;
 
 use aidaemon_core::ChannelVisibility;
@@ -817,10 +817,12 @@ mod tests {
     fn the_verifier_treats_looking_inside_the_work_area_as_in_scope() {
         assert!(VERIFIER_SYSTEM_PROMPT.contains("looking before acting"));
         assert!(VERIFIER_SYSTEM_PROMPT.contains("working area"));
-        assert!(verifier_schema()["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("owner_reason")));
+        assert!(
+            verifier_schema()["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("owner_reason"))
+        );
     }
 
     /// Live 2026-11-13: the check refused a Drupal install step that read
@@ -879,10 +881,12 @@ mod tests {
         assert!(user.contains("reaches repo.packagist.org:443 (outside this computer)"));
         assert!(user.contains("possibly more"));
         let unknown = verifier_messages("r", true, "t", "d", &json!({}));
-        assert!(unknown[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Working area: not known"));
+        assert!(
+            unknown[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Working area: not known")
+        );
     }
 
     /// Live 2026-11-13: a Drupal helper's delete of a reset script its own
@@ -931,10 +935,12 @@ mod tests {
         )));
         assert!(user.contains(&format!("deletes {older}/web/index.php\"")));
         assert!(user.contains("Folders this request's work created"));
-        assert!(messages[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("changing or deleting anything there is consistent"));
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("changing or deleting anything there is consistent")
+        );
     }
 
     fn proposed_call() -> Value {
@@ -1121,10 +1127,12 @@ mod tests {
         assert_eq!(turns.len(), 64);
         assert_eq!(turns.first().map(String::as_str), Some("turn-6"));
         assert_eq!(turns.last().map(String::as_str), Some("turn-69"));
-        assert!(tainted_turns(&state, "telegram:synthetic-user-2")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            tainted_turns(&state, "telegram:synthetic-user-2")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1134,9 +1142,11 @@ mod tests {
             .set_setting("untrusted_turns:telegram:synthetic-user-1", "not json")
             .await
             .unwrap();
-        assert!(tainted_turns(&state, "telegram:synthetic-user-1")
-            .await
-            .is_err());
+        assert!(
+            tainted_turns(&state, "telegram:synthetic-user-1")
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -1151,10 +1161,12 @@ mod tests {
         );
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
-        assert!(messages[0]["content"]
-            .as_str()
-            .unwrap()
-            .starts_with("You are the untrusted call verifier."));
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("You are the untrusted call verifier.")
+        );
         assert_eq!(messages[1]["role"], "user");
         let user = messages[1]["content"].as_str().unwrap();
         assert!(user.contains("Send Jordan Lee the summary."));

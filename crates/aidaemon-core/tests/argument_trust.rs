@@ -4,13 +4,13 @@
 
 use std::sync::{Arc, Mutex};
 
-use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, text, tool_calls};
 use aidaemon_core::{
     Agent, FnTool, Hook, HookContext, ReceiptStatus, Tool, ToolAnnotations, ToolCall, ToolDecision,
     ToolInfo, ToolOutput, ToolSpec,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 type Seen = Arc<Mutex<Vec<Value>>>;
 

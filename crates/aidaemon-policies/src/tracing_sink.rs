@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use aidaemon_core::{Event, EventSink, RunId, RunStatus};
-use tracing::{field, Level, Span};
+use tracing::{Level, Span, field};
 
 /// Emits one `tracing` event per kernel [`Event`], inside spans:
 ///

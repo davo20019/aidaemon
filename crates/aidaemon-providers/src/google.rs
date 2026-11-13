@@ -7,13 +7,13 @@ use aidaemon_core::{
     ToolCall, ToolChoice, Usage,
 };
 use async_trait::async_trait;
-use reqwest::header::HeaderMap;
 use reqwest::StatusCode;
-use serde_json::{json, Map, Value};
+use reqwest::header::HeaderMap;
+use serde_json::{Map, Value, json};
 
 use crate::transport::{
-    body_excerpt, build_client, header_map, map_reqwest_error, map_status, retry_after,
-    ConfigError, Secret, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TIMEOUT,
+    ConfigError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TIMEOUT, Secret, body_excerpt, build_client,
+    header_map, map_reqwest_error, map_status, retry_after,
 };
 
 pub const GOOGLE_DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -218,12 +218,13 @@ impl Provider for GoogleGenai {
         if !request.options.single_attempt
             && rejection.status == StatusCode::BAD_REQUEST
             && is_missing_thought_signature_error(&rejection.body)
-            && let Some(retry) = body_without_unsigned_calls(&body) {
-                return match self.send(&url, &retry).await? {
-                    Ok(data) => Ok(parse_response(&data)),
-                    Err(rejection) => Err(rejection.into_error()),
-                };
-            }
+            && let Some(retry) = body_without_unsigned_calls(&body)
+        {
+            return match self.send(&url, &retry).await? {
+                Ok(data) => Ok(parse_response(&data)),
+                Err(rejection) => Err(rejection.into_error()),
+            };
+        }
         Err(rejection.into_error())
     }
 }
@@ -657,9 +658,10 @@ fn blocked_safety_categories(ratings: Option<&Vec<Value>>) -> Vec<String> {
             continue;
         }
         if let Some(category) = rating.get("category").and_then(Value::as_str)
-            && !categories.iter().any(|c| c == category) {
-                categories.push(category.to_string());
-            }
+            && !categories.iter().any(|c| c == category)
+        {
+            categories.push(category.to_string());
+        }
     }
     categories
 }
@@ -1141,8 +1143,10 @@ mod tests {
     fn user_audio_becomes_inline_data() {
         let request = ModelRequest {
             model: "gemini-test".into(),
-            messages: vec![Message::user("Transcribe.")
-                .with_audio([aidaemon_core::Audio::new("opus", "QUJD")])],
+            messages: vec![
+                Message::user("Transcribe.")
+                    .with_audio([aidaemon_core::Audio::new("opus", "QUJD")]),
+            ],
             ..Default::default()
         };
         let body = build_body(&request);
@@ -1199,7 +1203,9 @@ mod tests {
             .collect();
         assert_eq!(
             roles,
-            ["user", "model", "function", "function", "function", "user", "user"]
+            [
+                "user", "model", "function", "function", "function", "user", "user"
+            ]
         );
         assert_eq!(contents[1]["parts"][0]["text"], "Looking.");
         assert_eq!(

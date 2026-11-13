@@ -7,8 +7,8 @@
 //! newer ones on its own turns. Privacy follows the rules a live turn has.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use aidaemon_core::{FnService, Schedule, Service, ServiceError};

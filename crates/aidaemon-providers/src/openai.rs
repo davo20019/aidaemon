@@ -4,18 +4,18 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aidaemon_core::{
-    collect_stream, Image, Message, ModelRequest, ModelResponse, Provider, ProviderError,
-    ResponseFormat, Role, StreamEvent, ToolCall, ToolChoice, Usage,
+    Image, Message, ModelRequest, ModelResponse, Provider, ProviderError, ResponseFormat, Role,
+    StreamEvent, ToolCall, ToolChoice, Usage, collect_stream,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use reqwest::header::HeaderMap;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::sse::SseEvent;
 use crate::transport::{
-    body_excerpt, build_client, drive, header_map, parse_arguments, raw_arguments, ConfigError,
-    Secret, SseDecoder, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TIMEOUT,
+    ConfigError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TIMEOUT, Secret, SseDecoder, body_excerpt,
+    build_client, drive, header_map, parse_arguments, raw_arguments,
 };
 
 /// Default base URL (OpenAI). Point it at OpenRouter, Ollama
@@ -416,10 +416,11 @@ impl SseDecoder for ChatDecoder {
             let delta = choice.get("delta").or_else(|| choice.get("message"));
             if let Some(delta) = delta {
                 if let Some(text) = delta.get("content").and_then(Value::as_str)
-                    && !text.is_empty() {
-                        self.text.push_str(text);
-                        deltas.push(text.to_string());
-                    }
+                    && !text.is_empty()
+                {
+                    self.text.push_str(text);
+                    deltas.push(text.to_string());
+                }
                 // DeepSeek and Moonshot send `reasoning_content`, OpenRouter
                 // sends `reasoning`.
                 let thought = ["reasoning_content", "reasoning"]

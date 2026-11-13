@@ -30,9 +30,9 @@ mod logging;
 mod mandates {
     //! The mandate policy lives in `aidaemon_work::mandates`.
     #[allow(unused_imports)]
-    pub(crate) use aidaemon_work::mandates::{history, policy::*};
-    #[allow(unused_imports)]
     pub use aidaemon_work::MANDATE_PROTOCOL_TOOLS;
+    #[allow(unused_imports)]
+    pub(crate) use aidaemon_work::mandates::{history, policy::*};
     #[allow(unused_imports)]
     pub(crate) use aidaemon_work::{admissibility, authority};
 }
@@ -339,11 +339,12 @@ pub fn run() -> anyhow::Result<()> {
                 if candidate.exists() {
                     eprintln!("Trying restore from {}...", candidate.display());
                     if let Ok(()) = std::fs::copy(candidate, &config_path).map(|_| ())
-                        && config::AppConfig::load(&config_path).is_ok() {
-                            eprintln!("Restored config from {}", candidate.display());
-                            restored = true;
-                            break;
-                        }
+                        && config::AppConfig::load(&config_path).is_ok()
+                    {
+                        eprintln!("Restored config from {}", candidate.display());
+                        restored = true;
+                        break;
+                    }
                 }
             }
 
@@ -678,7 +679,9 @@ fn handle_agent_command(args: &[String]) -> anyhow::Result<()> {
             println!("  aidaemon agent start <codex|claude|gemini|opencode> [cwd] [-- flags...]");
             println!("  aidaemon share [session_id]");
             println!();
-            println!("Attach your native terminal to an active /agent session started from Telegram Mini App.");
+            println!(
+                "Attach your native terminal to an active /agent session started from Telegram Mini App."
+            );
             println!(
                 "The one-time code is generated inside Telegram when you tap Continue on Computer."
             );

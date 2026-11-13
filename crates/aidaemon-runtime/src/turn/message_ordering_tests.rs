@@ -157,9 +157,10 @@ fn test_tool_result_before_matching_call_is_dropped() {
     fixup_message_ordering(&mut msgs);
 
     assert_all_invariants(&msgs);
-    assert!(msgs
-        .iter()
-        .all(|message| message.get("tool_call_id").and_then(Value::as_str) != Some("c1")));
+    assert!(
+        msgs.iter()
+            .all(|message| message.get("tool_call_id").and_then(Value::as_str) != Some("c1"))
+    );
 }
 
 #[test]
@@ -240,9 +241,10 @@ fn test_orphaned_tool_at_start_of_window() {
     fixup_message_ordering(&mut msgs);
     assert_all_invariants(&msgs);
     // The orphaned tool should be gone
-    assert!(msgs
-        .iter()
-        .all(|m| m.get("role").and_then(|r| r.as_str()) != Some("tool")));
+    assert!(
+        msgs.iter()
+            .all(|m| m.get("role").and_then(|r| r.as_str()) != Some("tool"))
+    );
 }
 
 #[test]
@@ -353,11 +355,13 @@ fn test_collapse_repeated_tool_errors_keeps_latest() {
         .find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("c2"))
         .unwrap();
 
-    assert!(first_tool
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .contains("collapsed"));
+    assert!(
+        first_tool
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("collapsed")
+    );
     assert_eq!(
         second_tool.get("content").and_then(|v| v.as_str()),
         Some("Error: second failure")

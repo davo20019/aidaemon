@@ -67,10 +67,12 @@ async fn send_splits_and_reopens_fences() {
             assert!(content.starts_with("```python\n"));
         }
     }
-    assert!(reqs.last().unwrap().body["content"]
-        .as_str()
-        .unwrap()
-        .ends_with("Done."));
+    assert!(
+        reqs.last().unwrap().body["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("Done.")
+    );
     // The returned ref is the last part's.
     assert_eq!(r.conversation_id, CHANNEL_ID);
     assert_eq!(

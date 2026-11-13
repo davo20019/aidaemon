@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::warn;
 
+use crate::OutcomeTool as Tool;
 use crate::sanitize::sanitize_external_content;
 use crate::semantics::{
     AuthorizationPreflightRecord, AuthorizationPreflightStatus, ToolCallContext, ToolCallMetadata,
@@ -16,7 +17,6 @@ use crate::semantics::{
     ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
 };
 use crate::web::validate_url_for_ssrf;
-use crate::OutcomeTool as Tool;
 
 /// The OAuth tokens behind some auth profiles, kept fresh by the host.
 #[async_trait]
@@ -287,18 +287,20 @@ impl HttpRequestTool {
                 "follow_redirects" => {
                     strip_from_url = true;
                     if !map.contains_key("follow_redirects")
-                        && let Ok(parsed) = value_owned.parse::<bool>() {
-                            map.insert("follow_redirects".to_string(), Value::Bool(parsed));
-                            recovered.push("follow_redirects".to_string());
-                        }
+                        && let Ok(parsed) = value_owned.parse::<bool>()
+                    {
+                        map.insert("follow_redirects".to_string(), Value::Bool(parsed));
+                        recovered.push("follow_redirects".to_string());
+                    }
                 }
                 "timeout_secs" | "max_response_bytes" => {
                     strip_from_url = true;
                     if !map.contains_key(normalized.as_str())
-                        && let Ok(parsed) = value_owned.parse::<u64>() {
-                            map.insert(normalized.clone(), Value::Number(parsed.into()));
-                            recovered.push(normalized);
-                        }
+                        && let Ok(parsed) = value_owned.parse::<u64>()
+                    {
+                        map.insert(normalized.clone(), Value::Number(parsed.into()));
+                        recovered.push(normalized);
+                    }
                 }
                 "headers" => {
                     let looks_embedded = Self::query_value_looks_like_embedded_json(&value_owned);
@@ -816,12 +818,13 @@ impl HttpRequestTool {
         }
 
         if status_code == 401
-            && let Some(profile_name) = auth_profile_name {
-                return Some(format!(
-                    "OAuth diagnostic: HTTP 401 Unauthorized while using auth_profile='{}'. This response alone does not prove the token is expired. It may also indicate revoked credentials, missing scopes, or app permission mismatch.",
-                    profile_name
-                ));
-            }
+            && let Some(profile_name) = auth_profile_name
+        {
+            return Some(format!(
+                "OAuth diagnostic: HTTP 401 Unauthorized while using auth_profile='{}'. This response alone does not prove the token is expired. It may also indicate revoked credentials, missing scopes, or app permission mismatch.",
+                profile_name
+            ));
+        }
 
         None
     }
@@ -891,14 +894,13 @@ impl HttpRequestTool {
         // Include form-encoded body params in signature (NOT JSON body)
         let is_form =
             content_type.is_some_and(|ct| ct.contains("application/x-www-form-urlencoded"));
-        if is_form
-            && let Some(body_str) = body {
-                for pair in body_str.split('&') {
-                    if let Some((k, v)) = pair.split_once('=') {
-                        params.push((percent_decode(k), percent_decode(v)));
-                    }
+        if is_form && let Some(body_str) = body {
+            for pair in body_str.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    params.push((percent_decode(k), percent_decode(v)));
                 }
             }
+        }
 
         // Sort parameters
         params.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -1148,7 +1150,7 @@ impl HttpRequestTool {
                 return make(
                     AuthorizationPreflightStatus::Blocked,
                     Some("credential_profile_missing"),
-                )
+                );
             }
         };
         if !profile
@@ -1205,7 +1207,7 @@ impl HttpRequestTool {
                     return make(
                         AuthorizationPreflightStatus::Blocked,
                         Some("credential_refresh_failed"),
-                    )
+                    );
                 }
             }
         } else {
@@ -1258,11 +1260,12 @@ impl HttpRequestTool {
         );
         let mut ready = make(AuthorizationPreflightStatus::Ready, None);
         if let Some(gateway) = self.oauth_gateway.read().await.clone()
-            && let Some(scopes) = gateway.managed_scopes(profile_name).await {
-                ready.authorized_scopes = scopes;
-                ready.authorized_scopes.sort();
-                ready.authorized_scopes.dedup();
-            }
+            && let Some(scopes) = gateway.managed_scopes(profile_name).await
+        {
+            ready.authorized_scopes = scopes;
+            ready.authorized_scopes.sort();
+            ready.authorized_scopes.dedup();
+        }
         ready.credential_generation = Some(format!(
             "sha256:{}",
             hex::encode(Sha256::digest(generation_material.as_bytes()))
@@ -1313,9 +1316,10 @@ impl HttpRequestTool {
                 builder = builder.header("Content-Type", ct);
             }
             if let Some(payload) = body
-                && (redirect_count == 0 || resend_body) {
-                    builder = builder.body(payload.to_string());
-                }
+                && (redirect_count == 0 || resend_body)
+            {
+                builder = builder.body(payload.to_string());
+            }
 
             if let Some(headers) = custom_headers {
                 for (k, v) in headers {
@@ -1442,11 +1446,12 @@ impl HttpRequestTool {
                         }
 
                         if let Ok(next_parsed) = reqwest::Url::parse(&next_url)
-                            && next_parsed.scheme() != "https" {
-                                return Err(anyhow::anyhow!(
-                                    "Redirect blocked: redirected to non-HTTPS URL"
-                                ));
-                            }
+                            && next_parsed.scheme() != "https"
+                        {
+                            return Err(anyhow::anyhow!(
+                                "Redirect blocked: redirected to non-HTTPS URL"
+                            ));
+                        }
                     }
 
                     current_url = next_url;
@@ -1724,18 +1729,24 @@ impl HttpRequestTool {
         }
 
         // Step 2: SSRF validation (skip for localhost — local dev/testing)
-        if !is_localhost && local_site.is_none()
-            && let Err(reason) = validate_url_for_ssrf(&url) {
-                return Ok((format!("Request blocked: {}", reason), None, None));
-            }
+        if !is_localhost
+            && local_site.is_none()
+            && let Err(reason) = validate_url_for_ssrf(&url)
+        {
+            return Ok((format!("Request blocked: {}", reason), None, None));
+        }
 
         // Step 3: Catch malformed tool calls where tool-only args were stuffed into the URL.
         let leaked_tool_params = Self::embedded_tool_params_in_url(&parsed_url);
         if !leaked_tool_params.is_empty() {
-            return Ok((format!(
-                "Request blocked: tool-only parameters were embedded in the URL ({}). Put them in the top-level `http_request` arguments instead of `url`.",
-                leaked_tool_params.join(", ")
-            ), None, None));
+            return Ok((
+                format!(
+                    "Request blocked: tool-only parameters were embedded in the URL ({}). Put them in the top-level `http_request` arguments instead of `url`.",
+                    leaked_tool_params.join(", ")
+                ),
+                None,
+                None,
+            ));
         }
         if !recovered_tool_params.is_empty() {
             warn!(
@@ -1748,10 +1759,14 @@ impl HttpRequestTool {
         // Step 4: Block manual credential headers so auth always flows through profiles.
         let blocked_headers = Self::blocked_manual_auth_headers(custom_headers);
         if !blocked_headers.is_empty() {
-            return Ok((format!(
-                "Request blocked: credential-bearing headers are not allowed in `headers` ({}). Configure an auth_profile instead.",
-                blocked_headers.join(", ")
-            ), None, None));
+            return Ok((
+                format!(
+                    "Request blocked: credential-bearing headers are not allowed in `headers` ({}). Configure an auth_profile instead.",
+                    blocked_headers.join(", ")
+                ),
+                None,
+                None,
+            ));
         }
 
         // Step 5: Resolve auth profile and check domain
@@ -1770,9 +1785,9 @@ impl HttpRequestTool {
             if !domain_ok {
                 return Ok((
                     format!(
-                    "Request blocked: domain '{}' is not in the allowed domains for profile '{}'",
-                    request_host, name
-                ),
+                        "Request blocked: domain '{}' is not in the allowed domains for profile '{}'",
+                        request_host, name
+                    ),
                     None,
                     None,
                 ));
@@ -1839,13 +1854,14 @@ impl HttpRequestTool {
         let mandate_grant = mandate_execution && mandate_preapproved;
         if !mandate_grant
             && let Some(request) = Self::owner_approval_request(&args)
-                && !Self::scope_covers(kernel_approved, &request.subject) {
-                    anyhow::bail!(
-                        "http_request `{}` requires approval through the agent kernel; it was \
+            && !Self::scope_covers(kernel_approved, &request.subject)
+        {
+            anyhow::bail!(
+                "http_request `{}` requires approval through the agent kernel; it was \
                          called outside an approved agent call",
-                        request.subject
-                    );
-                }
+                request.subject
+            );
+        }
 
         // Refresh a known-expiring bearer before sending anything. Mandate
         // requests deliberately are not replayed after a 401, so this preflight
@@ -1939,69 +1955,70 @@ impl HttpRequestTool {
                 ));
             }
         } else if response.status() == reqwest::StatusCode::UNAUTHORIZED
-            && let Some(profile_name) = auth_profile_name {
-                let is_bearer_profile = profile
-                    .as_ref()
-                    .is_some_and(|resolved| matches!(resolved.auth_type, HttpAuthType::Bearer));
-                if is_bearer_profile {
-                    match self.try_refresh_oauth_profile(profile_name).await {
-                        Ok(Some(refresh_message)) => {
-                            let refreshed_profiles = self.profiles.read().await.clone();
-                            let refreshed_profile = refreshed_profiles.get(profile_name).cloned();
-                            if let Some(refreshed_profile_value) = refreshed_profile {
-                                let (retry_response, retry_redirects) = self
-                                    .execute_request(
-                                        &client,
-                                        &method,
-                                        &url,
-                                        &parsed_url,
-                                        body,
-                                        content_type.as_deref(),
-                                        custom_headers,
-                                        Some(&refreshed_profile_value),
-                                        &refreshed_profiles,
-                                        follow_redirects,
-                                        None,
-                                    )
-                                    .await?;
-                                let retry_status = retry_response.status();
-                                response = retry_response;
-                                redirect_count = retry_redirects;
-                                oauth_retry_note = Some(Self::build_oauth_retry_note(
-                                    profile_name,
-                                    &refresh_message,
-                                    retry_status,
-                                ));
-                            } else {
-                                oauth_retry_note = Some(format!(
-                                    "aidaemon refreshed OAuth provider state for '{}' but could not rebuild the HTTP auth profile, so it did not retry the request. {}",
-                                    profile_name, refresh_message
-                                ));
-                            }
-                        }
-                        Ok(None) => {
-                            oauth_retry_note = Some(format!(
-                                "HTTP 401 Unauthorized from the remote API while using auth_profile='{}'. \
-aidaemon did not attempt an OAuth refresh because this profile is not managed by the OAuth gateway.",
-                                profile_name
+            && let Some(profile_name) = auth_profile_name
+        {
+            let is_bearer_profile = profile
+                .as_ref()
+                .is_some_and(|resolved| matches!(resolved.auth_type, HttpAuthType::Bearer));
+            if is_bearer_profile {
+                match self.try_refresh_oauth_profile(profile_name).await {
+                    Ok(Some(refresh_message)) => {
+                        let refreshed_profiles = self.profiles.read().await.clone();
+                        let refreshed_profile = refreshed_profiles.get(profile_name).cloned();
+                        if let Some(refreshed_profile_value) = refreshed_profile {
+                            let (retry_response, retry_redirects) = self
+                                .execute_request(
+                                    &client,
+                                    &method,
+                                    &url,
+                                    &parsed_url,
+                                    body,
+                                    content_type.as_deref(),
+                                    custom_headers,
+                                    Some(&refreshed_profile_value),
+                                    &refreshed_profiles,
+                                    follow_redirects,
+                                    None,
+                                )
+                                .await?;
+                            let retry_status = retry_response.status();
+                            response = retry_response;
+                            redirect_count = retry_redirects;
+                            oauth_retry_note = Some(Self::build_oauth_retry_note(
+                                profile_name,
+                                &refresh_message,
+                                retry_status,
                             ));
-                        }
-                        Err(err) => {
+                        } else {
                             oauth_retry_note = Some(format!(
-                                "HTTP 401 Unauthorized from the remote API while using auth_profile='{}'. \
-aidaemon attempted an OAuth refresh once, but it failed: {}",
-                                profile_name, err
+                                "aidaemon refreshed OAuth provider state for '{}' but could not rebuild the HTTP auth profile, so it did not retry the request. {}",
+                                profile_name, refresh_message
                             ));
                         }
                     }
-                } else {
-                    oauth_retry_note = Some(format!(
-                        "HTTP 401 Unauthorized from the remote API while using auth_profile='{}'. \
-aidaemon did not attempt an OAuth refresh because this profile is not bearer-token OAuth-managed.",
-                        profile_name
-                    ));
+                    Ok(None) => {
+                        oauth_retry_note = Some(format!(
+                            "HTTP 401 Unauthorized from the remote API while using auth_profile='{}'. \
+aidaemon did not attempt an OAuth refresh because this profile is not managed by the OAuth gateway.",
+                            profile_name
+                        ));
+                    }
+                    Err(err) => {
+                        oauth_retry_note = Some(format!(
+                            "HTTP 401 Unauthorized from the remote API while using auth_profile='{}'. \
+aidaemon attempted an OAuth refresh once, but it failed: {}",
+                            profile_name, err
+                        ));
+                    }
                 }
+            } else {
+                oauth_retry_note = Some(format!(
+                    "HTTP 401 Unauthorized from the remote API while using auth_profile='{}'. \
+aidaemon did not attempt an OAuth refresh because this profile is not bearer-token OAuth-managed.",
+                    profile_name
+                ));
             }
+        }
 
         // Step 9: Format response
         let status = response.status();
@@ -2147,14 +2164,15 @@ fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len()
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
             && let Ok(byte) =
                 u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
-            {
-                result.push(byte);
-                i += 3;
-                continue;
-            }
+        {
+            result.push(byte);
+            i += 3;
+            continue;
+        }
         if bytes[i] == b'+' {
             result.push(b' ');
         } else {
@@ -2962,16 +2980,20 @@ mod tests {
         let schema = tool.schema();
         assert_eq!(schema["name"], "http_request");
         assert!(schema["description"].as_str().unwrap().len() > 10);
-        assert!(schema["description"]
-            .as_str()
-            .unwrap()
-            .contains("never inside the URL"));
+        assert!(
+            schema["description"]
+                .as_str()
+                .unwrap()
+                .contains("never inside the URL")
+        );
         assert!(schema["parameters"]["properties"]["method"].is_object());
         assert!(schema["parameters"]["properties"]["url"].is_object());
-        assert!(schema["parameters"]["properties"]["url"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("Do NOT append tool arguments"));
+        assert!(
+            schema["parameters"]["properties"]["url"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Do NOT append tool arguments")
+        );
         let required = schema["parameters"]["required"].as_array().unwrap();
         assert!(required.contains(&json!("method")));
         assert!(required.contains(&json!("url")));
@@ -3118,11 +3140,12 @@ mod tests {
         assert!(!formatted.contains("response exceeded 3 bytes limit"));
         assert!(!formatted.contains('\u{FFFD}'));
         let info = truncation.expect("truncation info");
-        assert!(info
-            .remediation_hint
-            .as_deref()
-            .unwrap_or("")
-            .contains("3 byte limit"));
+        assert!(
+            info.remediation_hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("3 byte limit")
+        );
     }
 
     #[test]
@@ -3160,11 +3183,12 @@ mod tests {
         assert_eq!(body, "partial body");
         assert!(!body.contains("[Truncated:"));
         let info = truncation.expect("truncation info");
-        assert!(info
-            .remediation_hint
-            .as_deref()
-            .unwrap_or("")
-            .contains("1024"));
+        assert!(
+            info.remediation_hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("1024")
+        );
     }
 
     #[test]
@@ -3208,9 +3232,11 @@ mod tests {
             r#"{"method":"POST","url":"https://api.x.com/2/tweets","auth_profile":"twitter-prod","account_id":"2244994945","body":"{\"text\":\"hello\"}"}"#,
         );
 
-        assert!(semantics
-            .mutation_effects
-            .contains(ToolMutationEffects::REMOTE_MUTATION));
+        assert!(
+            semantics
+                .mutation_effects
+                .contains(ToolMutationEffects::REMOTE_MUTATION)
+        );
         assert!(
             semantics
                 .mutation_effects
@@ -3228,10 +3254,12 @@ mod tests {
         assert!(semantics.target_hints.iter().any(|target| {
             target.kind == ToolTargetHintKind::ResourceId && target.value == "account:2244994945"
         }));
-        assert!(semantics
-            .target_hints
-            .iter()
-            .all(|target| !target.value.contains("token")));
+        assert!(
+            semantics
+                .target_hints
+                .iter()
+                .all(|target| !target.value.contains("token"))
+        );
 
         assert_eq!(
             HttpRequestTool::auth_profile_resource_id("Twitter Prod/account"),
@@ -3747,9 +3775,11 @@ mod tests {
 
         let semantics = tool.call_semantics(&arguments);
         assert_eq!(semantics.target_hints.len(), 1);
-        assert!(semantics.target_hints[0]
-            .value
-            .ends_with("?account=1&account=2"));
+        assert!(
+            semantics.target_hints[0]
+                .value
+                .ends_with("?account=1&account=2")
+        );
         let outcome = tool
             .call_with_execution_context(
                 &arguments,
@@ -3803,9 +3833,11 @@ mod tests {
         server.abort();
         let _ = server.await;
         assert!(outcome.metadata.http_status.is_none());
-        assert!(outcome
-            .output
-            .contains("cannot recover tool parameters embedded in the URL"));
+        assert!(
+            outcome
+                .output
+                .contains("cannot recover tool parameters embedded in the URL")
+        );
         assert_eq!(
             request_count.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -3846,9 +3878,11 @@ mod tests {
         server.abort();
         let _ = server.await;
         assert!(outcome.metadata.http_status.is_none());
-        assert!(outcome
-            .output
-            .contains("method-override headers are not allowed"));
+        assert!(
+            outcome
+                .output
+                .contains("method-override headers are not allowed")
+        );
         assert_eq!(
             request_count.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -3984,9 +4018,11 @@ mod tests {
             "unexpected tool output: {}",
             outcome.output
         );
-        assert!(outcome
-            .output
-            .contains("Reactive OAuth refresh and request replay are disabled"));
+        assert!(
+            outcome
+                .output
+                .contains("Reactive OAuth refresh and request replay are disabled")
+        );
         assert_eq!(
             request_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -4040,9 +4076,11 @@ mod tests {
             "unexpected tool output: {}",
             outcome.output
         );
-        assert!(outcome
-            .output
-            .contains("Reactive OAuth refresh and request replay are disabled"));
+        assert!(
+            outcome
+                .output
+                .contains("Reactive OAuth refresh and request replay are disabled")
+        );
         assert_eq!(
             request_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -4359,10 +4397,12 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unknown auth profile"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown auth profile")
+        );
     }
 
     #[tokio::test]

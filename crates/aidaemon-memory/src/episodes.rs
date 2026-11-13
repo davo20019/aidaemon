@@ -341,7 +341,7 @@ where
 mod tests {
     use std::sync::Mutex;
 
-    use aidaemon_core::testing::{text, ScriptedProvider};
+    use aidaemon_core::testing::{ScriptedProvider, text};
     use async_trait::async_trait;
 
     use super::*;

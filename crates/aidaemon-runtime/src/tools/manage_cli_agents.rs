@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::info;
 
 use crate::tools::cli_agent::CliAgentTool;
 use crate::tools::traits::{
-    semantics_for_exact_read_actions, DynamicCliAgentStore, OwnerApprovalNeed, Tool,
-    ToolCallContext, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    DynamicCliAgentStore, OwnerApprovalNeed, Tool, ToolCallContext, ToolCallSemantics,
+    ToolCapabilities, ToolMutationEffects, semantics_for_exact_read_actions,
 };
 
 pub struct ManageCliAgentsTool {
@@ -73,11 +73,12 @@ impl ManageCliAgentsTool {
         }
         let mut effects = CallEffects::unknown();
         if args.action == "add"
-            && let Some(command) = args.command.filter(|command| !command.is_empty()) {
-                effects
-                    .keys
-                    .push(EffectKey::named(EffectClass::Process, &command));
-            }
+            && let Some(command) = args.command.filter(|command| !command.is_empty())
+        {
+            effects
+                .keys
+                .push(EffectKey::named(EffectClass::Process, &command));
+        }
         effects
     }
 
@@ -382,9 +383,11 @@ mod tests {
         let OwnerApprovalNeed::Ask(first) = ManageCliAgentsTool::owner_approval(&args) else {
             panic!("an add must ask");
         };
-        assert!(first
-            .summary
-            .starts_with("Add CLI agent 'synthetic' (synthetic-cli --quiet)"));
+        assert!(
+            first
+                .summary
+                .starts_with("Add CLI agent 'synthetic' (synthetic-cli --quiet)")
+        );
         assert_eq!(first.risk, aidaemon_core::ApprovalRisk::High);
         let mut changed = args.clone();
         changed["args"] = json!(["--loud"]);

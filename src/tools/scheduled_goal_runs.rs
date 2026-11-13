@@ -14,8 +14,8 @@ mod tests {
     use crate::traits::ToolResultPresentation;
     use crate::traits::ToolSemantics;
     use crate::traits::{Goal, GoalSchedule, Task};
-    use serde_json::json;
     use serde_json::Value;
+    use serde_json::json;
     use std::sync::Arc;
 
     async fn setup_state() -> Arc<dyn StateStore> {
@@ -46,9 +46,10 @@ mod tests {
         assert!(!required_values.contains(&"goal_id"));
         assert!(schema["parameters"]["properties"]["include_diagnostics"].is_object());
         assert!(tool.validate_arguments(r#"{"action":"overview"}"#).is_ok());
-        assert!(tool
-            .validate_arguments(r#"{"action":"run_history"}"#)
-            .is_err());
+        assert!(
+            tool.validate_arguments(r#"{"action":"run_history"}"#)
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -127,12 +128,16 @@ mod tests {
             .iter()
             .find(|observation| observation.subject.value == objective_id)
             .expect("exact objective receipt assertion");
-        assert!(observation
-            .facets
-            .contains(&crate::traits::ToolSemanticFacet::Schedule));
-        assert!(observation
-            .facets
-            .contains(&crate::traits::ToolSemanticFacet::Control));
+        assert!(
+            observation
+                .facets
+                .contains(&crate::traits::ToolSemanticFacet::Schedule)
+        );
+        assert!(
+            observation
+                .facets
+                .contains(&crate::traits::ToolSemanticFacet::Control)
+        );
         let collection = outcome
             .metadata
             .collection_observations
@@ -147,10 +152,12 @@ mod tests {
             collection.completeness,
             crate::traits::ToolCollectionCompleteness::Complete
         );
-        assert!(collection
-            .members
-            .iter()
-            .any(|member| member.value == objective_id));
+        assert!(
+            collection
+                .members
+                .iter()
+                .any(|member| member.value == objective_id)
+        );
         assert!(!output.contains(&goal_id));
         assert!(!output.contains(&schedule_id));
         assert!(!output.contains(&task_id));
@@ -281,10 +288,11 @@ mod tests {
         );
         assert_eq!(tool.resolve_goal_id(&goal.id[..8]).await.unwrap(), goal.id);
         assert!(tool.resolve_goal_id("blog").await.is_err());
-        assert!(tool
-            .resolve_goal_id("no such objective anywhere")
-            .await
-            .is_err());
+        assert!(
+            tool.resolve_goal_id("no such objective anywhere")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -684,12 +692,16 @@ mod tests {
         }
 
         let updated = state.get_goal(&goal.id).await.unwrap().unwrap();
-        assert!(updated
-            .description
-            .contains("Use one current primary source and write a human-useful insight."));
-        assert!(!updated
-            .description
-            .contains("Search a current authoritative source before drafting."));
+        assert!(
+            updated
+                .description
+                .contains("Use one current primary source and write a human-useful insight.")
+        );
+        assert!(
+            !updated
+                .description
+                .contains("Search a current authoritative source before drafting.")
+        );
         assert_eq!(
             updated
                 .description
@@ -710,11 +722,13 @@ mod tests {
             "latest_revision_wins"
         );
         assert!(state.get_tasks_for_goal(&goal.id).await.unwrap().is_empty());
-        assert!(state
-            .get_current_goal_run(&goal.id)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            state
+                .get_current_goal_run(&goal.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             state.get_schedules_for_goal(&goal.id).await.unwrap()[0].id,
             schedule.id
@@ -778,12 +792,14 @@ mod tests {
         let state = setup_state().await;
         let tool = ScheduledGoalRunsTool::new(state.clone());
 
-        assert!(tool
-            .validate_arguments(r#"{"action":"run_history"}"#)
-            .is_err());
-        assert!(tool
-            .validate_arguments(r#"{"action":"run_history","goal_id":"goal-synthetic"}"#)
-            .is_ok());
+        assert!(
+            tool.validate_arguments(r#"{"action":"run_history"}"#)
+                .is_err()
+        );
+        assert!(
+            tool.validate_arguments(r#"{"action":"run_history","goal_id":"goal-synthetic"}"#)
+                .is_ok()
+        );
 
         let goal = Goal::new_continuous(
             "Post daily optimized tweets",

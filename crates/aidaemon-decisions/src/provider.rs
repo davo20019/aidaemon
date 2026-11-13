@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aidaemon_core::{Message, ModelRequest, Provider, RequestOptions, ResponseFormat, ToolChoice};
 use async_trait::async_trait;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::{
     Answer, AnswerValue, ConfidenceSource, Decider, DeciderCapabilities, DecisionError,
@@ -255,7 +255,7 @@ fn parse_reply(
 mod tests {
     use super::*;
     use crate::Question;
-    use aidaemon_core::testing::{text, ScriptedProvider};
+    use aidaemon_core::testing::{ScriptedProvider, text};
 
     fn request() -> DecisionRequest {
         DecisionRequest::new("Can we meet at noon on Friday? -- Alice Rivera")
@@ -298,10 +298,12 @@ mod tests {
         assert_eq!(response.answers["is_question"].p_yes(), Some(0.9));
         assert_eq!(response.answers["topic"].chosen(), Some("meeting"));
         assert_eq!(response.answers["urgency"].score(), Some(1.0));
-        assert!(response
-            .answers
-            .values()
-            .all(|a| a.confidence_source == ConfidenceSource::SelfReported));
+        assert!(
+            response
+                .answers
+                .values()
+                .all(|a| a.confidence_source == ConfidenceSource::SelfReported)
+        );
         assert_eq!(response.usage.input_tokens, 100);
 
         let requests = provider.requests();

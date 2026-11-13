@@ -178,9 +178,10 @@ impl aidaemon_core::FailoverPolicy for DaemonRecovery {
             }
         }
         if matches!(error, aidaemon_core::ProviderError::QuotaExhausted { .. })
-            && let Ok(mut quota) = self.quota.lock() {
-                quota.get_or_insert_with(|| error.clone());
-            }
+            && let Ok(mut quota) = self.quota.lock()
+        {
+            quota.get_or_insert_with(|| error.clone());
+        }
         // Too long for this model's window: retrying cannot help. Record
         // the window so the caller shrinks the request.
         if let aidaemon_core::ProviderError::ContextOverflow { limit, .. } = error {
@@ -202,15 +203,17 @@ impl aidaemon_core::FailoverPolicy for DaemonRecovery {
                     affordable_tokens: Some(affordable),
                     ..
                 } = error
-                    && *affordable >= MIN_USEFUL_TOKENS && request.max_output_tokens.is_none() {
-                        let mut capped = request.clone();
-                        capped.max_output_tokens =
-                            Some(affordable.saturating_sub(100).max(MIN_USEFUL_TOKENS) as u32);
-                        return RetryWith {
-                            delay: Duration::ZERO,
-                            request: Box::new(capped),
-                        };
-                    }
+                    && *affordable >= MIN_USEFUL_TOKENS
+                    && request.max_output_tokens.is_none()
+                {
+                    let mut capped = request.clone();
+                    capped.max_output_tokens =
+                        Some(affordable.saturating_sub(100).max(MIN_USEFUL_TOKENS) as u32);
+                    return RetryWith {
+                        delay: Duration::ZERO,
+                        request: Box::new(capped),
+                    };
+                }
                 if let Ok(mut cache) = self.billing_failed_models.try_write() {
                     cache.insert(model.to_string(), Instant::now());
                     cache.retain(|_, at| at.elapsed() < BILLING_FAIL_CACHE_TTL);
@@ -377,10 +380,12 @@ pub async fn call_llm_with_recovery(
 ) -> anyhow::Result<aidaemon_events::provider::ProviderResponse> {
     use aidaemon_core::{Failover, FailoverStep};
 
-    let mut steps = vec![FailoverStep::from_arc(provider.clone())
-        .model(model)
-        .deadline(first_attempt_deadline)
-        .attempts(MAX_STEP_ATTEMPTS)];
+    let mut steps = vec![
+        FailoverStep::from_arc(provider.clone())
+            .model(model)
+            .deadline(first_attempt_deadline)
+            .attempts(MAX_STEP_ATTEMPTS),
+    ];
     if pin_model.is_none() {
         for fallback in fallback_models(host, model, router.as_ref()).await {
             steps.push(

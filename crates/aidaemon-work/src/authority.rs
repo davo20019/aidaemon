@@ -1113,10 +1113,12 @@ mod tests {
         assert_eq!(grant.decision_cycle_id, base_cycle.id);
         assert!(grant.counts_toward_cycle_budget);
         assert_eq!(grant.action_digest.len(), 64);
-        assert!(grant
-            .action_digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit()));
+        assert!(
+            grant
+                .action_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
     }
 
     #[test]
@@ -1554,11 +1556,9 @@ mod tests {
         let semantics = ToolCallSemantics {
             effect: ToolCallEffect::Observation,
             mutation_effects: ToolMutationEffects::REMOTE_MUTATION,
-            target_hints: vec![ToolTargetHint::new(
-                ToolTargetHintKind::Url,
-                "https://api.x.com/2/tweets",
-            )
-            .unwrap()],
+            target_hints: vec![
+                ToolTargetHint::new(ToolTargetHintKind::Url, "https://api.x.com/2/tweets").unwrap(),
+            ],
             ..ToolCallSemantics::default()
         };
         let grant = decide(

@@ -7,7 +7,7 @@
 //! cargo run -p aidaemon-sdk --example approvals --features testing
 use aidaemon_sdk::policies::ApprovalMode;
 use aidaemon_sdk::prelude::*;
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
 use serde_json::json;
 
 /// Refund part or all of an order. Moves money (simulated here).

@@ -6,5 +6,5 @@ mod run;
 mod shortcuts;
 mod types;
 
-pub use run::{run_bootstrap, GateFilterStage};
+pub use run::{GateFilterStage, run_bootstrap};
 pub use types::{BootstrapCtx, BootstrapData, BootstrapOutcome};

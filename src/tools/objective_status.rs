@@ -8,9 +8,9 @@ pub(crate) use aidaemon_work::tools::objective_status::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{setup_test_agent, MockProvider};
-    use crate::traits::store_prelude::*;
+    use crate::testing::{MockProvider, setup_test_agent};
     use crate::traits::ToolCalls as _;
+    use crate::traits::store_prelude::*;
     use crate::traits::{Goal, GoalSchedule};
 
     #[tokio::test]
@@ -39,14 +39,16 @@ mod tests {
             .start_goal_run(&goal.id, "scheduled", Some(&schedule.id), None)
             .await
             .unwrap();
-        assert!(state
-            .finish_goal_run(
-                &run.id,
-                "completed",
-                Some("Published and verified the daily post.")
-            )
-            .await
-            .unwrap());
+        assert!(
+            state
+                .finish_goal_run(
+                    &run.id,
+                    "completed",
+                    Some("Published and verified the daily post.")
+                )
+                .await
+                .unwrap()
+        );
 
         let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
         let runs = state.get_goal_runs(&goal.id).await.unwrap();
@@ -121,10 +123,12 @@ mod tests {
                 .start_goal_run(&goal.id, "scheduled", Some(&schedule.id), None)
                 .await
                 .unwrap();
-            assert!(state
-                .finish_goal_run(&run.id, "failed", Some("synthetic failure"))
-                .await
-                .unwrap());
+            assert!(
+                state
+                    .finish_goal_run(&run.id, "failed", Some("synthetic failure"))
+                    .await
+                    .unwrap()
+            );
         }
         let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
         let runs = state.get_goal_runs(&goal.id).await.unwrap();

@@ -70,14 +70,16 @@ pub async fn build_stores(
     let own_memory = config.memory.backend == crate::config::MemoryBackend::Daemon;
     if own_memory {
         if let Ok(count) = state.memory().backfill_episode_embeddings().await
-            && count > 0 {
-                info!(count, "Backfilled missing episode embeddings");
-            }
+            && count > 0
+        {
+            info!(count, "Backfilled missing episode embeddings");
+        }
 
         if let Ok(count) = state.memory().backfill_fact_embeddings().await
-            && count > 0 {
-                info!(count, "Backfilled missing fact embeddings");
-            }
+            && count > 0
+        {
+            info!(count, "Backfilled missing fact embeddings");
+        }
     }
 
     let event_store = Arc::new(

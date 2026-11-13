@@ -13,7 +13,7 @@ use aidaemon_core::StoreError;
 use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
 
-use crate::{Error, SqliteStore, NOW};
+use crate::{Error, NOW, SqliteStore};
 
 /// Open approvals kept in the `channel_approvals` table of a [`SqliteStore`]
 /// database (created by migration 2). Cheap to clone.

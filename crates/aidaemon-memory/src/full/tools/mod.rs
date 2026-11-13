@@ -27,9 +27,9 @@ mod manage_people;
 mod remember_fact;
 mod share_memory;
 
-pub use manage_memories::{ManageMemoriesTool, MEMORY_ACTIONS};
+pub use manage_memories::{MEMORY_ACTIONS, ManageMemoriesTool};
 pub use manage_people::ManagePeopleTool;
-pub use remember_fact::{call_deletes_facts, RememberFactTool};
+pub use remember_fact::{RememberFactTool, call_deletes_facts};
 pub use share_memory::ShareMemoryTool;
 
 /// The names of the full memory system's tools.
@@ -249,8 +249,8 @@ fn manage_memories_output_is_report(result_text: &str, tool_arguments: Option<&s
 pub(crate) mod test_support {
     use std::sync::Arc;
 
-    use aidaemon_tools::semantics::ToolCallContext;
     use aidaemon_tools::OutcomeTool;
+    use aidaemon_tools::semantics::ToolCallContext;
     use async_trait::async_trait;
 
     use crate::sqlite::SqliteMemory;

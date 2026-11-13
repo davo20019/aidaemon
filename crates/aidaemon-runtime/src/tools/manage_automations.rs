@@ -18,7 +18,7 @@ use aidaemon_work::automations::{self, AutomationKind, ScheduleSpec};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::tools::manage_memories::ManageMemoriesTool;
 use crate::tools::traits::{
@@ -296,7 +296,7 @@ impl ManageAutomationsTool {
             (None, None) => {
                 return Ok(Err(
                     "Say which automation: its name, or its ref from the list.".to_string(),
-                ))
+                ));
             }
         };
         let label = name.or(id).unwrap_or_default();

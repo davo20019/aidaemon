@@ -7,7 +7,7 @@ mod tests {
 
     #[tokio::test]
     async fn delivered_mandate_ask_persists_typed_owner_input_context() {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::{DialogueStateStore, QuestionKind};
 
         let harness = setup_test_agent(MockProvider::new())
@@ -64,7 +64,7 @@ mod tests {
     #[tokio::test]
     async fn parent_text_result_delivery_records_parent_visible_text() {
         use super::super::parent_delivery::ParentDeliveryKind;
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
@@ -190,7 +190,7 @@ mod tests {
     async fn parent_text_result_does_not_record_on_dropped_hub() {
         use super::super::parent_delivery::ParentDeliveryKind;
         use crate::channels::{ChannelHub, SessionMap};
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
         use std::collections::HashMap;
         use std::sync::{Arc, Weak};

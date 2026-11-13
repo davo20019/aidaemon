@@ -1,7 +1,7 @@
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
@@ -1677,9 +1677,11 @@ mod tests {
         let error = service.create(request).await.unwrap_err();
 
         assert!(error.to_string().contains("omit mandate_id"));
-        assert!(error
-            .to_string()
-            .contains("no separate monitoring authorization is required"));
+        assert!(
+            error
+                .to_string()
+                .contains("no separate monitoring authorization is required")
+        );
     }
 
     #[tokio::test]

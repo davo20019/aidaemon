@@ -180,32 +180,33 @@ pub trait TurnNotes: TurnHost + crate::turn::turn_context::TurnHistory {
         }
 
         if let (Some(hub_weak), Some(surface_id)) = (hub, surface_id)
-            && let Some(hub_arc) = hub_weak.upgrade() {
-                match hub_arc
-                    .edit_text(parent_session_id, surface_id, trimmed)
-                    .await
-                {
-                    Ok(true) => {
-                        self.record_parent_visible_result_note(
-                            parent_session_id,
-                            kind.note_prefix(),
-                            trimmed,
-                        )
-                        .await?;
-                        return Ok(ParentDeliveryOutcome {
-                            sent: true,
-                            recorded: true,
-                        });
-                    }
-                    Ok(false) => {}
-                    Err(error) => warn!(
-                        session_id = %parent_session_id,
-                        message_id = %surface_id,
-                        %error,
-                        "Failed to replace parent progress surface; sending a new message"
-                    ),
+            && let Some(hub_arc) = hub_weak.upgrade()
+        {
+            match hub_arc
+                .edit_text(parent_session_id, surface_id, trimmed)
+                .await
+            {
+                Ok(true) => {
+                    self.record_parent_visible_result_note(
+                        parent_session_id,
+                        kind.note_prefix(),
+                        trimmed,
+                    )
+                    .await?;
+                    return Ok(ParentDeliveryOutcome {
+                        sent: true,
+                        recorded: true,
+                    });
                 }
+                Ok(false) => {}
+                Err(error) => warn!(
+                    session_id = %parent_session_id,
+                    message_id = %surface_id,
+                    %error,
+                    "Failed to replace parent progress surface; sending a new message"
+                ),
             }
+        }
 
         self.deliver_parent_text_result(hub, parent_session_id, trimmed, kind)
             .await

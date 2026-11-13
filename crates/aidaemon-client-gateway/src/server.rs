@@ -449,7 +449,7 @@ async fn http_events(
             loop {
                 match live.recv().await {
                     Ok(frame) if matches!(*frame, ServerFrame::Event { seq: Some(_), .. }) => {
-                        return
+                        return;
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => return,
@@ -485,7 +485,7 @@ async fn websocket(
         Some(token) => match principal(&gateway, Some(token)) {
             Some(principal) => Some(principal),
             None => {
-                return error_response(ErrorCode::Unauthorized, "A valid client token is required")
+                return error_response(ErrorCode::Unauthorized, "A valid client token is required");
             }
         },
         None => None,

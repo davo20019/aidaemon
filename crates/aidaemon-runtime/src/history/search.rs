@@ -144,7 +144,8 @@ pub async fn project_event(pool: &SqlitePool, event_id: i64) -> anyhow::Result<b
 
     // Assistant payloads predate explicit channel provenance. Resolve it from
     // the closest preceding canonical user event in the same session.
-    if role == "assistant" && (visibility.is_none() || channel_id.is_none())
+    if role == "assistant"
+        && (visibility.is_none() || channel_id.is_none())
         && let Some(origin) = sqlx::query(
             "SELECT data FROM events
              WHERE session_id = ? AND event_type = 'user_message' AND id <= ?
@@ -154,32 +155,32 @@ pub async fn project_event(pool: &SqlitePool, event_id: i64) -> anyhow::Result<b
         .bind(event_id)
         .fetch_optional(pool)
         .await?
-        {
-            let origin_raw: String = origin.get("data");
-            if let Ok(origin_data) = serde_json::from_str::<Value>(&origin_raw) {
-                channel_id = channel_id.or_else(|| {
-                    origin_data
-                        .get("channel_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .or_else(|| {
-                            aidaemon_events::session::derive_channel_id_from_session(&session_id)
-                        })
-                });
-                visibility = visibility.or_else(|| {
-                    origin_data
-                        .get("channel_visibility")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
-                user_role = user_role.or_else(|| {
-                    origin_data
-                        .get("user_role")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
-            }
+    {
+        let origin_raw: String = origin.get("data");
+        if let Ok(origin_data) = serde_json::from_str::<Value>(&origin_raw) {
+            channel_id = channel_id.or_else(|| {
+                origin_data
+                    .get("channel_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        aidaemon_events::session::derive_channel_id_from_session(&session_id)
+                    })
+            });
+            visibility = visibility.or_else(|| {
+                origin_data
+                    .get("channel_visibility")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+            user_role = user_role.or_else(|| {
+                origin_data
+                    .get("user_role")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
         }
+    }
 
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("DELETE FROM history_message_fts WHERE rowid = ?")
@@ -1283,17 +1284,21 @@ mod tests {
                 .unwrap(),
             Some(user)
         );
-        assert!(event_for_message_id(&pool, "slack:C2-user", &scope)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            event_for_message_id(&pool, "slack:C2-user", &scope)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let selected_turn = turn(&pool, "turn-1", &scope).await.unwrap();
         assert_eq!(selected_turn.len(), 2);
         assert_eq!(selected_turn[0].event_id, user);
         assert_eq!(selected_turn[1].event_id, assistant);
-        assert!(selected_turn
-            .iter()
-            .all(|message| message.session_id == "slack:C1"));
+        assert!(
+            selected_turn
+                .iter()
+                .all(|message| message.session_id == "slack:C1")
+        );
     }
 
     #[tokio::test]

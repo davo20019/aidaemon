@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use aidaemon_tools::duration_format::{compact_chrono_duration, ZeroUnitStyle};
+use aidaemon_tools::duration_format::{ZeroUnitStyle, compact_chrono_duration};
 use chrono::{DateTime, Utc};
 
 use crate::ports::{ChannelAgentRuntime, ChatWorkKind, ChatWorkView, RunningItem};
@@ -304,9 +304,10 @@ pub async fn stop_background_work(
     let mut stopped = Vec::new();
     for entry in &list.entries {
         if let Target::Work(key) = &entry.target
-            && agent.stop_chat_work(session_id, key).await {
-                stopped.push(entry.title.clone());
-            }
+            && agent.stop_chat_work(session_id, key).await
+        {
+            stopped.push(entry.title.clone());
+        }
     }
     stopped
 }

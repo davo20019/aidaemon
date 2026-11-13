@@ -6,18 +6,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use axuielement::AXUIElement;
 use axuielement::ax_action::AX_PRESS_ACTION;
 use axuielement::ax_attribute::attributes::{
     AX_DESCRIPTION_ATTRIBUTE, AX_ENABLED_ATTRIBUTE, AX_FOCUSED_ATTRIBUTE, AX_MAIN_ATTRIBUTE,
     AX_POSITION_ATTRIBUTE, AX_ROLE_ATTRIBUTE, AX_SIZE_ATTRIBUTE, AX_SUBROLE_ATTRIBUTE,
     AX_TITLE_ATTRIBUTE, AX_VALUE_ATTRIBUTE, AX_WINDOWS_ATTRIBUTE,
 };
-use axuielement::AXUIElement;
 use axuielement::{is_process_trusted, is_process_trusted_with_prompt};
 use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
-use xcap::image::imageops::FilterType;
-use xcap::image::RgbaImage;
 use xcap::Window;
+use xcap::image::RgbaImage;
+use xcap::image::imageops::FilterType;
 
 use crate::settings::ComputerUseConfig;
 
@@ -25,8 +25,8 @@ use super::cache::{SnapshotCache, SnapshotKey};
 use super::harness::{ComputerHarness, HarnessRequestContext};
 use super::policy::{is_prohibited_bundle, is_text_input_element};
 use super::types::{
-    is_browser_bundle, normalized_to_global_point, AppInfo, AppSnapshot, AxWalkLimits,
-    ElementBounds, IndexedElement, WindowFrame,
+    AppInfo, AppSnapshot, AxWalkLimits, ElementBounds, IndexedElement, WindowFrame,
+    is_browser_bundle, normalized_to_global_point,
 };
 
 const ACCESSIBILITY_HELP: &str = "Accessibility permission is required. \
@@ -270,7 +270,7 @@ impl ComputerHarness for MacOsHarness {
                     "click requires either element_index/element_title, or both x and y \
                      normalized coordinates (0-1000, read off the screenshot)"
                         .to_string(),
-                )
+                );
             }
         };
         let frame = window_frame(resolved.pid, &resolved.name)
@@ -819,10 +819,12 @@ fn collapse_passthrough(parent: &AXUIElement, children: Vec<AXUIElement>) -> Vec
     // collapsed, otherwise value-bearing groups exhaust the depth budget before
     // the real controls are reached.
     let title = structural_label(parent);
-    if title.is_empty() && role.contains("Group")
-        && let Ok(grandchildren) = children[0].children() {
-            return collapse_passthrough(&children[0], grandchildren);
-        }
+    if title.is_empty()
+        && role.contains("Group")
+        && let Ok(grandchildren) = children[0].children()
+    {
+        return collapse_passthrough(&children[0], grandchildren);
+    }
     children
 }
 
@@ -868,9 +870,10 @@ fn structural_label(element: &AXUIElement) -> String {
 fn structural_label_opt(element: &AXUIElement) -> Option<String> {
     for attr in [AX_TITLE_ATTRIBUTE, AX_DESCRIPTION_ATTRIBUTE] {
         if let Some(value) = optional_string_attr(element, attr)
-            && !value.is_empty() {
-                return Some(value);
-            }
+            && !value.is_empty()
+        {
+            return Some(value);
+        }
     }
     None
 }

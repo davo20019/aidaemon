@@ -1409,14 +1409,14 @@ impl RunAggregate {
                 .filter_map(|obligation| obligation.receipt.as_ref())
                 .filter_map(|predicate| predicate.max_invocations)
                 .min()
-            {
-                // The producer computed its operation ceiling from every
-                // statically compatible predicate. Once a stricter sibling is
-                // closed, its smaller ceiling no longer governs the remaining
-                // proof. Re-derive the ceiling from open obligations.
-                effective.max_invocations = active_ceiling.max(1);
-                effective.max_attempts = effective.max_attempts.max(effective.max_invocations);
-            }
+        {
+            // The producer computed its operation ceiling from every
+            // statically compatible predicate. Once a stricter sibling is
+            // closed, its smaller ceiling no longer governs the remaining
+            // proof. Re-derive the ceiling from open obligations.
+            effective.max_invocations = active_ceiling.max(1);
+            effective.max_attempts = effective.max_attempts.max(effective.max_invocations);
+        }
         effective
     }
 
@@ -1547,9 +1547,10 @@ impl RunAggregate {
             operation.evidence_capabilities = receipt.semantics.evidence.clone();
         }
         if operation.evidence_capabilities.is_empty()
-            && let Some(denial) = receipt.access_denial.as_ref() {
-                operation.evidence_capabilities = denial.proposed_evidence.clone();
-            }
+            && let Some(denial) = receipt.access_denial.as_ref()
+        {
+            operation.evidence_capabilities = denial.proposed_evidence.clone();
+        }
         if operation.targets.is_empty() {
             operation.targets = receipt_targets(receipt);
         }
@@ -3779,9 +3780,11 @@ mod tests {
         }
 
         let aggregate = RunAggregate::replay("task-1", &events);
-        assert!(aggregate
-            .invariant_violations
-            .contains(&"dispatched_operation_outside_allowed_tool_set".to_string()));
+        assert!(
+            aggregate
+                .invariant_violations
+                .contains(&"dispatched_operation_outside_allowed_tool_set".to_string())
+        );
         assert!(aggregate.projected_success_response().is_none());
         assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Failed);
     }
@@ -4012,12 +4015,16 @@ mod tests {
             event.id = index as i64 + 1;
         }
         let aggregate = RunAggregate::replay("task-1", &events);
-        assert!(aggregate
-            .obligations
-            .contains_key("task:task-1/obligation:mutation:local_workspace_write"));
-        assert!(aggregate
-            .obligations
-            .contains_key("task:task-1/obligation:deliver:response"));
+        assert!(
+            aggregate
+                .obligations
+                .contains_key("task:task-1/obligation:mutation:local_workspace_write")
+        );
+        assert!(
+            aggregate
+                .obligations
+                .contains_key("task:task-1/obligation:deliver:response")
+        );
         assert!(aggregate.terminal_policy_denial());
         let decision = aggregate.closeout(|_| true);
         assert_eq!(
@@ -5127,9 +5134,11 @@ mod tests {
         let aggregate = RunAggregate::replay("task-1", &events);
         assert!(aggregate.executor_expectations_present);
         assert!(!aggregate.contract_present);
-        assert!(!aggregate
-            .obligations
-            .contains_key("task:task-1/obligation:checklist:3"));
+        assert!(
+            !aggregate
+                .obligations
+                .contains_key("task:task-1/obligation:checklist:3")
+        );
         assert_eq!(
             aggregate.obligations["task:task-1/obligation:checklist:0"].state,
             RunObligationState::Satisfied
@@ -5407,10 +5416,12 @@ mod tests {
         ];
         renumber(&mut events);
         let aggregate = RunAggregate::replay("task-1", &events);
-        assert!(aggregate
-            .operations
-            .values()
-            .all(|op| op.outcome == Some(ToolOutcomeStatus::Succeeded)));
+        assert!(
+            aggregate
+                .operations
+                .values()
+                .all(|op| op.outcome == Some(ToolOutcomeStatus::Succeeded))
+        );
         assert!(!aggregate.evidence_closed());
         assert_ne!(
             aggregate.terminal_decision(),
@@ -5581,12 +5592,16 @@ mod tests {
             event.id = index as i64 + 1;
         }
         let aggregate = RunAggregate::replay("task-1", &events);
-        assert!(aggregate
-            .obligations
-            .contains_key("task:task-1/obligation:checklist:0"));
-        assert!(aggregate
-            .obligations
-            .contains_key("task:task-1/obligation:evidence:0"));
+        assert!(
+            aggregate
+                .obligations
+                .contains_key("task:task-1/obligation:checklist:0")
+        );
+        assert!(
+            aggregate
+                .obligations
+                .contains_key("task:task-1/obligation:evidence:0")
+        );
     }
 
     #[test]
@@ -5807,11 +5822,10 @@ mod tests {
                 completeness: crate::traits::ToolCollectionCompleteness::Partial,
                 returned_count: 1,
                 total_count: Some(2),
-                members: vec![ToolTargetHint::new(
-                    ToolTargetHintKind::ResourceId,
-                    "objective:goal-other",
-                )
-                .unwrap()],
+                members: vec![
+                    ToolTargetHint::new(ToolTargetHintKind::ResourceId, "objective:goal-other")
+                        .unwrap(),
+                ],
             }],
         );
         let mut partial_events = vec![declaration.clone(), partial];

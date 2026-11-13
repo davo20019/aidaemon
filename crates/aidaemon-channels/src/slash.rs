@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use aidaemon_events::conversation::{ConversationSummary, Message};
 use aidaemon_events::provider::TokenUsageRecord;
-use aidaemon_tools::duration_format::{compact_chrono_duration, ZeroUnitStyle};
+use aidaemon_tools::duration_format::{ZeroUnitStyle, compact_chrono_duration};
 use aidaemon_tools::semantics::UserRole;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

@@ -14,9 +14,9 @@ use tracing::info;
 
 use crate::consolidation::Consolidator;
 use crate::history::EventHistory;
+use crate::llm::SharedLlmRuntime;
 use crate::llm::gateway::SideCallGateway;
 use crate::llm::side_calls::SideCall;
-use crate::llm::SharedLlmRuntime;
 use crate::stores::StateStore;
 
 /// The daemon's side of the memory jobs.

@@ -2,12 +2,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
 use aidaemon_core::{
     Agent, Extensions, Tool, ToolAnnotations, ToolContext, ToolOutput, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A synthetic application value carried to tools.
 #[derive(Debug, Clone, PartialEq)]
@@ -81,8 +81,10 @@ async fn extensions_reach_every_call() {
         ]
     );
     // A context built outside the loop starts empty.
-    assert!(ToolContext::new("s", "c")
-        .extensions
-        .get::<Workspace>()
-        .is_none());
+    assert!(
+        ToolContext::new("s", "c")
+            .extensions
+            .get::<Workspace>()
+            .is_none()
+    );
 }

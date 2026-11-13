@@ -7,14 +7,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aidaemon_channel_telegram::TelegramChannel;
-use aidaemon_channels::conformance::{check_channel, ChannelHarness};
+use aidaemon_channels::conformance::{ChannelHarness, check_channel};
 use aidaemon_channels::{ApprovalPrompt, Attachment, Conversation, ConversationKind};
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
 use axum::response::IntoResponse;
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const TOKEN: &str = "000000:SYNTHETIC";
 const BOT_USERNAME: &str = "synthetic_helper_bot";

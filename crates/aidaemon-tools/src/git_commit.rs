@@ -1,10 +1,10 @@
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::OutcomeTool as Tool;
 use crate::semantics::{
     ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole, ToolTargetHintKind,
 };
-use crate::OutcomeTool as Tool;
 
 use super::fs_utils;
 

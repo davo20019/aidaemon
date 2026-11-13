@@ -23,7 +23,7 @@ mod write;
 
 pub use edit::EditFile;
 pub use guard::ProtectedPathGuard;
-pub use read::{render_read_file_output, render_read_file_output_within, ReadFile, MAX_READ_CHARS};
+pub use read::{MAX_READ_CHARS, ReadFile, render_read_file_output, render_read_file_output_within};
 pub use workspace_backend::WorkspaceBackend;
 pub use write::WriteFile;
 

@@ -113,9 +113,11 @@ pub(crate) async fn current_version(pool: &SqlitePool) -> Result<i64> {
 
 /// Bring the schema up to date. Idempotent and refuses newer databases.
 pub(crate) async fn run(pool: &SqlitePool) -> Result<()> {
-    debug_assert!(MIGRATIONS
-        .windows(2)
-        .all(|w| w[1].version == w[0].version + 1));
+    debug_assert!(
+        MIGRATIONS
+            .windows(2)
+            .all(|w| w[1].version == w[0].version + 1)
+    );
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS memory_schema_migrations (

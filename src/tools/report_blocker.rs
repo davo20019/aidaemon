@@ -8,10 +8,10 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::store_prelude::*;
     use crate::traits::StateStore;
     use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
+    use crate::traits::store_prelude::*;
     use crate::traits::{Goal, Task};
     use serde_json::json;
     use std::sync::Arc;
@@ -81,16 +81,18 @@ mod tests {
 
         let task = state.get_task(&task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "blocked");
-        assert!(task
-            .blocker
-            .as_deref()
-            .unwrap()
-            .contains("Missing API credentials"));
-        assert!(task
-            .context
-            .as_deref()
-            .unwrap()
-            .contains("\"executor_result\""));
+        assert!(
+            task.blocker
+                .as_deref()
+                .unwrap()
+                .contains("Missing API credentials")
+        );
+        assert!(
+            task.context
+                .as_deref()
+                .unwrap()
+                .contains("\"executor_result\"")
+        );
     }
 
     /// A recorded blocker ends the executor's run as partial work, from the
@@ -132,9 +134,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(rejected
-            .output
-            .starts_with("Error: blocker report rejected"));
+        assert!(
+            rejected
+                .output
+                .starts_with("Error: blocker report rejected")
+        );
         assert!(rejected.finish.is_none());
     }
 
@@ -164,9 +168,11 @@ mod tests {
         assert_eq!(entry.session_id, "test-session");
         assert_eq!(entry.notification_type, "escalation");
         assert!(entry.message.contains("Docker daemon is not reachable"));
-        assert!(entry
-            .message
-            .contains("Start Docker, then ask me to retry."));
+        assert!(
+            entry
+                .message
+                .contains("Start Docker, then ask me to retry.")
+        );
         assert!(entry.message.starts_with("⚠️ **Action needed**"));
         assert!(entry.message.contains("**Blocked:**"));
         assert!(entry.message.contains("**Needed:**"));
@@ -246,11 +252,13 @@ mod tests {
             state.get_task(&task_id).await.unwrap().unwrap().status,
             original_status
         );
-        assert!(state
-            .get_pending_notifications(10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            state
+                .get_pending_notifications(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -285,11 +293,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(state
-            .get_pending_notifications(10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            state
+                .get_pending_notifications(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -332,25 +342,30 @@ mod tests {
             .unwrap();
 
         assert!(result.contains("Executor outcome: partial_done_blocked"));
-        assert!(result.contains("Completed work so far: Set up project structure and dependencies"));
+        assert!(
+            result.contains("Completed work so far: Set up project structure and dependencies")
+        );
 
         let task = state.get_task(&task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "blocked");
-        assert!(task
-            .blocker
-            .as_deref()
-            .unwrap()
-            .contains("Need clarification"));
-        assert!(task
-            .blocker
-            .as_deref()
-            .unwrap()
-            .contains("Possible resolutions"));
-        assert!(task
-            .context
-            .as_deref()
-            .unwrap()
-            .contains("\"partial_done_blocked\""));
+        assert!(
+            task.blocker
+                .as_deref()
+                .unwrap()
+                .contains("Need clarification")
+        );
+        assert!(
+            task.blocker
+                .as_deref()
+                .unwrap()
+                .contains("Possible resolutions")
+        );
+        assert!(
+            task.context
+                .as_deref()
+                .unwrap()
+                .contains("\"partial_done_blocked\"")
+        );
     }
 
     #[tokio::test]
@@ -379,11 +394,12 @@ mod tests {
 
         assert!(result.contains("Executor outcome: needs_approval"));
         let task = state.get_task(&task_id).await.unwrap().unwrap();
-        assert!(task
-            .context
-            .as_deref()
-            .unwrap()
-            .contains("\"needs_approval\""));
+        assert!(
+            task.context
+                .as_deref()
+                .unwrap()
+                .contains("\"needs_approval\"")
+        );
     }
 
     #[tokio::test]
@@ -404,11 +420,13 @@ mod tests {
             mission: "Build and publish the synthetic site.".to_string(),
             task_description: "Repair the failed build and continue the workflow.".to_string(),
             target_scope: crate::agent::TargetScope {
-                allowed_targets: vec![crate::traits::ToolTargetHint::new(
-                    crate::traits::ToolTargetHintKind::ProjectScope,
-                    project.path().to_string_lossy(),
-                )
-                .unwrap()],
+                allowed_targets: vec![
+                    crate::traits::ToolTargetHint::new(
+                        crate::traits::ToolTargetHintKind::ProjectScope,
+                        project.path().to_string_lossy(),
+                    )
+                    .unwrap(),
+                ],
                 hard_fail_outside_scope: true,
             },
             expected_targets: Vec::new(),

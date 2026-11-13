@@ -21,7 +21,7 @@ use aidaemon_core as sdk;
 use aidaemon_events::conversation::Message;
 use aidaemon_events::stores::MessageStore;
 use aidaemon_policies::line_ownership::{
-    diff_lines, lines as split_lines, Claim, Contested, OwnerId, Ownership, NOBODY,
+    Claim, Contested, NOBODY, OwnerId, Ownership, diff_lines, lines as split_lines,
 };
 use aidaemon_tools::backend::SharedExecutionBackend;
 use aidaemon_tools::semantics::{FileFence, FileWriteGuard};
@@ -1804,9 +1804,10 @@ pub async fn canonical_path(backend: &SharedExecutionBackend, raw: &str) -> anyh
         return Ok(real.to_string_lossy().into_owned());
     }
     if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
-        && let Ok(real) = tokio::fs::canonicalize(parent).await {
-            return Ok(real.join(name).to_string_lossy().into_owned());
-        }
+        && let Ok(real) = tokio::fs::canonicalize(parent).await
+    {
+        return Ok(real.join(name).to_string_lossy().into_owned());
+    }
     Ok(resolved.as_str().to_string())
 }
 
@@ -2640,9 +2641,10 @@ mod tests {
         else {
             panic!("the top-level agent's deliverable is sent by its caller");
         };
-        assert!(tree
-            .claim_delivery("telegram:synthetic", &page.subject())
-            .is_err());
+        assert!(
+            tree.claim_delivery("telegram:synthetic", &page.subject())
+                .is_err()
+        );
         // A run outside any ledger records nothing; one with no deliverable
         // says it sent nothing.
         assert_eq!(delivery_lines(None), None);
@@ -2676,9 +2678,10 @@ mod tests {
             "you"
         );
         // Another page is its own artifact.
-        assert!(tree
-            .claim_delivery("telegram:synthetic", "screenshot:wp.ddev.site")
-            .is_ok());
+        assert!(
+            tree.claim_delivery("telegram:synthetic", "screenshot:wp.ddev.site")
+                .is_ok()
+        );
         // A released claim (its delivery failed) frees the page; only its
         // holder can release it.
         tree.release_delivery("telegram:synthetic", page);
@@ -2724,11 +2727,12 @@ mod tests {
         tree.shell_began("specialist:code:a", "call-a");
         tree.finish_member("specialist:code:a");
         tree.shell_began("specialist:code:b", "call-b");
-        assert!(tree
-            .ledger()
-            .open_shells
-            .iter()
-            .all(|open| !open.overlapped));
+        assert!(
+            tree.ledger()
+                .open_shells
+                .iter()
+                .all(|open| !open.overlapped)
+        );
     }
 
     #[test]

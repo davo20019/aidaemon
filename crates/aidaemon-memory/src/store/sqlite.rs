@@ -11,15 +11,15 @@ use sqlx::sqlite::{
 };
 use sqlx::{Row, Sqlite, Transaction};
 
-use super::{migrations, related_fact_scores, MemoryStore};
+use super::{MemoryStore, migrations, related_fact_scores};
 use crate::embed::{decode_embedding, encode_embedding};
 use crate::error::{MemoryError, Result};
 use crate::scoring::{term_overlap, tokens};
 use crate::types::{
-    episode_search_text, fact_search_text, new_id, normalize_category, normalize_key, parse_ts,
-    same_value, ts, DecayReport, Episode, EpisodeRecord, Fact, FactAccess, FactRecord, MemoryStats,
-    NewEpisode, NewFact, Provenance, RecordKind, RetentionConfig, StaleEmbedding, StoredEmbedding,
-    UpsertOutcome,
+    DecayReport, Episode, EpisodeRecord, Fact, FactAccess, FactRecord, MemoryStats, NewEpisode,
+    NewFact, Provenance, RecordKind, RetentionConfig, StaleEmbedding, StoredEmbedding,
+    UpsertOutcome, episode_search_text, fact_search_text, new_id, normalize_category,
+    normalize_key, parse_ts, same_value, ts,
 };
 
 const FACT_COLUMNS: &str = "id, scope, category, key, value, confidence, source_run_id, \

@@ -450,10 +450,12 @@ mod tests {
         registry.set_effective_daily_budget("goal-3", 123_456).await;
         registry.remove("goal-3").await;
         assert!(registry.child_token("goal-3").await.is_none());
-        assert!(registry
-            .get_effective_daily_budget("goal-3")
-            .await
-            .is_none());
+        assert!(
+            registry
+                .get_effective_daily_budget("goal-3")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -508,10 +510,12 @@ mod tests {
     #[tokio::test]
     async fn test_runtime_daily_budget_override_round_trips() {
         let registry = GoalTokenRegistry::new();
-        assert!(registry
-            .get_effective_daily_budget("goal-4")
-            .await
-            .is_none());
+        assert!(
+            registry
+                .get_effective_daily_budget("goal-4")
+                .await
+                .is_none()
+        );
 
         registry.set_effective_daily_budget("goal-4", 400_000).await;
 

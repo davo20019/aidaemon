@@ -9,8 +9,8 @@
 //! loop for more work only when a tool admissible under Authority could
 //! satisfy them. Nothing here reads request wording.
 
-use aidaemon_events::traits::ToolSemanticScope;
 use aidaemon_events::RunObligation;
+use aidaemon_events::traits::ToolSemanticScope;
 
 /// Static authority view used to test whether a tool may still be invoked.
 pub struct ClosingAuthority<'a> {
@@ -89,9 +89,10 @@ impl<'a> ClosingAuthority<'a> {
         // same rule as an exact write path beating a directory root).
         if !explicitly_allowed
             && let Some(scope) = crate::turn::tool_facts::fallback_tool_semantic_scope(tool)
-                && self.forbidden_tool_scopes.contains(&scope) {
-                    return Some("forbidden_scope");
-                }
+            && self.forbidden_tool_scopes.contains(&scope)
+        {
+            return Some("forbidden_scope");
+        }
         if self.forbids_mutation && read_only == Some(false) {
             return Some("forbids_mutation");
         }
@@ -109,12 +110,13 @@ pub fn obligation_admissible(
 ) -> bool {
     let admits = |tool: &str| authority.admits_tool(tool, read_only(tool));
     if let Some(predicate) = obligation.receipt.as_ref()
-        && !predicate.tool_names.is_empty() {
-            return predicate
-                .tool_names
-                .iter()
-                .any(|tool| visible_tools.contains(&tool.as_str()) && admits(tool));
-        }
+        && !predicate.tool_names.is_empty()
+    {
+        return predicate
+            .tool_names
+            .iter()
+            .any(|tool| visible_tools.contains(&tool.as_str()) && admits(tool));
+    }
     if let Some(requirement) = obligation.evidence_requirement.as_ref() {
         // Candidate routing is ranked and capped for model guidance. Apply
         // authority first so unavailable candidates cannot crowd out an

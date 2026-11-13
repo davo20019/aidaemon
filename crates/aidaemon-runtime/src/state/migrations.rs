@@ -2,7 +2,7 @@ use sqlx::Row;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 
-use aidaemon_work::schema::{table_exists_in_pool, LEGACY_GOALS_IMPORTED_VERSION};
+use aidaemon_work::schema::{LEGACY_GOALS_IMPORTED_VERSION, table_exists_in_pool};
 
 async fn migrate_legacy_messages_to_events(pool: &SqlitePool) -> anyhow::Result<()> {
     let has_messages = sqlx::query_scalar::<_, i64>(
@@ -756,9 +756,11 @@ mod oauth_identity_upgrade_tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-        assert!(columns
-            .iter()
-            .any(|row| row.get::<String, _>("name") == "account_id"));
+        assert!(
+            columns
+                .iter()
+                .any(|row| row.get::<String, _>("name") == "account_id")
+        );
         let row = sqlx::query(
             "SELECT username, account_id FROM oauth_connections WHERE service = 'synthetic'",
         )
@@ -931,9 +933,11 @@ mod mandate_ledger_upgrade_tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-        assert!(columns
-            .iter()
-            .any(|row| row.get::<String, _>("name") == "dispatch_claimed_at"));
+        assert!(
+            columns
+                .iter()
+                .any(|row| row.get::<String, _>("name") == "dispatch_claimed_at")
+        );
 
         let preserved = sqlx::query(
             "SELECT status, action_digest, tool_call_id, dispatch_claimed_at
@@ -948,9 +952,11 @@ mod mandate_ledger_upgrade_tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         assert_eq!(preserved.get::<String, _>("tool_call_id"), "tool-legacy");
-        assert!(preserved
-            .get::<Option<String>, _>("dispatch_claimed_at")
-            .is_none());
+        assert!(
+            preserved
+                .get::<Option<String>, _>("dispatch_claimed_at")
+                .is_none()
+        );
 
         sqlx::query(
             "UPDATE mandate_mutation_attempts
@@ -959,13 +965,15 @@ mod mandate_ledger_upgrade_tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert!(sqlx::query(
-            "UPDATE mandate_mutation_attempts
+        assert!(
+            sqlx::query(
+                "UPDATE mandate_mutation_attempts
              SET status = 'invented_status' WHERE id = 'legacy-row'",
-        )
-        .execute(&pool)
-        .await
-        .is_err());
+            )
+            .execute(&pool)
+            .await
+            .is_err()
+        );
 
         let foreign_tables = sqlx::query("PRAGMA foreign_key_list(mandate_mutation_attempts)")
             .fetch_all(&pool)
@@ -1004,8 +1012,9 @@ mod mandate_ledger_upgrade_tests {
         assert!(index_names.contains("idx_mandate_mutations_run_status"));
 
         // The rebuilt references remain enforced, including their cascade.
-        assert!(sqlx::query(
-            "INSERT INTO mandate_mutation_attempts
+        assert!(
+            sqlx::query(
+                "INSERT INTO mandate_mutation_attempts
                 (id, mandate_id, mandate_version, decision_cycle_id, goal_run_id,
                  intention_id, root_task_id, root_task_attempt_id, task_id,
                  task_attempt_id, reserved_action_attempt, action_digest,
@@ -1017,10 +1026,11 @@ mod mandate_ledger_upgrade_tests {
                      'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
                      'tool-orphan', 'http_request', '[\"external_delivery\"]',
                      '[]', '[]', 'reserved', '2026-08-02T12:00:01Z')",
-        )
-        .execute(&pool)
-        .await
-        .is_err());
+            )
+            .execute(&pool)
+            .await
+            .is_err()
+        );
         sqlx::query("DELETE FROM mandates WHERE id = 'mandate'")
             .execute(&pool)
             .await

@@ -484,16 +484,20 @@ mod tests {
             EvidenceTemporalScope::Historical,
         );
         let external = evidence_capabilities_for_tool_call("http_request", r#"{"method":"GET"}"#);
-        assert!(!external
-            .iter()
-            .any(|capability| capability_supports_requirement(capability, &need)));
+        assert!(
+            !external
+                .iter()
+                .any(|capability| capability_supports_requirement(capability, &need))
+        );
         let trace = evidence_capabilities_for_tool_call(
             "goal_trace",
             r#"{"action":"tool_trace","task_id":"synthetic-task"}"#,
         );
-        assert!(trace
-            .iter()
-            .any(|capability| capability_supports_requirement(capability, &need)));
+        assert!(
+            trace
+                .iter()
+                .any(|capability| capability_supports_requirement(capability, &need))
+        );
     }
 
     #[test]
@@ -508,9 +512,11 @@ mod tests {
             "manage_memories",
             r#"{"action":"search_episodes"}"#,
         );
-        assert!(!memory
-            .iter()
-            .any(|capability| capability_supports_requirement(capability, &need)));
+        assert!(
+            !memory
+                .iter()
+                .any(|capability| capability_supports_requirement(capability, &need))
+        );
     }
 
     #[test]
@@ -544,9 +550,11 @@ mod tests {
             "manage_memories",
             r#"{"action":"search","query":"synthetic family facts"}"#,
         );
-        assert!(memory
-            .iter()
-            .any(|capability| { capability_supports_requirement(capability, &historical_fact) }));
+        assert!(
+            memory.iter().any(|capability| {
+                capability_supports_requirement(capability, &historical_fact)
+            })
+        );
     }
 
     #[test]
@@ -559,24 +567,27 @@ mod tests {
         );
         let recent =
             evidence_capabilities_for_tool_call("goal_trace", r#"{"action":"tool_trace"}"#);
-        assert!(!recent
-            .iter()
-            .any(|capability| capability_supports_requirement(capability, &need)));
+        assert!(
+            !recent
+                .iter()
+                .any(|capability| capability_supports_requirement(capability, &need))
+        );
         let targeted = evidence_capabilities_for_tool_call(
             "goal_trace",
             r#"{"action":"tool_trace","task_id":"synthetic-task"}"#,
         );
-        assert!(targeted
-            .iter()
-            .any(|capability| capability_supports_requirement(capability, &need)));
+        assert!(
+            targeted
+                .iter()
+                .any(|capability| capability_supports_requirement(capability, &need))
+        );
     }
 
     #[test]
     fn exact_url_hint_gives_an_unknown_tool_direct_current_scope_only() {
-        let hints =
-            vec![
-                ToolTargetHint::new(ToolTargetHintKind::Url, "https://example.test/state").unwrap(),
-            ];
+        let hints = vec![
+            ToolTargetHint::new(ToolTargetHintKind::Url, "https://example.test/state").unwrap(),
+        ];
         let capabilities = evidence_capabilities_from_target_hints(&hints);
         assert!(capabilities.iter().any(|capability| {
             capability.scope == ToolSemanticScope::ExternalRemote

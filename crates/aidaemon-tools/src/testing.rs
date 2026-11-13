@@ -5,9 +5,9 @@ use tokio::sync::mpsc;
 
 use serde_json::Value;
 
-use crate::semantics::{ApprovalResponse, ToolCallContext, ToolCallOutcome};
-use crate::status::{with_status, StatusUpdate};
 use crate::OutcomeTool;
+use crate::semantics::{ApprovalResponse, ToolCallContext, ToolCallOutcome};
+use crate::status::{StatusUpdate, with_status};
 
 /// Calling a tool directly from a test.
 #[async_trait]

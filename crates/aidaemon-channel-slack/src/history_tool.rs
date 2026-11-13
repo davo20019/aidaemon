@@ -7,12 +7,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use aidaemon_tools::semantics::{ToolCallContext, ToolCapabilities};
 use aidaemon_tools::OutcomeTool as Tool;
+use aidaemon_tools::semantics::{ToolCallContext, ToolCapabilities};
 
 /// Tool that reads Slack channel conversation history via the Slack API.
 /// Provides rich message data (text, sender, timestamps, threads, reactions, mentions)
@@ -150,12 +150,13 @@ impl ReadChannelHistoryTool {
 
         let body = resp.json::<Value>().await.ok()?;
         if body["ok"].as_bool() == Some(true)
-            && let Some(url) = body["url"].as_str() {
-                let url = url.trim_end_matches('/').to_string();
-                let mut cached = self.workspace_url.write().await;
-                cached.insert(token_index, url.clone());
-                return Some(url);
-            }
+            && let Some(url) = body["url"].as_str()
+        {
+            let url = url.trim_end_matches('/').to_string();
+            let mut cached = self.workspace_url.write().await;
+            cached.insert(token_index, url.clone());
+            return Some(url);
+        }
         None
     }
 
@@ -317,15 +318,17 @@ impl ReadChannelHistoryTool {
 
         // Check if bot owner was mentioned
         if let Some(owner_id) = bot_owner_id
-            && raw_text.contains(&format!("<@{}>", owner_id)) {
-                meta_parts.push("⚠️ You were mentioned".to_string());
-            }
+            && raw_text.contains(&format!("<@{}>", owner_id))
+        {
+            meta_parts.push("⚠️ You were mentioned".to_string());
+        }
 
         // Thread reply count
         if let Some(reply_count) = msg["reply_count"].as_u64()
-            && reply_count > 0 {
-                meta_parts.push(format!("💬 {} replies", reply_count));
-            }
+            && reply_count > 0
+        {
+            meta_parts.push(format!("💬 {} replies", reply_count));
+        }
 
         // Reactions
         if let Some(reactions) = msg["reactions"].as_array() {

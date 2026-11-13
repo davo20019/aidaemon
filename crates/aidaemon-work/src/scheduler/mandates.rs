@@ -51,9 +51,9 @@ impl GoalCycle {
                         .state
                         .release_mandate_review_lease(&mandate.id, token, &retry_at)
                         .await
-                    {
-                        warn!(mandate_id = %mandate.id, %error, "Failed to defer mandate review");
-                    }
+                {
+                    warn!(mandate_id = %mandate.id, %error, "Failed to defer mandate review");
+                }
             }
             return;
         }

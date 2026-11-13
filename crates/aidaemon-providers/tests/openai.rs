@@ -6,7 +6,7 @@ use aidaemon_core::{
     Image, Message, ModelRequest, Provider, ProviderError, ToolCall, ToolChoice, ToolSpec, Usage,
 };
 use aidaemon_providers::OpenAiCompatible;
-use common::{data_events, drain, MockResponse, MockServer};
+use common::{MockResponse, MockServer, data_events, drain};
 use serde_json::json;
 
 fn provider(server: &MockServer) -> OpenAiCompatible {
@@ -374,7 +374,7 @@ async fn truncated_stream_is_transient() {
 #[tokio::test]
 async fn timeout_is_transient() {
     let server = MockServer::start(vec![
-        MockResponse::sse(text_stream(&["late"]), 64).delay(Duration::from_secs(3))
+        MockResponse::sse(text_stream(&["late"]), 64).delay(Duration::from_secs(3)),
     ])
     .await;
     let p = OpenAiCompatible::builder()
@@ -456,10 +456,9 @@ fn json_formats_reasoning_and_defaults_reach_the_body() {
 #[test]
 fn user_audio_becomes_input_audio_and_text_only_output() {
     let provider = OpenAiCompatible::builder().api_key("k").build().unwrap();
-    let body =
-        provider
-            .request_body(&request(vec![Message::user("What is said?")
-                .with_audio([aidaemon_core::Audio::new("ogg", "QUJD")])]));
+    let body = provider.request_body(&request(vec![
+        Message::user("What is said?").with_audio([aidaemon_core::Audio::new("ogg", "QUJD")]),
+    ]));
     assert_eq!(
         body["messages"][0]["content"][1],
         json!({"type": "input_audio", "input_audio": {"data": "QUJD", "format": "ogg"}})

@@ -389,12 +389,16 @@ mod tests {
             "8 KiB total bound should admit eight 1,024-byte entries"
         );
         assert!(guidance.iter().all(|entry| entry.chars().count() == 1_024));
-        assert!(guidance
-            .first()
-            .is_some_and(|entry| entry.starts_with("g04-")));
-        assert!(guidance
-            .last()
-            .is_some_and(|entry| entry.starts_with("g11-")));
+        assert!(
+            guidance
+                .first()
+                .is_some_and(|entry| entry.starts_with("g04-"))
+        );
+        assert!(
+            guidance
+                .last()
+                .is_some_and(|entry| entry.starts_with("g11-"))
+        );
         assert!(
             guidance
                 .iter()

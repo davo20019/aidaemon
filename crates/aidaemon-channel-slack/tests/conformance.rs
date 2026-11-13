@@ -5,18 +5,18 @@
 mod support;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aidaemon_channel_slack::SlackChannel;
-use aidaemon_channels::conformance::{check_channel, ChannelHarness};
+use aidaemon_channels::conformance::{ChannelHarness, check_channel};
 use aidaemon_channels::{ApprovalPrompt, Attachment, Conversation, ConversationKind};
 use futures::{SinkExt, StreamExt};
-use serde_json::{json, Value};
-use support::{MockApi, Response, APP_TOKEN, BOT_TOKEN, BOT_USER};
+use serde_json::{Value, json};
+use support::{APP_TOKEN, BOT_TOKEN, BOT_USER, MockApi, Response};
 use tokio::net::TcpListener;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{Notify, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 const DM: &str = "D000SYNTH";

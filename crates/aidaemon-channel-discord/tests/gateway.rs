@@ -3,10 +3,10 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aidaemon_channel_discord::{encode_custom_id, intents, DiscordChannel};
+use aidaemon_channel_discord::{DiscordChannel, encode_custom_id, intents};
 use aidaemon_channels::{Channel, ChannelError, ChannelEvent, ConversationKind};
 use common::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;

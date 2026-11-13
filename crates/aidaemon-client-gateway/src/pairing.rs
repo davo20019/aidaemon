@@ -14,14 +14,14 @@ use std::time::Duration;
 
 use aidaemon_channels::hub::ApprovalRequest;
 use aidaemon_client_protocol::{
-    challenge_message, AccessGrant, Challenge, ClientKind, DeviceInfo, Enrollment, EnrollmentState,
-    ErrorCode, PairingOffer, ProtocolError, RedeemRequest, Risk, Scope, ALL_SCOPES,
+    ALL_SCOPES, AccessGrant, Challenge, ClientKind, DeviceInfo, Enrollment, EnrollmentState,
+    ErrorCode, PairingOffer, ProtocolError, RedeemRequest, Risk, Scope, challenge_message,
 };
 use aidaemon_store_sqlite::{DeviceRow, PairingRow, SqliteClientEventLog};
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
 use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};

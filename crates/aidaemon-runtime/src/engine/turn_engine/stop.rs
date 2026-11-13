@@ -316,7 +316,7 @@ impl TurnEngine<'_> {
     /// it, then the run fails closed.
     pub async fn sdk_mandate_commit_check(&self, scope: &TurnScope<'_>) -> sdk::StopDecision {
         use crate::engine::mandate_run::{
-            mandate_decision_commit_state, MandateDecisionCommitState,
+            MandateDecisionCommitState, mandate_decision_commit_state,
         };
         use crate::turn::closeout::{StopDemand, StopDemandVerdict};
         let state = match mandate_decision_commit_state(self.host).await {

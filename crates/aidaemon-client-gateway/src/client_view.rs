@@ -16,12 +16,12 @@ use std::sync::Arc;
 use aidaemon_client_protocol::{Pane, ViewAction};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::semantics::{
     ToolCallContext, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolRole, ToolSemantics,
 };
-use aidaemon_tools::OutcomeTool as Tool;
 
 /// Where view actions go: the running Client Gateway, or a test double.
 pub trait ClientViews: Send + Sync {
@@ -286,13 +286,14 @@ mod tests {
                 "You asked what is waiting".to_string()
             )]
         );
-        assert!(tool
-            .execute(
+        assert!(
+            tool.execute(
                 r#"{"action":"new_session"}"#,
                 &facts("telegram:synthetic-user-1")
             )
             .await
-            .is_err());
+            .is_err()
+        );
     }
 
     #[tokio::test]

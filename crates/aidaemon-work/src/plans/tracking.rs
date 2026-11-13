@@ -298,10 +298,11 @@ impl StepTracker {
 
             // Ensure current step is in progress
             if let Some(step) = plan.current_step_mut()
-                && step.status == StepStatus::Pending {
-                    step.status = StepStatus::InProgress;
-                    step.started_at = Some(Utc::now());
-                }
+                && step.status == StepStatus::Pending
+            {
+                step.status = StepStatus::InProgress;
+                step.started_at = Some(Utc::now());
+            }
 
             self.plan_store.update(&plan).await?;
         }
@@ -344,11 +345,12 @@ impl StepTracker {
 
         // Mark current step as failed too
         if let Some(step) = plan.current_step_mut()
-            && step.status == StepStatus::InProgress {
-                step.status = StepStatus::Failed;
-                step.error = Some(error);
-                step.completed_at = Some(Utc::now());
-            }
+            && step.status == StepStatus::InProgress
+        {
+            step.status = StepStatus::Failed;
+            step.error = Some(error);
+            step.completed_at = Some(Utc::now());
+        }
 
         self.plan_store.update(&plan).await?;
         Ok(Some(plan))

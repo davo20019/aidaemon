@@ -148,9 +148,10 @@ fn structured_json_value(tool_output: &str) -> Option<serde_json::Value> {
         let start = offset.saturating_add(leading);
         let candidate = cleaned.get(start..)?.trim();
         if (candidate.starts_with('{') || candidate.starts_with('['))
-            && let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
-                return Some(value);
-            }
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate)
+        {
+            return Some(value);
+        }
         offset = offset.saturating_add(line.len());
     }
     None
@@ -378,7 +379,9 @@ mod tests {
             "Here are the results:"
         );
         // Artifact delivered overrides tool-specific prefix
-        assert!(tool_output_completion_prefix("terminal", true).contains("sent the requested file"));
+        assert!(
+            tool_output_completion_prefix("terminal", true).contains("sent the requested file")
+        );
     }
 
     #[test]
@@ -412,12 +415,14 @@ mod tests {
     fn structured_http_tool_output_requires_synthesis() {
         // Without a delivered artifact, structured HTTP output still defers
         // to synthesis recovery.
-        assert!(build_tool_output_completion_reply(
-            "http_request",
-            "HTTP 200 OK\n{\"items\":[]}",
-            false
-        )
-        .is_none());
+        assert!(
+            build_tool_output_completion_reply(
+                "http_request",
+                "HTTP 200 OK\n{\"items\":[]}",
+                false
+            )
+            .is_none()
+        );
         // With a delivered artifact, the closeout wins over synthesis.
         let reply =
             build_tool_output_completion_reply("http_request", "HTTP 200 OK\n{\"items\":[]}", true)
@@ -446,12 +451,14 @@ mod tests {
             false,
         )
         .is_none());
-        assert!(build_tool_output_completion_reply(
-            "write_file",
-            "File written to /tmp/foo.py, 200 bytes",
-            false
-        )
-        .is_none());
+        assert!(
+            build_tool_output_completion_reply(
+                "write_file",
+                "File written to /tmp/foo.py, 200 bytes",
+                false
+            )
+            .is_none()
+        );
         // Directory listing is trivial
         assert!(build_tool_output_completion_reply(
             "terminal",
@@ -465,19 +472,23 @@ mod tests {
             false,
         )
         .is_none());
-        assert!(build_tool_output_completion_reply(
-            "web_fetch",
-            "[CONTENT FILTERED] This request should be answered directly in plain text.",
-            false,
-        )
-        .is_none());
+        assert!(
+            build_tool_output_completion_reply(
+                "web_fetch",
+                "[CONTENT FILTERED] This request should be answered directly in plain text.",
+                false,
+            )
+            .is_none()
+        );
         // Substantive output should still work
-        assert!(build_tool_output_completion_reply(
-            "terminal",
-            "test_foo PASSED\ntest_bar PASSED\n2 passed",
-            false,
-        )
-        .is_some());
+        assert!(
+            build_tool_output_completion_reply(
+                "terminal",
+                "test_foo PASSED\ntest_bar PASSED\n2 passed",
+                false,
+            )
+            .is_some()
+        );
     }
 
     #[test]

@@ -9,11 +9,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aidaemon_sdk::channels::testing::{direct, message, TestChannel};
-use aidaemon_sdk::channels::{AccessPolicy, ChannelRunner, EventRouter, APPROVE_CHOICE};
-use aidaemon_sdk::prelude::*;
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
 use aidaemon_sdk::CancellationToken;
+use aidaemon_sdk::channels::testing::{TestChannel, direct, message};
+use aidaemon_sdk::channels::{APPROVE_CHOICE, AccessPolicy, ChannelRunner, EventRouter};
+use aidaemon_sdk::prelude::*;
+use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
 use serde_json::json;
 
 const OWNER: &str = "synthetic-user-1";

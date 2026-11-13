@@ -300,26 +300,27 @@ pub async fn build_system_prompt_for_message(
     };
 
     if let Some(checkpoint) = resume_checkpoint
-        && host.turn_runtime().record_decision_points {
-            crate::turn::task_end::emit_decision_point(
-                host,
-                emitter,
-                task_id,
-                0,
-                DecisionType::InstructionsSnapshot,
-                format!(
-                    "Resume checkpoint injected from task {}",
-                    checkpoint.task_id.as_str()
-                ),
-                json!({
-                    "resume_from_task_id": checkpoint.task_id.as_str(),
-                    "resume_last_iteration": checkpoint.last_iteration,
-                    "resume_pending_tool_calls": checkpoint.pending_tool_call_ids.len(),
-                    "resume_elapsed_secs": checkpoint.elapsed_secs
-                }),
-            )
-            .await;
-        }
+        && host.turn_runtime().record_decision_points
+    {
+        crate::turn::task_end::emit_decision_point(
+            host,
+            emitter,
+            task_id,
+            0,
+            DecisionType::InstructionsSnapshot,
+            format!(
+                "Resume checkpoint injected from task {}",
+                checkpoint.task_id.as_str()
+            ),
+            json!({
+                "resume_from_task_id": checkpoint.task_id.as_str(),
+                "resume_last_iteration": checkpoint.last_iteration,
+                "resume_pending_tool_calls": checkpoint.pending_tool_call_ids.len(),
+                "resume_elapsed_secs": checkpoint.elapsed_secs
+            }),
+        )
+        .await;
+    }
 
     let active_skill_names: Vec<String> = active_skills
         .iter()

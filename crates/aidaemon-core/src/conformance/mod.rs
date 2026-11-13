@@ -31,8 +31,8 @@ mod report;
 mod tool;
 
 pub use provider::{
-    check_provider, probe_requests, provider_checks, PROVIDER_CALLS_PER_REQUEST,
-    PROVIDER_CALL_TIMEOUT,
+    PROVIDER_CALL_TIMEOUT, PROVIDER_CALLS_PER_REQUEST, check_provider, probe_requests,
+    provider_checks,
 };
 pub use report::ConformanceReport;
-pub use tool::{check_tool, check_tool_with, sample_arguments, tool_checks, ToolKitOptions};
+pub use tool::{ToolKitOptions, check_tool, check_tool_with, sample_arguments, tool_checks};

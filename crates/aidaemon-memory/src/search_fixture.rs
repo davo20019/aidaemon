@@ -304,8 +304,7 @@ pub(crate) fn queries() -> Vec<LabelledQuery> {
             forbidden_related: &[],
         },
         LabelledQuery {
-            query:
-                "home city town residence location where live hometown address place springfield",
+            query: "home city town residence location where live hometown address place springfield",
             limit: 5,
             relevant: &[HOME_CITY],
             forbidden_related: &[],
@@ -369,9 +368,11 @@ mod tests {
             }
         }
         assert!(queries().len() >= 8);
-        assert!(queries()
-            .iter()
-            .any(|q| q.query.split_whitespace().count() == 11));
+        assert!(
+            queries()
+                .iter()
+                .any(|q| q.query.split_whitespace().count() == 11)
+        );
 
         // The only same-key-same-value pair is the deliberate duplicate.
         let mut by_content: HashMap<(String, String, String), Vec<i64>> = HashMap::new();
@@ -409,7 +410,7 @@ mod tests {
     fn ranking_metrics_meet_bar() {
         use crate::neighborhood::{eligible_neighbors, is_relationship_key, seeds_from_hits};
         use crate::retrieval_eval::evaluate_ranked;
-        use crate::search::{candidates, rank, rank_related, FactSearchConfig, LexicalIndex};
+        use crate::search::{FactSearchConfig, LexicalIndex, candidates, rank, rank_related};
 
         let facts = corpus();
         let cfg = FactSearchConfig::default();

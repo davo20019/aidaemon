@@ -7,7 +7,7 @@ use crate::traits::{DialogueState, Message, OpenRequest, OpenRequestStatus};
 
 #[tokio::test]
 async fn internal_continuation_does_not_rotate_open_request() {
-    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::testing::{MockProvider, setup_test_agent};
     use crate::traits::DialogueStateStore;
 
     let harness = setup_test_agent(MockProvider::new())

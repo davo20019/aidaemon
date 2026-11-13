@@ -8,8 +8,8 @@
 //! draining the session's queue in order. Platforms differ only in how the
 //! surface shows things.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -19,8 +19,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use aidaemon_core::ChannelVisibility;
-use aidaemon_events::conversation::MessageAttachment;
 use aidaemon_events::ResponseDeliveryState;
+use aidaemon_events::conversation::MessageAttachment;
 use aidaemon_tools::semantics::UserRole;
 use aidaemon_tools::status::StatusUpdate;
 
@@ -519,13 +519,14 @@ impl TurnRunner {
                             )
                         };
                         if let Ok(ids) = surface.say(&notice).await
-                            && let [message_id] = ids.as_slice() {
-                                self.remember_queued_notice(
-                                    &session_id,
-                                    &turn.text,
-                                    message_id.clone(),
-                                );
-                            }
+                            && let [message_id] = ids.as_slice()
+                        {
+                            self.remember_queued_notice(
+                                &session_id,
+                                &turn.text,
+                                message_id.clone(),
+                            );
+                        }
                     }
                     return;
                 }
@@ -1541,10 +1542,12 @@ mod tests {
             crate::presentation::queued_message_notice(true)
         );
         let ctx = ChannelContext::private("test");
-        assert!(registry
-            .take_steering_messages(session, UserRole::Owner, &ctx)
-            .await
-            .is_empty());
+        assert!(
+            registry
+                .take_steering_messages(session, UserRole::Owner, &ctx)
+                .await
+                .is_empty()
+        );
         registry.clear_queue(session).await;
 
         // A change to the work (or no reading at all): it joins the run.

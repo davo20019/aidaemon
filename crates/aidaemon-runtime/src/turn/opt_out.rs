@@ -16,8 +16,8 @@
 //! (`/clear`, a new session) nothing brings the turn back. Recall still
 //! works on the turn: opting out is about learning, not reading.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aidaemon_core as sdk;
 use aidaemon_policies::{OptOutRecorder as _, TurnLearning};

@@ -1,7 +1,7 @@
 //! The turn runner on the daemon's agent: what only a real agent shows.
 
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -9,9 +9,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::turns::{status_line, Turn, TurnRunner, TurnSurface};
 use super::ChannelRuntimeDeps;
-use crate::testing::{setup_test_agent, MockProvider};
+use super::turns::{Turn, TurnRunner, TurnSurface, status_line};
+use crate::testing::{MockProvider, setup_test_agent};
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
 
 /// Records what the runner says.

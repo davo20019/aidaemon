@@ -6,14 +6,14 @@
 use std::sync::Arc;
 
 use aidaemon_core::ChannelVisibility;
-use aidaemon_tools::semantics::{
-    semantics_for_exact_read_actions, ToolCallContext, ToolCallMetadata, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus,
-};
 use aidaemon_tools::OutcomeTool as Tool;
+use aidaemon_tools::semantics::{
+    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects, ToolOutcomeStatus, semantics_for_exact_read_actions,
+};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::records::FactPrivacy;
 use crate::stores::MemoryStores;
@@ -251,7 +251,10 @@ impl ManageMemoriesTool {
                 }
 
                 let filtered = if let Some(ref cat) = args.category {
-                    facts.into_iter().filter(|f| f.category == *cat).collect::<Vec<_>>()
+                    facts
+                        .into_iter()
+                        .filter(|f| f.category == *cat)
+                        .collect::<Vec<_>>()
                 } else {
                     facts
                 };
@@ -295,8 +298,14 @@ impl ManageMemoriesTool {
                 Ok(output)
             }
             "forget" => {
-                let key_raw = args.key.as_deref().ok_or_else(|| anyhow::anyhow!("'key' is required for forget action"))?;
-                let category = args.category.as_deref().ok_or_else(|| anyhow::anyhow!("'category' is required for forget action"))?;
+                let key_raw = args
+                    .key
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'key' is required for forget action"))?;
+                let category = args
+                    .category
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'category' is required for forget action"))?;
 
                 // Reject empty / whitespace-only / too-short keys. A blank key would
                 // make partial key matching true for every
@@ -338,8 +347,7 @@ impl ManageMemoriesTool {
                 // in the requested key is never a match: forgetting
                 // `qa_pet_name` used to also delete the owner's `name` fact.
                 let exact_in_category = |f: &crate::records::Fact| -> bool {
-                    f.superseded_at.is_none()
-                        && (f.key == key || canon(&f.key) == key_canonical)
+                    f.superseded_at.is_none() && (f.key == key || canon(&f.key) == key_canonical)
                 };
                 let key_segments: Vec<&str> = key_canonical.split('_').collect();
                 let partial_in_category = |f: &crate::records::Fact| -> bool {
@@ -391,29 +399,48 @@ impl ManageMemoriesTool {
                 }
 
                 if to_delete.is_empty() {
-                    Ok(format!("No active fact found matching key '{}' in any category. Use manage_memories(action='list') to see stored facts and their exact keys.", key))
+                    Ok(format!(
+                        "No active fact found matching key '{}' in any category. Use manage_memories(action='list') to see stored facts and their exact keys.",
+                        key
+                    ))
                 } else {
                     let mut forgotten = Vec::new();
                     for (id, cat, k) in &to_delete {
                         self.store.delete_fact(*id).await?;
                         forgotten.push(format!("[{}] {}", cat, k));
                     }
-                    Ok(format!("Forgotten {} fact(s): {}", forgotten.len(), forgotten.join(", ")))
+                    Ok(format!(
+                        "Forgotten {} fact(s): {}",
+                        forgotten.len(),
+                        forgotten.join(", ")
+                    ))
                 }
             }
             "set_privacy" => {
-                let key = args.key.as_deref().ok_or_else(|| anyhow::anyhow!("'key' is required for set_privacy action"))?;
-                let category = args.category.as_deref().ok_or_else(|| anyhow::anyhow!("'category' is required for set_privacy action"))?;
-                let privacy_str = args.privacy.as_deref().ok_or_else(|| anyhow::anyhow!("'privacy' is required for set_privacy action"))?;
+                let key = args
+                    .key
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'key' is required for set_privacy action"))?;
+                let category = args.category.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'category' is required for set_privacy action")
+                })?;
+                let privacy_str = args.privacy.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'privacy' is required for set_privacy action")
+                })?;
                 let privacy = FactPrivacy::from_str_lossy(privacy_str);
 
                 let facts = self.store.get_facts(Some(category)).await?;
-                let fact = facts.iter().find(|f| f.key == key && f.superseded_at.is_none());
+                let fact = facts
+                    .iter()
+                    .find(|f| f.key == key && f.superseded_at.is_none());
 
                 match fact {
                     Some(f) => {
                         self.store.update_fact_privacy(f.id, privacy).await?;
-                        Ok(format!("Updated privacy: [{}] {} → {}", category, key, privacy))
+                        Ok(format!(
+                            "Updated privacy: [{}] {} → {}",
+                            category, key, privacy
+                        ))
                     }
                     None => Ok(format!("No active fact found: [{}] {}", category, key)),
                 }
@@ -427,11 +454,7 @@ impl ManageMemoriesTool {
                 let limit = args.limit.unwrap_or(10).clamp(1, 200);
                 let report = self
                     .store
-                    .search_facts(
-                        query,
-                        limit,
-                        &crate::search::FactSearchConfig::default(),
-                    )
+                    .search_facts(query, limit, &crate::search::FactSearchConfig::default())
                     .await?;
                 if report.hits.is_empty() {
                     return Ok(format!("No memories matching '{}'.", query));
@@ -447,7 +470,11 @@ impl ManageMemoriesTool {
                         report.considered
                     )
                 } else {
-                    format!("{} shown of {} considered", report.hits.len(), report.considered)
+                    format!(
+                        "{} shown of {} considered",
+                        report.hits.len(),
+                        report.considered
+                    )
                 };
                 let mut output = format!(
                     "══ Stored facts matching '{}' ({}) ══\n\

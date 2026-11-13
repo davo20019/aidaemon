@@ -2,8 +2,8 @@
 //! stream event, so a slow but live stream is not mistaken for a hang.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Liveness of the streaming call in flight: milliseconds since `started`

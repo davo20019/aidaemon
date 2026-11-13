@@ -455,7 +455,7 @@ impl Preset {
             None => {
                 return Err(PresetError::NoModel {
                     provider: provider.name().to_string(),
-                })
+                });
             }
         };
 

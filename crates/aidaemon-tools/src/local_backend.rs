@@ -10,9 +10,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::backend::{
-    normalize_local_lexically, BackendDirEntry, BackendFileType, BackendKind, BackendMetadata,
-    BackendPath, CommandSpec, ExecutionBackend, ExecutionRequest, ProcessHandle, SpawnedProcess,
-    WriteMode,
+    BackendDirEntry, BackendFileType, BackendKind, BackendMetadata, BackendPath, CommandSpec,
+    ExecutionBackend, ExecutionRequest, ProcessHandle, SpawnedProcess, WriteMode,
+    normalize_local_lexically,
 };
 use crate::process_control::{configure_command_for_process_group, send_sigkill, send_sigterm};
 
@@ -225,10 +225,9 @@ impl ExecutionBackend for LocalBackend {
     ) -> anyhow::Result<()> {
         let host = self.host_path(path);
         self.ensure_allowed(&host).await?;
-        if create_parents
-            && let Some(parent) = host.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
+        if create_parents && let Some(parent) = host.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
         match mode {
             WriteMode::Append => {
                 let mut file = tokio::fs::OpenOptions::new()

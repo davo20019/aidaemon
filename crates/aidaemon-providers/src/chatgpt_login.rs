@@ -21,8 +21,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aidaemon_secrets::{names, SecretStore};
-use anyhow::{anyhow, Context, Result};
+use aidaemon_secrets::{SecretStore, names};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -279,9 +279,10 @@ impl ChatGptCredentialManager {
                 // Persist immediately: OpenAI rotates refresh tokens and the
                 // old token may already be dead.
                 if self.persist_refreshes
-                    && let Err(error) = self.store_credentials(&refreshed) {
-                        warn!(%error, "Refreshed ChatGPT tokens could not be persisted");
-                    }
+                    && let Err(error) = self.store_credentials(&refreshed)
+                {
+                    warn!(%error, "Refreshed ChatGPT tokens could not be persisted");
+                }
                 state.credentials = Some(refreshed.clone());
                 state.rejection = None;
                 Ok(refreshed)
@@ -349,10 +350,9 @@ impl ChatGptCredentialManager {
         debug!("Refreshing ChatGPT credentials after remote authentication rejection");
         match refresh(current.clone()).await {
             Ok(refreshed) => {
-                if persist
-                    && let Err(error) = self.store_credentials(&refreshed) {
-                        warn!(%error, "Remotely recovered ChatGPT tokens could not be persisted");
-                    }
+                if persist && let Err(error) = self.store_credentials(&refreshed) {
+                    warn!(%error, "Remotely recovered ChatGPT tokens could not be persisted");
+                }
                 state.credentials = Some(refreshed.clone());
                 state.rejection = None;
                 Ok(refreshed)

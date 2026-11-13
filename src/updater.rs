@@ -11,9 +11,9 @@ use tracing::{error, info, warn};
 
 use crate::channels::ChannelHub;
 use crate::config::{UpdateConfig, UpdateMode};
+use crate::tools::ApprovalBroker;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
-use crate::tools::ApprovalBroker;
 use crate::types::ApprovalResponse;
 
 const REPO_OWNER: &str = "davo20019";
@@ -72,11 +72,11 @@ impl Updater {
             if let (Ok(current), Ok(latest_parsed)) = (
                 semver::Version::parse(CURRENT_VERSION),
                 semver::Version::parse(latest_version),
-            )
-                && latest_parsed > current {
-                    let notes = latest.body().unwrap_or("No release notes.");
-                    return Ok(Some((latest_version.to_string(), notes.to_string())));
-                }
+            ) && latest_parsed > current
+            {
+                let notes = latest.body().unwrap_or("No release notes.");
+                return Ok(Some((latest_version.to_string(), notes.to_string())));
+            }
         }
 
         Ok(None)

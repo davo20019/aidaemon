@@ -10,15 +10,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
-use super::backend::{MockBackend, MockCall};
 use super::BrowserTool;
+use super::backend::{MockBackend, MockCall};
 use aidaemon_channels::hub::{MediaKind, MediaMessage};
 use aidaemon_events::conversation::AttachmentProvenance;
-use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse};
 use aidaemon_tools::OutcomeTool as Tool;
+use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse};
 
 /// A browser tool called the way the agent kernel calls it: each call's
 /// card (`owner_approval_request`) is recorded and answered with `reply`
@@ -305,10 +305,12 @@ async fn render_pdf_uses_chromium_and_persists_a_valid_artifact() {
         .expect("render_pdf should register the PDF as a durable artifact");
     assert_eq!(artifact.mime_type, "application/pdf");
     assert_eq!(artifact.local_path, path.to_string_lossy());
-    assert!(artifact
-        .resource_id
-        .as_deref()
-        .is_some_and(|id| id.starts_with("res_")));
+    assert!(
+        artifact
+            .resource_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("res_"))
+    );
     assert!(artifact.sha256.is_some());
     assert!(
         outcome.metadata.attachments.iter().any(|attachment| {
@@ -327,9 +329,11 @@ async fn render_pdf_uses_chromium_and_persists_a_valid_artifact() {
     assert!(calls.contains(&MockCall::WaitForNavigation));
     assert!(calls.contains(&MockCall::RenderPdf));
     assert!(calls.contains(&MockCall::Screenshot(None, true)));
-    assert!(calls
-        .iter()
-        .any(|call| matches!(call, MockCall::CloseTarget(_))));
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, MockCall::CloseTarget(_)))
+    );
 }
 
 #[tokio::test]
@@ -406,9 +410,11 @@ async fn render_pdf_times_out_a_stalled_chromium_print_without_output() {
     let calls = backend.calls();
     let calls = calls.lock().await;
     assert!(calls.contains(&MockCall::RenderPdf));
-    assert!(calls
-        .iter()
-        .any(|call| matches!(call, MockCall::CloseTarget(_))));
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, MockCall::CloseTarget(_)))
+    );
 }
 
 #[tokio::test]
@@ -2735,11 +2741,13 @@ async fn ordinary_mutation_approval_is_session_only() {
     }
 
     assert_eq!(recorder.count().await, 2);
-    assert!(recorder
-        .permission_modes()
-        .await
-        .iter()
-        .all(|mode| *mode == aidaemon_tools::command_risk::PermissionMode::Cautious));
+    assert!(
+        recorder
+            .permission_modes()
+            .await
+            .iter()
+            .all(|mode| *mode == aidaemon_tools::command_risk::PermissionMode::Cautious)
+    );
 }
 
 /// POINT-OF-ACTION: every `execute_js` call prompts even after AllowSession —
@@ -3794,7 +3802,7 @@ async fn denied_execute_js_not_evaluated() {
 // Task 10: handler-health monitoring + disconnect recovery
 // ============================================================================
 
-use super::backend::{is_connection_error, BrowserBackend, FailOp};
+use super::backend::{BrowserBackend, FailOp, is_connection_error};
 
 /// `is_connection_error` recognizes transport/connection-death patterns but NOT
 /// ordinary page errors. This is the classifier that gates ALL recovery.

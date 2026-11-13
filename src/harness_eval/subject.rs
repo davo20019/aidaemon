@@ -13,10 +13,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::events::{Event, EventStore};
-use crate::harness_eval::recorder::{collect_run_result, HarnessEvalRunResult};
+use crate::harness_eval::recorder::{HarnessEvalRunResult, collect_run_result};
 use crate::state::SqliteStateStore;
 use crate::testing::{
-    setup_test_agent, setup_test_agent_orchestrator, setup_test_agent_with_models, MockProvider,
+    MockProvider, setup_test_agent, setup_test_agent_orchestrator, setup_test_agent_with_models,
 };
 use crate::traits::{Goal, GoalStore, ProviderResponse, ToolInvocationStage, ToolOutcomeStatus};
 use crate::types::{ChannelContext, UserRole};
@@ -537,7 +537,7 @@ pub fn check_daemon_expect(expect: &DaemonExpect, result: &HarnessEvalRunResult)
 
 #[cfg(test)]
 mod tests {
-    use aidaemon_eval::{check_trajectory, CaseResult, Suite};
+    use aidaemon_eval::{CaseResult, Suite, check_trajectory};
 
     use super::*;
     use crate::harness_eval::recorder::record_scenario_from_events;

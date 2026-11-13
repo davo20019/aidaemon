@@ -307,7 +307,7 @@ impl Provider for Failover {
                         // gets the time instead (a single-attempt request
                         // stops below).
                         Err(_) if !step_request.options.single_attempt => {
-                            break timed_out(step.deadline)
+                            break timed_out(step.deadline);
                         }
                         Err(_) => timed_out(step.deadline),
                     },
@@ -370,7 +370,7 @@ impl Provider for Failover {
                                 // step gets the time instead (a single-attempt
                                 // request stops below).
                                 Err(_) if !step_request.options.single_attempt => {
-                                    break timed_out(step.deadline)
+                                    break timed_out(step.deadline);
                                 }
                                 Err(_) => timed_out(step.deadline),
                             }
@@ -419,7 +419,7 @@ impl Provider for Failover {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{text, ScriptedProvider};
+    use crate::testing::{ScriptedProvider, text};
 
     /// Never answers.
     struct Hanging;
@@ -500,9 +500,11 @@ mod tests {
             FailoverStep::new(ScriptedProvider::new(vec![text("fallback")])),
         ]);
         let events = collect(&chain).await;
-        assert!(!events
-            .iter()
-            .any(|e| matches!(e, Ok(StreamEvent::Switched(_)))));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Ok(StreamEvent::Switched(_))))
+        );
         assert!(matches!(events.last(), Some(Ok(StreamEvent::Done(r))) if r.text == "second try"));
     }
 

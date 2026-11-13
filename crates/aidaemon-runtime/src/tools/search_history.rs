@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Sha256;
 use uuid::Uuid;
 

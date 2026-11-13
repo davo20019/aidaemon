@@ -15,8 +15,8 @@
 use crate::engine::deferral::DeferredRetries as _;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use aidaemon_channels::context::ChannelContext;
@@ -26,13 +26,14 @@ use aidaemon_events::{EventEmitter, EventType, TaskOutcome, TaskStatus};
 use aidaemon_tools::semantics::UserRole;
 use aidaemon_tools::status::StatusUpdate;
 use async_trait::async_trait;
-use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::engine::TOOL_TIMEOUT;
 use crate::engine::budgets::*;
 use crate::engine::calls::{
     AfterCallCheck, GateRequest, HostCall as DaemonCall, KernelCall, KernelNotice, ModelCall,
@@ -40,21 +41,20 @@ use crate::engine::calls::{
 };
 use crate::engine::outcome::TurnVerdict;
 use crate::engine::provider::{
-    fit_run_values, from_provider_response, prefix_with_notes, split_injected_notes,
-    to_chat_options, to_daemon_messages_from, to_daemon_tools, values_to_sdk, HostProvider,
+    HostProvider, fit_run_values, from_provider_response, prefix_with_notes, split_injected_notes,
+    to_chat_options, to_daemon_messages_from, to_daemon_tools, values_to_sdk,
 };
 use crate::engine::recovery;
 use crate::engine::scope::{AbsorbedSteering, BudgetGoal, TurnScope};
 use crate::engine::settings::SdkEngineSettings;
-use crate::engine::settings::{turn_cwd, turn_trust_roots, TrustRootSources};
+use crate::engine::settings::{TrustRootSources, turn_cwd, turn_trust_roots};
 use crate::engine::tool_exec::ToolExecCtx;
 use crate::engine::work_scope::WorkScope;
-use crate::engine::TOOL_TIMEOUT;
 use crate::host::TurnHost;
 use crate::media::vision::encode_image_attachment;
 use crate::settings::VisionConfig;
 use crate::turn::helpers::touch_heartbeat;
-use crate::turn::memory::{daemon_tool_offer, memory_parts, DaemonToolOffer, MemoryTurn};
+use crate::turn::memory::{DaemonToolOffer, MemoryTurn, daemon_tool_offer, memory_parts};
 use crate::turn::notes::TurnNotes;
 use crate::turn::turn_context::TurnHistory;
 use aidaemon_channels::owner_wait::ProgressClock;
@@ -958,14 +958,15 @@ impl TurnEngine<'_> {
                 _ => {}
             }
             if let Some(tx) = reply_text.as_ref()
-                && let Ok(mut pending) = pending_text.lock() {
-                    match event {
-                        sdk::Event::TextDelta { text, .. } => pending.push(text),
-                        sdk::Event::TurnStarted { .. } => pending.next_call(),
-                        _ => {}
-                    }
-                    pending.flush(tx);
+                && let Ok(mut pending) = pending_text.lock()
+            {
+                match event {
+                    sdk::Event::TextDelta { text, .. } => pending.push(text),
+                    sdk::Event::TurnStarted { .. } => pending.next_call(),
+                    _ => {}
                 }
+                pending.flush(tx);
+            }
             let Some(status_tx) = sink_status.as_ref() else {
                 return;
             };

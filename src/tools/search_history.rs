@@ -14,8 +14,8 @@ mod tests {
     use crate::traits::ToolSemantics;
     use crate::types::ChannelVisibility;
     use crate::types::UserRole;
-    use serde_json::json;
     use serde_json::Value;
+    use serde_json::json;
     use std::sync::Arc;
 
     async fn tool() -> (SearchHistoryTool, Arc<EventStore>, tempfile::NamedTempFile) {
@@ -255,12 +255,14 @@ mod tests {
         assert!(outcome.metadata.untrusted_verbatim);
         assert!(outcome.metadata.preserve_inline);
         assert!(outcome.metadata.suppress_activity_result);
-        assert!(!outcome
-            .metadata
-            .persistent_output
-            .as_deref()
-            .unwrap()
-            .contains("verbatim secret"));
+        assert!(
+            !outcome
+                .metadata
+                .persistent_output
+                .as_deref()
+                .unwrap()
+                .contains("verbatim secret")
+        );
 
         let value: Value = serde_json::from_str(&outcome.output).unwrap();
         let cursor = value["matches"][0]["older_cursor"].as_str().unwrap();
@@ -324,9 +326,10 @@ mod tests {
 
         let mut repair_args = scoped_args;
         repair_args["action"] = json!("repair");
-        assert!(tool
-            .call_with(&repair_args.to_string(), facts)
-            .await
-            .is_err());
+        assert!(
+            tool.call_with(&repair_args.to_string(), facts)
+                .await
+                .is_err()
+        );
     }
 }

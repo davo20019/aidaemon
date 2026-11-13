@@ -23,8 +23,8 @@ use aidaemon_core::Message;
 use crate::context_window::estimate_tokens;
 
 pub use compactor::{CompactionJobs, CompactionLimits, Compactor};
-pub use hooks::{render_summary_note, ConversationCompaction, SummaryNote};
-pub use summarizer::{elide_middle, ProviderSummarizer, COMPACTED_STATE_HEADINGS};
+pub use hooks::{ConversationCompaction, SummaryNote, render_summary_note};
+pub use summarizer::{COMPACTED_STATE_HEADINGS, ProviderSummarizer, elide_middle};
 
 /// History size, in tokens, at which a conversation is compacted after a
 /// run: 60% of the model's context window.

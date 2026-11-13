@@ -13,8 +13,8 @@ pub mod writer;
 
 pub use jobs::{JobCall, JobSchedule, JobsHost, MemoryJobs};
 pub use recall::{
-    FullRecall, RecallDecision, RecallHost, RecallSettings, RecallSource, RecallTurn,
-    IDENTITY_CATEGORIES,
+    FullRecall, IDENTITY_CATEGORIES, RecallDecision, RecallHost, RecallSettings, RecallSource,
+    RecallTurn,
 };
 pub use system::{FullMemory, FullTurn};
 pub use transcript::{TranscriptLog, TranscriptRecorder};

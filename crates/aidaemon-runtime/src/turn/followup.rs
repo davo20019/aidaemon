@@ -5,9 +5,9 @@
 //! `looks_like_*` / `classify_followup_mode` family.
 
 #[cfg(test)]
-use super::completion_contract::looks_like_question_request;
-#[cfg(test)]
 use super::completion_contract::HTTP_URL_RE;
+#[cfg(test)]
+use super::completion_contract::looks_like_question_request;
 use super::project_scope::extract_project_scopes_from_text;
 #[cfg(test)]
 use super::project_scope::token_looks_like_filesystem_path;

@@ -1,12 +1,12 @@
 //! Forced text replies, budget stops and stuck notices through the kernel's
 //! hooks, run against the real loop.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aidaemon_core as sdk;
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
-use serde_json::{json, Value};
+use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::budgets::GOAL_BUDGET_EXHAUSTED;

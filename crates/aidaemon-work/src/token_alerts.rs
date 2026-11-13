@@ -257,11 +257,7 @@ fn format_tokens(tokens: i64) -> String {
         }
         out.push(ch);
     }
-    if negative {
-        format!("-{}", out)
-    } else {
-        out
-    }
+    if negative { format!("-{}", out) } else { out }
 }
 
 fn truncate_line(input: &str, max_chars: usize) -> String {

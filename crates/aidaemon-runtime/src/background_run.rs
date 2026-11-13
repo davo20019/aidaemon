@@ -24,7 +24,7 @@ use crate::run_state::{
     GroupEnd, GroupTurn, RunEnd, RunEvidence, RunMeasure, RunReport, RunState, RunStates,
 };
 use crate::spawn_tool::{
-    group_followup, job_end, render_run_result, settle_background_steps, HelperCard,
+    HelperCard, group_followup, job_end, render_run_result, settle_background_steps,
 };
 
 /// The reply of a turn that handed its work to a background run, and the

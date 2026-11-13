@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::coordination::{CallFence, Escalation};
 use crate::tools::traits::{Tool, ToolCallContext, ToolCallOutcome, ToolCapabilities};

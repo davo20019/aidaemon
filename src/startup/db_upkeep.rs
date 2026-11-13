@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tracing::{info, warn};
 
 use crate::config::StateConfig;

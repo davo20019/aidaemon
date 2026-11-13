@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 
 use aidaemon_events::conversation::{Message, MessageAttachment};
 use aidaemon_tools::status::StatusUpdate;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -1737,9 +1737,11 @@ get_app_state below. Call get_app_state to re-read the current screen if you nee
         return;
     };
     for (i, m) in messages.iter_mut().enumerate() {
-        if i != last_idx && is_tree(m)
-            && let Some(content) = m.get_mut("content") {
-                *content = Value::String(STUB.to_string());
-            }
+        if i != last_idx
+            && is_tree(m)
+            && let Some(content) = m.get_mut("content")
+        {
+            *content = Value::String(STUB.to_string());
+        }
     }
 }

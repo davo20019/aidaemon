@@ -6,15 +6,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
 use aidaemon_core::{
-    Agent, Event, FnTool, Hook, HookContext, InterruptKind, LimitDecision, LimitGrants, LimitKind,
-    Limits, Message, ModelDecision, ModelErrorDecision, ModelResponse, ProviderError,
-    ReceiptStatus, Resolution, Role, RunState, RunStatus, StopDecision, Tool, ToolAnnotations,
-    ToolCall, ToolDecision, ToolInfo, ToolOutput, HARD_TURN_CAP,
+    Agent, Event, FnTool, HARD_TURN_CAP, Hook, HookContext, InterruptKind, LimitDecision,
+    LimitGrants, LimitKind, Limits, Message, ModelDecision, ModelErrorDecision, ModelResponse,
+    ProviderError, ReceiptStatus, Resolution, Role, RunState, RunStatus, StopDecision, Tool,
+    ToolAnnotations, ToolCall, ToolDecision, ToolInfo, ToolOutput,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 fn write_tool(calls: Arc<AtomicUsize>) -> impl Tool {
@@ -250,11 +250,11 @@ async fn a_rejected_response_runs_no_tools_and_the_model_sees_why() {
     assert!(second.iter().any(|m| m.content == "draft"));
     assert!(second.iter().any(|m| m.content == "cite a source"));
     assert!(second.iter().all(|m| m.tool_calls.is_empty()));
-    assert!(events
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|e| matches!(e, Event::ModelRejected { message, .. } if message == "cite a source")));
+    assert!(
+        events.lock().unwrap().iter().any(
+            |e| matches!(e, Event::ModelRejected { message, .. } if message == "cite a source")
+        )
+    );
 }
 
 #[tokio::test]
@@ -328,11 +328,13 @@ async fn a_hook_can_retry_a_failed_model_call_with_the_typed_error() {
     // request or change the model for the next attempt.
     assert_eq!(hook.models_asked.load(Ordering::SeqCst), 2);
     assert_eq!(out.state.turn, 2);
-    assert!(events
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|e| matches!(e, Event::ModelRetried { .. })));
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, Event::ModelRetried { .. }))
+    );
 }
 
 #[tokio::test]
@@ -632,9 +634,11 @@ async fn a_transcript_edit_is_durable_and_leaves_the_receipts_alone() {
     let out = agent.run("s", "go").await.unwrap();
 
     let request = &provider.requests()[1].messages;
-    assert!(request
-        .iter()
-        .any(|m| m.content == "summary of the work so far"));
+    assert!(
+        request
+            .iter()
+            .any(|m| m.content == "summary of the work so far")
+    );
     assert!(request.iter().all(|m| m.role != Role::Tool));
     assert_eq!(out.state.messages[0].content, "summary of the work so far");
     assert_eq!(
@@ -672,11 +676,13 @@ async fn assert_refused(replacement: Vec<Message>) {
         "the edit was not applied"
     );
     assert_eq!(out.final_text.as_deref(), Some("done"));
-    assert!(events
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|e| matches!(e, Event::TranscriptEditRefused { .. })));
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, Event::TranscriptEditRefused { .. }))
+    );
 }
 
 #[tokio::test]
@@ -945,14 +951,18 @@ async fn a_sink_sees_the_final_request_and_each_hook_decision() {
     agent.run("s", "go").await.unwrap();
 
     let requests = observer.requests.lock().unwrap();
-    assert!(requests[0]
-        .messages
-        .iter()
-        .any(|m| m.content == "added by a hook"));
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|m| m.content == "added by a hook")
+    );
     let events = observer.events.lock().unwrap();
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, Event::ModelRequested { model, .. } if model == "m")));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ModelRequested { model, .. } if model == "m"))
+    );
     assert!(events.iter().any(|e| matches!(
         e,
         Event::HookDecided { hook, decision, reason, .. }
@@ -990,11 +1000,13 @@ async fn a_child_run_names_its_parent() {
         .await
         .unwrap();
 
-    assert!(events
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|e| matches!(e, Event::RunLinked { parent_run } if *parent_run == parent)));
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, Event::RunLinked { parent_run } if *parent_run == parent))
+    );
 }
 
 // ---------- ending a run from a response ----------

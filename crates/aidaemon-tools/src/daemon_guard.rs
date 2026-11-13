@@ -1,5 +1,5 @@
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -294,9 +294,9 @@ fn extract_nested_payloads(input: &str) -> Vec<String> {
         if INLINE_CODE_WRAPPERS.contains(&base.as_str())
             && let Some(payload) =
                 extract_flag_payload(&parts, cmd_index + 1, PayloadMode::InlineCode)
-            {
-                push_unique_owned(&mut out, &mut seen, payload);
-            }
+        {
+            push_unique_owned(&mut out, &mut seen, payload);
+        }
     }
 
     out

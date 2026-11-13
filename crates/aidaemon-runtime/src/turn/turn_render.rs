@@ -14,10 +14,10 @@
 use crate::policy::recall_guardrails::text_relates_to_critical_identity;
 use crate::settings::{AudioConfig, SttConfig, VisionConfig};
 use crate::turn::sliding_window::summarize_tool_result;
+use aidaemon_events::TerminalState;
 use aidaemon_events::conversation::AttachmentProvenance;
 use aidaemon_events::conversation::{Message, ToolCall};
-use aidaemon_events::TerminalState;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Bump when the rendering ALGORITHM changes; invalidates all cached renders.
 /// v6: a structurally referenced parent turn retains bounded receipt-bearing
@@ -47,9 +47,11 @@ pub fn attach_source_provenance(value: &mut Value, messages: &[&Message]) {
             message_ids.push(message.id.clone());
         }
         if let Some(turn_id) = message.turn_id.as_ref()
-            && !turn_id.is_empty() && !turn_ids.contains(turn_id) {
-                turn_ids.push(turn_id.clone());
-            }
+            && !turn_id.is_empty()
+            && !turn_ids.contains(turn_id)
+        {
+            turn_ids.push(turn_id.clone());
+        }
     }
     if !message_ids.is_empty() {
         object.insert(SOURCE_MESSAGE_IDS_KEY.to_string(), json!(message_ids));
@@ -227,9 +229,10 @@ fn wire_tool_calls(tc_json: &str, result_ids: &std::collections::HashSet<&str>) 
 /// Attach `name` / `tool_call_id` fields when present.
 fn attach_tool_routing(obj: &mut Value, m: &Message) {
     if let Some(name) = &m.tool_name
-        && !name.is_empty() {
-            obj["name"] = json!(name);
-        }
+        && !name.is_empty()
+    {
+        obj["name"] = json!(name);
+    }
     if let Some(tcid) = &m.tool_call_id {
         obj["tool_call_id"] = json!(tcid);
     }
@@ -696,13 +699,14 @@ fn tool_args_for_call(turn_messages: &[Message], call_id: &str) -> Option<String
     for m in turn_messages.iter() {
         if m.role == "assistant"
             && let Some(tc_json) = &m.tool_calls_json
-                && let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
-                    for tc in &tcs {
-                        if tc.id == call_id {
-                            return Some(tc.arguments.clone());
-                        }
-                    }
+            && let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json)
+        {
+            for tc in &tcs {
+                if tc.id == call_id {
+                    return Some(tc.arguments.clone());
                 }
+            }
+        }
     }
     None
 }
@@ -922,9 +926,11 @@ mod tests {
             RENDERER_VERSION,
             &RenderOptions::default(),
         );
-        assert!(serde_json::to_string(&out)
-            .unwrap()
-            .contains("[task interrupted]"));
+        assert!(
+            serde_json::to_string(&out)
+                .unwrap()
+                .contains("[task interrupted]")
+        );
     }
 
     #[test]
@@ -938,9 +944,11 @@ mod tests {
             RENDERER_VERSION,
             &RenderOptions::default(),
         );
-        assert!(serde_json::to_string(&out)
-            .unwrap()
-            .contains("my name is Jordan Lee"));
+        assert!(
+            serde_json::to_string(&out)
+                .unwrap()
+                .contains("my name is Jordan Lee")
+        );
     }
 
     #[test]
@@ -1081,9 +1089,11 @@ mod tests {
         );
         let assistants: Vec<&Value> = out.iter().filter(|m| m["role"] == "assistant").collect();
         assert_eq!(assistants.len(), 1, "{out:?}");
-        assert!(assistants[0]["content"]
-            .as_str()
-            .is_some_and(|c| c.contains("the deploy finished")));
+        assert!(
+            assistants[0]["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("the deploy finished"))
+        );
     }
 
     #[test]

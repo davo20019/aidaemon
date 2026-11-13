@@ -108,29 +108,39 @@ async fn the_guard_refuses_secrets_and_sensitive_writes() {
         .await
         .expect("a secret is refused");
     assert!(!reason.contains("synthetic"), "{reason}");
-    assert!(guard
-        .refusal("read_file", &paths(&root.join(".env.example")), &[])
-        .await
-        .is_none());
-    assert!(guard
-        .refusal("read_file", &paths(&root.join("main.rs")), &[])
-        .await
-        .is_none());
+    assert!(
+        guard
+            .refusal("read_file", &paths(&root.join(".env.example")), &[])
+            .await
+            .is_none()
+    );
+    assert!(
+        guard
+            .refusal("read_file", &paths(&root.join("main.rs")), &[])
+            .await
+            .is_none()
+    );
     for tool in ["write_file", "edit_file"] {
-        assert!(guard
-            .refusal(tool, &[], &paths(&root.join(".env")))
-            .await
-            .is_some());
-        assert!(guard
-            .refusal(tool, &[], &paths(&root.join("notes.txt")))
-            .await
-            .is_none());
+        assert!(
+            guard
+                .refusal(tool, &[], &paths(&root.join(".env")))
+                .await
+                .is_some()
+        );
+        assert!(
+            guard
+                .refusal(tool, &[], &paths(&root.join("notes.txt")))
+                .await
+                .is_none()
+        );
     }
     // A tool the guard was not told about is not judged.
-    assert!(guard
-        .refusal("other_tool", &paths(&root.join(".env")), &[])
-        .await
-        .is_none());
+    assert!(
+        guard
+            .refusal("other_tool", &paths(&root.join(".env")), &[])
+            .await
+            .is_none()
+    );
     drop(dir);
 }
 
@@ -145,15 +155,19 @@ async fn the_guard_follows_symlinks_to_what_they_name() {
     std::os::unix::fs::symlink(root.join(".ssh"), root.join("keys")).unwrap();
     let guard = ProtectedPathGuard::for_workspace(workspace);
 
-    assert!(guard
-        .refusal("read_file", &paths(&root.join("notes.txt")), &[])
-        .await
-        .is_some());
+    assert!(
+        guard
+            .refusal("read_file", &paths(&root.join("notes.txt")), &[])
+            .await
+            .is_some()
+    );
     // A file not created yet, under a link to a sensitive directory.
-    assert!(guard
-        .refusal("write_file", &[], &paths(&root.join("keys/new_key")))
-        .await
-        .is_some());
+    assert!(
+        guard
+            .refusal("write_file", &[], &paths(&root.join("keys/new_key")))
+            .await
+            .is_some()
+    );
     drop(dir);
 }
 
@@ -169,10 +183,12 @@ async fn sensitive_reads_cover_more_than_secrets() {
     let config = paths(&root.join(".git/config"));
     assert!(guard.refusal("read_file", &config, &[]).await.is_none());
     assert!(guard.refusal("publisher", &config, &[]).await.is_some());
-    assert!(guard
-        .refusal("publisher", &paths(&root.join("page.html")), &[])
-        .await
-        .is_none());
+    assert!(
+        guard
+            .refusal("publisher", &paths(&root.join("page.html")), &[])
+            .await
+            .is_none()
+    );
     drop(dir);
 }
 
@@ -212,15 +228,18 @@ async fn edit_changes_nothing_when_ambiguous_and_validates_first() {
         "x\nx\n"
     );
 
-    assert!(edit
-        .validate(&json!({"path": "a", "old_text": "", "new_text": "y"}))
-        .is_err());
-    assert!(edit
-        .validate(&json!({"path": "a", "old_text": "y", "new_text": "y"}))
-        .is_err());
-    assert!(edit
-        .validate(&json!({"path": "a", "old_text": "y"}))
-        .is_err());
+    assert!(
+        edit.validate(&json!({"path": "a", "old_text": "", "new_text": "y"}))
+            .is_err()
+    );
+    assert!(
+        edit.validate(&json!({"path": "a", "old_text": "y", "new_text": "y"}))
+            .is_err()
+    );
+    assert!(
+        edit.validate(&json!({"path": "a", "old_text": "y"}))
+            .is_err()
+    );
 }
 
 /// What a write tool predicts for a call is what the call then writes, and

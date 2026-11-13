@@ -5,8 +5,8 @@
 use std::sync::Mutex;
 
 use aidaemon_memory::{
-    same_value, Episode, EpisodeRecord, Fact, FactRecord, MemoryStats, MemoryStore, NewEpisode,
-    NewFact, Result, StoredEmbedding, UpsertOutcome,
+    Episode, EpisodeRecord, Fact, FactRecord, MemoryStats, MemoryStore, NewEpisode, NewFact,
+    Result, StoredEmbedding, UpsertOutcome, same_value,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

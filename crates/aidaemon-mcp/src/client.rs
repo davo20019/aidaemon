@@ -8,13 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aidaemon_core::{Tool, ToolAnnotations};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::tool::{tools_from_defs, McpToolDef};
+use crate::tool::{McpToolDef, tools_from_defs};
 
 /// The protocol version this client asks for.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -643,9 +643,9 @@ impl McpServer {
             && tokio::time::timeout(Duration::from_secs(2), child.wait())
                 .await
                 .is_err()
-            {
-                let _ = child.kill().await;
-            }
+        {
+            let _ = child.kill().await;
+        }
         self.inner.shared.close();
     }
 }

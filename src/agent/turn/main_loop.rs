@@ -183,13 +183,15 @@ mod stuck_fallback_tests {
         ];
         let mut progress = CompletionProgress::new(&contract, "task-child");
 
-        assert!(assimilate_visible_antecedent_context(
-            &contract,
-            &mut progress,
-            &recent,
-            "antecedent-user",
-        )
-        .is_none());
+        assert!(
+            assimilate_visible_antecedent_context(
+                &contract,
+                &mut progress,
+                &recent,
+                "antecedent-user",
+            )
+            .is_none()
+        );
         assert!(progress.verification_pending);
     }
 

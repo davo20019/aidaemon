@@ -4,7 +4,7 @@
 //!
 //! cargo run -p aidaemon-sdk --example quickstart --features testing
 use aidaemon_sdk::prelude::*;
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
 
 /// Today's weather for a city.
 #[tool(read_only)]

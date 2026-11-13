@@ -11,7 +11,7 @@ mod provenance_tests {
         active_scheduled_root_task_id, task_has_scheduled_provenance,
     };
 
-    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::testing::{MockProvider, setup_test_agent};
     use crate::traits::{Goal, StateStore, Task};
 
     fn root_task(goal_id: &str) -> Task {

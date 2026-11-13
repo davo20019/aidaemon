@@ -73,9 +73,10 @@ impl EventRouter {
 
     pub(crate) fn detach(&self, session_id: &str) {
         if let Ok(mut routes) = self.routes.lock()
-            && let Some(tx) = routes.by_session.remove(session_id) {
-                routes.by_run.retain(|_, other| !other.same_channel(&tx));
-            }
+            && let Some(tx) = routes.by_session.remove(session_id)
+        {
+            routes.by_run.retain(|_, other| !other.same_channel(&tx));
+        }
     }
 
     #[cfg(test)]
@@ -89,9 +90,10 @@ impl EventSink for EventRouter {
     fn emit(&self, run_id: RunId, event: &Event) {
         if let Ok(mut routes) = self.routes.lock() {
             if let Event::RunStarted { session_id } = event
-                && let Some(tx) = routes.by_session.get(session_id).cloned() {
-                    routes.by_run.insert(run_id, tx);
-                }
+                && let Some(tx) = routes.by_session.get(session_id).cloned()
+            {
+                routes.by_run.insert(run_id, tx);
+            }
             let finished = matches!(event, Event::Finished { .. });
             if let Some(tx) = routes.by_run.get(&run_id) {
                 let _ = tx.send(event.clone());

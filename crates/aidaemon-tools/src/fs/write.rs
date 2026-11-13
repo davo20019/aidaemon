@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use aidaemon_core::{AccessManifest, ToolAnnotations};
 
-use super::{path_arg, workspace_parts, FilePolicy, SharedBackend, ToolText};
+use super::{FilePolicy, SharedBackend, ToolText, path_arg, workspace_parts};
 use crate::backend::WriteMode;
-use crate::outcome::{core_tool, OutcomeTool};
+use crate::outcome::{OutcomeTool, core_tool};
 use crate::semantics::{
     DurableReplayDecision, ToolCallContext, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolMutationEffects, ToolRole, ToolTargetHintKind,
@@ -132,12 +132,12 @@ impl OutcomeTool for WriteFile {
                 .metadata(&parent)
                 .await
                 .is_ok_and(|metadata| metadata.is_dir())
-            {
-                anyhow::bail!(
-                    "Parent directory does not exist: {}. Set create_dirs=true to create it.",
-                    parent
-                );
-            }
+        {
+            anyhow::bail!(
+                "Parent directory does not exist: {}. Set create_dirs=true to create it.",
+                parent
+            );
+        }
 
         // Write mode: "overwrite" (default, replaces with backup) or "append"
         // (additive, no backup — lets the model build a large file in chunks
@@ -382,7 +382,7 @@ impl crate::semantics::ToolSemantics for WriteFile {
                     reason: format!(
                         "the prior file-write target can no longer be resolved safely: {error}"
                     ),
-                }
+                };
             }
         };
         match backend.read(&path).await {

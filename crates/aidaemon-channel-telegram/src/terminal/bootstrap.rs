@@ -4,9 +4,9 @@
 
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
+use rand::Rng;
 use rand::rand_core::UnwrapErr;
 use rand::rngs::SysRng;
-use rand::Rng;
 use sha2::Sha256;
 
 const TERMINAL_TENANT_BOT_BOOTSTRAP_DEVICE_ID: &str = "tenant-bot-bootstrap";

@@ -1,20 +1,20 @@
 #[cfg(test)]
 use std::collections::HashMap;
 #[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
-#[cfg(test)]
-use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
 
 #[cfg(test)]
 use chrono::Utc;
 #[cfg(test)]
-use serde_json::json;
-#[cfg(test)]
 use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 #[cfg(test)]
 use tokio::sync::mpsc;
 
@@ -86,7 +86,7 @@ mod validation_state {
     pub(crate) use aidaemon_runtime::turn::validation_state::*;
 }
 #[cfg(test)]
-pub(crate) use validation_state::{persist_executor_handoff_context, ExecutorHandoff};
+pub(crate) use validation_state::{ExecutorHandoff, persist_executor_handoff_context};
 #[cfg(test)]
 #[path = "turn/execution_state.rs"]
 mod execution_state;
@@ -237,9 +237,9 @@ pub use policy_metrics::PolicyAutotuneSnapshot;
 #[path = "agent_helpers.rs"]
 mod agent_helpers;
 #[cfg(test)]
-pub use agent_helpers::touch_heartbeat;
-#[cfg(test)]
 pub(in crate::agent) use agent_helpers::IntentGateDecision;
+#[cfg(test)]
+pub use agent_helpers::touch_heartbeat;
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::{
     user_explicitly_requests_local_file_inspection, user_text_references_filesystem_path,
@@ -263,14 +263,14 @@ pub(in crate::agent) use system_directives::SystemDirective;
 mod goal_dispatch;
 #[cfg(test)]
 pub(crate) use goal_dispatch::{
+    SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS, SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
+};
+#[cfg(test)]
+pub(crate) use goal_dispatch::{
     build_goal_failure_summary, build_goal_task_results_summary, extract_file_paths_from_text,
 };
 #[cfg(test)]
 pub(in crate::agent) use goal_dispatch::{parse_wait_task_seconds, user_facing_task_description};
-#[cfg(test)]
-pub(crate) use goal_dispatch::{
-    SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS, SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
-};
 
 // A goal's background task lead lives in `aidaemon_runtime::background_task_lead`.
 #[path = "background_task_lead.rs"]

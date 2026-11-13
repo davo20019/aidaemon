@@ -17,9 +17,9 @@
 //! logging live at the Task-7 call site, NOT in the pure helper — keep the
 //! helper pure so it stays unit-testable, exactly as `core_cache_decision`.
 
-use aidaemon_events::traits::Message;
 use aidaemon_events::TerminalState;
-use serde_json::{json, Value};
+use aidaemon_events::traits::Message;
+use serde_json::{Value, json};
 
 use crate::prompt::fingerprint::hash_canonical;
 
@@ -83,8 +83,8 @@ pub fn render_cache_decision(
 mod tests {
     use super::*;
     use crate::turn::turn_render::RENDERER_VERSION;
-    use aidaemon_events::conversation::Message;
     use aidaemon_events::TerminalState;
+    use aidaemon_events::conversation::Message;
     use chrono::Utc;
     use serde_json::json;
 

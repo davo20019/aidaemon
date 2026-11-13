@@ -3,14 +3,14 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::info;
 
-use aidaemon_tools::semantics::{
-    semantics_for_exact_read_actions, ApprovalCall, OwnerApprovalNeed, ToolCallContext,
-    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolSemantics,
-};
 use aidaemon_tools::OutcomeTool as Tool;
+use aidaemon_tools::semantics::{
+    ApprovalCall, OwnerApprovalNeed, ToolCallContext, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolMutationEffects, ToolSemantics, semantics_for_exact_read_actions,
+};
 
 use super::{McpRegistry, McpServerConfig};
 
@@ -75,20 +75,22 @@ impl ManageMcpTool {
         }
         let mut effects = CallEffects::unknown();
         if args.action == "add"
-            && let Some(command) = args.command.filter(|command| !command.is_empty()) {
-                effects
-                    .keys
-                    .push(EffectKey::named(EffectClass::Process, &command));
-            }
+            && let Some(command) = args.command.filter(|command| !command.is_empty())
+        {
+            effects
+                .keys
+                .push(EffectKey::named(EffectClass::Process, &command));
+        }
         // Every call that can start a server's process names that server, so
         // a declined add, restart or enable binds the others for it.
         if matches!(args.action.as_str(), "add" | "restart" | "enable")
-            && let Some(name) = args.name.filter(|name| !name.trim().is_empty()) {
-                effects.keys.push(EffectKey::named(
-                    EffectClass::Process,
-                    &server_process_key(&name),
-                ));
-            }
+            && let Some(name) = args.name.filter(|name| !name.trim().is_empty())
+        {
+            effects.keys.push(EffectKey::named(
+                EffectClass::Process,
+                &server_process_key(&name),
+            ));
+        }
         effects
     }
 
@@ -324,8 +326,7 @@ impl ManageMcpTool {
                     .command
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'command' is required for add action"))?;
-                self.handle_add(name, command, args.args)
-                    .await
+                self.handle_add(name, command, args.args).await
             }
             "list" => self.handle_list().await,
             "remove" => {
@@ -392,12 +393,13 @@ impl ToolSemantics for ManageMcpTool {
             return OwnerApprovalNeed::NotNeeded;
         }
         if let Ok(args) = serde_json::from_value::<ManageMcpArgs>(call.arguments.clone())
-            && matches!(args.action.as_str(), "restart" | "enable") {
-                let Some(name) = args.name.as_deref().filter(|name| !name.trim().is_empty()) else {
-                    return OwnerApprovalNeed::NotNeeded;
-                };
-                return self.respawn_approval(&args.action, name).await;
-            }
+            && matches!(args.action.as_str(), "restart" | "enable")
+        {
+            let Some(name) = args.name.as_deref().filter(|name| !name.trim().is_empty()) else {
+                return OwnerApprovalNeed::NotNeeded;
+            };
+            return self.respawn_approval(&args.action, name).await;
+        }
         Self::owner_approval(call.arguments)
     }
 

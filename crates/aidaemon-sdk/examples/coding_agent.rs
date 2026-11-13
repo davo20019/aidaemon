@@ -19,7 +19,7 @@ use aidaemon_sdk::policies::{
 use aidaemon_sdk::prelude::*;
 use aidaemon_sdk::providers::{Anthropic, OpenAiCompatible};
 use aidaemon_sdk::store::SqliteStore;
-use aidaemon_sdk::tools::{default_tools, Workspace};
+use aidaemon_sdk::tools::{Workspace, default_tools};
 use aidaemon_sdk::{Authority, AuthorityHook};
 
 #[tokio::main]

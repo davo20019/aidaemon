@@ -221,8 +221,8 @@ pub(crate) fn normalize_state(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aidaemon_core::testing::{text, ScriptedProvider};
     use aidaemon_core::ToolCall;
+    use aidaemon_core::testing::{ScriptedProvider, text};
     use serde_json::json;
 
     #[test]
@@ -232,7 +232,9 @@ mod tests {
             assert!(normalized.contains(heading));
         }
         assert!(normalized.contains("None recorded."));
-        assert!(normalized.starts_with("## Active goals and open loops\nA concise legacy summary."));
+        assert!(
+            normalized.starts_with("## Active goals and open loops\nA concise legacy summary.")
+        );
     }
 
     #[test]

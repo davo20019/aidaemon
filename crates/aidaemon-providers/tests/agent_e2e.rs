@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use aidaemon_core::{Agent, FnTool, Retry, ToolAnnotations, ToolOutput, ToolSpec};
 use aidaemon_providers::{Anthropic, OpenAiCompatible};
-use common::{data_events, named_events, MockResponse, MockServer};
-use serde_json::{json, Value};
+use common::{MockResponse, MockServer, data_events, named_events};
+use serde_json::{Value, json};
 
 fn lookup_tool() -> impl aidaemon_core::Tool {
     let spec = ToolSpec {
@@ -88,10 +88,12 @@ async fn openai_agent_tool_round_trip() {
     assert_eq!(assistant["tool_calls"][0]["id"], "call_77");
     let tool_msg = messages.iter().find(|m| m["role"] == "tool").unwrap();
     assert_eq!(tool_msg["tool_call_id"], "call_77");
-    assert!(tool_msg["content"]
-        .as_str()
-        .unwrap()
-        .contains("order A-100: shipped"));
+    assert!(
+        tool_msg["content"]
+            .as_str()
+            .unwrap()
+            .contains("order A-100: shipped")
+    );
     assert_eq!(
         requests[2].body["tools"][0]["function"]["name"],
         "lookup_order"
@@ -191,8 +193,10 @@ async fn anthropic_agent_tool_round_trip() {
     assert_eq!(messages[2]["role"], "user");
     assert_eq!(messages[2]["content"][0]["type"], "tool_result");
     assert_eq!(messages[2]["content"][0]["tool_use_id"], "toolu_1");
-    assert!(messages[2]["content"][0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("order B-7: shipped"));
+    assert!(
+        messages[2]["content"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("order B-7: shipped")
+    );
 }

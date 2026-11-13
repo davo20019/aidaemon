@@ -13,7 +13,7 @@ use crate::outcome::{RunOutcome, RunStatus};
 use crate::provider::{Provider, ToolSpec};
 use crate::run_loop::Driver;
 use crate::safeguard::Safeguard;
-use crate::state::{Interruption, RunState, RUN_STATE_SCHEMA};
+use crate::state::{Interruption, RUN_STATE_SCHEMA, RunState};
 use crate::store::RunStore;
 use crate::stuck::StuckConfig;
 use crate::tool::{Extensions, Tool};

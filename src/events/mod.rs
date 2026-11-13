@@ -19,7 +19,7 @@ pub use aidaemon_runtime::consolidation::{Consolidator, Pruner};
 
 #[allow(unused_imports)]
 pub use aidaemon_events::conversation_turn::{
-    turn_from_event, ConversationTurn, ConversationTurnRole, FetchedTurn,
+    ConversationTurn, ConversationTurnRole, FetchedTurn, turn_from_event,
 };
 pub use aidaemon_events::payloads::*;
 #[cfg(test)]
@@ -37,8 +37,8 @@ pub use aidaemon_events::store::{
 pub use aidaemon_events::terminal_state::TerminalState;
 #[allow(unused_imports)]
 pub use aidaemon_events::{
-    is_memory_isolated_worker_session, session_has_mandate_execution_provenance, Event, EventType,
-    TaskOutcome, TaskStatus,
+    Event, EventType, TaskOutcome, TaskStatus, is_memory_isolated_worker_session,
+    session_has_mandate_execution_provenance,
 };
 
 /// The daemon's end of the event store's seams.

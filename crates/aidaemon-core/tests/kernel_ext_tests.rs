@@ -4,14 +4,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider, StreamingProvider};
+use aidaemon_core::testing::{ScriptedProvider, StreamingProvider, call, spec, text, tool_calls};
 use aidaemon_core::{
     AccessManifest, Agent, Event, Hook, HookContext, MemoryStore, ProviderError, ReceiptStatus,
     Retry, Role, RunId, RunStatus, RunStore, Tool, ToolAnnotations, ToolCall, ToolContext,
     ToolDecision, ToolInfo, ToolOutput, ToolResult, ToolSpec, Usage,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]

@@ -286,31 +286,43 @@ mod tests {
         let config = ComputerUseConfig::default();
         state.approve_once("session", &requested_app_subject(" Example "));
 
-        assert!(state
-            .ensure_app(&config, "session", "com.example.App", "Example", "example")
-            .await
-            .is_ok());
-        assert!(state
-            .ensure_app(&config, "session", "com.example.App", "Example", "example")
-            .await
-            .is_err());
+        assert!(
+            state
+                .ensure_app(&config, "session", "com.example.App", "Example", "example")
+                .await
+                .is_ok()
+        );
+        assert!(
+            state
+                .ensure_app(&config, "session", "com.example.App", "Example", "example")
+                .await
+                .is_err()
+        );
     }
 
     #[test]
     fn consequential_approval_covers_one_exact_action() {
         let state = ApprovalState::new();
         state.approve_once("session", "delete-subject");
-        assert!(state
-            .ensure_consequential("session", "other-subject")
-            .is_err());
-        assert!(state
-            .ensure_consequential("other-session", "delete-subject")
-            .is_err());
-        assert!(state
-            .ensure_consequential("session", "delete-subject")
-            .is_ok());
-        assert!(state
-            .ensure_consequential("session", "delete-subject")
-            .is_err());
+        assert!(
+            state
+                .ensure_consequential("session", "other-subject")
+                .is_err()
+        );
+        assert!(
+            state
+                .ensure_consequential("other-session", "delete-subject")
+                .is_err()
+        );
+        assert!(
+            state
+                .ensure_consequential("session", "delete-subject")
+                .is_ok()
+        );
+        assert!(
+            state
+                .ensure_consequential("session", "delete-subject")
+                .is_err()
+        );
     }
 }

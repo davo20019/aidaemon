@@ -20,14 +20,14 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::backend::{normalize_posix_absolute, SharedExecutionBackend};
-use crate::local_backend::{expand_local_path, LocalBackend};
+use crate::backend::{SharedExecutionBackend, normalize_posix_absolute};
+use crate::local_backend::{LocalBackend, expand_local_path};
 use crate::process_control::{
     configure_command_for_process_group, send_sigkill, send_sigterm, terminate_process_tree,
 };
 use crate::{
-    shell_quote, BackendDirEntry, BackendFileType, BackendKind, BackendMetadata, BackendPath,
-    ExecutionBackend, ExecutionOutput, ExecutionRequest, ProcessHandle, SpawnedProcess, WriteMode,
+    BackendDirEntry, BackendFileType, BackendKind, BackendMetadata, BackendPath, ExecutionBackend,
+    ExecutionOutput, ExecutionRequest, ProcessHandle, SpawnedProcess, WriteMode, shell_quote,
 };
 
 /// Agent-visible execution workspace configuration.
@@ -681,9 +681,10 @@ impl RemoteBackendCore {
         let mut values = BTreeMap::new();
         for name in &self.env_allowlist {
             if !removed_env.contains(name)
-                && let Ok(value) = std::env::var(name) {
-                    values.insert(name.clone(), value);
-                }
+                && let Ok(value) = std::env::var(name)
+            {
+                values.insert(name.clone(), value);
+            }
         }
         values.extend(request_env.clone());
         values
@@ -1234,8 +1235,8 @@ async fn local_command_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::normalize_path_lexically;
     use crate::LexicalPaths;
+    use crate::backend::normalize_path_lexically;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -1323,9 +1324,11 @@ mod tests {
 
         let nested = backend.resolve_path("nested").await?;
         let entries = backend.read_dir(&nested).await?;
-        anyhow::ensure!(entries
-            .iter()
-            .any(|entry| entry.path.file_name() == Some("value.txt")));
+        anyhow::ensure!(
+            entries
+                .iter()
+                .any(|entry| entry.path.file_name() == Some("value.txt"))
+        );
         anyhow::ensure!(backend.metadata(&path).await?.is_file());
 
         let copy = backend.resolve_path("nested/copied.txt").await?;

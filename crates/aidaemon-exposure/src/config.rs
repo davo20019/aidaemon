@@ -10,7 +10,7 @@ use crate::adapters::{
     cloudflare::CloudflareAdapter, command::CommandAdapter, manual::ManualAdapter,
     tailscale::TailscaleAdapter,
 };
-use crate::{validate_https_origin, ExposedService, ExposureAdapter, OriginStability};
+use crate::{ExposedService, ExposureAdapter, OriginStability, validate_https_origin};
 
 /// The `[exposure]` table. No table: nothing is exposed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,13 +148,14 @@ impl ExposureConfig {
                 ..
             }),
         ) = (&self.client_gateway, &self.node_gateway)
-            && a.trim() == b.trim() {
-                return Err(
-                    "exposure.client_gateway and exposure.node_gateway must use different \
+            && a.trim() == b.trim()
+        {
+            return Err(
+                "exposure.client_gateway and exposure.node_gateway must use different \
                      Cloudflare tunnels: one tunnel publishes one service"
-                        .to_string(),
-                );
-            }
+                    .to_string(),
+            );
+        }
         if let (
             Some(ServiceExposureConfig::Tailscale { .. }),
             Some(ServiceExposureConfig::Tailscale { .. }),

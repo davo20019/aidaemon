@@ -381,9 +381,10 @@ pub(crate) async fn spawn(
             }
         };
         if let Some(cleanup) = &options.cleanup
-            && let Err(error) = cleanup.output(Duration::from_secs(10)).await {
-                warn!(program = %label, %error, "Tunnel cleanup failed");
-            }
+            && let Err(error) = cleanup.output(Duration::from_secs(10)).await
+        {
+            warn!(program = %label, %error, "Tunnel cleanup failed");
+        }
         if let Some(pidfile) = &options.pidfile {
             let _ = tokio::fs::remove_file(pidfile).await;
         }

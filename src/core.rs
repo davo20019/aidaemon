@@ -568,7 +568,7 @@ pub async fn run(
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut terminate) => {
                 tokio::select! {
@@ -662,11 +662,11 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::startup::migrations::{
-        retire_legacy_system_maintenance_goals, LEGACY_KNOWLEDGE_MAINTENANCE_GOAL_DESC,
-        LEGACY_MEMORY_HEALTH_GOAL_DESC, LEGACY_SYSTEM_SESSION_ID,
+        LEGACY_KNOWLEDGE_MAINTENANCE_GOAL_DESC, LEGACY_MEMORY_HEALTH_GOAL_DESC,
+        LEGACY_SYSTEM_SESSION_ID, retire_legacy_system_maintenance_goals,
     };
     use crate::startup::prompt::{
-        build_base_system_prompt, load_agent_persona, MAX_PERSONA_FILE_BYTES,
+        MAX_PERSONA_FILE_BYTES, build_base_system_prompt, load_agent_persona,
     };
     use crate::state::SqliteStateStore;
     use crate::traits::store_prelude::*;
@@ -1071,8 +1071,10 @@ primary = "gpt-4o"
         assert!(prompt.contains("never give an earlier run's measurement as this run's result"));
         // A helper reports no time at all: its run's time is the daemon's
         // measurement, added under its report.
-        assert!(include_str!("../specialists/_executor_base.md")
-            .contains(aidaemon_runtime::specialists::compose::OWN_DURATION_RULE));
+        assert!(
+            include_str!("../specialists/_executor_base.md")
+                .contains(aidaemon_runtime::specialists::compose::OWN_DURATION_RULE)
+        );
     }
 
     /// Live 2026-11-13: a clear request for two fresh installs got "Did you
@@ -1091,8 +1093,10 @@ primary = "gpt-4o"
             "- **Do clear requests without asking.** When the request is clear and the way to do \
              it without harming anything that exists is obvious"
         ));
-        assert!(prompt
-            .contains("Ask first only when the choices would destroy or change existing work."));
+        assert!(
+            prompt
+                .contains("Ask first only when the choices would destroy or change existing work.")
+        );
         assert!(prompt.contains(&format!(
             "A result's line starting \"{}\" is the daemon's own measurement",
             aidaemon_runtime::turn::sliding_window::MEASURED_TIMING_MARK.trim_end()
@@ -1131,7 +1135,9 @@ primary = "gpt-4o"
         )
         .unwrap();
 
-        assert!(prompt.contains("**Outcome-driven autonomy — when to continue and when to stop:**"));
+        assert!(
+            prompt.contains("**Outcome-driven autonomy — when to continue and when to stop:**")
+        );
         assert!(prompt.contains(
             "Treat the user's requested outcome as the unit of work, not an individual message, command, or tool call"
         ));

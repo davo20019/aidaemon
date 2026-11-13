@@ -9,8 +9,8 @@ use aidaemon_events::conversation::MessageAttachment;
 
 use super::auth;
 use super::domain::{
-    AuthenticatedNodeContext, NodeAction, NodeTurnState, CHILD_COMPANION_POLICY,
-    NODE_PROTOCOL_MAJOR,
+    AuthenticatedNodeContext, CHILD_COMPANION_POLICY, NODE_PROTOCOL_MAJOR, NodeAction,
+    NodeTurnState,
 };
 use super::protocol::*;
 use super::store::{CreateTurnOutcome, NodeStore, PairingOffer};
@@ -840,14 +840,14 @@ impl NodeService {
                 .turn_is_cancelled(&context.node_id, &turn_id)
                 .await
                 .unwrap_or(false)
-            {
-                let _ = self.store.update_turn(
+        {
+            let _ = self.store.update_turn(
                     &context.node_id,
                     &turn_id,
                     NodeTurnState::Error,
                     json!({"state":"error", "code":"processing_failed", "message":error.to_string()}),
                 ).await;
-            }
+        }
     }
 
     async fn complete_with_response(
@@ -985,27 +985,33 @@ mod sensor_tests {
 
     #[test]
     fn environmental_sensor_validation_is_bounded() {
-        assert!(validate_sensor_reading(&SensorReading {
-            capability_id: "sensor.environment.temperature".into(),
-            capability_version: 1,
-            value: 22.75,
-            unit: "celsius".into(),
-        })
-        .is_ok());
-        assert!(validate_sensor_reading(&SensorReading {
-            capability_id: "sensor.environment.humidity".into(),
-            capability_version: 1,
-            value: 101.0,
-            unit: "percent_rh".into(),
-        })
-        .is_err());
-        assert!(validate_sensor_reading(&SensorReading {
-            capability_id: "sensor.environment.temperature".into(),
-            capability_version: 1,
-            value: f64::NAN,
-            unit: "celsius".into(),
-        })
-        .is_err());
+        assert!(
+            validate_sensor_reading(&SensorReading {
+                capability_id: "sensor.environment.temperature".into(),
+                capability_version: 1,
+                value: 22.75,
+                unit: "celsius".into(),
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_sensor_reading(&SensorReading {
+                capability_id: "sensor.environment.humidity".into(),
+                capability_version: 1,
+                value: 101.0,
+                unit: "percent_rh".into(),
+            })
+            .is_err()
+        );
+        assert!(
+            validate_sensor_reading(&SensorReading {
+                capability_id: "sensor.environment.temperature".into(),
+                capability_version: 1,
+                value: f64::NAN,
+                unit: "celsius".into(),
+            })
+            .is_err()
+        );
     }
 
     #[test]

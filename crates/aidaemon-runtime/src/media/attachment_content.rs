@@ -1,6 +1,6 @@
 //! Compose text + image + audio blocks for user messages with attachments.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::settings::{AudioConfig, VisionConfig};
 use aidaemon_events::conversation::MessageAttachment;

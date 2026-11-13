@@ -7,8 +7,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use aidaemon_core::{
-    EffectClass, Hook, HookContext, InterruptKind, OwnerApprovalRequest, Safeguard, ToolCall,
-    ToolDecision, ToolInfo, OWNER_DECLINED,
+    EffectClass, Hook, HookContext, InterruptKind, OWNER_DECLINED, OwnerApprovalRequest, Safeguard,
+    ToolCall, ToolDecision, ToolInfo,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -368,9 +368,10 @@ impl ApprovalPolicy {
             return refusal;
         }
         if let Some(grants) = &self.grants
-            && grants.covers(&request).await {
-                return ToolDecision::Allow;
-            }
+            && grants.covers(&request).await
+        {
+            return ToolDecision::Allow;
+        }
         interrupt(request, info)
     }
 }
@@ -534,9 +535,10 @@ impl Hook for ApprovalPolicy {
             // The owner already allowed this exact call on the safety
             // check's card: one answer covers it.
             if let Some(grants) = &self.grants
-                && grants.take_call_allowed_once(&request.subject).await {
-                    return decision;
-                }
+                && grants.take_call_allowed_once(&request.subject).await
+            {
+                return decision;
+            }
             if let Some(card) = &mut request.card {
                 card.reason = Some(aidaemon_core::AskReason::AfterADecline {
                     declined: declined_in_words(ctx.declined),
@@ -684,18 +686,18 @@ mod tests {
 
 #[cfg(test)]
 mod rules_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::grants::SessionGrants;
-    use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
+    use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
     use aidaemon_core::{
-        is_untrusted_egress, AccessManifest, Agent, ApprovalRisk, CallEffects, EffectClass,
-        EffectKey, FnTool, OwnerApprovalRequest, Resolution, RunId, RunStatus, SourceTrust,
-        ToolAnnotations, ToolOutput, UntrustedHook, UntrustedMode, Usage,
+        AccessManifest, Agent, ApprovalRisk, CallEffects, EffectClass, EffectKey, FnTool,
+        OwnerApprovalRequest, Resolution, RunId, RunStatus, SourceTrust, ToolAnnotations,
+        ToolOutput, UntrustedHook, UntrustedMode, Usage, is_untrusted_egress,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     const SEND: ToolAnnotations = ToolAnnotations {
         egress: true,
@@ -1118,11 +1120,9 @@ mod rules_tests {
         );
         // Complete effects are left to the kernel's decline check.
         let known = ToolInfo {
-            effects: complete(vec![EffectKey::path(
-                EffectClass::Write,
-                "/home/synthetic/project/b",
-            )
-            .unwrap()]),
+            effects: complete(vec![
+                EffectKey::path(EffectClass::Write, "/home/synthetic/project/b").unwrap(),
+            ]),
             ..opaque_write.clone()
         };
         assert_eq!(

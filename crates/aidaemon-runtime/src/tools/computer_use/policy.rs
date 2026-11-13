@@ -152,9 +152,10 @@ pub fn classify_target(
         }
     }
     if let Some(text) = typed_text
-        && aidaemon_tools::consequential::names_consequential_action(text) {
-            return ActionClass::Consequential;
-        }
+        && aidaemon_tools::consequential::names_consequential_action(text)
+    {
+        return ActionClass::Consequential;
+    }
     action.base_class()
 }
 

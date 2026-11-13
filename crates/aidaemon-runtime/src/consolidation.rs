@@ -25,9 +25,9 @@ use aidaemon_events::{Event, EventStore, EventType, TaskOutcome};
 use aidaemon_memory::Embedder;
 use aidaemon_work::plans::{PlanStore, StepStatus};
 
+use crate::llm::SharedLlmRuntime;
 use crate::llm::gateway::SideCallGateway;
 use crate::llm::side_calls::SideCall;
-use crate::llm::SharedLlmRuntime;
 
 /// Statistics from a consolidation run
 #[derive(Debug, Default)]

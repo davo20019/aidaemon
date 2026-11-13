@@ -58,12 +58,12 @@ use std::time::Duration;
 use aidaemon_core::{Event, RunId, RunState, RunStatus, RunStore, StoreError};
 use async_trait::async_trait;
 use serde_json::Value;
+use sqlx::Row;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
-use sqlx::Row;
 
-pub use migrations::{latest_version, Migration, MIGRATIONS};
+pub use migrations::{MIGRATIONS, Migration, latest_version};
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 

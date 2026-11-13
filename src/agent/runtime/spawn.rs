@@ -210,7 +210,7 @@ mod tests {
 
     #[tokio::test]
     async fn mandate_task_lead_receives_only_bounded_owner_guidance_from_goal_context() {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::store_prelude::*;
         use crate::traits::{Goal, Mandate, MandateAuthority};
 
@@ -250,9 +250,10 @@ mod tests {
             .engine()
             .build_task_lead_spec(&[], &goal.id, &goal.description, 1, false, None)
             .await;
-        assert!(spec
-            .system_prompt
-            .contains("Prefer thoughtful replies over original posts"));
+        assert!(
+            spec.system_prompt
+                .contains("Prefer thoughtful replies over original posts")
+        );
         assert!(!spec.system_prompt.contains("PRIVATE CONTROLLER FACT"));
         assert!(!spec.system_prompt.contains("PRIVATE CONTROLLER HISTORY"));
     }

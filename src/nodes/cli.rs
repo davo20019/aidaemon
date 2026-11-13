@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::config::AppConfig;
-use crate::nodes::domain::{NodeAction, CHILD_COMPANION_POLICY};
+use crate::nodes::domain::{CHILD_COMPANION_POLICY, NodeAction};
 use anyhow::Context;
 use sqlx::SqlitePool;
 
@@ -345,7 +345,9 @@ fn print_monitor_help() {
     println!("  list");
     println!("  history <monitor_id> [--since-hours N] [--limit N]");
     println!("  pause|resume|cancel <monitor_id>");
-    println!("Owner session is resolved from the most recently active configured private Telegram Channel; use --session only for explicit local administration.");
+    println!(
+        "Owner session is resolved from the most recently active configured private Telegram Channel; use --session only for explicit local administration."
+    );
 }
 
 #[cfg(test)]

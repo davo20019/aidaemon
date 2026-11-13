@@ -859,12 +859,14 @@ async fn the_chat_work_lists_a_tools_background_command_and_stops_it() {
     assert_eq!(job.kind, ChatWorkKind::BackgroundJob);
     assert_eq!(job.title, "Background command: count to 300");
     assert_eq!(job.request.as_deref(), Some("turn-a"));
-    assert!(harness
-        .agent
-        .chat_work("another-chat")
-        .await
-        .items
-        .is_empty());
+    assert!(
+        harness
+            .agent
+            .chat_work("another-chat")
+            .await
+            .items
+            .is_empty()
+    );
 
     assert!(
         harness
@@ -872,12 +874,14 @@ async fn the_chat_work_lists_a_tools_background_command_and_stops_it() {
             .stop_chat_work("chat-with-a-job", &job.key)
             .await
     );
-    assert!(harness
-        .agent
-        .chat_work("chat-with-a-job")
-        .await
-        .items
-        .is_empty());
+    assert!(
+        harness
+            .agent
+            .chat_work("chat-with-a-job")
+            .await
+            .items
+            .is_empty()
+    );
 }
 
 /// The real terminal, called as a sub-agent's run calls it: its session is

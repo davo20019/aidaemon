@@ -89,13 +89,13 @@ mod suite;
 #[cfg(feature = "examples")]
 pub mod examples;
 
-pub use report::{compare, Comparison, ComparisonRow, FailureCount, Report, ScenarioReport};
+pub use report::{Comparison, ComparisonRow, FailureCount, Report, ScenarioReport, compare};
 pub use runner::{
-    check_expectations, check_trajectory, AgentFactory, AgentSubject, CallRecord, CaseResult,
-    FactoryError, FnFactory, Subject, Trajectory,
+    AgentFactory, AgentSubject, CallRecord, CaseResult, FactoryError, FnFactory, Subject,
+    Trajectory, check_expectations, check_trajectory,
 };
 pub use scenario::{
-    status_name, EvalError, Expect, ExpectedStatus, NoExtension, Scenario, ScenarioLimits,
-    ScriptedArguments, ScriptedCall, ScriptedReply, ScriptedUsage, ToolLaneExpect,
+    EvalError, Expect, ExpectedStatus, NoExtension, Scenario, ScenarioLimits, ScriptedArguments,
+    ScriptedCall, ScriptedReply, ScriptedUsage, ToolLaneExpect, status_name,
 };
 pub use suite::Suite;

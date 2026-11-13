@@ -2,15 +2,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
 use aidaemon_core::{
     Agent, CancellationToken, Event, Hook, HookContext, InterruptKind, Interruption, Pending,
     ReceiptStatus, Resolution, RunId, RunState, RunStatus, RunStore, Tool, ToolAnnotations,
     ToolCall, ToolContext, ToolDecision, ToolInfo, ToolOutput, ToolResult, ToolSpec,
 };
-use aidaemon_store_sqlite::{latest_version, Error, SqliteStore};
+use aidaemon_store_sqlite::{Error, SqliteStore, latest_version};
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn db_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
     dir.path().join("runs.db")
@@ -265,11 +265,13 @@ async fn session_queries_and_interrupted_runs() {
         .unwrap()
         .unwrap();
     assert_eq!(latest.run_id, paused.state.run_id);
-    assert!(store
-        .latest_state_for_session("nobody")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .latest_state_for_session("nobody")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let interrupted = store.interrupted_runs().await.unwrap();
     assert_eq!(interrupted.len(), 1);

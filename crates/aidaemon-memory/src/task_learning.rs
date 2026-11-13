@@ -8,7 +8,7 @@ use aidaemon_core::{Message, ModelRequest, Provider};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::learning::{procedure_keyed_name, ErrorSolution, LearningStore, Procedure};
+use crate::learning::{ErrorSolution, LearningStore, Procedure, procedure_keyed_name};
 use crate::records::FactPrivacy;
 use crate::stores::FactStore;
 
@@ -366,7 +366,7 @@ mod tests {
 mod learner_tests {
     use std::sync::Mutex;
 
-    use aidaemon_core::testing::{text, ScriptedProvider};
+    use aidaemon_core::testing::{ScriptedProvider, text};
     use async_trait::async_trait;
 
     use super::*;

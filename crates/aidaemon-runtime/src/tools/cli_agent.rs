@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -22,8 +22,8 @@ use crate::tools::traits::{
 };
 use crate::turn::execution_state::TargetScope;
 use crate::turn::validation_state::{
-    derive_executor_step_result, persist_executor_handoff_context, persist_executor_result_context,
-    ExecutorHandoff, TaskValidationOutcome,
+    ExecutorHandoff, TaskValidationOutcome, derive_executor_step_result,
+    persist_executor_handoff_context, persist_executor_result_context,
 };
 use aidaemon_channels::ports::OutboundRouter;
 use aidaemon_core::card::Step;
@@ -1007,15 +1007,16 @@ async fn resolve_agent_launch(
     let mut resolved_args = args.to_vec();
 
     if is_env_launcher(&resolved_command)
-        && let Some(index) = env_wrapped_program_index(&resolved_args) {
-            let nested = resolved_args[index].clone();
-            let resolved_nested = resolve_executable(backend, &nested).await.ok_or_else(|| {
+        && let Some(index) = env_wrapped_program_index(&resolved_args)
+    {
+        let nested = resolved_args[index].clone();
+        let resolved_nested = resolve_executable(backend, &nested).await.ok_or_else(|| {
                 format!(
                     "wrapped CLI agent executable '{nested}' was not found in PATH or common user install directories"
                 )
             })?;
-            resolved_args[index] = resolved_nested;
-        }
+        resolved_args[index] = resolved_nested;
+    }
 
     Ok((resolved_command, resolved_args))
 }
@@ -1291,9 +1292,10 @@ impl CliAgentTool {
                 .is_some_and(|name| name.eq_ignore_ascii_case("codex"))
         };
         if let Some(preferred) = preferred
-            && tools.get(preferred).is_some_and(supports_split_access) {
-                return Some(preferred.to_string());
-            }
+            && tools.get(preferred).is_some_and(supports_split_access)
+        {
+            return Some(preferred.to_string());
+        }
         let mut compatible = tools
             .iter()
             .filter(|(_, entry)| supports_split_access(entry))
@@ -1885,21 +1887,22 @@ impl CliAgentTool {
         // Conversation context (truncated first if over budget)
         let mut context_text = String::new();
         if let Ok(history) = self.state.get_history(session_id, 10).await
-            && !history.is_empty() {
-                let mut lines = Vec::new();
-                for msg in history.iter().rev().take(10) {
-                    let role = &msg.role;
-                    let content: String = msg
-                        .content
-                        .as_deref()
-                        .unwrap_or("")
-                        .chars()
-                        .take(400)
-                        .collect();
-                    lines.push(format!("{}: {}", role, content));
-                }
-                context_text = lines.join("\n");
+            && !history.is_empty()
+        {
+            let mut lines = Vec::new();
+            for msg in history.iter().rev().take(10) {
+                let role = &msg.role;
+                let content: String = msg
+                    .content
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(400)
+                    .collect();
+                lines.push(format!("{}: {}", role, content));
             }
+            context_text = lines.join("\n");
+        }
 
         // Relevant facts (query both task prompt and recent user message)
         let mut facts_text = String::new();
@@ -1917,17 +1920,19 @@ impl CliAgentTool {
 
             if let Ok(history) = self.state.get_history(session_id, 10).await
                 && let Some(last_user_msg) = history.iter().rev().find(|m| m.role == "user")
-                    && let Some(content) = last_user_msg.content.as_deref() {
-                        let user_text: String = content.chars().take(500).collect();
-                        if user_text != task_prompt
-                            && let Ok(facts) = store.get_relevant_facts(&user_text, 10).await {
-                                for fact in facts {
-                                    if seen.insert((fact.category.clone(), fact.key.clone())) {
-                                        facts_accum.push(fact);
-                                    }
-                                }
-                            }
+                && let Some(content) = last_user_msg.content.as_deref()
+            {
+                let user_text: String = content.chars().take(500).collect();
+                if user_text != task_prompt
+                    && let Ok(facts) = store.get_relevant_facts(&user_text, 10).await
+                {
+                    for fact in facts {
+                        if seen.insert((fact.category.clone(), fact.key.clone())) {
+                            facts_accum.push(fact);
+                        }
                     }
+                }
+            }
 
             facts_accum.truncate(20);
             let recalled: Vec<i64> = facts_accum.iter().map(|fact| fact.id).collect();
@@ -1947,9 +1952,9 @@ impl CliAgentTool {
             && let Some(active_goal) = goals
                 .iter()
                 .find(|g| g.status == "active" || g.status == "in_progress")
-            {
-                active_goal_text = active_goal.description.chars().take(500).collect();
-            }
+        {
+            active_goal_text = active_goal.description.chars().take(500).collect();
+        }
 
         // Scoped repository instructions. Native coding CLIs also perform
         // their own discovery from cwd; this shared snapshot keeps enriched
@@ -2385,10 +2390,11 @@ impl CliAgentTool {
             Err(error) => {
                 // Auto-disable dynamic agents that disappeared
                 if let Ok(agents) = self.state.list_dynamic_cli_agents().await
-                    && let Some(mut agent) = agents.into_iter().find(|a| a.name == tool_name) {
-                        agent.enabled = false;
-                        let _ = self.state.update_dynamic_cli_agent(&agent).await;
-                    }
+                    && let Some(mut agent) = agents.into_iter().find(|a| a.name == tool_name)
+                {
+                    agent.enabled = false;
+                    let _ = self.state.update_dynamic_cli_agent(&agent).await;
+                }
                 let message = format!(
                     "ERROR: CLI agent '{tool_name}' could not start: {error}. \
                  Re-register it with an absolute executable path or reinstall it."
@@ -3035,26 +3041,27 @@ impl CliAgentTool {
 
             // Send any remaining lines (with JSON parsing)
             if !pending_lines.is_empty()
-                && let Some(ref tx) = status_tx_clone {
-                    let mut progress_items: Vec<String> = Vec::new();
-                    for line in &pending_lines {
-                        if looks_like_json(line) {
-                            if let Some(progress) = extract_progress_from_json(line) {
-                                progress_items.push(progress);
-                            }
-                        } else {
-                            progress_items.push(line.clone());
+                && let Some(ref tx) = status_tx_clone
+            {
+                let mut progress_items: Vec<String> = Vec::new();
+                for line in &pending_lines {
+                    if looks_like_json(line) {
+                        if let Some(progress) = extract_progress_from_json(line) {
+                            progress_items.push(progress);
                         }
-                    }
-                    if !progress_items.is_empty() {
-                        progress_items.dedup();
-                        let chunk = progress_items.join("\n");
-                        let _ = tx.try_send(StatusUpdate::ToolProgress {
-                            name: tool_name_owned.clone(),
-                            chunk: truncate_with_note(&chunk, 500),
-                        });
+                    } else {
+                        progress_items.push(line.clone());
                     }
                 }
+                if !progress_items.is_empty() {
+                    progress_items.dedup();
+                    let chunk = progress_items.join("\n");
+                    let _ = tx.try_send(StatusUpdate::ToolProgress {
+                        name: tool_name_owned.clone(),
+                        chunk: truncate_with_note(&chunk, 500),
+                    });
+                }
+            }
 
             // Wait for process to complete and signal via channel
             let exit_code = if loop_detected {
@@ -4373,74 +4380,75 @@ fn extract_progress_from_json(line: &str) -> Option<String> {
             "assistant" => {
                 // Assistant is thinking/responding - extract tool use details
                 if let Some(content) = v.get("message").and_then(|m| m.get("content"))
-                    && let Some(arr) = content.as_array() {
-                        for item in arr {
-                            if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                                let name = item
-                                    .get("name")
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("unknown");
-                                let input = item.get("input");
+                    && let Some(arr) = content.as_array()
+                {
+                    for item in arr {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            let name = item
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("unknown");
+                            let input = item.get("input");
 
-                                // Extract details based on tool type
-                                let detail = match name {
-                                    "Bash" | "bash" | "terminal" => input
-                                        .and_then(|i| i.get("command"))
-                                        .and_then(|c| c.as_str())
-                                        .map(|cmd| {
-                                            let short: String = cmd.chars().take(50).collect();
-                                            format!("⚡ {}", short)
-                                        }),
-                                    "Read" | "read" => input
-                                        .and_then(|i| i.get("file_path"))
-                                        .and_then(|p| p.as_str())
-                                        .map(|path| {
-                                            let short: String = path
-                                                .chars()
-                                                .rev()
-                                                .take(40)
-                                                .collect::<String>()
-                                                .chars()
-                                                .rev()
-                                                .collect();
-                                            format!("📖 ...{}", short)
-                                        }),
-                                    "Write" | "write" | "Edit" | "edit" => input
-                                        .and_then(|i| i.get("file_path"))
-                                        .and_then(|p| p.as_str())
-                                        .map(|path| {
-                                            let short: String = path
-                                                .chars()
-                                                .rev()
-                                                .take(40)
-                                                .collect::<String>()
-                                                .chars()
-                                                .rev()
-                                                .collect();
-                                            format!("✏️ ...{}", short)
-                                        }),
-                                    "Glob" | "glob" => input
-                                        .and_then(|i| i.get("pattern"))
-                                        .and_then(|p| p.as_str())
-                                        .map(|pat| format!("🔍 {}", pat)),
-                                    "Grep" | "grep" => input
-                                        .and_then(|i| i.get("pattern"))
-                                        .and_then(|p| p.as_str())
-                                        .map(|pat| {
-                                            let short: String = pat.chars().take(30).collect();
-                                            format!("🔍 grep: {}", short)
-                                        }),
-                                    "Task" => input
-                                        .and_then(|i| i.get("description"))
-                                        .and_then(|d| d.as_str())
-                                        .map(|desc| format!("🚀 {}", desc)),
-                                    _ => None,
-                                };
+                            // Extract details based on tool type
+                            let detail = match name {
+                                "Bash" | "bash" | "terminal" => input
+                                    .and_then(|i| i.get("command"))
+                                    .and_then(|c| c.as_str())
+                                    .map(|cmd| {
+                                        let short: String = cmd.chars().take(50).collect();
+                                        format!("⚡ {}", short)
+                                    }),
+                                "Read" | "read" => input
+                                    .and_then(|i| i.get("file_path"))
+                                    .and_then(|p| p.as_str())
+                                    .map(|path| {
+                                        let short: String = path
+                                            .chars()
+                                            .rev()
+                                            .take(40)
+                                            .collect::<String>()
+                                            .chars()
+                                            .rev()
+                                            .collect();
+                                        format!("📖 ...{}", short)
+                                    }),
+                                "Write" | "write" | "Edit" | "edit" => input
+                                    .and_then(|i| i.get("file_path"))
+                                    .and_then(|p| p.as_str())
+                                    .map(|path| {
+                                        let short: String = path
+                                            .chars()
+                                            .rev()
+                                            .take(40)
+                                            .collect::<String>()
+                                            .chars()
+                                            .rev()
+                                            .collect();
+                                        format!("✏️ ...{}", short)
+                                    }),
+                                "Glob" | "glob" => input
+                                    .and_then(|i| i.get("pattern"))
+                                    .and_then(|p| p.as_str())
+                                    .map(|pat| format!("🔍 {}", pat)),
+                                "Grep" | "grep" => input
+                                    .and_then(|i| i.get("pattern"))
+                                    .and_then(|p| p.as_str())
+                                    .map(|pat| {
+                                        let short: String = pat.chars().take(30).collect();
+                                        format!("🔍 grep: {}", short)
+                                    }),
+                                "Task" => input
+                                    .and_then(|i| i.get("description"))
+                                    .and_then(|d| d.as_str())
+                                    .map(|desc| format!("🚀 {}", desc)),
+                                _ => None,
+                            };
 
-                                return Some(detail.unwrap_or_else(|| format!("🔧 {}", name)));
-                            }
+                            return Some(detail.unwrap_or_else(|| format!("🔧 {}", name)));
                         }
                     }
+                }
                 return None; // Don't show generic "assistant" events
             }
             "tool_use" => {
@@ -4470,7 +4478,9 @@ fn prohibited_cli_agent_command_reason(command: &str) -> Option<&'static str> {
         || lower.contains("pragma key")
         || lower.contains("pragma cipher")
     {
-        return Some("Direct manipulation of aidaemon's state database is prohibited. Use manage_memories / built-in tools instead of terminal SQL.");
+        return Some(
+            "Direct manipulation of aidaemon's state database is prohibited. Use manage_memories / built-in tools instead of terminal SQL.",
+        );
     }
 
     // Narrow install block for sqlcipher specifically (common rabbit-hole).
@@ -4493,13 +4503,13 @@ fn extract_terminal_commands_from_json(line: &str) -> Vec<String> {
     // Claude Code stream-json tool_use: { "name": "Bash", "input": {"command": "..."} }
     if let Some(tool_name) = v.get("name").and_then(|n| n.as_str())
         && matches!(tool_name, "Bash" | "bash" | "terminal")
-            && let Some(cmd) = v
-                .get("input")
-                .and_then(|i| i.get("command"))
-                .and_then(|c| c.as_str())
-            {
-                out.push(cmd.to_string());
-            }
+        && let Some(cmd) = v
+            .get("input")
+            .and_then(|i| i.get("command"))
+            .and_then(|c| c.as_str())
+    {
+        out.push(cmd.to_string());
+    }
 
     // Claude Code assistant wrapper:
     // { "type": "assistant", "message": {"content":[{"type":"tool_use","name":"Bash","input":{"command":"..."}}]}}
@@ -4508,24 +4518,24 @@ fn extract_terminal_commands_from_json(line: &str) -> Vec<String> {
             .get("message")
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_array())
-        {
-            for item in items {
-                if item.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
-                    continue;
-                }
-                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                if !matches!(name, "Bash" | "bash" | "terminal") {
-                    continue;
-                }
-                if let Some(cmd) = item
-                    .get("input")
-                    .and_then(|i| i.get("command"))
-                    .and_then(|c| c.as_str())
-                {
-                    out.push(cmd.to_string());
-                }
+    {
+        for item in items {
+            if item.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                continue;
+            }
+            let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if !matches!(name, "Bash" | "bash" | "terminal") {
+                continue;
+            }
+            if let Some(cmd) = item
+                .get("input")
+                .and_then(|i| i.get("command"))
+                .and_then(|c| c.as_str())
+            {
+                out.push(cmd.to_string());
             }
         }
+    }
 
     // Generic tool_use format: { "type": "tool_use", "tool": "bash", "command": "..." }
     if v.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
@@ -4535,9 +4545,10 @@ fn extract_terminal_commands_from_json(line: &str) -> Vec<String> {
             .unwrap_or("")
             .to_ascii_lowercase();
         if (tool == "bash" || tool == "terminal")
-            && let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
-                out.push(cmd.to_string());
-            }
+            && let Some(cmd) = v.get("command").and_then(|c| c.as_str())
+        {
+            out.push(cmd.to_string());
+        }
     }
 
     out
@@ -4595,9 +4606,10 @@ fn extract_jsonl_content(raw: &str) -> Option<String> {
             // unfinished and cause the orchestrator to repeat it.
             if v.get("type").and_then(Value::as_str) == Some("item.completed")
                 && v.pointer("/item/type").and_then(Value::as_str) == Some("agent_message")
-                && let Some(text) = v.pointer("/item/text").and_then(Value::as_str) {
-                    return Some(text.to_string());
-                }
+                && let Some(text) = v.pointer("/item/text").and_then(Value::as_str)
+            {
+                return Some(text.to_string());
+            }
 
             if let Some(content) = v
                 .pointer("/item/content")
@@ -5012,9 +5024,10 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
             .unwrap_or("read_write");
         let mut read_targets = Vec::new();
         if let Some(cwd) = execution_cwd.as_deref()
-            && let Some(target) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd) {
-                read_targets.push(target);
-            }
+            && let Some(target) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd)
+        {
+            read_targets.push(target);
+        }
         for path in parsed
             .as_ref()
             .and_then(|value| value.get("read_paths"))
@@ -5029,9 +5042,10 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
                 .map(|cwd| aidaemon_tools::BackendPath::new(cwd).join(path).to_string())
                 .unwrap_or_else(|| path.to_string());
             if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path)
-                && !read_targets.contains(&target) {
-                    read_targets.push(target);
-                }
+                && !read_targets.contains(&target)
+            {
+                read_targets.push(target);
+            }
         }
         let mut write_targets = parsed
             .as_ref()
@@ -5210,9 +5224,10 @@ impl CliAgentTool {
         let mut session_id = args.call_session.clone().unwrap_or_default();
         if let Some(ref goal_id) = args.call_goal_id
             && let Ok(Some(goal)) = self.state.get_goal(goal_id).await
-                && !goal.session_id.trim().is_empty() {
-                    session_id = goal.session_id;
-                }
+            && !goal.session_id.trim().is_empty()
+        {
+            session_id = goal.session_id;
+        }
 
         match action {
             "run" => {
@@ -5601,17 +5616,20 @@ mod tests {
             "/synthetic/extra".to_string(),
         ];
         apply_read_only_cli_adapter("/synthetic/bin/codex", &mut args).unwrap();
-        assert!(!args
-            .iter()
-            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+        );
         assert!(!args.iter().any(|arg| arg.contains("workspace-write")));
         assert!(!args.iter().any(|arg| arg == "--add-dir"));
         assert!(!args.iter().any(|arg| arg == "/synthetic/extra"));
         assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
         assert!(args.iter().any(|arg| arg == "--skip-git-repo-check"));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--sandbox", "read-only"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--sandbox", "read-only"])
+        );
     }
 
     #[test]
@@ -7013,10 +7031,10 @@ mod tests {
             context["executor_result"]["task_outcome"].as_str(),
             Some("task_done")
         );
-        let stored_scope = context["executor_handoff"]["target_scope"]["allowed_targets"][0]
-            ["value"]
-            .as_str()
-            .unwrap();
+        let stored_scope =
+            context["executor_handoff"]["target_scope"]["allowed_targets"][0]["value"]
+                .as_str()
+                .unwrap();
         assert!(
             stored_scope.ends_with(tmp_dir.path().to_string_lossy().as_ref()),
             "expected stored scope '{}' to end with '{}'",
@@ -7060,10 +7078,12 @@ mod tests {
         // Must have name and description (critical gotcha from CLAUDE.md)
         assert_eq!(schema["name"], "cli_agent");
         assert!(schema["description"].as_str().unwrap().contains("echo"));
-        assert!(schema["parameters"]["properties"]["tool"]["enum"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("echo")));
+        assert!(
+            schema["parameters"]["properties"]["tool"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("echo"))
+        );
     }
 
     #[tokio::test]
@@ -7261,10 +7281,12 @@ mod tests {
 
         assert!(!completion.success);
         assert!(completion.response.is_none());
-        assert!(completion
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("authentication failed")));
+        assert!(
+            completion
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("authentication failed"))
+        );
         assert!(!completion.persisted_output.contains("workspace-gca"));
     }
 
@@ -8012,9 +8034,11 @@ mod tests {
             outcome.metadata.outcome_status,
             Some(ToolOutcomeStatus::CompletedWithNegativeResult)
         );
-        assert!(outcome
-            .output
-            .contains("do not treat this lookup miss as completion"));
+        assert!(
+            outcome
+                .output
+                .contains("do not treat this lookup miss as completion")
+        );
     }
 
     #[tokio::test]

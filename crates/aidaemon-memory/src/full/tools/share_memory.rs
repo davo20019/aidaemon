@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::semantics::{
     ApprovalCall, OwnerApprovalNeed, ToolCallContext, ToolCapabilities,
 };
-use aidaemon_tools::OutcomeTool as Tool;
 
 use crate::records::{Fact, FactPrivacy};
 use crate::stores::FactStore;
@@ -157,7 +157,9 @@ impl aidaemon_tools::semantics::ToolSemantics for ShareMemoryTool {
                 summary: format!("Share memory globally: [{}] {}", args.category, args.key),
                 subject: json!({"category": args.category, "key": args.key}).to_string(),
                 risk: aidaemon_core::ApprovalRisk::High,
-                warnings: vec!["This will make this memory visible across all channels".to_string()],
+                warnings: vec![
+                    "This will make this memory visible across all channels".to_string(),
+                ],
             }),
         }
     }

@@ -4,7 +4,7 @@ use tracing::{info, warn};
 
 use crate::config::{AppConfig, ProviderKind};
 use aidaemon_runtime::engine::settings::{
-    log_configured_trust_roots, SdkEngineSettings, DEFAULT_MAX_TURNS,
+    DEFAULT_MAX_TURNS, SdkEngineSettings, log_configured_trust_roots,
 };
 
 /// The engine settings from `[agent.engine]`.
@@ -41,14 +41,15 @@ pub(crate) fn settings_from_config(
         // dedicated Anthropic client; its model pin named a model for that
         // client, which the daemon's own provider may not serve.
         if config.provider.kind != ProviderKind::Anthropic
-            && let Some(model) = model_override.take() {
-                warn!(
-                    model = %model,
-                    "[agent.engine] model is ignored: it was configured for the removed \
-                     Anthropic engine client; set it without api_key to pin a model the \
-                     daemon's provider serves"
-                );
-            }
+            && let Some(model) = model_override.take()
+        {
+            warn!(
+                model = %model,
+                "[agent.engine] model is ignored: it was configured for the removed \
+                 Anthropic engine client; set it without api_key to pin a model the \
+                 daemon's provider serves"
+            );
+        }
     }
     let settings = SdkEngineSettings {
         model_override,

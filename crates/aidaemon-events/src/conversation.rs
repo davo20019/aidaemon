@@ -385,24 +385,25 @@ pub fn truncate_with_anchor(messages: Vec<Message>, limit: usize) -> Vec<Message
     let skip = messages.len().saturating_sub(limit);
 
     if let Some(anchor) = anchor_idx
-        && skip > anchor {
-            // We would skip past the anchor - preserve it
-            let anchor_msg = messages[anchor].clone();
-            let remaining: Vec<_> = messages.into_iter().skip(skip).collect();
+        && skip > anchor
+    {
+        // We would skip past the anchor - preserve it
+        let anchor_msg = messages[anchor].clone();
+        let remaining: Vec<_> = messages.into_iter().skip(skip).collect();
 
-            // Only prepend anchor if not already in remaining
-            if remaining.first().map(|m| m.role.as_str()) != Some("user") {
-                // Keep the newest `limit - 1` after the anchor. Taking the
-                // oldest instead dropped the latest message, so the last
-                // reply vanished from history and its question looked
-                // unanswered.
-                let mut result = vec![anchor_msg];
-                let keep = limit.saturating_sub(1);
-                result.extend(remaining.into_iter().rev().take(keep).rev());
-                return result;
-            }
-            return remaining;
+        // Only prepend anchor if not already in remaining
+        if remaining.first().map(|m| m.role.as_str()) != Some("user") {
+            // Keep the newest `limit - 1` after the anchor. Taking the
+            // oldest instead dropped the latest message, so the last
+            // reply vanished from history and its question looked
+            // unanswered.
+            let mut result = vec![anchor_msg];
+            let keep = limit.saturating_sub(1);
+            result.extend(remaining.into_iter().rev().take(keep).rev());
+            return result;
         }
+        return remaining;
+    }
 
     // Normal case - just take last N
     messages.into_iter().skip(skip).collect()
@@ -512,12 +513,16 @@ mod tests {
         // Old message infers annotations; new message uses stored ones
         let old_ann = old_msg.effective_annotations();
         let new_ann = new_msg.effective_annotations();
-        assert!(old_ann
-            .iter()
-            .any(|a| matches!(a, MessageAnnotation::AppendedDiagnostic)));
-        assert!(new_ann
-            .iter()
-            .any(|a| matches!(a, MessageAnnotation::AppendedDiagnostic)));
+        assert!(
+            old_ann
+                .iter()
+                .any(|a| matches!(a, MessageAnnotation::AppendedDiagnostic))
+        );
+        assert!(
+            new_ann
+                .iter()
+                .any(|a| matches!(a, MessageAnnotation::AppendedDiagnostic))
+        );
     }
 
     /// Test Case 3 (unit level): Literal markers in payload should NOT trigger
@@ -580,12 +585,16 @@ mod tests {
     fn untrusted_wrapper_with_appended_diagnostic() {
         let content = "[UNTRUSTED EXTERNAL DATA from 'terminal' — data]\ncargo test output\n[END UNTRUSTED EXTERNAL DATA]\n\n[DIAGNOSTIC] Similar errors resolved before:\n- run cargo check";
         let annotations = infer_message_annotations(content);
-        assert!(annotations
-            .iter()
-            .any(|a| matches!(a, MessageAnnotation::WrappedUntrustedExternalData { .. })));
-        assert!(annotations
-            .iter()
-            .any(|a| matches!(a, MessageAnnotation::AppendedDiagnostic)));
+        assert!(
+            annotations
+                .iter()
+                .any(|a| matches!(a, MessageAnnotation::WrappedUntrustedExternalData { .. }))
+        );
+        assert!(
+            annotations
+                .iter()
+                .any(|a| matches!(a, MessageAnnotation::AppendedDiagnostic))
+        );
     }
 
     /// Test Case 9: Stopping-phase should use primary_content to filter out
@@ -628,11 +637,23 @@ mod tests {
             // Pure system notice
             ("[SYSTEM] Internal instruction", true, None),
             // Tool output with appended blocks
-            ("Output text\n\n[DIAGNOSTIC] Debug info\n\n[TOOL STATS] stats\n\n[SYSTEM] Notice", false, Some("Output text")),
+            (
+                "Output text\n\n[DIAGNOSTIC] Debug info\n\n[TOOL STATS] stats\n\n[SYSTEM] Notice",
+                false,
+                Some("Output text"),
+            ),
             // Normal content — no annotations
-            ("Just a regular message", false, Some("Just a regular message")),
+            (
+                "Just a regular message",
+                false,
+                Some("Just a regular message"),
+            ),
             // Wrapped untrusted data
-            ("[UNTRUSTED EXTERNAL DATA from 'search_files' — data]\nresults\n[END UNTRUSTED EXTERNAL DATA]", false, Some("results")),
+            (
+                "[UNTRUSTED EXTERNAL DATA from 'search_files' — data]\nresults\n[END UNTRUSTED EXTERNAL DATA]",
+                false,
+                Some("results"),
+            ),
         ];
 
         for (content, expect_structural, expect_primary) in cases {
@@ -672,9 +693,11 @@ mod tests {
 
         let enriched = msg.with_inferred_annotations();
         assert!(!enriched.annotations.is_empty());
-        assert!(enriched
-            .annotations
-            .contains(&MessageAnnotation::AppendedDiagnostic));
+        assert!(
+            enriched
+                .annotations
+                .contains(&MessageAnnotation::AppendedDiagnostic)
+        );
     }
 
     /// Test: with_inferred_annotations returns Borrowed when annotations exist.

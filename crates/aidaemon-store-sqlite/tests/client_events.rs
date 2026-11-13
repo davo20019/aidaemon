@@ -150,24 +150,27 @@ async fn an_offer_pairs_one_device_and_wrong_codes_close_it() {
     let row = log.offer("o1").await.unwrap().unwrap();
     assert_eq!(row.status, "pending");
     assert_eq!(row.device_name.as_deref(), Some("Pixel"));
-    assert!(log
-        .decide_offer("o1", "approved", Some("d1"))
-        .await
-        .unwrap());
+    assert!(
+        log.decide_offer("o1", "approved", Some("d1"))
+            .await
+            .unwrap()
+    );
     assert!(!log.decide_offer("o1", "denied", None).await.unwrap());
 
     log.create_offer(&offer("o2", 100)).await.unwrap();
     for _ in 0..3 {
-        assert!(!log
-            .redeem_offer("o2", "wrong", 5, 3, "x", "web", "pk", "observe")
-            .await
-            .unwrap());
+        assert!(
+            !log.redeem_offer("o2", "wrong", 5, 3, "x", "web", "pk", "observe")
+                .await
+                .unwrap()
+        );
     }
     assert_eq!(log.offer("o2").await.unwrap().unwrap().status, "expired");
-    assert!(!log
-        .redeem_offer("o2", "hash", 5, 3, "x", "web", "pk", "observe")
-        .await
-        .unwrap());
+    assert!(
+        !log.redeem_offer("o2", "hash", 5, 3, "x", "web", "pk", "observe")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

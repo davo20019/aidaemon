@@ -643,8 +643,8 @@ mod tests {
 }
 
 async fn print_eval_task(pool: &SqlitePool, task_id: &str) -> anyhow::Result<()> {
-    use aidaemon::harness_eval::report::{format_eval_task_report, EvalTaskRow};
     use aidaemon::TaskEndData;
+    use aidaemon::harness_eval::report::{EvalTaskRow, format_eval_task_report};
 
     let row = sqlx::query(
         r#"
@@ -681,8 +681,8 @@ async fn print_eval_task(pool: &SqlitePool, task_id: &str) -> anyhow::Result<()>
 }
 
 async fn print_eval_summary(pool: &SqlitePool, hours: i64, root_only: bool) -> anyhow::Result<()> {
-    use aidaemon::harness_eval::report::{aggregate_summary, format_eval_summary_row, EvalTaskRow};
     use aidaemon::TaskEndData;
+    use aidaemon::harness_eval::report::{EvalTaskRow, aggregate_summary, format_eval_summary_row};
 
     let rows = sqlx::query(
         r#"
@@ -1410,9 +1410,10 @@ async fn print_fabrication_audit(pool: &SqlitePool, hours: i64) -> anyhow::Resul
             material_tasks.insert(task_id.clone());
         }
         if let Some(raw) = row.try_get::<Option<String>, _>("completion_proof")?
-            && let Ok(proof) = serde_json::from_str::<aidaemon::TaskCompletionProofData>(&raw) {
-                proofs.insert(task_id, proof);
-            }
+            && let Ok(proof) = serde_json::from_str::<aidaemon::TaskCompletionProofData>(&raw)
+        {
+            proofs.insert(task_id, proof);
+        }
     }
 
     let total = tasks.len();
@@ -1491,7 +1492,7 @@ async fn record_fixture_from_session(
     include_text: bool,
 ) -> anyhow::Result<()> {
     use aidaemon::harness_eval::recorder::{
-        record_scenario_from_events, recorded_scenarios_dir, RECORDED_SCENARIO_HEADER,
+        RECORDED_SCENARIO_HEADER, record_scenario_from_events, recorded_scenarios_dir,
     };
 
     // Plain SELECT (no EventStore::new, which would run migrations against a
@@ -2148,8 +2149,10 @@ async fn main() -> anyhow::Result<()> {
             row.try_get::<Option<i64>, _>("success").unwrap_or(None),
             row.try_get::<Option<i64>, _>("exit_code").unwrap_or(None),
             row.get::<String, _>("started_at"),
-            row.try_get::<Option<String>, _>("completed_at").unwrap_or(None),
-            row.try_get::<Option<f64>, _>("duration_secs").unwrap_or(None),
+            row.try_get::<Option<String>, _>("completed_at")
+                .unwrap_or(None),
+            row.try_get::<Option<f64>, _>("duration_secs")
+                .unwrap_or(None),
             row.get::<String, _>("prompt_summary")
         );
     }
@@ -2535,8 +2538,10 @@ async fn main() -> anyhow::Result<()> {
                 row.try_get::<Option<i64>, _>("success").unwrap_or(None),
                 row.try_get::<Option<i64>, _>("exit_code").unwrap_or(None),
                 row.get::<String, _>("started_at"),
-                row.try_get::<Option<String>, _>("completed_at").unwrap_or(None),
-                row.try_get::<Option<f64>, _>("duration_secs").unwrap_or(None),
+                row.try_get::<Option<String>, _>("completed_at")
+                    .unwrap_or(None),
+                row.try_get::<Option<f64>, _>("duration_secs")
+                    .unwrap_or(None),
                 row.get::<String, _>("prompt_summary"),
                 row.try_get::<Option<String>, _>("output_summary")
                     .unwrap_or(None)
@@ -2620,24 +2625,38 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "- task_id={:?} iter={} model={} fell_back={} latency_ms={} prefill_ms={:?} decode_ms={:?} overhead_ms={:?} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} est_in_tok={:?} usage_evidence={:?} failed={} failure_kind={:?} provider_status={:?} at={}",
                 row.try_get::<Option<String>, _>("task_id").unwrap_or(None),
-                row.try_get::<Option<i64>, _>("iteration").unwrap_or(None).unwrap_or(0),
-                row.try_get::<Option<String>, _>("model").unwrap_or(None).unwrap_or_default(),
+                row.try_get::<Option<i64>, _>("iteration")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                row.try_get::<Option<String>, _>("model")
+                    .unwrap_or(None)
+                    .unwrap_or_default(),
                 row.try_get::<Option<i64>, _>("fell_back").unwrap_or(None) == Some(1),
                 latency_ms,
                 prefill_ms.map(|v| v.round() as i64),
                 decode_ms.map(|v| v.round() as i64),
                 overhead_ms,
-                row.try_get::<Option<i64>, _>("input_tokens").unwrap_or(None).unwrap_or(0),
-                row.try_get::<Option<i64>, _>("cached_input_tokens").unwrap_or(None),
-                row.try_get::<Option<i64>, _>("fresh_input_tokens").unwrap_or(None),
+                row.try_get::<Option<i64>, _>("input_tokens")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                row.try_get::<Option<i64>, _>("cached_input_tokens")
+                    .unwrap_or(None),
+                row.try_get::<Option<i64>, _>("fresh_input_tokens")
+                    .unwrap_or(None),
                 row.try_get::<Option<i64>, _>("cache_creation_input_tokens")
                     .unwrap_or(None),
-                row.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0),
-                row.try_get::<Option<i64>, _>("est_input_tokens").unwrap_or(None),
-                row.try_get::<Option<String>, _>("token_usage_evidence").unwrap_or(None),
+                row.try_get::<Option<i64>, _>("output_tokens")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                row.try_get::<Option<i64>, _>("est_input_tokens")
+                    .unwrap_or(None),
+                row.try_get::<Option<String>, _>("token_usage_evidence")
+                    .unwrap_or(None),
                 row.try_get::<Option<i64>, _>("failed").unwrap_or(None) == Some(1),
-                row.try_get::<Option<String>, _>("provider_error_kind").unwrap_or(None),
-                row.try_get::<Option<i64>, _>("provider_status").unwrap_or(None),
+                row.try_get::<Option<String>, _>("provider_error_kind")
+                    .unwrap_or(None),
+                row.try_get::<Option<i64>, _>("provider_status")
+                    .unwrap_or(None),
                 row.get::<String, _>("created_at"),
             );
         }
@@ -2719,21 +2738,44 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or_default();
                     println!(
                         "  contract: task_kind={} requires_observation={} evidence={} invocations={} allowed_tools={}",
-                        contract.get("task_kind").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                        contract.get("requires_observation").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                        contract
+                            .get("task_kind")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        contract
+                            .get("requires_observation")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
                         evidence.len(),
                         invocations.len(),
-                        contract.get("allowed_tool_names").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        contract
+                            .get("allowed_tool_names")
+                            .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
                     );
                     for (index, requirement) in evidence.iter().enumerate() {
                         println!(
                             "  evidence[{index}]: purpose={} authority={} temporal={} scopes={} target={} receipt={}",
-                            requirement.get("purpose").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                            requirement.get("minimum_authority").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                            requirement.get("temporal_scope").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                            requirement.get("acceptable_scopes").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
-                            requirement.get("target").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                            requirement.get("receipt").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                            requirement
+                                .get("purpose")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown"),
+                            requirement
+                                .get("minimum_authority")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown"),
+                            requirement
+                                .get("temporal_scope")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown"),
+                            requirement
+                                .get("acceptable_scopes")
+                                .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                            requirement
+                                .get("target")
+                                .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                            requirement
+                                .get("receipt")
+                                .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
                         );
                     }
                     for (index, predicate) in invocations.iter().enumerate() {
@@ -2743,28 +2785,63 @@ async fn main() -> anyhow::Result<()> {
                 if row.get::<String, _>("event_type") == "tool_call" {
                     println!(
                         "  claim: call_id={} stable_key={} obligations={} max_attempts={} max_invocations={} lineage={}",
-                        data.get("tool_call_id").and_then(serde_json::Value::as_str).unwrap_or("none"),
-                        data.get("stable_operation_key").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        data.get("obligation_ids").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
-                        data.get("max_operation_attempts").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        data.get("max_operation_invocations").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        data.get("operation_lineage").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("tool_call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("none"),
+                        data.get("stable_operation_key")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("obligation_ids")
+                            .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        data.get("max_operation_attempts")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("max_operation_invocations")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("operation_lineage")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
                     );
                 }
                 if let Some(receipt) = data.get("receipt") {
                     println!(
                         "  receipt: call_id={} outcome={} evidence={} exit_code={} http_status={} result_id={} completeness={}/{} preflight={} closes={} continues={}",
-                        data.get("tool_call_id").and_then(|value| value.as_str()).unwrap_or("none"),
-                        receipt.get("outcome_status").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                        receipt.get("outcome_evidence").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                        receipt.get("exit_code").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        receipt.get("http_status").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        receipt.pointer("/result_provenance/result_id").and_then(|value| value.as_str()).unwrap_or("none"),
-                        receipt.pointer("/result_provenance/model_view_completeness").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                        receipt.pointer("/result_provenance/durable_view_completeness").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                        receipt.pointer("/authorization_preflight/status").and_then(|value| value.as_str()).unwrap_or("none"),
-                        receipt.get("completion_obligation_ids").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
-                        receipt.get("continuation_obligation_ids").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        data.get("tool_call_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("none"),
+                        receipt
+                            .get("outcome_status")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown"),
+                        receipt
+                            .get("outcome_evidence")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown"),
+                        receipt
+                            .get("exit_code")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        receipt
+                            .get("http_status")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        receipt
+                            .pointer("/result_provenance/result_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("none"),
+                        receipt
+                            .pointer("/result_provenance/model_view_completeness")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown"),
+                        receipt
+                            .pointer("/result_provenance/durable_view_completeness")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown"),
+                        receipt
+                            .pointer("/authorization_preflight/status")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("none"),
+                        receipt
+                            .get("completion_obligation_ids")
+                            .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        receipt
+                            .get("continuation_obligation_ids")
+                            .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
                     );
                 }
                 let metadata = data.get("metadata");
@@ -2838,22 +2915,36 @@ async fn main() -> anyhow::Result<()> {
                 };
                 println!(
                     "- iter={} model={} fell_back={} attempts={} latency_ms={} prefill_ms={:?} decode_ms={:?} overhead_ms={:?} build_ms={} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} est_in_tok={}",
-                    row.try_get::<Option<i64>, _>("iteration").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("iteration")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
                     model_label,
                     fell_back,
-                    row.try_get::<Option<i64>, _>("attempts").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("attempts")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
                     latency_ms,
                     prefill_ms.map(|v| v.round() as i64),
                     decode_ms.map(|v| v.round() as i64),
                     overhead_ms,
-                    row.try_get::<Option<i64>, _>("build_ms").unwrap_or(None).unwrap_or(0),
-                    row.try_get::<Option<i64>, _>("input_tokens").unwrap_or(None).unwrap_or(0),
-                    row.try_get::<Option<i64>, _>("cached_input_tokens").unwrap_or(None),
-                    row.try_get::<Option<i64>, _>("fresh_input_tokens").unwrap_or(None),
+                    row.try_get::<Option<i64>, _>("build_ms")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("input_tokens")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("cached_input_tokens")
+                        .unwrap_or(None),
+                    row.try_get::<Option<i64>, _>("fresh_input_tokens")
+                        .unwrap_or(None),
                     row.try_get::<Option<i64>, _>("cache_creation_input_tokens")
                         .unwrap_or(None),
-                    row.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0),
-                    row.try_get::<Option<i64>, _>("est_input_tokens").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("output_tokens")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("est_input_tokens")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
                 );
             }
         }
@@ -3043,7 +3134,9 @@ async fn main() -> anyhow::Result<()> {
                 r.get::<i64, _>("is_paused"),
                 r.get::<i64, _>("is_one_shot"),
                 r.get::<String, _>("next_run_at"),
-                r.try_get::<Option<String>, _>("last_run_at").unwrap_or(None).unwrap_or_else(|| "never".to_string()),
+                r.try_get::<Option<String>, _>("last_run_at")
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "never".to_string()),
                 r.get::<String, _>("desc"),
             );
         }
@@ -3069,10 +3162,18 @@ async fn main() -> anyhow::Result<()> {
                 &r.get::<String, _>("goal_id")[..8],
                 r.get::<String, _>("status"),
                 r.get::<i64, _>("retry_count"),
-                r.try_get::<Option<String>, _>("agent_id").unwrap_or(None).unwrap_or_else(|| "none".to_string()),
+                r.try_get::<Option<String>, _>("agent_id")
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "none".to_string()),
                 &r.get::<String, _>("created_at")[..19],
-                r.try_get::<Option<String>, _>("started_at").unwrap_or(None).map(|s| s[..19].to_string()).unwrap_or_else(|| "none".to_string()),
-                r.try_get::<Option<String>, _>("completed_at").unwrap_or(None).map(|s| s[..19].to_string()).unwrap_or_else(|| "none".to_string()),
+                r.try_get::<Option<String>, _>("started_at")
+                    .unwrap_or(None)
+                    .map(|s| s[..19].to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                r.try_get::<Option<String>, _>("completed_at")
+                    .unwrap_or(None)
+                    .map(|s| s[..19].to_string())
+                    .unwrap_or_else(|| "none".to_string()),
                 r.get::<String, _>("desc"),
             );
         }

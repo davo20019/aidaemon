@@ -7,8 +7,8 @@ pub(crate) use aidaemon_runtime::approvals::*;
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use async_trait::async_trait;
 
@@ -180,7 +180,7 @@ mod tests {
     /// probe. The alternate name proves declines follow effects, not names.
     #[tokio::test]
     async fn mcp_approval_binds_process_effects_across_tools() {
-        use sdk::testing::{call, spec, text, tool_calls, ScriptedProvider};
+        use sdk::testing::{ScriptedProvider, call, spec, text, tool_calls};
         struct ProcessProbe(&'static str, Arc<AtomicU64>);
         #[async_trait]
         impl sdk::Tool for ProcessProbe {
@@ -242,10 +242,12 @@ mod tests {
                         sdk::EffectKey::named(sdk::EffectClass::Process, "mcp-server:synthetic"),
                     ]
                 );
-                assert!(finished
-                    .receipts()
-                    .iter()
-                    .all(|r| r.status == sdk::ReceiptStatus::Denied));
+                assert!(
+                    finished
+                        .receipts()
+                        .iter()
+                        .all(|r| r.status == sdk::ReceiptStatus::Denied)
+                );
             }
         }
     }
@@ -780,9 +782,11 @@ mod tests {
             else {
                 panic!("a registration must ask (trusted={trusted})");
             };
-            assert!(registered
-                .summary
-                .starts_with("Register custom OAuth provider 'synthetic-other' (authorize="));
+            assert!(
+                registered
+                    .summary
+                    .starts_with("Register custom OAuth provider 'synthetic-other' (authorize=")
+            );
             for text in [&registered.summary, &registered.subject] {
                 assert!(!text.contains("synthetic-client-secret"), "{text}");
             }
@@ -963,10 +967,12 @@ mod tests {
             panic!("the owner is asked even under trust-all");
         };
         assert_eq!(request.risk, sdk::ApprovalRisk::Critical);
-        assert!(request
-            .warnings
-            .iter()
-            .any(|w| w.contains("Daemonization primitives detected")));
+        assert!(
+            request
+                .warnings
+                .iter()
+                .any(|w| w.contains("Daemonization primitives detected"))
+        );
         let guest = AppApprovalRules {
             user_role: Some(crate::types::UserRole::Guest),
             ..owner.clone()
@@ -1351,11 +1357,13 @@ mod tests {
         );
         // Judging stores nothing.
         use crate::traits::store_prelude::*;
-        assert!(store
-            .list_mandates(Some("telegram:synthetic-user-1"), true)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .list_mandates(Some("telegram:synthetic-user-1"), true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

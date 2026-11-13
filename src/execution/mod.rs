@@ -3,9 +3,9 @@
 
 #[allow(unused_imports)]
 pub use aidaemon_tools::{
-    shell_quote, BackendDirEntry, BackendFileType, BackendKind, BackendMetadata, BackendPath,
-    CommandSpec, ExecutionBackend, ExecutionOutput, ExecutionRequest, LexicalPaths, ProcessHandle,
-    SpawnedProcess, WriteMode,
+    BackendDirEntry, BackendFileType, BackendKind, BackendMetadata, BackendPath, CommandSpec,
+    ExecutionBackend, ExecutionOutput, ExecutionRequest, LexicalPaths, ProcessHandle,
+    SpawnedProcess, WriteMode, shell_quote,
 };
 
 pub use aidaemon_tools::backend::SharedExecutionBackend;

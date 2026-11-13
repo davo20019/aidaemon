@@ -7,7 +7,7 @@
 //! messages (PLAN 8.3); progressive fact extraction is memory and lives in
 //! `memory::progressive`.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
@@ -655,7 +655,7 @@ mod tests {
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("hi"), 1); // ceil(2/4) = 1
         assert_eq!(estimate_tokens("hello world!!"), 4); // ceil(13/4) = 4
-                                                         // ~1000 chars should be ~250 tokens
+        // ~1000 chars should be ~250 tokens
         let long = "a".repeat(1000);
         assert_eq!(estimate_tokens(&long), 250);
     }

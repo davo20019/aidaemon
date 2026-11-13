@@ -7,9 +7,9 @@
 //!
 //! Live with ANTHROPIC_API_KEY or OPENAI_API_KEY, otherwise scripted:
 //! cargo run -p aidaemon-sdk --example otel_traces --features "testing otel"
-use aidaemon_sdk::policies::{otlp_provider, OtelSink};
+use aidaemon_sdk::policies::{OtelSink, otlp_provider};
 use aidaemon_sdk::prelude::*;
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use serde_json::json;
 

@@ -13,12 +13,12 @@ pub mod promotion {
         use super::*;
         use std::sync::Arc;
 
+        use crate::llm_runtime::gateway::SideCallGateway;
         use crate::llm_runtime::gateway::test_support::{
             failed_calls, gateway_with, ok_calls, provider_answering, provider_failing,
         };
-        use crate::llm_runtime::gateway::SideCallGateway;
-        use crate::traits::store_prelude::*;
         use crate::traits::Procedure;
+        use crate::traits::store_prelude::*;
 
         const VALUABLE_SKILL: &str = "---\nname: deploy-rust-service\n\
             description: Build, validate, and deploy a Rust service safely.\n\

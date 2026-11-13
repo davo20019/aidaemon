@@ -330,11 +330,13 @@ async fn consolidation_skips_a_turn_opted_out_of_learning() {
         .await
         .expect("consolidate opted-out session");
     assert_eq!(skipped.procedures_created, 0);
-    assert!(event_store
-        .query_unconsolidated("opted-out-session")
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        event_store
+            .query_unconsolidated("opted-out-session")
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let procedures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM procedures")
         .fetch_one(&state.pool())
         .await

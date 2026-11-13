@@ -1,18 +1,18 @@
 //! Runner tests: TestChannel + ScriptedProvider + a real Agent.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use aidaemon_channels::testing::{direct, group, message, TestChannel};
 use aidaemon_channels::ChannelEvent;
+use aidaemon_channels::testing::{TestChannel, direct, group, message};
 use aidaemon_channels::{
-    AccessPolicy, ApprovalAnswer, ApprovalStore, Attachment, ChannelError, ChannelRunner,
-    ChannelRunnerBuilder, CommandContext, CommandHandler, CommandInvocation, CommandReply,
-    EventRouter, MemoryApprovalStore, MemorySessionIndex, RunnerBuildError, RunnerConfig,
-    SessionIndex, APPROVE_CHOICE, DENY_CHOICE,
+    APPROVE_CHOICE, AccessPolicy, ApprovalAnswer, ApprovalStore, Attachment, ChannelError,
+    ChannelRunner, ChannelRunnerBuilder, CommandContext, CommandHandler, CommandInvocation,
+    CommandReply, DENY_CHOICE, EventRouter, MemoryApprovalStore, MemorySessionIndex,
+    RunnerBuildError, RunnerConfig, SessionIndex,
 };
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider, StreamingProvider};
+use aidaemon_core::testing::{ScriptedProvider, StreamingProvider, call, spec, text, tool_calls};
 use aidaemon_core::{
     Agent, FnTool, Hook, HookContext, Image, MemoryStore, ModelRequest, ModelResponse, Provider,
     ProviderError, Role, RunStore, SourceTrust, ToolAnnotations, ToolCall, ToolDecision, ToolInfo,
@@ -952,11 +952,12 @@ async fn approval_buttons_resume_the_run() {
     assert!(run.wait_text("chat-1", "Deployed to staging.").await);
     assert_eq!(run.deploys.load(Ordering::SeqCst), 1);
     // The prompt message was marked as settled.
-    assert!(run
-        .channel
-        .edits()
-        .iter()
-        .any(|e| e.text.contains("**Approved**")));
+    assert!(
+        run.channel
+            .edits()
+            .iter()
+            .any(|e| e.text.contains("**Approved**"))
+    );
     run.stop().await;
 }
 
@@ -1118,11 +1119,12 @@ async fn stop_cancels_the_active_run() {
     assert!(run.wait_text("chat-1", "Stopped.").await);
     run.say("chat-1", "/status");
     assert!(run.wait_text("chat-1", "Idle.").await);
-    assert!(!run
-        .channel
-        .sent_texts("chat-1")
-        .iter()
-        .any(|t| t.contains("too late")));
+    assert!(
+        !run.channel
+            .sent_texts("chat-1")
+            .iter()
+            .any(|t| t.contains("too late"))
+    );
     gate.add_permits(10);
     run.stop().await;
 }

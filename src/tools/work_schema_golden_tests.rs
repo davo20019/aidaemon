@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use crate::testing::{setup_test_agent, MockProvider};
+use crate::testing::{MockProvider, setup_test_agent};
 use crate::traits::Tool;
 
 fn goldens_dir() -> PathBuf {

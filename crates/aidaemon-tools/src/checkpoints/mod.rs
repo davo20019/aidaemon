@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use sqlx::{Row, SqlitePool};
@@ -1645,9 +1645,10 @@ fn checkpoint_access_manifest(
                 .iter()
                 .find_map(|key| args.get(*key).and_then(Value::as_str))
         })
-            && let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path) {
-                write_targets.push(target);
-            }
+        && let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path)
+    {
+        write_targets.push(target);
+    }
     ToolCallAccessManifest {
         execution_cwd,
         read_targets: Vec::new(),
@@ -2517,11 +2518,10 @@ mod tests {
         let manifest = ToolCallAccessManifest {
             execution_cwd: Some(workspace_container.path().to_string_lossy().into_owned()),
             read_targets: Vec::new(),
-            write_targets: vec![ToolTargetHint::new(
-                ToolTargetHintKind::ProjectScope,
-                project.to_string_lossy(),
-            )
-            .unwrap()],
+            write_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::ProjectScope, project.to_string_lossy())
+                    .unwrap(),
+            ],
             adapter_read_targets: Vec::new(),
         };
 
@@ -2695,14 +2695,10 @@ mod tests {
         .unwrap();
         assert_eq!(plan.operations.len(), 2);
         for operation in &plan.operations {
-            assert!(apply_restore_operation(
-                &git,
-                &empty_config,
-                workspace.path(),
-                &repo,
-                operation
-            )
-            .unwrap());
+            assert!(
+                apply_restore_operation(&git, &empty_config, workspace.path(), &repo, operation)
+                    .unwrap()
+            );
         }
         assert_eq!(
             fs::read_to_string(workspace.path().join("tracked.txt")).unwrap(),

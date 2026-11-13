@@ -1,9 +1,9 @@
 use crate::host::{TurnStores, TurnWorkspace};
 use aidaemon_events::traits::{
-    extract_primary_message_content, message_content_is_structural_only, ActiveTaskRef,
-    ActiveTaskStatus, AssistantTurnKind, AssistantTurnSummary, DialogueState, Message,
-    OpenQuestion, OpenRequest, OpenRequestStatus, QuestionKind, ToolSemanticScope,
-    UserRequestBinding, UserTurnKind, UserTurnSummary,
+    ActiveTaskRef, ActiveTaskStatus, AssistantTurnKind, AssistantTurnSummary, DialogueState,
+    Message, OpenQuestion, OpenRequest, OpenRequestStatus, QuestionKind, ToolSemanticScope,
+    UserRequestBinding, UserTurnKind, UserTurnSummary, extract_primary_message_content,
+    message_content_is_structural_only,
 };
 use aidaemon_events::{
     AssistantResponseData, EventType, InteractionRequestedData, InteractionResolvedData,
@@ -538,24 +538,26 @@ fn apply_user_message(
                 && matches!(
                     open_request.status,
                     OpenRequestStatus::Blocked | OpenRequestStatus::PartiallyAnswered
-                ) {
-                    open_request.status = if state.active_task.is_some() {
-                        OpenRequestStatus::InProgress
-                    } else {
-                        OpenRequestStatus::Open
-                    };
-                    open_request.resolved_at = None;
-                }
+                )
+            {
+                open_request.status = if state.active_task.is_some() {
+                    OpenRequestStatus::InProgress
+                } else {
+                    OpenRequestStatus::Open
+                };
+                open_request.resolved_at = None;
+            }
         }
         UserTurnKind::Followup => {
             // A typed new TaskStart on a related turn reopens the request.
             // The user's choice of words ("retry", "continue", or any
             // paraphrase) is irrelevant to this lifecycle transition.
             if state.active_task.is_some()
-                && let Some(open_request) = state.open_request.as_mut() {
-                    open_request.status = OpenRequestStatus::InProgress;
-                    open_request.resolved_at = None;
-                }
+                && let Some(open_request) = state.open_request.as_mut()
+            {
+                open_request.status = OpenRequestStatus::InProgress;
+                open_request.resolved_at = None;
+            }
         }
         UserTurnKind::NewRequest => {
             // Owed work is not answered by a later message. Keep it in the
@@ -563,26 +565,27 @@ fn apply_user_message(
             // continuation can still reach the owner's earlier request.
             if let Some(open_request) = state.open_request.as_ref()
                 && request_is_owed(open_request)
-                    && !state
-                        .unfinished_requests
-                        .iter()
-                        .any(|owed| owed.user_message_id == open_request.user_message_id)
-                {
-                    state.unfinished_requests.push(open_request.clone());
-                    let excess = state
-                        .unfinished_requests
-                        .len()
-                        .saturating_sub(UNFINISHED_REQUEST_LIMIT);
-                    state.unfinished_requests.drain(..excess);
-                }
+                && !state
+                    .unfinished_requests
+                    .iter()
+                    .any(|owed| owed.user_message_id == open_request.user_message_id)
+            {
+                state.unfinished_requests.push(open_request.clone());
+                let excess = state
+                    .unfinished_requests
+                    .len()
+                    .saturating_sub(UNFINISHED_REQUEST_LIMIT);
+                state.unfinished_requests.drain(..excess);
+            }
             if let Some(open_request) = state.open_request.as_mut()
                 && !matches!(
                     open_request.status,
                     OpenRequestStatus::Answered | OpenRequestStatus::Superseded
-                ) {
-                    open_request.status = OpenRequestStatus::Superseded;
-                    open_request.resolved_at = Some(observed_at);
-                }
+                )
+            {
+                open_request.status = OpenRequestStatus::Superseded;
+                open_request.resolved_at = Some(observed_at);
+            }
             // This relationship is provisional until semantic task
             // assessment. Keep the exact prior request and its typed contract
             // so a genuine continuation can restore it without reconstructing
@@ -698,14 +701,16 @@ fn apply_semantic_user_turn_assessment(
                 .open_request
                 .as_ref()
                 .is_some_and(|request| request.user_message_id == message_id)
-                && let Some(antecedent) = state.antecedent_request.take() {
-                    state.open_request = Some(antecedent);
-                }
+                && let Some(antecedent) = state.antecedent_request.take()
+            {
+                state.open_request = Some(antecedent);
+            }
             if let Some(request) = state.open_request.as_mut()
-                && state.active_task.is_some() {
-                    request.status = OpenRequestStatus::InProgress;
-                    request.resolved_at = None;
-                }
+                && state.active_task.is_some()
+            {
+                request.status = OpenRequestStatus::InProgress;
+                request.resolved_at = None;
+            }
         }
         UserTurnKind::Courtesy | UserTurnKind::Unknown => {}
     }
@@ -839,62 +844,63 @@ fn apply_task_end(
         .is_some_and(|request_task_id| request_task_id == task_id);
 
     if let Some(open_request) = state.open_request.as_mut()
-        && (matches_request || open_request.task_id.is_none()) {
-            match status {
-                TaskStatus::Completed => {
-                    match outcome {
-                        TaskOutcome::Succeeded => {
-                            let awaits_mandate_input =
-                                state.open_question.as_ref().is_some_and(|question| {
-                                    question.awaiting_user_reply
-                                        && question.kind == QuestionKind::MandateInput
-                                });
-                            if awaits_mandate_input {
-                                open_request.status = OpenRequestStatus::PartiallyAnswered;
-                                open_request.resolved_at = None;
-                            } else if !matches!(
-                                open_request.status,
-                                OpenRequestStatus::Answered | OpenRequestStatus::Superseded
-                            ) {
-                                open_request.status = OpenRequestStatus::Answered;
-                                open_request.resolved_at = Some(observed_at);
-                                state.open_question = None;
-                                // A continuation that completes successfully
-                                // discharges the owed work of its chain: the
-                                // owner followed up on the same work and it
-                                // is done. A new, unrelated request does not
-                                // discharge anything; owed entries still expire.
-                                if state
-                                    .last_user_turn
-                                    .as_ref()
-                                    .is_some_and(|turn| turn.kind == UserTurnKind::Followup)
-                                {
-                                    state.unfinished_requests.clear();
-                                }
-                            }
-                        }
-                        TaskOutcome::Partial => {
-                            // Semantic outcome is authoritative over response prose. A useful
-                            // explanation can accompany unfinished work, but it cannot resolve
-                            // the request that produced it.
+        && (matches_request || open_request.task_id.is_none())
+    {
+        match status {
+            TaskStatus::Completed => {
+                match outcome {
+                    TaskOutcome::Succeeded => {
+                        let awaits_mandate_input =
+                            state.open_question.as_ref().is_some_and(|question| {
+                                question.awaiting_user_reply
+                                    && question.kind == QuestionKind::MandateInput
+                            });
+                        if awaits_mandate_input {
                             open_request.status = OpenRequestStatus::PartiallyAnswered;
                             open_request.resolved_at = None;
-                        }
-                        TaskOutcome::Failed => {
-                            open_request.status = OpenRequestStatus::Blocked;
+                        } else if !matches!(
+                            open_request.status,
+                            OpenRequestStatus::Answered | OpenRequestStatus::Superseded
+                        ) {
+                            open_request.status = OpenRequestStatus::Answered;
                             open_request.resolved_at = Some(observed_at);
+                            state.open_question = None;
+                            // A continuation that completes successfully
+                            // discharges the owed work of its chain: the
+                            // owner followed up on the same work and it
+                            // is done. A new, unrelated request does not
+                            // discharge anything; owed entries still expire.
+                            if state
+                                .last_user_turn
+                                .as_ref()
+                                .is_some_and(|turn| turn.kind == UserTurnKind::Followup)
+                            {
+                                state.unfinished_requests.clear();
+                            }
                         }
                     }
-                }
-                TaskStatus::Failed | TaskStatus::Cancelled => {
-                    open_request.status = OpenRequestStatus::Blocked;
-                    open_request.resolved_at = Some(observed_at);
-                }
-                TaskStatus::Interrupted => {
-                    open_request.status = OpenRequestStatus::PartiallyAnswered;
+                    TaskOutcome::Partial => {
+                        // Semantic outcome is authoritative over response prose. A useful
+                        // explanation can accompany unfinished work, but it cannot resolve
+                        // the request that produced it.
+                        open_request.status = OpenRequestStatus::PartiallyAnswered;
+                        open_request.resolved_at = None;
+                    }
+                    TaskOutcome::Failed => {
+                        open_request.status = OpenRequestStatus::Blocked;
+                        open_request.resolved_at = Some(observed_at);
+                    }
                 }
             }
+            TaskStatus::Failed | TaskStatus::Cancelled => {
+                open_request.status = OpenRequestStatus::Blocked;
+                open_request.resolved_at = Some(observed_at);
+            }
+            TaskStatus::Interrupted => {
+                open_request.status = OpenRequestStatus::PartiallyAnswered;
+            }
         }
+    }
 
     if matches_active_task {
         state.active_task = None;

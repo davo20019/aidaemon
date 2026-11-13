@@ -4,14 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aidaemon_agents::{AgentExt, AgentTool, ChildBudget, TranscriptTap};
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
 use aidaemon_core::{
     Agent, AgentBuilder, CancellationToken, FnTool, Hook, HookContext, InterruptResolver,
     Interruption, ReceiptStatus, Resolution, Role, RunState, RunStatus, Tool, ToolAnnotations,
     ToolCall, ToolContext, ToolDecision, ToolInfo, ToolOutput, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::{Barrier, Notify};
 
 fn echo_tool() -> impl Tool {

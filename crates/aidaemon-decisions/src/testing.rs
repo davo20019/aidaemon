@@ -93,7 +93,7 @@ impl Decider for ScriptedDecider {
             (None, None) => {
                 return Err(DecisionError::Other(
                     "scripted decider: script exhausted".into(),
-                ))
+                ));
             }
         };
         response.check_against(request)?;

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::traits::UserRole;
@@ -42,10 +42,10 @@ const MAX_OBSERVATION_TEXT: usize = 750;
 const MAX_OBSERVATIONS_JSON: usize = 6 * 1024;
 const MAX_QUESTION_TEXT: usize = 500;
 const MAX_INTENTION_TEXT: usize = 1024;
+use crate::mandates::MAX_INTENTION_METADATA_TEXT;
 use crate::mandates::card::{
     CanDo, EndLimit, Ends, MandateConfirmationCard, NoticeTrigger, ReviewCadence,
 };
-use crate::mandates::MAX_INTENTION_METADATA_TEXT;
 const MAX_GUIDANCE_ENTRIES: usize = 10;
 const MAX_GUIDANCE_ENTRY_TEXT: usize = 1024;
 const MAX_GUIDANCE_TEXT: usize = 8 * 1024;
@@ -410,8 +410,7 @@ impl ManageMandatesTool {
                 .unwrap_or(ReviewEffort::Balanced.per_cycle_capacity())
         };
         anyhow::ensure!(
-            (MIN_MANDATE_TOKEN_BUDGET..=MAX_MANDATE_TOKEN_BUDGET_PER_CYCLE)
-                .contains(&per_cycle),
+            (MIN_MANDATE_TOKEN_BUDGET..=MAX_MANDATE_TOKEN_BUDGET_PER_CYCLE).contains(&per_cycle),
             "legacy per-review token capacity must be between {MIN_MANDATE_TOKEN_BUDGET} and {MAX_MANDATE_TOKEN_BUDGET_PER_CYCLE}"
         );
         let review_cycles = expected_default_review_cycles(default_review_secs, timing)?;
@@ -2006,7 +2005,10 @@ impl ManageMandatesTool {
             .await?;
         Ok(format!(
             "Updated mandate {} to policy version {} in {} mode with {} review effort and automatically managed capacity. In-flight decisions on older versions are revoked; the next review is due now.",
-            mandate.id, mandate.version, mandate.autonomy_mode, capacity.display_mode(),
+            mandate.id,
+            mandate.version,
+            mandate.autonomy_mode,
+            capacity.display_mode(),
         ))
     }
 
@@ -2305,10 +2307,13 @@ impl ManageMandatesTool {
         Ok(match outcome {
             MandateDecisionOutcome::Act => {
                 format!(
-                "ACT committed for mandate {}. Create only tasks necessary for this intention: {}",
-                mandate.id,
-                intention.as_ref().map(|value| value.description.as_str()).unwrap_or("")
-            )
+                    "ACT committed for mandate {}. Create only tasks necessary for this intention: {}",
+                    mandate.id,
+                    intention
+                        .as_ref()
+                        .map(|value| value.description.as_str())
+                        .unwrap_or("")
+                )
             }
             MandateDecisionOutcome::Wait => format!(
                 "WAIT recorded. No action tasks should be created; review again at {}.",
@@ -2560,14 +2565,11 @@ const AUTONOMY_MODES: &[&str] = &["bounded", "autopilot"];
 const PRIORITIES: &[&str] = &["low", "medium", "high", "critical"];
 const REVIEW_EFFORTS: &[&str] = &["efficient", "balanced", "thorough"];
 const GET_SECTIONS: &[&str] = &["summary", "policy", "history"];
-const DEFAULT_REVIEW_FIELD_DESCRIPTION: &str =
-    "How often the mandate runs, in minutes (every hour = 60). For a fixed interval set min_review_minutes and max_review_minutes to the same value.";
+const DEFAULT_REVIEW_FIELD_DESCRIPTION: &str = "How often the mandate runs, in minutes (every hour = 60). For a fixed interval set min_review_minutes and max_review_minutes to the same value.";
 const FIXED_DEADLINE_DESCRIPTION: &str =
     "RFC3339 fixed deadline. Supported by both create and update.";
-const OWNER_ALERTS_DESCRIPTION: &str =
-    "create/update: true when the owner asked to be told what the mandate finds (e.g. tell me when it is down). Lets a review's WAIT carry owner_alert; grants no tool, target or effect.";
-const OWNER_ALERT_DESCRIPTION: &str =
-    "WAIT only, when the policy grants owner_alerts: the one finding the owner asked to hear about, in a sentence.";
+const OWNER_ALERTS_DESCRIPTION: &str = "create/update: true when the owner asked to be told what the mandate finds (e.g. tell me when it is down). Lets a review's WAIT carry owner_alert; grants no tool, target or effect.";
+const OWNER_ALERT_DESCRIPTION: &str = "WAIT only, when the policy grants owner_alerts: the one finding the owner asked to hear about, in a sentence.";
 const STOP_ONLY_DESCRIPTION: &str = "STOP only; omit for ACT, WAIT, and ASK.";
 const VALUE_CRITERION_DESCRIPTION: &str =
     "ACT: exact owner-confirmed success criterion advanced; legacy uses the exact objective.";
@@ -2691,10 +2693,12 @@ impl Tool for ManageMandatesTool {
         // A committed non-action decision (WAIT, ASK, STOP) completes the
         // fenced review: the run ends on the durable decision's summary,
         // without another model call.
-        if args.action == "record_decision" && outcome_status == ToolOutcomeStatus::Succeeded
-            && let Some(summary) = self.committed_non_action_summary(&facts).await {
-                outcome = outcome.with_finish(aidaemon_core::Finish::succeeded(summary));
-            }
+        if args.action == "record_decision"
+            && outcome_status == ToolOutcomeStatus::Succeeded
+            && let Some(summary) = self.committed_non_action_summary(&facts).await
+        {
+            outcome = outcome.with_finish(aidaemon_core::Finish::succeeded(summary));
+        }
         Ok(outcome)
     }
 }
@@ -3595,14 +3599,17 @@ mod tests {
             assert!(!rendered.contains(nonsense), "{nonsense}: {rendered}");
         }
         // Version and decision checks stay available, as details only.
-        assert!(card
-            .details
-            .iter()
-            .any(|detail| detail.starts_with("Policy reference:") && detail.contains("version 2")));
-        assert!(card
-            .details
-            .iter()
-            .any(|detail| detail.starts_with("Review depth:")));
+        assert!(
+            card.details
+                .iter()
+                .any(|detail| detail.starts_with("Policy reference:")
+                    && detail.contains("version 2"))
+        );
+        assert!(
+            card.details
+                .iter()
+                .any(|detail| detail.starts_with("Review depth:"))
+        );
 
         // An end date reads in the owner's zone and format, never RFC 3339.
         let expires_at = (chrono::Utc::now() + chrono::Duration::days(3)).to_rfc3339();
@@ -3669,9 +3676,11 @@ mod tests {
     #[test]
     fn empty_learning_note_ignores_generator_supplied_receipt_defaults_before_commit() {
         let receipts = vec!["provider-filled-default".to_string()];
-        assert!(normalized_learning_note(Some(""), Some(&receipts))
-            .unwrap()
-            .is_none());
+        assert!(
+            normalized_learning_note(Some(""), Some(&receipts))
+                .unwrap()
+                .is_none()
+        );
         assert!(normalized_learning_note(Some("real learning"), None).is_err());
     }
 

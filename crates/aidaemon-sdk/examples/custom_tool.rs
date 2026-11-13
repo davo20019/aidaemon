@@ -5,7 +5,7 @@
 //! Live with ANTHROPIC_API_KEY or OPENAI_API_KEY, otherwise scripted:
 //! cargo run -p aidaemon-sdk --example custom_tool --features testing
 use aidaemon_sdk::prelude::*;
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;

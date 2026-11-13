@@ -751,11 +751,7 @@ fn runtime_mode_label(environment: LowLatencyEnvironment) -> &'static str {
 }
 
 fn yes_no(value: bool) -> &'static str {
-    if value {
-        "yes"
-    } else {
-        "no"
-    }
+    if value { "yes" } else { "no" }
 }
 
 fn render_starter_persona(agent_name: &str, primary_role: &str, style: &str) -> String {
@@ -1757,11 +1753,11 @@ fn assign_listen_ports(
             .as_deref()
             .and_then(parse_listen_port)
             && all_port_usage.get(&existing_port).copied().unwrap_or(0) <= 1
-                && !assigned.values().any(|&port| port == existing_port)
-            {
-                assigned.insert(bot.target, existing_port);
-                continue;
-            }
+            && !assigned.values().any(|&port| port == existing_port)
+        {
+            assigned.insert(bot.target, existing_port);
+            continue;
+        }
 
         let mut candidate = 8443u16;
         while occupied.contains(&candidate) {
@@ -2529,7 +2525,7 @@ pub(crate) async fn cloudflared_authenticated_zone_name() -> Result<Option<Strin
                 "failed to read cloudflared origin cert at `{}`: {}",
                 cert_path.display(),
                 err
-            ))
+            ));
         }
     };
     let payload = cert_content
@@ -2685,7 +2681,7 @@ async fn running_cloudflared_tunnel_pids(tunnel_name: &str) -> Result<Vec<u32>, 
             return Err(format!(
                 "failed to inspect existing cloudflared process: {}",
                 err
-            ))
+            ));
         }
     };
     if !output.status.success() {
@@ -2896,13 +2892,13 @@ pub(crate) async fn start_cloudflared_tunnel_background(
 #[cfg(test)]
 mod tests {
     use super::{
+        CloudflaredIngressRoute, SetupCommandSpec, TelegramBotTarget, TelegramWebhookPlan,
         apply_webhook_plans, assign_listen_ports, build_low_latency_plans_for_all_bots,
         cloudflare_models_probe_url, collect_telegram_bot_entries, hostname_matches_zone,
         is_cloudflare_ai_gateway_base, low_latency_cloudflared_ingress_routes_for_plans,
         normalize_domain_input, normalize_hostname_input, render_cloudflared_ingress_config,
         render_starter_persona, setup_route_dns_hosts, toml_string_literal,
-        write_starter_persona_if_missing, CloudflaredIngressRoute, SetupCommandSpec,
-        TelegramBotTarget, TelegramWebhookPlan,
+        write_starter_persona_if_missing,
     };
 
     #[test]

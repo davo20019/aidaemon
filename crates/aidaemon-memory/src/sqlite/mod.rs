@@ -13,11 +13,11 @@ use chrono::{DateTime, Datelike, Utc};
 use sqlx::{Row, SqlitePool};
 use tokio::sync::Mutex;
 
-use crate::embed::{decode_embedding_with_dim, encode_embedding, Embedder};
+use crate::LearningStore;
+use crate::embed::{Embedder, decode_embedding_with_dim, encode_embedding};
 use crate::records::*;
 use crate::stores::*;
 use crate::text::truncate_chars as truncate_str;
-use crate::LearningStore;
 use crate::{BehaviorPattern, ErrorSolution, Expertise, Procedure, UserProfile};
 use aidaemon_core::ChannelVisibility;
 
@@ -35,13 +35,13 @@ mod search_tests;
 mod structured;
 
 pub(crate) use claims::memory_visible;
-pub use claims::{project_message_span, MemoryClaimRecord};
+pub use claims::{MemoryClaimRecord, project_message_span};
 pub use export::ExportFile;
+pub(crate) use facts::{FACT_RESTATEMENT_MIN_SIMILARITY, facts_make_the_same_claim};
 pub use facts::{
     build_fact_embedding_text, fact_category_is_personal, facts_are_restatements,
     is_owner_authored_fact_source,
 };
-pub(crate) use facts::{facts_make_the_same_claim, FACT_RESTATEMENT_MIN_SIMILARITY};
 pub use retention::{MemoryRetention, MemoryRetentionPolicy, MemoryRetentionStats};
 pub use schema::{migrate, rebuild_memory_fts_projections};
 

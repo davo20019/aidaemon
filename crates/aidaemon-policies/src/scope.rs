@@ -144,7 +144,7 @@ impl ScopeGuard {
                              under {}",
                             self.roots_list()
                         ),
-                    }
+                    };
                 }
             };
             if !self.within_roots(&resolved) {

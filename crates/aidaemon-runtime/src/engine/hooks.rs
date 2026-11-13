@@ -2,8 +2,8 @@
 //! Each one only forwards to the host over the turn's [`HostCall`] channel,
 //! or adjusts the request from what the run has seen.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aidaemon_core as sdk;
 use async_trait::async_trait;
@@ -11,11 +11,11 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
+use super::TOOL_TIMEOUT;
 use super::calls::{
     AfterCallCheck, BudgetCheck, GateRequest, HostCall, KernelCall, KernelNotice, ModelErrorCheck,
     StopCheck, ToolRequest,
 };
-use super::TOOL_TIMEOUT;
 
 /// The ledger closeout as an SDK stop hook: before a final answer ships, the
 /// run ledger decides whether a still-reachable expectation needs another

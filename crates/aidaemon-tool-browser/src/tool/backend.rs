@@ -9,8 +9,8 @@
 //! Error style mirrors the rest of the module: internal methods return
 //! `Result<_, String>`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -849,7 +849,9 @@ impl PageHandle for ChromiumoxidePage {
                 // the single reconnect. A cancelled-but-healthy connection
                 // continues to work with no reset. This is the lightest correct
                 // behavior: reset only when a later call proves CDP is dead.
-                debug!("wait_for_navigation local-timeout; proceeding best-effort (next call's health gate catches a dead CDP)");
+                debug!(
+                    "wait_for_navigation local-timeout; proceeding best-effort (next call's health gate catches a dead CDP)"
+                );
                 Ok(())
             }
         }

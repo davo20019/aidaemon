@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use aidaemon_memory::encode_embedding;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
 
@@ -991,9 +991,11 @@ async fn the_scenario_reaches_every_path() {
         assert!(has(table("error_solutions"), "connection refused"));
         assert!(!has(table("error_solutions"), "disk quota"));
         // The empty pattern left by a scaffolding-only error is kept.
-        assert!(table("error_solutions")
-            .iter()
-            .any(|row| row[0].as_deref() == Some("")));
+        assert!(
+            table("error_solutions")
+                .iter()
+                .any(|row| row[0].as_deref() == Some(""))
+        );
         // Consolidation itself never embeds into the index.
         assert!(table("memory_embeddings").is_empty());
         assert!(has(table("facts"), "user_stated"));

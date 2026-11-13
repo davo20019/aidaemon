@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aidaemon_channels::download::{DownloadClient, DownloadRequest};
 use aidaemon_channels::ChannelError;
+use aidaemon_channels::download::{DownloadClient, DownloadRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 

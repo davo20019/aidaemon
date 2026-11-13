@@ -322,9 +322,10 @@ pub fn relationship_candidate_ids(conversation_context: &str) -> Vec<String> {
         if let Some(id) = id
             .map(str::trim)
             .filter(|id| !id.is_empty() && *id != "unknown")
-            && !ids.iter().any(|known| known == id) {
-                ids.push(id.to_string());
-            }
+            && !ids.iter().any(|known| known == id)
+        {
+            ids.push(id.to_string());
+        }
     }
     ids
 }
@@ -813,7 +814,7 @@ mod digest_tests {
 
     use super::*;
     use crate::llm::decide::gated_for_tests;
-    use crate::llm::decisions::{digest_keys, Decision};
+    use crate::llm::decisions::{Decision, digest_keys};
 
     const CONTEXT: &str = "[Session Summary] synthetic summary\n\
         - [message_id=msg-1] U: book a table for Alice Rivera\n\
@@ -858,10 +859,12 @@ mod digest_tests {
     #[test]
     fn without_a_conversation_only_identity_and_tier_are_asked() {
         let digest = turn_digest_request("what is my daughter's name?", None);
-        assert!(!digest
-            .request
-            .questions
-            .contains_key(digest_keys::RELATIONSHIP));
+        assert!(
+            !digest
+                .request
+                .questions
+                .contains_key(digest_keys::RELATIONSHIP)
+        );
         assert!(digest.request.questions.contains_key(digest_keys::IDENTITY));
         assert!(digest.request.questions.contains_key(digest_keys::TIER));
         assert!(digest.request.validate().is_ok());

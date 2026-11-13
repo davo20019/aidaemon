@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use aidaemon_core::{Hook, Provider};
 use aidaemon_eval::examples::{ExampleExpect, ExampleFactory, ExampleSubject};
-use aidaemon_eval::{compare, NoExtension, Report, Suite};
+use aidaemon_eval::{NoExtension, Report, Suite, compare};
 use aidaemon_policies::{
     ApprovalMode, ApprovalPolicy, ContextWindow, EgressGuard, Redactor, SameToolStreakGuard,
     ScopeGuard, StreakLimits, UntrustedOutput,

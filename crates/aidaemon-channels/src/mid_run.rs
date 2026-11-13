@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aidaemon_tools::duration_format::{compact_seconds, ZeroUnitStyle};
+use aidaemon_tools::duration_format::{ZeroUnitStyle, compact_seconds};
 use aidaemon_tools::status::StatusUpdate;
 
 use crate::ports::{ChatWorkKind, HelperProgress, RunningWork};
@@ -70,9 +70,9 @@ impl LiveWork {
             && sessions
                 .get(session_id)
                 .is_some_and(|p| p.task_id == task_id)
-            {
-                sessions.remove(session_id);
-            }
+        {
+            sessions.remove(session_id);
+        }
     }
 
     /// Note what `update` says about `task_id`'s work. A helper's start

@@ -6,7 +6,7 @@
 //! when the test was written, and decodes that text back.
 
 use chrono::{TimeZone, Utc};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::traits::{
     CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill, SkillDraft,

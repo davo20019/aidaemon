@@ -17,7 +17,7 @@ use crate::channels::{ChannelHub, SessionMap};
 use crate::config::AppConfig;
 use crate::daemon;
 use crate::health::HealthProbeManager;
-use crate::queue_policy::{should_shed_due_to_overload, SessionFairnessBudget};
+use crate::queue_policy::{SessionFairnessBudget, should_shed_due_to_overload};
 use crate::queue_telemetry::QueueTelemetry;
 use crate::traits::{MandateStore, SessionChannelStore, SettingsStore};
 use crate::triggers;
@@ -31,10 +31,11 @@ fn cleanup_inbox(dir: &str, retention: Duration) {
     for entry in entries.flatten() {
         if let Ok(meta) = entry.metadata()
             && let Ok(modified) = meta.modified()
-                && modified < cutoff {
-                    let _ = std::fs::remove_file(entry.path());
-                    tracing::info!(file = %entry.path().display(), "Cleaned up expired inbox file");
-                }
+            && modified < cutoff
+        {
+            let _ = std::fs::remove_file(entry.path());
+            tracing::info!(file = %entry.path().display(), "Cleaned up expired inbox file");
+        }
     }
 }
 

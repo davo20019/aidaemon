@@ -273,11 +273,13 @@ fallback = ["old-a", "old-b"]
         let effects = tool.effects_for(r#"{"action":"set","key":"provider.kind","value":"x"}"#);
         assert_eq!(
             effects.keys,
-            vec![aidaemon_core::EffectKey::path(
-                aidaemon_core::EffectClass::Configuration,
-                "/tmp/aidaemon-synthetic/config.toml"
-            )
-            .unwrap()]
+            vec![
+                aidaemon_core::EffectKey::path(
+                    aidaemon_core::EffectClass::Configuration,
+                    "/tmp/aidaemon-synthetic/config.toml"
+                )
+                .unwrap()
+            ]
         );
         assert!(!effects.complete);
         assert_eq!(

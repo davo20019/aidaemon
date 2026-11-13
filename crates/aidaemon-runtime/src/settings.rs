@@ -189,9 +189,9 @@ impl ContextWindowConfig {
                 .max_tool_result_chars
                 .saturating_mul(budget)
                 .checked_div(self.default_budget)
-            {
-                return scaled.max(MIN_TOOL_RESULT_CHARS);
-            }
+        {
+            return scaled.max(MIN_TOOL_RESULT_CHARS);
+        }
         self.max_tool_result_chars
     }
 

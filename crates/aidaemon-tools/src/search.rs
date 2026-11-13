@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use globset::{GlobBuilder, GlobMatcher};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use aidaemon_core::{
     AccessManifest, Tool, ToolAnnotations, ToolContext, ToolOutput, ToolResult, ToolSpec,
@@ -291,7 +291,7 @@ impl Tool for Grep {
                 return Ok(fail(format!(
                     "invalid regex `{}`: {e}. Escape special characters such as `(`, `[` or `{{` with a backslash.",
                     args.pattern
-                )))
+                )));
             }
         };
         let filter = match args.glob.as_deref().filter(|g| !g.trim().is_empty()) {

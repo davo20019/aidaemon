@@ -160,8 +160,9 @@ impl Scrubber<'_> {
             return;
         };
         if self.value(&mut value)
-            && let Ok(redacted) = serde_json::from_value(value) {
-                *item = redacted;
-            }
+            && let Ok(redacted) = serde_json::from_value(value)
+        {
+            *item = redacted;
+        }
     }
 }

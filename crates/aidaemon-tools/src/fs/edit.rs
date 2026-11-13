@@ -4,13 +4,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use aidaemon_core::{AccessManifest, ToolAnnotations};
 
-use super::{path_arg, workspace_parts, FilePolicy, SharedBackend, ToolText};
+use super::{FilePolicy, SharedBackend, ToolText, path_arg, workspace_parts};
 use crate::backend::WriteMode;
-use crate::outcome::{core_tool, OutcomeTool};
+use crate::outcome::{OutcomeTool, core_tool};
 use crate::semantics::{
     ToolCallContext, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
     ToolRole, ToolTargetHintKind,

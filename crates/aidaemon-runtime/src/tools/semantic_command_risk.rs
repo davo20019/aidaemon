@@ -8,7 +8,7 @@
 //! closed so they can never silently authorize execution.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::warn;
 
 use aidaemon_core as sdk;
@@ -469,8 +469,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::llm::gateway::test_support::*;
     use crate::llm::gateway::SideCallGateway;
+    use crate::llm::gateway::test_support::*;
     use crate::llm::side_calls::SideCall;
 
     fn quota_exhausted() -> aidaemon_core::ProviderError {
@@ -628,10 +628,12 @@ mod tests {
     #[test]
     fn malformed_or_unknown_effect_assessment_is_rejected() {
         assert!(parse_assessment("not json").is_none());
-        assert!(parse_assessment(
-            r#"{"dangerous":false,"risk_level":"safe","effects":["magic"],"reasons":[]}"#
-        )
-        .is_none());
+        assert!(
+            parse_assessment(
+                r#"{"dangerous":false,"risk_level":"safe","effects":["magic"],"reasons":[]}"#
+            )
+            .is_none()
+        );
     }
 
     #[test]

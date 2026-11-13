@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, text, tool_calls};
 use aidaemon_core::{Agent, ReceiptStatus, Role, Tool, ToolAnnotations, ToolContext};
 use aidaemon_mcp::{McpError, McpOptions, McpServer, McpServerSpec, McpTool, StderrCallback};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake_mcp_server");
 
@@ -105,9 +105,10 @@ async fn pagination_collects_every_page_and_names_are_sanitized() {
     let long = names.iter().find(|n| n.starts_with("fake__aaa")).unwrap();
     assert_eq!(long.len(), 64);
     for name in &names {
-        assert!(name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
+        assert!(
+            name.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        );
     }
 
     let mcp = server.mcp_tools();
@@ -191,9 +192,10 @@ async fn rich_content_is_summarized_with_structured_details() {
         .call(json!({}), &ctx())
         .await
         .unwrap();
-    assert!(out
-        .content
-        .starts_with("summary\n[image content: image/png"));
+    assert!(
+        out.content
+            .starts_with("summary\n[image content: image/png")
+    );
     assert_eq!(out.details["structured_content"], json!({"rows": 3}));
 }
 
@@ -386,10 +388,12 @@ async fn stderr_callback_gets_whole_lines_and_the_tail_still_works() {
         ..Default::default()
     })
     .await;
-    assert!(find(&server, "fake__crash")
-        .call(json!({}), &ctx())
-        .await
-        .is_err());
+    assert!(
+        find(&server, "fake__crash")
+            .call(json!({}), &ctx())
+            .await
+            .is_err()
+    );
     tokio::time::sleep(Duration::from_millis(50)).await;
     let lines = lines.lock().unwrap().clone();
     assert!(lines.iter().any(|l| l == "fake-mcp: started"), "{lines:?}");

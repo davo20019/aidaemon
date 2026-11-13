@@ -238,8 +238,10 @@ mod tests {
         let plans = crate::tools::track_requirements::TrackRequirementsTool::new(Arc::new(
             crate::plans::PlanStore::new(pool).await.unwrap(),
         ));
-        assert!(crate::traits::Tool::description(&plans)
-            .contains("name the folder or file an item creates"));
+        assert!(
+            crate::traits::Tool::description(&plans)
+                .contains("name the folder or file an item creates")
+        );
     }
 
     #[test]
@@ -1050,11 +1052,13 @@ mod child_runtime_tests {
         );
         assert_eq!(combined.metadata.output_trust, Some(SourceTrust::Untrusted));
         assert!(combined.output.contains("### second\nFailed: boom"));
-        assert!(combine_batch(
-            vec![("only".to_string(), Err(anyhow::anyhow!("boom")))],
-            false
-        )
-        .is_err());
+        assert!(
+            combine_batch(
+                vec![("only".to_string(), Err(anyhow::anyhow!("boom")))],
+                false
+            )
+            .is_err()
+        );
     }
 
     /// Starting helpers in the background answers with one plain line each,
@@ -1257,10 +1261,11 @@ mod child_runtime_tests {
         assert!(order(0) < order(1));
 
         let unknown = json!({"mission": "m", "task": "t", "precedence": "mine"}).to_string();
-        assert!(tool
-            .call_with_execution_context(&unknown, None, facts_in_tree(&family))
-            .await
-            .is_err());
+        assert!(
+            tool.call_with_execution_context(&unknown, None, facts_in_tree(&family))
+                .await
+                .is_err()
+        );
     }
 
     /// An overlap with a running sibling is stated, never refused, and the
@@ -1781,9 +1786,11 @@ mod child_runtime_tests {
 
         let entry = wait_for_notification(&store).await;
         assert_eq!(entry.session_id, "telegram:synthetic-user-1");
-        assert!(entry
-            .message
-            .contains("A restart stopped this background job"));
+        assert!(
+            entry
+                .message
+                .contains("A restart stopped this background job")
+        );
         assert!(entry.message.contains("Publish the synthetic report"));
         assert!(store.take_background_spawns().await.unwrap().is_empty());
     }
@@ -2623,10 +2630,11 @@ mod child_runtime_tests {
         let child = ScriptedChild::new("set up", Duration::from_millis(200));
         let (card, plan) = background_card_after(&child).await;
         assert!(card.starts_with("✅ Done · 3 of 3 steps"), "{card}");
-        assert!(plan
-            .steps
-            .iter()
-            .all(|step| step.status == crate::plans::StepStatus::Completed));
+        assert!(
+            plan.steps
+                .iter()
+                .all(|step| step.status == crate::plans::StepStatus::Completed)
+        );
     }
 
     /// A child that fails marks its steps failed, never done.
@@ -2989,11 +2997,13 @@ mod child_runtime_tests {
         .task_access
         .expect("a child with a declared folder is confined to it");
         let writes = |path: &str| crate::traits::ToolCallAccessManifest {
-            write_targets: vec![crate::traits::ToolTargetHint::new(
-                crate::traits::ToolTargetHintKind::Path,
-                path.to_string(),
-            )
-            .unwrap()],
+            write_targets: vec![
+                crate::traits::ToolTargetHint::new(
+                    crate::traits::ToolTargetHintKind::Path,
+                    path.to_string(),
+                )
+                .unwrap(),
+            ],
             ..Default::default()
         };
         let check = |path: &str| {
@@ -3094,9 +3104,11 @@ mod child_runtime_tests {
             false,
         )
         .unwrap();
-        assert!(combined
-            .output
-            .contains("### WordPress install\nFailed: Sub-agent failed."));
+        assert!(
+            combined
+                .output
+                .contains("### WordPress install\nFailed: Sub-agent failed.")
+        );
         assert_ne!(
             combined.metadata.outcome_status,
             Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded)

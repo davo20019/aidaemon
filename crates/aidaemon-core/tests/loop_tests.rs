@@ -4,16 +4,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
 use aidaemon_core::{
     Agent, CoreError, Event, FnTool, Hook, HookContext, Image, InterruptKind, InvocationStage,
-    LimitKind, Limits, MemoryStore, Message, ProviderError, Receipt, ReceiptStatus, Resolution,
-    Retry, Role, RunSnapshot, RunState, RunStatus, RunStore, Safeguard, SourceTrust, StopDecision,
-    StuckConfig, StuckDecision, StuckSignal, Tool, ToolAnnotations, ToolCall, ToolContext,
-    ToolDecision, ToolInfo, ToolOutput, ToolResult, ToolSpec, RUN_STATE_SCHEMA,
+    LimitKind, Limits, MemoryStore, Message, ProviderError, RUN_STATE_SCHEMA, Receipt,
+    ReceiptStatus, Resolution, Retry, Role, RunSnapshot, RunState, RunStatus, RunStore, Safeguard,
+    SourceTrust, StopDecision, StuckConfig, StuckDecision, StuckSignal, Tool, ToolAnnotations,
+    ToolCall, ToolContext, ToolDecision, ToolInfo, ToolOutput, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Barrier;
 use tokio_util::sync::CancellationToken;
 
@@ -573,9 +573,11 @@ async fn deny_hook_blocks_the_tool_and_tells_the_model_why() {
     let r = &out.receipts()[0];
     assert_eq!(r.status, ReceiptStatus::Denied);
     assert_eq!(r.stage, InvocationStage::RejectedBeforeDispatch);
-    assert!(tool_messages(&out.state)[0]
-        .1
-        .contains("destructive tools are disabled"));
+    assert!(
+        tool_messages(&out.state)[0]
+            .1
+            .contains("destructive tools are disabled")
+    );
 }
 
 /// Answers every call in the tool's place, with a finish that must be
@@ -737,11 +739,12 @@ async fn before_model_hook_can_edit_the_request() {
     let sent = &provider.requests()[0].messages;
     assert!(sent.last().unwrap().content.contains("metric units"));
     // Hook additions affect the request only, not the stored transcript.
-    assert!(out
-        .state
-        .messages
-        .iter()
-        .all(|m| !m.content.contains("metric")));
+    assert!(
+        out.state
+            .messages
+            .iter()
+            .all(|m| !m.content.contains("metric"))
+    );
 }
 
 /// A completion check built from receipts: the run may only finish after at
@@ -777,11 +780,12 @@ async fn stop_hook_can_reject_an_unsupported_done() {
     assert!(out.is_completed());
     assert_eq!(out.final_text.as_deref(), Some("Done, with evidence."));
     assert_eq!(out.turns(), 3);
-    assert!(out
-        .state
-        .messages
-        .iter()
-        .any(|m| m.role == Role::User && m.content.contains("not run any tools")));
+    assert!(
+        out.state
+            .messages
+            .iter()
+            .any(|m| m.role == Role::User && m.content.contains("not run any tools"))
+    );
 }
 
 /// Lets the run stop but reports a fixed set of unmet requirements.
@@ -1401,14 +1405,16 @@ fn an_agent_with_tools_must_cover_every_safeguard() {
     ));
 
     // Hooks and attestations combine.
-    assert!(base()
-        .tool(echo_tool())
-        .hook(Guards(&[Safeguard::Authority, Safeguard::UntrustedOutput]))
-        .attest(Safeguard::Scope)
-        .hook(Guards(&[Safeguard::Approval]))
-        .attest(Safeguard::Egress)
-        .build()
-        .is_ok());
+    assert!(
+        base()
+            .tool(echo_tool())
+            .hook(Guards(&[Safeguard::Authority, Safeguard::UntrustedOutput]))
+            .attest(Safeguard::Scope)
+            .hook(Guards(&[Safeguard::Approval]))
+            .attest(Safeguard::Egress)
+            .build()
+            .is_ok()
+    );
 
     // No tools, nothing to guard; an explicit opt-out also builds.
     assert!(base().build().is_ok());
@@ -1836,11 +1842,13 @@ async fn panicking_tool_is_a_failed_receipt_not_a_crash() {
 
     assert_eq!(out.status, RunStatus::Completed);
     assert_eq!(out.receipts()[0].status, ReceiptStatus::Failed);
-    assert!(out.receipts()[0]
-        .reason
-        .as_deref()
-        .unwrap()
-        .contains("kaboom"));
+    assert!(
+        out.receipts()[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("kaboom")
+    );
     assert_eq!(out.receipts()[1].status, ReceiptStatus::Succeeded);
     let messages = tool_messages(&out.state);
     assert!(messages[0].1.contains("panicked"), "{}", messages[0].1);
@@ -1906,7 +1914,7 @@ struct RunEndHook(Arc<RunEndLog>);
 #[async_trait]
 impl Hook for RunEndHook {
     async fn on_run_end(&self, ctx: &HookContext<'_>, outcome: &aidaemon_core::RunOutcome) {
-        self.0 .0.lock().unwrap().push((
+        self.0.0.lock().unwrap().push((
             outcome.status.clone(),
             outcome.final_text.clone(),
             ctx.run_receipts().count(),
@@ -2232,11 +2240,13 @@ async fn non_converging_rewrites_are_refused() {
     .unwrap();
     let out = agent.run("s", "go").await.unwrap();
     assert_eq!(out.receipts()[0].status, ReceiptStatus::Denied);
-    assert!(out.receipts()[0]
-        .reason
-        .as_ref()
-        .unwrap()
-        .contains("did not converge"));
+    assert!(
+        out.receipts()[0]
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("did not converge")
+    );
 }
 
 #[tokio::test]

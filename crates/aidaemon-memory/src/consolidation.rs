@@ -13,7 +13,7 @@ use crate::history::{ConsolidationCursors, ConversationSource, TurnRole};
 use crate::progressive::{identity_fact_lacks_user_evidence, worth_extracting};
 use crate::records::{ExtractedMemoryGraph, FactPrivacy, PersonalMemoryWrite};
 use crate::stores::FactStore;
-use crate::task_learning::{FactLifetime, FACT_LIFETIME_INSTRUCTION};
+use crate::task_learning::{FACT_LIFETIME_INSTRUCTION, FactLifetime};
 
 /// Turns read per session per pass.
 const TURNS_PER_PASS: usize = 300;
@@ -429,8 +429,8 @@ pub fn parse_consolidation_response(text: &str) -> anyhow::Result<Vec<ExtractedF
 mod tests {
     use std::sync::Mutex;
 
-    use aidaemon_core::testing::{text, ScriptedProvider};
     use aidaemon_core::ProviderError;
+    use aidaemon_core::testing::{ScriptedProvider, text};
     use async_trait::async_trait;
 
     use super::*;
@@ -466,9 +466,11 @@ mod tests {
     fn parser_retries_when_every_item_is_structurally_bad() {
         let error = parse_consolidation_response(r#"[{"category": 7}, false]"#)
             .expect_err("an entirely malformed batch must be retried");
-        assert!(error
-            .to_string()
-            .contains("all 2 memory facts were malformed"));
+        assert!(
+            error
+                .to_string()
+                .contains("all 2 memory facts were malformed")
+        );
     }
 
     /// A one-session history: the owner speaks unless `guest` is set.

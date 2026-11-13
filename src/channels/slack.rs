@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-pub use aidaemon_channel_slack::bot::{spawn_slack_channel, SlackBot as SlackChannel};
+pub use aidaemon_channel_slack::bot::{SlackBot as SlackChannel, spawn_slack_channel};
 use aidaemon_channel_slack::bot::{SlackBotSettings, SlackHost, WorkspaceGrantMutation};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
@@ -125,10 +125,11 @@ impl SlackHost for DaemonSlackHost {
             updated = true;
         }
         if let Some(bots) = doc.get_mut("slack_bots").and_then(|v| v.as_array_mut())
-            && let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
-                first.insert("allowed_user_ids".to_string(), ids_toml);
-                updated = true;
-            }
+            && let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut())
+        {
+            first.insert("allowed_user_ids".to_string(), ids_toml);
+            updated = true;
+        }
 
         if !updated {
             anyhow::bail!("No [slack] or [[slack_bots]] section found in config");

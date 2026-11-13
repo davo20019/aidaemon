@@ -5,15 +5,15 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, spec, text, tool_calls};
 use aidaemon_core::{
     Agent, ApprovalRisk, CallEffects, CancellationToken, EffectClass, EffectKey, Hook, HookContext,
-    InterruptKind, InterruptResolver, Interruption, OwnerApprovalRequest, ReceiptStatus,
-    Resolution, RunState, RunStatus, SharedDeclines, SourceTrust, Tool, ToolAnnotations, ToolCall,
-    ToolContext, ToolDecision, ToolInfo, ToolOutput, ToolResult, OWNER_DECLINED,
+    InterruptKind, InterruptResolver, Interruption, OWNER_DECLINED, OwnerApprovalRequest,
+    ReceiptStatus, Resolution, RunState, RunStatus, SharedDeclines, SourceTrust, Tool,
+    ToolAnnotations, ToolCall, ToolContext, ToolDecision, ToolInfo, ToolOutput, ToolResult,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Notify;
 
 const SEND: ToolAnnotations = ToolAnnotations {
@@ -385,11 +385,13 @@ async fn a_parents_later_decline_reaches_a_running_child() {
         .find(|r| r.call_id == "k2")
         .unwrap();
     assert_eq!(refused.status, ReceiptStatus::Denied);
-    assert!(refused
-        .reason
-        .as_deref()
-        .unwrap()
-        .starts_with(OWNER_DECLINED));
+    assert!(
+        refused
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with(OWNER_DECLINED)
+    );
     // A call with another effect still runs.
     assert_eq!(child_posted.load(Ordering::SeqCst), 1);
     assert_eq!(child_out.state.declined, vec![report_host()]);

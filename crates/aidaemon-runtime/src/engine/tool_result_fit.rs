@@ -71,9 +71,9 @@ pub trait ToolResultFit: TurnHost {
         if let Some(provenance) = result_metadata.result_provenance.as_mut()
             && provenance.model_view_completeness
                 != aidaemon_tools::semantics::ToolResultCompleteness::Truncated
-            {
-                provenance.model_visible_chars = result_text.chars().count();
-            }
+        {
+            provenance.model_visible_chars = result_text.chars().count();
+        }
         result_text
     }
 
@@ -146,15 +146,16 @@ pub trait ToolResultFit: TurnHost {
         if matches!(tool_name, "http_request" | "web_fetch")
             && !result_is_err
             && result_text.chars().count() > STRUCTURED_JSON_COMPACT_MIN_CHARS
-            && let Some(compacted) = crate::context_budget::compact_embedded_json(&result_text) {
-                tracing::info!(
-                    tool = %tool_name,
-                    original_chars = result_text.chars().count(),
-                    compact_chars = compacted.chars().count(),
-                    "Losslessly compacted embedded JSON in tool result"
-                );
-                result_text = compacted;
-            }
+            && let Some(compacted) = crate::context_budget::compact_embedded_json(&result_text)
+        {
+            tracing::info!(
+                tool = %tool_name,
+                original_chars = result_text.chars().count(),
+                compact_chars = compacted.chars().count(),
+                "Losslessly compacted embedded JSON in tool result"
+            );
+            result_text = compacted;
+        }
 
         // Oversized successful results are spilled to a temp file when the
         // model has a filesystem recovery path (read_file or terminal): it
@@ -201,14 +202,13 @@ pub trait ToolResultFit: TurnHost {
             None if keep_inline => result_text,
             None => crate::context_budget::compress_tool_result(tool_name, &result_text, max_chars),
         };
-        if !keep_inline
-            && let Some(provenance) = result_metadata.result_provenance.as_mut() {
-                provenance.mark_model_view_truncated(&result_text);
-                if was_spilled {
-                    provenance.source =
-                        aidaemon_tools::semantics::ToolResultContentSource::SpillPreview;
-                }
+        if !keep_inline && let Some(provenance) = result_metadata.result_provenance.as_mut() {
+            provenance.mark_model_view_truncated(&result_text);
+            if was_spilled {
+                provenance.source =
+                    aidaemon_tools::semantics::ToolResultContentSource::SpillPreview;
             }
+        }
         // Record how the harness transformed the result before the model saw
         // it, so a single `db_probe --task` query explains "why did the model
         // do that".

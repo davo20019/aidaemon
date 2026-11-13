@@ -114,75 +114,87 @@ fn convert_inline(s: &str) -> String {
 
         // Inline code: copy through, escaped.
         if c == '`'
-            && let Some(end) = find_char(&chars, '`', i + 1) {
-                out.push('`');
-                push_escaped(&mut out, &collect(&chars[i + 1..end]));
-                out.push('`');
-                i = end + 1;
-                continue;
-            }
+            && let Some(end) = find_char(&chars, '`', i + 1)
+        {
+            out.push('`');
+            push_escaped(&mut out, &collect(&chars[i + 1..end]));
+            out.push('`');
+            i = end + 1;
+            continue;
+        }
 
         // Bold: **x** or __x__ → *x*
-        if (c == '*' || c == '_') && i + 1 < len && chars[i + 1] == c
+        if (c == '*' || c == '_')
+            && i + 1 < len
+            && chars[i + 1] == c
             && let Some(end) = find_double(&chars, c, i + 2)
-                && end > i + 2 {
-                    out.push('*');
-                    out.push_str(&convert_inline(&collect(&chars[i + 2..end])));
-                    out.push('*');
-                    i = end + 2;
-                    continue;
-                }
+            && end > i + 2
+        {
+            out.push('*');
+            out.push_str(&convert_inline(&collect(&chars[i + 2..end])));
+            out.push('*');
+            i = end + 2;
+            continue;
+        }
 
         // Strikethrough: ~~x~~ → ~x~
-        if c == '~' && i + 1 < len && chars[i + 1] == '~'
+        if c == '~'
+            && i + 1 < len
+            && chars[i + 1] == '~'
             && let Some(end) = find_double(&chars, '~', i + 2)
-                && end > i + 2 {
-                    out.push('~');
-                    out.push_str(&convert_inline(&collect(&chars[i + 2..end])));
-                    out.push('~');
-                    i = end + 2;
-                    continue;
-                }
+            && end > i + 2
+        {
+            out.push('~');
+            out.push_str(&convert_inline(&collect(&chars[i + 2..end])));
+            out.push('~');
+            i = end + 2;
+            continue;
+        }
 
         // Italic: *x* → _x_ (opening star must touch a word).
-        if c == '*' && i + 1 < len && !chars[i + 1].is_whitespace()
+        if c == '*'
+            && i + 1 < len
+            && !chars[i + 1].is_whitespace()
             && let Some(end) = find_single_star(&chars, i + 1)
-                && !chars[end - 1].is_whitespace() {
-                    out.push('_');
-                    out.push_str(&convert_inline(&collect(&chars[i + 1..end])));
-                    out.push('_');
-                    i = end + 1;
-                    continue;
-                }
+            && !chars[end - 1].is_whitespace()
+        {
+            out.push('_');
+            out.push_str(&convert_inline(&collect(&chars[i + 1..end])));
+            out.push('_');
+            i = end + 1;
+            continue;
+        }
 
         // Link: [text](url) → <url|text>
         if c == '['
-            && let Some((text, url, end)) = parse_link(&chars, i) {
-                out.push('<');
-                push_escaped(&mut out, &sanitize_url(&url));
-                out.push('|');
-                push_escaped(&mut out, &text.replace('|', "/"));
-                out.push('>');
-                i = end;
-                continue;
-            }
+            && let Some((text, url, end)) = parse_link(&chars, i)
+        {
+            out.push('<');
+            push_escaped(&mut out, &sanitize_url(&url));
+            out.push('|');
+            push_escaped(&mut out, &text.replace('|', "/"));
+            out.push('>');
+            i = end;
+            continue;
+        }
 
         // `<...>` tokens: autolinks and user/channel mentions survive.
         if c == '<'
-            && let Some(end) = find_char(&chars, '>', i + 1) {
-                let inner = collect(&chars[i + 1..end]);
-                if is_preserved_token(&inner) {
-                    out.push('<');
-                    if inner.starts_with('@') || inner.starts_with('#') {
-                        out.push_str(&inner);
-                    } else {
-                        push_escaped(&mut out, &sanitize_url(&inner));
-                    }
-                    out.push('>');
-                    i = end + 1;
-                    continue;
+            && let Some(end) = find_char(&chars, '>', i + 1)
+        {
+            let inner = collect(&chars[i + 1..end]);
+            if is_preserved_token(&inner) {
+                out.push('<');
+                if inner.starts_with('@') || inner.starts_with('#') {
+                    out.push_str(&inner);
+                } else {
+                    push_escaped(&mut out, &sanitize_url(&inner));
                 }
+                out.push('>');
+                i = end + 1;
+                continue;
             }
+        }
 
         match c {
             '&' => out.push_str("&amp;"),
@@ -299,10 +311,12 @@ pub fn split_mrkdwn(text: &str, max_chars: usize) -> Vec<String> {
 
         // Do not cut a `<url|text>` or `<@U...>` token in half.
         if let Some(lt) = current[..split].rfind('<')
-            && lt > 0 && !current[lt..split].contains('>') {
-                split = lt;
-                split_at_space = false;
-            }
+            && lt > 0
+            && !current[lt..split].contains('>')
+        {
+            split = lt;
+            split_at_space = false;
+        }
 
         let mut chunk = current[..split].trim_end().to_string();
         let mut remainder = &current[split..];

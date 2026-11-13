@@ -41,9 +41,10 @@ impl SeenMessages {
             return false;
         }
         if self.order.len() >= Self::CAPACITY
-            && let Some(old) = self.order.pop_front() {
-                self.set.remove(&old);
-            }
+            && let Some(old) = self.order.pop_front()
+        {
+            self.set.remove(&old);
+        }
         self.set.insert(key.clone());
         self.order.push_back(key);
         true
@@ -535,9 +536,11 @@ mod tests {
             m.attachments[0].kind,
             aidaemon_channels::AttachmentKind::File
         );
-        assert!(m.attachments[0]
-            .source
-            .starts_with("https://files.slack.com/"));
+        assert!(
+            m.attachments[0]
+                .source
+                .starts_with("https://files.slack.com/")
+        );
     }
 
     #[test]

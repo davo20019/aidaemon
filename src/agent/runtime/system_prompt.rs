@@ -261,7 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_task_prompt_omits_prior_summary_and_session_activity() {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::types::{ChannelContext, UserRole};
 
         let harness = setup_test_agent(MockProvider::new())
@@ -299,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn mandate_context_uses_only_built_in_policy_prompt_inputs() {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::{
             Goal, Mandate, MandateAuthority, MandateObjectiveControl, MandateStore,
             ObjectiveMetricDirection, TaskAttempt,

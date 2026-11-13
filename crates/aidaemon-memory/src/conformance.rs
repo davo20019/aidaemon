@@ -224,11 +224,7 @@ macro_rules! call {
 }
 
 fn ensure(cond: bool, message: impl FnOnce() -> String) -> Check {
-    if cond {
-        Ok(())
-    } else {
-        Err(message())
-    }
+    if cond { Ok(()) } else { Err(message()) }
 }
 
 fn close(a: f32, b: f32) -> bool {
@@ -361,7 +357,9 @@ async fn supersedes(store: Arc<dyn MemoryStore>) -> Check {
     ensure(
         *previous_id == old_id && previous_value == "Acme Corp",
         || {
-            format!("previous should be ({old_id:?}, \"Acme Corp\"), got ({previous_id:?}, {previous_value:?})")
+            format!(
+                "previous should be ({old_id:?}, \"Acme Corp\"), got ({previous_id:?}, {previous_value:?})"
+            )
         },
     )?;
     let facts = active(&*store, SCOPE).await?;

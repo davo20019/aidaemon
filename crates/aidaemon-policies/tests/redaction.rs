@@ -3,10 +3,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_core::testing::{ScriptedProvider, call, text, tool_calls};
 use aidaemon_core::{Agent, Event, FnTool, RunId, ToolAnnotations, ToolOutput, ToolSpec};
 use aidaemon_policies::Redactor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const TOKEN: &str = "tok_live_policies_1a2b3c4d5e6f";
 const SHAPED: &str = "sk-proj-AAAABBBBCCCCDDDDEEEEFFFF1234";

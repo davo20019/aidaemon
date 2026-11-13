@@ -40,7 +40,7 @@ use crate::channel::{
     ChannelEvent, Conversation, ConversationKind, InboundMessage, OutboundMessage,
 };
 use crate::split::TRUNCATION_MARK;
-use crate::testing::{sender, TestChannel};
+use crate::testing::{TestChannel, sender};
 
 /// How long the kit waits for an injected event to arrive, and for `run` to
 /// return after shutdown or after the receiver is dropped.
@@ -349,12 +349,13 @@ pub async fn check_channel(
         let result = session.next_message("probe named").await.and_then(|m| {
             let mut problems = Vec::new();
             if let Ok(plain) = &first
-                && m.sender.id != plain.sender.id {
-                    problems.push(format!(
-                        "sender id changed with the name: {:?} became {:?}",
-                        plain.sender.id, m.sender.id
-                    ));
-                }
+                && m.sender.id != plain.sender.id
+            {
+                problems.push(format!(
+                    "sender id changed with the name: {:?} became {:?}",
+                    plain.sender.id, m.sender.id
+                ));
+            }
             let name = m.sender.display_name.unwrap_or_default();
             if name.chars().any(|c| c.is_control() || c == '\u{202E}') {
                 problems.push(format!("control characters kept in {name:?}"));
@@ -734,7 +735,7 @@ impl Session {
                 Ok(None) => {
                     return Err(format!(
                         "run ended before {what} arrived (the event sender was dropped)"
-                    ))
+                    ));
                 }
                 Ok(Some(event)) => {
                     if let Some(found) = pick(event) {
@@ -931,8 +932,9 @@ mod tests {
     fn long_text_is_long_enough_and_plain() {
         let text = long_text(300);
         assert!(text.chars().count() >= 300);
-        assert!(text
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c.is_whitespace()));
+        assert!(
+            text.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c.is_whitespace())
+        );
     }
 }

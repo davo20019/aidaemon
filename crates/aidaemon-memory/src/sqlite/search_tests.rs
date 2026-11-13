@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use super::*;
+use crate::HashEmbedder;
 use crate::search::{FactSearchConfig, FactSearchReport};
 use crate::search_fixture::{self as fx, corpus, queries};
-use crate::HashEmbedder;
 
 async fn open_at(path: &std::path::Path) -> SqliteMemory {
     // Test-only durability trade: the corpus is rebuilt on every run.

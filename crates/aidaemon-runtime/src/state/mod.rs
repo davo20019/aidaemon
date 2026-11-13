@@ -23,11 +23,12 @@ mod types {
     pub(crate) use crate::stores::*;
     pub(crate) use aidaemon_channels::hub::DynamicBot;
     pub(crate) use aidaemon_events::conversation::{
-        infer_message_annotations, ConversationSummary, Message, MessageAnnotation,
+        ConversationSummary, Message, MessageAnnotation, infer_message_annotations,
     };
     pub(crate) use aidaemon_events::dialogue::DialogueState;
     pub(crate) use aidaemon_events::provider::{TokenUsage, TokenUsageRecord};
     pub(crate) use aidaemon_mcp::registry::DynamicMcpServer;
+    pub(crate) use aidaemon_memory::Procedure;
     #[cfg(test)]
     pub(crate) use aidaemon_memory::records::{
         Episode, ExtractedMemoryEntity, ExtractedMemoryGraph, ExtractedMemoryRelationship,
@@ -38,7 +39,6 @@ mod types {
         RecentToolTurn, TaskBookends,
     };
     pub(crate) use aidaemon_memory::skills::{DynamicSkill, SkillDraft};
-    pub(crate) use aidaemon_memory::Procedure;
     #[cfg(test)]
     pub(crate) use aidaemon_memory::{BehaviorPattern, ErrorSolution};
     pub(crate) use aidaemon_tools::services::{
@@ -74,9 +74,10 @@ fn set_db_file_permissions(db_path: &str) {
     for suffix in &["-wal", "-shm"] {
         let path = format!("{}{}", db_path, suffix);
         if std::path::Path::new(&path).exists()
-            && let Err(e) = std::fs::set_permissions(&path, mode.clone()) {
-                tracing::warn!("Failed to set permissions on {}: {}", path, e);
-            }
+            && let Err(e) = std::fs::set_permissions(&path, mode.clone())
+        {
+            tracing::warn!("Failed to set permissions on {}: {}", path, e);
+        }
     }
 }
 
@@ -223,11 +224,12 @@ impl SqliteStateStore {
         // every connection in the pool (PRAGMA key must be the first statement).
         #[cfg(feature = "encryption")]
         if let Some(key) = encryption_key
-            && !key.is_empty() {
-                let escaped_key = key.replace('\'', "''");
-                opts = opts.pragma("key", format!("'{}'", escaped_key));
-                tracing::info!("SQLCipher encryption enabled for database");
-            }
+            && !key.is_empty()
+        {
+            let escaped_key = key.replace('\'', "''");
+            opts = opts.pragma("key", format!("'{}'", escaped_key));
+            tracing::info!("SQLCipher encryption enabled for database");
+        }
 
         #[cfg(not(feature = "encryption"))]
         if let Some(key) = encryption_key {

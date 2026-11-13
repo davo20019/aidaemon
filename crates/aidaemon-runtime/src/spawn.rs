@@ -973,9 +973,10 @@ pub fn message_has_sqlite_busy_code(message: &str) -> bool {
 pub fn is_sqlite_busy(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         if let Some(sqlx::Error::Database(database)) = cause.downcast_ref::<sqlx::Error>()
-            && database.code().is_some_and(|code| sqlite_busy_code(&code)) {
-                return true;
-            }
+            && database.code().is_some_and(|code| sqlite_busy_code(&code))
+        {
+            return true;
+        }
         let message = cause.to_string().to_ascii_lowercase();
         message.contains("database is locked")
             || message.contains("database table is locked")

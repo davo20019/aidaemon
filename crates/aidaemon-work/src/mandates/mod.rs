@@ -1409,8 +1409,7 @@ pub fn review_failure_is_notified(consecutive_failures: i64) -> bool {
 /// Rationale of the WAIT the runtime records when a mandate deliberator exits
 /// without committing a decision. Display text only: what makes it a
 /// fallback is its [`MandateDecisionOrigin::RuntimeFallback`].
-pub const SAFE_FALLBACK_WAIT_RATIONALE: &str =
-    "The deliberator returned without committing an explicit decision; the runtime safely defaulted this cycle to WAIT.";
+pub const SAFE_FALLBACK_WAIT_RATIONALE: &str = "The deliberator returned without committing an explicit decision; the runtime safely defaulted this cycle to WAIT.";
 
 /// Why a STOP decision may close a mandate. Evidence-dependent reasons must
 /// cite one or more current-run structured tool receipts.
@@ -1616,12 +1615,13 @@ impl MandateDecisionCycle {
             }
         }
         if let Some(question) = self.question.as_deref()
-            && !canonical_text_within(question, MAX_DECISION_QUESTION_TEXT) {
-                return Err(
+            && !canonical_text_within(question, MAX_DECISION_QUESTION_TEXT)
+        {
+            return Err(
                     "decision question must be canonical non-empty text of at most 500 characters and bytes"
                         .to_string(),
                 );
-            }
+        }
         if self.evidence_receipt_ids.len() > MAX_MANDATE_EVIDENCE_REFS
             || self.evidence_receipt_ids.iter().any(|value| {
                 !canonical_text_within(value, 256)
@@ -1633,9 +1633,10 @@ impl MandateDecisionCycle {
             return Err("decision evidence receipt IDs exceed their canonical bounds".to_string());
         }
         if let Some(matched) = self.termination_match.as_deref()
-            && !canonical_text_within(matched, MAX_MANDATE_POLICY_ENTRY_TEXT) {
-                return Err("decision termination match exceeds its canonical bound".to_string());
-            }
+            && !canonical_text_within(matched, MAX_MANDATE_POLICY_ENTRY_TEXT)
+        {
+            return Err("decision termination match exceeds its canonical bound".to_string());
+        }
         Ok(())
     }
 }
@@ -2604,7 +2605,10 @@ impl MandateRunNotification {
             MandateRunNotificationKind::ActSatisfied => {
                 let done = match self.counts.succeeded_mutations {
                     0 => "finished a review and completed its planned work".to_string(),
-                    count => format!("completed {}", plural(count, "verified action", "verified actions")),
+                    count => format!(
+                        "completed {}",
+                        plural(count, "verified action", "verified actions")
+                    ),
                 };
                 format!("{label} {done}. It keeps running on its own.")
             }
@@ -3113,9 +3117,11 @@ mod tests {
             authority.allowed_tools,
             vec!["http_request".to_string(), "web_fetch".to_string()]
         );
-        assert!(authority
-            .allowed_target_prefixes
-            .contains(&"account:12345".to_string()));
+        assert!(
+            authority
+                .allowed_target_prefixes
+                .contains(&"account:12345".to_string())
+        );
 
         let mut missing_delivery = post.clone();
         missing_delivery.mutation_effects = vec!["remote_mutation".to_string()];
@@ -3295,16 +3301,19 @@ mod tests {
 
         let mut cadence = control.clone();
         cadence.measurement_cadence_secs = 59;
-        assert!(cadence
-            .validate()
-            .unwrap_err()
-            .starts_with("measurement_cadence_secs is 59"));
+        assert!(
+            cadence
+                .validate()
+                .unwrap_err()
+                .starts_with("measurement_cadence_secs is 59")
+        );
         let mut when = control.clone();
         when.baseline_observed_at = "yesterday".to_string();
-        assert!(when
-            .validate()
-            .unwrap_err()
-            .starts_with("baseline_observed_at is \"yesterday\""));
+        assert!(
+            when.validate()
+                .unwrap_err()
+                .starts_with("baseline_observed_at is \"yesterday\"")
+        );
     }
 
     #[test]

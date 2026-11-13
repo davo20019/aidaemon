@@ -31,10 +31,12 @@ mod tests {
             [END UNTRUSTED EXTERNAL DATA]";
         let pattern = extract_error_pattern(wrapped);
         assert_eq!(pattern, "npm ERR! code ENOENT");
-        assert!(extract_error_pattern(
-            "[UNTRUSTED EXTERNAL DATA from 'http_request' — x]\n[END UNTRUSTED EXTERNAL DATA]"
-        )
-        .is_empty());
+        assert!(
+            extract_error_pattern(
+                "[UNTRUSTED EXTERNAL DATA from 'http_request' — x]\n[END UNTRUSTED EXTERNAL DATA]"
+            )
+            .is_empty()
+        );
     }
 
     #[test]

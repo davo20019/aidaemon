@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 
 use crate::report::Report;
 use crate::runner::{AgentFactory, AgentSubject, CaseResult, Subject};
-use crate::scenario::{load_dir, EvalError, NoExtension, Scenario};
+use crate::scenario::{EvalError, NoExtension, Scenario, load_dir};
 
 /// A set of scenarios run N times each.
 #[derive(Debug, Clone)]

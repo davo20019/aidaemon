@@ -1,8 +1,8 @@
 //! The agent's front door: an inbound message with its attachments, and the
 //! one-shot interpretation of a finished background command.
 
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use aidaemon_channels::context::ChannelContext;
 use aidaemon_events::conversation::MessageAttachment;

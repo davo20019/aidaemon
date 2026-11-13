@@ -3,18 +3,18 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
 use aidaemon_core::ChannelVisibility;
 use aidaemon_tools::semantics::UserRole;
 
+use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::semantics::{
     EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ToolCallContext, ToolCallMetadata,
     ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolEvidenceCapability,
     ToolMutationEffects, ToolOutcomeStatus, ToolRole, ToolSemanticScope, ToolVerificationMode,
 };
-use aidaemon_tools::OutcomeTool as Tool;
 
 const FRESH_READING_SECONDS: i64 = 90;
 /// A Node seen within this many seconds counts as recently connected (a
@@ -712,9 +712,11 @@ mod tests {
         let semantics = node_audio_receipt_semantics();
         assert!(semantics.observes_state());
         assert!(semantics.mutates_state());
-        assert!(semantics
-            .mutation_effects
-            .contains(ToolMutationEffects::EXTERNAL_DELIVERY));
+        assert!(
+            semantics
+                .mutation_effects
+                .contains(ToolMutationEffects::EXTERNAL_DELIVERY)
+        );
         assert!(semantics.can_verify_with_result_content());
         assert!(semantics.evidence.iter().any(|capability| {
             capability.scope == ToolSemanticScope::ExternalRemote
@@ -799,9 +801,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(disabled
-            .to_string()
-            .contains("Node audio announcements are disabled"));
+        assert!(
+            disabled
+                .to_string()
+                .contains("Node audio announcements are disabled")
+        );
     }
 
     #[tokio::test]

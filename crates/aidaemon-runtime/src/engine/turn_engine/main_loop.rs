@@ -6,7 +6,7 @@ use crate::engine::tool_roster::ToolRoster as _;
 use crate::turn::bootstrap::{BootstrapCtx, BootstrapData, BootstrapOutcome};
 use crate::turn::completion_contract::{CompletionContract, CompletionProgress};
 use crate::turn::execution_state::{
-    select_initial_execution_budget, ExecutionPersistence, ExecutionState,
+    ExecutionPersistence, ExecutionState, select_initial_execution_budget,
 };
 #[cfg(any(test, feature = "testing"))]
 use crate::turn::followup::FollowupMode;
@@ -1379,14 +1379,16 @@ impl TurnEngine<'_> {
         // intentionally `Failed` and is excluded from that central branch.
         // If an earlier phase already emitted TaskEnd, its accounting has
         // already happened; this pass only repairs the missing response.
-        if !terminal_boundary_already_closed && status == aidaemon_events::TaskStatus::Failed
-            && let Some(efficiency) = self.task_efficiency_data(&unhandled_error_task_id).await {
-                crate::policy::metrics::record_failed_task_tokens(
-                    efficiency
-                        .input_tokens
-                        .saturating_add(efficiency.output_tokens),
-                );
-            }
+        if !terminal_boundary_already_closed
+            && status == aidaemon_events::TaskStatus::Failed
+            && let Some(efficiency) = self.task_efficiency_data(&unhandled_error_task_id).await
+        {
+            crate::policy::metrics::record_failed_task_tokens(
+                efficiency
+                    .input_tokens
+                    .saturating_add(efficiency.output_tokens),
+            );
+        }
         if !terminal_boundary_already_closed {
             self.emit_task_end(
                 &unhandled_error_emitter,

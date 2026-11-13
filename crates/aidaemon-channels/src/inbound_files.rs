@@ -160,12 +160,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("channels-test-{}", RunId::new()));
         let path = save_attachment(&dir, "telegram:1", "../../evil.sh", b"data").unwrap();
         assert!(path.starts_with(dir.join("telegram_1")));
-        assert!(path
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .ends_with("_evil.sh"));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("_evil.sh")
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"data");
         #[cfg(unix)]
         {

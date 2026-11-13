@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::tools::manage_memories::ManageMemoriesTool;
 use crate::tools::traits::{

@@ -484,19 +484,23 @@ mod tests {
         assert!(context.contains("mandate_review_failed"), "{context}");
 
         // Another session, and a turn that started after it, see nothing.
-        assert!(store
-            .notices_delivered_since("other-session", turn_started)
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(store
-            .notices_delivered_since(
-                "owner-session",
-                chrono::Utc::now() + chrono::Duration::seconds(5)
-            )
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .notices_delivered_since("other-session", turn_started)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .notices_delivered_since(
+                    "owner-session",
+                    chrono::Utc::now() + chrono::Duration::seconds(5)
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(crate::goals::notices_turn_context(&[]), None);
     }
 
@@ -504,12 +508,14 @@ mod tests {
     async fn mandate_notice_rolls_back_with_its_enclosing_state_transaction() {
         let (store, _database) = test_store().await;
         let mut tx = store.pool.begin().await.unwrap();
-        assert!(enqueue_mandate_run_notification_on_connection(
-            &mut tx,
-            &notice(MandateRunNotificationKind::ActSatisfied),
-        )
-        .await
-        .unwrap());
+        assert!(
+            enqueue_mandate_run_notification_on_connection(
+                &mut tx,
+                &notice(MandateRunNotificationKind::ActSatisfied),
+            )
+            .await
+            .unwrap()
+        );
         tx.rollback().await.unwrap();
 
         let count =
@@ -585,11 +591,13 @@ mod tests {
             .mark_notification_delivered(&notice.notification_id())
             .await
             .unwrap();
-        assert!(store
-            .get_pending_notifications(10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .get_pending_notifications(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

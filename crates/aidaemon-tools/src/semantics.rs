@@ -1778,9 +1778,10 @@ fn default_access_manifest(
         .collect::<Vec<_>>();
     let mut read_targets = Vec::new();
     if let Some(cwd) = execution_cwd.as_deref()
-        && let Some(target) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd) {
-            read_targets.push(target);
-        }
+        && let Some(target) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd)
+    {
+        read_targets.push(target);
+    }
     if semantics.observes_state() {
         read_targets.extend(non_cwd_targets.iter().cloned());
     }
@@ -2901,7 +2902,7 @@ pub fn prepare_invocation<T: ToolSemantics + ?Sized>(
 
 #[cfg(test)]
 mod file_trust_tests {
-    use super::{file_output_trust, TrustRoots};
+    use super::{TrustRoots, file_output_trust};
     use aidaemon_core::SourceTrust::{Trusted, Untrusted};
 
     #[test]

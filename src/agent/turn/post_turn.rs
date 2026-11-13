@@ -43,7 +43,7 @@ mod gate_telemetry_tests {
 
     #[tokio::test]
     async fn mandate_prose_closeout_retries_and_corrected_typed_wait_commits() {
-        use crate::testing::{setup_test_agent_with_mandates, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent_with_mandates};
         use crate::traits::store_prelude::*;
         use crate::traits::{Goal, Mandate, MandateAuthority, MandateDecisionOutcome, Task};
 

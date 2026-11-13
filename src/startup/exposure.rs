@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use aidaemon_core::{CancellationToken, EndpointPublisher, EndpointSource};
 use aidaemon_exposure::{
-    supervisor::StatusHandle, Backoff, ExposedService, ExposurePlan, ExposureSupervisor,
-    ServiceListeners,
+    Backoff, ExposedService, ExposurePlan, ExposureSupervisor, ServiceListeners,
+    supervisor::StatusHandle,
 };
 use async_trait::async_trait;
 
@@ -81,12 +81,13 @@ pub fn start(
         }
     }
     if config.nodes.gateway.enabled
-        && let Ok(ip) = config.nodes.gateway.bind.parse::<std::net::IpAddr>() {
-            let addr = std::net::SocketAddr::new(ip, config.nodes.gateway.port);
-            if let Err(error) = listeners.register(ExposedService::NodeGateway, addr) {
-                tracing::warn!(%error, "Node Gateway listener not exposable");
-            }
+        && let Ok(ip) = config.nodes.gateway.bind.parse::<std::net::IpAddr>()
+    {
+        let addr = std::net::SocketAddr::new(ip, config.nodes.gateway.port);
+        if let Err(error) = listeners.register(ExposedService::NodeGateway, addr) {
+            tracing::warn!(%error, "Node Gateway listener not exposable");
         }
+    }
     let state_dir = state_dir();
     let mut plans = Vec::new();
     for (service, settings) in config.exposure.services() {

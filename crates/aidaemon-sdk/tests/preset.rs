@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use aidaemon_sdk::policies::{ApprovalMode, MemoryParts, MemorySystem, MemoryTurn};
-use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
 use aidaemon_sdk::{
-    preset, tool, BuildError, MemoryStore, PresetError, RunStatus, RunStore, Safeguard, Tool,
+    BuildError, MemoryStore, PresetError, RunStatus, RunStore, Safeguard, Tool, preset, tool,
 };
 use serde_json::json;
 
@@ -293,11 +293,13 @@ async fn a_workspace_brings_the_default_tools_and_sqlite_keeps_runs() {
     assert!(outcome.is_completed());
     drop(agent);
     let store = aidaemon_sdk::store::SqliteStore::open(&db).await.unwrap();
-    assert!(store
-        .load_state(outcome.state.run_id)
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        store
+            .load_state(outcome.state.run_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// A synthetic memory system: one recall tool and its own guidance.

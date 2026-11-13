@@ -126,17 +126,20 @@ impl Limits {
             return Some(LimitKind::Turns);
         }
         if let Some(max) = self.max_tokens
-            && snapshot.usage.billable_tokens() >= max {
-                return Some(LimitKind::Tokens);
-            }
+            && snapshot.usage.billable_tokens() >= max
+        {
+            return Some(LimitKind::Tokens);
+        }
         if let Some(max) = self.max_tool_calls
-            && snapshot.tool_calls >= max {
-                return Some(LimitKind::ToolCalls);
-            }
+            && snapshot.tool_calls >= max
+        {
+            return Some(LimitKind::ToolCalls);
+        }
         if let Some(max) = self.timeout
-            && snapshot.elapsed >= max {
-                return Some(LimitKind::WallClock);
-            }
+            && snapshot.elapsed >= max
+        {
+            return Some(LimitKind::WallClock);
+        }
         None
     }
 }

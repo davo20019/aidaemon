@@ -4,13 +4,13 @@
 
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::*;
 use crate::channels::mock_api::{MockApi, Recorded};
 use crate::runtime_ports::DaemonAgentRuntime;
 use crate::tasks::TaskRegistry;
-use crate::testing::{setup_test_agent, MockProvider};
+use crate::testing::{MockProvider, setup_test_agent};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::HubChannel;
 use crate::types::ApprovalResponse;
@@ -187,10 +187,12 @@ async fn an_approval_card_is_answered_by_an_owner_press_and_shows_its_outcome() 
         .unwrap();
     assert!(matches!(answer, ApprovalResponse::AllowOnce));
     let updated = api.wait_for(|r| r.path == "/chat.update").await;
-    assert!(updated.json()["text"]
-        .as_str()
-        .unwrap()
-        .contains("Allowed this once"));
+    assert!(
+        updated.json()["text"]
+            .as_str()
+            .unwrap()
+            .contains("Allowed this once")
+    );
 }
 
 /// A typed card renders as Telegram's and Discord's do, in Slack's blocks: the

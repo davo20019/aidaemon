@@ -8,8 +8,8 @@
 //! ([`NoticeDelivery`]) and how text is shown to the owner ([`WorkPresenter`]).
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use aidaemon_core::{Schedule, Service, ServiceContext, ServiceError};
@@ -198,9 +198,10 @@ pub fn sqlite_busy_code(value: &str) -> bool {
 pub fn is_sqlite_busy_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         if let Some(sqlx::Error::Database(database)) = cause.downcast_ref::<sqlx::Error>()
-            && database.code().is_some_and(|code| sqlite_busy_code(&code)) {
-                return true;
-            }
+            && database.code().is_some_and(|code| sqlite_busy_code(&code))
+        {
+            return true;
+        }
         let message = cause.to_string().to_ascii_lowercase();
         message.contains("database is locked")
             || message.contains("database table is locked")
@@ -710,16 +711,17 @@ impl GoalCycle {
         // Each is a whole agent turn, so they run beside the cycle: schedules,
         // mandates and stuck-task checks must not wait for them.
         if let Some(agent) = self.live_agent()
-            && !self.deferred_retry_running.swap(true, Ordering::AcqRel) {
-                let running = self.deferred_retry_running.clone();
-                tokio::spawn(async move {
-                    let dispatched = agent.retry_deferred_provider_requests().await;
-                    running.store(false, Ordering::Release);
-                    if dispatched > 0 {
-                        info!(dispatched, "Re-ran requests deferred by a provider outage");
-                    }
-                });
-            }
+            && !self.deferred_retry_running.swap(true, Ordering::AcqRel)
+        {
+            let running = self.deferred_retry_running.clone();
+            tokio::spawn(async move {
+                let dispatched = agent.retry_deferred_provider_requests().await;
+                running.store(false, Ordering::Release);
+                if dispatched > 0 {
+                    info!(dispatched, "Re-ran requests deferred by a provider outage");
+                }
+            });
+        }
 
         Ok(())
     }

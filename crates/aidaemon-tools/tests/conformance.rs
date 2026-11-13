@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use aidaemon_core::conformance::{check_tool, check_tool_with, ConformanceReport, ToolKitOptions};
 use aidaemon_core::Tool;
-use aidaemon_tools::{default_tools, Checklist, Shell, Workspace};
+use aidaemon_core::conformance::{ConformanceReport, ToolKitOptions, check_tool, check_tool_with};
+use aidaemon_tools::{Checklist, Shell, Workspace, default_tools};
 use serde_json::json;
 
 #[test]

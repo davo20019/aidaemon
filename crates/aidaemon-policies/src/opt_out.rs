@@ -9,7 +9,7 @@ use aidaemon_core::{
     ToolError, ToolInfo, ToolOutput, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::memory::TurnLearning;
 

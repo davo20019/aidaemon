@@ -6,8 +6,8 @@ use aidaemon_core::{
     Image, Message, ModelRequest, Provider, ProviderError, ToolCall, ToolChoice, ToolSpec, Usage,
 };
 use aidaemon_providers::{Anthropic, ConfigError};
-use common::{drain, named_events, MockResponse, MockServer};
-use serde_json::{json, Value};
+use common::{MockResponse, MockServer, drain, named_events};
+use serde_json::{Value, json};
 
 fn provider(server: &MockServer) -> Anthropic {
     Anthropic::builder()
@@ -173,7 +173,7 @@ fn images_on_user_messages_and_tool_results() {
 
     // An image with no text still makes a user turn.
     let body = p.request_body(&request(vec![
-        Message::user("").with_images([Image::url("https://example.com/a.png")])
+        Message::user("").with_images([Image::url("https://example.com/a.png")]),
     ]));
     assert_eq!(body["messages"][0]["content"][0]["type"], "image");
 }

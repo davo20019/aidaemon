@@ -189,14 +189,11 @@ pub(crate) fn build_base_system_prompt(
     // OrbStack stopped instead of starting it.
     let obstacle_guidance = aidaemon_policies::OBSTACLE_GUIDANCE;
 
-    let http_request_table_row =
-        "\n| Make authenticated API requests (Twitter, Stripe, etc.) | http_request | terminal (curl) |";
+    let http_request_table_row = "\n| Make authenticated API requests (Twitter, Stripe, etc.) | http_request | terminal (curl) |";
 
-    let manage_api_table_row =
-        "\n| Deterministically connect, learn, and verify an API end-to-end | manage_api | manual multi-tool orchestration |";
+    let manage_api_table_row = "\n| Deterministically connect, learn, and verify an API end-to-end | manage_api | manual multi-tool orchestration |";
 
-    let manage_http_auth_table_row =
-        "\n| Create and verify generic API auth profiles | manage_http_auth | manual config edits + keychain commands |";
+    let manage_http_auth_table_row = "\n| Create and verify generic API auth profiles | manage_http_auth | manual config edits + keychain commands |";
 
     let manage_oauth_table_row =
         "\n| Connect external services via OAuth (built-in or custom OAuth2) | manage_oauth | — |";
@@ -275,8 +272,7 @@ pub(crate) fn build_base_system_prompt(
         },
     );
 
-    let social_intelligence_guidelines =
-        "\n\n## Social Intelligence — BE PROACTIVE\n\
+    let social_intelligence_guidelines = "\n\n## Social Intelligence — BE PROACTIVE\n\
         **IMPORTANT: All proactive suggestions below are for private DMs with the owner ONLY.**\n\
         You are a socially intelligent assistant. Actively help the owner nurture relationships:\n\n\
         **Proactive reminders** (only in DM with owner):\n\

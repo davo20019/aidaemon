@@ -96,27 +96,27 @@ mod workspace;
 mod testutil;
 
 pub use backend::{
-    shell_quote, BackendDirEntry, BackendFileType, BackendKind, BackendMetadata, BackendPath,
-    CommandSpec, ExecutionBackend, ExecutionOutput, ExecutionRequest, LexicalPaths, ProcessHandle,
-    SpawnedProcess, WriteMode,
+    BackendDirEntry, BackendFileType, BackendKind, BackendMetadata, BackendPath, CommandSpec,
+    ExecutionBackend, ExecutionOutput, ExecutionRequest, LexicalPaths, ProcessHandle,
+    SpawnedProcess, WriteMode, shell_quote,
 };
 pub use checklist::{Checklist, ChecklistGate, ChecklistItem, ChecklistState, ItemStatus};
 pub use exec::{
-    best_available_sandbox, default_deny_read, home_secret_paths, sandbox_preference_from_env,
-    select_sandbox, BubblewrapSandbox, CommandOutput, DockerSandbox, ExecError, LocalSandbox,
-    Sandbox, SandboxCommand, SandboxKind, SandboxSelection, SeatbeltSandbox, TerminalConfinement,
-    HOME_SECRET_PATHS, SANDBOX_ENV,
+    BubblewrapSandbox, CommandOutput, DockerSandbox, ExecError, HOME_SECRET_PATHS, LocalSandbox,
+    SANDBOX_ENV, Sandbox, SandboxCommand, SandboxKind, SandboxSelection, SeatbeltSandbox,
+    TerminalConfinement, best_available_sandbox, default_deny_read, home_secret_paths,
+    sandbox_preference_from_env, select_sandbox,
 };
 pub use fs::{
-    format_with_line_numbers, render_read_file_output, render_read_file_output_within, EditFile,
-    FilePolicy, HostFilePolicy, HostFilePolicySettings, ProtectedPathGuard, ReadFile, ToolText,
-    WorkspaceBackend, WorkspaceFilePolicy, WriteFile, DEFAULT_IGNORE_DIRS, MAX_READ_CHARS,
+    DEFAULT_IGNORE_DIRS, EditFile, FilePolicy, HostFilePolicy, HostFilePolicySettings,
+    MAX_READ_CHARS, ProtectedPathGuard, ReadFile, ToolText, WorkspaceBackend, WorkspaceFilePolicy,
+    WriteFile, format_with_line_numbers, render_read_file_output, render_read_file_output_within,
 };
 pub use outcome::{CallValidator, KernelAdapter, NothingSentError, OutcomeRunner, OutcomeTool};
 pub use path_class::PathClassifier;
 pub use search::{Glob, Grep};
 pub use search_files::SearchFiles;
-pub use shell::{Shell, DEFAULT_ENV_ALLOWLIST};
+pub use shell::{DEFAULT_ENV_ALLOWLIST, Shell};
 pub use util::sniff_image_mime;
 pub use web::{NetworkGuard, WebFetch};
 pub use workspace::{PathError, Workspace};

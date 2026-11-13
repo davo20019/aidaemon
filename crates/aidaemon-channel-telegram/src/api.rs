@@ -165,7 +165,7 @@ impl BotApi {
                     code: status.as_u16(),
                     description: status.canonical_reason().unwrap_or("error").to_string(),
                     retry_after: None,
-                })
+                });
             }
             Err(e) => return Err(ApiError::Transport(format!("invalid response body: {e}"))),
         };

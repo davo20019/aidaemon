@@ -11,8 +11,8 @@ mod tests {
     use crate::traits::Tool;
     use crate::traits::ToolSemanticFacet;
     use crate::traits::ToolSemantics;
-    use serde_json::json;
     use serde_json::Value;
+    use serde_json::json;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
@@ -45,8 +45,8 @@ mod tests {
         })
         .to_string();
         tool.validate_arguments(&failed_item).unwrap();
-        let statuses = &tool.schema()["parameters"]["properties"]["items"]["items"]["properties"]
-            ["status"]["enum"];
+        let statuses = &tool.schema()["parameters"]["properties"]["items"]["items"]["properties"]["status"]
+            ["enum"];
         assert!(statuses.as_array().unwrap().contains(&json!("failed")));
         let out = tool
             .call_with(&failed_item, crate::testing::call_facts("sess-failed"))

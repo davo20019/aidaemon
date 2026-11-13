@@ -440,9 +440,9 @@ pub trait ExecutionBackend: Send + Sync {
                     .lines()
                     .map(str::trim)
                     .find(|line| !line.is_empty())
-                {
-                    return Ok(Some(BackendPath::new(resolved.to_string())));
-                }
+            {
+                return Ok(Some(BackendPath::new(resolved.to_string())));
+            }
         }
         Ok(None)
     }

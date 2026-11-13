@@ -1030,13 +1030,10 @@ impl fmt::Debug for TerminalConfig {
             .field("daemon_ws_url", &self.daemon_ws_url)
             .field(
                 "daemon_connect_token",
-                &self.daemon_connect_token.as_ref().map(|v| {
-                    if v.is_empty() {
-                        "\"\""
-                    } else {
-                        "[REDACTED]"
-                    }
-                }),
+                &self
+                    .daemon_connect_token
+                    .as_ref()
+                    .map(|v| if v.is_empty() { "\"\"" } else { "[REDACTED]" }),
             )
             .field(
                 "allow_static_token_fallback",
@@ -2209,13 +2206,14 @@ impl AppConfig {
 
         // Add legacy config as "default" if present and has a token
         if let Some(ref legacy) = self.telegram
-            && !legacy.bot_token.is_empty() {
-                bots.push(TelegramBotConfig {
-                    bot_token: legacy.bot_token.clone(),
-                    allowed_user_ids: legacy.allowed_user_ids.clone(),
-                    webhook: legacy.webhook.clone(),
-                });
-            }
+            && !legacy.bot_token.is_empty()
+        {
+            bots.push(TelegramBotConfig {
+                bot_token: legacy.bot_token.clone(),
+                allowed_user_ids: legacy.allowed_user_ids.clone(),
+                webhook: legacy.webhook.clone(),
+            });
+        }
 
         bots
     }
@@ -2226,13 +2224,14 @@ impl AppConfig {
         let mut bots = self.discord_bots.clone();
 
         if let Some(ref legacy) = self.discord
-            && !legacy.bot_token.is_empty() {
-                bots.push(DiscordBotConfig {
-                    bot_token: legacy.bot_token.clone(),
-                    allowed_user_ids: legacy.allowed_user_ids.clone(),
-                    guild_id: legacy.guild_id,
-                });
-            }
+            && !legacy.bot_token.is_empty()
+        {
+            bots.push(DiscordBotConfig {
+                bot_token: legacy.bot_token.clone(),
+                allowed_user_ids: legacy.allowed_user_ids.clone(),
+                guild_id: legacy.guild_id,
+            });
+        }
 
         bots
     }
@@ -2268,9 +2267,10 @@ impl AppConfig {
 
         // Legacy telegram config
         if let Some(ref mut telegram) = self.telegram
-            && telegram.bot_token == "keychain" {
-                telegram.bot_token = resolve_from_keychain("bot_token")?;
-            }
+            && telegram.bot_token == "keychain"
+        {
+            telegram.bot_token = resolve_from_keychain("bot_token")?;
+        }
 
         // Telegram bots array
         for (i, bot) in self.telegram_bots.iter_mut().enumerate() {
@@ -2281,16 +2281,18 @@ impl AppConfig {
         }
 
         if let Some(ref email) = self.triggers.email
-            && email.password == "keychain" {
-                let password = resolve_from_keychain("email_password")?;
-                let mut email = email.clone();
-                email.password = password;
-                self.triggers.email = Some(email);
-            }
+            && email.password == "keychain"
+        {
+            let password = resolve_from_keychain("email_password")?;
+            let mut email = email.clone();
+            email.password = password;
+            self.triggers.email = Some(email);
+        }
         if let Some(ref key) = self.state.encryption_key
-            && key == "keychain" {
-                self.state.encryption_key = Some(resolve_from_keychain("encryption_key")?);
-            }
+            && key == "keychain"
+        {
+            self.state.encryption_key = Some(resolve_from_keychain("encryption_key")?);
+        }
         if self.search.api_key == "keychain" {
             self.search.api_key = resolve_from_keychain("search_api_key")?;
         }
@@ -2311,9 +2313,10 @@ impl AppConfig {
         #[cfg(feature = "discord")]
         {
             if let Some(ref mut discord) = self.discord
-                && discord.bot_token == "keychain" {
-                    discord.bot_token = resolve_from_keychain("discord_bot_token")?;
-                }
+                && discord.bot_token == "keychain"
+            {
+                discord.bot_token = resolve_from_keychain("discord_bot_token")?;
+            }
             for (i, bot) in self.discord_bots.iter_mut().enumerate() {
                 if bot.bot_token == "keychain" {
                     let key = aidaemon_secrets::names::bot_token(

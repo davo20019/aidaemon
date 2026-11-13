@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use aidaemon_core::{Message, ModelRequest, Provider, ProviderError};
 use aidaemon_providers::{ChatGpt, ChatGptAuth, ChatGptCredentials};
 use async_trait::async_trait;
-use common::{data_events, drain, MockResponse, MockServer};
+use common::{MockResponse, MockServer, data_events, drain};
 use serde_json::json;
 
 /// Hands out `token-1`, then `token-2` after a rejection; records what was
@@ -126,7 +126,7 @@ async fn a_refreshed_token_rejected_again_is_reported_and_fails() {
 #[tokio::test]
 async fn a_plan_limit_is_a_rate_limit_with_an_explanation() {
     let server = MockServer::start(vec![
-        MockResponse::status(429, "{}").header("retry-after", "3")
+        MockResponse::status(429, "{}").header("retry-after", "3"),
     ])
     .await;
     let error = provider(&server, Arc::default())

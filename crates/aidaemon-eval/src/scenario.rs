@@ -399,9 +399,10 @@ impl<S, X> Scenario<S, X> {
             }
         }
         if let Some(limits) = &self.limits
-            && limits.max_turns == Some(0) {
-                return Err("`limits.max_turns` must be at least 1".into());
-            }
+            && limits.max_turns == Some(0)
+        {
+            return Err("`limits.max_turns` must be at least 1".into());
+        }
         Ok(())
     }
 

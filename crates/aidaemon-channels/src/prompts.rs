@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{ApprovalChoice, ApprovalPrompt, Channel, Conversation, MessageRef, OutboundMessage};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 use tracing::{info, warn};
 
 use crate::approval_render;
@@ -414,7 +414,9 @@ fn goal_outcome(
         (true, "edit", _) => {
             "✏️ Autopilot not activated\nSend the accounts, actions, limits, or guardrails you want changed."
         }
-        (true, _, ApprovalResponse::Deny) => "❌ Autopilot cancelled\nNo new autonomy was activated.",
+        (true, _, ApprovalResponse::Deny) => {
+            "❌ Autopilot cancelled\nNo new autonomy was activated."
+        }
         (true, _, _) => "✅ Autopilot enabled\nActivation is continuing now.",
         (false, _, ApprovalResponse::Deny) => "❌ Goal cancelled\nNothing was activated.",
         (false, _, _) => "✅ Goal approved\nActivation is continuing now.",
@@ -430,7 +432,7 @@ mod tests {
     /// whoever asked stops waiting and drops the request.
     #[tokio::test]
     async fn an_unanswered_card_expires() {
-        use crate::testing::{direct, TestChannel};
+        use crate::testing::{TestChannel, direct};
         for dropped in [false, true] {
             let channel = Arc::new(
                 TestChannel::new("synthetic")
@@ -469,7 +471,7 @@ mod tests {
     /// line around the ask) says that answer, not "expired".
     #[tokio::test]
     async fn a_card_answered_elsewhere_says_so() {
-        use crate::testing::{direct, TestChannel};
+        use crate::testing::{TestChannel, direct};
         let channel = Arc::new(
             TestChannel::new("synthetic")
                 .with_buttons(true)
@@ -490,9 +492,11 @@ mod tests {
                 Duration::from_secs(60),
             ),
         ));
-        assert!(tokio::time::timeout(Duration::from_millis(50), &mut ask)
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut ask)
+                .await
+                .is_err()
+        );
         *note.lock().unwrap() = Some("✅ Allowed this once, from the app.".to_string());
         drop(ask);
         assert!(
@@ -508,7 +512,7 @@ mod tests {
     /// A waiting approval card gets one reminder before it expires.
     #[tokio::test]
     async fn a_waiting_approval_card_is_reminded_once_before_it_expires() {
-        use crate::testing::{direct, TestChannel};
+        use crate::testing::{TestChannel, direct};
         let channel = Arc::new(
             TestChannel::new("synthetic")
                 .with_buttons(true)

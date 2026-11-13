@@ -35,12 +35,16 @@ mod tests {
         let (message_ids, turn_ids) = take_projected_source_ids(&mut messages);
         assert_eq!(message_ids, ["message-1"]);
         assert_eq!(turn_ids, ["turn-1"]);
-        assert!(messages[0]
-            .get(aidaemon_runtime::turn::turn_render::SOURCE_MESSAGE_IDS_KEY)
-            .is_none());
-        assert!(messages[0]
-            .get(aidaemon_runtime::turn::turn_render::SOURCE_TURN_IDS_KEY)
-            .is_none());
+        assert!(
+            messages[0]
+                .get(aidaemon_runtime::turn::turn_render::SOURCE_MESSAGE_IDS_KEY)
+                .is_none()
+        );
+        assert!(
+            messages[0]
+                .get(aidaemon_runtime::turn::turn_render::SOURCE_TURN_IDS_KEY)
+                .is_none()
+        );
     }
     use chrono::Utc;
 
@@ -105,10 +109,12 @@ mod tests {
         assert!(!rendered.contains("/Users/owner"));
         assert!(!rendered.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
         assert!(rendered.contains("[REDACTED:API key]"));
-        assert!(turns[0]
-            .messages
-            .iter()
-            .all(|message| message.tool_calls_json.is_none()));
+        assert!(
+            turns[0]
+                .messages
+                .iter()
+                .all(|message| message.tool_calls_json.is_none())
+        );
     }
 
     #[test]
@@ -126,26 +132,34 @@ mod tests {
         collapse_superseded_computer_use_trees(&mut messages);
 
         // Only the latest tree keeps full content.
-        assert!(messages[5]["content"]
-            .as_str()
-            .unwrap()
-            .contains("AXButton newest"));
+        assert!(
+            messages[5]["content"]
+                .as_str()
+                .unwrap()
+                .contains("AXButton newest")
+        );
         // Earlier trees are stubbed.
-        assert!(messages[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Earlier computer_use screen state omitted"));
-        assert!(messages[3]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Earlier computer_use screen state omitted"));
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Earlier computer_use screen state omitted")
+        );
+        assert!(
+            messages[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Earlier computer_use screen state omitted")
+        );
         // Non-tree messages (system, assistant, list_apps) untouched.
         assert_eq!(messages[0]["content"], "sys");
         assert_eq!(messages[2]["content"], "thinking");
-        assert!(messages[4]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Running apps"));
+        assert!(
+            messages[4]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Running apps")
+        );
     }
 
     fn msg(role: &str, content: &str) -> Message {
@@ -383,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn later_iterations_include_execution_checkpoint_after_tool_progress() {
         use crate::execution_policy::PolicyBundle;
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
 
         let harness = setup_test_agent(MockProvider::new())
             .await
@@ -491,7 +505,7 @@ mod tests {
     #[tokio::test]
     async fn later_iterations_preserve_system_prompt_prefix_without_duplicate_guidance() {
         use crate::execution_policy::PolicyBundle;
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
@@ -597,7 +611,7 @@ mod tests {
     #[tokio::test]
     async fn non_event_history_is_not_reconstructed_into_payload() {
         use crate::execution_policy::PolicyBundle;
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
         use chrono::Duration as ChronoDuration;
 
@@ -697,7 +711,7 @@ mod tests {
     async fn session_summary_travels_inside_task_context_tail() {
         use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
         use crate::execution_policy::PolicyBundle;
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
@@ -785,7 +799,7 @@ mod tests {
     async fn adjacent_answer_continuity_does_not_depend_on_followup_phrase_classifier() {
         use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
         use crate::execution_policy::PolicyBundle;
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
 
         let harness = setup_test_agent(MockProvider::new())
             .await
@@ -963,7 +977,7 @@ mod tests {
     async fn small_context_model_compacts_tool_schemas_without_dropping_tools() {
         use crate::context_budget::{estimate_tokens, estimate_tool_definition_tokens};
         use crate::execution_policy::PolicyBundle;
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let mut harness = setup_test_agent(MockProvider::new())
@@ -1086,7 +1100,7 @@ mod tests {
     async fn small_context_model_rechecks_budget_after_final_prompt_assembly() {
         use crate::context_budget::{estimate_tokens, estimate_tool_definition_tokens};
         use crate::execution_policy::PolicyBundle;
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let mut harness = setup_test_agent(MockProvider::new())
@@ -1198,7 +1212,7 @@ mod tests {
     async fn tail_follows_current_turn_and_summary_lives_only_in_tail() {
         use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
         use crate::execution_policy::PolicyBundle;
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
@@ -1373,7 +1387,7 @@ mod tests {
     async fn within_task_tail_reuse_is_byte_identical() {
         use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
         use crate::execution_policy::PolicyBundle;
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
@@ -1474,7 +1488,7 @@ mod tests {
     #[tokio::test]
     async fn final_tool_order_is_name_sorted_after_mutations() {
         use crate::execution_policy::PolicyBundle;
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
@@ -1549,7 +1563,7 @@ mod tests {
     // ====================================================================
 
     use crate::execution_policy::PolicyBundle;
-    use crate::testing::{setup_test_agent, MockProvider, TestHarness};
+    use crate::testing::{MockProvider, TestHarness, setup_test_agent};
 
     /// Build a payload for `session`/`user_text` at `iteration`, using the
     /// turn-anchored path. Returns the built messages.
@@ -1749,9 +1763,11 @@ mod tests {
             .clear();
         let after_restart =
             build_payload_with_continuity(&harness, session, "How old are they?", 1, false).await;
-        assert!(serde_json::to_string(&after_restart)
-            .unwrap()
-            .contains("Mia and Zoe"));
+        assert!(
+            serde_json::to_string(&after_restart)
+                .unwrap()
+                .contains("Mia and Zoe")
+        );
     }
 
     #[test]
@@ -1796,14 +1812,18 @@ mod tests {
             (5..=10).collect::<Vec<_>>(),
             "the newest turns are kept, oldest first"
         );
-        assert!(turns
-            .iter()
-            .flat_map(|turn| &turn.messages)
-            .all(|message| message.role != "tool"));
-        assert!(turns[0]
-            .messages
-            .iter()
-            .any(|message| message.content.as_deref() == Some("answer 5")));
+        assert!(
+            turns
+                .iter()
+                .flat_map(|turn| &turn.messages)
+                .all(|message| message.role != "tool")
+        );
+        assert!(
+            turns[0]
+                .messages
+                .iter()
+                .any(|message| message.content.as_deref() == Some("answer 5"))
+        );
     }
 
     #[tokio::test]
@@ -1861,9 +1881,11 @@ mod tests {
             .get_turns_from_anchor("new-task-floor", floor)
             .await
             .unwrap();
-        assert!(retained
-            .iter()
-            .all(|turn| turn.turn_id.as_deref() != Some("old-task")));
+        assert!(
+            retained
+                .iter()
+                .all(|turn| turn.turn_id.as_deref() != Some("old-task"))
+        );
 
         // Simulate a daemon restart. The in-memory anchor disappears, while
         // the typed new-task floor must remain authoritative in SQLite.

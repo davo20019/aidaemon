@@ -11,7 +11,7 @@ use aidaemon_core::{
     SourceTrust, Tool, ToolAnnotations, ToolContext, ToolOutput, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::memory::{Memory, ScopeResolver};
 use crate::types::{NewFact, Provenance, UpsertOutcome};
