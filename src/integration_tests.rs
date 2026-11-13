@@ -27,3 +27,4 @@ include!("integration_tests/part_21_owed_requests.rs");
 include!("integration_tests/part_22_deferred_items.rs");
 include!("integration_tests/part_23_coordination.rs");
 include!("integration_tests/part_24_client_gateway.rs");
+include!("integration_tests/part_25_unattempted_work.rs");

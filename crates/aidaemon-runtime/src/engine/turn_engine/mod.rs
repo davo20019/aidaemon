@@ -1214,6 +1214,7 @@ impl TurnEngine<'_> {
             closeout_ended_unmet: AtomicBool::new(false),
             verification_demanded: AtomicBool::new(false),
             recovery_demanded: AtomicBool::new(false),
+            unattempted_work_demanded: AtomicBool::new(false),
             executor_demanded_at: AtomicU64::new(u64::MAX),
             open_checklist_items: AtomicU64::new(0),
             checklist_declared: AtomicBool::new(false),

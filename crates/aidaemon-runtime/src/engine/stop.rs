@@ -122,3 +122,92 @@ pub fn closeout_demands_work(facts: &StopFacts) -> bool {
 pub fn closeout_ended_unmet(facts: &StopFacts, demands_made: u32) -> bool {
     demands_made > 0 && !facts.reachable_obligation_ids.is_empty()
 }
+
+/// The unmet requirement a run records when it stops having declared work
+/// and attempted none of it.
+pub const UNATTEMPTED_WORK_UNMET: &str = "none of the requested work was attempted";
+
+/// What the closeout does with a run about to stop that declared work and
+/// attempted none of it ([`aidaemon_events::run_aggregate::RunAggregate::declared_work_unattempted`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnattemptedWorkVerdict {
+    /// Nothing to hold: work was attempted, none was declared, the request
+    /// forbids changes, the run is not about to stop, or the owner was asked.
+    NotApplicable,
+    /// Send the run back once: do the work, or ask the owner.
+    Demand,
+    /// The pass was spent and still nothing was attempted: the run stops
+    /// unmet, with [`UNATTEMPTED_WORK_UNMET`] as its typed reason.
+    StopUnmet,
+}
+
+/// Judge a stop from typed facts only: whether the declared work was
+/// attempted, the agent's verdict, whether the closeout would let the run
+/// stop, whether the request permits changes, and whether the one pass was
+/// used. An unfinished verdict or a deferral is honoured once work was tried
+/// or something typed stood in the way; with nothing tried and nothing in
+/// the way, the request is carried out or the owner is asked
+/// (`needs_owner`), never closed on a report of earlier work.
+pub fn unattempted_work_verdict(
+    work_unattempted: bool,
+    claim: Option<aidaemon_events::ExecutorClaimedOutcome>,
+    closeout_lets_stop: bool,
+    changes_permitted: bool,
+    demanded: bool,
+) -> UnattemptedWorkVerdict {
+    let asks_owner = claim == Some(aidaemon_events::ExecutorClaimedOutcome::NeedsOwner);
+    if !work_unattempted || !changes_permitted || asks_owner || !closeout_lets_stop {
+        return UnattemptedWorkVerdict::NotApplicable;
+    }
+    if demanded {
+        UnattemptedWorkVerdict::StopUnmet
+    } else {
+        UnattemptedWorkVerdict::Demand
+    }
+}
+
+#[cfg(test)]
+mod unattempted_work_tests {
+    use super::*;
+    use aidaemon_events::ExecutorClaimedOutcome as Claim;
+
+    /// Live 2026-11-13: two installs declared, only a listing run, then a
+    /// `blocked` verdict. The run goes back once, then stops unmet.
+    #[test]
+    fn an_unfinished_verdict_on_unattempted_work_is_sent_back_once() {
+        assert_eq!(
+            unattempted_work_verdict(true, Some(Claim::Blocked), true, true, false),
+            UnattemptedWorkVerdict::Demand
+        );
+        assert_eq!(
+            unattempted_work_verdict(true, Some(Claim::Partial), true, true, true),
+            UnattemptedWorkVerdict::StopUnmet
+        );
+        // A deferral with no verdict is the same stop.
+        assert_eq!(
+            unattempted_work_verdict(true, None, true, true, false),
+            UnattemptedWorkVerdict::Demand
+        );
+    }
+
+    #[test]
+    fn asking_the_owner_attempted_work_and_read_only_requests_are_honoured() {
+        assert_eq!(
+            unattempted_work_verdict(true, Some(Claim::NeedsOwner), true, true, false),
+            UnattemptedWorkVerdict::NotApplicable
+        );
+        assert_eq!(
+            unattempted_work_verdict(false, Some(Claim::Blocked), true, true, false),
+            UnattemptedWorkVerdict::NotApplicable
+        );
+        assert_eq!(
+            unattempted_work_verdict(true, Some(Claim::Blocked), true, false, false),
+            UnattemptedWorkVerdict::NotApplicable
+        );
+        // Reachable work is demanded by the ledger closeout itself.
+        assert_eq!(
+            unattempted_work_verdict(true, None, false, true, false),
+            UnattemptedWorkVerdict::NotApplicable
+        );
+    }
+}

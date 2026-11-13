@@ -62,6 +62,13 @@ pub enum SystemDirective {
     LedgerExpectationsRequired {
         expectations: Vec<String>,
     },
+    /// The run declared work and attempted none of it, and was about to
+    /// stop on an unfinished verdict or a deferral
+    /// (`RunAggregate::declared_work_unattempted`, judged from receipts).
+    /// One pass: do the work, or ask the owner the one question it waits on.
+    DeclaredWorkUnattempted {
+        items: Vec<String>,
+    },
     /// A ledger demand ended unmet and the model's reply answered the
     /// demand. One tool-less rewrite addressed to the user, judged by the
     /// run's state (`ReplyDefect::AnswersUnmetDemand`), never by wording.
@@ -257,6 +264,21 @@ impl SystemDirective {
             ),
             Self::FinalAnswerRejectedInternalMarkers => "[SYSTEM] Your previous answer was rejected: it consisted of internal tool-envelope markers instead of an answer. Do NOT quote tool output wrappers, [SYSTEM] lines, or bracketed markers. In plain language, state your final answer to the user's request now — what you found or did, and any honest limitation (e.g. the requested item was not found).".to_string(),
             Self::FinalAnswerWasFilePaste => "[SYSTEM] Your previous answer pasted raw tool output (file contents, a line-numbered page, a list of file paths, or a JSON dump) instead of answering. Do NOT paste raw tool output. Using ONLY the items relevant to the user's request, answer in plain language now — name the specific matches by filename (or say clearly that none matched). If the user asked for a file, deliver it with send_file rather than listing paths. If the data is too large to scan, say which filter you would need.".to_string(),
+            Self::DeclaredWorkUnattempted { items } => format!(
+                "[SYSTEM] Internal check, not shown to the user: the owner asked for work and none of it has been attempted: {}. \
+                 An instruction to do something is carried out now, anew, unless the owner said otherwise. \
+                 What memory, history or existing files show was done before is context for the work, never its result, \
+                 so reporting the state of earlier work does not answer the instruction. \
+                 Do the work now with the available tools; when earlier results exist, work alongside them under fresh names and say so up front. \
+                 Only if the work truly cannot start without the owner's choice (redoing it would replace or duplicate results they may want kept), \
+                 pass track_requirements once more with outcome needs_owner and make your next reply that one question. \
+                 Your next reply without tool calls is sent to the user; do not mention this check, the checklist, receipts or the ledger.",
+                if items.is_empty() {
+                    "(the declared steps)".to_string()
+                } else {
+                    items.join("; ")
+                }
+            ),
             Self::FinalAnswerAfterUnmetCloseout => "[SYSTEM] The work on this request is over and tools are disabled. Your previous reply answered an internal check instead of the user. Write your final reply to the user now: answer their original request directly with what you did and the concrete results they asked for (URLs, file paths, values), and say plainly anything that is not done or not verified. This reply is sent to the user as is: do not mention internal checks, system notices, the checklist, receipts or the ledger.".to_string(),
             Self::GuiCoordinateClickUnverified => "[SYSTEM] You are about to report a GUI action done, but your last click was a COORDINATE click at a raw point — it has no element identity, so it is NOT verified: it may have hit empty space, not the target. Do NOT claim success yet. Call computer_use get_app_state (or screenshot) NOW, look at the fresh screen, and confirm the intended change actually happened (e.g. the Like heart is filled/red, the count changed). If it did not, click again; if the target now shows a stable element_title, click by title (auto-verified). Only report done after you have visually confirmed the change.".to_string(),                                }
     }
@@ -288,6 +310,23 @@ mod tests {
             SystemDirective::DuplicateSendFileAlreadySent.render(),
             "[SYSTEM] The requested file was already sent in this task. Stop calling send_file and reply with plain text only."
         );
+    }
+
+    /// The pass for declared, never-attempted work states the principle (an
+    /// instruction is carried out anew; earlier work is context, not its
+    /// result) and offers exactly two ways on: do the work, or ask the owner
+    /// through the typed `needs_owner` verdict.
+    #[test]
+    fn unattempted_work_directive_carries_the_principle_and_the_typed_ask() {
+        let demand = SystemDirective::DeclaredWorkUnattempted {
+            items: vec!["Install WordPress in ~/projects/synthetic-site".to_string()],
+        }
+        .render();
+        assert!(demand.contains("Install WordPress in ~/projects/synthetic-site"));
+        assert!(demand.contains("carried out now, anew"));
+        assert!(demand.contains("never its result"));
+        assert!(demand.contains("outcome needs_owner"));
+        assert!(demand.contains("not shown to the user"));
     }
 
     /// Both texts the model sees around an unmet ledger demand say its next
