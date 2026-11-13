@@ -75,6 +75,28 @@ pub struct RunState {
     /// Its latest step while it runs.
     pub step: Option<Step>,
     pub evidence: RunEvidence,
+    /// The chat card this run's line is drawn on after its turn: the card
+    /// the turn that started it kept. A no-plan run's end edits exactly this
+    /// card, never whichever card is newest.
+    pub card: RunCard,
+}
+
+/// Which chat card a run's line is drawn on once the turn that started it
+/// ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunCard {
+    /// The starting turn has not kept its card yet; `before` is the chat's
+    /// kept card when the run began (`None`: there was none), so the card
+    /// is the first one the chat keeps after it.
+    Pending { before: Option<String> },
+    /// The message id of the card the starting turn kept.
+    Kept(String),
+}
+
+impl Default for RunCard {
+    fn default() -> Self {
+        Self::Pending { before: None }
+    }
 }
 
 impl RunState {
@@ -159,6 +181,7 @@ impl RunStates {
             waited: Duration::ZERO,
             step: None,
             evidence: RunEvidence::default(),
+            card: RunCard::default(),
         };
         let seq = self
             .order
@@ -183,6 +206,26 @@ impl RunStates {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// The chat's kept card when run `id` began: its own card is the first
+    /// one the chat keeps after this. Ignored once the card is known.
+    pub fn card_before(&self, id: &str, before: Option<String>) {
+        if let Some(entry) = self.lock().get_mut(id) {
+            if matches!(entry.state.card, RunCard::Pending { .. }) {
+                entry.state.card = RunCard::Pending { before };
+            }
+        }
+    }
+
+    /// Run `id`'s line is drawn on card `message_id`, the card its starting
+    /// turn kept. Set once: a later card belongs to a later turn.
+    pub fn keep_card(&self, id: &str, message_id: &str) {
+        if let Some(entry) = self.lock().get_mut(id) {
+            if matches!(entry.state.card, RunCard::Pending { .. }) {
+                entry.state.card = RunCard::Kept(message_id.to_string());
+            }
         }
     }
 

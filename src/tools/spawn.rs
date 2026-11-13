@@ -113,6 +113,7 @@ mod tests {
             evidence: aidaemon_runtime::run_state::RunEvidence {
                 unconfirmed: unconfirmed.iter().map(|s| s.to_string()).collect(),
             },
+            card: Default::default(),
         }
     }
 
@@ -1798,6 +1799,8 @@ mod child_runtime_tests {
         edits: StdMutex<Vec<(String, String)>>,
         /// No card is kept yet: the turn is still running.
         turn_running: std::sync::atomic::AtomicBool,
+        /// A later turn kept this card after "card-1".
+        later_card: StdMutex<Option<String>>,
     }
 
     #[async_trait]
@@ -1845,8 +1848,30 @@ mod child_runtime_tests {
             None
         }
         async fn checklist_surface(&self, _session_id: &str) -> Option<String> {
-            (!self.turn_running.load(std::sync::atomic::Ordering::SeqCst))
-                .then(|| "card-1".to_string())
+            if self.turn_running.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            Some(
+                self.later_card
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "card-1".to_string()),
+            )
+        }
+        async fn checklist_surface_after(
+            &self,
+            _session_id: &str,
+            after: Option<&str>,
+        ) -> Option<String> {
+            if self.turn_running.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            match after {
+                None => Some("card-1".to_string()),
+                Some("card-1") => self.later_card.lock().unwrap().clone(),
+                Some(_) => None,
+            }
         }
         async fn request_inline_approval(
             &self,
@@ -1862,6 +1887,62 @@ mod child_runtime_tests {
             false
         }
         async fn unregister_session_route(&self, _child: &str, _parent: &str) {}
+    }
+
+    /// A no-plan helper that ends after a later turn kept its own card
+    /// settles the card its starting turn kept, recorded on its run, and
+    /// leaves the later turn's card alone (the newest card belonged to
+    /// another turn).
+    #[tokio::test]
+    async fn a_helpers_end_edits_its_own_turns_card_not_the_newest() {
+        let chat = "telegram:synthetic-own-card-chat";
+        let hub = Arc::new(CardHub::default());
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        let weak = Arc::downgrade(&router);
+        let runs = Arc::new(aidaemon_runtime::run_state::RunStates::default());
+        runs.begin("job-own-card", chat, "Slow count", None);
+        runs.card_before("job-own-card", None);
+        // The starting turn kept card-1; then a later turn kept card-2.
+        *hub.later_card.lock().unwrap() = Some("card-2".to_string());
+        assert_eq!(
+            hub.checklist_surface(chat).await.as_deref(),
+            Some("card-2"),
+            "the newest card is the later turn's"
+        );
+        runs.finish(
+            "job-own-card",
+            aidaemon_runtime::run_state::RunPhase::Succeeded,
+            aidaemon_runtime::run_state::RunMeasure {
+                ended_at: chrono::Utc::now(),
+                work_began: None,
+                waited: Duration::ZERO,
+            },
+            Default::default(),
+            aidaemon_runtime::run_state::RunReport {
+                text: "Done.".into(),
+                untrusted: false,
+            },
+        );
+        settle_background_steps(
+            &runs,
+            None,
+            Some(&weak),
+            None,
+            chat,
+            "job-own-card",
+            crate::plans::JobEnd::Succeeded,
+        )
+        .await;
+        let edits = hub.edits.lock().unwrap().clone();
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits[0].0, "card-1", "{edits:?}");
+        assert!(edits[0].1.contains("Slow count"), "{edits:?}");
+        assert_eq!(
+            runs.get("job-own-card").map(|run| run.card),
+            Some(aidaemon_runtime::run_state::RunCard::Kept(
+                "card-1".to_string()
+            )),
+        );
     }
 
     /// A helper's steps reach the card its turn left after that turn ended,
