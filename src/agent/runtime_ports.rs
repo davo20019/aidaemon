@@ -141,6 +141,79 @@ impl ChildAgentRuntime for Agent {
     fn helper_runs(&self) -> std::sync::Arc<aidaemon_runtime::run_state::RunStates> {
         self.running_children.runs()
     }
+
+    /// The runs one chat turn started all ended: the chat's request is
+    /// continued once (an internal continuation of that turn's task, under
+    /// the same serializer and budget as every background continuation),
+    /// and its reply is sent to the chat with its delivery recorded.
+    async fn answer_after_runs(
+        &self,
+        answer: aidaemon_runtime::spawn::RunsAnswer,
+    ) -> anyhow::Result<bool> {
+        let Some(hub) = answer.hub.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return Ok(false);
+        };
+        let envelope = crate::tools::terminal::run_background_continuation(
+            self,
+            ConversationRequest {
+                session_id: answer.chat.clone(),
+                user_text: answer.followup,
+                status_tx: None,
+                user_role: crate::types::UserRole::Owner,
+                channel_ctx: crate::types::ChannelContext::internal(),
+                heartbeat: None,
+                parent_task_id: answer.parent_task_id,
+                parent_tool_call_id: None,
+                parent_result_id: None,
+            },
+        )
+        .await?;
+        let reply = aidaemon_tools::sanitize::sanitize_user_facing_reply(&envelope.text);
+        if reply.trim().is_empty() {
+            return Ok(false);
+        }
+        let record = |state, ids: Vec<String>, reason: Option<&str>| {
+            envelope.delivery("background_router", state, ids, reason.map(str::to_string))
+        };
+        let _ = self
+            .record_continuation_delivery(
+                &answer.chat,
+                record(
+                    crate::events::ResponseDeliveryState::Queued,
+                    Vec::new(),
+                    None,
+                ),
+            )
+            .await;
+        match hub.send_text_tracked(&answer.chat, &reply).await {
+            Ok(platform_id) => {
+                let _ = self
+                    .record_continuation_delivery(
+                        &answer.chat,
+                        record(
+                            crate::events::ResponseDeliveryState::PlatformAcknowledged,
+                            platform_id.into_iter().collect(),
+                            None,
+                        ),
+                    )
+                    .await;
+                Ok(true)
+            }
+            Err(error) => {
+                let _ = self
+                    .record_continuation_delivery(
+                        &answer.chat,
+                        record(
+                            crate::events::ResponseDeliveryState::Failed,
+                            Vec::new(),
+                            Some("transport_error"),
+                        ),
+                    )
+                    .await;
+                Err(error)
+            }
+        }
+    }
 }
 
 #[async_trait]

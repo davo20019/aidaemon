@@ -83,16 +83,20 @@ impl RunFailure {
 
 impl RunEvidence {
     /// The one plain line under a finish header: why it failed, else the
-    /// typed steps left unconfirmed.
+    /// typed steps left unconfirmed. The unconfirmed ones belong to a run
+    /// that finished (its own verdict was done and nothing contradicts it),
+    /// so the line says only what is true of them, in words that agree with
+    /// "finished": its report is the one record of them (live 2026-11-13:
+    /// "I couldn't verify one of its steps" under a ✅ read as a failure).
     pub fn line(&self) -> Option<String> {
         if let Some(failure) = &self.failure {
             return Some(failure.reason());
         }
         match self.unconfirmed.as_slice() {
             [] => None,
-            [one] => Some(format!("I couldn't verify one of its steps: {one}.")),
+            [one] => Some(format!("Its report is the only record of one step: {one}.")),
             many => Some(format!(
-                "I couldn't verify {} of its steps: {}.",
+                "Its report is the only record of {} steps: {}.",
                 many.len(),
                 many.join("; ")
             )),
@@ -210,6 +214,39 @@ pub struct RunEnded {
 pub struct RunStates {
     runs: Mutex<HashMap<String, Entry>>,
     order: std::sync::atomic::AtomicU64,
+    groups: Mutex<HashMap<String, RunGroup>>,
+}
+
+/// The runs one turn started, in the order they started, and the ends of
+/// those whose results are ready.
+#[derive(Default)]
+struct RunGroup {
+    members: Vec<String>,
+    ended: HashMap<String, GroupEnd>,
+}
+
+/// One grouped run's end with its result, held until its group's last run
+/// ends.
+#[derive(Debug, Clone)]
+pub struct GroupEnd {
+    pub state: RunState,
+    pub report: RunReport,
+    /// Its own result message, rendered from its record: what the chat gets
+    /// when the group's answer cannot be written.
+    pub message: String,
+}
+
+/// What a run's end means for its group ([`RunStates::group_end`]).
+#[derive(Debug)]
+pub enum GroupTurn {
+    /// It is not one of several runs a turn started: its result is its own
+    /// answer.
+    Alone,
+    /// Other runs of its group still run: its result waits for theirs.
+    Waiting,
+    /// It was the group's last run: every member's end, in start order. Given
+    /// once.
+    Complete(Vec<GroupEnd>),
 }
 
 struct Entry {
@@ -261,6 +298,66 @@ impl RunStates {
             },
         );
         state
+    }
+
+    /// Run `id` is one of the runs of `group`: the runs one turn started.
+    /// Their results are answered together once the last of them ends
+    /// ([`Self::group_end`]).
+    pub fn join_group(&self, id: &str, group: &str) {
+        if !self.lock().contains_key(id) {
+            return;
+        }
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let members = &mut groups.entry(group.to_string()).or_default().members;
+        if !members.iter().any(|member| member == id) {
+            members.push(id.to_string());
+        }
+    }
+
+    /// Run `id`'s result is ready (`end`). A run alone in its group, or in
+    /// none, is [`GroupTurn::Alone`]; otherwise its end is held until every
+    /// member's is, and the call that brings the last one gets them all, in
+    /// start order, exactly once.
+    pub fn group_end(&self, id: &str, end: GroupEnd) -> GroupTurn {
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(group) = groups
+            .iter()
+            .find(|(_, group)| group.members.iter().any(|member| member == id))
+            .map(|(name, _)| name.clone())
+        else {
+            return GroupTurn::Alone;
+        };
+        let Some(entry) = groups.get_mut(&group) else {
+            return GroupTurn::Alone;
+        };
+        if entry.members.len() < 2 {
+            groups.remove(&group);
+            return GroupTurn::Alone;
+        }
+        entry.ended.insert(id.to_string(), end);
+        if entry
+            .members
+            .iter()
+            .any(|member| !entry.ended.contains_key(member))
+        {
+            return GroupTurn::Waiting;
+        }
+        let Some(mut entry) = groups.remove(&group) else {
+            return GroupTurn::Waiting;
+        };
+        GroupTurn::Complete(
+            entry
+                .members
+                .iter()
+                .filter_map(|member| entry.ended.remove(member))
+                .collect(),
+        )
     }
 
     /// The running run's latest step. Ignored once it ended.

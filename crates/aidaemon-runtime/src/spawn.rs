@@ -1107,6 +1107,15 @@ pub trait ChildAgentRuntime: Send + Sync {
 
     async fn mark_executor_task_timeout(&self, task_id: &str, timeout_secs: u64);
 
+    /// Every run one turn started has ended: continue that turn's request
+    /// once in its chat with the runs' typed results ([`RunsAnswer`]), and
+    /// send the reply there. `Ok(true)` once the reply reached the chat;
+    /// `Ok(false)` when no answer was written here (the caller then sends
+    /// each run's own result).
+    async fn answer_after_runs(&self, _answer: RunsAnswer) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     async fn deliver_background_child_result(
         &self,
         router: Option<&Weak<dyn OutboundRouter>>,
@@ -1117,6 +1126,19 @@ pub trait ChildAgentRuntime: Send + Sync {
 
     /// The run-state records of this agent tree's background helpers.
     fn helper_runs(&self) -> Arc<crate::run_state::RunStates>;
+}
+
+/// The one continuation a turn's group of runs gets once its last run ended
+/// ([`ChildAgentRuntime::answer_after_runs`]).
+pub struct RunsAnswer {
+    pub hub: Option<Weak<dyn OutboundRouter>>,
+    /// The chat whose request started the runs.
+    pub chat: String,
+    /// That request's task: the continuation continues it.
+    pub parent_task_id: Option<String>,
+    /// The runs' results and measured times, from their records
+    /// ([`crate::spawn_tool::group_followup`]).
+    pub followup: String,
 }
 
 /// Owned input for re-entering an existing conversation.
@@ -1324,7 +1346,10 @@ mod tests {
         let (phase, evidence) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run));
         assert_eq!(phase, crate::run_state::RunPhase::Succeeded);
         let line = evidence.line().expect("an evidence line");
-        assert_eq!(line, "I couldn't verify 2 of its steps: step 0; step 1.");
+        assert_eq!(
+            line,
+            "Its report is the only record of 2 steps: step 0; step 1."
+        );
         for internal in [
             "receipt",
             "local_workspace_write",
@@ -1436,6 +1461,8 @@ mod tests {
             .send(StatusUpdate::Checklist(aidaemon_core::card::PlanCard {
                 text: rendered_checklist(5, 5),
                 steps: 5,
+                done: 5,
+                settled: true,
             }))
             .await
             .unwrap();
@@ -1443,6 +1470,8 @@ mod tests {
             .send(StatusUpdate::Checklist(aidaemon_core::card::PlanCard {
                 text: rendered_checklist(1, 4),
                 steps: 4,
+                done: 1,
+                settled: false,
             }))
             .await
             .unwrap();

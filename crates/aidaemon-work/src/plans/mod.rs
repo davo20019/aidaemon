@@ -448,8 +448,9 @@ impl TaskPlan {
     }
 
     /// The turn handed its work to background jobs `job_ids` without naming
-    /// the steps they do (`checklist_items`): every step still open (or
-    /// already waiting on an earlier job) waits on them, so the card reads "continuing in the background", never
+    /// the steps they do (`checklist_items`): every step still open (marked
+    /// handed off with no job yet, or already waiting on an earlier job)
+    /// waits on them, so the card reads "continuing in the background", never
     /// "stopped short", while they run. Their typed ends settle such a step
     /// ([`PlanStep::waits_on_jobs`]). Returns whether anything changed.
     pub fn wait_on_background_jobs(&mut self, job_ids: &[String]) -> bool {
@@ -462,9 +463,16 @@ impl TaskPlan {
             // (live 2026-11-13: two helpers started by one turn; the second
             // was never on the plan, so the first's end settled the steps
             // while the second still ran, and its own end found no plan).
+            // A step the model marked handed off ("background") before any
+            // launch took it waits on the launches too: the mark says it
+            // delegated, the jobs are what it delegated to (live 2026-11-13:
+            // two such steps were skipped here, no run was ever linked to
+            // them, and the turn's end set them aside as "not done" while
+            // both helpers went on to succeed).
             let open = matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
                 || (step.status == StepStatus::Deferred && step.not_done.is_none())
-                || (step.status == StepStatus::Background && step.waits_on_jobs);
+                || (step.status == StepStatus::Background
+                    && (step.waits_on_jobs || step.background_jobs.is_empty()));
             if !open {
                 continue;
             }
@@ -641,6 +649,11 @@ impl TaskPlan {
         aidaemon_core::card::PlanCard {
             text: self.render_compact_checklist(),
             steps: self.steps.len(),
+            done: self.completed_steps(),
+            settled: !self
+                .steps
+                .iter()
+                .any(|step| matches!(step.status, StepStatus::Pending | StepStatus::InProgress)),
         }
     }
 

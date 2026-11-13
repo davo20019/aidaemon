@@ -1121,6 +1121,31 @@ impl BrowserTool {
         )
         .map_err(|e| format!("Screenshot captured but failed to save for vision context: {e}"))?;
 
+        // A capture is an observation; only the one the call declares the
+        // owner's deliverable is sent. Every other capture (checking a page
+        // that may have redirected or is not ready yet) is kept for the agent
+        // to look at, never delivered (live 2026-11-13: a helper's check of
+        // a WordPress site caught its install page, and that capture reached
+        // the owner beside the homepage they asked for). Whether a capture is
+        // the deliverable is the call's typed declaration, never read from
+        // the page's address.
+        let deliver = args
+            .get("deliver")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !deliver {
+            return Ok(DispatchResult {
+                text: format!(
+                    "Screenshot captured and kept, not sent: {caption}. It is for you to look \
+                     at. If it shows what the owner asked for, send it with send_file, or \
+                     capture again with deliver: true.\nSaved to: {}",
+                    saved_attachment.local_path
+                ),
+                attachments: vec![saved_attachment],
+                semantics: None,
+            });
+        }
+
         // Decide HOW to deliver based on size. A viewport capture is always a
         // Photo. A full-page capture of a long page can exceed Telegram's
         // sendPhoto caps (PHOTO_INVALID_DIMENSIONS); rather than refusing it, we
@@ -2394,6 +2419,10 @@ impl Tool for BrowserTool {
                     "selector": {
                         "type": "string",
                         "description": "Stable CSS selector for click/fill/get_text/wait/screenshot. Prefer id, data-*, name, or aria attributes. Never convert a querySelectorAll array index into :nth-of-type(); DOM indexes go stale and :nth-of-type is sibling-relative. Re-observe after page changes."
+                    },
+                    "deliver": {
+                        "type": "boolean",
+                        "description": "For 'screenshot': true sends this capture to the owner now, as the deliverable their request asked for. Default false: the capture is saved and kept for you to look at, not sent. Leave it false for any capture that checks a page (it may have redirected or not be ready); set it only when you know the page is the one asked for, or send a kept capture later with send_file."
                     },
                     "full_page": {
                         "type": "boolean",

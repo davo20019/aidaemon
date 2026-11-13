@@ -133,6 +133,8 @@ mod live_status_surface_tests {
             aidaemon_core::card::PlanCard {
                 text: "📋 Plan\n✅ Create script\n✅ Run it".to_string(),
                 steps: 2,
+                done: 2,
+                settled: true,
             },
         )
         .await;

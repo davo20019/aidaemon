@@ -11,7 +11,13 @@
 //! outside), and the output of a call that set something up on this
 //! computer within the run's authority ([`set_up_locally`]): what a run
 //! created within its scope is in its scope, whatever program it used. A
-//! call that only read (a page, a file, a status query) adds nothing. Each
+//! site served from inside the run's own write scope is in its scope too,
+//! whoever set it up and whenever ([`served_within`]): a command that ran
+//! in a folder the run may change reports the sites that folder serves (a
+//! project's own `status` or `describe` output), so the site's project
+//! folder, not whether this run's set-up command printed it, decides. A
+//! call that only read elsewhere (a page, a file, a status query outside
+//! the run's scope) adds nothing. Each
 //! site is kept by the key the browser approves sites under
 //! ([`crate::web::local_site_key`]), so only names that resolve to this
 //! computer alone are ever noted; any other host stays gated.
@@ -93,6 +99,37 @@ pub fn set_up_locally(
 ) -> bool {
     let effects = semantics.mutation_effects;
     !status.is_failure() && !effects.is_empty() && LOCAL_SETUP.contains(effects)
+}
+
+/// Whether a call that ran in folder `cwd` ran inside one of a run's
+/// `write_roots`, so the local sites its output reports are served from the
+/// run's own write scope. Compared by path component, so a folder never
+/// counts as inside a sibling that shares its name's start
+/// (`claude-drupal-2` is not inside `claude-drupal`). A run without write
+/// roots (one not confined to any) has no scope to serve sites from.
+pub fn served_within(cwd: &str, write_roots: &[String]) -> bool {
+    let normal = |path: &str| {
+        let expanded = shellexpand::tilde(path.trim()).into_owned();
+        let path = std::path::PathBuf::from(expanded);
+        path.is_absolute().then(|| {
+            path.components()
+                .filter(|part| !matches!(part, std::path::Component::CurDir))
+                .collect::<std::path::PathBuf>()
+        })
+    };
+    let Some(cwd) = normal(cwd) else {
+        return false;
+    };
+    if cwd
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    write_roots
+        .iter()
+        .filter_map(|root| normal(root))
+        .any(|root| root.parent().is_some() && cwd.starts_with(&root))
 }
 
 /// Note `keys` as sites the work in `grant_session` set up or was asked for.
@@ -190,6 +227,47 @@ mod tests {
                 "{elsewhere:?}"
             );
         }
+    }
+
+    /// Live 2026-11-13: a helper scoped to `~/projects/claude-drupal` was
+    /// asked to approve opening `claude-drupal.ddev.site`, which that folder
+    /// serves: the site was there before the run, so no set-up command of
+    /// its own printed it. A command run inside the run's write scope
+    /// reports its sites; one run outside it, or in a sibling folder whose
+    /// name only starts the same, does not.
+    #[test]
+    fn a_run_may_open_a_site_served_from_inside_its_own_scope_only() {
+        let scope = vec!["/Users/someone/projects/claude-drupal".to_string()];
+        assert!(served_within(
+            "/Users/someone/projects/claude-drupal",
+            &scope
+        ));
+        assert!(served_within(
+            "/Users/someone/projects/claude-drupal/web",
+            &scope
+        ));
+        assert!(served_within(
+            "/Users/someone/projects/claude-drupal/./web",
+            &scope
+        ));
+        assert!(!served_within(
+            "/Users/someone/projects/claude-drupal-2",
+            &scope
+        ));
+        assert!(!served_within(
+            "/Users/someone/projects/claude-wordpress",
+            &scope
+        ));
+        assert!(!served_within("/Users/someone/projects", &scope));
+        assert!(!served_within(
+            "/Users/someone/projects/claude-drupal/../claude-wordpress",
+            &scope
+        ));
+        assert!(!served_within("relative/claude-drupal", &scope));
+        // No write scope: nothing is served from it, and the root never
+        // counts as a scope that holds everything.
+        assert!(!served_within("/Users/someone/projects/claude-drupal", &[]));
+        assert!(!served_within("/Users/someone", &["/".to_string()]));
     }
 
     #[test]

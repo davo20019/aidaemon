@@ -10,6 +10,13 @@ pub struct PlanStore {
     pool: SqlitePool,
 }
 
+/// One writer at a time for every read-change-store of a plan. A plan is
+/// stored whole, so two writers that read it at once each store their own
+/// copy and the later one drops the earlier one's change (two helpers one
+/// `spawn_agent` batch starts link their steps concurrently). Process-wide,
+/// so every `PlanStore` over the database shares it.
+static PLAN_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 impl PlanStore {
     /// Create a new PlanStore with the given database pool.
     /// Runs migrations to create the task_plans table.
@@ -100,6 +107,50 @@ impl PlanStore {
         .await?;
 
         Ok(())
+    }
+
+    /// The session's latest plan, when it belongs to `task_id` (any task
+    /// when `None`), changed by `change` under the plan write lock and
+    /// stored when `change` says it changed. Returns the stored plan, or
+    /// `None` when there was no such plan or nothing changed.
+    async fn change_latest(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        change: impl FnOnce(&mut TaskPlan) -> bool,
+    ) -> anyhow::Result<Option<TaskPlan>> {
+        let _write = PLAN_WRITES.lock().await;
+        let Some(mut plan) = self
+            .get_recent_for_session(session_id, 1)
+            .await?
+            .into_iter()
+            .next()
+            .filter(|plan| task_id.is_none() || plan.task_id.as_deref() == task_id)
+        else {
+            return Ok(None);
+        };
+        if !change(&mut plan) {
+            return Ok(None);
+        }
+        self.update(&plan).await?;
+        Ok(Some(plan))
+    }
+
+    /// Plan `plan_id` changed by `change` under the plan write lock, stored
+    /// when `change` says it changed. Returns the plan as it now stands.
+    pub async fn modify(
+        &self,
+        plan_id: &str,
+        change: impl FnOnce(&mut TaskPlan) -> bool,
+    ) -> anyhow::Result<Option<TaskPlan>> {
+        let _write = PLAN_WRITES.lock().await;
+        let Some(mut plan) = self.get(plan_id).await? else {
+            return Ok(None);
+        };
+        if change(&mut plan) {
+            self.update(&plan).await?;
+        }
+        Ok(Some(plan))
     }
 
     /// Create or replace the active checklist for a session. Full-set replace:
@@ -198,6 +249,7 @@ impl PlanStore {
             .position(|s| matches!(s.status, StepStatus::Pending | StepStatus::InProgress))
             .unwrap_or(0);
 
+        let _write = PLAN_WRITES.lock().await;
         if let Some(mut existing) = self.get_incomplete_for_session(session_id).await? {
             // A step a background job is still doing stays with that job:
             // a checklist update cannot finish or drop work it did not do.
@@ -283,20 +335,10 @@ impl PlanStore {
         indices: &[usize],
         job_id: &str,
     ) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self
-            .get_recent_for_session(session_id, 1)
-            .await?
-            .into_iter()
-            .next()
-            .filter(|plan| task_id.is_none() || plan.task_id.as_deref() == task_id)
-        else {
-            return Ok(None);
-        };
-        if !plan.link_background_job(indices, job_id) {
-            return Ok(None);
-        }
-        self.update(&plan).await?;
-        Ok(Some(plan))
+        self.change_latest(session_id, task_id, |plan| {
+            plan.link_background_job(indices, job_id)
+        })
+        .await
     }
 
     /// The helper for the steps at `indices` of the session's checklist for
@@ -309,20 +351,10 @@ impl PlanStore {
         indices: &[usize],
         reason: &str,
     ) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self
-            .get_recent_for_session(session_id, 1)
-            .await?
-            .into_iter()
-            .next()
-            .filter(|plan| task_id.is_none() || plan.task_id.as_deref() == task_id)
-        else {
-            return Ok(None);
-        };
-        if !plan.helper_did_not_start(indices, reason) {
-            return Ok(None);
-        }
-        self.update(&plan).await?;
-        Ok(Some(plan))
+        self.change_latest(session_id, task_id, |plan| {
+            plan.helper_did_not_start(indices, reason)
+        })
+        .await
     }
 
     /// The session's checklist for `task_id`: its latest plan, when that
@@ -349,14 +381,10 @@ impl PlanStore {
         task_id: &str,
         indices: &std::collections::BTreeSet<usize>,
     ) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self.for_task(session_id, task_id).await? else {
-            return Ok(None);
-        };
-        if !plan.confirm_steps(indices) {
-            return Ok(None);
-        }
-        self.update(&plan).await?;
-        Ok(Some(plan))
+        self.change_latest(session_id, Some(task_id), |plan| {
+            plan.confirm_steps(indices)
+        })
+        .await
     }
 
     /// The session's checklist for `task_id` waits on background jobs
@@ -368,20 +396,10 @@ impl PlanStore {
         task_id: Option<&str>,
         job_ids: &[String],
     ) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self
-            .get_recent_for_session(session_id, 1)
-            .await?
-            .into_iter()
-            .next()
-            .filter(|plan| task_id.is_none() || plan.task_id.as_deref() == task_id)
-        else {
-            return Ok(None);
-        };
-        if !plan.wait_on_background_jobs(job_ids) {
-            return Ok(None);
-        }
-        self.update(&plan).await?;
-        Ok(Some(plan))
+        self.change_latest(session_id, task_id, |plan| {
+            plan.wait_on_background_jobs(job_ids)
+        })
+        .await
     }
 
     /// Record the end of background job `job_id` on the session's checklist
@@ -393,6 +411,7 @@ impl PlanStore {
         job_id: &str,
         end: super::JobEnd,
     ) -> anyhow::Result<Option<TaskPlan>> {
+        let _write = PLAN_WRITES.lock().await;
         for mut plan in self.get_recent_for_session(session_id, 5).await? {
             if plan.settle_background_job(job_id, end) {
                 self.update(&plan).await?;
@@ -405,13 +424,7 @@ impl PlanStore {
     /// Settle plan `plan_id`'s open steps as not done
     /// ([`TaskPlan::settle_open_steps`]). Returns the plan as it now stands.
     pub async fn settle_open_steps(&self, plan_id: &str) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self.get(plan_id).await? else {
-            return Ok(None);
-        };
-        if plan.settle_open_steps() {
-            self.update(&plan).await?;
-        }
-        Ok(Some(plan))
+        self.modify(plan_id, TaskPlan::settle_open_steps).await
     }
 
     /// Update just the status of a plan.
@@ -1291,5 +1304,95 @@ mod tests {
             .expect("settled");
         assert_eq!(plan.steps[1].status, StepStatus::Completed);
         assert_eq!(plan.status, PlanStatus::Completed);
+    }
+
+    /// Live 2026-11-13: the model marked the two helper steps "background",
+    /// then one `spawn_agent` batch started both helpers without naming
+    /// steps. The marked steps take both launches (the launches link
+    /// concurrently and neither link is lost), and both runs' success
+    /// settles them done: the card's header says done, as its total does.
+    #[tokio::test]
+    async fn a_batch_of_two_delegated_steps_settles_done_from_both_runs() {
+        use crate::plans::{ChecklistItem, JobEnd, StepStatus};
+        use std::sync::Arc;
+        let store = Arc::new(create_test_store().await);
+        let item = |text: &str, status: StepStatus| ChecklistItem {
+            description: text.to_string(),
+            status,
+            depends_on: Vec::new(),
+            // The helpers' steps change their sites; the check and the
+            // report change nothing.
+            required_mutation_effects: if status == StepStatus::Background {
+                crate::traits::ToolMutationEffects::LOCAL_WORKSPACE_WRITE
+            } else {
+                crate::traits::ToolMutationEffects::NONE
+            },
+            requires_observation: false,
+            expected_targets: Vec::new(),
+        };
+        store
+            .upsert_checklist_graph(
+                "chat",
+                Some("t"),
+                "track_requirements",
+                &[
+                    item("Check both sites", StepStatus::Completed),
+                    item(
+                        "Have a helper finish the Drupal site",
+                        StepStatus::Background,
+                    ),
+                    item(
+                        "Have a helper finish the WordPress site",
+                        StepStatus::Background,
+                    ),
+                    item("Report each helper's result", StepStatus::Pending),
+                ],
+            )
+            .await
+            .unwrap();
+        let jobs = ["job-drupal", "job-wordpress"].map(|job| vec![job.to_string()]);
+        let (first, second) = tokio::join!(
+            store.wait_on_background_jobs("chat", Some("t"), &jobs[0]),
+            store.wait_on_background_jobs("chat", Some("t"), &jobs[1]),
+        );
+        assert!(first.unwrap().is_some() && second.unwrap().is_some());
+        let plan = store.for_task("chat", "t").await.unwrap().unwrap();
+        for index in 1..=3 {
+            let step = &plan.steps[index];
+            assert_eq!(step.status, StepStatus::Background, "step {index}");
+            assert_eq!(
+                step.background_jobs,
+                vec!["job-drupal".to_string(), "job-wordpress".to_string()],
+                "step {index} waits on both launches"
+            );
+        }
+        assert!(plan
+            .card()
+            .text
+            .starts_with("⏳ Continuing in the background · 1 of 4 done"));
+
+        let plan = store
+            .settle_background_job("chat", "job-drupal", JobEnd::Succeeded)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.steps[1].status,
+            StepStatus::Background,
+            "one run still runs"
+        );
+        let plan = store
+            .settle_background_job("chat", "job-wordpress", JobEnd::Succeeded)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(plan
+            .steps
+            .iter()
+            .all(|step| step.status == StepStatus::Completed));
+        assert_eq!(plan.status, PlanStatus::Completed);
+        let card = plan.card().text;
+        assert!(card.starts_with("✅ Done · 4 of 4 steps"), "{card}");
+        assert!(!card.contains("not done"), "{card}");
     }
 }
