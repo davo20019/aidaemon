@@ -44,7 +44,6 @@ SHELL = {
     "dashboard.rs": "the dashboard",
     "dashboard.html": "the dashboard",
     "otel_export.rs": "OTel export setup",
-    "stt_setup.rs": "speech-to-text setup",
     "runtime_ports.rs": "the app's port traits onto crate parts",
     "agent": "the agent as the crates' host (held by MOVED and AGENT_ADAPTERS)",
     "testing.rs": "the daemon's test harness",
@@ -82,7 +81,7 @@ REEXPORTS = {
 # Behavior still in the app, and the plan step that moves it.
 PENDING = {
     "channels": "9.5: the daemon's channel hosts",
-    "tools": "9.4: terminal, cli_agent, computer_use, run_command, spawn, escalate, send_file, ...",
+    "tools": "9.4: terminal (+ run_command, command_patterns, semantic_command_risk), cli_agent, manage_cli_agents, computer_use, spawn, file policy wrappers",
     "cli_agent_flags.rs": "9.4: cli_agent",
     "state": "9.3/9.6: the SQLite store behind the facade traits",
     "memory": "9.1/9.6: memory host adapters, procedures, task learning, retention",

@@ -407,6 +407,7 @@ mod tests {
         std::fs::write(&path, "[provider]\nkind = \"openai_compatible\"\n").unwrap();
         let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::ConfigManagerTool::new(
             crate::config::config_file(path),
+            Arc::new(aidaemon_secrets::MemorySecretStore::new()),
         ));
         for trusted in [false, true] {
             let rules = AppApprovalRules {

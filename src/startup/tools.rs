@@ -1284,9 +1284,10 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::ConfigManager => BuiltBaseTool {
-            tool: Arc::new(ConfigManagerTool::new(crate::config::config_file(
-                config_path,
-            ))),
+            tool: Arc::new(ConfigManagerTool::new(
+                crate::config::config_file(config_path),
+                crate::config::shared_secret_store(),
+            )),
             terminal_tool: None,
         },
         BaseToolId::WebFetch => BuiltBaseTool {

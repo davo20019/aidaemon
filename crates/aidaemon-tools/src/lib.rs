@@ -81,6 +81,7 @@ pub mod service_status;
 pub mod services;
 mod shell;
 pub mod status;
+pub mod stt_setup;
 pub mod system;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
