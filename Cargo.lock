@@ -577,6 +577,7 @@ dependencies = [
  "dirs 7.0.0",
  "futures",
  "hex",
+ "hmac",
  "proptest",
  "regex",
  "reqwest 0.13.5",
