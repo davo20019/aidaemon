@@ -2166,15 +2166,15 @@ mod child_runtime_tests {
             },
         )
         .unwrap();
-        let step = |line: &str| {
+        let step = |lines: u64| {
             StatusUpdate::Helper(aidaemon_core::card::HelperView::running(
                 "Slow count to 30",
                 true,
-                Some(aidaemon_core::card::Step::Output(line.into())),
+                Some(aidaemon_core::card::Step::Output { lines }),
             ))
         };
 
-        helper.send(step("14")).await.unwrap();
+        helper.send(step(14)).await.unwrap();
         assert!(matches!(
             parent_rx.recv().await,
             Some(StatusUpdate::Helper(view)) if view == runs.get("job-steps").unwrap().view()
@@ -2187,7 +2187,7 @@ mod child_runtime_tests {
 
         hub.turn_running
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        helper.send(step("15")).await.unwrap();
+        helper.send(step(15)).await.unwrap();
         let card = tokio::time::timeout(HELPER_CARD_EVERY * 3, async {
             loop {
                 if let Some((id, text)) = hub.edits.lock().unwrap().last().cloned() {
@@ -2201,13 +2201,13 @@ mod child_runtime_tests {
         .expect("the kept card shows the helper's step");
         assert!(
             card.contains(
-                "⏳ Running in the background: Slow count to 30\nRunning a command · last output: 15"
+                "⏳ Running in the background: Slow count to 30\nRunning a command · 15 lines of output so far"
             ),
             "{card}"
         );
         assert_eq!(
             runs.get("job-steps").and_then(|run| run.step),
-            Some(aidaemon_core::card::Step::Output("15".into())),
+            Some(aidaemon_core::card::Step::Output { lines: 15 }),
             "/tasks reads the same step from the run record"
         );
     }
@@ -2576,7 +2576,7 @@ mod child_runtime_tests {
                 aidaemon_core::card::HelperView::running(
                     "Slow count",
                     true,
-                    Some(aidaemon_core::card::Step::Output("13".into())),
+                    Some(aidaemon_core::card::Step::Output { lines: 13 }),
                 ),
             ))
             .await

@@ -725,7 +725,7 @@ pub fn child_status_sender(
                 StatusUpdate::StepHandedOff { kind } => Some(Step::HandedOff(*kind)),
                 // What the child's running command printed last is that
                 // child's progress line, as it runs.
-                StatusUpdate::CommandOutput { line, .. } => Some(Step::Output(line.clone())),
+                StatusUpdate::CommandOutput { lines, .. } => Some(Step::Output { lines: *lines }),
                 _ => None,
             };
             let update = match own_step {

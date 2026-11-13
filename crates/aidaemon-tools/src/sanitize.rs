@@ -524,6 +524,12 @@ pub fn redact_secrets(text: &str) -> String {
 /// local paths and endpoints readable: for text the owner reads to decide
 /// on a call, where the path is what they are approving.
 pub fn redact_secrets_only(text: &str) -> String {
+    // Last, so a value one of the shapes names keeps its kind.
+    aidaemon_policies::redact_labelled_credentials(&redact_secret_shapes(text))
+}
+
+/// [`redact_secrets_only`] without the values under a credential label.
+fn redact_secret_shapes(text: &str) -> String {
     let mut result = text.to_string();
     for (kind, regex) in aidaemon_policies::secret_patterns().iter() {
         if regex.is_match(&result) {
@@ -532,6 +538,42 @@ pub fn redact_secrets_only(text: &str) -> String {
         }
     }
     result
+}
+
+/// Text on its way to the owner, through the one redaction every channel
+/// applies before any platform sees it: every registered secret (each value
+/// a secret store handed out, and each credential a tool printed), then the
+/// credential shapes ([`redact_secrets_only`]). A credential seen here for
+/// the first time is registered, so it is hidden wherever it shows later.
+pub fn redact_for_owner(text: &str) -> String {
+    let registered = aidaemon_core::redaction::redact_registered(text);
+    let hidden = redact_secrets_only(&registered);
+    if hidden != registered.as_ref() {
+        // What the labels hid is registered, so it stays hidden where it
+        // shows later without a label.
+        let shaped = redact_secret_shapes(&registered);
+        for value in aidaemon_policies::labelled_credentials(&shaped) {
+            let _ = aidaemon_core::redaction::register_secret(value);
+        }
+    }
+    hidden
+}
+
+/// Every string in `value` through [`redact_for_owner`]: a platform
+/// request's body, whatever its fields are called.
+pub fn redact_json_for_owner(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => {
+            let redacted = redact_for_owner(text);
+            if redacted != *text {
+                *text = redacted;
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_json_for_owner),
+        Value::Object(map) => map.values_mut().for_each(redact_json_for_owner),
+        _ => {}
+    }
 }
 
 /// What a hidden secret reads as in a command the owner is shown.

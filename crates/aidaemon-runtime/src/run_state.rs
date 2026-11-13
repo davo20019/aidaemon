@@ -908,7 +908,7 @@ mod tests {
         let runs = RunStates::default();
         let (tx, mut rx) = mpsc::unbounded_channel();
         runs.begin("job-1", "chat-a", "Slow count", Some(tx));
-        assert!(runs.step("job-1", Step::Output("3".into())));
+        assert!(runs.step("job-1", Step::Output { lines: 3 }));
         assert!(rx.try_recv().is_err(), "nothing is pushed while it runs");
         let ended = runs
             .finish(
@@ -932,7 +932,7 @@ mod tests {
             )
             .is_none()
         );
-        assert!(!runs.step("job-1", Step::Output("4".into())));
+        assert!(!runs.step("job-1", Step::Output { lines: 4 }));
         assert_eq!(runs.get("job-1").unwrap().phase, RunPhase::Succeeded);
         assert!(runs.running("chat-a").is_empty());
     }
@@ -1140,10 +1140,10 @@ mod tests {
         let runs = children.runs();
         let begun = runs.begin("job-7", "chat-a", "Slow count", None);
         let _entry = children.enter("chat-a", "Slow count", "Count", "child-7", Some("job-7"));
-        runs.step("job-7", Step::Output("9".into()));
+        runs.step("job-7", Step::Output { lines: 9 });
         let listed = children.listed("chat-a");
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].step, Some(Step::Output("9".into())));
+        assert_eq!(listed[0].step, Some(Step::Output { lines: 9 }));
         assert_eq!(listed[0].child.started_at, begun.started_at);
     }
 }

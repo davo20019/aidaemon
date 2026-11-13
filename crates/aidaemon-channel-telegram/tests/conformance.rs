@@ -254,6 +254,6 @@ async fn telegram_channel_conforms() {
     );
     let report = check_channel(channel, &harness).await;
     report.assert_all_passed();
-    assert_eq!(report.passed.len(), 20, "{report}");
+    assert_eq!(report.passed.len(), 21, "{report}");
     assert!(report.notes.is_empty(), "{report}");
 }

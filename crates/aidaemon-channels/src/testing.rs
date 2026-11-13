@@ -338,14 +338,16 @@ impl Channel for TestChannel {
         conversation: &Conversation,
         message: &OutboundMessage,
     ) -> Result<MessageRef, ChannelError> {
-        // Like a real adapter, split text over the advertised limit; each
+        // Like a real adapter, the text passes the one redaction boundary
+        // at the wire, and text over the advertised limit is split; each
         // part is recorded as its own sent message. Text within the limit
         // (everything the runner sends, since it splits first) is recorded
-        // unchanged.
-        let parts = if message.text.chars().count() > self.caps.max_message_len {
-            crate::split::split_message(&message.text, self.caps.max_message_len)
+        // unchanged otherwise.
+        let text = crate::outbound::redact_text(&message.text);
+        let parts = if text.chars().count() > self.caps.max_message_len {
+            crate::split::split_message(&text, self.caps.max_message_len)
         } else {
-            vec![message.text.clone()]
+            vec![text]
         };
         let mut sent = self.sent.lock().expect("poisoned");
         let mut last = None;
@@ -374,7 +376,10 @@ impl Channel for TestChannel {
         }
         self.edits.lock().expect("poisoned").push(EditedMessage {
             message_ref: message.clone(),
-            text: crate::split::truncate_for_edit(text, self.caps.max_message_len),
+            text: crate::split::truncate_for_edit(
+                &crate::outbound::redact_text(text),
+                self.caps.max_message_len,
+            ),
             at: Instant::now(),
         });
         Ok(())

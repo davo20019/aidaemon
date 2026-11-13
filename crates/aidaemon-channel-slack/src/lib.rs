@@ -291,7 +291,9 @@ impl SlackChannel {
         token: &str,
         body: Option<&Value>,
     ) -> Result<Value, ChannelError> {
-        self.call_with(method, token, |request| match body {
+        // The one redaction boundary every request to the chat passes.
+        let body = body.map(aidaemon_channels::outbound::redact_body);
+        self.call_with(method, token, |request| match &body {
             Some(body) => request.json(body),
             None => request.header("Content-Type", "application/x-www-form-urlencoded"),
         })
@@ -304,7 +306,11 @@ impl SlackChannel {
         method: &str,
         fields: &[(&str, String)],
     ) -> Result<Value, ChannelError> {
-        self.call_with(method, &self.bot_token, |request| request.form(fields))
+        let fields: Vec<(&str, String)> = fields
+            .iter()
+            .map(|(name, value)| (*name, aidaemon_channels::outbound::redact_text(value)))
+            .collect();
+        self.call_with(method, &self.bot_token, |request| request.form(&fields))
             .await
     }
 

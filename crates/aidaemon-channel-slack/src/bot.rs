@@ -1276,7 +1276,8 @@ impl SlackBot {
     /// Make a POST Slack API call with a JSON body.
     async fn slack_api_post(&self, method: &str, body: &Value) -> anyhow::Result<Value> {
         let url = format!("{}/{}", self.api_base, method);
-        let body_bytes = serde_json::to_vec(body)?;
+        // The one redaction boundary every request to the chat passes.
+        let body_bytes = serde_json::to_vec(&aidaemon_channels::outbound::redact_body(body))?;
         let mut resp = self
             .http
             .post(&url)
@@ -1794,7 +1795,12 @@ impl SlackBot {
                         "replace_original": false,
                         "text": mrkdwn,
                     });
-                    let _ = self.http.post(response_url).json(&updated).send().await;
+                    let _ = self
+                        .http
+                        .post(response_url)
+                        .json(&aidaemon_channels::outbound::redact_body(&updated))
+                        .send()
+                        .await;
                 }
                 continue;
             }
@@ -1870,7 +1876,12 @@ impl SlackBot {
                 "response_type": "ephemeral",
                 "text": mrkdwn,
             });
-            let _ = self.http.post(response_url).json(&body).send().await;
+            let _ = self
+                .http
+                .post(response_url)
+                .json(&aidaemon_channels::outbound::redact_body(&body))
+                .send()
+                .await;
         } else {
             let _ = self.post_message(channel_id, &reply, None).await;
         }
@@ -2445,6 +2456,7 @@ async fn slack_post_message(
     if let Some(ts) = thread_ts {
         body["thread_ts"] = Value::String(ts.to_string());
     }
+    let body = aidaemon_channels::outbound::redact_body(&body);
     let mut resp = http
         .post(format!("{api_base}/chat.postMessage"))
         .header("Authorization", format!("Bearer {}", bot_token))

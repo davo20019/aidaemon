@@ -124,7 +124,9 @@ impl BotApi {
         timeout: Duration,
     ) -> Result<T, ApiError> {
         let url = format!("{}/{}", self.base, method);
-        let request = self.client.post(&url).json(body).timeout(timeout);
+        // The one redaction boundary every request to the chat passes.
+        let body = aidaemon_channels::outbound::redact_body(body);
+        let request = self.client.post(&url).json(&body).timeout(timeout);
         self.finish(request).await
     }
 

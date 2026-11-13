@@ -2839,6 +2839,8 @@ impl CliAgentTool {
             let mut stdout_done = false;
             let mut stderr_done = false;
             let mut last_parsed_action: Option<String> = None;
+            // How many lines the agent has printed: its background step.
+            let mut printed_lines: u64 = 0;
             let mut loop_detector = LoopDetector::new();
             let mut loop_detected = false;
             let mut loop_pattern_count: Option<usize> = None;
@@ -3002,13 +3004,7 @@ impl CliAgentTool {
                     }
 
                     let elapsed_secs = started_at.elapsed().as_secs();
-                    let latest_output = progress_items
-                        .iter()
-                        .rev()
-                        .flat_map(|item| item.lines().rev())
-                        .map(str::trim)
-                        .find(|line| !line.is_empty())
-                        .map(|line| truncate_str(line, 120).to_string());
+                    printed_lines += pending_lines.len() as u64;
                     let chunk = if !progress_items.is_empty() {
                         // Deduplicate consecutive items
                         progress_items.dedup();
@@ -3028,10 +3024,12 @@ impl CliAgentTool {
                         });
                     }
 
-                    // A background run's step is the agent's latest real
-                    // output line, never a heartbeat or a timer.
-                    if let (Some(run), Some(line)) = (run_for_task.get().cloned(), latest_output) {
-                        tokio::spawn(async move { run.step(Step::Output(line)).await });
+                    // A background run's step is how much the agent printed,
+                    // never a heartbeat or a timer, and never what it printed:
+                    // its output is its own data and can carry a credential.
+                    if let Some(run) = run_for_task.get().cloned().filter(|_| printed_lines > 0) {
+                        let lines = printed_lines;
+                        tokio::spawn(async move { run.step(Step::Output { lines }).await });
                     }
 
                     pending_lines.clear();
@@ -8130,7 +8128,7 @@ mod tests {
         assert!(
             chat.wait_for(Duration::from_secs(10), |text| text
                 .starts_with("⏳ Running in the background: tidy the notes")
-                && text.contains("last output: working-on-it"))
+                && text.contains("of output so far"))
                 .await,
             "{:#?}",
             chat.shown().await

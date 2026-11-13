@@ -64,6 +64,8 @@ impl EventBus {
     /// Log (when durable) and broadcast `event`. Returns its `seq`.
     pub async fn publish(&self, session_id: Option<String>, event: Event) -> Option<u64> {
         let at_ms = now_ms();
+        // The one redaction boundary every frame to the owner's app passes.
+        let event = owner_event(event);
         if !event.is_durable() {
             let _ = self.live.send(Arc::new(ServerFrame::Event {
                 seq: None,
@@ -156,4 +158,17 @@ impl EventBus {
             Err(_) => false,
         }
     }
+}
+
+/// `event` with every string in it through the channels' one redaction
+/// boundary ([`aidaemon_channels::outbound`]).
+fn owner_event(event: Event) -> Event {
+    let Ok(value) = serde_json::to_value(&event) else {
+        return event;
+    };
+    let redacted = aidaemon_channels::outbound::redact_body(&value);
+    if redacted == value {
+        return event;
+    }
+    serde_json::from_value(redacted).unwrap_or(event)
 }

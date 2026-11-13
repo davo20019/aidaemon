@@ -52,7 +52,9 @@ impl Rest {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Value, ChannelError> {
-        self.send_with(method, path, |req| match body {
+        // The one redaction boundary every request to the chat passes.
+        let body = body.map(aidaemon_channels::outbound::redact_body);
+        self.send_with(method, path, |req| match &body {
             Some(b) => req.json(b),
             None => req.body(Vec::<u8>::new()),
         })
@@ -69,6 +71,7 @@ impl Rest {
         bytes: &[u8],
         mime_type: Option<&str>,
     ) -> Result<Value, ChannelError> {
+        let payload = &aidaemon_channels::outbound::redact_body(payload);
         self.send_with(Method::POST, path, |req| {
             let mut part =
                 reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(file_name.to_string());

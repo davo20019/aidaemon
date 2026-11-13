@@ -107,9 +107,12 @@ pub enum Step {
     /// A step of this kind handed its work on to something that keeps
     /// running: the work goes on, so it never reads as finished.
     HandedOff(ActivityKind),
-    /// A command is running, and this is the latest line it printed
-    /// (secrets redacted): shown as its output, never as a label.
-    Output(String),
+    /// A command is running and has printed this many lines so far. What
+    /// it printed is the command's own data, never the owner's card: a line
+    /// can carry a credential (live 2026-11-13: `drush site:install` printed
+    /// the new admin password and the card showed it), so the card shows
+    /// that it moves, not what it said.
+    Output { lines: u64 },
     /// Its work ended and its result is being written up for the chat.
     Reporting,
 }
@@ -131,7 +134,7 @@ impl Step {
         match self {
             Self::Doing(kind) => kind.says_what(),
             // Work that goes on elsewhere says so, whatever its kind.
-            Self::HandedOff(_) | Self::Output(_) | Self::Reporting => true,
+            Self::HandedOff(_) | Self::Output { .. } | Self::Reporting => true,
         }
     }
 
@@ -143,10 +146,16 @@ impl Step {
                 "Handed to a helper; it works in the background".to_string()
             }
             Self::HandedOff(kind) => format!("{} · goes on in the background", kind.words()),
-            Self::Output(line) => match line.trim() {
-                "" => ActivityKind::Run.words().to_string(),
-                line => format!("{} · last output: {line}", ActivityKind::Run.words()),
-            },
+            Self::Output { lines: 0 } => ActivityKind::Run.words().to_string(),
+            Self::Output { lines: 1 } => {
+                format!("{} · 1 line of output so far", ActivityKind::Run.words())
+            }
+            Self::Output { lines } => {
+                format!(
+                    "{} · {lines} lines of output so far",
+                    ActivityKind::Run.words()
+                )
+            }
             Self::Reporting => "Writing up the result".to_string(),
         }
     }

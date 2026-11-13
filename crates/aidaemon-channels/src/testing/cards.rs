@@ -12,7 +12,9 @@ use crate::hub::{ChannelCapabilities, ChannelHub, HubChannel, MediaMessage, Sess
 use aidaemon_tools::semantics::{ApprovalResponse, PermissionMode, RiskLevel};
 
 /// A channel whose messages can be edited: each message keeps its id and
-/// its latest text, so a test reads the chat exactly as the owner sees it.
+/// its latest text, so a test reads the chat exactly as the owner sees it,
+/// through the one redaction boundary every platform wire applies
+/// ([`crate::outbound`]).
 #[derive(Default)]
 pub struct CardChannel {
     shown: Mutex<Vec<(String, String)>>,
@@ -44,7 +46,7 @@ impl HubChannel for CardChannel {
     ) -> anyhow::Result<Option<String>> {
         let mut shown = self.shown.lock().await;
         let id = format!("m{}", shown.len() + 1);
-        shown.push((id.clone(), text.to_string()));
+        shown.push((id.clone(), crate::outbound::redact_text(text)));
         Ok(Some(id))
     }
 
@@ -57,7 +59,7 @@ impl HubChannel for CardChannel {
         let mut shown = self.shown.lock().await;
         match shown.iter_mut().find(|(id, _)| id == message_id) {
             Some((_, shown)) => {
-                *shown = text.to_string();
+                *shown = crate::outbound::redact_text(text);
                 Ok(true)
             }
             None => Ok(false),

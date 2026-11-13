@@ -112,6 +112,11 @@ pub mod channel_checks {
     /// `send` of an inline code span holding LaTeX leaves the LaTeX as it
     /// was written, whatever else it does to the text.
     pub const SEND_KEEPS_CODE: &str = "channel.send_keeps_code";
+    /// `send` of a text carrying a credential (a value under a password
+    /// label, as a site install prints it) reaches the platform without the
+    /// value: every adapter's wire passes [`crate::outbound`], the one
+    /// redaction boundary for what the owner is shown.
+    pub const SEND_HIDES_CREDENTIALS: &str = "channel.send_hides_credentials";
     /// A sender whose display name is hostile (line breaks, control and
     /// direction-override characters, far too long) keeps the same platform
     /// id, and the name arrives on one line, without those characters and
@@ -409,6 +414,25 @@ pub async fn check_channel(
     } else {
         vacuous(&mut report, REGISTER_COMMANDS, "no command menu");
     }
+
+    let credential_probe = "conformance probe User password: Conformance-Synthetic-58";
+    let hidden = channel
+        .send(&conversation, &OutboundMessage::text(credential_probe))
+        .await;
+    report.record(
+        SEND_HIDES_CREDENTIALS,
+        match hidden {
+            Err(e) => Err(format!("send failed: {e}")),
+            Ok(_) => {
+                let sent = harness.sent_messages().await;
+                if sent.iter().any(|m| m.contains("Conformance-Synthetic-58")) {
+                    Err("the platform received the credential".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        },
+    );
 
     let max = caps.max_message_len.max(1);
     let long = long_text(max * 3);

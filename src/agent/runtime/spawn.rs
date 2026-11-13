@@ -118,19 +118,15 @@ mod tests {
     use aidaemon_core::card::Step;
 
     /// Live 2026-11-13: "the whole count ran as a single command" and the
-    /// card showed nothing for 60 s. The line a helper's running command
-    /// printed last (secrets redacted) is that helper's progress line.
+    /// card showed nothing for 60 s. How much a helper's running command
+    /// printed is that helper's progress line; what it printed never is
+    /// (live 2026-11-13: `drush site:install` printed the new admin
+    /// password, and the card showed it as the "last output").
     #[tokio::test]
     async fn a_helpers_command_output_is_its_progress_line() {
-        let printed = b"1\n2\nTOKEN=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789\r42\n\n";
-        let line = crate::tools::terminal::latest_output_line(printed).expect("a line");
-        assert_eq!(line, "42");
-        let secret = crate::tools::terminal::latest_output_line(
-            b"export API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789\n",
-        )
-        .expect("a line");
-        assert!(!secret.contains("abcdefghijklmnop"), "{secret}");
-        assert_eq!(crate::tools::terminal::latest_output_line(b"\n \n"), None);
+        let printed = b"1\n2\n[success] User name: admin  User password: Synthetic-Pass-42\n";
+        let lines = crate::tools::terminal::printed_lines(printed, b"");
+        assert_eq!(lines, 3);
 
         let (parent_tx, mut parent_rx) = mpsc::channel(4);
         let counter =
@@ -138,7 +134,7 @@ mod tests {
         counter
             .send(StatusUpdate::CommandOutput {
                 name: "terminal".into(),
-                line,
+                lines,
             })
             .await
             .unwrap();
@@ -146,12 +142,13 @@ mod tests {
         match parent_rx.recv().await {
             Some(StatusUpdate::Helper(view)) => {
                 assert_eq!(view.label, "Slow counter");
-                assert_eq!(view.step, Some(Step::Output("42".into())));
+                assert_eq!(view.step, Some(Step::Output { lines: 3 }));
+                let words = view.step.unwrap().words();
                 assert_eq!(
-                    view.step.unwrap().words(),
-                    "Running a command · last output: 42",
+                    words, "Running a command · 3 lines of output so far",
                     "the owner reads plain words"
                 );
+                assert!(!words.contains("Synthetic-Pass-42"));
             }
             other => panic!("expected the helper's record, got {other:?}"),
         }

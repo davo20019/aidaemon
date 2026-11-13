@@ -1247,7 +1247,9 @@ pub fn status_text(update: &StatusUpdate) -> Option<String> {
             },
         )?),
         StatusUpdate::StepHandedOff { kind } => progress(Step::HandedOff(*kind).words()),
-        StatusUpdate::CommandOutput { line, .. } => progress(Step::Output(line.clone()).words()),
+        StatusUpdate::CommandOutput { lines, .. } => {
+            progress(Step::Output { lines: *lines }.words())
+        }
         StatusUpdate::Finished { by_me, total } => progress(crate::live_status::finished_block(
             by_me.as_deref(),
             total.as_deref(),
@@ -2078,7 +2080,7 @@ mod tests {
     #[tokio::test]
     async fn tasks_lists_a_helpers_latest_step() {
         let mut work = two_counting_jobs();
-        work[0].step = Some(aidaemon_core::card::Step::Output("14".into()));
+        work[0].step = Some(aidaemon_core::card::Step::Output { lines: 14 });
         let agent = ScriptedAgent {
             release: tokio::sync::Notify::new(),
             reading: std::sync::Mutex::new(None),
@@ -2088,7 +2090,9 @@ mod tests {
         let running = crate::stop::running_work(&registry, &agent, "s1").await;
         let tasks = crate::slash::render_tasks(&running, &[], chrono::Utc::now(), None);
         assert!(
-            tasks.contains("Sub-agent: Counting agent A – Running a command · last output: 14 ("),
+            tasks.contains(
+                "Sub-agent: Counting agent A – Running a command · 14 lines of output so far ("
+            ),
             "{tasks}"
         );
         assert!(

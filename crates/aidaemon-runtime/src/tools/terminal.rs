@@ -86,75 +86,20 @@ fn foreground_wait(initial: Duration, backgrounded: bool, notifications_reach: b
 /// Per-stream tail of startup output returned with a background launch.
 const PARTIAL_OUTPUT_TAIL_BYTES: usize = 1500;
 
-/// How often a running command's latest output line is sent as its progress.
+/// How often a running command's output count is sent as its progress.
 const COMMAND_OUTPUT_PROGRESS_EVERY: Duration = Duration::from_secs(3);
 
-/// The last line a command printed so far that says something (a carriage
-/// return starts a new line, as a progress bar redraws), as text: terminal
-/// escape sequences (colours, cursor moves, titles) and control characters
-/// removed, secrets redacted, cut to a card's width. A line with no letter
-/// or digit (a bar of `=`, a spinner) says nothing and is skipped. `None`
-/// before it printed anything that does (live 2026-11-13: "last output: For
-/// full details use 'ddev describe'.[0m").
-pub fn latest_output_line(output: &[u8]) -> Option<String> {
-    const MAX_CHARS: usize = 100;
-    let start = output.len().saturating_sub(4096);
-    let tail = strip_terminal_controls(&String::from_utf8_lossy(&output[start..]));
-    let line = tail
-        .split(['\n', '\r'])
-        .map(|line| line.trim())
-        .rfind(|line| line.chars().any(char::is_alphanumeric))?;
-    let line = aidaemon_tools::sanitize::redact_secrets_only(line);
-    Some(if line.chars().count() > MAX_CHARS {
-        let cut: String = line.chars().take(MAX_CHARS - 1).collect();
-        format!("{}\u{2026}", cut.trim_end())
-    } else {
-        line
-    })
-}
-
-/// `text` without terminal escape sequences or control characters, line
-/// breaks kept: CSI sequences (`ESC [ … final`, colours and cursor moves),
-/// OSC strings (`ESC ] … BEL` or `ESC \\`, window titles and links), and
-/// the short `ESC x` / `ESC ( x` forms.
-fn strip_terminal_controls(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\u{1b}' => match chars.next() {
-                Some('[') => {
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    while let Some(c) = chars.next() {
-                        if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
-                            break;
-                        }
-                    }
-                }
-                Some('(' | ')' | '*' | '+' | '#' | '%') => {
-                    chars.next();
-                }
-                _ => {}
-            },
-            '\u{9b}' => {
-                for c in chars.by_ref() {
-                    if ('@'..='~').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            '\n' | '\r' => out.push(c),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out
+/// How many lines a command has printed so far on both streams (a last
+/// line without its newline counts): what its card shows while it runs.
+/// Never the lines themselves: a command's output is its own data, and a
+/// line can carry a credential (live 2026-11-13: `drush site:install`
+/// printed "User password: …" and the card showed it as "last output").
+pub fn printed_lines(stdout: &[u8], stderr: &[u8]) -> u64 {
+    let count = |output: &[u8]| {
+        let breaks = output.iter().filter(|byte| **byte == b'\n').count() as u64;
+        breaks + u64::from(output.last().is_some_and(|byte| *byte != b'\n'))
+    };
+    count(stdout) + count(stderr)
 }
 
 /// A disowned background process (notifier-active, non-detached) that makes no
@@ -5200,7 +5145,7 @@ impl TerminalTool {
         let output_progress = status_tx.clone();
         let (progress_stdout, progress_stderr) = (stdout_buf.clone(), stderr_buf.clone());
         let poll_finished = async {
-            let mut shown = String::new();
+            let mut shown = 0;
             let mut last_check = tokio::time::Instant::now();
             loop {
                 if reader_handle.is_finished() {
@@ -5214,19 +5159,14 @@ impl TerminalTool {
                     continue;
                 }
                 last_check = tokio::time::Instant::now();
-                let line = {
-                    let stdout = progress_stdout.lock().await;
-                    match latest_output_line(&stdout) {
-                        Some(line) => Some(line),
-                        None => latest_output_line(&progress_stderr.lock().await),
-                    }
-                };
-                if let Some(line) = line.filter(|line| *line != shown) {
+                let lines =
+                    printed_lines(&progress_stdout.lock().await, &progress_stderr.lock().await);
+                if lines != shown {
                     let _ = tx.try_send(StatusUpdate::CommandOutput {
                         name: "terminal".to_string(),
-                        line: line.clone(),
+                        lines,
                     });
-                    shown = line;
+                    shown = lines;
                 }
             }
         };
@@ -5572,22 +5512,22 @@ impl TerminalTool {
                         let mut tick = tokio::time::interval(COMMAND_OUTPUT_PROGRESS_EVERY);
                         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         tick.tick().await;
-                        let mut shown = String::new();
+                        let mut shown = 0;
                         let exit_code = loop {
                             tokio::select! {
                                 exit = &mut completion_rx => break exit.ok().flatten(),
                                 _ = tick.tick() => {
                                     let Some(tx) = progress.as_ref() else { continue };
-                                    let line = match latest_output_line(&stdout_buf.lock().await) {
-                                        Some(line) => Some(line),
-                                        None => latest_output_line(&stderr_buf.lock().await),
-                                    };
-                                    if let Some(line) = line.filter(|line| *line != shown) {
+                                    let lines = printed_lines(
+                                        &stdout_buf.lock().await,
+                                        &stderr_buf.lock().await,
+                                    );
+                                    if lines != shown {
                                         let _ = tx.try_send(StatusUpdate::CommandOutput {
                                             name: "terminal".to_string(),
-                                            line: line.clone(),
+                                            lines,
                                         });
-                                        shown = line;
+                                        shown = lines;
                                     }
                                 }
                             }
@@ -5731,17 +5671,17 @@ impl TerminalTool {
                                         }
                                     },
                                     _ = step_tick.tick() => {
-                                        // Its latest output line is its step.
+                                        // How much it has printed is its step.
                                         let Some(run) = run else { continue };
                                         if !notify_on_completion.load(Ordering::Relaxed) {
                                             continue;
                                         }
-                                        let line = match latest_output_line(&stdout_buf.lock().await) {
-                                            Some(line) => Some(line),
-                                            None => latest_output_line(&stderr_buf.lock().await),
-                                        };
-                                        if let Some(line) = line {
-                                            run.step(Step::Output(line)).await;
+                                        let lines = printed_lines(
+                                            &stdout_buf.lock().await,
+                                            &stderr_buf.lock().await,
+                                        );
+                                        if lines > 0 {
+                                            run.step(Step::Output { lines }).await;
                                         }
                                     }
                                 }
@@ -8260,27 +8200,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// A command's latest line on a card is text: colour codes, cursor
-    /// moves and titles are gone, and a line that says nothing is skipped
-    /// (live 2026-11-13: "last output: For full details use 'ddev
-    /// describe'.[0m").
+    /// A command's progress is how much it printed, counted on both
+    /// streams, a last line without its newline included.
     #[test]
-    fn a_commands_latest_line_is_plain_text() {
-        let ddev = b"\x1b[32mSuccessfully started demo\x1b[0m\nFor full details use 'ddev describe'.\x1b[0m\n";
-        assert_eq!(
-            latest_output_line(ddev).as_deref(),
-            Some("For full details use 'ddev describe'.")
-        );
-        let titled = b"\x1b]0;window title\x07Building \x1b[1;34mstep 3\x1b[K\r\x1b(B";
-        assert_eq!(
-            latest_output_line(titled).as_deref(),
-            Some("Building step 3")
-        );
-        assert_eq!(
-            latest_output_line(b"Downloading\n[=====>     ]\r\x1b[2K|\n").as_deref(),
-            Some("Downloading")
-        );
-        assert_eq!(latest_output_line(b"\x1b[0m\n----\n"), None);
+    fn a_commands_progress_counts_its_lines() {
+        assert_eq!(printed_lines(b"", b""), 0);
+        assert_eq!(printed_lines(b"one\ntwo\n", b"partial"), 3);
     }
 
     /// The dispatcher's context for an owner's call the kernel approved.
@@ -11552,8 +11477,8 @@ mod tests {
         let lines = |rx: &mut mpsc::Receiver<StatusUpdate>| {
             let mut lines = Vec::new();
             while let Ok(update) = rx.try_recv() {
-                if let StatusUpdate::CommandOutput { line, .. } = update {
-                    lines.push(line);
+                if let StatusUpdate::CommandOutput { lines: count, .. } = update {
+                    lines.push(count);
                 }
             }
             lines
@@ -11572,9 +11497,7 @@ mod tests {
         assert!(!outcome.metadata.background_started);
         let shown = lines(&mut rx);
         assert!(
-            shown
-                .iter()
-                .any(|line| ["1", "2", "3", "4"].contains(&line.as_str())),
+            shown.iter().any(|count| (1..=4).contains(count)),
             "{shown:?}"
         );
 
@@ -11592,9 +11515,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(4)).await;
         let shown = lines(&mut rx);
         assert!(
-            shown
-                .iter()
-                .any(|line| ["3", "4", "5"].contains(&line.as_str())),
+            shown.iter().any(|count| (3..=5).contains(count)),
             "{shown:?}"
         );
         while tool.jobs_ended_by_task_end("helper-task").await > 0 {
@@ -12720,7 +12641,7 @@ mod tests {
         assert!(
             chat.wait_for(Duration::from_secs(10), |text| text
                 .starts_with("⏳ Running in the background: counting script")
-                && text.contains("last output: step-one"))
+                && text.contains("1 line of output so far"))
                 .await,
             "{:#?}",
             chat.shown().await
@@ -12734,6 +12655,45 @@ mod tests {
         );
         chat.assert_one_settled_card("✅ Finished in the background: counting script", "all-done")
             .await;
+    }
+
+    /// Live 2026-11-13: a helper's card showed `drush site:install`'s
+    /// "User password: …" line as its "last output". A command whose output
+    /// carries a password shows no line of it on its card, and none of the
+    /// chat's messages carries the value.
+    #[tokio::test]
+    async fn a_password_a_command_prints_never_reaches_the_chat() {
+        let chat = aidaemon_channels::testing::CardChat::new("telegram:synthetic-secret").await;
+        let tool = card_chat_terminal(&chat).await;
+        chat.turn(
+            |tx| {
+                tool.call_with_execution_context(
+                    r#"{"action":"run","command":"echo '[success] User name: admin  User password: Card-Synthetic-73'; sleep 5; echo installed","description":"site install","background":true}"#,
+                    Some(tx),
+                    aidaemon_tools::testing::call_facts("telegram:synthetic-secret"),
+                )
+            },
+            |_| String::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            chat.wait_for(Duration::from_secs(10), |text| text
+                .contains("1 line of output so far"))
+                .await,
+            "{:#?}",
+            chat.shown().await
+        );
+        assert!(
+            chat.wait_for(Duration::from_secs(20), |text| text
+                .starts_with("✅ Finished in the background"))
+                .await,
+            "{:#?}",
+            chat.shown().await
+        );
+        for text in chat.shown().await {
+            assert!(!text.contains("Card-Synthetic-73"), "{text}");
+        }
     }
 
     /// A command that prints nothing has no step on its card, and its end
@@ -12763,7 +12723,7 @@ mod tests {
         );
         let shown = chat.shown().await;
         assert_eq!(shown.len(), 1, "only the card: {shown:#?}");
-        assert!(!shown[0].contains("last output"), "{shown:#?}");
+        assert!(!shown[0].contains("of output so far"), "{shown:#?}");
     }
 
     #[test]

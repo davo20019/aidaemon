@@ -33,6 +33,7 @@ pub mod latex;
 pub mod live_status;
 pub mod mid_run;
 pub mod names;
+pub mod outbound;
 pub mod owner_wait;
 pub mod policy;
 pub mod ports;

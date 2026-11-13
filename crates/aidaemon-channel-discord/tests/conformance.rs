@@ -330,6 +330,6 @@ async fn discord_channel_conforms() {
     let discord = Arc::new(channel(&harness.http).with_gateway_url(harness.gateway.url.clone()));
     let report = check_channel(discord, &harness).await;
     report.assert_all_passed();
-    assert_eq!(report.passed.len(), 20, "{report}");
+    assert_eq!(report.passed.len(), 21, "{report}");
     assert!(report.notes.is_empty(), "{report}");
 }

@@ -109,10 +109,12 @@ pub enum StatusUpdate {
     StepHandedOff {
         kind: aidaemon_core::card::ActivityKind,
     },
-    /// The latest line a long-running command printed (secrets redacted),
-    /// sent at most every few seconds while it runs. A helper's card line
-    /// shows it, so a long count or install visibly moves.
-    CommandOutput { name: String, line: String },
+    /// How many lines a long-running command has printed so far, sent at
+    /// most every few seconds while it runs. A helper's card line shows the
+    /// count, so a long count or install visibly moves. Never the lines
+    /// themselves: a command's output is its own data and can carry a
+    /// credential (see [`aidaemon_core::card::Step::Output`]).
+    CommandOutput { name: String, lines: u64 },
 }
 
 impl StatusUpdate {

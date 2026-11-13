@@ -74,7 +74,7 @@ pub use opt_out::{
 #[cfg(feature = "otel")]
 pub use otel::{OtelSink, otlp_provider};
 pub use path::{resolve_path, resolve_path_from, resolves_within};
-pub use redact::{Redactor, secret_patterns};
+pub use redact::{Redactor, labelled_credentials, redact_labelled_credentials, secret_patterns};
 pub use scope::{ScopeGuard, UndeclaredAccess};
 pub use shell::{
     catastrophic_reason, command_segments, contains_shell_operator, credential_path_segment,

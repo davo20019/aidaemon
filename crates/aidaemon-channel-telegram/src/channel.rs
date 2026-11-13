@@ -899,6 +899,7 @@ impl Channel for TelegramChannel {
         if let Some(caption) = file.caption.as_deref().filter(|c| !c.trim().is_empty()) {
             // Plain text: an HTML caption cut at the limit could break a tag.
             let plain = html_to_plain(&self.to_html(caption));
+            let plain = aidaemon_channels::outbound::redact_text(&plain);
             let caption: String = plain.chars().take(CAPTION_MAX_LEN).collect();
             form = form.text("caption", caption);
         }

@@ -34,7 +34,8 @@ pub fn aidaemon_core::card::RunPhase::is_terminal(self) -> bool
 pub enum aidaemon_core::card::Step
 pub aidaemon_core::card::Step::Doing(aidaemon_core::card::ActivityKind)
 pub aidaemon_core::card::Step::HandedOff(aidaemon_core::card::ActivityKind)
-pub aidaemon_core::card::Step::Output(alloc::string::String)
+pub aidaemon_core::card::Step::Output
+pub aidaemon_core::card::Step::Output::lines: u64
 pub aidaemon_core::card::Step::Reporting
 impl aidaemon_core::card::Step
 pub fn aidaemon_core::card::Step::is_shown(&self) -> bool

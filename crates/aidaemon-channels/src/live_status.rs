@@ -1077,7 +1077,7 @@ mod tests {
              background)",
             1,
         );
-        let record = HelperView::running("Slow count", true, Some(Step::Output("13".into())));
+        let record = HelperView::running("Slow count", true, Some(Step::Output { lines: 13 }));
         let sink = FakeSink::new(true);
         let mut live = LiveStatus::new();
         live.set_checklist(&sink, plan.clone()).await;
@@ -1115,15 +1115,19 @@ mod tests {
         );
     }
 
-    /// A running command's latest line reads as its output, never as a
-    /// label or a counter of the step.
+    /// A running command reads as how much it printed, never what it
+    /// printed: its output is its own data and can carry a credential.
     #[test]
-    fn a_commands_latest_line_reads_as_its_output() {
+    fn a_running_command_reads_as_how_much_it_printed() {
         assert_eq!(
-            Step::Output("3".into()).words(),
-            "Running a command · last output: 3"
+            Step::Output { lines: 3 }.words(),
+            "Running a command · 3 lines of output so far"
         );
-        assert_eq!(Step::Output("  ".into()).words(), "Running a command");
+        assert_eq!(
+            Step::Output { lines: 1 }.words(),
+            "Running a command · 1 line of output so far"
+        );
+        assert_eq!(Step::Output { lines: 0 }.words(), "Running a command");
     }
 
     /// Nothing the owner reads names a tool, an internal label or a raw
@@ -1139,7 +1143,7 @@ mod tests {
             lines.push(Step::Doing(kind).words());
             lines.push(Step::HandedOff(kind).words());
         }
-        lines.push(Step::Output("42".into()).words());
+        lines.push(Step::Output { lines: 42 }.words());
         lines.push(Step::Reporting.words());
         for phase in [
             RunPhase::Running,

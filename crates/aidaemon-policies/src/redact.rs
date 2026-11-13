@@ -70,6 +70,52 @@ pub fn secret_patterns() -> &'static [(&'static str, Regex)] {
     })
 }
 
+/// A value printed under a credential's label: `User password: …`,
+/// `password=…`, `API key: …`, `token: …`. A shape like the ones in
+/// [`secret_patterns`], but it names its value by the label in front of it,
+/// so the value is what is hidden, the label kept. Placeholders (`$VAR`,
+/// `<…>`, `[REDACTED…]`, `***`) and values under
+/// [`MIN_SECRET_CHARS`](aidaemon_core::redaction::MIN_SECRET_CHARS)
+/// characters are not credentials. Kept apart from [`secret_patterns`]:
+/// [`crate::EgressGuard`] refuses calls carrying those shapes, and a call
+/// that sets a password (`--password=…`) is the owner's to make.
+fn labelled_credential() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(?:pass(?:word|wd|phrase)|secret|token|api[-_ ]?key|private[-_ ]?key)\b["']?\s*[:=]\s*["']?(?P<value>[^\s"'`,;]+)"#,
+        )
+        .expect("labelled credential pattern compiles")
+    })
+}
+
+/// The values printed under a credential's label in `text`
+/// ([`labelled_credential`]), each once, in order.
+pub fn labelled_credentials(text: &str) -> Vec<&str> {
+    let mut values: Vec<&str> = Vec::new();
+    for found in labelled_credential().captures_iter(text) {
+        let Some(value) = found.name("value").map(|value| value.as_str()) else {
+            continue;
+        };
+        let placeholder = value.starts_with(['$', '<', '[', '(', '{', '*', '%'])
+            || value.chars().all(|c| c == '*' || c == '.');
+        if !placeholder && value.chars().count() >= MIN_LITERAL_LEN && !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    values
+}
+
+/// `text` with every value printed under a credential's label replaced by
+/// `[REDACTED:credential]`, the label kept.
+pub fn redact_labelled_credentials(text: &str) -> String {
+    let mut out = text.to_string();
+    for value in labelled_credentials(text) {
+        out = out.replace(value, "[REDACTED:credential]");
+    }
+    out
+}
+
 impl Redactor {
     pub fn new() -> Self {
         Self {
@@ -129,6 +175,13 @@ impl Redactor {
 
     /// Redact `text`.
     pub fn redact(&self, text: &str) -> String {
+        // Last, so a value one of the shapes names keeps its kind.
+        redact_labelled_credentials(&self.redact_shapes(text))
+    }
+
+    /// `text` with the literals and the shapes hidden, not yet the values
+    /// under a credential label.
+    fn redact_shapes(&self, text: &str) -> String {
         let mut out = text.to_string();
         for literal in &self.literals {
             if out.contains(literal.as_str()) {
@@ -170,7 +223,15 @@ impl Hook for Redactor {
         _receipt: &Receipt,
         output: &mut ToolOutput,
     ) {
-        output.content = self.redact(&output.content);
+        // A credential a tool printed (a site install's new admin password)
+        // is registered before it is hidden, so it is hidden everywhere it
+        // shows later, labelled or not: the model's reply, a card, a file it
+        // sends.
+        let shaped = self.redact_shapes(&output.content);
+        for value in labelled_credentials(&shaped) {
+            let _ = aidaemon_core::redaction::register_secret(value);
+        }
+        output.content = redact_labelled_credentials(&shaped);
     }
 }
 
@@ -212,6 +273,35 @@ mod tests {
             .secret("abc");
         let out = r.redact("pw=hunter2-synthetic-password; abc stays");
         assert_eq!(out, "pw=[REDACTED:secret]; abc stays");
+    }
+
+    /// Live 2026-11-13: `drush site:install` printed the new admin
+    /// password, and the card showed it. A value under a credential's label
+    /// is hidden, the label kept; placeholders and short words are not
+    /// credentials.
+    #[test]
+    fn a_value_under_a_credential_label_is_hidden() {
+        let r = Redactor::new();
+        let out = r.redact("[success] User name: admin  User password: Synthetic-Pass-42");
+        assert!(!out.contains("Synthetic-Pass-42"), "{out}");
+        assert!(
+            out.contains("User password: [REDACTED:credential]"),
+            "{out}"
+        );
+        assert!(out.contains("User name: admin"), "{out}");
+        for kept in [
+            "password: $DB_PASSWORD",
+            "token=<your token>",
+            "Password: ********",
+            "secret: abc",
+            "the token budget was extended",
+        ] {
+            assert_eq!(r.redact(kept), kept);
+        }
+        assert_eq!(
+            labelled_credentials("api_key=\"Synthetic-Key-77\" and PASSWORD=Synthetic-Pass-42"),
+            vec!["Synthetic-Key-77", "Synthetic-Pass-42"]
+        );
     }
 
     #[test]
