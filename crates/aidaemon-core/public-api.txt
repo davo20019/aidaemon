@@ -50,6 +50,28 @@ pub fn aidaemon_core::conformance::check_tool(&dyn aidaemon_core::Tool) -> aidae
 pub fn aidaemon_core::conformance::check_tool_with(&dyn aidaemon_core::Tool, aidaemon_core::conformance::ToolKitOptions) -> aidaemon_core::conformance::ConformanceReport
 pub fn aidaemon_core::conformance::probe_requests() -> alloc::vec::Vec<(&'static str, aidaemon_core::ModelRequest)>
 pub fn aidaemon_core::conformance::sample_arguments(&serde_json::value::Value) -> serde_json::value::Value
+pub mod aidaemon_core::mandate_card
+pub enum aidaemon_core::mandate_card::Essential
+pub aidaemon_core::mandate_card::Essential::CanDo
+pub aidaemon_core::mandate_card::Essential::Ends
+pub aidaemon_core::mandate_card::Essential::HowOften
+pub aidaemon_core::mandate_card::Essential::TellsYouWhen
+pub aidaemon_core::mandate_card::Essential::What
+impl aidaemon_core::mandate_card::Essential
+pub const aidaemon_core::mandate_card::Essential::ALL: [Self; 5]
+pub const fn aidaemon_core::mandate_card::Essential::label(self) -> &'static str
+pub fn aidaemon_core::mandate_card::Essential::parse_line(&str) -> core::option::Option<(Self, &str)>
+pub struct aidaemon_core::mandate_card::MandateConfirmationCard
+pub aidaemon_core::mandate_card::MandateConfirmationCard::can_do: alloc::string::String
+pub aidaemon_core::mandate_card::MandateConfirmationCard::details: alloc::vec::Vec<alloc::string::String>
+pub aidaemon_core::mandate_card::MandateConfirmationCard::ends: alloc::string::String
+pub aidaemon_core::mandate_card::MandateConfirmationCard::how_often: alloc::string::String
+pub aidaemon_core::mandate_card::MandateConfirmationCard::tells_you_when: alloc::string::String
+pub aidaemon_core::mandate_card::MandateConfirmationCard::what: alloc::string::String
+impl aidaemon_core::mandate_card::MandateConfirmationCard
+pub fn aidaemon_core::mandate_card::MandateConfirmationCard::essentials(&self) -> [(aidaemon_core::mandate_card::Essential, &str); 5]
+pub fn aidaemon_core::mandate_card::MandateConfirmationCard::from_lines(&[alloc::string::String]) -> core::option::Option<Self>
+pub fn aidaemon_core::mandate_card::MandateConfirmationCard::into_lines(self) -> alloc::vec::Vec<alloc::string::String>
 pub mod aidaemon_core::testing
 pub struct aidaemon_core::testing::ScriptedProvider
 impl aidaemon_core::testing::ScriptedProvider
@@ -83,6 +105,11 @@ pub aidaemon_core::ApprovalRisk::Critical
 pub aidaemon_core::ApprovalRisk::High
 pub aidaemon_core::ApprovalRisk::Low
 pub aidaemon_core::ApprovalRisk::Medium
+#[non_exhaustive] pub enum aidaemon_core::AskReason
+pub aidaemon_core::AskReason::AfterADecline
+pub aidaemon_core::AskReason::AfterADecline::declined: core::option::Option<alloc::string::String>
+pub aidaemon_core::AskReason::ReadOutsideContent
+pub aidaemon_core::AskReason::ReadOutsideContent::check_says: core::option::Option<alloc::string::String>
 #[non_exhaustive] pub enum aidaemon_core::BuildError
 pub aidaemon_core::BuildError::DuplicateTool(alloc::string::String)
 pub aidaemon_core::BuildError::EmptyAgentId
@@ -90,6 +117,17 @@ pub aidaemon_core::BuildError::InvalidToolName(alloc::string::String)
 pub aidaemon_core::BuildError::MissingModel
 pub aidaemon_core::BuildError::MissingProvider
 pub aidaemon_core::BuildError::MissingSafeguard(aidaemon_core::Safeguard)
+#[non_exhaustive] pub enum aidaemon_core::CardAction
+pub aidaemon_core::CardAction::Command
+pub aidaemon_core::CardAction::Command::line: alloc::string::String
+pub aidaemon_core::CardAction::Command::looks_inside: alloc::vec::Vec<alloc::string::String>
+pub aidaemon_core::CardAction::Command::title: core::option::Option<alloc::string::String>
+pub aidaemon_core::CardAction::OpenLocalSite
+pub aidaemon_core::CardAction::OpenLocalSite::once_minutes: u64
+pub aidaemon_core::CardAction::OpenLocalSite::site: alloc::string::String
+pub aidaemon_core::CardAction::Use
+pub aidaemon_core::CardAction::Use::detail: core::option::Option<alloc::string::String>
+pub aidaemon_core::CardAction::Use::what: alloc::string::String
 pub enum aidaemon_core::ChannelVisibility
 pub aidaemon_core::ChannelVisibility::Internal
 pub aidaemon_core::ChannelVisibility::Private
@@ -203,6 +241,12 @@ pub aidaemon_core::FailoverAction::Stop
 pub aidaemon_core::FinishOutcome::Blocked
 pub aidaemon_core::FinishOutcome::Partial
 pub aidaemon_core::FinishOutcome::Succeeded
+#[non_exhaustive] pub enum aidaemon_core::HighImpact
+pub aidaemon_core::HighImpact::Deletes
+pub aidaemon_core::HighImpact::Deletes::targets: alloc::vec::Vec<alloc::string::String>
+pub aidaemon_core::HighImpact::Sends
+pub aidaemon_core::HighImpact::Spends
+pub aidaemon_core::HighImpact::WritesOutsideWorkArea
 pub enum aidaemon_core::HookFailure
 pub aidaemon_core::HookFailure::Cancelled
 pub aidaemon_core::HookFailure::Panicked
@@ -316,6 +360,8 @@ pub aidaemon_core::Resolution::Deny::reason: alloc::string::String
 pub aidaemon_core::Resolution::OwnerDeclined
 pub aidaemon_core::Resolution::OwnerDeclined::reason: alloc::string::String
 pub aidaemon_core::Resolution::OwnerDeclined::request: aidaemon_core::OwnerApprovalRequest
+pub aidaemon_core::Resolution::Unanswered
+pub aidaemon_core::Resolution::Unanswered::reason: alloc::string::String
 pub enum aidaemon_core::ResponseFormat
 pub aidaemon_core::ResponseFormat::JsonObject
 pub aidaemon_core::ResponseFormat::JsonSchema
@@ -482,6 +528,13 @@ pub fn aidaemon_core::AgentBuilder::stuck_detection(self, aidaemon_core::StuckCo
 pub fn aidaemon_core::AgentBuilder::tool(self, impl aidaemon_core::Tool + 'static) -> Self
 pub fn aidaemon_core::AgentBuilder::tool_arc(self, alloc::sync::Arc<dyn aidaemon_core::Tool>) -> Self
 pub fn aidaemon_core::AgentBuilder::tool_extensions(self, aidaemon_core::Extensions) -> Self
+pub struct aidaemon_core::ApprovalCard
+pub aidaemon_core::ApprovalCard::action: aidaemon_core::CardAction
+pub aidaemon_core::ApprovalCard::asked_by: core::option::Option<alloc::string::String>
+pub aidaemon_core::ApprovalCard::impact: core::option::Option<aidaemon_core::HighImpact>
+pub aidaemon_core::ApprovalCard::reason: core::option::Option<aidaemon_core::AskReason>
+impl aidaemon_core::ApprovalCard
+pub fn aidaemon_core::ApprovalCard::new(aidaemon_core::CardAction) -> Self
 pub struct aidaemon_core::Audio
 pub aidaemon_core::Audio::data: alloc::string::String
 pub aidaemon_core::Audio::format: alloc::string::String
@@ -504,6 +557,7 @@ impl aidaemon_core::AuthorityHook
 pub fn aidaemon_core::AuthorityHook::delegated(self) -> Self
 pub fn aidaemon_core::AuthorityHook::new(aidaemon_core::Authority) -> Self
 pub fn aidaemon_core::AuthorityHook::with_ceiling(self, alloc::sync::Arc<dyn aidaemon_core::AuthorityCeiling>) -> Self
+pub fn aidaemon_core::AuthorityHook::with_limit_note(self, impl core::convert::Into<alloc::string::String>) -> Self
 impl aidaemon_core::Hook for aidaemon_core::AuthorityHook
 pub fn aidaemon_core::AuthorityHook::after_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 mut aidaemon_core::ModelResponse) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ModelDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::AuthorityHook::after_tool<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::Receipt, &'life4 mut aidaemon_core::ToolOutput) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait
@@ -549,6 +603,15 @@ pub fn aidaemon_core::EffectKey::egress(&str, &str, core::option::Option<u16>) -
 pub fn aidaemon_core::EffectKey::named(aidaemon_core::EffectClass, &str) -> aidaemon_core::EffectKey
 pub fn aidaemon_core::EffectKey::overlaps(&self, &aidaemon_core::EffectKey) -> bool
 pub fn aidaemon_core::EffectKey::path(aidaemon_core::EffectClass, &str) -> core::option::Option<aidaemon_core::EffectKey>
+pub struct aidaemon_core::EndpointPublisher
+impl aidaemon_core::EndpointPublisher
+pub fn aidaemon_core::EndpointPublisher::set(&self, core::option::Option<alloc::string::String>)
+pub struct aidaemon_core::EndpointSource
+impl aidaemon_core::EndpointSource
+pub fn aidaemon_core::EndpointSource::current(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn aidaemon_core::EndpointSource::fixed(alloc::vec::Vec<alloc::string::String>) -> Self
+pub fn aidaemon_core::EndpointSource::live(alloc::vec::Vec<alloc::string::String>) -> (Self, aidaemon_core::EndpointPublisher)
+pub fn aidaemon_core::EndpointSource::live_origin(&self) -> core::option::Option<alloc::string::String>
 pub struct aidaemon_core::Extensions
 impl aidaemon_core::Extensions
 pub fn aidaemon_core::Extensions::get<T: 'static>(&self) -> core::option::Option<&T>
@@ -687,6 +750,7 @@ pub aidaemon_core::ModelResponse::text: alloc::string::String
 pub aidaemon_core::ModelResponse::tool_calls: alloc::vec::Vec<aidaemon_core::ToolCall>
 pub aidaemon_core::ModelResponse::usage: aidaemon_core::Usage
 pub struct aidaemon_core::OwnerApprovalRequest
+pub aidaemon_core::OwnerApprovalRequest::card: core::option::Option<alloc::boxed::Box<aidaemon_core::ApprovalCard>>
 pub aidaemon_core::OwnerApprovalRequest::effects: alloc::vec::Vec<aidaemon_core::EffectKey>
 pub aidaemon_core::OwnerApprovalRequest::risk: aidaemon_core::ApprovalRisk
 pub aidaemon_core::OwnerApprovalRequest::subject: alloc::string::String
@@ -928,13 +992,17 @@ pub aidaemon_core::Usage::output_tokens: u64
 impl aidaemon_core::Usage
 pub fn aidaemon_core::Usage::add(&mut self, aidaemon_core::Usage)
 pub fn aidaemon_core::Usage::billable_tokens(&self) -> u64
+pub const aidaemon_core::AUTHORITY_BLOCKED: &str
 pub const aidaemon_core::EGRESS_BLOCKED: &str
 pub const aidaemon_core::HARD_TURN_CAP: u32
 pub const aidaemon_core::OWNER_DECLINED: &str
+pub const aidaemon_core::OWNER_UNANSWERED: &str
 pub const aidaemon_core::RUN_STATE_SCHEMA: u32
+pub const aidaemon_core::UNTRUSTED_BLOCKED: &str
 pub const aidaemon_core::UNTRUSTED_EGRESS_INTERRUPT: &str
 pub trait aidaemon_core::AuthorityCeiling: core::marker::Send + core::marker::Sync
 pub fn aidaemon_core::AuthorityCeiling::ceiling<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::Authority>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn aidaemon_core::AuthorityCeiling::limit_note(&self) -> core::option::Option<&str>
 pub trait aidaemon_core::EventSink: core::marker::Send + core::marker::Sync
 pub fn aidaemon_core::EventSink::emit(&self, aidaemon_core::RunId, &aidaemon_core::Event)
 pub fn aidaemon_core::EventSink::observe_request(&self, aidaemon_core::RunId, &aidaemon_core::ModelRequest)

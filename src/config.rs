@@ -2125,28 +2125,9 @@ impl AppConfig {
             );
             let mut unique_endpoints = std::collections::HashSet::new();
             for endpoint in &config.nodes.gateway.advertised_endpoints {
-                anyhow::ensure!(
-                    endpoint.len() <= 192,
-                    "nodes.gateway.advertised_endpoints origins must not exceed 192 bytes"
-                );
-                let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
-                    anyhow::anyhow!(
-                        "nodes.gateway.advertised_endpoints must contain valid HTTPS origins"
-                    )
-                })?;
-                anyhow::ensure!(
-                    parsed.scheme() == "https" && parsed.host_str().is_some(),
-                    "nodes.gateway.advertised_endpoints must use HTTPS"
-                );
-                anyhow::ensure!(
-                    parsed.host_str().is_some()
-                        && parsed.username().is_empty()
-                        && parsed.password().is_none()
-                        && parsed.query().is_none()
-                        && parsed.fragment().is_none()
-                        && parsed.path() == "/",
-                    "nodes.gateway.advertised_endpoints must be HTTPS origins without credentials, paths, queries or fragments"
-                );
+                if let Err(error) = aidaemon_exposure::validate_https_origin(endpoint) {
+                    anyhow::bail!("nodes.gateway.advertised_endpoints {error}");
+                }
                 anyhow::ensure!(
                     unique_endpoints.insert(endpoint.trim_end_matches('/')),
                     "nodes.gateway.advertised_endpoints must be unique"

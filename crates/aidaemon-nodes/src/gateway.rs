@@ -765,6 +765,34 @@ async fn cancel_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every route this listener mounts sits under `/node/v1`: an exposure
+    /// adapter forwards the whole port, so nothing else may be served here.
+    #[test]
+    fn every_route_is_under_the_service_prefix() {
+        let source = include_str!("gateway.rs");
+        let body = source
+            .split("pub fn router(state: NodeGatewayState) -> Router {")
+            .nth(1)
+            .expect("router() is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let routes: Vec<&str> = body
+            .split(".route(")
+            .skip(1)
+            .map(|rest| rest.trim_start().trim_start_matches('"'))
+            .collect();
+        assert!(!routes.is_empty());
+        for route in routes {
+            assert!(
+                route.starts_with("/node/v1/"),
+                "route outside /node/v1: {}",
+                route.lines().next().unwrap_or_default()
+            );
+        }
+        assert!(!body.contains(".nest(") && !body.contains(".fallback("));
+    }
     use aidaemon_tools::testing::CallWithFacts;
     use async_trait::async_trait;
     use sqlx::sqlite::SqlitePoolOptions;

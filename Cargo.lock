@@ -81,6 +81,7 @@ dependencies = [
  "aidaemon-decisions",
  "aidaemon-eval",
  "aidaemon-events",
+ "aidaemon-exposure",
  "aidaemon-mcp",
  "aidaemon-memory",
  "aidaemon-nodes",
@@ -357,6 +358,23 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aidaemon-exposure"
+version = "0.2.0"
+dependencies = [
+ "aidaemon-core",
+ "aidaemon-exposure",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "tracing",
+ "url",
 ]
 
 [[package]]

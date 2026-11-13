@@ -19,6 +19,7 @@ mod agent;
 mod approval;
 mod audience;
 mod authority;
+mod endpoint;
 mod error;
 mod event;
 mod failover;
@@ -52,6 +53,7 @@ pub use approval::{
 };
 pub use audience::{ChannelVisibility, UserRole};
 pub use authority::{AccessLevel, Authority, AuthorityCeiling, AuthorityHook};
+pub use endpoint::{EndpointPublisher, EndpointSource};
 pub use error::{BuildError, CoreError};
 pub use event::{Event, EventSink};
 pub use failover::{
