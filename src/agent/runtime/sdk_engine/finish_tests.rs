@@ -984,7 +984,7 @@ async fn a_helper_that_waited_for_its_background_command_finished() {
     assert_eq!(reply, "Done. I counted to 3.");
     let end = task_end(&harness, "helper-waits-for-its-job").await;
     assert_eq!(end.effective_outcome(), TaskOutcome::Succeeded);
-    let label = crate::tools::spawn::background_completion_label(end.effective_outcome());
+    let label = aidaemon_runtime::run_state::RunPhase::ended(end.effective_outcome()).headline();
     assert!(
         label.starts_with("\u{2705} Finished in the background"),
         "{label}"

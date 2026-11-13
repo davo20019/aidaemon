@@ -19,6 +19,7 @@ use crate::traits::{
 };
 use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 use aidaemon_core::SourceTrust;
+use aidaemon_runtime::run_state::RunPhase;
 use aidaemon_runtime::turn::sliding_window::MEASURED_TIMING_MARK;
 
 /// A tool that allows the LLM to spawn a sub-agent for a focused task.
@@ -260,32 +261,19 @@ fn bounded_child_response(
     (shown, Some(info))
 }
 
-/// The first line of a background helper's result in the chat, from its
-/// typed outcome.
-pub(crate) fn background_completion_label(outcome: TaskOutcome) -> &'static str {
-    match outcome {
-        TaskOutcome::Succeeded => "\u{2705} Finished in the background",
-        TaskOutcome::Partial => "\u{26a0}\u{fe0f} Didn't finish in the background",
-        TaskOutcome::Failed => "\u{274c} Failed in the background",
-    }
-}
-
-/// A background helper's result for the chat, headed by its typed outcome.
-/// A helper whose own typed verdict was `done` but whose tools did not
-/// confirm every step it listed (`reported_done` with a partial outcome)
-/// finished, and the result says what was not confirmed (live 2026-11-13:
-/// helpers whose reports said "Done." read "Didn't finish" because a
-/// step's receipts never matched how it was listed).
-fn format_background_completion(
-    mission: &str,
-    response: &str,
-    outcome: TaskOutcome,
-    reported_done: bool,
+/// A background helper's result for the chat, rendered from its run record
+/// alone: the header is its phase, the one evidence line names the typed
+/// steps no tool confirmed, and the footer is the time the runtime
+/// measured. The helper's report is the body, never what decides the rest.
+fn render_run_result(
+    state: &aidaemon_runtime::run_state::RunState,
+    name: &str,
+    report: &str,
     max_response_chars: usize,
-) -> (&'static str, String) {
+) -> String {
     // This goes straight to the chat, past the loop that renders truncation
     // metadata for tool results.
-    let mut text = match bounded_child_response(response, max_response_chars) {
+    let body = match bounded_child_response(report, max_response_chars) {
         (shown, Some(info)) => {
             format!(
                 "{shown}\n\n{}",
@@ -294,115 +282,49 @@ fn format_background_completion(
         }
         (shown, None) => shown.to_string(),
     };
-    let outcome = match outcome {
-        TaskOutcome::Partial if reported_done => {
-            text.push_str(
-                "\n\nIt reported its work done; its tools didn't confirm every step it listed.",
-            );
-            TaskOutcome::Succeeded
-        }
-        outcome => outcome,
-    };
-    let kind = match outcome {
-        TaskOutcome::Succeeded => "completed",
-        TaskOutcome::Partial => "partial",
-        TaskOutcome::Failed => "failed",
-    };
-    (
-        kind,
-        format!(
-            "{}: {}\n\n{}",
-            background_completion_label(outcome),
-            mission,
-            text
-        ),
-    )
+    let mut message = format!("{}: {name}", state.phase.headline());
+    if let Some(line) = state.evidence.line() {
+        message.push('\n');
+        message.push_str(&line);
+    }
+    if !body.trim().is_empty() {
+        message.push_str("\n\n");
+        message.push_str(body.trim_end());
+    }
+    if let Some(footer) = background_timing(state) {
+        message.push_str("\n\n");
+        message.push_str(&footer);
+    }
+    message
 }
 
-/// Each chat's background helpers still running, in the order they
-/// started: their job id, the name the card gives them and their latest
-/// step. A plan card edited after its turn (a helper finished and settled
-/// its steps, or reported a step) keeps a start line for each one still
-/// running.
-static RUNNING_HELPERS: std::sync::LazyLock<std::sync::Mutex<RunningHelpers>> =
-    std::sync::LazyLock::new(Default::default);
-
-/// One running helper on its chat's card.
-struct RunningHelper {
-    job: String,
-    label: String,
-    step: Option<String>,
-}
-
-/// Per chat: its running helpers.
-type RunningHelpers = std::collections::HashMap<String, Vec<RunningHelper>>;
-
-fn note_running_helper(chat: &str, job_id: &str, label: &str) {
-    if let Ok(mut running) = RUNNING_HELPERS.lock() {
-        running
-            .entry(chat.to_string())
-            .or_default()
-            .push(RunningHelper {
-                job: job_id.to_string(),
-                label: label.to_string(),
-                step: None,
-            });
+/// The notification kind a run's phase is queued under.
+fn run_notification_type(phase: RunPhase) -> &'static str {
+    match phase {
+        RunPhase::Succeeded => "completed",
+        RunPhase::Stopped => "partial",
+        RunPhase::Failed | RunPhase::Running => "failed",
     }
 }
 
-/// The helper's latest step, for its line on the card.
-fn note_helper_step(chat: &str, job_id: &str, step: &str) {
-    if let Ok(mut running) = RUNNING_HELPERS.lock() {
-        if let Some(helper) = running
-            .get_mut(chat)
-            .and_then(|helpers| helpers.iter_mut().find(|helper| helper.job == job_id))
-        {
-            helper.step = Some(step.to_string());
-        }
+/// The plan steps a run's phase settles.
+fn job_end(phase: RunPhase) -> crate::plans::JobEnd {
+    match phase {
+        RunPhase::Succeeded => crate::plans::JobEnd::Succeeded,
+        RunPhase::Stopped => crate::plans::JobEnd::Stopped,
+        RunPhase::Failed | RunPhase::Running => crate::plans::JobEnd::Failed,
     }
 }
 
-/// The chat's running helpers: each one's card name and latest step.
-fn running_helper_lines(chat: &str) -> Vec<(String, Option<String>)> {
-    RUNNING_HELPERS
-        .lock()
-        .ok()
-        .and_then(|running| {
-            running.get(chat).map(|helpers| {
-                helpers
-                    .iter()
-                    .map(|helper| (helper.label.clone(), helper.step.clone()))
-                    .collect()
-            })
-        })
-        .unwrap_or_default()
-}
-
-/// The job ended: its start line leaves the card. Returns the names of
-/// the chat's helpers still running.
-fn helper_ended(chat: &str, job_id: &str) -> Vec<String> {
-    let Ok(mut running) = RUNNING_HELPERS.lock() else {
-        return Vec::new();
-    };
-    let Some(helpers) = running.get_mut(chat) else {
-        return Vec::new();
-    };
-    helpers.retain(|helper| helper.job != job_id);
-    let left = helpers.iter().map(|helper| helper.label.clone()).collect();
-    if helpers.is_empty() {
-        running.remove(chat);
-    }
-    left
-}
-
-/// Whether the chat's helper `job_id` is still running (its start line is
-/// on the card).
-fn helper_running(chat: &str, job_id: &str) -> bool {
-    RUNNING_HELPERS.lock().is_ok_and(|running| {
-        running
-            .get(chat)
-            .is_some_and(|helpers| helpers.iter().any(|helper| helper.job == job_id))
-    })
+/// The chat's running helpers' lines on its card, from their run records.
+fn running_helper_lines(
+    runs: &aidaemon_runtime::run_state::RunStates,
+    chat: &str,
+) -> Vec<(String, Option<String>)> {
+    runs.running(chat)
+        .iter()
+        .map(aidaemon_runtime::run_state::RunState::card_line)
+        .collect()
 }
 
 /// One writer at a time for a chat's kept card. A helper's step redraw and
@@ -425,6 +347,7 @@ fn card_writer(chat: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// The card a background helper's turn leaves in the chat, for showing
 /// the helper's steps after that turn ended.
 struct HelperCard {
+    runs: Arc<aidaemon_runtime::run_state::RunStates>,
     hub: Option<Weak<dyn OutboundRouter>>,
     plans: Option<Arc<crate::plans::PlanStore>>,
     plan_session: Option<String>,
@@ -449,7 +372,11 @@ impl HelperCard {
         let writer = card_writer(&self.chat);
         let _turn = writer.lock().await;
         // Ended meanwhile: its end drew the finished card.
-        if !helper_running(&self.chat, &self.job) {
+        if self
+            .runs
+            .get(&self.job)
+            .is_none_or(|run| run.phase != RunPhase::Running)
+        {
             return;
         }
         let (Some(hub), Some(plans), Some(plan_session)) = (
@@ -488,7 +415,7 @@ impl HelperCard {
         };
         let card = aidaemon_channels::live_status::with_helper_lines(
             &plan.render_compact_checklist(),
-            running_helper_lines(&self.chat)
+            running_helper_lines(&self.runs, &self.chat)
                 .iter()
                 .map(|(label, step)| (label.as_str(), step.as_deref())),
         );
@@ -541,7 +468,7 @@ fn show_helper_steps_on_card(
                     let Some(update) = update else { break };
                     if let StatusUpdate::SubAgentProgress { label, progress } = &update {
                         if *label == card.label {
-                            note_helper_step(&card.chat, &card.job, progress);
+                            card.runs.step(&card.job, progress);
                             changed = true;
                         }
                     }
@@ -855,11 +782,13 @@ fn owner_wait_note(waited: Duration) -> String {
     )
 }
 
-/// A background child's measured run for the chat: one duration, from its
-/// first step to its report, and the times it spans (live 2026-11-13: "Ran
-/// 2m 44s (8:34 PM ET to 8:37 PM ET)" read as the whole run, but was its
-/// first to last tool call, minutes apart from its own measurement).
-fn background_timing(run: &MeasuredRun) -> String {
+/// A background helper's measured run for the chat, from its run record:
+/// one duration, from its first step to its end, and the times it spans
+/// (live 2026-11-13: "Ran 2m 44s (8:34 PM ET to 8:37 PM ET)" read as the
+/// whole run, but was its first to last tool call). `None` while it runs.
+fn background_timing(run: &aidaemon_runtime::run_state::RunState) -> Option<String> {
+    let took = run.took()?;
+    let ended = run.ended_at?;
     let wait = if run.waited.as_secs() == 0 {
         String::new()
     } else {
@@ -871,11 +800,11 @@ fn background_timing(run: &MeasuredRun) -> String {
             )
         )
     };
-    format!(
+    Some(format!(
         "{MEASURED_TIMING_MARK}Took {} ({}).{wait}",
-        compact(run.took()),
-        run.range()
-    )
+        compact(took),
+        owner_clock_range(run.began(), ended)
+    ))
 }
 
 /// One result for a batch call: each child's result under its mission, in
@@ -998,6 +927,56 @@ struct SpawnArgs {
     /// Who wins where that scope overlaps a running sibling's.
     #[serde(default)]
     precedence: Option<crate::agent::coordination::Precedence>,
+    /// Folders this child creates fresh (a new install or project): each
+    /// must not exist yet ([`folders_already_there`]).
+    #[serde(default)]
+    new_folders: Vec<String>,
+}
+
+/// The `new_folders` that already exist, each with the next name beside it
+/// that is free: a child asked to create a folder fresh never starts on one
+/// that already holds something (live 2026-11-13: "fresh" installs went
+/// into claude-drupal-3, which held an earlier site, and preserved it).
+fn folders_already_there(folders: &[String]) -> Vec<(String, String)> {
+    folders
+        .iter()
+        .filter_map(|folder| {
+            let path = std::path::PathBuf::from(shellexpand::tilde(folder.trim()).as_ref());
+            if !path.exists() {
+                return None;
+            }
+            Some((
+                path.display().to_string(),
+                next_free_folder(&path).display().to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// The first sibling of `path` named like it with a higher number
+/// (`site-3` -> `site-4`, `site` -> `site-2`) that does not exist.
+fn next_free_folder(path: &std::path::Path) -> std::path::PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let (stem, mut number) = match name.rsplit_once('-') {
+        Some((stem, digits))
+            if !stem.is_empty()
+                && !digits.is_empty()
+                && digits.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            (stem.to_string(), digits.parse::<u64>().unwrap_or(1))
+        }
+        _ => (name.clone(), 1),
+    };
+    loop {
+        number += 1;
+        let candidate = path.with_file_name(format!("{stem}-{number}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
 }
 
 impl SpawnArgs {
@@ -1238,6 +1217,11 @@ impl Tool for SpawnAgentTool {
                         "items": { "type": "string" },
                         "description": "Optional: the files or directories this child will change. When several children will write, give them disjoint scopes so they do not collide. If a scope must overlap a running child's, say who wins there with precedence."
                     },
+                    "new_folders": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "When the work makes something new in a folder of its own (a fresh install, a new project), that folder's absolute path. The call fails if it already exists and names the next free folder, so pick that one (in title, task, scope and here) or ask the owner; never send a fresh install into a folder that holds something."
+                    },
                     "precedence": {
                         "type": "string",
                         "enum": ["this_child", "running_siblings", "shared"],
@@ -1332,6 +1316,21 @@ impl SpawnAgentTool {
         let facts = facts.clone();
 
         let args = SpawnArgs::parse(arguments)?;
+        let taken = folders_already_there(&args.new_folders);
+        if !taken.is_empty() {
+            let listed = taken
+                .iter()
+                .map(|(there, free)| {
+                    format!("{there} already exists (the next free name is {free})")
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::bail!(
+                "No helper started: {listed}. New work needs a folder that doesn't exist yet. \
+                 Call again with the free folder in title, task, scope and new_folders, or ask \
+                 the owner whether to use the existing one."
+            );
+        }
         let project_scope = facts.project_scope.clone();
         let mut parent_authority = crate::agent::authority::parent_authority(&facts).cloned();
         // A child can be made narrower than its parent and never wider.
@@ -1631,7 +1630,25 @@ impl SpawnAgentTool {
         }
         let plan_session = approval_session_id.clone();
         let helper_label = crate::agent::helper_card_label(&name);
-        note_running_helper(&session_id, &background_id, &helper_label);
+        // The run's one typed record. Its end pushes the result to the chat
+        // through the subscriber below, the moment it ends.
+        let runs = agent.helper_runs();
+        let (ended_tx, ended_rx) = mpsc::unbounded_channel();
+        runs.begin(&background_id, &session_id, &helper_label, Some(ended_tx));
+        tokio::spawn(deliver_when_run_ends(
+            ended_rx,
+            ResultRoute {
+                agent: agent.clone(),
+                runs: runs.clone(),
+                hub: hub_for_parent_delivery.clone(),
+                state: state.clone(),
+                plans: plan_store.clone(),
+                plan_session: plan_session.clone(),
+                goal_id: notify_goal_id.clone(),
+                name: name.clone(),
+                max_response_chars,
+            },
+        ));
         let at_start = match hub.as_ref() {
             Some(hub) => (
                 hub.checklist_surface(&session_id).await,
@@ -1642,6 +1659,7 @@ impl SpawnAgentTool {
         let status_tx = show_helper_steps_on_card(
             status_tx,
             HelperCard {
+                runs: runs.clone(),
                 hub: hub_for_parent_delivery.clone(),
                 plans: plan_store.clone(),
                 plan_session: plan_session.clone(),
@@ -1656,21 +1674,13 @@ impl SpawnAgentTool {
         tokio::spawn(async move {
             // This task owns `family_permit`, so the slot stays taken until
             // the child has finished.
-            let delivery = BackgroundDelivery {
-                agent: agent.as_ref(),
-                hub: hub_for_parent_delivery.as_ref(),
-                state: state.as_ref(),
-                session_id: &session_id,
-                goal_id: &notify_goal_id,
-            };
-            // A panic in the child or in its delivery must not skip the
-            // cleanup below, and the parent session still hears it failed.
+            let waits = crate::tools::OwnerWaitClock::current()
+                .unwrap_or_default()
+                .nested();
+            // A panic in the child must not skip the cleanup below, and the
+            // run still ends (failed), which tells the chat.
             let finished = std::panic::AssertUnwindSafe(async {
                 let started_at = std::time::Instant::now();
-                let started_utc = chrono::Utc::now();
-                let waits = crate::tools::OwnerWaitClock::current()
-                    .unwrap_or_default()
-                    .nested();
                 let mut progress_interval =
                     tokio::time::interval(Duration::from_secs(BACKGROUND_PROGRESS_INTERVAL_SECS));
                 progress_interval.tick().await; // consume immediate tick
@@ -1682,22 +1692,25 @@ impl SpawnAgentTool {
                         family_permit.as_ref(),
                         crate::tools::OwnerWaitClock::within(
                             Some(waits.clone()),
-                            agent.run_child(ChildAgentRequest {
-                                mission: mission.clone(),
-                                task: task.clone(),
-                                status_tx: status_tx.clone(),
-                                channel_ctx,
-                                user_role,
-                                child_role,
-                                goal_id: goal_id_ref.clone(),
-                                task_id: task_id_ref.clone(),
-                                project_scope: project_scope.clone(),
-                                specialist: args.specialist.clone(),
-                                approval_session_id: Some(session_id.clone()),
-                                parent_authority: parent_authority.clone(),
-                                time_limit,
-                                model_tier: args.model_tier.map(Into::into),
-                            })
+                            aidaemon_runtime::run_state::within_run(
+                                &background_id,
+                                agent.run_child(ChildAgentRequest {
+                                    mission: mission.clone(),
+                                    task: task.clone(),
+                                    status_tx: status_tx.clone(),
+                                    channel_ctx,
+                                    user_role,
+                                    child_role,
+                                    goal_id: goal_id_ref.clone(),
+                                    task_id: task_id_ref.clone(),
+                                    project_scope: project_scope.clone(),
+                                    specialist: args.specialist.clone(),
+                                    approval_session_id: Some(session_id.clone()),
+                                    parent_authority: parent_authority.clone(),
+                                    time_limit,
+                                    model_tier: args.model_tier.map(Into::into),
+                                })
+                            )
                         )
                     ),);
                     let owner_cancelled = async {
@@ -1750,37 +1763,27 @@ impl SpawnAgentTool {
                     || matches!(&result, Err(error) if error
                         .downcast_ref::<crate::runtime_ports::ChildStoppedByOwner>()
                         .is_some());
-                let (notification_type, message) = match result {
+                // How it ended (typed), what it found to say about it, and
+                // what its receipts left unconfirmed.
+                let (phase, evidence, report) = match result {
                     _ if cancelled_by_owner => (
-                        "failed",
-                        format!(
-                            "\u{23f9}\u{fe0f} Cancelled in the background: {}\n\n\
-                         It may have done part of the work.",
-                            name
-                        ),
+                        RunPhase::Stopped,
+                        Default::default(),
+                        "You cancelled it. It may have done part of the work.".to_string(),
                     ),
                     Ok(run) => {
-                        let (kind, mut message) = format_background_completion(
-                            &name,
-                            &run.response,
-                            run.outcome,
-                            run.reported_done,
-                            max_response_chars,
-                        );
-                        message.push_str(&coordination_trailer(tree_for_bg.as_ref(), &run.session));
+                        let mut report = run.response.clone();
+                        report.push_str(&coordination_trailer(tree_for_bg.as_ref(), &run.session));
                         if let Some(note) = tree_for_bg
                             .as_ref()
                             .and_then(|family| family.coordination().shared_files_note())
                         {
-                            message.push_str(&note);
+                            report.push_str(&note);
                         }
-                        (kind, message)
+                        (run.phase, run.evidence, report)
                     }
                     Err(error) => match error.downcast_ref::<ChildTimedOut>() {
-                        None => (
-                            "failed",
-                            format!("\u{274c} Failed in the background: {}\n\n{}", name, error),
-                        ),
+                        None => (RunPhase::Failed, Default::default(), error.to_string()),
                         Some(timed_out) => {
                             // The child may have persisted a terminal outcome
                             // before it was stopped — deliver that instead of a
@@ -1803,33 +1806,20 @@ impl SpawnAgentTool {
                                 }
                             }
                             match salvaged {
-                                Some(outcome) if outcome.status == "completed" => (
-                                    "completed",
-                                    format!(
-                                        "\u{2705} Finished in the background: {}\n\n{}",
-                                        name, outcome.details
-                                    ),
-                                ),
-                                Some(outcome) if outcome.status == "blocked" => (
-                                    "blocked",
-                                    format!(
-                                        "\u{26a0}\u{fe0f} Stuck in the background: {}\n\n{}",
-                                        name, outcome.details
-                                    ),
-                                ),
                                 Some(outcome) => (
-                                    "failed",
-                                    format!(
-                                        "\u{274c} Failed in the background: {}\n\n{}",
-                                        name, outcome.details
-                                    ),
+                                    match outcome.status.as_str() {
+                                        "completed" => RunPhase::Succeeded,
+                                        "blocked" => RunPhase::Stopped,
+                                        _ => RunPhase::Failed,
+                                    },
+                                    Default::default(),
+                                    outcome.details,
                                 ),
                                 None => (
-                                    "failed",
+                                    RunPhase::Stopped,
+                                    Default::default(),
                                     format!(
-                                        "\u{23f1} Stopped in the background after it made no \
-                                         progress: {}\n\n{}",
-                                        name,
+                                        "It made no progress for its limit and was stopped.\n\n{}",
                                         timed_out.render()
                                     ),
                                 ),
@@ -1837,22 +1827,16 @@ impl SpawnAgentTool {
                         }
                     },
                 };
-                // How long it took, measured here: the owner and the parent
-                // read this, not times the child wrote.
-                let message = format!(
-                    "{message}\n\n{}",
-                    background_timing(&MeasuredRun::ended_now(started_utc, &waits))
-                );
-                delivery.deliver(notification_type, &message, trust).await;
-                settle_background_steps(
-                    plan_store.as_ref(),
-                    hub_for_parent_delivery.as_ref(),
-                    plan_session.as_deref(),
-                    &session_id,
+                runs.finish(
                     &background_id,
-                    notification_type == "completed",
-                )
-                .await;
+                    phase,
+                    measured_end(&waits),
+                    evidence,
+                    aidaemon_runtime::run_state::RunReport {
+                        text: report,
+                        untrusted: trust == SourceTrust::Untrusted,
+                    },
+                );
             })
             .catch_unwind()
             .await;
@@ -1862,39 +1846,18 @@ impl SpawnAgentTool {
                     %background_id,
                     "Background sub-agent panicked; reporting it as failed"
                 );
-                let message = format!(
-                    "\u{274c} Failed in the background: {}\n\nIt stopped unexpectedly.",
-                    name
-                );
-                // The note is the daemon's own text, so it is trusted.
-                let delivered = std::panic::AssertUnwindSafe(delivery.deliver(
-                    "failed",
-                    &message,
-                    SourceTrust::Trusted,
-                ))
-                .catch_unwind()
-                .await;
-                settle_background_steps(
-                    plan_store.as_ref(),
-                    hub_for_parent_delivery.as_ref(),
-                    plan_session.as_deref(),
-                    &session_id,
+                // The note is the daemon's own text, so it is trusted. A run
+                // that already ended keeps how it ended.
+                runs.finish(
                     &background_id,
-                    false,
-                )
-                .await;
-                if delivered.is_err() {
-                    enqueue_background_notification(
-                        state.as_ref(),
-                        &notify_goal_id,
-                        &session_id,
-                        "failed",
-                        &message,
-                        "spawn_agent background completion notifier",
-                        false,
-                    )
-                    .await;
-                }
+                    RunPhase::Failed,
+                    measured_end(&waits),
+                    Default::default(),
+                    aidaemon_runtime::run_state::RunReport {
+                        text: "It stopped unexpectedly.".to_string(),
+                        untrusted: false,
+                    },
+                );
             }
 
             if let Some(state) = state.as_ref() {
@@ -1915,6 +1878,92 @@ impl SpawnAgentTool {
     }
 }
 
+/// Where a background run's result goes when the run ends, and what it
+/// settles there.
+struct ResultRoute {
+    agent: Arc<dyn ChildAgentRuntime>,
+    runs: Arc<aidaemon_runtime::run_state::RunStates>,
+    hub: Option<Weak<dyn OutboundRouter>>,
+    state: Option<Arc<dyn StateStore>>,
+    plans: Option<Arc<crate::plans::PlanStore>>,
+    plan_session: Option<String>,
+    goal_id: String,
+    name: String,
+    max_response_chars: usize,
+}
+
+/// The subscriber on one run's terminal transition: when the run ends it
+/// pushes the result, rendered from the run record, to the chat (or the
+/// queue), then settles the plan steps the run was handed and redraws the
+/// card. It waits on nothing but the transition: no turn and no inbound
+/// message is involved.
+async fn deliver_when_run_ends(
+    mut ended: mpsc::UnboundedReceiver<aidaemon_runtime::run_state::RunEnded>,
+    route: ResultRoute,
+) {
+    let Some(ended) = ended.recv().await else {
+        return;
+    };
+    let state = ended.state;
+    let message = render_run_result(
+        &state,
+        &route.name,
+        &ended.report.text,
+        route.max_response_chars,
+    );
+    let trust = if ended.report.untrusted {
+        SourceTrust::Untrusted
+    } else {
+        SourceTrust::Trusted
+    };
+    let notification_type = run_notification_type(state.phase);
+    let delivery = BackgroundDelivery {
+        agent: route.agent.as_ref(),
+        hub: route.hub.as_ref(),
+        state: route.state.as_ref(),
+        session_id: &state.chat,
+        goal_id: &route.goal_id,
+    };
+    let delivered =
+        std::panic::AssertUnwindSafe(delivery.deliver(notification_type, &message, trust))
+            .catch_unwind()
+            .await;
+    if delivered.is_err() {
+        warn!(session_id = %state.chat, job_id = %state.id, "Delivering a helper's result panicked; queuing it");
+        enqueue_background_notification(
+            route.state.as_ref(),
+            &route.goal_id,
+            &state.chat,
+            notification_type,
+            &message,
+            "spawn_agent background completion notifier",
+            ended.report.untrusted,
+        )
+        .await;
+    }
+    settle_background_steps(
+        &route.runs,
+        route.plans.as_ref(),
+        route.hub.as_ref(),
+        route.plan_session.as_deref(),
+        &state.chat,
+        &state.id,
+        job_end(state.phase),
+    )
+    .await;
+    route.runs.forget(&state.id);
+}
+
+/// What the runtime measured of a background run as it ends: now, its
+/// first tool step and its wait for the owner.
+fn measured_end(clock: &crate::tools::OwnerWaitClock) -> aidaemon_runtime::run_state::RunMeasure {
+    aidaemon_runtime::run_state::RunMeasure {
+        ended_at: chrono::Utc::now(),
+        work_began: clock.steps().map(|(first, _)| first),
+        waited: clock.waited(),
+    }
+}
+
 /// The coordination log's entries about one child, for the end of its result.
 fn coordination_trailer(
     tree: Option<&crate::agent::authority::SpawnFamily>,
@@ -1928,25 +1977,27 @@ fn coordination_trailer(
 /// the card's new state, editing the card the turn left (or the session's
 /// background status message) in place, else sending it fresh.
 pub(crate) async fn settle_background_steps(
+    runs: &aidaemon_runtime::run_state::RunStates,
     plan_store: Option<&Arc<crate::plans::PlanStore>>,
     hub: Option<&Weak<dyn OutboundRouter>>,
     plan_session: Option<&str>,
     chat_session: &str,
     job_id: &str,
-    succeeded: bool,
+    end: crate::plans::JobEnd,
 ) {
-    let still_running = helper_ended(chat_session, job_id);
-    // After any step redraw of this helper still in flight, and before any
-    // that would start now (it sees the helper ended and draws nothing).
+    // Its run record already says it ended, so a step redraw that starts
+    // now draws nothing; this waits for any still in flight.
+    let still_running: Vec<String> = runs
+        .running(chat_session)
+        .into_iter()
+        .map(|run| run.label)
+        .collect();
     let writer = card_writer(chat_session);
     let _turn = writer.lock().await;
     let (Some(plans), Some(plan_session)) = (plan_store, plan_session) else {
         return;
     };
-    let plan = match plans
-        .settle_background_job(plan_session, job_id, succeeded)
-        .await
-    {
+    let plan = match plans.settle_background_job(plan_session, job_id, end).await {
         Ok(Some(plan)) => plan,
         Ok(None) => return,
         Err(error) => {
@@ -2323,44 +2374,82 @@ mod tests {
         assert_eq!(truncate_utf8("", 0), "");
     }
 
-    #[test]
-    fn partial_background_result_is_not_labeled_complete() {
-        let (notification_type, message) = format_background_completion(
-            "Build and verify the site",
-            "Blocked on workspace access.",
-            TaskOutcome::Partial,
-            false,
-            8_000,
-        );
-        assert_eq!(notification_type, "partial");
-        assert!(message.starts_with("\u{26a0}\u{fe0f} Didn't finish in the background"));
-        assert!(!message.contains("\u{2705} Finished in the background"));
-
-        // Its own typed verdict was done and only receipts are missing: it
-        // finished, and says what its tools did not confirm.
-        let (notification_type, message) = format_background_completion(
-            "Count to 30",
-            "Done. I counted from 1 to 30.",
-            TaskOutcome::Partial,
-            true,
-            8_000,
-        );
-        assert_eq!(notification_type, "completed");
-        assert!(message.starts_with("\u{2705} Finished in the background: Count to 30"));
-        assert!(message.ends_with("its tools didn't confirm every step it listed."));
+    /// A synthetic ended run record.
+    pub(super) fn ended_run(
+        phase: RunPhase,
+        unconfirmed: &[&str],
+        first_step: Option<i64>,
+        finished: i64,
+        waited: u64,
+    ) -> aidaemon_runtime::run_state::RunState {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-11-13T02:05:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        aidaemon_runtime::run_state::RunState {
+            id: "background_spawn:synthetic".to_string(),
+            chat: "telegram:synthetic-chat".to_string(),
+            label: "Slow count".to_string(),
+            phase,
+            started_at: start,
+            ended_at: Some(start + chrono::Duration::seconds(finished)),
+            work_began: first_step.map(|secs| start + chrono::Duration::seconds(secs)),
+            waited: Duration::from_secs(waited),
+            step: None,
+            evidence: aidaemon_runtime::run_state::RunEvidence {
+                unconfirmed: unconfirmed.iter().map(|s| s.to_string()).collect(),
+            },
+        }
     }
 
+    /// The result's header is the run's phase, its one evidence line names
+    /// only typed steps no tool confirmed, and its footer is the measured
+    /// time: what the helper wrote is only the body.
     #[test]
-    fn successful_background_result_keeps_completion_label() {
-        let (notification_type, message) = format_background_completion(
-            "Build and verify the site",
-            "Build passed.",
-            TaskOutcome::Succeeded,
-            false,
+    fn a_runs_result_renders_from_its_record() {
+        let stopped = render_run_result(
+            &ended_run(RunPhase::Stopped, &[], None, 60, 0),
+            "WordPress install",
+            "The site is running.",
             8_000,
         );
-        assert_eq!(notification_type, "completed");
-        assert!(message.starts_with("\u{2705} Finished in the background"));
+        assert!(
+            stopped.starts_with("\u{26a0}\u{fe0f} Didn't finish in the background: WordPress install\n\nThe site is running."),
+            "{stopped}"
+        );
+        assert!(!stopped.contains("Finished in the background"));
+
+        let succeeded = render_run_result(
+            &ended_run(RunPhase::Succeeded, &[], Some(2), 62, 0),
+            "Slow count",
+            "Done.",
+            8_000,
+        );
+        assert!(
+            succeeded.starts_with("\u{2705} Finished in the background: Slow count\n\nDone."),
+            "{succeeded}"
+        );
+        assert!(!succeeded.contains("confirm"), "{succeeded}");
+        assert!(succeeded.contains("Took 1m"), "{succeeded}");
+
+        let unconfirmed = render_run_result(
+            &ended_run(
+                RunPhase::Succeeded,
+                &["Capture the screenshot"],
+                None,
+                60,
+                0,
+            ),
+            "Site install",
+            "Done.",
+            8_000,
+        );
+        assert!(
+            unconfirmed.starts_with(
+                "\u{2705} Finished in the background: Site install\n\
+                 Its tools didn't confirm one step: Capture the screenshot.\n\nDone."
+            ),
+            "{unconfirmed}"
+        );
     }
 
     /// A helper's title, and each plan item, names the folder the work
@@ -2739,6 +2828,10 @@ mod child_runtime_tests {
         declarations: StdMutex<Vec<crate::agent::authority::ChildDeclaration>>,
         /// The authority each child was started with.
         authorities: StdMutex<Vec<Option<aidaemon_core::Authority>>>,
+        /// Its tree's helper run records.
+        runs: Arc<aidaemon_runtime::run_state::RunStates>,
+        /// How its runs end when they return.
+        phase: StdMutex<RunPhase>,
     }
 
     impl ScriptedChild {
@@ -2756,6 +2849,8 @@ mod child_runtime_tests {
                 declarations: StdMutex::new(Vec::new()),
                 salvage_lookups: StdMutex::new(Vec::new()),
                 authorities: StdMutex::new(Vec::new()),
+                runs: Default::default(),
+                phase: StdMutex::new(RunPhase::Succeeded),
             })
         }
     }
@@ -2815,8 +2910,12 @@ mod child_runtime_tests {
                 response: self.response.clone(),
                 outcome: TaskOutcome::Succeeded,
                 trust: SourceTrust::Trusted,
-                reported_done: false,
+                phase: *self.phase.lock().unwrap(),
+                evidence: Default::default(),
             })
+        }
+        fn helper_runs(&self) -> Arc<aidaemon_runtime::run_state::RunStates> {
+            self.runs.clone()
         }
         async fn background_cancel_token(
             &self,
@@ -3732,7 +3831,8 @@ mod child_runtime_tests {
         assert!(
             entry
                 .message
-                .contains("Cancelled in the background: Report"),
+                .contains("Didn't finish in the background: Report")
+                && entry.message.contains("You cancelled it"),
             "{}",
             entry.message
         );
@@ -3758,6 +3858,14 @@ mod child_runtime_tests {
             }),
             waited: Duration::from_secs(waited),
         };
+        let record = |first_step: Option<i64>, finished: i64, waited: u64| {
+            let mut state =
+                super::tests::ended_run(RunPhase::Succeeded, &[], None, finished, waited);
+            state.started_at = started;
+            state.ended_at = Some(started + chrono::Duration::seconds(finished));
+            state.work_began = first_step.map(|a| started + chrono::Duration::seconds(a));
+            state
+        };
         let seconds = |at: i64| {
             (started + chrono::Duration::seconds(at))
                 .with_timezone(&chrono::Local)
@@ -3765,7 +3873,7 @@ mod child_runtime_tests {
                 .to_string()
         };
 
-        let footer = background_timing(&run(Some(7), 78, 0));
+        let footer = background_timing(&record(Some(7), 78, 0)).unwrap();
         assert_eq!(
             footer,
             format!(
@@ -3789,7 +3897,7 @@ mod child_runtime_tests {
         assert!(!window.contains("in all"), "{window}");
 
         // No steps: from when it was started.
-        let footer = background_timing(&run(None, 78, 20));
+        let footer = background_timing(&record(None, 78, 20)).unwrap();
         assert!(
             footer.starts_with(&format!(
                 "{MEASURED_TIMING_MARK}Took 1m 18s ({} to ",
@@ -3803,7 +3911,7 @@ mod child_runtime_tests {
         );
 
         // Ten minutes or more: the owner's usual clock, no seconds.
-        let long = background_timing(&run(Some(0), 900, 0));
+        let long = background_timing(&record(Some(0), 900, 0)).unwrap();
         let owner_start = crate::cron_utils::owner_time(&started);
         assert!(
             long.contains(&format!("Took 15m ({owner_start} to ")),
@@ -3894,11 +4002,10 @@ mod child_runtime_tests {
 
     #[test]
     fn truncated_background_result_says_what_is_missing() {
-        let (_, message) = format_background_completion(
+        let message = render_run_result(
+            &super::tests::ended_run(RunPhase::Succeeded, &[], None, 5, 0),
             "Report",
             &"x".repeat(500),
-            TaskOutcome::Succeeded,
-            false,
             100,
         );
         assert!(message.contains("OUTPUT TRUNCATED"));
@@ -4073,11 +4180,13 @@ mod child_runtime_tests {
         hub.turn_running
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let router: Arc<dyn OutboundRouter> = hub.clone();
-        note_running_helper(chat, "job-steps", "Slow count to 30");
+        let runs = Arc::new(aidaemon_runtime::run_state::RunStates::default());
+        runs.begin("job-steps", chat, "Slow count to 30", None);
         let (parent_tx, mut parent_rx) = mpsc::channel(8);
         let helper = show_helper_steps_on_card(
             Some(parent_tx),
             HelperCard {
+                runs: runs.clone(),
                 hub: Some(Arc::downgrade(&router)),
                 plans: Some(plans.clone()),
                 plan_session: Some(chat.to_string()),
@@ -4124,7 +4233,11 @@ mod child_runtime_tests {
             card.contains("Started in the background: Slow count to 30\n🤖 running a command: 15"),
             "{card}"
         );
-        helper_ended(chat, "job-steps");
+        assert_eq!(
+            runs.get("job-steps").and_then(|run| run.step).as_deref(),
+            Some("running a command: 15"),
+            "/tasks reads the same step from the run record"
+        );
     }
 
     /// Launch a background child for checklist items 1 and 2 of a three-item
@@ -4474,11 +4587,13 @@ mod child_runtime_tests {
         hub.slow_ms.store(800, std::sync::atomic::Ordering::SeqCst);
         let router: Arc<dyn OutboundRouter> = hub.clone();
         let weak = Arc::downgrade(&router);
-        note_running_helper(chat, "job-race", "Slow count");
+        let runs = Arc::new(aidaemon_runtime::run_state::RunStates::default());
+        runs.begin("job-race", chat, "Slow count", None);
         let (parent_tx, _parent_rx) = mpsc::channel(64);
         let helper = show_helper_steps_on_card(
             Some(parent_tx),
             HelperCard {
+                runs: runs.clone(),
                 hub: Some(weak.clone()),
                 plans: Some(plans.clone()),
                 plan_session: Some(chat.to_string()),
@@ -4501,13 +4616,28 @@ mod child_runtime_tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         hub.slow_ms.store(0, std::sync::atomic::Ordering::SeqCst);
         let ended = std::time::Instant::now();
+        runs.finish(
+            "job-race",
+            RunPhase::Succeeded,
+            aidaemon_runtime::run_state::RunMeasure {
+                ended_at: chrono::Utc::now(),
+                work_began: None,
+                waited: Duration::ZERO,
+            },
+            Default::default(),
+            aidaemon_runtime::run_state::RunReport {
+                text: "Done.".into(),
+                untrusted: false,
+            },
+        );
         settle_background_steps(
+            &runs,
             Some(&plans),
             Some(&weak),
             Some(chat),
             chat,
             "job-race",
-            true,
+            crate::plans::JobEnd::Succeeded,
         )
         .await;
         assert!(ended.elapsed() < Duration::from_secs(2));
@@ -4578,5 +4708,253 @@ mod child_runtime_tests {
 
         let sent = hub.sent.lock().unwrap();
         assert!(sent.is_empty(), "no interim pings: {sent:?}");
+    }
+
+    /// What every surface shows for one background helper: the card while
+    /// it runs, its run record then, and the chat's finish line and the
+    /// final card once it ended.
+    struct Surfaces {
+        running_card: String,
+        running_record: RunPhase,
+        running_lines: Vec<(String, Option<String>)>,
+        message: String,
+        final_card: String,
+    }
+
+    async fn surfaces_for(child: &Arc<ScriptedChild>, cancel: bool) -> Surfaces {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(pool).await.unwrap());
+        let session = "telegram:synthetic-user-1";
+        plans
+            .upsert_checklist(
+                session,
+                Some("task-agree"),
+                "track_requirements",
+                &[
+                    (
+                        "Check the tools".into(),
+                        crate::plans::StepStatus::Completed,
+                    ),
+                    ("Install the site".into(), crate::plans::StepStatus::Pending),
+                ],
+            )
+            .await
+            .unwrap();
+        plans
+            .confirm_steps(
+                session,
+                "task-agree",
+                &std::collections::BTreeSet::from([0]),
+            )
+            .await
+            .unwrap();
+        let hub = Arc::new(CardHub::default());
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(child).with_state(state);
+        tool.set_hub(Arc::downgrade(&router));
+        tool.set_plan_store(plans.clone());
+        let args = json!({
+            "title": "Site install",
+            "task": "Install it",
+            "background": true,
+            "checklist_items": [1]
+        })
+        .to_string();
+        let mut call_facts = facts();
+        call_facts.task_id = Some("task-agree".to_string());
+        tool.call_with_execution_context(&args, None, call_facts)
+            .await
+            .unwrap();
+
+        let running_card =
+            plans.get_recent_for_session(session, 1).await.unwrap()[0].render_compact_checklist();
+        let records = child.runs.for_chat(session);
+        assert_eq!(records.len(), 1, "one record per helper run");
+        let running_record = records[0].phase;
+        let running_lines = running_helper_lines(&child.runs, session);
+        if cancel {
+            child.cancel.cancel();
+        }
+        let message = wait_for_notification(&store).await.message;
+        let final_card = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some((_, text)) = hub.edits.lock().unwrap().last().cloned() {
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the card is redrawn when the run ends");
+        Surfaces {
+            running_card,
+            running_record,
+            running_lines,
+            message,
+            final_card,
+        }
+    }
+
+    /// Running, succeeded, failed and stopped helpers: the card, the run
+    /// record, the helper line, the finish header, its measured footer and
+    /// the step's mark all say the same thing, from the one run record.
+    #[tokio::test]
+    async fn every_surface_agrees_on_how_a_helper_stands() {
+        let cases: [(&str, RunPhase, bool, &str); 4] = [
+            (
+                "succeeded",
+                RunPhase::Succeeded,
+                false,
+                "✅ Install the site",
+            ),
+            (
+                "stopped short",
+                RunPhase::Stopped,
+                false,
+                "⏭️ Install the site (not done: its helper stopped before it finished)",
+            ),
+            (
+                "failed",
+                RunPhase::Failed,
+                false,
+                "⚠️ Install the site (couldn't be done)",
+            ),
+            (
+                "cancelled",
+                RunPhase::Stopped,
+                true,
+                "⏭️ Install the site (not done: its helper stopped before it finished)",
+            ),
+        ];
+        for (case, phase, cancel, step_line) in cases {
+            let delay = if cancel {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_millis(300)
+            };
+            let child = ScriptedChild::new("The site is up.", delay);
+            match phase {
+                RunPhase::Failed => {
+                    *child.failure.lock().unwrap() = Some(anyhow::anyhow!("synthetic failure"))
+                }
+                other => *child.phase.lock().unwrap() = other,
+            }
+            let seen = surfaces_for(&child, cancel).await;
+
+            // While it runs.
+            assert_eq!(seen.running_record, RunPhase::Running, "{case}");
+            assert!(
+                seen.running_card
+                    .starts_with("⏳ Continuing in the background · 1 of 2 done"),
+                "{case}: {}",
+                seen.running_card
+            );
+            assert!(
+                seen.running_card
+                    .contains("⏳ Install the site (running in the background)"),
+                "{case}: {}",
+                seen.running_card
+            );
+            assert_eq!(
+                seen.running_lines,
+                vec![("Site install".to_string(), None)],
+                "{case}"
+            );
+
+            // Once it ended.
+            assert!(
+                seen.message
+                    .contains(&format!("{}: Site install", phase.headline())),
+                "{case}: {}",
+                seen.message
+            );
+            for other in [RunPhase::Succeeded, RunPhase::Failed, RunPhase::Stopped] {
+                if other != phase {
+                    assert!(
+                        !seen.message.contains(other.headline()),
+                        "{case}: {}",
+                        seen.message
+                    );
+                }
+            }
+            assert!(seen.message.contains("Took "), "{case}: {}", seen.message);
+            assert!(
+                !seen.message.contains("confirm"),
+                "{case}: {}",
+                seen.message
+            );
+            assert!(
+                seen.final_card.contains(step_line),
+                "{case}: {}",
+                seen.final_card
+            );
+            assert!(
+                !seen.final_card.contains("running in the background"),
+                "{case}: {}",
+                seen.final_card
+            );
+            if phase != RunPhase::Failed {
+                assert!(
+                    !seen.final_card.contains("couldn't be done"),
+                    "{case}: only a typed failure reads as couldn't be done: {}",
+                    seen.final_card
+                );
+            }
+            assert!(
+                child.runs.for_chat("telegram:synthetic-user-1").is_empty(),
+                "{case}: the ended run's record goes once its result is out"
+            );
+        }
+    }
+
+    /// A fresh install never starts in a folder that already holds
+    /// something: the call names the next free folder and no helper runs,
+    /// and a folder that doesn't exist yet starts.
+    #[tokio::test]
+    async fn new_work_never_starts_in_a_folder_that_already_exists() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("site-3")).unwrap();
+        std::fs::create_dir(root.path().join("site-4")).unwrap();
+        let child = ScriptedChild::new("set up", Duration::from_millis(10));
+        let tool = tool_for(&child);
+        let taken = root.path().join("site-3").display().to_string();
+        let args = json!({
+            "title": "Site install in site-3",
+            "task": "Install a fresh site",
+            "new_folders": [taken],
+        })
+        .to_string();
+        let error = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .expect_err("an existing folder is not a fresh one");
+        let free = root.path().join("site-5").display().to_string();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{taken} already exists"))
+                && error
+                    .to_string()
+                    .contains(&format!("next free name is {free}")),
+            "{error}"
+        );
+        assert!(child.tasks.lock().unwrap().is_empty(), "no helper ran");
+
+        let args = json!({
+            "title": "Site install in site-5",
+            "task": "Install a fresh site",
+            "new_folders": [free],
+        })
+        .to_string();
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .expect("a folder that doesn't exist yet is fine");
+        assert_eq!(child.tasks.lock().unwrap().len(), 1);
     }
 }

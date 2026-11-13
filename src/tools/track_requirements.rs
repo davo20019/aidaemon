@@ -966,8 +966,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.contains("Done ·"), "{out}");
-        // Ticked on the model's word only: said done, not done.
-        assert!(out.contains("0 of 3 done, 2 said done"), "{out}");
+        // Ticked on the model's word only: done, and the final card says no
+        // tool confirmed them.
+        assert!(
+            out.contains("2 of 3 done, 2 not confirmed by a tool"),
+            "{out}"
+        );
 
         let partial = json!({
             "items": [
@@ -983,7 +987,7 @@ mod tests {
             .unwrap();
         assert!(!out.contains("Done ·"), "{out}");
         assert!(
-            out.contains("Stopped short · 0 of 2 done, 2 said done"),
+            out.contains("Stopped short · 2 of 2 done, 2 not confirmed by a tool"),
             "{out}"
         );
 
@@ -993,7 +997,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out.contains("☑️ Finished · 0 of 2 confirmed, 2 said done"),
+            out.contains("☑️ Finished · 2 of 2 done, 2 not confirmed by a tool"),
             "{out}"
         );
     }
@@ -1038,7 +1042,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out.contains("Continuing in the background · 0 of 2 done, 1 said done"),
+            out.contains("Continuing in the background · 1 of 2 done\n"),
             "{out}"
         );
         assert!(
@@ -1073,7 +1077,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out.contains("☑️ Finished · 0 of 2 confirmed, 1 said done, 1 not needed"),
+            out.contains("☑️ Finished · 1 of 2 done, 1 not confirmed by a tool, 1 not needed"),
             "{out}"
         );
         assert!(
@@ -1100,7 +1104,7 @@ mod tests {
         facts.mutation_forbidden = true;
         let out = tool.call_with(&args, facts).await.unwrap();
         assert!(
-            out.contains("⏭️ Not done: read-only is on · 0 of 2 done, 1 said done"),
+            out.contains("⏭️ Not done: read-only is on · 1 of 2 done, 1 not confirmed by a tool"),
             "{out}"
         );
         assert!(

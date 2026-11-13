@@ -31,6 +31,9 @@
 //! - [`coordination`]: what one request's tree of sub-agents knows about each
 //!   other, and the hook that judges their file writes.
 //! - [`known_resources`]: the context that crosses a handoff.
+//! - [`run_state`]: one typed record per background helper run (running,
+//!   succeeded, failed or stopped; measured times; evidence) that every
+//!   surface showing a helper renders from, and whose end pushes its result.
 //! - [`spawn`]: the running sub-agents registry, a child's progress and
 //!   end as its parent sees them, and the plain child's prompt.
 //! - [`turn_runtime`]: one agent's turn settings and caches.
@@ -52,6 +55,7 @@ pub mod message_content;
 pub mod mid_run;
 pub mod policy;
 pub mod prompt;
+pub mod run_state;
 pub mod settings;
 pub mod spawn;
 pub mod turn;
