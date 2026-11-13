@@ -1873,7 +1873,9 @@ impl SpawnAgentTool {
             if let Some(ref task_id) = executor_task_id {
                 self.finish_executor_task(task_id).await;
             }
+            let checklist_items = args.checklist_items.clone();
             return result.map(|mut outcome| {
+                outcome.metadata.checklist_items = checklist_items;
                 outcome.output.push_str(&scope_overlap_note);
                 outcome
             });
@@ -2190,6 +2192,9 @@ impl SpawnAgentTool {
         });
 
         let mut outcome = started_as;
+        // The launch's typed link to the declared items it took on: the
+        // run's ledger judges each declared item by it.
+        outcome.metadata.checklist_items = args.checklist_items.clone();
         outcome.output.push_str(&scope_overlap_note);
         Ok(outcome)
     }

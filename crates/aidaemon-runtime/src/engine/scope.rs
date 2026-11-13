@@ -51,9 +51,13 @@ pub struct TurnScope<'a> {
     /// The verify-once and failure-recovery passes have been used.
     pub verification_demanded: AtomicBool,
     pub recovery_demanded: AtomicBool,
-    /// The run was sent back once because it declared work and attempted
-    /// none of it (`RunAggregate::declared_work_unattempted`).
+    /// The run was sent back once because declared work was never
+    /// attempted (`RunAggregate::unattempted_declared_work`).
     pub unattempted_work_demanded: AtomicBool,
+    /// Declared items the run ended without attempting, after its one pass
+    /// (index, the step in the model's own words): their typed reason, "not
+    /// attempted", reaches the card and the reply.
+    pub not_attempted: std::sync::Mutex<Vec<(usize, String)>>,
     /// Extra passes the ledger demanded so far.
     pub closeout_demands: std::sync::atomic::AtomicU32,
     /// The latest closeout let the run stop after a demand while the ledger

@@ -599,6 +599,41 @@ impl TaskPlan {
         changed
     }
 
+    /// The run's ledger says nothing ever took on the steps at `indices`
+    /// ([`NotDoneReason::NotAttempted`]): each settles as not done with that
+    /// reason, unless it is done or skipped. A step that only waited on the
+    /// turn's jobs without being handed to one waits no longer: no job is
+    /// doing it. Returns whether anything changed.
+    pub fn mark_not_attempted(&mut self, indices: &std::collections::BTreeSet<usize>) -> bool {
+        let now = Utc::now();
+        let mut changed = false;
+        for &index in indices {
+            let Some(step) = self.steps.get_mut(index) else {
+                continue;
+            };
+            if matches!(step.status, StepStatus::Completed | StepStatus::Skipped)
+                || (step.status == StepStatus::Background && !step.waits_on_jobs)
+            {
+                continue;
+            }
+            step.status = StepStatus::Deferred;
+            step.waits_on_jobs = false;
+            step.background_jobs.clear();
+            step.not_done = Some(NotDoneReason::NotAttempted);
+            step.completed_at = Some(now);
+            changed = true;
+        }
+        if changed {
+            if self.is_finished() {
+                self.status = self.resolved_status();
+            } else {
+                self.sync_active_step();
+            }
+            self.updated_at = now;
+        }
+        changed
+    }
+
     /// Record that the steps not done in this plan were held back because
     /// the turn could not make changes: a failed or deferred step becomes a
     /// deferred step with [`NotDoneReason::ChangesOff`], which the card shows
@@ -1091,6 +1126,9 @@ pub enum NotDoneReason {
     LeftOpen,
     /// A background job it waited on failed (its run record says so).
     WaitedOnFailed,
+    /// Nothing ever took it on: no call did it, no job was launched for it,
+    /// and the owner was not asked (the run's ledger says so).
+    NotAttempted,
 }
 
 impl NotDoneReason {
@@ -1100,6 +1138,7 @@ impl NotDoneReason {
             Self::HelperStopped => "its helper stopped before it finished",
             Self::LeftOpen => "nothing was left working on it",
             Self::WaitedOnFailed => "the work it waited on failed",
+            Self::NotAttempted => "not attempted",
         }
     }
 }
@@ -1519,6 +1558,32 @@ mod tests {
             card.contains("wait for the build (not done: the work it waited on failed)"),
             "{card}"
         );
+    }
+
+    /// Live 2026-11-13: one helper launched for the Drupal step; the
+    /// WordPress step was never taken on. The card says so with its typed
+    /// reason, and the running helper still settles its own step.
+    #[test]
+    fn a_step_nothing_took_on_reads_not_attempted() {
+        let mut plan = TaskPlan::new(
+            "synthetic-session",
+            "synthetic-task",
+            "description",
+            vec!["Install Drupal".into(), "Install WordPress".into()],
+            "track_requirements",
+        );
+        plan.link_background_job(&[0], "job-a");
+        assert!(plan.mark_not_attempted(&std::collections::BTreeSet::from([1])));
+        assert_eq!(plan.steps[1].not_done, Some(NotDoneReason::NotAttempted));
+        assert_eq!(plan.steps[0].status, StepStatus::Background);
+        let card = plan.render_compact_checklist();
+        assert!(
+            card.contains("Install WordPress (not done: not attempted)"),
+            "{card}"
+        );
+        assert!(plan.settle_background_job("job-a", JobEnd::Succeeded));
+        assert_eq!(plan.steps[0].status, StepStatus::Completed);
+        assert_eq!(plan.steps[1].not_done, Some(NotDoneReason::NotAttempted));
     }
 
     #[test]

@@ -1215,6 +1215,7 @@ impl TurnEngine<'_> {
             verification_demanded: AtomicBool::new(false),
             recovery_demanded: AtomicBool::new(false),
             unattempted_work_demanded: AtomicBool::new(false),
+            not_attempted: std::sync::Mutex::new(Vec::new()),
             executor_demanded_at: AtomicU64::new(u64::MAX),
             open_checklist_items: AtomicU64::new(0),
             checklist_declared: AtomicBool::new(false),
@@ -1442,6 +1443,38 @@ impl TurnEngine<'_> {
                     .clone();
                 if let Some(note) = recovery::not_done_note(&not_done) {
                     reply = format!("{note}\n\n{reply}");
+                }
+                // Declared items the run ended without attempting: their
+                // typed reason reaches the card and the reply, from the
+                // ledger's record, never from the model's text.
+                let not_attempted = scope
+                    .not_attempted
+                    .lock()
+                    .map(|items| items.clone())
+                    .unwrap_or_default();
+                if !not_attempted.is_empty() {
+                    if let Some(plan_store) = self.plan_store().await {
+                        let indices = not_attempted.iter().map(|(index, _)| *index).collect();
+                        match plan_store
+                            .mark_not_attempted(session_id, &task_id, &indices)
+                            .await
+                        {
+                            Ok(Some(plan)) if plan.steps.len() > 1 => {
+                                if let Some(tx) = scope.status_tx.as_ref() {
+                                    let _ = tx.try_send(StatusUpdate::Checklist(plan.card()));
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                warn!(task_id, %error, "SDK engine: could not mark steps not attempted")
+                            }
+                        }
+                    }
+                    let steps: Vec<String> =
+                        not_attempted.into_iter().map(|(_, step)| step).collect();
+                    if let Some(note) = crate::engine::stop::not_attempted_note(&steps) {
+                        reply = format!("{}\n\n{note}", reply.trim_end());
+                    }
                 }
                 let run_failure = scope.verdict.run_failure();
                 if status == TaskStatus::Completed {

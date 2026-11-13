@@ -169,6 +169,11 @@ pub struct RunOperation {
     pub result_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_lineage: Option<super::ToolOperationLineage>,
+    /// The declared checklist items this operation took on (a launch's
+    /// `checklist_items`, from its receipt): the typed link from work to
+    /// the item it serves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checklist_items: Vec<usize>,
 }
 
 impl RunOperation {
@@ -1170,41 +1175,127 @@ impl RunAggregate {
     }
 
     /// The executing model declared work (a checklist item that changes
-    /// something) and the run attempted none of it: no change was dispatched
-    /// or handed to a background job, none was refused by policy or declined
-    /// by the owner, no declared item is proven, and the model reported no
-    /// resource it ran out of. Read from receipts, never from the reply.
+    /// something) and the run attempted part of it or none of it: these are
+    /// the declared items, in order, that nothing took on. Judged per item,
+    /// from receipts only, never from the reply:
     ///
-    /// Nothing stood between such a run and the work, so an unfinished
-    /// verdict or a deferral is no reason for it to stop: the request is
-    /// carried out anew, or the owner is asked
-    /// ([`super::ExecutorClaimedOutcome::NeedsOwner`]). Live 2026-11-13: an
-    /// instruction to install two sites was answered with the state of the
-    /// sites a past run had installed, and the run ended there.
-    pub fn declared_work_unattempted(&self) -> bool {
-        let declared_work: Vec<&RunObligation> = self
-            .obligations
-            .iter()
-            .filter(|(id, obligation)| {
-                id.contains("/obligation:checklist:")
-                    && obligation.class == RunObligationClass::Achieve
-            })
-            .map(|(_, obligation)| obligation)
-            .collect();
-        if declared_work.is_empty()
-            || declared_work
-                .iter()
-                .any(|obligation| obligation.state == RunObligationState::Satisfied)
-            || self.executor_short_of.is_some()
-        {
-            return false;
+    /// - an item a receipt proved, or one a call named in its typed
+    ///   `checklist_items` (a launch handing it to a job, or a call refused
+    ///   by policy or declined by the owner), was attempted;
+    /// - every other call that changed something, was refused or declined,
+    ///   or left a job running without naming its items took on one item at
+    ///   most: the items that remain beyond those calls were never started.
+    ///
+    /// A resource the model reported running out of is a typed reason and
+    /// holds nothing. Nothing else stood between such an item and the work,
+    /// so a deferral, a handoff or an unfinished verdict is no reason to
+    /// leave it: it is carried out, or the owner is asked
+    /// ([`super::ExecutorClaimedOutcome::NeedsOwner`]). Live 2026-11-13: two
+    /// installs declared, one helper launched for the first, and the turn
+    /// handed off with the second never started and no reason given.
+    pub fn unattempted_declared_work(&self) -> Vec<String> {
+        if self.executor_short_of.is_some() {
+            return Vec::new();
         }
-        !self.operations.values().any(|operation| {
+        let attempted = |operation: &&RunOperation| {
             operation.mutating
                 || operation.policy_denied
                 || operation.owner_declined
                 || operation.is_background_in_flight()
-        })
+        };
+        let named: BTreeSet<usize> = self
+            .operations
+            .values()
+            .filter(|operation| {
+                operation.dispatched || operation.policy_denied || operation.owner_declined
+            })
+            .flat_map(|operation| operation.checklist_items.iter().copied())
+            .collect();
+        let unnamed_attempts = self
+            .operations
+            .values()
+            .filter(|operation| operation.checklist_items.is_empty())
+            .filter(attempted)
+            .count();
+        let mut open: Vec<(usize, String)> = self
+            .obligations
+            .iter()
+            .filter(|(_, obligation)| {
+                obligation.class == RunObligationClass::Achieve
+                    && obligation.state != RunObligationState::Satisfied
+            })
+            .filter_map(|(id, _)| {
+                let index: usize = id
+                    .rsplit_once("/obligation:checklist:")
+                    .and_then(|(_, index)| index.parse().ok())?;
+                (!named.contains(&index)).then(|| (index, id.clone()))
+            })
+            .collect();
+        open.sort_by_key(|(index, _)| *index);
+        open.into_iter()
+            .skip(unnamed_attempts)
+            .map(|(_, id)| id)
+            .collect()
+    }
+
+    /// Record a launch whose receipt is being written now: the job it left
+    /// running took on `checklist_items` (none named: one item at most).
+    /// Lets a handoff be judged with the launch it makes, before its
+    /// receipt reaches the ledger.
+    pub fn with_pending_launch(mut self, operation_id: &str, checklist_items: &[usize]) -> Self {
+        let operation = self
+            .operations
+            .entry(operation_id.to_string())
+            .or_insert_with(|| RunOperation {
+                operation_id: operation_id.to_string(),
+                tool_name: String::new(),
+                stable_operation_key: None,
+                obligation_ids: Vec::new(),
+                max_attempts: None,
+                max_invocations: None,
+                idempotency_key: None,
+                outcome: None,
+                dispatched: false,
+                policy_denied: false,
+                owner_declined: false,
+                mutating: false,
+                evidence_capabilities: Vec::new(),
+                targets: Vec::new(),
+                observations: Vec::new(),
+                collection_observations: Vec::new(),
+                mutation_effects: crate::traits::ToolMutationEffects::NONE,
+                observes: false,
+                result_revision: None,
+                receipt_sequence: None,
+                result_id: None,
+                operation_lineage: None,
+                checklist_items: Vec::new(),
+            });
+        operation.dispatched = true;
+        operation.outcome = Some(ToolOutcomeStatus::Backgrounded);
+        for item in checklist_items {
+            if !operation.checklist_items.contains(item) {
+                operation.checklist_items.push(*item);
+            }
+        }
+        self
+    }
+
+    /// The checklist indices of [`Self::unattempted_declared_work`].
+    pub fn unattempted_checklist_items(&self) -> BTreeSet<usize> {
+        self.unattempted_declared_work()
+            .iter()
+            .filter_map(|id| {
+                id.rsplit_once("/obligation:checklist:")
+                    .and_then(|(_, index)| index.parse().ok())
+            })
+            .collect()
+    }
+
+    /// Whether any declared work was never attempted
+    /// ([`Self::unattempted_declared_work`]).
+    pub fn declared_work_unattempted(&self) -> bool {
+        !self.unattempted_declared_work().is_empty()
     }
 
     pub fn open_executor_expectations(&self) -> usize {
@@ -1292,6 +1383,7 @@ impl RunAggregate {
                 receipt_sequence: None,
                 result_id: None,
                 operation_lineage: call.operation_lineage,
+                checklist_items: Vec::new(),
             },
         );
     }
@@ -1435,8 +1527,14 @@ impl RunAggregate {
                 receipt_sequence: None,
                 result_id: None,
                 operation_lineage: None,
+                checklist_items: Vec::new(),
             });
         operation.outcome = Some(receipt.outcome_status);
+        for item in &receipt.checklist_items {
+            if !operation.checklist_items.contains(item) {
+                operation.checklist_items.push(*item);
+            }
+        }
         operation.dispatched = operation.dispatched || receipt.invocation_stage.reached_dispatch();
         operation.policy_denied =
             operation.policy_denied || (!operation.dispatched && receipt.access_denial.is_some());
@@ -3018,6 +3116,7 @@ mod tests {
                     observations: Vec::new(),
                     collection_observations: Vec::new(),
                     mandate_authority: None,
+                    checklist_items: Vec::new(),
                 }),
             },
         )
@@ -6748,7 +6847,8 @@ mod tests {
         let aggregate = RunAggregate::replay("task-1", &events);
         assert!(aggregate.declared_work_unattempted());
 
-        // One attempted change, even a failed one, is an attempt.
+        // One attempted change, even a failed one, is an attempt, but at
+        // one item: the second install was still never started.
         events.push(call("install", "terminal"));
         events.push(result(
             "install",
@@ -6759,7 +6859,74 @@ mod tests {
         ));
         renumber(&mut events);
         let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(aggregate.unattempted_checklist_items(), BTreeSet::from([1]));
+
+        events.push(call("install-2", "terminal"));
+        events.push(result(
+            "install-2",
+            "terminal",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            workspace_write_semantics("/tmp/site-2"),
+        ));
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
         assert!(!aggregate.declared_work_unattempted());
+    }
+
+    /// Live 2026-11-13: Drupal and WordPress installs declared, one helper
+    /// launched naming the Drupal item, and the turn handed off. The
+    /// WordPress item is judged on its own: nothing took it on.
+    #[test]
+    fn a_launch_covers_only_the_items_it_names() {
+        let install = |index, status: &str| {
+            checklist_item(
+                index,
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                false,
+                &[],
+                status,
+            )
+        };
+        let mut launch = result(
+            "spawn",
+            "spawn_agent",
+            ToolOutcomeStatus::Backgrounded,
+            0,
+            ToolCallSemantics::default(),
+        );
+        launch.data["receipt"]["checklist_items"] = serde_json::json!([0]);
+        let mut events = vec![
+            declared_with_outcome(vec![install(0, "background"), install(1, "pending")], None),
+            call("spawn", "spawn_agent"),
+            launch,
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.unattempted_declared_work(),
+            vec!["task:task-1/obligation:checklist:1".to_string()]
+        );
+
+        // A deferral is no typed reason; running out of a resource is.
+        events.push(declared_with_outcome(
+            vec![install(0, "background"), install(1, "deferred")],
+            Some(crate::ExecutorClaimedOutcome::Partial),
+        ));
+        renumber(&mut events);
+        assert!(RunAggregate::replay("task-1", &events).declared_work_unattempted());
+        events.push(event(
+            EventType::ExecutorExpectationsDeclared,
+            ExecutorExpectationsDeclaredData {
+                schema_version: ExecutorExpectationsDeclaredData::SCHEMA_VERSION,
+                task_id: "task-1".to_string(),
+                items: vec![install(0, "background"), install(1, "deferred")],
+                outcome: Some(crate::ExecutorClaimedOutcome::Partial),
+                short_of: Some(crate::ShortResource::DiskSpace),
+            },
+        ));
+        renumber(&mut events);
+        assert!(!RunAggregate::replay("task-1", &events).declared_work_unattempted());
     }
 
     /// A request that only observes (a status question) declares no work,

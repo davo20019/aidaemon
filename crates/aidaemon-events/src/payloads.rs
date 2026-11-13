@@ -418,6 +418,10 @@ pub struct ToolReceiptV1 {
     /// not a reusable capability; replay still revalidates current policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mandate_authority: Option<crate::traits::MandateAuthorityGrant>,
+    /// The declared checklist items this call took on (a launch's
+    /// `checklist_items`), copied from its metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checklist_items: Vec<usize>,
 }
 
 impl ToolReceiptV1 {
@@ -469,6 +473,7 @@ impl ToolReceiptV1 {
                 Vec::new()
             },
             mandate_authority: None,
+            checklist_items: metadata.checklist_items.clone(),
         }
     }
 
@@ -500,6 +505,7 @@ impl ToolReceiptV1 {
             semantics: self.semantics.clone(),
             observations: self.observations.clone(),
             collection_observations: self.collection_observations.clone(),
+            checklist_items: self.checklist_items.clone(),
             ..ToolCallMetadata::default()
         }
     }

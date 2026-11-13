@@ -387,6 +387,20 @@ impl PlanStore {
         .await
     }
 
+    /// Settle the steps at `indices` of the session's checklist for
+    /// `task_id` as not attempted ([`TaskPlan::mark_not_attempted`]).
+    pub async fn mark_not_attempted(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        indices: &std::collections::BTreeSet<usize>,
+    ) -> anyhow::Result<Option<TaskPlan>> {
+        self.change_latest(session_id, Some(task_id), |plan| {
+            plan.mark_not_attempted(indices)
+        })
+        .await
+    }
+
     /// The session's checklist for `task_id` waits on background jobs
     /// `job_ids` ([`TaskPlan::wait_on_background_jobs`]). Returns the updated
     /// plan, or `None` when there is no such checklist or nothing changed.

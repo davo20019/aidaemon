@@ -62,9 +62,10 @@ pub enum SystemDirective {
     LedgerExpectationsRequired {
         expectations: Vec<String>,
     },
-    /// The run declared work and attempted none of it, and was about to
-    /// stop on an unfinished verdict or a deferral
-    /// (`RunAggregate::declared_work_unattempted`, judged from receipts).
+    /// The run declared work that nothing took on, and was about to stop or
+    /// hand its turn to a background job
+    /// (`RunAggregate::unattempted_declared_work`, judged per item from
+    /// receipts).
     /// One pass: do the work, or ask the owner the one question it waits on.
     DeclaredWorkUnattempted {
         items: Vec<String>,
@@ -265,8 +266,10 @@ impl SystemDirective {
             Self::FinalAnswerRejectedInternalMarkers => "[SYSTEM] Your previous answer was rejected: it consisted of internal tool-envelope markers instead of an answer. Do NOT quote tool output wrappers, [SYSTEM] lines, or bracketed markers. In plain language, state your final answer to the user's request now — what you found or did, and any honest limitation (e.g. the requested item was not found).".to_string(),
             Self::FinalAnswerWasFilePaste => "[SYSTEM] Your previous answer pasted raw tool output (file contents, a line-numbered page, a list of file paths, or a JSON dump) instead of answering. Do NOT paste raw tool output. Using ONLY the items relevant to the user's request, answer in plain language now — name the specific matches by filename (or say clearly that none matched). If the user asked for a file, deliver it with send_file rather than listing paths. If the data is too large to scan, say which filter you would need.".to_string(),
             Self::DeclaredWorkUnattempted { items } => format!(
-                "[SYSTEM] Internal check, not shown to the user: the owner asked for work and none of it has been attempted: {}. \
+                "[SYSTEM] Internal check, not shown to the user: the owner asked for work that nothing has taken on yet: {}. \
+                 Each thing the owner asked for is done in its own right: work started on another part, or a job left running for it, does not do this one. \
                  An instruction to do something is carried out now, anew, unless the owner said otherwise. \
+                 Do it yourself, or launch a job for it that names it in its checklist_items, before this turn ends. \
                  What memory, history or existing files show was done before is context for the work, never its result, \
                  so reporting the state of earlier work does not answer the instruction. \
                  Do the work now with the available tools; when earlier results exist, work alongside them under fresh names and say so up front. \

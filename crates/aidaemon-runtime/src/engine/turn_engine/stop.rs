@@ -4,6 +4,46 @@
 use super::*;
 pub use crate::engine::stop::*;
 
+/// Record the declared items the run ends without attempting, with their
+/// typed reason, for the card and the reply; returns the run's unmet lines.
+pub fn record_not_attempted(
+    scope: &TurnScope<'_>,
+    aggregate: &aidaemon_events::run_aggregate::RunAggregate,
+) -> Vec<String> {
+    let items: Vec<(usize, String)> = aggregate
+        .unattempted_declared_work()
+        .iter()
+        .filter_map(|id| {
+            let index = id
+                .rsplit_once("/obligation:checklist:")
+                .and_then(|(_, index)| index.parse().ok())?;
+            let obligation = aggregate.obligations.get(id)?;
+            let step = obligation
+                .step
+                .clone()
+                .or_else(|| obligation.summary.clone())
+                .unwrap_or_default();
+            Some((index, step))
+        })
+        .collect();
+    let unmet = if items.is_empty() {
+        vec![UNATTEMPTED_WORK_UNMET.to_string()]
+    } else {
+        items
+            .iter()
+            .map(|(_, step)| format!("{UNATTEMPTED_WORK_UNMET}: {step}"))
+            .collect()
+    };
+    if let Ok(mut recorded) = scope.not_attempted.lock() {
+        for item in items {
+            if !recorded.iter().any(|(index, _)| *index == item.0) {
+                recorded.push(item);
+            }
+        }
+    }
+    unmet
+}
+
 /// The tools the closeout may count as reachable: the registered daemon
 /// tools, minus daemon memory tools the active memory plugin does not own,
 /// and the MCP tools bridged for the turn.
@@ -46,7 +86,26 @@ impl TurnEngine<'_> {
             return;
         }
         let mut decision = self.sdk_mandate_commit_check(scope).await;
-        if decision == sdk::StopDecision::Accept && self.sdk_background_handoff(scope).await {
+        // A stop that would hand the turn to a running job first answers for
+        // every declared item: one nothing took on is launched or asked
+        // about now, since the job's result answers only for its own items.
+        if decision == sdk::StopDecision::Accept
+            && scope.open_background_jobs.load(Ordering::Relaxed) > 0
+        {
+            match self.sdk_judge_unattempted_work(scope, None).await {
+                Some(held @ sdk::StopDecision::Continue { .. }) => {
+                    let _ = check.reply.send(held);
+                    return;
+                }
+                Some(unmet) => decision = unmet,
+                None => {}
+            }
+        }
+        if matches!(
+            decision,
+            sdk::StopDecision::Accept | sdk::StopDecision::AcceptUnmet { .. }
+        ) && self.sdk_background_handoff(scope).await
+        {
             let _ = check.reply.send(decision);
             return;
         }
@@ -450,22 +509,13 @@ impl TurnEngine<'_> {
             .unattempted_work_demanded
             .store(true, Ordering::Relaxed);
         scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
-        let declared: Vec<String> = aggregate
-            .obligations
-            .iter()
-            .filter(|(id, obligation)| {
-                id.contains("/obligation:checklist:")
-                    && obligation.class
-                        == aidaemon_events::run_aggregate::RunObligationClass::Achieve
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        let declared = aggregate.unattempted_declared_work();
         self.emit_decision_point(
             scope.emitter,
             scope.task_id,
             iteration,
             aidaemon_events::payloads::DecisionType::PostExecutionValidation,
-            "Declared work was never attempted: one pass to do it or ask the owner".to_string(),
+            "Declared work nothing took on: one pass to do it or ask the owner".to_string(),
             serde_json::json!({
                 "condition": "declared_work_unattempted",
                 "claimed_outcome": aggregate.executor_claimed_outcome.map(|claim| claim.as_str()),
@@ -479,6 +529,48 @@ impl TurnEngine<'_> {
                 items: aggregate.expectation_summaries(&declared),
             }
             .render(),
+        }
+    }
+
+    /// Judge declared work nothing took on when the turn is about to hand
+    /// off to a background job (`launch`: the launch making the handoff now,
+    /// its receipt not yet in the ledger, and the items it names). `None`:
+    /// nothing to hold. `Continue`: the one pass to launch it or ask.
+    /// `AcceptUnmet`: the pass was spent, and the items end "not attempted".
+    pub async fn sdk_judge_unattempted_work(
+        &self,
+        scope: &TurnScope<'_>,
+        launch: Option<(&str, &[usize])>,
+    ) -> Option<sdk::StopDecision> {
+        let aggregate = self
+            .events()
+            .task_run_aggregate(scope.session_id, scope.task_id)
+            .await
+            .ok()?;
+        let aggregate = match launch {
+            Some((call_id, items)) => aggregate.with_pending_launch(call_id, items),
+            None => aggregate,
+        };
+        let changes_permitted =
+            !scope.contract.forbids_mutation && !scope.contract.forbids_tool_use;
+        match unattempted_work_verdict(
+            aggregate.declared_work_unattempted(),
+            aggregate.executor_claimed_outcome,
+            true,
+            changes_permitted,
+            scope.unattempted_work_demanded.load(Ordering::Relaxed),
+        ) {
+            UnattemptedWorkVerdict::NotApplicable => None,
+            UnattemptedWorkVerdict::Demand => {
+                let iteration = scope.model_calls.load(Ordering::Relaxed) as usize;
+                Some(
+                    self.sdk_demand_unattempted_work(scope, &aggregate, iteration)
+                        .await,
+                )
+            }
+            UnattemptedWorkVerdict::StopUnmet => Some(sdk::StopDecision::AcceptUnmet {
+                unmet: record_not_attempted(scope, &aggregate),
+            }),
         }
     }
 
@@ -541,7 +633,7 @@ impl TurnEngine<'_> {
             .await;
             let mut unmet = vec![claim.unmet_line()];
             if unattempted == UnattemptedWorkVerdict::StopUnmet {
-                unmet.push(UNATTEMPTED_WORK_UNMET.to_string());
+                unmet.extend(record_not_attempted(scope, &aggregate));
             }
             return sdk::StopDecision::AcceptUnmet { unmet };
         }
@@ -610,7 +702,7 @@ impl TurnEngine<'_> {
             UnattemptedWorkVerdict::StopUnmet => {
                 scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
                 return sdk::StopDecision::AcceptUnmet {
-                    unmet: vec![UNATTEMPTED_WORK_UNMET.to_string()],
+                    unmet: record_not_attempted(scope, &aggregate),
                 };
             }
             UnattemptedWorkVerdict::NotApplicable => {}

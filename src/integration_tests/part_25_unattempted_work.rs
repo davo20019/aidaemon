@@ -178,7 +178,12 @@ async fn unattempted_work_after_the_pass_stops_with_a_typed_reason() {
     let harness = unattempted_work_harness(provider).await;
     let reply = ask_owner_turn(&harness, session, "Install Drupal and WordPress with ddev.").await;
 
-    assert_eq!(reply, "The sites from earlier are still there.");
+    assert_eq!(
+        reply,
+        "The sites from earlier are still there.\n\nI didn't start these parts: \
+         Install Drupal in ~/projects/synthetic-drupal; Install WordPress in \
+         ~/projects/synthetic-wp; Send a screenshot of each homepage."
+    );
     assert_eq!(harness.provider.call_count().await, 4);
     let end = unattempted_work_task_end(&harness, session).await;
     assert_eq!(
@@ -206,5 +211,121 @@ async fn a_status_question_is_still_answered_directly() {
     assert_eq!(
         end.effective_outcome(),
         crate::events::TaskOutcome::Succeeded
+    );
+}
+
+// Live 2026-11-13: Drupal and WordPress were declared as two installs, one
+// helper was launched naming the Drupal item, and the launch handed the turn
+// off: WordPress was never started and nothing said why. Each declared item
+// is judged on its own; one nothing took on is launched or asked about
+// before a handoff ends the turn.
+
+/// A notifying launch that hands the turn to the background and names the
+/// declared items its job takes on.
+fn item_launcher(name: &str, line: &str, items: Vec<usize>) -> crate::testing::MockTool {
+    crate::testing::MockTool::new(name, "Starts a synthetic install in the background", line)
+        .with_metadata(crate::traits::ToolCallMetadata {
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::Backgrounded),
+            background_started: true,
+            background_handoff: true,
+            completion_notifications_enabled: true,
+            checklist_items: items,
+            ..crate::traits::ToolCallMetadata::default()
+        })
+        .with_finish(
+            crate::traits::ToolCallOutcome::from_output(String::new())
+                .handed_to_background()
+                .finish
+                .unwrap(),
+        )
+}
+
+async fn launch_harness(provider: MockProvider) -> crate::testing::TestHarness {
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+        Arc::new(item_launcher(
+            "launch_drupal",
+            "Started in the background: the Drupal install.",
+            vec![0],
+        )),
+        Arc::new(item_launcher(
+            "launch_wordpress",
+            "Started in the background: the WordPress install.",
+            vec![1],
+        )),
+    ];
+    setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, tools, None)
+        .await
+        .unwrap()
+}
+
+fn two_installs(first: &str, second: &str) -> serde_json::Value {
+    json!({"items": [
+        {"text": "Install Drupal in ~/projects/synthetic-drupal", "status": first, "mutation_effects": ["local_workspace_write"]},
+        {"text": "Install WordPress in ~/projects/synthetic-wp", "status": second, "mutation_effects": ["local_workspace_write"]}
+    ]})
+}
+
+async fn held_for_unattempted_work(harness: &crate::testing::TestHarness, session: &str) -> bool {
+    harness
+        .agent
+        .event_store()
+        .query_events_by_types(session, &[crate::events::EventType::DecisionPoint], 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| event.parse_data::<crate::events::DecisionPointData>().ok())
+        .any(|point| point.metadata["condition"] == "declared_work_unattempted")
+}
+
+/// One of two declared installs launched: the handoff is held once, the
+/// second install is launched, and only then does the turn hand off.
+#[tokio::test]
+async fn a_handoff_is_held_until_every_declared_item_is_taken_on() {
+    let session = "unattempted-item-launched";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &two_installs("background", "pending").to_string(),
+        ),
+        MockProvider::tool_call_response("launch_drupal", "{}"),
+        MockProvider::tool_call_response("launch_wordpress", "{}"),
+        MockProvider::text_response("UNREACHED"),
+    ]);
+    let harness = launch_harness(provider).await;
+    let reply = ask_owner_turn(&harness, session, "Install Drupal and WordPress in parallel.").await;
+
+    assert_eq!(harness.provider.call_count().await, 3);
+    assert!(held_for_unattempted_work(&harness, session).await);
+    assert!(!reply.contains("didn't start"), "{reply}");
+}
+
+/// After the one pass the second install is still not taken on: the turn
+/// hands off, and that item ends with its typed reason, "not attempted",
+/// named in the reply.
+#[tokio::test]
+async fn an_item_still_untaken_after_the_pass_ends_not_attempted() {
+    let session = "unattempted-item-left";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &two_installs("background", "pending").to_string(),
+        ),
+        MockProvider::tool_call_response("launch_drupal", "{}"),
+        MockProvider::text_response("The Drupal install is underway."),
+        MockProvider::text_response("UNREACHED"),
+    ]);
+    let harness = launch_harness(provider).await;
+    let reply = ask_owner_turn(&harness, session, "Install Drupal and WordPress in parallel.").await;
+
+    assert_eq!(harness.provider.call_count().await, 3);
+    assert!(held_for_unattempted_work(&harness, session).await);
+    assert!(
+        reply.ends_with("I didn't start this part: Install WordPress in ~/projects/synthetic-wp."),
+        "{reply}"
+    );
+    let end = unattempted_work_task_end(&harness, session).await;
+    assert_eq!(
+        end.effective_outcome(),
+        crate::events::TaskOutcome::Partial
     );
 }

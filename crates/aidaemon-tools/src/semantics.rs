@@ -1453,6 +1453,11 @@ pub struct ToolCallMetadata {
     /// launch line names its runs from these, never from the call's text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_run_label: Option<String>,
+    /// The declared checklist items (their indices) this call took on: a
+    /// launch hands them to the job it starts (`checklist_items`). Typed
+    /// attribution of work to declared items, never read from text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checklist_items: Vec<usize>,
     /// Completion semantics for this specific tool call.
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,

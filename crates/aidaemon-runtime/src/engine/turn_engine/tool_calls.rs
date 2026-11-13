@@ -860,12 +860,36 @@ impl TurnEngine<'_> {
                     // 2026-11-11). Only a job without notifications keeps the
                     // run going for the remaining work.
                     let reports_back = outcome.metadata.completion_notifications_enabled;
-                    let hands_off = finish.is_some()
+                    let mut hands_off = finish.is_some()
                         && !typed_failure
                         && (!work_remains || reports_back)
                         && !outcome.metadata.detached;
+                    // The job answers only for the declared items it took
+                    // on. One nothing took on is launched or asked about
+                    // before the handoff ends the turn (live 2026-11-13:
+                    // two installs declared, one helper launched, and the
+                    // second was never started).
+                    let mut held: Option<String> = None;
+                    // Past the one pass, the items end "not attempted" (the
+                    // judgement records them) and the handoff goes ahead.
+                    if hands_off {
+                        let judged = self
+                            .sdk_judge_unattempted_work(
+                                scope,
+                                Some((&request.call_id, &outcome.metadata.checklist_items)),
+                            )
+                            .await;
+                        if let Some(sdk::StopDecision::Continue { message }) = judged {
+                            hands_off = false;
+                            held = Some(message);
+                        }
+                    }
                     handed_off = hands_off;
-                    let directive = if hands_off {
+                    let directive = if let Some(message) = held {
+                        finish = None;
+                        output = format!("{output}\n\n{message}");
+                        None
+                    } else if hands_off {
                         // The reply is the call's own first line, which names
                         // the run ("Started in the background: …"); the run
                         // itself is on the turn's card.
@@ -884,14 +908,20 @@ impl TurnEngine<'_> {
                         if let Some(finish) = finish.as_mut() {
                             finish.reply = Some(reply);
                         }
-                        crate::turn::system_directives::SystemDirective::BackgroundHandoff {
-                            notifications_active: outcome.metadata.completion_notifications_enabled,
-                        }
+                        Some(
+                            crate::turn::system_directives::SystemDirective::BackgroundHandoff {
+                                notifications_active: outcome
+                                    .metadata
+                                    .completion_notifications_enabled,
+                            },
+                        )
                     } else {
                         finish = None;
-                        crate::turn::system_directives::SystemDirective::BackgroundProcessContinue
+                        Some(crate::turn::system_directives::SystemDirective::BackgroundProcessContinue)
                     };
-                    output = format!("{output}\n\n{}", directive.render());
+                    if let Some(directive) = directive {
+                        output = format!("{output}\n\n{}", directive.render());
+                    }
                 }
                 let satisfied = !status.is_failure();
                 // The tool's own typed finish ends the run once the batch

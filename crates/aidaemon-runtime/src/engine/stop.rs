@@ -123,12 +123,26 @@ pub fn closeout_ended_unmet(facts: &StopFacts, demands_made: u32) -> bool {
     demands_made > 0 && !facts.reachable_obligation_ids.is_empty()
 }
 
-/// The unmet requirement a run records when it stops having declared work
-/// and attempted none of it.
-pub const UNATTEMPTED_WORK_UNMET: &str = "none of the requested work was attempted";
+/// The typed reason a declared item ends with when nothing took it on.
+pub const UNATTEMPTED_WORK_UNMET: &str = "not attempted";
 
-/// What the closeout does with a run about to stop that declared work and
-/// attempted none of it ([`aidaemon_events::run_aggregate::RunAggregate::declared_work_unattempted`]).
+/// The reply's line for declared steps the run ended without attempting,
+/// in the steps' own words.
+pub fn not_attempted_note(steps: &[String]) -> Option<String> {
+    let steps: Vec<&str> = steps
+        .iter()
+        .map(|step| step.trim().trim_end_matches('.'))
+        .filter(|step| !step.is_empty())
+        .collect();
+    match steps.as_slice() {
+        [] => None,
+        [one] => Some(format!("I didn't start this part: {one}.")),
+        many => Some(format!("I didn't start these parts: {}.", many.join("; "))),
+    }
+}
+
+/// What the closeout does with a run about to stop, or hand off, with
+/// declared work nothing took on ([`aidaemon_events::run_aggregate::RunAggregate::declared_work_unattempted`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnattemptedWorkVerdict {
     /// Nothing to hold: work was attempted, none was declared, the request
@@ -136,8 +150,8 @@ pub enum UnattemptedWorkVerdict {
     NotApplicable,
     /// Send the run back once: do the work, or ask the owner.
     Demand,
-    /// The pass was spent and still nothing was attempted: the run stops
-    /// unmet, with [`UNATTEMPTED_WORK_UNMET`] as its typed reason.
+    /// The pass was spent and the work still was not attempted: the run
+    /// stops unmet, with [`UNATTEMPTED_WORK_UNMET`] as each item's reason.
     StopUnmet,
 }
 

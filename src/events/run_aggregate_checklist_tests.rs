@@ -303,6 +303,7 @@ fn result(
                 observations: Vec::new(),
                 collection_observations: Vec::new(),
                 mandate_authority: None,
+                checklist_items: Vec::new(),
             }),
         },
     )
