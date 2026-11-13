@@ -126,6 +126,14 @@ pub enum RunFailure {
     /// It changed something but ended with these steps of its own that
     /// needed a change left undone.
     Unfinished { undone: Vec<String> },
+    /// The owner declined a step it asked to take (an approval card
+    /// answered no): it went on without it and ended short of its work.
+    /// `steps` are its own checklist steps the declined calls served, in
+    /// its words; empty when none was linked. Not a failure: the owner's
+    /// answer (live 2026-11-13: the owner declined a WordPress helper's
+    /// password rotation, its screenshot still reached them, and its card
+    /// read "its helper stopped before it finished").
+    Declined { steps: Vec<String> },
     /// The owner cancelled it.
     Cancelled,
     /// It made no progress for its limit and was stopped.
@@ -227,6 +235,19 @@ impl RunFailure {
                     "these steps are"
                 },
                 undone.join("; ")
+            ),
+            Self::Declined { steps } if steps.is_empty() => {
+                "You declined one of its steps, so it went on without it.".to_string()
+            }
+            Self::Declined { steps } => format!(
+                "You declined {}, so it went on without {}: {}.",
+                if steps.len() == 1 {
+                    "one of its steps"
+                } else {
+                    "some of its steps"
+                },
+                if steps.len() == 1 { "it" } else { "them" },
+                steps.join("; ")
             ),
             Self::Cancelled => "You cancelled it before it finished.".to_string(),
             Self::NoProgress => {

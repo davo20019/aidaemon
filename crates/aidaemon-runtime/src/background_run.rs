@@ -324,7 +324,7 @@ impl BackgroundRun {
             Some(&self.chat),
             &self.chat,
             &self.id,
-            job_end(phase),
+            job_end(phase, None),
         )
         .await;
         (Some(ended), on_card)

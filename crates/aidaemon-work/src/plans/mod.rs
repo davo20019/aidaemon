@@ -519,6 +519,7 @@ impl TaskPlan {
                     JobEnd::Succeeded if step.background_jobs.is_empty() => None,
                     JobEnd::Succeeded => continue,
                     JobEnd::Stopped => Some(NotDoneReason::HelperStopped),
+                    JobEnd::Declined => Some(NotDoneReason::OwnerDeclined),
                     JobEnd::Failed => Some(NotDoneReason::WaitedOnFailed),
                 };
                 step.waits_on_jobs = false;
@@ -544,10 +545,14 @@ impl TaskPlan {
                     step.completed_at = Some(now);
                 }
                 JobEnd::Succeeded => {}
-                JobEnd::Stopped => {
+                JobEnd::Stopped | JobEnd::Declined => {
                     step.background_jobs.clear();
                     step.status = StepStatus::Deferred;
-                    step.not_done = Some(NotDoneReason::HelperStopped);
+                    step.not_done = Some(if end == JobEnd::Declined {
+                        NotDoneReason::OwnerDeclined
+                    } else {
+                        NotDoneReason::HelperStopped
+                    });
                     step.completed_at = Some(now);
                 }
                 JobEnd::Failed => {
@@ -1143,6 +1148,10 @@ pub enum NotDoneReason {
     LeftOpen,
     /// A background job it waited on failed (its run record says so).
     WaitedOnFailed,
+    /// The owner declined a step the helper it was handed asked to take,
+    /// and it ended without finishing (its run record says so): the
+    /// owner's answer, never a failure.
+    OwnerDeclined,
     /// Nothing ever took it on: no call did it, no job was launched for it,
     /// and the owner was not asked (the run's ledger says so).
     NotAttempted,
@@ -1155,6 +1164,7 @@ impl NotDoneReason {
             Self::HelperStopped => "its helper stopped before it finished",
             Self::LeftOpen => "nothing was left working on it",
             Self::WaitedOnFailed => "the work it waited on failed",
+            Self::OwnerDeclined => "you declined a step its helper asked to take",
             Self::NotAttempted => "not attempted",
         }
     }
@@ -1166,6 +1176,8 @@ impl NotDoneReason {
 pub enum JobEnd {
     Succeeded,
     Stopped,
+    /// It stopped short because the owner declined one of its steps.
+    Declined,
     Failed,
 }
 

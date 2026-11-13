@@ -332,10 +332,19 @@ pub fn run_notification_type(phase: RunPhase) -> &'static str {
     }
 }
 
-/// The plan steps a run's phase settles.
-pub fn job_end(phase: RunPhase) -> aidaemon_work::plans::JobEnd {
+/// The plan steps a run's end settles: its phase, and for a run that
+/// stopped because the owner declined one of its steps, that reason.
+pub fn job_end(
+    phase: RunPhase,
+    failure: Option<&crate::run_state::RunFailure>,
+) -> aidaemon_work::plans::JobEnd {
     match phase {
         RunPhase::Succeeded => aidaemon_work::plans::JobEnd::Succeeded,
+        RunPhase::Stopped
+            if matches!(failure, Some(crate::run_state::RunFailure::Declined { .. })) =>
+        {
+            aidaemon_work::plans::JobEnd::Declined
+        }
         RunPhase::Stopped => aidaemon_work::plans::JobEnd::Stopped,
         RunPhase::Failed | RunPhase::Running => aidaemon_work::plans::JobEnd::Failed,
     }
@@ -2260,7 +2269,7 @@ pub async fn deliver_when_run_ends(
         route.plan_session.as_deref(),
         &state.chat,
         &state.id,
-        job_end(state.phase),
+        job_end(state.phase, state.failure.as_ref()),
     )
     .await;
     let message = render_run_result(

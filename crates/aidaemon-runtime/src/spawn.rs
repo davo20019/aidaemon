@@ -136,6 +136,16 @@ pub fn run_phase(
             .iter()
             .any(crate::coordination::RunDelivery::reached_owner)
     });
+    // The owner declined a step it asked to take: that is why it ended
+    // short, whatever else its records say. Its deliveries stay delivered.
+    if outcome != TaskOutcome::Succeeded && aggregate.owner_declined() {
+        return (
+            RunEnd::Stopped(Some(RunFailure::Declined {
+                steps: declined_steps(aggregate),
+            })),
+            RunEvidence::default(),
+        );
+    }
     if let Some(failure) = nothing_done(outcome, &checklist, aggregate, delivered_any) {
         return (RunEnd::Failed(failure), RunEvidence::default());
     }
@@ -193,6 +203,33 @@ pub fn run_phase(
             ..Default::default()
         },
     )
+}
+
+/// The run's own checklist steps that the calls the owner declined served,
+/// in its words, each once.
+fn declined_steps(aggregate: &aidaemon_events::RunAggregate) -> Vec<String> {
+    let mut ids: Vec<&String> = aggregate
+        .operations
+        .values()
+        .filter(|operation| operation.owner_declined)
+        .flat_map(|operation| operation.obligation_ids.iter())
+        .filter(|id| id.contains("/obligation:checklist:"))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let mut steps: Vec<String> = Vec::new();
+    for id in ids {
+        if let Some(step) = aggregate
+            .obligations
+            .get(id)
+            .and_then(|obligation| obligation.step.as_deref())
+            .map(plain_step)
+            && !steps.contains(&step)
+        {
+            steps.push(step);
+        }
+    }
+    steps
 }
 
 /// How a run ended when no more specific rule explained it: its outcome's
@@ -1534,6 +1571,52 @@ mod tests {
         assert_eq!(
             nothing_done(TaskOutcome::Succeeded, &checklist(&undone), &undone, false),
             None
+        );
+    }
+
+    /// Live 2026-11-13: the owner declined the WordPress helper's password
+    /// rotation; its screenshot reached them, and its card read "its
+    /// helper stopped before it finished". A run that ended short because
+    /// the owner declined a step says so, naming the step, and its plan
+    /// steps read declined, not stopped.
+    #[test]
+    fn a_run_the_owner_declined_a_step_of_ends_short_saying_so() {
+        let end: aidaemon_events::TaskEndData = serde_json::from_value(serde_json::json!({
+            "task_id": "t",
+            "status": "completed",
+            "duration_secs": 1,
+            "iterations": 1,
+            "tool_calls_count": 2,
+        }))
+        .unwrap();
+        let mut run = aggregate(&[("satisfied", 2), ("pending", 2)], &[("succeeded", 2)]);
+        let declined = serde_json::from_value(serde_json::json!({
+            "operation_id": "op-declined",
+            "tool_name": "terminal",
+            "dispatched": false,
+            "owner_declined": true,
+            "mutating": true,
+            "obligation_ids": ["task:t/obligation:checklist:1"],
+        }))
+        .unwrap();
+        run.operations.insert("op-declined".to_string(), declined);
+        let (phase, _) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run), None);
+        let crate::run_state::RunEnd::Stopped(Some(failure)) = &phase else {
+            panic!("{phase:?}");
+        };
+        assert_eq!(
+            failure,
+            &RunFailure::Declined {
+                steps: vec!["step 1".to_string()]
+            }
+        );
+        assert_eq!(
+            failure.reason(),
+            "You declined one of its steps, so it went on without it: step 1."
+        );
+        assert_eq!(
+            crate::spawn_tool::job_end(phase.phase(), phase.failure()),
+            aidaemon_work::plans::JobEnd::Declined
         );
     }
 
