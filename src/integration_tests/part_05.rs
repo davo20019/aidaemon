@@ -651,13 +651,14 @@ async fn test_successful_external_action_timeout_returns_deterministic_completio
         updates.push(update);
     }
 
+    // The status line names the tool in words, never as its identifier.
     assert!(
         updates.iter().any(|update| matches!(
             update,
             StatusUpdate::ToolComplete { name, summary }
-                if name == "external_action" && summary.contains("Created remote record id=abc123")
+                if name == "external action" && summary.contains("Created remote record id=abc123")
         )),
-        "expected ToolComplete status update for external_action, got: {:?}",
+        "expected ToolComplete status update for external action, got: {:?}",
         updates
     );
 }
