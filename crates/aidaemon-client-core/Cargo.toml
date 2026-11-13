@@ -1,0 +1,33 @@
+[package]
+name = "aidaemon-client-core"
+description = "The shared core of AIdaemon's own clients: the Client Gateway link (reconnect, resume, resend), the event reducer, and sign-in with the local token or a paired device key"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["agent", "client", "websocket"]
+categories = ["network-programming"]
+exclude = ["tests/"]
+publish = false
+
+[dependencies]
+aidaemon-client-protocol = { version = "0.2.0", path = "../client-protocol" }
+anyhow = "1"
+base64 = "0.23"
+futures = "0.3"
+p256 = { version = "0.14", features = ["ecdsa"] }
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

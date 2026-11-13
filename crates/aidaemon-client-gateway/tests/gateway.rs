@@ -1151,3 +1151,94 @@ async fn the_web_client_is_served() {
         .starts_with("text/javascript"));
     assert!(script.text().await.unwrap().contains("/sessions/challenge"));
 }
+
+/// The shared client core pairs a device with its own key, signs in with a
+/// signed challenge and holds a socket on the grant, against this router.
+#[tokio::test]
+async fn the_client_core_pairs_and_signs_in_with_a_device_key() {
+    use aidaemon_client_core::keystore::{KeyStore, MemoryKeyStore};
+    use aidaemon_client_core::link::{self, Auth, ClientIdentity, LinkConfig, Update};
+    use aidaemon_client_core::signin::{self, PairRequest};
+
+    let f = fixture(RiskLevel::Medium).await;
+    let offer: PairingOffer = f
+        .owner_post("/client/v1/pairing/offers", serde_json::json!({}))
+        .await;
+    let base = format!("http://{}", f.url);
+    let request = PairRequest {
+        gateway: base.clone(),
+        offer_id: offer.offer_id.clone(),
+        code: offer.code.clone(),
+        device_name: "Synthetic Desktop".into(),
+        device_kind: ClientKind::Desktop,
+        fingerprint: Some(offer.fingerprint.clone()),
+    };
+    let pairing = tokio::spawn(async move {
+        signin::pair(&reqwest::Client::new(), &request, Duration::from_millis(20)).await
+    });
+    // The owner confirms once the device has redeemed the offer.
+    let mut decided = false;
+    for _ in 0..200 {
+        let response = f
+            .http()
+            .post(format!(
+                "{base}/client/v1/pairing/offers/{}/decision",
+                offer.offer_id
+            ))
+            .bearer_auth(&f.token)
+            .json(&serde_json::json!({"approve": true}))
+            .send()
+            .await
+            .unwrap();
+        if response.status().is_success() {
+            decided = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(decided, "the offer was never redeemed");
+    let device = pairing.await.unwrap().unwrap();
+    assert_eq!(device.gateway, base);
+
+    // A direct sign-in gets a grant for this device.
+    let grant = signin::sign_in(&reqwest::Client::new(), &device)
+        .await
+        .unwrap();
+    assert_eq!(grant.device_id, device.device_id);
+
+    // The link signs in by itself and speaks the protocol on the grant.
+    let store = Arc::new(MemoryKeyStore::default());
+    store.save(&device).unwrap();
+    let (updates_tx, mut updates) = mpsc::unbounded_channel();
+    let commands = link::spawn(
+        LinkConfig {
+            url: format!("ws://{}/client/v1/ws", f.url),
+            auth: Auth::Device(store),
+            client: ClientIdentity {
+                kind: ClientKind::Desktop,
+                name: "synthetic-desktop".into(),
+                version: None,
+            },
+            device: None,
+            capabilities: Vec::new(),
+        },
+        updates_tx,
+    );
+    commands
+        .send(("core-1".into(), Command::GetGlance))
+        .unwrap();
+    let mut welcomed = false;
+    loop {
+        let update = tokio::time::timeout(Duration::from_secs(10), updates.recv())
+            .await
+            .expect("an update in time")
+            .expect("the link runs");
+        match update {
+            Update::Disconnected(disconnect) => panic!("dropped: {disconnect:?}"),
+            Update::Frame(ServerFrame::Welcome { .. }) => welcomed = true,
+            Update::Frame(ServerFrame::Ack { request_id, .. }) if request_id == "core-1" => break,
+            _ => {}
+        }
+    }
+    assert!(welcomed);
+}

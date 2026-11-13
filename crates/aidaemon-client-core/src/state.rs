@@ -4,13 +4,16 @@
 
 use std::collections::BTreeMap;
 
+use serde::Serialize;
+
 use aidaemon_client_protocol::{
     Approval, CommandResult, Event, HistoryMessage, ServerFrame, SessionSummary, Snapshot,
     TaskState, TaskSummary, TurnState, TurnStatus,
 };
 
 /// One line of a transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Line {
     User {
         text: String,
@@ -26,21 +29,23 @@ pub enum Line {
 }
 
 /// A turn running now: its streamed text and its latest status.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct LiveTurn {
     pub turn_id: String,
     pub streamed: String,
     pub status: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct SessionView {
     pub summary: Option<SessionSummary>,
     pub lines: Vec<Line>,
     pub live: Option<LiveTurn>,
 }
 
-#[derive(Debug, Default)]
+/// The client's view. Its JSON form (`serde_json::to_value`) is what the
+/// shared reducer fixtures compare, in Rust and in the web client.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct State {
     /// The last durable `seq` applied.
     pub last_seq: Option<u64>,

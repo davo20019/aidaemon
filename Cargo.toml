@@ -31,6 +31,7 @@ members = [
     "crates/node-protocol",
     "crates/node-sdk",
     "crates/client-protocol",
+    "crates/aidaemon-client-core",
     "crates/aidaemon-tui",
     "crates/aidaemon-client-gateway",
     "crates/aidaemon-core",

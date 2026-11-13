@@ -100,7 +100,7 @@ jobs:
           -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
           -p aidaemon-events -p aidaemon-work -p aidaemon-decisions -p aidaemon-runtime -p aidaemon-skills -p aidaemon-secrets -p aidaemon-nodes -p aidaemon-terminal-bridge -p aidaemon-client-protocol -p aidaemon-client-gateway
           -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
-          -p aidaemon-channel-discord -p aidaemon-parity-agent -p aidaemon-tui
+          -p aidaemon-channel-discord -p aidaemon-parity-agent -p aidaemon-tui -p aidaemon-client-core
           --all-targets --all-features -- -D warnings
 
   core-api:
@@ -352,7 +352,7 @@ jobs:
           -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
           -p aidaemon-events -p aidaemon-work -p aidaemon-decisions -p aidaemon-runtime -p aidaemon-skills -p aidaemon-secrets -p aidaemon-nodes -p aidaemon-terminal-bridge -p aidaemon-client-protocol -p aidaemon-client-gateway
           -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
-          -p aidaemon-channel-discord -p aidaemon-tui --all-features
+          -p aidaemon-channel-discord -p aidaemon-tui -p aidaemon-client-core --all-features
 
       # Each example runs against the scripted provider when no API key is
       # set (CI sets none), and against a live model when one is.

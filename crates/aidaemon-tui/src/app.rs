@@ -13,7 +13,7 @@ use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::state::{Line, State};
+use aidaemon_client_core::state::{Line, State};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -68,7 +68,38 @@ fn key_of(decision: ApprovalDecision) -> (char, &'static str) {
     }
 }
 
+/// What this client asks for in `hello`.
+pub const CAPABILITIES: &[aidaemon_client_protocol::Capability] = &[];
+
 impl App {
+    /// Apply what the link reports; the commands to send in reply.
+    pub fn update(&mut self, update: aidaemon_client_core::Update) -> Vec<Command> {
+        use aidaemon_client_core::Update;
+        match update {
+            Update::Connecting => Vec::new(),
+            Update::Connected => {
+                self.connected = true;
+                vec![Command::ListSessions {
+                    cursor: None,
+                    limit: 200,
+                }]
+            }
+            Update::Disconnected(disconnect) => {
+                self.connected = false;
+                self.state.notice = Some(disconnect.reason);
+                Vec::new()
+            }
+            Update::Frame(frame) => {
+                self.state.apply(frame.clone());
+                self.after_frame(&frame);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Time passes (redraw tick).
+    pub fn tick(&mut self) {}
+
     /// After a frame: follow a session this client just started.
     pub fn after_frame(&mut self, frame: &aidaemon_client_protocol::ServerFrame) {
         use aidaemon_client_protocol::{CommandResult, ServerFrame};

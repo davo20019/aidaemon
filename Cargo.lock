@@ -252,10 +252,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aidaemon-client-core"
+version = "0.2.0"
+dependencies = [
+ "aidaemon-client-protocol",
+ "anyhow",
+ "base64 0.23.1",
+ "futures",
+ "p256",
+ "rand 0.10.3",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "uuid",
+]
+
+[[package]]
 name = "aidaemon-client-gateway"
 version = "0.2.0"
 dependencies = [
  "aidaemon-channels",
+ "aidaemon-client-core",
  "aidaemon-client-protocol",
  "aidaemon-core",
  "aidaemon-events",
@@ -727,6 +747,7 @@ dependencies = [
 name = "aidaemon-tui"
 version = "0.2.0"
 dependencies = [
+ "aidaemon-client-core",
  "aidaemon-client-protocol",
  "anyhow",
  "crossterm",
@@ -734,8 +755,6 @@ dependencies = [
  "ratatui",
  "serde_json",
  "tokio",
- "tokio-tungstenite 0.30.0",
- "uuid",
 ]
 
 [[package]]

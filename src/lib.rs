@@ -781,12 +781,11 @@ fn handle_tui_command(args: &[String], config_path: &Path) -> anyhow::Result<()>
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(aidaemon_tui::run(aidaemon_tui::link::LinkConfig {
+        .block_on(aidaemon_tui::run(aidaemon_tui::link_config(
             url,
-            token,
+            aidaemon_tui::link::Auth::LocalToken(token),
             device,
-            capabilities: Vec::new(),
-        }))
+        )))
 }
 
 /// Open `url` in the default browser.

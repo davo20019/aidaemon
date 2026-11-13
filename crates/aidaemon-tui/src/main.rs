@@ -4,7 +4,7 @@
 //! (the output of `aidaemon client-token` saved to a file). `aidaemon tui`
 //! runs the same client with the daemon's own settings and no flags.
 
-use aidaemon_tui::link::LinkConfig;
+use aidaemon_tui::link::Auth;
 
 fn usage() -> ! {
     eprintln!(
@@ -33,11 +33,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let Some(token) = token else { usage() };
-    aidaemon_tui::run(LinkConfig {
+    aidaemon_tui::run(aidaemon_tui::link_config(
         url,
-        token,
+        Auth::LocalToken(token),
         device,
-        capabilities: Vec::new(),
-    })
+    ))
     .await
 }
