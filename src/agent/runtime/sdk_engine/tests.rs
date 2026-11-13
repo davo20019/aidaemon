@@ -2037,14 +2037,10 @@ async fn bridged_terminal_ls_is_read_only_rm_is_not() {
     assert!(permits(run("ls /tmp")));
     assert!(permits(serde_json::json!({"action": "check", "pid": 1})));
     assert!(!permits(serde_json::json!({"action": "kill", "pid": 1})));
-    assert!(!permits(serde_json::json!({"action": "trust_all"})));
+    // The retired trust_all action changes nothing.
+    assert!(permits(serde_json::json!({"action": "trust_all"})));
     assert!(!permits(run("ls > /tmp/aidaemon-test/out")));
     assert!(!permits(run("FOO=1 ls")));
-    assert!(
-        bridged
-            .annotations_for(&serde_json::json!({"action": "trust_all"}))
-            .egress
-    );
 }
 
 #[tokio::test]

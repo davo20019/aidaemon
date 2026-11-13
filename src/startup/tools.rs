@@ -127,6 +127,7 @@ pub async fn setup_tools(
 
     if let Some(terminal) = &terminal_tool {
         terminal.set_side_calls(side_calls);
+        crate::startup::trust_all::publish(terminal.clone());
     }
 
     let OptionalToolsOutcome {
@@ -440,7 +441,7 @@ fn optional_enabled_always(_: &AppConfig) -> bool {
 const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
     OptionalToolSpec {
         id: OptionalToolId::Diagnose,
-        name: "diagnose",
+        name: "self_diagnose",
         enabled_if: optional_enabled_diagnostics,
     },
     OptionalToolSpec {

@@ -247,12 +247,15 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
 #[derive(Clone)]
 struct ResolvedProviderSelection {
     preset: &'static ProviderPreset,
-    api_key: String,
+    /// The secret store holds this provider slot's API key.
+    api_key_stored: bool,
     base_url: String,
     primary_model: String,
     fast_model: String,
     smart_model: String,
-    gateway_token: Option<String>,
+    /// The secret store holds this provider slot's gateway token (only
+    /// looked up for presets that take one).
+    gateway_token_stored: bool,
 }
 
 impl ResolvedProviderSelection {
@@ -300,6 +303,31 @@ impl ConfigManagerTool {
              an approved agent call",
             args.action
         )
+    }
+
+    /// The refusal for a `set` that would write a secret's value: a
+    /// sensitive key only takes the reference `keychain`, and the owner puts
+    /// the value in the secret store themselves. Never echoes the value.
+    fn literal_secret_refusal(args: &ConfigArgs) -> Option<String> {
+        if args.action != "set"
+            || args.value.is_empty()
+            || args.value.trim() == "keychain"
+            || !is_sensitive_key(&args.key)
+        {
+            return None;
+        }
+        let path = ConfigPath::parse(&args.key).ok();
+        let instruction = match path.as_ref().and_then(provider_secret_name) {
+            Some((name, primary)) => Self::owner_secret_instruction(&[&name], primary),
+            None => "Ask the owner to store it with `aidaemon keychain set <key>` in their own \
+                     terminal; never ask them to paste a secret in chat."
+                .to_string(),
+        };
+        Some(format!(
+            "Nothing was changed: secret values are not accepted as tool arguments. {} \
+             Then set `{}` to `keychain`.",
+            instruction, args.key
+        ))
     }
 
     /// The card summary for a `set` that needs approval: secrets are shown
@@ -367,6 +395,7 @@ impl ConfigManagerTool {
                 if args.key.is_empty()
                     || (args.action == "set" && args.value.is_empty())
                     || !Self::change_needs_approval(args)
+                    || Self::literal_secret_refusal(args).is_some()
                 {
                     return Ok(None);
                 }
@@ -387,14 +416,11 @@ impl ConfigManagerTool {
             "enable_exposure" => Ok(Self::exposure_settings(args)
                 .ok()
                 .map(|(service, settings)| Self::exposure_summary(&service, &settings))),
-            "switch_provider" => Ok(Self::resolve_provider_selection(args, "switch_provider")
+            "switch_provider" => Ok(self
+                .resolve_provider_selection(args, "switch_provider", None)
                 .ok()
                 .map(|selection| Self::switch_provider_summary(&selection))),
             "add_failover_provider" => {
-                let Ok(selection) = Self::resolve_provider_selection(args, "add_failover_provider")
-                else {
-                    return Ok(None);
-                };
                 let content = self.config.read().await?;
                 let doc: toml::Table = content.parse()?;
                 let next_index = match doc.get("provider") {
@@ -407,6 +433,14 @@ impl ConfigManagerTool {
                             .map(|entries| entries.len())
                             .unwrap_or(0)
                     }
+                };
+                let key_prefix = Self::fallback_key_prefix(next_index);
+                let Ok(selection) = self.resolve_provider_selection(
+                    args,
+                    "add_failover_provider",
+                    Some(&key_prefix),
+                ) else {
+                    return Ok(None);
                 };
                 Ok(Some(Self::add_failover_summary(next_index, &selection)))
             }
@@ -468,13 +502,10 @@ impl ConfigManagerTool {
             _ => json!({
                 "action": args.action,
                 "provider": args.provider,
-                "api_key": secret(&args.api_key),
                 "base_url": args.base_url,
-                "gateway_token": secret(&args.gateway_token),
                 "primary_model": args.primary_model,
                 "fast_model": args.fast_model,
                 "smart_model": args.smart_model,
-                "save_secrets_to_keychain": args.save_secrets_to_keychain,
             }),
         };
         subject.to_string()
@@ -650,11 +681,14 @@ impl ConfigManagerTool {
 
         lines.push("".to_string());
         lines.push(
-            "Example: {\"action\":\"switch_provider\",\"provider\":\"moonshot\",\"api_key\":\"YOUR_KEY\"}"
+            "Example: {\"action\":\"switch_provider\",\"provider\":\"moonshot\"}".to_string(),
+        );
+        lines.push(
+            "Failover example: {\"action\":\"add_failover_provider\",\"provider\":\"anthropic\"}"
                 .to_string(),
         );
         lines.push(
-            "Failover example: {\"action\":\"add_failover_provider\",\"provider\":\"anthropic\",\"api_key\":\"YOUR_KEY\"}"
+            "API keys are never tool arguments: the owner stores them with `aidaemon keychain set <key>` in their own terminal (the reply names the key)."
                 .to_string(),
         );
 
@@ -684,9 +718,15 @@ impl ConfigManagerTool {
         }
     }
 
+    /// The provider a `switch_provider` / `add_failover_provider` call
+    /// selects, for the slot whose secret-store keys start with `key_prefix`
+    /// (`None` for the primary provider). Secrets are never arguments: the
+    /// API key must already be in the secret store under that slot's key.
     fn resolve_provider_selection(
+        &self,
         args: &ConfigArgs,
         action_name: &str,
+        key_prefix: Option<&str>,
     ) -> Result<ResolvedProviderSelection, String> {
         let provider_name = args.provider.trim();
         if provider_name.is_empty() {
@@ -703,11 +743,27 @@ impl ConfigManagerTool {
             ));
         };
 
-        let api_key = args.api_key.trim();
-        if preset.needs_api_key && api_key.is_empty() {
+        let api_key_name = Self::keychain_field_name(key_prefix, "api_key");
+        let gateway_token_name = Self::keychain_field_name(key_prefix, "gateway_token");
+        if args.api_key.is_some() || args.gateway_token.is_some() {
+            let mut names = vec![api_key_name.as_str()];
+            if preset.supports_gateway_token {
+                names.push(gateway_token_name.as_str());
+            }
             return Err(format!(
-                "Missing API key for {}. Provide `api_key` and retry.\n\nExample: {{\"action\":\"{}\",\"provider\":\"{}\",\"api_key\":\"YOUR_KEY\"}}",
-                preset.display_name, action_name, preset.id
+                "Nothing was changed: secrets are not accepted as tool arguments. {} \
+                 Then call {} again without the secret.",
+                Self::owner_secret_instruction(&names, key_prefix.is_none()),
+                action_name
+            ));
+        }
+        let api_key_stored = self.secrets.contains(&api_key_name);
+        if preset.needs_api_key && !api_key_stored {
+            return Err(format!(
+                "No API key for {} in the secret store. {} Then call {} again.",
+                preset.display_name,
+                Self::owner_secret_instruction(&[&api_key_name], key_prefix.is_none()),
+                action_name
             ));
         }
 
@@ -746,22 +802,37 @@ impl ConfigManagerTool {
             args.smart_model.trim().to_string()
         };
 
-        let gateway_token =
-            if preset.supports_gateway_token && !args.gateway_token.trim().is_empty() {
-                Some(args.gateway_token.trim().to_string())
-            } else {
-                None
-            };
+        let gateway_token_stored =
+            preset.supports_gateway_token && self.secrets.contains(&gateway_token_name);
 
         Ok(ResolvedProviderSelection {
             preset,
-            api_key: api_key.to_string(),
+            api_key_stored,
             base_url,
             primary_model,
             fast_model,
             smart_model,
-            gateway_token,
+            gateway_token_stored,
         })
+    }
+
+    /// What the owner does to put secrets `names` in the secret store, in
+    /// their own terminal; `/setkey` also covers the primary provider's key.
+    fn owner_secret_instruction(names: &[&str], primary_provider: bool) -> String {
+        let commands = names
+            .iter()
+            .map(|name| format!("`aidaemon keychain set {name}`"))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let setkey = if primary_provider {
+            " (or /setkey on Telegram)"
+        } else {
+            ""
+        };
+        format!(
+            "Ask the owner to run {commands} in their own terminal{setkey}; never ask them to \
+             paste a secret in chat."
+        )
     }
 
     fn fallback_key_prefix(index: usize) -> String {
@@ -816,7 +887,6 @@ impl ConfigManagerTool {
         provider_table: &mut toml::Table,
         selection: &ResolvedProviderSelection,
         key_prefix: Option<&str>,
-        save_secrets_to_keychain: bool,
         notes: &mut Vec<String>,
         note_prefix: &str,
     ) {
@@ -825,27 +895,20 @@ impl ConfigManagerTool {
             toml::Value::String(selection.preset.kind.to_string()),
         );
 
-        let api_key_value = if selection.preset.needs_api_key {
-            let (value, stored, note) = self.resolve_secret_config_value(
-                &Self::keychain_field_name(key_prefix, "api_key"),
-                &selection.api_key,
-                save_secrets_to_keychain,
-            );
-            if stored {
-                notes.push(if note_prefix.is_empty() {
-                    "API key stored in OS keychain.".to_string()
+        let keychain = || toml::Value::String("keychain".to_string());
+        let api_key_value = if selection.api_key_stored {
+            notes.push(format!(
+                "{}API key read from the secret store (`{}`).",
+                if note_prefix.is_empty() {
+                    String::new()
                 } else {
-                    format!("{} API key stored in OS keychain.", note_prefix)
-                });
-            }
-            if let Some(note) = note {
-                notes.push(note);
-            }
-            value
+                    format!("{} ", note_prefix)
+                },
+                Self::keychain_field_name(key_prefix, "api_key")
+            ));
+            keychain()
         } else {
-            toml::Value::String(if !selection.api_key.is_empty() {
-                selection.api_key.clone()
-            } else if selection.preset.kind == "openai_chatgpt" {
+            toml::Value::String(if selection.preset.kind == "openai_chatgpt" {
                 // Subscription auth: an "ollama" placeholder here would be
                 // actively misleading about where the credentials live.
                 String::new()
@@ -869,25 +932,19 @@ impl ConfigManagerTool {
             toml::Value::Table(Self::build_models_table(selection)),
         );
 
-        if let Some(token) = selection.gateway_token.as_deref() {
-            let (token_value, stored, note) = self.resolve_secret_config_value(
-                &Self::keychain_field_name(key_prefix, "gateway_token"),
-                token,
-                save_secrets_to_keychain,
-            );
-            if stored {
-                notes.push(if note_prefix.is_empty() {
-                    "Gateway token stored in OS keychain.".to_string()
-                } else {
-                    format!("{} gateway token stored in OS keychain.", note_prefix)
-                });
-            }
-            if let Some(note) = note {
-                notes.push(note);
-            }
-            provider_table.insert("gateway_token".to_string(), token_value);
+        if selection.gateway_token_stored {
+            provider_table.insert("gateway_token".to_string(), keychain());
         } else {
             provider_table.remove("gateway_token");
+            if selection.preset.supports_gateway_token {
+                notes.push(format!(
+                    "No gateway token in the secret store. To add one: {} Then repeat this call.",
+                    Self::owner_secret_instruction(
+                        &[&Self::keychain_field_name(key_prefix, "gateway_token")],
+                        false,
+                    )
+                ));
+            }
         }
     }
 
@@ -1212,11 +1269,6 @@ impl ConfigManagerTool {
     }
 
     async fn add_failover_provider(&self, args: &ConfigArgs) -> anyhow::Result<String> {
-        let selection = match Self::resolve_provider_selection(args, "add_failover_provider") {
-            Ok(selection) => selection,
-            Err(message) => return Ok(message),
-        };
-
         let content = self.config.read().await?;
         let mut doc: toml::Table = content.parse()?;
         let provider_table = doc
@@ -1227,17 +1279,22 @@ impl ConfigManagerTool {
         let next_index = Self::get_failover_array(provider_table)?
             .map(|entries| entries.len())
             .unwrap_or(0);
+        let key_prefix = Self::fallback_key_prefix(next_index);
+        let selection =
+            match self.resolve_provider_selection(args, "add_failover_provider", Some(&key_prefix))
+            {
+                Ok(selection) => selection,
+                Err(message) => return Ok(message),
+            };
 
         Self::require_kernel_approval(args)?;
 
         let mut notes = Vec::new();
         let mut new_provider = toml::Table::new();
-        let key_prefix = Self::fallback_key_prefix(next_index);
         self.apply_provider_selection(
             &mut new_provider,
             &selection,
             Some(&key_prefix),
-            args.save_secrets_to_keychain,
             &mut notes,
             "Failover",
         );
@@ -1404,7 +1461,7 @@ impl ConfigManagerTool {
     }
 
     async fn switch_provider(&self, args: &ConfigArgs) -> anyhow::Result<String> {
-        let selection = match Self::resolve_provider_selection(args, "switch_provider") {
+        let selection = match self.resolve_provider_selection(args, "switch_provider", None) {
             Ok(selection) => selection,
             Err(message) => return Ok(message),
         };
@@ -1420,14 +1477,7 @@ impl ConfigManagerTool {
             .or_insert_with(|| toml::Value::Table(toml::Table::new()))
             .as_table_mut()
             .ok_or_else(|| anyhow::anyhow!("`provider` is not a table"))?;
-        self.apply_provider_selection(
-            provider_table,
-            &selection,
-            None,
-            args.save_secrets_to_keychain,
-            &mut notes,
-            "",
-        );
+        self.apply_provider_selection(provider_table, &selection, None, &mut notes, "");
 
         let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
 
@@ -1721,12 +1771,16 @@ struct ConfigArgs {
     value: String,
     #[serde(default)]
     provider: String,
+    /// No longer a parameter: secrets never travel as tool arguments. Kept
+    /// only to notice a model that still sends one; the value is dropped
+    /// unread.
     #[serde(default)]
-    api_key: String,
+    api_key: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     base_url: String,
+    /// Same as `api_key`.
     #[serde(default)]
-    gateway_token: String,
+    gateway_token: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     primary_model: String,
     #[serde(default)]
@@ -1735,8 +1789,6 @@ struct ConfigArgs {
     smart_model: String,
     #[serde(default)]
     failover_index: Option<usize>,
-    #[serde(default = "default_true")]
-    save_secrets_to_keychain: bool,
     #[serde(default)]
     stt_cli_path: Option<String>,
     #[serde(default)]
@@ -1751,10 +1803,6 @@ struct ConfigArgs {
     kernel_approved: bool,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 fn apply_instruction_for_key(key: &str) -> &'static str {
     if key == "agent" || key.starts_with("agent.") {
         "Restart aidaemon to apply agent identity or persona changes."
@@ -1765,7 +1813,7 @@ fn apply_instruction_for_key(key: &str) -> &'static str {
 
 /// The tool's one description: the schema the model reads and
 /// `description()` both use it.
-const TOOL_DESCRIPTION: &str = "Read (secrets hidden)/update config.toml (backup+validate). key: dotted path, list entry as a[2].";
+const TOOL_DESCRIPTION: &str = "Read (secrets hidden)/update config.toml (backup+validate). key: dotted path, list entry as a[2]. Secrets are never args: owner runs `aidaemon keychain set <key>`; a secret setting takes value `keychain`.";
 
 fn manage_config_schema() -> Value {
     json!({
@@ -1781,14 +1829,11 @@ fn manage_config_schema() -> Value {
                 "key": { "type": "string" },
                 "value": { "type": "string" },
                 "provider": { "type": "string" },
-                "api_key": { "type": "string" },
                 "base_url": { "type": "string" },
-                "gateway_token": { "type": "string" },
                 "primary_model": { "type": "string" },
                 "fast_model": { "type": "string" },
                 "smart_model": { "type": "string" },
                 "failover_index": { "type": "integer" },
-                "save_secrets_to_keychain": { "type": "boolean" },
                 "stt_cli_path": { "type": "string" },
                 "stt_model_path": { "type": "string" },
                 "stt_language": { "type": "string" }
@@ -1936,6 +1981,9 @@ impl ConfigManagerTool {
     /// daemon's config would read it (a key it ignores is refused), and it is
     /// reported saved only after the file read back from disk holds it.
     async fn change_value(&self, args: &ConfigArgs) -> anyhow::Result<ConfigReply> {
+        if let Some(refusal) = Self::literal_secret_refusal(args) {
+            return Ok(ConfigReply::refused(refusal));
+        }
         let unset = args.action == "unset";
         if args.key.is_empty() || (!unset && args.value.is_empty()) {
             return Ok(ConfigReply::refused(if unset {
@@ -2168,6 +2216,45 @@ fn remove_toml_value(table: &mut toml::Table, path: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// The secret-store key a provider secret at `path` is read from
+/// (`provider.api_key` → `api_key`, `provider.fallbacks[0].api_key` →
+/// `provider_fallback_0_api_key`), and whether it is the primary provider's.
+/// `None` for any other path.
+fn provider_secret_name(path: &ConfigPath) -> Option<(String, bool)> {
+    use config_path::PathSegment;
+    let segments = path.segments();
+    let (last, chain) = segments.split_last()?;
+    let PathSegment::Key(field) = last else {
+        return None;
+    };
+    if !matches!(field.as_str(), "api_key" | "gateway_token") {
+        return None;
+    }
+    let (first, mut rest) = chain.split_first()?;
+    if !matches!(first, PathSegment::Key(key) if key == "provider") {
+        return None;
+    }
+    let mut prefix: Option<String> = None;
+    while let [PathSegment::Key(list), PathSegment::Index(index), tail @ ..] = rest {
+        if !matches!(list.as_str(), "fallbacks" | "failover") {
+            return None;
+        }
+        prefix = Some(aidaemon_secrets::names::provider_fallback_prefix(
+            prefix.as_deref(),
+            *index,
+        ));
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    let primary = prefix.is_none();
+    Some((
+        aidaemon_secrets::names::provider_field(prefix.as_deref(), field),
+        primary,
+    ))
+}
+
 /// Check if the last segment of a dotted key path is a sensitive key name.
 fn is_sensitive_key(path: &str) -> bool {
     match ConfigPath::parse(path) {
@@ -2287,13 +2374,12 @@ mod tests {
             key: String::new(),
             value: String::new(),
             provider: String::new(),
-            api_key: String::new(),
+            api_key: None,
             base_url: String::new(),
-            gateway_token: String::new(),
+            gateway_token: None,
             primary_model: String::new(),
             fast_model: String::new(),
             smart_model: String::new(),
-            save_secrets_to_keychain: true,
             failover_index: None,
             stt_cli_path: None,
             stt_model_path: None,
@@ -2301,6 +2387,23 @@ mod tests {
             stt_ffmpeg_path: None,
             kernel_approved: true,
         }
+    }
+
+    /// The tool over `path` with `secrets` already in its (in-memory)
+    /// secret store, as if the owner had run `aidaemon keychain set`.
+    fn tool_with_secrets(
+        path: PathBuf,
+        secrets: &[(&str, &str)],
+    ) -> (ConfigManagerTool, Arc<aidaemon_secrets::MemorySecretStore>) {
+        let store = Arc::new(aidaemon_secrets::MemorySecretStore::new());
+        for (key, value) in secrets {
+            store.set(key, value).unwrap();
+        }
+        let tool = ConfigManagerTool::new(
+            ConfigFile::new(path, Arc::new(test_check)),
+            store.clone() as Arc<dyn SecretStore>,
+        );
+        (tool, store)
     }
 
     fn test_tool() -> ConfigManagerTool {
@@ -2419,10 +2522,12 @@ fast = "gpt-4o-mini"
 
     #[tokio::test]
     async fn switch_provider_rejects_cloudflare_placeholder_base_url() {
-        let tool = test_tool();
+        let (tool, _store) = tool_with_secrets(
+            PathBuf::from("/tmp/nonexistent-config.toml"),
+            &[("api_key", "sk-synthetic-test-key")],
+        );
         let mut args = test_args();
         args.provider = "cloudflare_gateway".to_string();
-        args.api_key = "test-key".to_string();
         args.base_url =
             "https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/compat".to_string();
 
@@ -2451,12 +2556,13 @@ api_key = "primary-key"
 default = "primary-model"
 "#,
         );
-        let tool = approving_tool(path.clone());
+        let (tool, _store) = tool_with_secrets(
+            path.clone(),
+            &[("provider_fallback_0_api_key", "sk-synthetic-test-key")],
+        );
         let mut args = test_args();
         args.action = "add_failover_provider".to_string();
         args.provider = "anthropic".to_string();
-        args.api_key = "secondary-key".to_string();
-        args.save_secrets_to_keychain = false;
 
         let reply = tool.add_failover_provider(&args).await.unwrap();
         assert!(reply.contains("Added failover provider #0"));
@@ -2465,7 +2571,7 @@ default = "primary-model"
         let fallbacks = fallbacks(&saved);
         assert_eq!(fallbacks.len(), 1);
         assert_eq!(fallbacks[0]["kind"].as_str(), Some("anthropic"));
-        assert_eq!(fallbacks[0]["api_key"].as_str(), Some("secondary-key"));
+        assert_eq!(fallbacks[0]["api_key"].as_str(), Some("keychain"));
         assert_eq!(
             fallbacks[0]["models"]["default"].as_str(),
             Some("claude-sonnet-4-20250514")
@@ -2799,6 +2905,151 @@ token_file = "{}"
             Some(true)
         );
         assert!(!tokens.path().join("client-token").exists());
+    }
+
+    const PRIMARY_CONFIG: &str = "[provider]\nkind = \"openai_compatible\"\napi_key = \"keychain\"\n\n[provider.models]\ndefault = \"primary-model\"\n";
+
+    /// The calls a model makes, parsed as the tool parses them.
+    fn approved_args(arguments: &str) -> ConfigArgs {
+        let mut args: ConfigArgs = serde_json::from_str(arguments).unwrap();
+        args.kernel_approved = true;
+        args
+    }
+
+    #[tokio::test]
+    async fn provider_secret_arguments_are_refused_unread() {
+        let (_dir, path) = write_temp_config(PRIMARY_CONFIG);
+        let (tool, store) = tool_with_secrets(path.clone(), &[]);
+        let before = fs::read_to_string(&path).unwrap();
+
+        let switch = approved_args(
+            r#"{"action":"switch_provider","provider":"anthropic","api_key":"sk-synthetic-test-key"}"#,
+        );
+        let reply = tool.switch_provider(&switch).await.unwrap();
+        assert!(!reply.contains("sk-synthetic-test-key"), "{reply}");
+        assert!(reply.contains("aidaemon keychain set api_key"), "{reply}");
+        assert!(reply.contains("/setkey"), "{reply}");
+
+        let failover = approved_args(
+            r#"{"action":"add_failover_provider","provider":"cloudflare_gateway","gateway_token":"sk-synthetic-test-key"}"#,
+        );
+        let reply = tool.add_failover_provider(&failover).await.unwrap();
+        assert!(!reply.contains("sk-synthetic-test-key"), "{reply}");
+        assert!(
+            reply.contains("aidaemon keychain set provider_fallback_0_gateway_token"),
+            "{reply}"
+        );
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert!(!store.contains("api_key"));
+        assert!(!store.contains("provider_fallback_0_gateway_token"));
+        assert!(matches!(
+            tool.owner_approval(&json!({"action": "switch_provider", "provider": "anthropic", "api_key": "sk-synthetic-test-key"})).await,
+            OwnerApprovalNeed::NotNeeded
+        ));
+    }
+
+    #[tokio::test]
+    async fn switch_provider_uses_the_owner_stored_key() {
+        let (_dir, path) = write_temp_config(PRIMARY_CONFIG);
+        let (tool, _store) =
+            tool_with_secrets(path.clone(), &[("api_key", "sk-synthetic-test-key")]);
+
+        let reply = tool
+            .switch_provider(&approved_args(
+                r#"{"action":"switch_provider","provider":"anthropic"}"#,
+            ))
+            .await
+            .unwrap();
+        assert!(reply.contains("Switched provider to"), "{reply}");
+        assert!(!reply.contains("sk-synthetic-test-key"), "{reply}");
+        let saved = saved_table(&path);
+        assert_eq!(saved["provider"]["api_key"].as_str(), Some("keychain"));
+        assert_eq!(saved["provider"]["kind"].as_str(), Some("anthropic"));
+    }
+
+    #[tokio::test]
+    async fn switch_provider_without_a_stored_key_names_the_owner_command() {
+        let (_dir, path) = write_temp_config(PRIMARY_CONFIG);
+        let (tool, _store) = tool_with_secrets(path.clone(), &[]);
+        let before = fs::read_to_string(&path).unwrap();
+
+        let reply = tool
+            .switch_provider(&approved_args(
+                r#"{"action":"switch_provider","provider":"anthropic"}"#,
+            ))
+            .await
+            .unwrap();
+        assert!(reply.contains("aidaemon keychain set api_key"), "{reply}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+
+        let reply = tool
+            .add_failover_provider(&approved_args(
+                r#"{"action":"add_failover_provider","provider":"anthropic"}"#,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            reply.contains("aidaemon keychain set provider_fallback_0_api_key"),
+            "{reply}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn set_refuses_a_literal_secret_but_takes_the_keychain_reference() {
+        let (_dir, path) = write_temp_config(PRIMARY_CONFIG);
+        let tool = approving_tool(path.clone());
+        let before = fs::read_to_string(&path).unwrap();
+
+        for (key, command) in [
+            ("provider.api_key", "aidaemon keychain set api_key"),
+            (
+                "provider.fallbacks[1].api_key",
+                "aidaemon keychain set provider_fallback_1_api_key",
+            ),
+            ("telegram.bot_token", "aidaemon keychain set <key>"),
+        ] {
+            let mut args = test_args();
+            args.action = "set".into();
+            args.key = key.into();
+            args.value = "sk-synthetic-test-key".into();
+            let reply = tool.change_value(&args).await.unwrap();
+            assert!(
+                !reply.text.contains("sk-synthetic-test-key"),
+                "{}",
+                reply.text
+            );
+            assert!(reply.text.contains(command), "{key}: {}", reply.text);
+            assert!(matches!(
+                tool.owner_approval(
+                    &json!({"action": "set", "key": key, "value": "sk-synthetic-test-key"})
+                )
+                .await,
+                OwnerApprovalNeed::NotNeeded
+            ));
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+
+        let mut args = test_args();
+        args.action = "set".into();
+        args.key = "provider.api_key".into();
+        args.value = "keychain".into();
+        assert!(!matches!(
+            tool.owner_approval(
+                &json!({"action": "set", "key": "provider.api_key", "value": "keychain"})
+            )
+            .await,
+            OwnerApprovalNeed::NotNeeded
+        ));
+        // Past the secret check (this test's config check does not model
+        // the daemon's provider schema, so the write itself is not asserted).
+        let reply = tool.change_value(&args).await.unwrap();
+        assert!(
+            !reply.text.contains("not accepted as tool arguments"),
+            "{}",
+            reply.text
+        );
     }
 
     #[test]

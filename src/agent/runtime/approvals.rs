@@ -999,25 +999,13 @@ mod tests {
         ));
     }
 
-    /// Enabling trust-all always asks, Critical (until it is on).
+    /// Trust-all is the owner's `/trustall` command, not a tool action: a
+    /// model call to the retired action changes nothing and asks nothing.
     #[tokio::test]
-    async fn terminal_trust_all_asks_critical() {
-        let trusted = AppApprovalRules {
-            trusted_session: true,
-            ..terminal_rules(&[]).await
-        };
-        let RuleDecision::Ask(request) =
-            judge_terminal(&trusted, json!({"action": "trust_all"})).await
-        else {
-            panic!("trust_all must ask");
-        };
-        assert_eq!(request.risk, sdk::ApprovalRisk::Critical);
-        assert_eq!(request.subject, "ENABLE TRUST-ALL MODE");
-        // Always asked, even when it is already on, and whatever the
-        // model's `_` keys say.
-        let on = terminal_rules(&["*"]).await;
-        assert!(matches!(
-            judge_terminal(&on, json!({"action": "trust_all", "_goal_id": 0})).await,
+    async fn retired_trust_all_action_asks_nothing() {
+        let rules = terminal_rules(&[]).await;
+        assert!(!matches!(
+            judge_terminal(&rules, json!({"action": "trust_all"})).await,
             RuleDecision::Ask(_)
         ));
     }

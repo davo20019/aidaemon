@@ -39,6 +39,7 @@ fn fact(local_id: &str, predicate: &str, value: &str) -> PersonalFactCandidate {
         display_value: None,
         valid_from: None,
         valid_to: None,
+        retract: false,
     }
 }
 
@@ -773,17 +774,24 @@ async fn forgetting_a_profile_key_retracts_the_canonical_record() {
 }
 
 #[tokio::test]
-async fn a_delete_marker_value_forgets_instead_of_being_stored() {
+async fn a_typed_retract_forgets_and_a_none_value_is_stored() {
     let (_dir, store) = store().await;
     write(&store, &owner("birthplace", "Shelbyville")).await;
-    write(&store, &owner("birthplace", "delete")).await;
+    let mut forget = owner("birthplace", "");
+    forget.facts[0].retract = true;
+    write(&store, &forget).await;
     assert!(canonical(&store).await.is_empty());
 
-    // An extraction pass emitting "none" forgets nothing.
+    // The owner saying "none" states a value; it forgets nothing.
+    write(&store, &owner("allergies", "none")).await;
+    assert_eq!(canonical(&store).await, vec!["allergies=none"]);
+
+    // An extraction pass emitting "none" or a retract changes nothing.
     write(&store, &owner("residence", "Springfield")).await;
+    let mut extracted = owner("residence", "none");
     store
         .reconcile_structured_personal_memory(
-            &owner("residence", "none"),
+            &extracted,
             "progressive",
             None,
             None,
@@ -791,7 +799,22 @@ async fn a_delete_marker_value_forgets_instead_of_being_stored() {
         )
         .await
         .unwrap();
-    assert_eq!(canonical(&store).await, vec!["residence=Springfield"]);
+    extracted.facts[0].retract = true;
+    store
+        .reconcile_structured_personal_memory(
+            &extracted,
+            "progressive",
+            None,
+            None,
+            FactPrivacy::Private,
+        )
+        .await
+        .unwrap();
+    let rows = canonical(&store).await;
+    assert!(
+        rows.contains(&"residence=Springfield".to_string()),
+        "{rows:?}"
+    );
 }
 
 #[tokio::test]

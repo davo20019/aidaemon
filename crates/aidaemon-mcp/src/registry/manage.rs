@@ -12,6 +12,7 @@ use aidaemon_tools::semantics::{
     ToolCapabilities, ToolMutationEffects, ToolSemantics, semantics_for_exact_read_actions,
 };
 
+use super::running::ServerEnvBinding;
 use super::{McpRegistry, McpServerConfig};
 
 /// The process effect key naming an MCP server, whatever its command.
@@ -201,15 +202,37 @@ impl ManageMcpTool {
         }
     }
 
-    async fn handle_set_env(&self, name: &str, key: &str, value: &str) -> anyhow::Result<String> {
-        match self.registry.set_server_env(name, key, value).await {
-            Ok(()) => Ok(format!(
-                "Environment variable '{}' stored securely in OS keychain for server '{}'.\n\
+    /// Binds env var `key` to the value the owner stored under
+    /// `mcp_<server>_<KEY>`. The value itself is never an argument.
+    async fn handle_set_env(
+        &self,
+        name: &str,
+        key: &str,
+        value_sent_as_argument: bool,
+    ) -> anyhow::Result<String> {
+        let secret_key = McpRegistry::env_secret_key(name, key);
+        if value_sent_as_argument {
+            return Ok(format!(
+                "Nothing was stored: secret values are not accepted as tool arguments. \
+                 Ask the owner to run `aidaemon keychain set {}` in their own terminal, \
+                 then call set_env again with only name and key.",
+                secret_key
+            ));
+        }
+        match self.registry.set_server_env(name, key).await {
+            Ok(ServerEnvBinding::Bound { secret_key }) => Ok(format!(
+                "Environment variable '{}' of server '{}' now reads `{}` from the secret store.\n\
                  Use the 'restart' action to apply the new configuration.",
-                key, name
+                key, name, secret_key
+            )),
+            Ok(ServerEnvBinding::MissingSecret { secret_key }) => Ok(format!(
+                "No value for '{}' in the secret store, so nothing changed. Ask the owner to \
+                 run `aidaemon keychain set {}` in their own terminal (never paste it in chat), \
+                 then call set_env again.",
+                key, secret_key
             )),
             Err(e) => Ok(format!(
-                "Failed to store env var '{}' for server '{}': {}",
+                "Failed to set env var '{}' for server '{}': {}",
                 key, name, e
             )),
         }
@@ -253,13 +276,15 @@ struct ManageMcpArgs {
     #[serde(default)]
     args: Vec<String>,
     key: Option<String>,
-    value: Option<String>,
+    /// No longer a parameter: secrets never travel as tool arguments. Kept
+    /// only to notice a model that still sends one; the value is dropped
+    /// unread.
+    value: Option<serde::de::IgnoredAny>,
 }
 
 /// The tool's one description: the schema the model reads and
 /// `description()` both use it.
-const TOOL_DESCRIPTION: &str =
-    "Manage MCP servers at runtime. set_env stores env vars in OS keychain, never in chat.";
+const TOOL_DESCRIPTION: &str = "Manage MCP servers at runtime. set_env binds an env var to `mcp_<server>_<KEY>`, which the owner stores with `aidaemon keychain set`; values are never args.";
 
 fn manage_mcp_schema() -> Value {
     json!({
@@ -278,8 +303,7 @@ fn manage_mcp_schema() -> Value {
                     "description": "Spawn command (add). Allowed: npx, uvx, node, python, python3"
                 },
                 "args": { "type": "array", "items": { "type": "string" }, "description": "Command args (add)" },
-                "key": { "type": "string", "description": "Env var name (set_env)" },
-                "value": { "type": "string", "description": "Env var value (set_env); stored in keychain" }
+                "key": { "type": "string", "description": "Env var name (set_env)" }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -345,11 +369,7 @@ impl ManageMcpTool {
                     .key
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'key' is required for set_env action"))?;
-                let value = args
-                    .value
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'value' is required for set_env action"))?;
-                self.handle_set_env(name, key, value).await
+                self.handle_set_env(name, key, args.value.is_some()).await
             }
             "restart" => {
                 let name = args
@@ -500,5 +520,110 @@ mod tests {
             bytes <= 850,
             "manage_mcp schema is {bytes} bytes, budget is 850"
         );
+    }
+
+    /// One disabled server in memory, as its database row.
+    #[derive(Default)]
+    struct OneServerStore {
+        rows: std::sync::Mutex<Vec<super::super::DynamicMcpServer>>,
+    }
+
+    #[async_trait]
+    impl super::super::DynamicMcpServerStore for OneServerStore {
+        async fn list_dynamic_mcp_servers(
+            &self,
+        ) -> anyhow::Result<Vec<super::super::DynamicMcpServer>> {
+            Ok(self.rows.lock().unwrap().clone())
+        }
+
+        async fn update_dynamic_mcp_server(
+            &self,
+            server: &super::super::DynamicMcpServer,
+        ) -> anyhow::Result<()> {
+            let mut rows = self.rows.lock().unwrap();
+            if let Some(row) = rows.iter_mut().find(|row| row.id == server.id) {
+                *row = server.clone();
+            }
+            Ok(())
+        }
+    }
+
+    fn tool_with(
+        secrets: &[(&str, &str)],
+    ) -> (
+        ManageMcpTool,
+        std::sync::Arc<OneServerStore>,
+        std::sync::Arc<aidaemon_secrets::MemorySecretStore>,
+    ) {
+        use aidaemon_secrets::SecretStore;
+        let store = std::sync::Arc::new(OneServerStore::default());
+        store
+            .rows
+            .lock()
+            .unwrap()
+            .push(super::super::DynamicMcpServer {
+                id: 7,
+                name: "synthetic".to_string(),
+                command: "node".to_string(),
+                args_json: "[\"server.js\"]".to_string(),
+                env_keys_json: "[]".to_string(),
+                triggers_json: "[\"synthetic\"]".to_string(),
+                enabled: false,
+                created_at: String::new(),
+            });
+        let secret_store = std::sync::Arc::new(aidaemon_secrets::MemorySecretStore::new());
+        for (key, value) in secrets {
+            secret_store.set(key, value).unwrap();
+        }
+        let registry = McpRegistry::new(store.clone(), secret_store.clone());
+        (ManageMcpTool::new(registry), store, secret_store)
+    }
+
+    fn env_keys(store: &OneServerStore) -> Vec<String> {
+        serde_json::from_str(&store.rows.lock().unwrap()[0].env_keys_json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn set_env_refuses_a_value_argument_unread() {
+        use aidaemon_secrets::SecretStore;
+        let (tool, store, secrets) = tool_with(&[]);
+        let output = tool
+            .run(r#"{"action":"set_env","name":"synthetic","key":"API_TOKEN","value":"sk-synthetic-test-key"}"#)
+            .await
+            .unwrap();
+        assert!(!output.contains("sk-synthetic-test-key"), "{output}");
+        assert!(
+            output.contains("aidaemon keychain set mcp_synthetic_API_TOKEN"),
+            "{output}"
+        );
+        assert!(!secrets.contains("mcp_synthetic_API_TOKEN"));
+        assert!(env_keys(&store).is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_env_binds_the_owner_stored_value() {
+        let (tool, store, _secrets) =
+            tool_with(&[("mcp_synthetic_API_TOKEN", "sk-synthetic-test-key")]);
+        let output = tool
+            .run(r#"{"action":"set_env","name":"synthetic","key":"API_TOKEN"}"#)
+            .await
+            .unwrap();
+        assert!(output.contains("mcp_synthetic_API_TOKEN"), "{output}");
+        assert!(!output.contains("sk-synthetic-test-key"), "{output}");
+        assert_eq!(env_keys(&store), vec!["API_TOKEN".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn set_env_without_a_stored_value_names_the_owner_command() {
+        let (tool, store, _secrets) = tool_with(&[]);
+        let output = tool
+            .run(r#"{"action":"set_env","name":"synthetic","key":"API_TOKEN"}"#)
+            .await
+            .unwrap();
+        assert!(
+            output.contains("aidaemon keychain set mcp_synthetic_API_TOKEN"),
+            "{output}"
+        );
+        assert!(env_keys(&store).is_empty());
     }
 }

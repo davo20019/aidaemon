@@ -31,6 +31,15 @@ pub struct McpServerEntry {
     pub db_id: Option<i64>,
 }
 
+/// What [`McpRegistry::set_server_env`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerEnvBinding {
+    /// The env var now reads its value from `secret_key`.
+    Bound { secret_key: String },
+    /// The secret store holds nothing under `secret_key`; nothing changed.
+    MissingSecret { secret_key: String },
+}
+
 /// Summary info about a registered MCP server (for list action).
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields used by ManageMcpTool list action
@@ -240,16 +249,26 @@ impl McpRegistry {
         Ok(())
     }
 
-    /// Store an env var value in the OS keychain for an MCP server.
-    pub async fn set_server_env(&self, name: &str, key: &str, value: &str) -> anyhow::Result<()> {
+    /// The secret-store key server `name`'s env var `key` is read from.
+    pub fn env_secret_key(name: &str, key: &str) -> String {
+        format!("mcp_{}_{}", name, key)
+    }
+
+    /// Bind env var `key` of server `name` to its value in the secret store
+    /// ([`Self::env_secret_key`]), which the owner put there themselves; the
+    /// value is never an argument. Only a reference is recorded (in memory
+    /// and in the server's database row); `restart_server()` and `enable`
+    /// resolve the value from the secret store before spawning. When the
+    /// store holds no value, nothing changes and the key it should be under
+    /// is returned.
+    pub async fn set_server_env(&self, name: &str, key: &str) -> anyhow::Result<ServerEnvBinding> {
         Self::validate_server_name(name)?;
         Self::validate_env_key(key)?;
-        let keychain_key = format!("mcp_{}_{}", name, key);
-        self.secrets.set(&keychain_key, value)?;
+        let secret_key = Self::env_secret_key(name, key);
+        if !self.secrets.contains(&secret_key) {
+            return Ok(ServerEnvBinding::MissingSecret { secret_key });
+        }
 
-        // Update the env_keys in memory and DB.
-        // Store only a sentinel — real value stays in keychain only.
-        // restart_server() resolves the actual value from keychain before spawning.
         let mut servers = self.servers.write().await;
         if let Some(entry) = servers.get_mut(name) {
             entry
@@ -272,10 +291,27 @@ impl McpRegistry {
                 };
                 self.state.update_dynamic_mcp_server(&server_record).await?;
             }
+        } else {
+            drop(servers);
+            // Not running (a disabled server): record the key on its row so
+            // `enable` resolves it.
+            let Some(mut record) = self.find_dynamic_server_by_name(name).await? else {
+                anyhow::bail!("MCP server '{}' not found", name);
+            };
+            let mut env_keys: Vec<String> =
+                serde_json::from_str(&record.env_keys_json).unwrap_or_default();
+            if !env_keys.iter().any(|existing| existing == key) {
+                env_keys.push(key.to_string());
+            }
+            record.env_keys_json = serde_json::to_string(&env_keys)?;
+            self.state.update_dynamic_mcp_server(&record).await?;
         }
 
-        info!(server = name, key, "Stored MCP server env var in keychain");
-        Ok(())
+        info!(
+            server = name,
+            key, "Bound MCP server env var to the secret store"
+        );
+        Ok(ServerEnvBinding::Bound { secret_key })
     }
 
     /// Restart an MCP server (re-spawn with fresh env from keychain).

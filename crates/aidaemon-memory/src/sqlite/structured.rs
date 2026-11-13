@@ -156,15 +156,14 @@ fn split_legacy_people(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// A value that asks to forget rather than state something.
-fn is_retraction_value(value: &str) -> bool {
+/// A value that carries nothing to store. An extraction pass that emits a
+/// placeholder for "absent" is not stating a value either.
+fn is_placeholder_value(value: &str) -> bool {
     let value = value.trim();
     value.is_empty()
-        || [
-            "none", "null", "n/a", "delete", "remove", "deleted", "removed", "forget",
-        ]
-        .iter()
-        .any(|marker| value.eq_ignore_ascii_case(marker))
+        || ["none", "null", "n/a", "unknown"]
+            .iter()
+            .any(|marker| value.eq_ignore_ascii_case(marker))
 }
 
 fn confidence(source: &str, direct: bool) -> f32 {
@@ -663,11 +662,9 @@ async fn write_fact(
     result: &mut PersonalMemoryWriteResult,
 ) -> anyhow::Result<()> {
     let pred = predicate(&candidate.predicate);
-    if is_retraction_value(&candidate.value) {
-        // "delete"/"none" is the writer asking to forget the predicate, not
-        // a value to store: stored, it rendered as `residence = delete` and
-        // left the old value active beside it. Only the owner's own word
-        // forgets; an extraction pass reading "none" changes nothing.
+    if candidate.retract {
+        // A typed forget. Only the owner's own word forgets; an extraction
+        // pass asking to retract changes nothing.
         if !direct || low_authority(source) {
             return Ok(());
         }
@@ -682,6 +679,13 @@ async fn write_fact(
         .await?;
         let retracted = retract(tx, "memory_entity_facts", "fact", &ids, source).await?;
         result.superseded_facts += retracted as usize;
+        return Ok(());
+    }
+    // Nothing to store: an empty value, or an extraction pass's placeholder
+    // for "absent". The owner saying "none" ("allergies: none") is a value.
+    if candidate.value.trim().is_empty()
+        || ((!direct || low_authority(source)) && is_placeholder_value(&candidate.value))
+    {
         return Ok(());
     }
     let (normalized, value_type) = normalized_fact(&pred, &candidate.value)?;
@@ -1829,6 +1833,7 @@ impl SqliteMemory {
                     display_value: None,
                     valid_from: None,
                     valid_to: None,
+                    retract: false,
                 },
                 "legacy",
                 provenance.as_deref(),
@@ -2172,6 +2177,7 @@ impl SqliteMemory {
                     display_value: None,
                     valid_from: None,
                     valid_to: None,
+                    retract: false,
                 }),
             }
             let result = self

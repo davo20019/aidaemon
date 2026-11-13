@@ -3863,14 +3863,8 @@ impl TerminalTool {
     ) -> Result<Option<aidaemon_core::OwnerApprovalRequest>, String> {
         let args: TerminalArgs = Self::read_arguments(arguments)?;
         let (subject, ask) = match TerminalAction::parse(&args.action) {
-            // Always asked: the card is the only way trust-all turns on.
-            TerminalAction::TrustAll => (
-                Self::TRUST_ALL_SUBJECT.to_string(),
-                LadderAsk {
-                    risk: RiskLevel::Critical,
-                    warnings: Self::trust_all_warnings(),
-                },
-            ),
+            // Not a tool action any more: the call only says so.
+            TerminalAction::TrustAll => return Ok(None),
             TerminalAction::Run | TerminalAction::Unrecognized => {
                 // Neither or both of command and script: the tool refuses it.
                 let Some(command) = Self::run_command(&args) else {
@@ -3911,11 +3905,11 @@ impl TerminalTool {
                 )
                 .await;
         }
-        // A command's card says what it does from its structure; the
-        // trust-all switch keeps its own wording.
-        let card = (subject != Self::TRUST_ALL_SUBJECT)
-            .then(|| aidaemon_tools::command_effects::command_card(&subject, call_title(&args)))
-            .map(Box::new);
+        // A command's card says what it does from its structure.
+        let card = Some(Box::new(aidaemon_tools::command_effects::command_card(
+            &subject,
+            call_title(&args),
+        )));
         Ok(Some(aidaemon_core::OwnerApprovalRequest {
             card,
             effects: Vec::new(),
@@ -4363,61 +4357,45 @@ impl TerminalTool {
         Ok(cleaned)
     }
 
-    /// Enable trust-all mode: auto-approve all commands without prompting.
-    /// Requires user approval since this is a security-sensitive action.
-    /// The owner's card for enabling trust-all mode (asked by the kernel).
-    const TRUST_ALL_SUBJECT: &'static str = "ENABLE TRUST-ALL MODE";
-
-    fn trust_all_warnings() -> Vec<String> {
-        vec![
-            "All future commands will run without approval".to_string(),
-            "This includes dangerous commands (rm, sudo, etc.)".to_string(),
-            "Persists across restarts".to_string(),
-        ]
+    /// Whether trust-all mode (every command auto-approved) is on for this
+    /// backend.
+    pub async fn trust_all_enabled(&self) -> bool {
+        self.allowed_prefixes.read().await.iter().any(|p| p == "*")
     }
 
-    /// Enable trust-all mode: only with the kernel's approval (the owner
-    /// approved the card its rules asked for this call).
-    async fn handle_trust_all(
-        &self,
-        kernel_approved: Option<&crate::tools::traits::ApprovalScope>,
-    ) -> anyhow::Result<String> {
-        {
-            let prefixes = self.allowed_prefixes.read().await;
-            if prefixes.iter().any(|p| p == "*") {
-                return Ok(
-                    "Trust-all mode is already enabled. All commands are auto-approved."
-                        .to_string(),
-                );
-            }
-        }
-        if kernel_approved != Some(&crate::tools::traits::ApprovalScope::Call) {
-            anyhow::bail!(
-                "terminal trust_all requires approval through the agent kernel; it was called \
-                 outside an approved agent call"
-            );
-        }
+    /// Turn trust-all mode on or off. Only the owner's `/trustall` command
+    /// calls this; the model has no way to.
+    pub async fn set_trust_all(&self, on: bool) -> anyhow::Result<()> {
         let mut prefixes = self.allowed_prefixes.write().await;
-        if !prefixes.iter().any(|p| p == "*") {
+        let enabled = prefixes.iter().any(|p| p == "*");
+        if on == enabled {
+            return Ok(());
+        }
+        if on {
             prefixes.push("*".to_string());
-            info!("Trust-all mode enabled: all commands will be auto-approved");
-            if let Some(ref pool) = self.pool
-                && let Err(e) = sqlx::query(
-                    "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
-                        (backend_scope, prefix) VALUES (?, '*')",
-                )
+        } else {
+            prefixes.retain(|p| p != "*");
+        }
+        if let Some(ref pool) = self.pool {
+            let query = if on {
+                "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
+                    (backend_scope, prefix) VALUES (?, '*')"
+            } else {
+                "DELETE FROM terminal_backend_allowed_prefixes
+                    WHERE backend_scope = ? AND prefix = '*'"
+            };
+            sqlx::query(query)
                 .bind(self.backend.approval_scope())
                 .execute(pool)
-                .await
-            {
-                warn!("Failed to persist trust-all mode: {}", e);
-            }
+                .await?;
         }
-        Ok(
-            "Trust-all mode enabled. All commands will now run without approval prompts."
-                .to_string(),
-        )
+        info!(on, "Trust-all mode changed by the owner");
+        Ok(())
     }
+
+    /// The reply to a model still calling the retired `trust_all` action.
+    const TRUST_ALL_RETIRED: &'static str = "Nothing changed: trust-all mode is not a terminal \
+        action. Only the owner can turn it on or off, with the /trustall command.";
 
     fn prune_completed_map(completed: &mut HashMap<u32, CompletedProcess>) {
         const COMPLETED_TTL: Duration = Duration::from_secs(10 * 60);
@@ -6543,10 +6521,9 @@ impl TerminalTool {
                     .ok_or_else(|| anyhow::anyhow!("pid is required for action=\"kill\""))?;
                 self.handle_kill(pid).await?
             }
-            TerminalAction::TrustAll => ToolCallOutcome::from_output(
-                self.handle_trust_all(exec_ctx.kernel_approved.as_ref())
-                    .await?,
-            ),
+            TerminalAction::TrustAll => {
+                ToolCallOutcome::from_output(Self::TRUST_ALL_RETIRED.to_string())
+            }
             TerminalAction::Run | TerminalAction::Unrecognized => {
                 // "run", the default, or any other spelling
                 let command = args
@@ -7407,7 +7384,7 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
         TerminalAction::Check => ToolCallSemantics::observation()
             .with_verification_mode(ToolVerificationMode::ResultContent),
         TerminalAction::Kill => ToolCallSemantics::mutation(),
-        TerminalAction::TrustAll => ToolCallSemantics::administrative(),
+        TerminalAction::TrustAll => ToolCallSemantics::observation(),
         TerminalAction::Run | TerminalAction::Unrecognized => {
             let has_write_targets = args.as_ref().is_some_and(|value| {
                 ["write_paths", "write_roots"].into_iter().any(|field| {
@@ -7697,9 +7674,11 @@ fn terminal_call_effects_on(arguments: &str, local: bool) -> aidaemon_core::Call
                 without_local_paths(effects)
             }
         }
-        // `kill` signals a process and `trust_all` changes a standing rule;
-        // a non-canonical spelling is executed as a run nobody declared.
-        TerminalAction::Kill | TerminalAction::TrustAll | TerminalAction::Unrecognized => {
+        // The retired `trust_all` changes nothing.
+        TerminalAction::TrustAll => aidaemon_core::CallEffects::none(),
+        // `kill` signals a process; a non-canonical spelling is executed as
+        // a run nobody declared.
+        TerminalAction::Kill | TerminalAction::Unrecognized => {
             aidaemon_core::CallEffects::unknown()
         }
     }
@@ -7807,8 +7786,8 @@ impl Tool for TerminalTool {
                     },
                     "action": {
                         "type": "string",
-                        "enum": ["run", "check", "kill", "trust_all"],
-                        "description": "run, check, kill, or trust_all"
+                        "enum": ["run", "check", "kill"],
+                        "description": "run, check, or kill"
                     },
                     "detach": {
                         "type": "boolean",
@@ -7944,11 +7923,8 @@ impl crate::tools::traits::ToolSemantics for TerminalTool {
         match TerminalAction::parse(&args.action) {
             TerminalAction::Check => aidaemon_core::ToolAnnotations::READ_ONLY,
             TerminalAction::Kill => aidaemon_core::ToolAnnotations::WRITE,
-            // Changes a standing rule.
-            TerminalAction::TrustAll => aidaemon_core::ToolAnnotations {
-                egress: true,
-                ..aidaemon_core::ToolAnnotations::WRITE
-            },
+            // Retired: the call only says so.
+            TerminalAction::TrustAll => aidaemon_core::ToolAnnotations::READ_ONLY,
             // A non-canonical spelling executes as a run.
             TerminalAction::Run | TerminalAction::Unrecognized => {
                 terminal_run_annotations(&args, self.confinement, roots)
@@ -14499,11 +14475,14 @@ mod call_effects_tests {
             r#"{"action":"check","pid":42}"#,
         );
         assert_eq!(check, CallEffects::none());
-        for other in [
-            r#"{"action":"kill","pid":42}"#,
-            r#"{"action":"trust_all"}"#,
-            "{",
-        ] {
+        assert_eq!(
+            terminal_call_effects(
+                &*aidaemon_tools::testing::active_execution_backend(),
+                r#"{"action":"trust_all"}"#
+            ),
+            CallEffects::none()
+        );
+        for other in [r#"{"action":"kill","pid":42}"#, "{"] {
             assert_eq!(
                 terminal_call_effects(&*aidaemon_tools::testing::active_execution_backend(), other),
                 CallEffects::unknown(),

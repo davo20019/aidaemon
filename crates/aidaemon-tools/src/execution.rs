@@ -51,6 +51,11 @@ pub struct ExecutionConfig {
     /// the selected OS account/container and are governed by terminal approval.
     #[serde(default)]
     pub allow_outside_workspace: Option<bool>,
+    /// Extra host variable names local commands inherit, on top of
+    /// [`crate::local_backend::LOCAL_ENV_ALLOWLIST`] (a trailing `*` is a
+    /// prefix). The daemon's other variables never reach a command.
+    #[serde(default)]
+    pub env_allowlist: Vec<String>,
     #[cfg_attr(not(feature = "docker"), allow(dead_code))]
     #[serde(default)]
     pub docker: DockerExecutionConfig,
@@ -64,6 +69,7 @@ impl Default for ExecutionConfig {
             backend: default_execution_backend(),
             workspace_root: None,
             allow_outside_workspace: None,
+            env_allowlist: Vec::new(),
             docker: DockerExecutionConfig::default(),
             ssh: SshExecutionConfig::default(),
         }
@@ -211,11 +217,12 @@ fn default_true() -> bool {
 
 /// The local backend `[execution]` describes.
 pub async fn local_backend(config: &ExecutionConfig) -> anyhow::Result<LocalBackend> {
-    LocalBackend::new(
+    Ok(LocalBackend::new(
         config.workspace_root.as_deref(),
         config.effective_allow_outside_workspace(),
     )
-    .await
+    .await?
+    .with_env_allowlist(config.env_allowlist.iter().cloned()))
 }
 
 pub async fn build_execution_backend(
@@ -1381,6 +1388,35 @@ mod tests {
         let backend = local_backend(&config).await.unwrap();
         assert!(backend.resolve_path("ok.txt").await.is_ok());
         assert!(backend.resolve_path("/etc/passwd").await.is_err());
+    }
+
+    /// A daemon secret in the process environment never reaches a command
+    /// on the local backend; an allowlisted variable does, and so does one
+    /// the request sets itself.
+    #[tokio::test]
+    async fn local_commands_do_not_inherit_daemon_secrets() {
+        // SAFETY: names unique to this test; nothing else reads them.
+        unsafe {
+            std::env::set_var("AIDAEMON_SYNTHETIC_SECRET_KEY", "synthetic-secret-value");
+            std::env::set_var("AIDAEMON_SYNTHETIC_ALLOWED", "synthetic-allowed-value");
+        }
+        let backend =
+            LocalBackend::current_unrestricted().with_env_allowlist(["AIDAEMON_SYNTHETIC_ALLOWED"]);
+        let mut request = ExecutionRequest::shell("env");
+        request.env.insert(
+            "AIDAEMON_REQUEST_VAR".to_string(),
+            "set-by-request".to_string(),
+        );
+        let output = backend
+            .execute(request, std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        let env = output.stdout_lossy();
+        assert!(!env.contains("synthetic-secret-value"), "{env}");
+        assert!(env.contains("AIDAEMON_SYNTHETIC_ALLOWED=synthetic-allowed-value"));
+        assert!(env.contains("AIDAEMON_REQUEST_VAR=set-by-request"));
+        assert!(env.contains("PATH="), "{env}");
+        assert!(env.contains("HOME="), "{env}");
     }
 
     #[test]

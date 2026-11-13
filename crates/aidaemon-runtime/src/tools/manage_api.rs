@@ -50,7 +50,9 @@ struct ManageApiArgs {
     token_url: Option<String>,
     scopes: Option<Vec<String>>,
     client_id: Option<String>,
-    client_secret: Option<String>,
+    /// Retired: a secret is never an argument. Read unseen and dropped.
+    #[serde(default)]
+    client_secret: Option<serde::de::IgnoredAny>,
     docs_url: Option<String>,
     openapi_url: Option<String>,
     learn_url: Option<String>,
@@ -510,31 +512,37 @@ impl ManageApiTool {
             );
         }
 
-        match (&args.client_id, &args.client_secret) {
-            (Some(client_id), Some(client_secret)) => {
-                Self::send_stage(
-                    status_tx,
-                    format!("Storing OAuth client credentials for `{}`.", service),
-                )
-                .await;
-                let credential_args = json!({
-                    "action": "set_credentials",
-                    "service": service,
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                });
-                sections.push(
-                    self.manage_oauth
-                        .execute(
-                            &credential_args.to_string(),
-                            &crate::tools::traits::ToolCallContext::default(),
-                        )
-                        .await?
-                        .output,
-                );
+        // The client id is stored here; the client secret only ever comes
+        // from the keychain, and manage_oauth names the owner's command when
+        // it is missing.
+        if args.client_id.is_some() || args.client_secret.is_some() {
+            Self::send_stage(
+                status_tx,
+                format!("Storing OAuth client credentials for `{}`.", service),
+            )
+            .await;
+            let mut credential_args = json!({
+                "action": "set_credentials",
+                "service": service,
+            });
+            if let Some(client_id) = &args.client_id {
+                credential_args["client_id"] = json!(client_id);
             }
-            (None, None) => {}
-            _ => anyhow::bail!("Provide both client_id and client_secret together, or omit both."),
+            if args.client_secret.is_some() {
+                sections.push(format!(
+                    "The client_secret argument was ignored: secrets are never tool arguments. \
+                     The owner stores it with `aidaemon keychain set oauth_{service}_client_secret`."
+                ));
+            }
+            sections.push(
+                self.manage_oauth
+                    .execute(
+                        &credential_args.to_string(),
+                        &crate::tools::traits::ToolCallContext::default(),
+                    )
+                    .await?
+                    .output,
+            );
         }
 
         if args.connect.unwrap_or(true) {
@@ -986,7 +994,6 @@ fn manage_api_schema() -> Value {
                 "token_url": { "type": "string" },
                 "scopes": { "type": "array", "items": { "type": "string" } },
                 "client_id": { "type": "string" },
-                "client_secret": { "type": "string" },
                 "connect": { "type": "boolean", "description": "Run auth flow now" },
                 "docs_url": { "type": "string" },
                 "openapi_url": { "type": "string" },
@@ -1415,7 +1422,6 @@ mod tests {
                 "token_url": "https://auth.example.invalid/token",
                 "allowed_domains": ["api.example.invalid"],
                 "client_id": "synthetic-client-id",
-                "client_secret": "synthetic-client-secret",
             });
             let OwnerApprovalNeed::Ask(request) = judge_onboard(&tool, register, trusted).await
             else {
@@ -1436,7 +1442,6 @@ mod tests {
                 "service": "synthetic-oauth",
                 "auth_mode": "oauth2_pkce",
                 "client_id": "synthetic-client-id",
-                "client_secret": "synthetic-client-secret",
             });
             assert_eq!(
                 judge_onboard(&tool, connect_only, trusted).await,

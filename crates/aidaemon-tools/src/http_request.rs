@@ -167,6 +167,12 @@ pub type SharedHttpProfiles = Arc<RwLock<HashMap<String, HttpAuthProfile>>>;
 pub struct HttpRequestTool {
     profiles: Arc<RwLock<HashMap<String, HttpAuthProfile>>>,
     oauth_gateway: Arc<RwLock<Option<Arc<dyn OAuthTokens>>>>,
+    /// Client for public hosts: every connection resolves through
+    /// [`crate::web::PublicOnlyResolver`], so a name that passed the SSRF
+    /// check cannot answer with a private address at connect time.
+    public_client: Arc<std::sync::OnceLock<reqwest::Client>>,
+    /// Client for localhost and owner-approved local sites.
+    local_client: Arc<std::sync::OnceLock<reqwest::Client>>,
     #[cfg(test)]
     oauth_refresh_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -179,9 +185,32 @@ impl HttpRequestTool {
         Self {
             profiles,
             oauth_gateway: Arc::new(RwLock::new(None)),
+            public_client: Arc::new(std::sync::OnceLock::new()),
+            local_client: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             oauth_refresh_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// The shared client for this destination. Redirects are followed by
+    /// hand so each hop is re-checked; the timeout is set per request.
+    fn client(&self, local: bool) -> anyhow::Result<reqwest::Client> {
+        let cell = if local {
+            &self.local_client
+        } else {
+            &self.public_client
+        };
+        if let Some(client) = cell.get() {
+            return Ok(client.clone());
+        }
+        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        if !local {
+            builder = builder.dns_resolver(Arc::new(crate::web::PublicOnlyResolver));
+        }
+        let client = builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
+        Ok(cell.get_or_init(|| client).clone())
     }
 
     pub fn with_oauth_gateway(mut self, gateway: impl OAuthTokens + 'static) -> Self {
@@ -1294,6 +1323,7 @@ impl HttpRequestTool {
         profiles_snapshot: &HashMap<String, HttpAuthProfile>,
         follow_redirects: bool,
         local_site: Option<&str>,
+        timeout: Duration,
     ) -> anyhow::Result<(reqwest::Response, usize)> {
         let mut current_url = url.to_string();
         let mut current_method = method.to_string();
@@ -1310,7 +1340,8 @@ impl HttpRequestTool {
                 "PATCH" => client.patch(&current_url),
                 "DELETE" => client.delete(&current_url),
                 _ => return Err(anyhow::anyhow!("Unsupported method: {}", current_method)),
-            };
+            }
+            .timeout(timeout);
 
             if let Some(ct) = content_type {
                 builder = builder.header("Content-Type", ct);
@@ -1921,11 +1952,8 @@ impl HttpRequestTool {
         }
 
         // Step 9: Execute request, optionally refreshing OAuth-backed bearer auth once on 401.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
+        let client = self.client(is_localhost || local_site.is_some())?;
+        let timeout = Duration::from_secs(timeout_secs);
         if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE") {
             return Ok((format!("Unsupported method: {}", method), None, None));
         }
@@ -1943,6 +1971,7 @@ impl HttpRequestTool {
                 &profiles_snapshot,
                 follow_redirects,
                 local_site.as_deref(),
+                timeout,
             )
             .await?;
 
@@ -1979,6 +2008,7 @@ impl HttpRequestTool {
                                     &refreshed_profiles,
                                     follow_redirects,
                                     None,
+                                    timeout,
                                 )
                                 .await?;
                             let retry_status = retry_response.status();
@@ -4569,6 +4599,39 @@ mod tests {
 
     fn local_tool() -> HttpRequestTool {
         HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())))
+    }
+
+    /// The pre-request SSRF check and the connection look a name up
+    /// separately. The public client re-checks at connect time, so a name
+    /// that answers with a private address there is refused even if the
+    /// check before it passed.
+    #[tokio::test]
+    async fn the_public_client_refuses_a_private_address_at_connect() {
+        let (url, count, server) = spawn_counting_status_server("200 OK").await;
+        let port = reqwest::Url::parse(&url).unwrap().port().unwrap();
+        let tool = local_tool();
+        let error = tool
+            .client(false)
+            .unwrap()
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .await
+            .expect_err("a private address must be refused at connect");
+        let chain = format!("{error:?}");
+        assert!(chain.contains("blocked address"), "{chain}");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // The local client, used only for localhost and approved local
+        // sites, reaches it.
+        let response = tool
+            .client(true)
+            .unwrap()
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        server.abort();
     }
 
     /// Outside a kernel-approved call, a write needs a typed approval scope:

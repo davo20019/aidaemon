@@ -333,6 +333,7 @@ fn owner_write(predicate: &str, value: &str, correction: bool) -> PersonalMemory
             display_value: None,
             valid_from: None,
             valid_to: None,
+            retract: false,
         }],
         direct_user_statement: true,
         correction,
