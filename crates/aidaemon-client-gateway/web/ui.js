@@ -644,7 +644,8 @@ export class Screen {
             hint = this.flash;
         }
         else if (this.armedCard() && !input.value) {
-            hint = "Press y / s / a / n to answer the card";
+            const keys = this.armedCard().options.map((d) => DECISIONS[d].key);
+            hint = `Press ${keys.join(" / ")} to answer the card`;
         }
         else {
             hint = "Enter send · Esc stop · Ctrl+K sessions and commands · Alt+N new session";
