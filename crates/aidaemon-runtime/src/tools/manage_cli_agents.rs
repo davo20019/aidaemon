@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use tracing::info;
 
 use crate::tools::cli_agent::CliAgentTool;
-use crate::traits::{
+use crate::tools::traits::{
     semantics_for_exact_read_actions, DynamicCliAgentStore, OwnerApprovalNeed, Tool,
     ToolCallContext, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
 };
@@ -24,7 +24,7 @@ impl ManageCliAgentsTool {
     /// The owner approval for one call. Registering a CLI agent always asks,
     /// even in a trusted session; a call the add path refuses (no name or
     /// command, unreadable arguments) never runs and needs no card.
-    pub(crate) fn owner_approval(arguments: &Value) -> OwnerApprovalNeed {
+    pub fn owner_approval(arguments: &Value) -> OwnerApprovalNeed {
         let Ok(args) = serde_json::from_value::<ManageCliAgentsArgs>(arguments.clone()) else {
             return OwnerApprovalNeed::NotNeeded;
         };
@@ -252,13 +252,13 @@ impl Tool for ManageCliAgentsTool {
     async fn execute(
         &self,
         arguments: &str,
-        facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        facts: &crate::tools::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::tools::traits::ToolCallOutcome> {
         let facts = facts.clone();
 
         self.run(arguments, &facts)
             .await
-            .map(crate::traits::ToolCallOutcome::from_output)
+            .map(crate::tools::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -334,13 +334,13 @@ impl ManageCliAgentsTool {
 }
 
 #[async_trait]
-impl crate::traits::ToolSemantics for ManageCliAgentsTool {
+impl crate::tools::traits::ToolSemantics for ManageCliAgentsTool {
     /// Registering an agent asks the owner, whatever the session. The
     /// dispatcher runs the call only with that answer; a decline is recorded
     /// by the kernel.
     async fn owner_approval_request(
         &self,
-        call: &crate::traits::ApprovalCall<'_>,
+        call: &crate::tools::traits::ApprovalCall<'_>,
         _facts: &ToolCallContext,
     ) -> OwnerApprovalNeed {
         if call.refused {

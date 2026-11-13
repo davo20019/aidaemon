@@ -2,7 +2,7 @@ pub mod approval;
 #[cfg(feature = "slack")]
 #[cfg(feature = "slack")]
 mod channel_history;
-pub(crate) mod cli_agent;
+pub(crate) use aidaemon_runtime::tools::cli_agent;
 #[cfg(feature = "computer_use")]
 #[allow(dead_code)]
 pub mod computer_use;
@@ -23,6 +23,7 @@ pub(crate) mod manage_automations;
 pub(crate) mod manage_mandates;
 mod manage_memories;
 pub(crate) mod objective_status;
+#[cfg(feature = "computer_use")]
 pub(crate) use aidaemon_tools::owner_answers;
 mod policy_metrics;
 pub use aidaemon_tools::result_spill;
@@ -81,8 +82,7 @@ mod manage_oauth;
 pub use manage_oauth::ManageOAuthTool;
 pub mod manage_mcp;
 
-mod manage_cli_agents;
-pub use manage_cli_agents::ManageCliAgentsTool;
+pub use aidaemon_runtime::tools::manage_cli_agents::ManageCliAgentsTool;
 pub mod manage_goal_tasks;
 pub use manage_goal_tasks::ManageGoalTasksTool;
 pub mod report_blocker;
@@ -90,7 +90,6 @@ pub use aidaemon_client_gateway::client_view::ClientViewTool;
 pub use aidaemon_skills::tools::{ManageSkillsTool, SkillResourcesTool, UseSkillTool};
 pub(crate) use aidaemon_tools::command_effects;
 pub use aidaemon_tools::command_risk;
-pub use aidaemon_tools::daemon_guard;
 pub use manage_mcp::ManageMcpTool;
 pub use report_blocker::ReportBlockerTool;
 

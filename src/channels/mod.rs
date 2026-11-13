@@ -10,7 +10,6 @@ pub(crate) mod discord;
 pub(crate) use aidaemon_channels::live_status;
 #[cfg(test)]
 pub(crate) mod mock_api;
-use aidaemon_channels::presentation;
 pub(crate) mod set_key;
 #[cfg(feature = "slack")]
 pub(crate) mod slack;
@@ -28,7 +27,6 @@ use std::sync::Arc;
 pub use aidaemon_channels::hub::{ChannelHub, SessionMap};
 #[cfg(feature = "discord")]
 pub use discord::{spawn_discord_channel, DiscordChannel};
-pub(crate) use presentation::present_notification;
 #[cfg(feature = "slack")]
 pub use slack::{spawn_slack_channel, SlackChannel};
 pub(crate) use telegram::{new_telegram_bot, TelegramBot};

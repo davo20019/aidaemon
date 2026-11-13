@@ -69,7 +69,6 @@ REEXPORTS = {
     "llm_runtime",
     "mcp",
     "oauth",
-    "project_instructions.rs",
     "router.rs",
     "skills",
     "traits",
@@ -82,7 +81,6 @@ REEXPORTS = {
 PENDING = {
     "channels": "9.5: the daemon's channel hosts",
     "tools": "9.4: cli_agent, manage_cli_agents, computer_use, spawn, file policy wrappers",
-    "cli_agent_flags.rs": "9.4: cli_agent",
     "state": "9.3/9.6: the SQLite store behind the facade traits",
     "memory": "9.1/9.6: memory host adapters, procedures, task learning, retention",
     "nodes": "9.6: nodes host",

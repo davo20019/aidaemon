@@ -8,7 +8,6 @@ use tracing::info;
 use crate::config::AppConfig;
 use crate::events::EventStore;
 use crate::health::HealthProbeStore;
-use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
 use crate::nodes::tool::{
     ManageNodeMonitorsTool, ReadNodeHealthTool, ReadNodeSensorsTool, SendNodeAudioTool,
@@ -77,7 +76,6 @@ pub struct ToolSetupDependencies {
     pub memory: ToolMemoryAccess,
     pub pool: SqlitePool,
     pub event_store: Arc<EventStore>,
-    pub llm_runtime: SharedLlmRuntime,
     pub side_calls: crate::llm_runtime::gateway::SideCallGateway,
     pub health_store: Option<Arc<HealthProbeStore>>,
     pub approval_capacity: usize,
@@ -101,7 +99,6 @@ pub async fn setup_tools(
         memory,
         pool,
         event_store,
-        llm_runtime,
         side_calls,
         health_store,
         approval_capacity,
@@ -143,7 +140,6 @@ pub async fn setup_tools(
         memory.clone(),
         pool.clone(),
         event_store,
-        llm_runtime.clone(),
         health_store,
         media_tx.clone(),
         execution_backend.clone(),
@@ -729,7 +725,6 @@ pub async fn register_optional_tools(
     memory: ToolMemoryAccess,
     pool: SqlitePool,
     event_store: Arc<EventStore>,
-    llm_runtime: SharedLlmRuntime,
     health_store: Option<Arc<HealthProbeStore>>,
     media_tx: mpsc::Sender<MediaMessage>,
     execution_backend: crate::execution::SharedExecutionBackend,
@@ -871,7 +866,6 @@ pub async fn register_optional_tools(
                     execution_backend.clone(),
                     config.cli_agents.clone(),
                     state.clone(),
-                    llm_runtime.clone(),
                 )
                 .await;
                 if memory.own_memory {
@@ -1350,10 +1344,8 @@ async fn build_base_tool(
 mod tests {
     use super::*;
     use crate::events::EventStoreForTests as _;
-    use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::testing::MockProvider;
     use proptest::prelude::*;
     use serde_json::json;
     use std::collections::HashSet;
@@ -1394,7 +1386,6 @@ mod tests {
         let event_store = Arc::new(EventStore::new(state.pool()).await?);
         let config_file = NamedTempFile::new()?;
 
-        let model_provider = Arc::new(MockProvider::new()) as crate::llm_runtime::ModelBackend;
         let mut bundle = build_base_tools(
             &config,
             config_file.path().to_path_buf(),
@@ -1411,12 +1402,6 @@ mod tests {
             8,
         )
         .await?;
-        let llm_runtime = SharedLlmRuntime::new(
-            model_provider,
-            router_from_models(config.provider.models.clone()),
-            config.provider.kind,
-            config.provider.models.primary.clone(),
-        );
         let _optional = register_optional_tools(
             &mut bundle.tools,
             &config,
@@ -1427,7 +1412,6 @@ mod tests {
             },
             state.pool(),
             event_store.clone(),
-            llm_runtime,
             None,
             bundle.media_tx.clone(),
             crate::execution::active_execution_backend(),

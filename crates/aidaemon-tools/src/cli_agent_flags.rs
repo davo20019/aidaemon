@@ -1,3 +1,7 @@
+//! The terminal agents' (codex, claude, gemini, opencode) launch flags: their
+//! names, defaults kept in the settings store, and flags discovered from
+//! `--help`.
+
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::time::Duration;
@@ -6,39 +10,39 @@ use regex::Regex;
 use std::sync::LazyLock;
 use tokio::process::Command;
 
-use crate::traits::StateStore;
+use crate::services::SettingsStore;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-pub(crate) const AGENT_FLAGS_CACHE_TTL_SECS: i64 = 24 * 60 * 60;
-pub(crate) const MAX_DISCOVERED_AGENT_FLAGS: usize = 512;
-pub(crate) const MAX_DISCOVERED_AGENT_FLAG_CHARS: usize = 96;
-pub(crate) const MAX_DISCOVERED_AGENT_FLAG_DESC_CHARS: usize = 240;
-pub(crate) const AGENT_FLAGS_PAGE_SIZE: usize = 12;
-pub(crate) const SUPPORTED_TERMINAL_AGENTS: &[&str] = &["codex", "claude", "gemini", "opencode"];
-pub(crate) const MAX_TERMINAL_AGENT_ARGS: usize = 24;
-pub(crate) const MAX_TERMINAL_AGENT_ARG_CHARS: usize = 256;
+pub const AGENT_FLAGS_CACHE_TTL_SECS: i64 = 24 * 60 * 60;
+pub const MAX_DISCOVERED_AGENT_FLAGS: usize = 512;
+pub const MAX_DISCOVERED_AGENT_FLAG_CHARS: usize = 96;
+pub const MAX_DISCOVERED_AGENT_FLAG_DESC_CHARS: usize = 240;
+pub const AGENT_FLAGS_PAGE_SIZE: usize = 12;
+pub const SUPPORTED_TERMINAL_AGENTS: &[&str] = &["codex", "claude", "gemini", "opencode"];
+pub const MAX_TERMINAL_AGENT_ARGS: usize = 24;
+pub const MAX_TERMINAL_AGENT_ARG_CHARS: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Structs
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct AgentFlagDoc {
-    pub(crate) flag: String,
+pub struct AgentFlagDoc {
+    pub flag: String,
     #[serde(default)]
-    pub(crate) description: Option<String>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct AgentFlagsCacheEntry {
-    pub(crate) updated_at_unix: i64,
+pub struct AgentFlagsCacheEntry {
+    pub updated_at_unix: i64,
     #[serde(default)]
-    pub(crate) flags: Vec<String>,
+    pub flags: Vec<String>,
     #[serde(default)]
-    pub(crate) docs: Vec<AgentFlagDoc>,
+    pub docs: Vec<AgentFlagDoc>,
 }
 
 // ---------------------------------------------------------------------------
@@ -49,11 +53,23 @@ pub(crate) struct AgentFlagsCacheEntry {
 ///
 /// Reuses the `normalize_terminal_agent_name` from `lib.rs` (which returns
 /// `Option<&'static str>`) and converts to `Option<String>`.
-pub(crate) fn normalize_terminal_agent_name(value: &str) -> Option<String> {
-    crate::normalize_terminal_agent_name(value).map(String::from)
+/// The supported terminal agent `raw` names, case-insensitively.
+pub fn terminal_agent_name(raw: &str) -> Option<&'static str> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "codex" => Some("codex"),
+        "claude" => Some("claude"),
+        "gemini" => Some("gemini"),
+        "opencode" => Some("opencode"),
+        _ => None,
+    }
 }
 
-pub(crate) fn normalize_terminal_agent_args(values: Vec<String>) -> Vec<String> {
+pub fn normalize_terminal_agent_name(value: &str) -> Option<String> {
+    terminal_agent_name(value).map(String::from)
+}
+
+pub fn normalize_terminal_agent_args(values: Vec<String>) -> Vec<String> {
     values
         .into_iter()
         .map(|v| v.trim().to_string())
@@ -67,7 +83,7 @@ pub(crate) fn normalize_terminal_agent_args(values: Vec<String>) -> Vec<String> 
         .collect()
 }
 
-pub(crate) fn normalize_discovered_agent_flags(values: Vec<String>) -> Vec<String> {
+pub fn normalize_discovered_agent_flags(values: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for value in values {
@@ -89,7 +105,7 @@ pub(crate) fn normalize_discovered_agent_flags(values: Vec<String>) -> Vec<Strin
     out
 }
 
-pub(crate) fn normalize_agent_flag_docs(values: Vec<AgentFlagDoc>) -> Vec<AgentFlagDoc> {
+pub fn normalize_agent_flag_docs(values: Vec<AgentFlagDoc>) -> Vec<AgentFlagDoc> {
     let mut out: Vec<AgentFlagDoc> = Vec::new();
     let mut seen: HashMap<String, usize> = HashMap::new();
 
@@ -136,11 +152,7 @@ pub(crate) fn normalize_agent_flag_docs(values: Vec<AgentFlagDoc>) -> Vec<AgentF
 // Formatting
 // ---------------------------------------------------------------------------
 
-pub(crate) fn format_agent_flag_docs(
-    agent: &str,
-    docs: &[AgentFlagDoc],
-    cached: bool,
-) -> Vec<String> {
+pub fn format_agent_flag_docs(agent: &str, docs: &[AgentFlagDoc], cached: bool) -> Vec<String> {
     if docs.is_empty() {
         return vec![format!(
             "### No flags found for `{}`{}\nTry `/agent flags {} refresh`.",
@@ -200,7 +212,7 @@ pub(crate) fn format_agent_flag_docs(
     pages
 }
 
-pub(crate) fn strip_no_default_flag(agent_args: &mut Vec<String>) -> bool {
+pub fn strip_no_default_flag(agent_args: &mut Vec<String>) -> bool {
     let before = agent_args.len();
     agent_args.retain(|arg| arg != "--no-default-flags");
     before != agent_args.len()
@@ -210,7 +222,7 @@ pub(crate) fn strip_no_default_flag(agent_args: &mut Vec<String>) -> bool {
 // Help text parsing
 // ---------------------------------------------------------------------------
 
-pub(crate) fn extract_long_flags_from_help(help_text: &str) -> Vec<String> {
+pub fn extract_long_flags_from_help(help_text: &str) -> Vec<String> {
     static LONG_FLAG_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"--[a-zA-Z0-9][a-zA-Z0-9\-]*").expect("valid long flag regex")
     });
@@ -225,7 +237,7 @@ pub(crate) fn extract_long_flags_from_help(help_text: &str) -> Vec<String> {
     out
 }
 
-pub(crate) fn extract_flag_docs_from_help(help_text: &str) -> Vec<AgentFlagDoc> {
+pub fn extract_flag_docs_from_help(help_text: &str) -> Vec<AgentFlagDoc> {
     static LONG_FLAG_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"--[a-zA-Z0-9][a-zA-Z0-9\-]*").expect("valid long flag regex")
     });
@@ -264,7 +276,7 @@ pub(crate) fn extract_flag_docs_from_help(help_text: &str) -> Vec<AgentFlagDoc> 
 // Discovery
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn discover_agent_flags(agent: &str) -> anyhow::Result<Vec<AgentFlagDoc>> {
+pub async fn discover_agent_flags(agent: &str) -> anyhow::Result<Vec<AgentFlagDoc>> {
     let run_help_cmd = |help_arg: &str| {
         let mut cmd = Command::new(agent);
         cmd.arg(help_arg);
@@ -356,8 +368,8 @@ fn terminal_agent_defaults_key(namespace: &str, user_id: u64, chat_id: i64) -> S
     )
 }
 
-pub(crate) async fn load_agent_flags_cache(
-    state: &dyn StateStore,
+pub async fn load_agent_flags_cache(
+    state: &dyn SettingsStore,
     namespace: &str,
     user_id: u64,
     agent: &str,
@@ -383,8 +395,8 @@ pub(crate) async fn load_agent_flags_cache(
     Some(parsed)
 }
 
-pub(crate) async fn save_agent_flags_cache(
-    state: &dyn StateStore,
+pub async fn save_agent_flags_cache(
+    state: &dyn SettingsStore,
     namespace: &str,
     user_id: u64,
     agent: &str,
@@ -401,8 +413,8 @@ pub(crate) async fn save_agent_flags_cache(
     state.set_setting(&key, &serialized).await
 }
 
-pub(crate) async fn load_terminal_agent_defaults(
-    state: &dyn StateStore,
+pub async fn load_terminal_agent_defaults(
+    state: &dyn SettingsStore,
     namespace: &str,
     chat_id: i64,
     user_id: u64,
@@ -420,8 +432,10 @@ pub(crate) async fn load_terminal_agent_defaults(
             continue;
         };
         let cleaned = normalize_terminal_agent_args(args);
-        let (cleaned, _) =
-            crate::normalize_terminal_agent_permission_aliases(Some(agent_name.as_str()), cleaned);
+        let (cleaned, _) = crate::permission_bypass::normalize_terminal_agent_permission_aliases(
+            Some(agent_name.as_str()),
+            cleaned,
+        );
         if cleaned.is_empty() {
             continue;
         }
@@ -430,8 +444,8 @@ pub(crate) async fn load_terminal_agent_defaults(
     sanitized
 }
 
-pub(crate) async fn save_terminal_agent_defaults(
-    state: &dyn StateStore,
+pub async fn save_terminal_agent_defaults(
+    state: &dyn SettingsStore,
     namespace: &str,
     chat_id: i64,
     user_id: u64,

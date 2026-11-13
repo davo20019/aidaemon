@@ -159,7 +159,6 @@ pub async fn run(
             },
             pool: pool.clone(),
             event_store: event_store.clone(),
-            llm_runtime: llm_runtime.clone(),
             side_calls: side_calls.clone(),
             health_store: health_store.clone(),
             approval_capacity: queue_policy.approval_capacity,

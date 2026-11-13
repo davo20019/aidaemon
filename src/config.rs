@@ -1741,52 +1741,7 @@ fn default_task_token_budget() -> Option<u64> {
     Some(500_000)
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct CliAgentsConfig {
-    #[serde(default = "default_cli_agents_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_cli_agents_timeout_secs")]
-    pub timeout_secs: u64,
-    #[serde(default = "default_cli_agents_max_output_chars")]
-    pub max_output_chars: usize,
-    #[serde(default)]
-    pub tools: HashMap<String, CliToolConfig>,
-}
-
-impl Default for CliAgentsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_cli_agents_enabled(),
-            timeout_secs: default_cli_agents_timeout_secs(),
-            max_output_chars: default_cli_agents_max_output_chars(),
-            tools: HashMap::new(),
-        }
-    }
-}
-
-fn default_cli_agents_enabled() -> bool {
-    false
-}
-
-fn default_cli_agents_timeout_secs() -> u64 {
-    600
-}
-fn default_cli_agents_max_output_chars() -> usize {
-    16000
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct CliToolConfig {
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub max_output_chars: Option<usize>,
-}
+pub use aidaemon_runtime::tools::cli_agent::CliAgentsConfig;
 
 #[allow(unused_imports)]
 pub use aidaemon_tools::web_search::{SearchBackendKind, SearchConfig};

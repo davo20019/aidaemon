@@ -13,30 +13,101 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::daemon_guard::detect_daemonization_primitives;
-use crate::agent::{
+use crate::background_run::BackgroundRun;
+use crate::spawn::{ConversationRequest, ConversationRuntime};
+use crate::tools::traits::{
+    DynamicCliAgent, Message, Tool, ToolArgumentContractViolation, ToolCallAccessManifest,
+    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
+};
+use crate::turn::execution_state::TargetScope;
+use crate::turn::validation_state::{
     derive_executor_step_result, persist_executor_handoff_context, persist_executor_result_context,
-    ExecutorHandoff, TargetScope, TaskValidationOutcome,
+    ExecutorHandoff, TaskValidationOutcome,
 };
-use crate::config::CliAgentsConfig;
-use crate::execution::{
-    BackendFileType, BackendPath, ExecutionRequest, ProcessHandle, SharedExecutionBackend,
-};
-use crate::llm_runtime::SharedLlmRuntime;
-use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
-use crate::traits::{
-    DynamicCliAgent, Message, StateStore, Tool, ToolArgumentContractViolation,
-    ToolCallAccessManifest, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
-    ToolCapabilities, ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
-};
-use crate::types::StatusUpdate;
-use crate::types::{ApprovalResponse, UserRole};
-use crate::utils::{floor_char_boundary, truncate_str, truncate_with_note};
+use aidaemon_channels::ports::OutboundRouter;
 use aidaemon_core::card::Step;
-use aidaemon_runtime::background_run::BackgroundRun;
+use aidaemon_events::text::{truncate_str, truncate_with_note};
+use aidaemon_tools::backend::SharedExecutionBackend;
+use aidaemon_tools::daemon_guard::detect_daemonization_primitives;
 use aidaemon_tools::permission_bypass::strip_permission_bypass_flags;
 #[cfg(test)]
 use aidaemon_tools::permission_bypass::without_permission_bypass;
+use aidaemon_tools::semantics::{ApprovalResponse, UserRole};
+use aidaemon_tools::status::StatusUpdate;
+use aidaemon_tools::text::floor_char_boundary;
+use aidaemon_tools::{BackendFileType, BackendPath, ExecutionRequest, ProcessHandle};
+
+/// What the tool keeps in its host's store: the agents it may run and their
+/// invocation log, the chat's recent history for a run's context, the goal
+/// and task a delegated run reports to, and notices for a chat no one reads.
+pub trait CliAgentStore:
+    aidaemon_tools::services::DynamicCliAgentStore
+    + aidaemon_events::stores::MessageStore
+    + aidaemon_work::stores::GoalStore
+    + aidaemon_work::stores::TaskStore
+    + aidaemon_work::stores::NotificationStore
+{
+}
+
+impl<T> CliAgentStore for T where
+    T: aidaemon_tools::services::DynamicCliAgentStore
+        + aidaemon_events::stores::MessageStore
+        + aidaemon_work::stores::GoalStore
+        + aidaemon_work::stores::TaskStore
+        + aidaemon_work::stores::NotificationStore
+        + ?Sized
+{
+}
+
+/// `[cli_agents]`: the coding agents the daemon may run, and their limits.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CliAgentsConfig {
+    #[serde(default = "default_cli_agents_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_cli_agents_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_cli_agents_max_output_chars")]
+    pub max_output_chars: usize,
+    #[serde(default)]
+    pub tools: HashMap<String, CliToolConfig>,
+}
+
+impl Default for CliAgentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cli_agents_enabled(),
+            timeout_secs: default_cli_agents_timeout_secs(),
+            max_output_chars: default_cli_agents_max_output_chars(),
+            tools: HashMap::new(),
+        }
+    }
+}
+
+fn default_cli_agents_enabled() -> bool {
+    false
+}
+
+fn default_cli_agents_timeout_secs() -> u64 {
+    600
+}
+fn default_cli_agents_max_output_chars() -> usize {
+    16000
+}
+
+/// One `[cli_agents.tools.<name>]` entry.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CliToolConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub max_output_chars: Option<usize>,
+}
 
 /// Max bytes for output buffer (1 MB) to prevent unbounded memory growth.
 const BUFFER_CAP: usize = 1_048_576;
@@ -233,8 +304,7 @@ enum CliWorkspaceMode {
 /// What a delegated CLI agent's sandbox lets it do, as the adapters below
 /// enforce it ([`apply_read_only_cli_adapter`], [`apply_scoped_cli_adapter`]:
 /// the network off, only `:minimal` plus the run's own paths reachable).
-pub const CLI_SANDBOX: aidaemon_runtime::helper_run::CliSandbox =
-    aidaemon_runtime::helper_run::DELEGATED_CLI_SANDBOX;
+pub const CLI_SANDBOX: crate::helper_run::CliSandbox = crate::helper_run::DELEGATED_CLI_SANDBOX;
 
 /// Convert a configured CLI launch into a provider-native, enforceable
 /// read-only invocation. Prompt text is deliberately not part of this
@@ -410,11 +480,11 @@ fn permission_profile_path_key(path: &str) -> Result<&str, String> {
 }
 
 /// How a CLI agent's run ended, as the runtime decided it
-/// ([`aidaemon_runtime::helper_run::program_phase`]).
+/// ([`crate::helper_run::program_phase`]).
 #[derive(Debug, Clone)]
 struct CliRunEnd {
-    phase: aidaemon_runtime::run_state::RunPhase,
-    evidence: aidaemon_runtime::run_state::RunEvidence,
+    phase: crate::run_state::RunPhase,
+    evidence: crate::run_state::RunEvidence,
     changed_something: bool,
 }
 
@@ -610,7 +680,7 @@ fn make_dedup_prompt(prompt: &str) -> String {
 pub struct CliAgentTool {
     /// Stored facts handed to delegated agents, when the daemon's own memory
     /// keeps them.
-    context_facts: Option<Arc<dyn crate::traits::FactStore>>,
+    context_facts: Option<Arc<dyn crate::tools::traits::FactStore>>,
     backend: SharedExecutionBackend,
     // MUST be std::sync::RwLock because schema() is sync
     tools: Arc<std::sync::RwLock<HashMap<String, CliToolEntry>>>,
@@ -618,22 +688,20 @@ pub struct CliAgentTool {
     running: Arc<Mutex<HashMap<String, RunningCliAgent>>>, // task_id -> RunningCliAgent
     completed: Arc<Mutex<HashMap<String, CompletedCliAgent>>>, // task_id -> finalized output
     working_dir_claims: Arc<WorkingDirClaims>, // normalized dir -> claim (std Mutex: see WorkingDirClaimGuard)
-    state: Arc<dyn StateStore>,
-    #[allow(dead_code)] // Reserved for future interactive feedback
-    llm_runtime: SharedLlmRuntime,
+    state: Arc<dyn CliAgentStore>,
     default_timeout: Duration,
     default_max_output: usize,
     max_concurrent: usize,
     concurrency_limiter: Arc<Semaphore>,
     /// The owner's approvals of exact detached/background runs, delivered by
     /// the agent kernel (`record_owner_answer`) and consumed by the run.
-    owner_answers: Arc<crate::tools::owner_answers::OwnerAnsweredCalls>,
+    owner_answers: Arc<aidaemon_tools::owner_answers::OwnerAnsweredCalls>,
     hub: OnceLock<Weak<dyn OutboundRouter>>,
     /// The runtime's run records: an agent left running in the background is
     /// a run there, shown on its turn's card. Wired via [`Self::set_runs`].
-    runs: OnceLock<Arc<aidaemon_runtime::run_state::RunStates>>,
+    runs: OnceLock<Arc<crate::run_state::RunStates>>,
     /// The session checklists a background run's turn waits on.
-    plan_store: OnceLock<Arc<crate::plans::PlanStore>>,
+    plan_store: OnceLock<Arc<aidaemon_work::plans::PlanStore>>,
     /// Re-enter the root agent when background delegation completes so the
     /// delegated step advances the original user outcome instead of ending it.
     agent: OnceLock<Weak<dyn ConversationRuntime>>,
@@ -684,7 +752,7 @@ const CHANGE_RECEIPT_CAP: usize = 100_000;
 /// A receipt of what a run's write roots hold: how many entries, their
 /// total size and the newest change time. Two that differ show the run
 /// changed something there, whatever program it ran and whatever its reply
-/// says ([`aidaemon_runtime::helper_run::ProgramEnd`]).
+/// says ([`crate::helper_run::ProgramEnd`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TreeReceipt {
     entries: usize,
@@ -1025,7 +1093,7 @@ fn first_cli_failure_detail(output: &str) -> String {
 
 impl CliAgentTool {
     async fn persist_delegated_cli_result_with_state(
-        state: Arc<dyn StateStore>,
+        state: Arc<dyn CliAgentStore>,
         delegated_task_id: &str,
         response: Option<&str>,
         error: Option<&str>,
@@ -1384,8 +1452,7 @@ impl CliAgentTool {
     pub async fn discover(
         backend: SharedExecutionBackend,
         config: CliAgentsConfig,
-        state: Arc<dyn StateStore>,
-        llm_runtime: SharedLlmRuntime,
+        state: Arc<dyn CliAgentStore>,
     ) -> Self {
         let default_timeout = Duration::from_secs(config.timeout_secs);
         let default_max_output = config.max_output_chars;
@@ -1475,7 +1542,6 @@ impl CliAgentTool {
             completed: Arc::new(Mutex::new(HashMap::new())),
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state,
-            llm_runtime,
             default_timeout,
             default_max_output,
             max_concurrent: DEFAULT_MAX_CONCURRENT,
@@ -1495,7 +1561,7 @@ impl CliAgentTool {
     }
 
     /// Set channel hub reference for immediate background completion delivery.
-    pub fn with_context_facts(mut self, facts: Arc<dyn crate::traits::FactStore>) -> Self {
+    pub fn with_context_facts(mut self, facts: Arc<dyn crate::tools::traits::FactStore>) -> Self {
         self.context_facts = Some(facts);
         self
     }
@@ -1513,13 +1579,13 @@ impl CliAgentTool {
     }
 
     /// Wire the runtime's run records (see `runs`).
-    pub fn set_runs(&self, runs: Arc<aidaemon_runtime::run_state::RunStates>) {
+    pub fn set_runs(&self, runs: Arc<crate::run_state::RunStates>) {
         let _ = self.runs.set(runs);
     }
 
     /// Where a background run of this tool reports.
-    fn run_home(&self) -> aidaemon_runtime::background_run::RunHome {
-        aidaemon_runtime::background_run::RunHome {
+    fn run_home(&self) -> crate::background_run::RunHome {
+        crate::background_run::RunHome {
             runs: self.runs.get_or_init(Default::default).clone(),
             hub: self.hub.get().cloned(),
             plans: self.plan_store.get().cloned(),
@@ -1527,7 +1593,7 @@ impl CliAgentTool {
     }
 
     /// Wire the session checklists (see `plan_store`).
-    pub fn set_plan_store(&self, plan_store: Arc<crate::plans::PlanStore>) {
+    pub fn set_plan_store(&self, plan_store: Arc<aidaemon_work::plans::PlanStore>) {
         let _ = self.plan_store.set(plan_store);
     }
 
@@ -1539,7 +1605,7 @@ impl CliAgentTool {
         self.agent.get().and_then(|w| w.upgrade())
     }
 
-    pub(crate) fn wiring_ready(&self) -> bool {
+    pub fn wiring_ready(&self) -> bool {
         self.hub.get().and_then(Weak::upgrade).is_some()
             && self.agent.get().and_then(Weak::upgrade).is_some()
     }
@@ -1898,8 +1964,11 @@ impl CliAgentTool {
         // AIDaemon's direct-agent behavior.
         let mut project_instructions_text = String::new();
         if let Some(dir) = working_dir {
-            match crate::project_instructions::load_project_instructions(self.backend.clone(), dir)
-                .await
+            match crate::turn::project_instructions::load_project_instructions(
+                self.backend.clone(),
+                dir,
+            )
+            .await
             {
                 Ok(Some(instructions)) => {
                     project_instructions_text = instructions.render_for_prompt();
@@ -2061,7 +2130,7 @@ impl CliAgentTool {
         working_dir: &str,
     ) -> Option<String> {
         let directory = BackendPath::new(working_dir);
-        let git_check = crate::tools::fs_utils::run_cmd_backend(
+        let git_check = aidaemon_tools::fs_utils::run_cmd_backend(
             backend.as_ref(),
             "git rev-parse --git-dir",
             Some(&directory),
@@ -2074,7 +2143,7 @@ impl CliAgentTool {
         }
 
         // Check for uncommitted changes first
-        let diff_stat = crate::tools::fs_utils::run_cmd_backend(
+        let diff_stat = aidaemon_tools::fs_utils::run_cmd_backend(
             backend.as_ref(),
             "git diff --stat",
             Some(&directory),
@@ -2086,7 +2155,7 @@ impl CliAgentTool {
 
         if !stat_output.trim().is_empty() {
             // There are uncommitted changes — capture them
-            let diff = crate::tools::fs_utils::run_cmd_backend(
+            let diff = aidaemon_tools::fs_utils::run_cmd_backend(
                 backend.as_ref(),
                 "git diff",
                 Some(&directory),
@@ -2101,7 +2170,7 @@ impl CliAgentTool {
         }
 
         // No uncommitted changes — check if the agent committed something
-        let log = crate::tools::fs_utils::run_cmd_backend(
+        let log = aidaemon_tools::fs_utils::run_cmd_backend(
             backend.as_ref(),
             "git log -1 --stat --format=%s",
             Some(&directory),
@@ -2112,7 +2181,7 @@ impl CliAgentTool {
         let log_output = log.stdout;
 
         if !log_output.trim().is_empty() {
-            let committed_diff = crate::tools::fs_utils::run_cmd_backend(
+            let committed_diff = aidaemon_tools::fs_utils::run_cmd_backend(
                 backend.as_ref(),
                 "git diff HEAD~1..HEAD",
                 Some(&directory),
@@ -2141,7 +2210,7 @@ impl CliAgentTool {
         working_dir: &str,
     ) -> Option<usize> {
         let directory = BackendPath::new(working_dir);
-        let status = crate::tools::fs_utils::run_cmd_backend(
+        let status = aidaemon_tools::fs_utils::run_cmd_backend(
             backend.as_ref(),
             "git status --porcelain=v1 --untracked-files=all",
             Some(&directory),
@@ -2266,7 +2335,7 @@ impl CliAgentTool {
         enforce_native_access: bool,
         async_mode: bool,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        spec: &aidaemon_runtime::helper_run::HelperSpec,
+        spec: &crate::helper_run::HelperSpec,
         grant_session: &str,
     ) -> anyhow::Result<String> {
         // Get entry from the tools map (clone what we need, release lock)
@@ -2513,7 +2582,7 @@ impl CliAgentTool {
                 format!(
                     "{}\n\n{}",
                     prompt.trim_end(),
-                    aidaemon_runtime::helper_run::mission_rules(&spec.new_folders).trim()
+                    crate::helper_run::mission_rules(&spec.new_folders).trim()
                 )
             } else {
                 prompt.to_string()
@@ -3015,15 +3084,14 @@ impl CliAgentTool {
             let auth_failed =
                 CliAgentTool::detect_auth_error(&display_buf_writer.lock().await, &tool_name_owned)
                     .is_some();
-            let (run_phase, run_evidence) = aidaemon_runtime::helper_run::program_phase(
-                &aidaemon_runtime::helper_run::ProgramEnd {
+            let (run_phase, run_evidence) =
+                crate::helper_run::program_phase(&crate::helper_run::ProgramEnd {
                     exit_code,
                     stopped: loop_detected || auth_failed,
                     expects_change,
                     changed_something,
                     step: task_context.clone(),
-                },
-            );
+                });
             let _ = end_record_for_task.set(CliRunEnd {
                 phase: run_phase,
                 evidence: run_evidence.clone(),
@@ -3053,8 +3121,8 @@ impl CliAgentTool {
                         .await;
                 }
             }
-            if run_phase != aidaemon_runtime::run_state::RunPhase::Succeeded {
-                aidaemon_runtime::spawn_tool::release_new_folders(&folders_for_task);
+            if run_phase != crate::run_state::RunPhase::Succeeded {
+                crate::spawn_tool::release_new_folders(&folders_for_task);
             }
             // Persist completion even if the caller timed out and moved the task to background.
             if invocation_id != 0 {
@@ -3079,8 +3147,8 @@ impl CliAgentTool {
                         max_output_for_log,
                     )
                 };
-                let success = completion.success
-                    && run_phase == aidaemon_runtime::run_state::RunPhase::Succeeded;
+                let success =
+                    completion.success && run_phase == crate::run_state::RunPhase::Succeeded;
                 if completion.authentication_failed {
                     CliAgentTool::quarantine_unavailable_tool(
                         &tools_for_completion,
@@ -3169,7 +3237,7 @@ impl CliAgentTool {
                         "Background CLI task {status_word}.\nTask ID: {task_id_for_notify}\nTask: {task_context}\nResult:\n{persisted_output}"
                     );
                     let continuity_message = Message {
-                        content: Some(crate::tools::sanitize::wrap_untrusted_output(
+                        content: Some(aidaemon_tools::sanitize::wrap_untrusted_output(
                             "cli_agent",
                             &continuity_output,
                         )),
@@ -3199,17 +3267,17 @@ impl CliAgentTool {
                     let group = match (run.as_ref(), ended.as_ref()) {
                         (Some(run), Some((Some(state), on_card))) => run.end_in_group(
                             state,
-                            aidaemon_runtime::run_state::RunReport {
+                            crate::run_state::RunReport {
                                 text: persisted_output.clone(),
                                 untrusted: true,
                             },
                             run.result(Some(state), &body, *on_card),
                             max_output_for_log,
                         ),
-                        _ => aidaemon_runtime::background_run::RunsTurn::Alone,
+                        _ => crate::background_run::RunsTurn::Alone,
                     };
                     let group_answer = match group {
-                        aidaemon_runtime::background_run::RunsTurn::Waiting => {
+                        crate::background_run::RunsTurn::Waiting => {
                             info!(
                                 task_id = %task_id_for_notify,
                                 session_id = %notify_session_id,
@@ -3220,14 +3288,14 @@ impl CliAgentTool {
                                 completion_tx.send((exit_code, loop_detected, loop_pattern_count));
                             return;
                         }
-                        aidaemon_runtime::background_run::RunsTurn::Answer(answer) => Some(answer),
-                        aidaemon_runtime::background_run::RunsTurn::Alone => None,
+                        crate::background_run::RunsTurn::Answer(answer) => Some(answer),
+                        crate::background_run::RunsTurn::Alone => None,
                     };
 
                     // The written answer, when the agent loop gives one.
                     let mut reply: Option<(
                         String,
-                        Option<crate::runtime_ports::AgentResponseEnvelope>,
+                        Option<aidaemon_channels::ports::AgentResponseEnvelope>,
                     )> = None;
                     if notify_goal_id.is_empty() && !notify_session_id.trim().is_empty() {
                         let reengagement_allowed = {
@@ -3278,8 +3346,9 @@ impl CliAgentTool {
                                     session_id: notify_session_id.clone(),
                                     user_text: followup,
                                     status_tx: None,
-                                    user_role: crate::types::UserRole::Owner,
-                                    channel_ctx: crate::types::ChannelContext::internal(),
+                                    user_role: aidaemon_tools::semantics::UserRole::Owner,
+                                    channel_ctx:
+                                        aidaemon_channels::context::ChannelContext::internal(),
                                     heartbeat: None,
                                     parent_task_id,
                                     parent_tool_call_id: None,
@@ -3289,7 +3358,7 @@ impl CliAgentTool {
                             .await
                             {
                                 Ok(envelope) if !envelope.text.trim().is_empty() => {
-                                    let text = crate::tools::sanitize::sanitize_user_facing_reply(
+                                    let text = aidaemon_tools::sanitize::sanitize_user_facing_reply(
                                         &envelope.text,
                                     );
                                     reply = Some((text, Some(envelope)));
@@ -3315,7 +3384,10 @@ impl CliAgentTool {
                         (Some(run), Some((state, on_card))) => {
                             run.result(state.as_ref(), body, *on_card)
                         }
-                        _ => crate::channels::present_notification(notification_type, body),
+                        _ => aidaemon_channels::presentation::present_notification(
+                            notification_type,
+                            body,
+                        ),
                     };
                     let (text, envelope) = match (reply, group_answer) {
                         // A group's answer stands alone: the card shows
@@ -3337,7 +3409,7 @@ impl CliAgentTool {
                                     &notify_session_id,
                                     envelope.delivery(
                                         "background_router",
-                                        crate::events::ResponseDeliveryState::Queued,
+                                        aidaemon_events::ResponseDeliveryState::Queued,
                                         Vec::new(),
                                         None,
                                     ),
@@ -3355,7 +3427,7 @@ impl CliAgentTool {
                                             &notify_session_id,
                                             envelope.delivery(
                                                 "background_router",
-                                                crate::events::ResponseDeliveryState::PlatformAcknowledged,
+                                                aidaemon_events::ResponseDeliveryState::PlatformAcknowledged,
                                                 platform_id.into_iter().collect(),
                                                 None,
                                             ),
@@ -3378,7 +3450,7 @@ impl CliAgentTool {
                         } else {
                             &notify_goal_id
                         };
-                        let entry = crate::traits::NotificationEntry::new(
+                        let entry = crate::tools::traits::NotificationEntry::new(
                             queue_goal_id,
                             &notify_session_id,
                             notification_type,
@@ -3436,7 +3508,7 @@ impl CliAgentTool {
             return Ok(format!(
                 "{}\nCLI agent '{}' started in background (task_id={}). \
                  Use action=\"check\" with task_id=\"{}\" to see output when done.",
-                aidaemon_runtime::background_run::started_in_background(&run_label),
+                crate::background_run::started_in_background(&run_label),
                 tool_name,
                 task_id,
                 task_id
@@ -3468,10 +3540,10 @@ impl CliAgentTool {
 
                     // Emit error status
                     if let Some(ref tx) = status_tx {
-                        let (label, summary) = crate::tools::sanitize::user_facing_tool_activity(
+                        let (label, summary) = aidaemon_tools::sanitize::user_facing_tool_activity(
                             tool_name,
                             "killed - infinite loop detected",
-                            crate::types::ChannelVisibility::Public,
+                            aidaemon_core::ChannelVisibility::Public,
                         );
                         let _ = tx.try_send(StatusUpdate::ToolComplete {
                             name: label,
@@ -3499,10 +3571,10 @@ impl CliAgentTool {
                 let display_output = display_buf.lock().await.clone();
                 if let Some(auth_msg) = Self::detect_auth_error(&display_output, tool_name) {
                     if let Some(ref tx) = status_tx {
-                        let (label, summary) = crate::tools::sanitize::user_facing_tool_activity(
+                        let (label, summary) = aidaemon_tools::sanitize::user_facing_tool_activity(
                             tool_name,
                             "authentication failed",
-                            crate::types::ChannelVisibility::Public,
+                            aidaemon_core::ChannelVisibility::Public,
                         );
                         let _ = tx.try_send(StatusUpdate::ToolComplete {
                             name: label,
@@ -3555,10 +3627,10 @@ impl CliAgentTool {
                     } else {
                         format!("exited with code {:?}", exit_code)
                     };
-                    let (label, summary) = crate::tools::sanitize::user_facing_tool_activity(
+                    let (label, summary) = aidaemon_tools::sanitize::user_facing_tool_activity(
                         tool_name,
                         &raw_summary,
-                        crate::types::ChannelVisibility::Public,
+                        aidaemon_core::ChannelVisibility::Public,
                     );
                     let _ = tx.try_send(StatusUpdate::ToolComplete {
                         name: label,
@@ -3590,7 +3662,7 @@ impl CliAgentTool {
                     if end.changed_something {
                         mark_run_changed_locally();
                     }
-                    if end.phase != aidaemon_runtime::run_state::RunPhase::Succeeded {
+                    if end.phase != crate::run_state::RunPhase::Succeeded {
                         let why = end.evidence.line().unwrap_or_default();
                         let error_msg = format!(
                             "ERROR: CLI agent '{tool_name}' did not do its work. {why}\n\n\
@@ -3675,7 +3747,7 @@ impl CliAgentTool {
                     "{}\nCLI agent '{}' still running after {}s. Moved to background (task_id={}).\n\
                      Use action=\"check\" with task_id=\"{}\" to see output, or action=\"cancel\" to stop it.\n\n\
                      Partial output:\n{}",
-                    aidaemon_runtime::background_run::started_in_background(&run_label),
+                    crate::background_run::started_in_background(&run_label),
                     tool_name,
                     elapsed,
                     task_id,
@@ -3703,7 +3775,7 @@ impl CliAgentTool {
         }
         let run = BackgroundRun::start(
             self.run_home(),
-            aidaemon_runtime::background_run::RunStart {
+            crate::background_run::RunStart {
                 id: &format!("cli-agent-{task_id}"),
                 chat: session_id,
                 label,
@@ -4044,7 +4116,7 @@ struct CliAgentArgs {
     /// Optional description paired with `command`.
     description: Option<String>,
     /// What the work is, in a few plain words: the name the owner reads
-    /// for the run on every card ([`aidaemon_runtime::helper_run`]).
+    /// for the run on every card ([`crate::helper_run`]).
     #[serde(default)]
     title: Option<String>,
     /// Folders made fresh for this run (a new install or project), exactly
@@ -4123,12 +4195,12 @@ fn run_did_not_start(output: &str) -> bool {
 
 /// Where a CLI agent's run may write: what its call named, plus its
 /// declared scope and new folders, all within the parent turn's authority
-/// narrowed by that declaration ([`aidaemon_runtime::helper_run::helper_authority`],
+/// narrowed by that declaration ([`crate::helper_run::helper_authority`],
 /// the same narrowing a sub-agent gets). Without an inherited authority (a
 /// call outside a turn) the named paths stand as given.
 fn helper_write_paths(
     args: &CliAgentArgs,
-    spec: &aidaemon_runtime::helper_run::HelperSpec,
+    spec: &crate::helper_run::HelperSpec,
     session_id: &str,
     facts: &ToolCallContext,
 ) -> Vec<String> {
@@ -4139,12 +4211,11 @@ fn helper_write_paths(
             paths.push(path.clone());
         }
     }
-    let Some(parent) = aidaemon_runtime::authority::parent_authority(facts) else {
+    let Some(parent) = crate::authority::parent_authority(facts) else {
         return paths;
     };
-    let narrowed =
-        aidaemon_runtime::helper_run::helper_authority(parent, spec.declaration(session_id), None);
-    let Some(roots) = aidaemon_runtime::helper_run::write_roots(&narrowed) else {
+    let narrowed = crate::helper_run::helper_authority(parent, spec.declaration(session_id), None);
+    let Some(roots) = crate::helper_run::write_roots(&narrowed) else {
         return paths;
     };
     let within = |path: &String| {
@@ -4204,7 +4275,7 @@ impl CliAgentArgs {
         None
     }
 
-    async fn contextual_run_prompt(&self, state: &Arc<dyn StateStore>) -> Option<String> {
+    async fn contextual_run_prompt(&self, state: &Arc<dyn CliAgentStore>) -> Option<String> {
         let delegated_task = match self.call_task_id.as_deref() {
             Some(task_id) if !task_id.trim().is_empty() => {
                 state.get_task(task_id).await.ok().flatten()
@@ -4572,15 +4643,15 @@ impl Tool for CliAgentTool {
     fn approval_card_kind(
         &self,
         _request: &aidaemon_core::OwnerApprovalRequest,
-    ) -> crate::types::ApprovalKind {
-        crate::types::ApprovalKind::CommandOnce
+    ) -> aidaemon_tools::semantics::ApprovalKind {
+        aidaemon_tools::semantics::ApprovalKind::CommandOnce
     }
 
     /// Keep the owner's approval of a daemonizing run for that exact run in
     /// its session; the run consumes it.
     async fn record_owner_answer(
         &self,
-        call: &crate::traits::ApprovalCall<'_>,
+        call: &crate::tools::traits::ApprovalCall<'_>,
         facts: &ToolCallContext,
         response: Option<ApprovalResponse>,
     ) {
@@ -4698,9 +4769,9 @@ impl Tool for CliAgentTool {
     async fn execute(
         &self,
         arguments: &str,
-        facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-        let status_tx = crate::traits::status_sender(facts);
+        facts: &crate::tools::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::tools::traits::ToolCallOutcome> {
+        let status_tx = aidaemon_tools::status::status_sender(facts);
         let exec_ctx = facts.clone();
 
         self.outcome_with_facts(arguments, status_tx, true, &exec_ctx)
@@ -4741,7 +4812,7 @@ impl CliAgentTool {
 }
 
 #[async_trait]
-impl crate::traits::ToolSemantics for CliAgentTool {
+impl crate::tools::traits::ToolSemantics for CliAgentTool {
     async fn background_jobs(
         &self,
         session_id: &str,
@@ -4790,18 +4861,18 @@ impl crate::traits::ToolSemantics for CliAgentTool {
         finished.load(Ordering::Acquire)
     }
 
-    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
-        crate::traits::ToolDispatchFacts {
+    fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
+        crate::tools::traits::ToolDispatchFacts {
             task_lead_delegation: true,
             manages_own_timeout: true,
-            goal_context: crate::traits::GoalContext::BackgroundDelivery,
+            goal_context: crate::tools::traits::GoalContext::BackgroundDelivery,
             checkpoints_writes: true,
             // The owner's approval of a daemonizing run is kept for that
             // run alone (`record_owner_answer`), never as a session grant.
             keeps_own_grants: true,
             // A CLI agent's run is a helper run like a sub-agent's: it
             // inherits the turn's authority, narrowed by its declaration
-            // ([`aidaemon_runtime::helper_run::helper_authority`]).
+            // ([`crate::helper_run::helper_authority`]).
             spawns_child_agents: true,
             ..Default::default()
         }
@@ -4813,20 +4884,20 @@ impl crate::traits::ToolSemantics for CliAgentTool {
     /// Every other call is left to the approval policy.
     async fn owner_approval_request(
         &self,
-        call: &crate::traits::ApprovalCall<'_>,
+        call: &crate::tools::traits::ApprovalCall<'_>,
         facts: &ToolCallContext,
-    ) -> crate::traits::OwnerApprovalNeed {
+    ) -> crate::tools::traits::OwnerApprovalNeed {
         if call.refused {
-            return crate::traits::OwnerApprovalNeed::NotNeeded;
+            return crate::tools::traits::OwnerApprovalNeed::NotNeeded;
         }
         let Some((args, prompt)) = Self::daemonizing_run(call.arguments) else {
-            return crate::traits::OwnerApprovalNeed::Unjudged;
+            return crate::tools::traits::OwnerApprovalNeed::Unjudged;
         };
         if !Self::is_owner_role(facts.user_role) || facts.session().is_none() {
-            return crate::traits::OwnerApprovalNeed::Unjudged;
+            return crate::tools::traits::OwnerApprovalNeed::Unjudged;
         }
         let hits = Self::daemonization_hits(&prompt, args.system_instruction.as_deref());
-        crate::traits::OwnerApprovalNeed::Ask(self.daemonization_request(
+        crate::tools::traits::OwnerApprovalNeed::Ask(self.daemonization_request(
             args.tool.as_deref(),
             &prompt,
             args.system_instruction.as_deref(),
@@ -4874,7 +4945,7 @@ impl crate::traits::ToolSemantics for CliAgentTool {
         aidaemon_core::CallEffects::unknown()
     }
 
-    fn receipt_kind(&self, arguments: &str) -> crate::traits::ToolReceiptKind {
+    fn receipt_kind(&self, arguments: &str) -> crate::tools::traits::ToolReceiptKind {
         let action = serde_json::from_str::<Value>(arguments)
             .ok()
             .and_then(|value| {
@@ -4885,9 +4956,9 @@ impl crate::traits::ToolSemantics for CliAgentTool {
             })
             .unwrap_or_else(|| "run".to_string());
         if action == "run" {
-            crate::traits::ToolReceiptKind::Process
+            crate::tools::traits::ToolReceiptKind::Process
         } else {
-            crate::traits::ToolReceiptKind::Generic
+            crate::tools::traits::ToolReceiptKind::Generic
         }
     }
 
@@ -4964,12 +5035,8 @@ impl crate::traits::ToolSemantics for CliAgentTool {
         {
             let path = execution_cwd
                 .as_deref()
-                .filter(|_| !crate::execution::BackendPath::is_anchored(path))
-                .map(|cwd| {
-                    crate::execution::BackendPath::new(cwd)
-                        .join(path)
-                        .to_string()
-                })
+                .filter(|_| !aidaemon_tools::BackendPath::is_anchored(path))
+                .map(|cwd| aidaemon_tools::BackendPath::new(cwd).join(path).to_string())
                 .unwrap_or_else(|| path.to_string());
             if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path) {
                 if !read_targets.contains(&target) {
@@ -4987,12 +5054,8 @@ impl crate::traits::ToolSemantics for CliAgentTool {
             .map(|path| {
                 execution_cwd
                     .as_deref()
-                    .filter(|_| !crate::execution::BackendPath::is_anchored(path))
-                    .map(|cwd| {
-                        crate::execution::BackendPath::new(cwd)
-                            .join(path)
-                            .to_string()
-                    })
+                    .filter(|_| !aidaemon_tools::BackendPath::is_anchored(path))
+                    .map(|cwd| aidaemon_tools::BackendPath::new(cwd).join(path).to_string())
                     .unwrap_or_else(|| path.to_string())
             })
             .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::Path, path))
@@ -5285,12 +5348,12 @@ impl CliAgentTool {
                 let made_folders = if args.new_folders.is_empty() {
                     Vec::new()
                 } else {
-                    match aidaemon_runtime::spawn_tool::claim_new_folders(&args.new_folders) {
+                    match crate::spawn_tool::claim_new_folders(&args.new_folders) {
                         Ok(made) => made,
                         Err(error) => return Ok(format!("Blocked: {error}")),
                     }
                 };
-                let spec = aidaemon_runtime::helper_run::HelperSpec {
+                let spec = crate::helper_run::HelperSpec {
                     title: args
                         .title
                         .clone()
@@ -5379,7 +5442,7 @@ impl CliAgentTool {
                 // (only while still empty), as for a sub-agent.
                 let started = matches!(&output, Ok(text) if !run_did_not_start(text));
                 if !started {
-                    aidaemon_runtime::spawn_tool::release_new_folders(&made_folders);
+                    crate::spawn_tool::release_new_folders(&made_folders);
                 }
                 output
             }
@@ -5408,8 +5471,8 @@ impl CliAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::ToolCalls as _;
-    use crate::traits::ToolSemantics;
+    use crate::tools::traits::ToolSemantics;
+    use aidaemon_tools::testing::ToolCalls as _;
 
     /// The model-facing descriptions must not promise an auto-approve mode.
     #[test]
@@ -5421,15 +5484,113 @@ mod tests {
             );
         }
     }
-    use crate::config::CliAgentsConfig;
-    use crate::memory::embeddings::EmbeddingService;
-    use crate::state::SqliteStateStore;
-    use crate::testing::MockProvider;
-    use crate::traits::store_prelude::*;
-    use crate::traits::Tool;
-    use crate::traits::{Goal, Task};
+    use crate::stores::prelude::*;
+    use crate::tools::traits::Tool;
+    use crate::tools::traits::{Goal, Task};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// The work stores on a fresh database, an empty chat history and an
+    /// in-memory invocation log: what the tool reads and writes.
+    struct TestStore {
+        work: aidaemon_work::sqlite::SqliteWorkStore,
+        invocations: std::sync::Mutex<Vec<aidaemon_tools::services::CliAgentInvocation>>,
+    }
+
+    impl TestStore {
+        async fn open(path: &str) -> Self {
+            Self {
+                work: aidaemon_work::sqlite::open_for_tests(path).await,
+                invocations: Default::default(),
+            }
+        }
+    }
+
+    impl aidaemon_work::sqlite::WorkDatabase for TestStore {
+        fn work_pool(&self) -> &sqlx::SqlitePool {
+            self.work.work_pool()
+        }
+
+        fn redact_secrets(&self, text: &str) -> String {
+            self.work.redact_secrets(text)
+        }
+    }
+
+    #[async_trait]
+    impl aidaemon_events::stores::MessageStore for TestStore {
+        async fn append_message(&self, _msg: &Message) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get_history(
+            &self,
+            _session_id: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<Message>> {
+            Ok(Vec::new())
+        }
+
+        async fn clear_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl crate::tools::traits::DynamicCliAgentStore for TestStore {
+        async fn log_cli_agent_start(
+            &self,
+            task_id: Option<&str>,
+            session_id: &str,
+            agent_name: &str,
+            prompt_summary: &str,
+            working_dir: Option<&str>,
+        ) -> anyhow::Result<i64> {
+            let mut log = self.invocations.lock().unwrap();
+            let id = log.len() as i64 + 1;
+            log.push(aidaemon_tools::services::CliAgentInvocation {
+                id,
+                task_id: task_id.map(str::to_string),
+                session_id: session_id.to_string(),
+                agent_name: agent_name.to_string(),
+                prompt_summary: prompt_summary.to_string(),
+                working_dir: working_dir.map(str::to_string),
+                started_at: String::new(),
+                completed_at: None,
+                exit_code: None,
+                output_summary: None,
+                success: None,
+                duration_secs: None,
+            });
+            Ok(id)
+        }
+
+        async fn log_cli_agent_complete(
+            &self,
+            id: i64,
+            exit_code: Option<i32>,
+            output_summary: &str,
+            success: bool,
+            duration_secs: f64,
+        ) -> anyhow::Result<()> {
+            let mut log = self.invocations.lock().unwrap();
+            if let Some(entry) = log.iter_mut().find(|entry| entry.id == id) {
+                entry.completed_at = Some(String::new());
+                entry.exit_code = exit_code;
+                entry.output_summary = Some(output_summary.to_string());
+                entry.success = Some(success);
+                entry.duration_secs = Some(duration_secs);
+            }
+            Ok(())
+        }
+
+        async fn get_cli_agent_invocations(
+            &self,
+            limit: usize,
+        ) -> anyhow::Result<Vec<aidaemon_tools::services::CliAgentInvocation>> {
+            let log = self.invocations.lock().unwrap();
+            Ok(log.iter().rev().take(limit).cloned().collect())
+        }
+    }
 
     #[test]
     fn env_wrapper_finds_nested_program_after_unset_option() {
@@ -5510,7 +5671,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let expected = cwd.path().join("output.txt");
         let normalized = CliAgentTool::normalize_access_path(
-            &crate::execution::active_execution_backend(),
+            &aidaemon_tools::testing::active_execution_backend(),
             "output.txt",
             Some(cwd.path().to_string_lossy().as_ref()),
         )
@@ -5655,18 +5816,7 @@ mod tests {
     /// Uses a real temp-file SQLite DB for state persistence.
     async fn setup_echo_tool() -> (CliAgentTool, tempfile::NamedTempFile) {
         let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(
-                db_file.path().to_str().unwrap(),
-                100,
-                None,
-                embedding_service,
-            )
-            .await
-            .unwrap(),
-        );
-        let provider = Arc::new(MockProvider::new());
+        let state = Arc::new(TestStore::open(db_file.path().to_str().unwrap()).await);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -5683,19 +5833,13 @@ mod tests {
 
         let tool = CliAgentTool {
             context_facts: None,
-            backend: crate::execution::active_execution_backend(),
+            backend: aidaemon_tools::testing::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            state: state as Arc<dyn StateStore>,
-            llm_runtime: SharedLlmRuntime::new(
-                provider as crate::llm_runtime::ModelBackend,
-                None,
-                crate::config::ProviderKind::OpenaiCompatible,
-                "mock".to_string(),
-            ),
+            state: state as Arc<dyn CliAgentStore>,
             default_timeout: Duration::from_secs(10),
             default_max_output: 10000,
             max_concurrent: 3,
@@ -5714,18 +5858,7 @@ mod tests {
     /// Create a CliAgentTool with `bash` registered, for testing scripts.
     async fn setup_bash_tool() -> (CliAgentTool, tempfile::NamedTempFile) {
         let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(
-                db_file.path().to_str().unwrap(),
-                100,
-                None,
-                embedding_service,
-            )
-            .await
-            .unwrap(),
-        );
-        let provider = Arc::new(MockProvider::new());
+        let state = Arc::new(TestStore::open(db_file.path().to_str().unwrap()).await);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -5742,19 +5875,13 @@ mod tests {
 
         let tool = CliAgentTool {
             context_facts: None,
-            backend: crate::execution::active_execution_backend(),
+            backend: aidaemon_tools::testing::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash-agent".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            state: state as Arc<dyn StateStore>,
-            llm_runtime: SharedLlmRuntime::new(
-                provider as crate::llm_runtime::ModelBackend,
-                None,
-                crate::config::ProviderKind::OpenaiCompatible,
-                "mock".to_string(),
-            ),
+            state: state as Arc<dyn CliAgentStore>,
             default_timeout: Duration::from_secs(10),
             default_max_output: 10000,
             max_concurrent: 3,
@@ -6075,9 +6202,9 @@ mod tests {
                 None,
                 false,
                 false,
-                &crate::traits::ToolCallContext {
+                &crate::tools::traits::ToolCallContext {
                     session_id: "sess1".into(),
-                    user_role: Some(crate::types::UserRole::Guest),
+                    user_role: Some(aidaemon_tools::semantics::UserRole::Guest),
                     ..Default::default()
                 },
             )
@@ -6090,17 +6217,17 @@ mod tests {
         );
     }
 
-    fn owner_facts(session: &str) -> crate::traits::ToolCallContext {
-        crate::traits::ToolCallContext {
+    fn owner_facts(session: &str) -> crate::tools::traits::ToolCallContext {
+        crate::tools::traits::ToolCallContext {
             session_id: session.into(),
-            user_role: Some(crate::types::UserRole::Owner),
+            user_role: Some(aidaemon_tools::semantics::UserRole::Owner),
             ..Default::default()
         }
     }
 
     #[tokio::test]
     async fn daemonizing_run_asks_the_owner_through_the_kernel_once() {
-        use crate::traits::{ApprovalCall, OwnerApprovalNeed};
+        use crate::tools::traits::{ApprovalCall, OwnerApprovalNeed};
         let (tool, _db) = setup_echo_tool().await;
         let args = json!({"action":"run","tool":"echo","prompt":"nohup echo hi &"});
         let call = ApprovalCall::as_sent(&args);
@@ -6115,7 +6242,7 @@ mod tests {
         assert!(request.summary.contains("detached/background"));
         assert!(matches!(
             tool.approval_card_kind(&request),
-            crate::types::ApprovalKind::CommandOnce
+            aidaemon_tools::semantics::ApprovalKind::CommandOnce
         ));
         assert!(tool.dispatch_facts().keeps_own_grants);
 
@@ -6126,9 +6253,9 @@ mod tests {
                 .await,
             OwnerApprovalNeed::Unjudged
         ));
-        let guest = crate::traits::ToolCallContext {
+        let guest = crate::tools::traits::ToolCallContext {
             session_id: "sess1".into(),
-            user_role: Some(crate::types::UserRole::Guest),
+            user_role: Some(aidaemon_tools::semantics::UserRole::Guest),
             ..Default::default()
         };
         assert!(matches!(
@@ -6143,7 +6270,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemonizing_run_runs_only_with_a_kernel_approval_of_that_run() {
-        use crate::traits::ApprovalCall;
+        use crate::tools::traits::ApprovalCall;
         let (tool, _db) = setup_echo_tool().await;
         let raw = r#"{"action":"run","tool":"echo","prompt":"nohup echo hi &"}"#;
         let args: Value = serde_json::from_str(raw).unwrap();
@@ -6569,7 +6696,7 @@ mod tests {
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let dir_path = tmp_dir.path().to_str().unwrap();
         let normalized = CliAgentTool::normalize_working_dir(
-            &crate::execution::active_execution_backend(),
+            &aidaemon_tools::testing::active_execution_backend(),
             dir_path,
         )
         .await
@@ -6603,7 +6730,7 @@ mod tests {
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let dir = tmp_dir.path().to_string_lossy().to_string();
         let normalized = CliAgentTool::normalize_working_dir(
-            &crate::execution::active_execution_backend(),
+            &aidaemon_tools::testing::active_execution_backend(),
             &dir,
         )
         .await
@@ -7366,24 +7493,13 @@ mod tests {
     #[tokio::test]
     async fn test_discover_finds_echo() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(
-                db_file.path().to_str().unwrap(),
-                100,
-                None,
-                embedding_service,
-            )
-            .await
-            .unwrap(),
-        );
-        let provider = Arc::new(MockProvider::new());
+        let state = Arc::new(TestStore::open(db_file.path().to_str().unwrap()).await);
 
         // Config with echo as a custom tool
         let mut tools = HashMap::new();
         tools.insert(
             "echo".to_string(),
-            crate::config::CliToolConfig {
+            CliToolConfig {
                 command: "echo".to_string(),
                 args: vec![],
                 description: "Echo for test".to_string(),
@@ -7399,15 +7515,9 @@ mod tests {
         };
 
         let tool = CliAgentTool::discover(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             config,
-            state as Arc<dyn StateStore>,
-            SharedLlmRuntime::new(
-                provider as crate::llm_runtime::ModelBackend,
-                None,
-                crate::config::ProviderKind::OpenaiCompatible,
-                "mock".to_string(),
-            ),
+            state as Arc<dyn CliAgentStore>,
         )
         .await;
         assert!(tool.has_tools());
@@ -7419,23 +7529,12 @@ mod tests {
     #[tokio::test]
     async fn test_discover_skips_nonexistent() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(
-                db_file.path().to_str().unwrap(),
-                100,
-                None,
-                embedding_service,
-            )
-            .await
-            .unwrap(),
-        );
-        let provider = Arc::new(MockProvider::new());
+        let state = Arc::new(TestStore::open(db_file.path().to_str().unwrap()).await);
 
         let mut tools = HashMap::new();
         tools.insert(
             "fake-tool".to_string(),
-            crate::config::CliToolConfig {
+            CliToolConfig {
                 command: "aidaemon-nonexistent-12345".to_string(),
                 args: vec![],
                 description: "".to_string(),
@@ -7451,15 +7550,9 @@ mod tests {
         };
 
         let tool = CliAgentTool::discover(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             config,
-            state as Arc<dyn StateStore>,
-            SharedLlmRuntime::new(
-                provider as crate::llm_runtime::ModelBackend,
-                None,
-                crate::config::ProviderKind::OpenaiCompatible,
-                "mock".to_string(),
-            ),
+            state as Arc<dyn CliAgentStore>,
         )
         .await;
         assert!(!tool.has_tools());
@@ -7472,19 +7565,8 @@ mod tests {
     #[tokio::test]
     async fn test_run_logs_invocation() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(
-                db_file.path().to_str().unwrap(),
-                100,
-                None,
-                embedding_service,
-            )
-            .await
-            .unwrap(),
-        );
+        let state = Arc::new(TestStore::open(db_file.path().to_str().unwrap()).await);
         let state_clone = state.clone();
-        let provider = Arc::new(MockProvider::new());
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -7501,19 +7583,13 @@ mod tests {
 
         let tool = CliAgentTool {
             context_facts: None,
-            backend: crate::execution::active_execution_backend(),
+            backend: aidaemon_tools::testing::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            state: state as Arc<dyn StateStore>,
-            llm_runtime: SharedLlmRuntime::new(
-                provider as crate::llm_runtime::ModelBackend,
-                None,
-                crate::config::ProviderKind::OpenaiCompatible,
-                "mock".to_string(),
-            ),
+            state: state as Arc<dyn CliAgentStore>,
             default_timeout: Duration::from_secs(10),
             default_max_output: 10000,
             max_concurrent: 3,
@@ -7532,7 +7608,7 @@ mod tests {
             None,
             false,
             false,
-            &crate::testing::call_facts("sess1"),
+            &aidaemon_tools::testing::call_facts("sess1"),
         )
         .await
         .unwrap();
@@ -7552,19 +7628,8 @@ mod tests {
     #[tokio::test]
     async fn test_timeout_run_still_logs_completion() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(
-                db_file.path().to_str().unwrap(),
-                100,
-                None,
-                embedding_service,
-            )
-            .await
-            .unwrap(),
-        );
+        let state = Arc::new(TestStore::open(db_file.path().to_str().unwrap()).await);
         let state_clone = state.clone();
-        let provider = Arc::new(MockProvider::new());
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -7581,19 +7646,13 @@ mod tests {
 
         let tool = CliAgentTool {
             context_facts: None,
-            backend: crate::execution::active_execution_backend(),
+            backend: aidaemon_tools::testing::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            state: state as Arc<dyn StateStore>,
-            llm_runtime: SharedLlmRuntime::new(
-                provider as crate::llm_runtime::ModelBackend,
-                None,
-                crate::config::ProviderKind::OpenaiCompatible,
-                "mock".to_string(),
-            ),
+            state: state as Arc<dyn CliAgentStore>,
             default_timeout: Duration::from_secs(10),
             default_max_output: 10000,
             max_concurrent: 3,
@@ -7614,7 +7673,7 @@ mod tests {
                 None,
                 false,
                 false,
-                &crate::testing::call_facts("sess1"),
+                &aidaemon_tools::testing::call_facts("sess1"),
             )
             .await
             .unwrap();
@@ -7683,7 +7742,7 @@ mod tests {
             .call_with_status_under_contract(r#"{"action":"run","tool":"bash-agent","prompt":"sleep 0.2; echo delegated-background-ok"}"#, None, false, false, &ToolCallContext {
                     goal_id: Some(goal.id.clone()),
                     task_id: Some(task.id.clone()),
-                    ..crate::testing::call_facts("sess-bg")
+                    ..aidaemon_tools::testing::call_facts("sess-bg")
                 })
             .await
             .unwrap();
@@ -7726,18 +7785,7 @@ mod tests {
     #[tokio::test]
     async fn test_background_cli_check_returns_result_after_reap() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(
-                db_file.path().to_str().unwrap(),
-                100,
-                None,
-                embedding_service,
-            )
-            .await
-            .unwrap(),
-        );
-        let provider = Arc::new(MockProvider::new());
+        let state = Arc::new(TestStore::open(db_file.path().to_str().unwrap()).await);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -7754,19 +7802,13 @@ mod tests {
 
         let tool = CliAgentTool {
             context_facts: None,
-            backend: crate::execution::active_execution_backend(),
+            backend: aidaemon_tools::testing::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            state: state as Arc<dyn StateStore>,
-            llm_runtime: SharedLlmRuntime::new(
-                provider as crate::llm_runtime::ModelBackend,
-                None,
-                crate::config::ProviderKind::OpenaiCompatible,
-                "mock".to_string(),
-            ),
+            state: state as Arc<dyn CliAgentStore>,
             default_timeout: Duration::from_secs(10),
             default_max_output: 10000,
             max_concurrent: 3,
@@ -7785,7 +7827,7 @@ mod tests {
                 None,
                 false,
                 false,
-                &crate::testing::call_facts("sess1"),
+                &aidaemon_tools::testing::call_facts("sess1"),
             )
             .await
             .unwrap();
@@ -7800,7 +7842,7 @@ mod tests {
                 None,
                 false,
                 false,
-                &crate::testing::call_facts("sess1"),
+                &aidaemon_tools::testing::call_facts("sess1"),
             )
             .await
             .unwrap();
@@ -7812,7 +7854,7 @@ mod tests {
     async fn check_with_wrong_id_recovers_only_session_task() {
         let (tool, _db) = setup_bash_tool().await;
         let started = tool
-            .call_with_status_under_contract(r#"{"action":"run","tool":"bash-agent","prompt":"echo recovered-result","async_mode":true}"#, None, false, false, &crate::testing::call_facts("session-recover"))
+            .call_with_status_under_contract(r#"{"action":"run","tool":"bash-agent","prompt":"echo recovered-result","async_mode":true}"#, None, false, false, &aidaemon_tools::testing::call_facts("session-recover"))
             .await
             .unwrap();
         let real_task_id = extract_task_id_from_background_message(&started);
@@ -7824,7 +7866,7 @@ mod tests {
                 None,
                 false,
                 false,
-                &crate::testing::call_facts("session-recover"),
+                &aidaemon_tools::testing::call_facts("session-recover"),
             )
             .await
             .unwrap();
@@ -7845,7 +7887,7 @@ mod tests {
                 r#"{"action":"run","tool":"bash-agent","prompt":"echo 'the server is still running. Moved to background earlier.'"}"#,
                 None,
                 false,
-                &crate::testing::call_facts("session-typed-finish"),
+                &aidaemon_tools::testing::call_facts("session-typed-finish"),
             )
             .await
             .unwrap();
@@ -7867,7 +7909,7 @@ mod tests {
                 r#"{"action":"run","tool":"bash-agent","prompt":"sleep 0.2; echo later","async_mode":true}"#,
                 None,
                 false,
-                &crate::testing::call_facts("session-typed-async"),
+                &aidaemon_tools::testing::call_facts("session-typed-async"),
             )
             .await
             .unwrap();
@@ -7895,7 +7937,7 @@ mod tests {
     #[tokio::test]
     async fn check_waits_for_the_task_and_types_its_end() {
         let (tool, _db) = setup_bash_tool().await;
-        let facts = crate::testing::call_facts("session-check-wait");
+        let facts = aidaemon_tools::testing::call_facts("session-check-wait");
         let started = tool
             .outcome_with_facts(
                 r#"{"action":"run","tool":"bash-agent","prompt":"sleep 0.1; echo waited-result","async_mode":true}"#,
@@ -7974,7 +8016,7 @@ mod tests {
                 r#"{"action":"check","task_id":"missing"}"#,
                 None,
                 false,
-                &crate::testing::call_facts("empty-session"),
+                &aidaemon_tools::testing::call_facts("empty-session"),
             )
             .await
             .unwrap();
@@ -7996,7 +8038,7 @@ mod tests {
                 r#"{"action":"run","tool":"bash-agent","prompt":"sleep 2","async_mode":true}"#,
                 None,
                 false,
-                &crate::testing::call_facts("session-background"),
+                &aidaemon_tools::testing::call_facts("session-background"),
             )
             .await
             .unwrap();
@@ -8016,11 +8058,11 @@ mod tests {
     /// ended.
     #[tokio::test]
     async fn a_background_cli_run_is_listed_for_its_chat_and_stops() {
-        use crate::traits::ToolSemantics as _;
+        use crate::tools::traits::ToolSemantics as _;
         let (tool, _db) = setup_bash_tool().await;
         let facts = ToolCallContext {
             task_id: Some("turn-cli".to_string()),
-            ..crate::testing::call_facts("session-cli-jobs")
+            ..aidaemon_tools::testing::call_facts("session-cli-jobs")
         };
         tool.outcome_with_facts(
             r#"{"action":"run","tool":"bash-agent","prompt":"sleep 30","async_mode":true}"#,
@@ -8047,9 +8089,9 @@ mod tests {
     #[tokio::test]
     async fn a_background_agent_shows_one_card_that_settles() {
         let (tool, _db) = setup_bash_tool().await;
-        let chat = crate::testing::CardChat::new("telegram:synthetic-agent").await;
+        let chat = aidaemon_channels::testing::CardChat::new("telegram:synthetic-agent").await;
         tool.set_hub(chat.outbound());
-        let facts = crate::testing::call_facts("telegram:synthetic-agent");
+        let facts = aidaemon_tools::testing::call_facts("telegram:synthetic-agent");
         let output = chat
             .turn(
                 |tx| {
@@ -8111,14 +8153,14 @@ mod tests {
         async fn continue_conversation(
             &self,
             _request: ConversationRequest,
-        ) -> anyhow::Result<crate::runtime_ports::AgentResponseEnvelope> {
+        ) -> anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope> {
             std::future::pending().await
         }
 
         async fn record_continuation_delivery(
             &self,
             _session_id: &str,
-            _delivery: crate::events::ResponseDeliveryData,
+            _delivery: aidaemon_events::ResponseDeliveryData,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -8133,14 +8175,14 @@ mod tests {
     #[tokio::test]
     async fn a_refused_cli_run_ends_failed_and_the_card_agrees_at_once() {
         let (tool, _db) = setup_bash_tool().await;
-        let chat = crate::testing::CardChat::new("telegram:synthetic-refused").await;
+        let chat = aidaemon_channels::testing::CardChat::new("telegram:synthetic-refused").await;
         tool.set_hub(chat.outbound());
         let runtime: Arc<dyn ConversationRuntime> = Arc::new(PendingRuntime);
         tool.set_agent(Arc::downgrade(&runtime));
         let projects = tempfile::TempDir::new().unwrap();
         let drupal = projects.path().join("claude-drupal-7");
         let wordpress = projects.path().join("claude-wordpress-7");
-        let facts = crate::testing::call_facts("telegram:synthetic-refused");
+        let facts = aidaemon_tools::testing::call_facts("telegram:synthetic-refused");
         let installs = json!({
             "action": "run",
             "tool": "bash-agent",
@@ -8263,7 +8305,7 @@ mod tests {
     async fn test_capture_git_diff_no_repo() {
         let tmp = tempfile::TempDir::new().unwrap();
         let result = CliAgentTool::capture_git_diff(
-            &crate::execution::active_execution_backend(),
+            &aidaemon_tools::testing::active_execution_backend(),
             tmp.path().to_str().unwrap(),
         )
         .await;
@@ -8369,16 +8411,18 @@ mod tests {
 
         assert_eq!(
             CliAgentTool::dirty_worktree_entry_count(
-                &crate::execution::active_execution_backend(),
+                &aidaemon_tools::testing::active_execution_backend(),
                 dir
             )
             .await,
             Some(1)
         );
 
-        let result =
-            CliAgentTool::capture_git_diff(&crate::execution::active_execution_backend(), dir)
-                .await;
+        let result = CliAgentTool::capture_git_diff(
+            &aidaemon_tools::testing::active_execution_backend(),
+            dir,
+        )
+        .await;
         assert!(result.is_some(), "Should capture uncommitted changes");
         let diff = result.unwrap();
         assert!(
@@ -8521,7 +8565,7 @@ mod tests {
                 None,
                 false,
                 false,
-                &crate::testing::call_facts("telegram_12345"),
+                &aidaemon_tools::testing::call_facts("telegram_12345"),
             )
             .await
             .unwrap();
@@ -8558,7 +8602,7 @@ mod tests {
                 None,
                 false,
                 false,
-                &crate::testing::call_facts("telegram_12345"),
+                &aidaemon_tools::testing::call_facts("telegram_12345"),
             )
             .await
             .unwrap();

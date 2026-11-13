@@ -49,6 +49,7 @@ pub mod check_environment;
 mod checklist;
 #[cfg(feature = "checkpoints")]
 pub mod checkpoints;
+pub mod cli_agent_flags;
 pub mod command_effects;
 pub mod command_risk;
 pub mod config_file;
