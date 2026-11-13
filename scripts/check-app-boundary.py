@@ -80,7 +80,7 @@ REEXPORTS = {
 # Behavior still in the app, and the plan step that moves it.
 PENDING = {
     "channels": "9.5: the daemon's channel hosts",
-    "tools": "9.4: cli_agent, manage_cli_agents, computer_use, spawn, file policy wrappers",
+    "tools": "9.4: spawn (tests only), file policy and the read/write/edit/search_files wrappers",
     "state": "9.3/9.6: the SQLite store behind the facade traits",
     "memory": "9.1/9.6: memory host adapters, procedures, task learning, retention",
     "nodes": "9.6: nodes host",

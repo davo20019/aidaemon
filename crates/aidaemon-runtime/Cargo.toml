@@ -21,6 +21,10 @@ publish = false
 # Test-only helpers that dependents' test builds need, as `cfg(test)` cannot
 # reach across a crate boundary.
 testing = ["dep:tempfile", "aidaemon-core/testing", "aidaemon-events/testing", "aidaemon-decisions/testing"]
+# The `computer_use` tool (desktop apps through accessibility and screenshots).
+computer_use = []
+# Its macOS harness (accessibility, window capture, input).
+computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo"]
 
 [dependencies]
 aidaemon-agents = { version = "0.2.0", path = "../aidaemon-agents" }
@@ -65,6 +69,11 @@ tracing = "0.1"
 toml = "1.2"
 toml_edit = "0.25"
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+axuielement = { version = "0.10", optional = true }
+enigo = { version = "0.6", optional = true }
+xcap = { version = "0.9", optional = true }
 
 [dev-dependencies]
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }

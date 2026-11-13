@@ -4,8 +4,7 @@ pub mod approval;
 mod channel_history;
 pub(crate) use aidaemon_runtime::tools::cli_agent;
 #[cfg(feature = "computer_use")]
-#[allow(dead_code)]
-pub mod computer_use;
+pub use aidaemon_runtime::tools::computer_use;
 pub(crate) mod config_manager;
 #[allow(unused_imports)]
 pub(crate) use aidaemon_tools::consequential;
@@ -23,8 +22,6 @@ pub(crate) mod manage_automations;
 pub(crate) mod manage_mandates;
 mod manage_memories;
 pub(crate) mod objective_status;
-#[cfg(feature = "computer_use")]
-pub(crate) use aidaemon_tools::owner_answers;
 mod policy_metrics;
 pub use aidaemon_tools::result_spill;
 pub use aidaemon_tools::sanitize;

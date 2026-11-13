@@ -3,6 +3,8 @@
 
 pub mod cli_agent;
 pub mod command_patterns;
+#[cfg(feature = "computer_use")]
+pub mod computer_use;
 pub mod config_manager;
 pub mod diagnose;
 pub mod escalate;

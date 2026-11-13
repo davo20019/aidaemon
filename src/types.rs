@@ -4,7 +4,7 @@
 #[cfg(test)]
 pub use aidaemon_channels::context::WorkspaceAccessLevel;
 pub use aidaemon_channels::context::{ChannelContext, WorkspaceGrant};
-#[cfg(any(test, feature = "computer_use"))]
+#[cfg(test)]
 pub use aidaemon_channels::hub::MediaKind;
 pub use aidaemon_channels::hub::MediaMessage;
 pub use aidaemon_core::ChannelVisibility;

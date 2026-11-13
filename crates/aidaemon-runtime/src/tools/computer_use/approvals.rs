@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::config::ComputerUseConfig;
-use crate::tools::owner_answers::OwnerAnsweredCalls;
+use crate::settings::ComputerUseConfig;
+use aidaemon_tools::owner_answers::OwnerAnsweredCalls;
 
 use super::telemetry::MutationBudget;
 

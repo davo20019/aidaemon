@@ -1,10 +1,10 @@
-use crate::traits::ToolCalls as _;
+use aidaemon_tools::testing::ToolCalls as _;
 use serde_json::json;
 use tempfile::TempDir;
 
 use super::test_tool;
-use crate::config::ComputerUseConfig;
-use crate::traits::Tool;
+use crate::settings::ComputerUseConfig;
+use crate::tools::traits::Tool;
 
 #[test]
 fn lock_banner_stamps_observations_when_locked() {
@@ -65,13 +65,13 @@ async fn schema_includes_action_enum() {
 
 /// The dispatcher's facts for a computer_use call on `task`: the session
 /// and the live vision-capable model.
-fn cu_facts(task: &str) -> crate::traits::ToolCallContext {
-    crate::traits::ToolCallContext {
+fn cu_facts(task: &str) -> crate::tools::traits::ToolCallContext {
+    crate::tools::traits::ToolCallContext {
         task_id: Some(task.to_string()),
         model: Some("gpt-4o".to_string()),
         model_chain: Some(vec!["gpt-4o".to_string()]),
         provider_kind: Some("OpenaiCompatible".to_string()),
-        ..crate::testing::call_facts("telegram:1")
+        ..aidaemon_tools::testing::call_facts("telegram:1")
     }
 }
 
@@ -265,8 +265,8 @@ fn consequential_subject_binds_the_exact_action() {
 
 #[tokio::test]
 async fn app_control_is_asked_through_the_kernel() {
-    use crate::traits::{ApprovalCall, OwnerApprovalNeed, ToolSemantics};
-    use crate::types::{ApprovalKind, ApprovalResponse};
+    use crate::tools::traits::{ApprovalCall, OwnerApprovalNeed, ToolSemantics};
+    use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse};
 
     let dir = TempDir::new().unwrap();
     let tool = test_tool(
@@ -279,7 +279,7 @@ async fn app_control_is_asked_through_the_kernel() {
     .await;
     assert!(tool.dispatch_facts().keeps_own_grants);
     // `test_tool` approves Calculator for telegram:1 only.
-    let facts = crate::traits::ToolCallContext {
+    let facts = crate::tools::traits::ToolCallContext {
         session_id: "telegram:2".into(),
         ..cu_facts("task-kernel")
     };
@@ -287,7 +287,7 @@ async fn app_control_is_asked_through_the_kernel() {
     let raw = args.to_string();
 
     // Never approved: refused, not asked about inside the tool.
-    let out = crate::testing::call_with_facts(&tool, &raw, facts.clone())
+    let out = aidaemon_tools::testing::call_with_facts(&tool, &raw, facts.clone())
         .await
         .unwrap();
     assert!(out.contains("through the agent kernel"), "{out}");
@@ -323,7 +323,7 @@ async fn app_control_is_asked_through_the_kernel() {
         "{}",
         run.output
     );
-    let out = crate::testing::call_with_facts(&tool, &raw, facts.clone())
+    let out = aidaemon_tools::testing::call_with_facts(&tool, &raw, facts.clone())
         .await
         .unwrap();
     assert!(out.contains("through the agent kernel"), "{out}");
