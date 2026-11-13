@@ -67,6 +67,29 @@ pub fn with_helper_start_lines<'a>(
     out
 }
 
+/// A plan card with each helper's start line under it and, when it has
+/// reported one, its latest step under that, the way the live card shows
+/// them: for a card redrawn after its turn while helpers still work.
+pub fn with_helper_lines<'a>(
+    card: &str,
+    helpers: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> String {
+    let mut out = card.trim_end().to_string();
+    for (label, step) in helpers {
+        let line = helper_started_line(label);
+        if out.lines().any(|shown| shown == line) {
+            continue;
+        }
+        out.push_str("\n\n");
+        out.push_str(&line);
+        if let Some(step) = step.map(str::trim).filter(|step| !step.is_empty()) {
+            out.push_str("\n🤖 ");
+            out.push_str(step);
+        }
+    }
+    out
+}
+
 /// A helper's own step that went on in the background, as its progress
 /// line ("counting 1 to 60 goes on in the background").
 pub fn helper_step_handed_off(step: &str, to_helper: bool) -> String {

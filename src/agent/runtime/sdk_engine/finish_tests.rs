@@ -886,3 +886,107 @@ async fn the_chat_work_lists_a_tools_background_command_and_stops_it() {
         .items
         .is_empty());
 }
+
+/// The real terminal, called as a sub-agent's run calls it: its session is
+/// a helper's own, under its parent chat's grants, so nothing reports a
+/// background command's result and the run holds its answer until the
+/// command ends.
+struct HelperTerminal(std::sync::OnceLock<Arc<crate::tools::TerminalTool>>);
+
+#[async_trait::async_trait]
+impl Tool for HelperTerminal {
+    fn name(&self) -> &str {
+        "terminal"
+    }
+
+    fn description(&self) -> &str {
+        "Runs a shell command"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        self.0.get().expect("terminal set").schema()
+    }
+
+    async fn execute(
+        &self,
+        arguments: &str,
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = crate::traits::ToolCallContext {
+            grant_session: "telegram:synthetic-parent-chat".to_string(),
+            ..facts.clone()
+        };
+        self.0
+            .get()
+            .expect("terminal set")
+            .execute(arguments, &facts)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::traits::ToolSemantics for HelperTerminal {
+    async fn jobs_ended_by_task_end(&self, task_id: &str) -> usize {
+        self.0
+            .get()
+            .expect("terminal set")
+            .jobs_ended_by_task_end(task_id)
+            .await
+    }
+}
+
+/// A helper that runs a background command, waits for it to end and then
+/// reports done finished: the command's end is recorded on its launch, so
+/// the run's ledger no longer reads it as running, and the chat is told
+/// "Finished in the background" with ✅ (live 2026-11-13: helpers whose own
+/// reports said "Done." read "Didn't finish" and their card step ❌).
+#[tokio::test]
+async fn a_helper_that_waited_for_its_background_command_finished() {
+    let start = r#"{"items":[
+        {"text":"Count to 3 in the background","status":"in_progress","mutation_effects":["process_state"]}
+    ]}"#;
+    let done = r#"{"items":[
+        {"text":"Count to 3 in the background","status":"completed","mutation_effects":["process_state"]}
+    ],"outcome":"done"}"#;
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", start),
+        MockProvider::tool_call_response(
+            "terminal",
+            r#"{"action":"run","command":"sleep 3; echo 3","background":true}"#,
+        ),
+        MockProvider::text_response("Counting; it is still running."),
+        MockProvider::tool_call_response("track_requirements", done),
+        MockProvider::text_response("Done. I counted to 3."),
+        MockProvider::text_response("Done. I counted to 3."),
+    ]);
+    let helper_terminal = Arc::new(HelperTerminal(std::sync::OnceLock::new()));
+    let harness = root(provider, vec![helper_terminal.clone()]).await;
+    let (approval_tx, _approvals) = tokio::sync::mpsc::channel(1);
+    let terminal = crate::tools::TerminalTool::new(
+        crate::execution::active_execution_backend(),
+        vec!["*".to_string()],
+        crate::tools::ApprovalBroker::new(approval_tx),
+        30,
+        4000,
+        crate::tools::command_risk::PermissionMode::Yolo,
+        harness.state.pool(),
+    )
+    .await
+    .with_event_store(harness.agent.event_store().clone());
+    assert!(helper_terminal.0.set(Arc::new(terminal)).is_ok());
+
+    let reply = ask(
+        &harness,
+        "helper-waits-for-its-job",
+        "Count to 3 in the background",
+    )
+    .await;
+    assert_eq!(reply, "Done. I counted to 3.");
+    let end = task_end(&harness, "helper-waits-for-its-job").await;
+    assert_eq!(end.effective_outcome(), TaskOutcome::Succeeded);
+    let label = crate::tools::spawn::background_completion_label(end.effective_outcome());
+    assert!(
+        label.starts_with("\u{2705} Finished in the background"),
+        "{label}"
+    );
+}

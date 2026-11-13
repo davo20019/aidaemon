@@ -36,6 +36,8 @@ pub struct WorkEntry {
     pub number: u64,
     /// What it is, in plain words.
     pub title: String,
+    /// Its latest step, when its progress said one (a sub-agent's).
+    pub step: Option<String>,
     pub started_at: DateTime<Utc>,
     /// What it is: `None` for a chat turn.
     pub work: Option<ChatWorkKind>,
@@ -72,13 +74,21 @@ impl WorkList {
             .collect()
     }
 
-    /// One line per entry: its number, title and how long it has run.
+    /// One line per entry: its number, title, latest step (as the status
+    /// reply gives it) and how long it has run.
     pub fn lines(&self, now: DateTime<Utc>) -> Vec<String> {
         self.entries
             .iter()
             .map(|entry| {
+                let step = entry
+                    .step
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|step| !step.is_empty())
+                    .map(|step| format!(" – {}", crate::presentation::word_preview(step, 80)))
+                    .unwrap_or_default();
                 format!(
-                    "#{} {} ({} so far)",
+                    "#{} {}{step} ({} so far)",
                     entry.number,
                     crate::presentation::word_preview(&entry.title, 120),
                     compact_chrono_duration(now - entry.started_at, ZeroUnitStyle::Trim)
@@ -97,6 +107,7 @@ impl WorkList {
             .map(|(number, title, started_at, group)| WorkEntry {
                 number,
                 title: title.to_string(),
+                step: None,
                 started_at,
                 work: Some(ChatWorkKind::SubAgent),
                 group: group.to_string(),
@@ -127,6 +138,7 @@ async fn build_list(registry: &TaskRegistry, session_id: &str, view: ChatWorkVie
         .map(|entry| WorkEntry {
             number: entry.id,
             title: TURN_LABEL.to_string(),
+            step: None,
             started_at: entry.started_at,
             work: None,
             group: view
@@ -142,6 +154,7 @@ async fn build_list(registry: &TaskRegistry, session_id: &str, view: ChatWorkVie
         entries.push(WorkEntry {
             number,
             title: item.title.clone(),
+            step: item.step.clone(),
             started_at: item.started_at,
             work: Some(item.kind),
             group: item

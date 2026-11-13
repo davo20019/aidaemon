@@ -5809,6 +5809,81 @@ impl TerminalTool {
                         "Terminal background notifier not started: a sub-agent's session has no reader"
                     );
                     notify_on_completion.store(false, Ordering::Relaxed);
+                    // Nothing reports this job, but the run that started it
+                    // holds its answer until it ends: its latest output line
+                    // stays its progress (live 2026-11-13: a helper's card
+                    // sat still for its whole command), and its end is
+                    // recorded on the launch's own call, so the run's ledger
+                    // knows it ended.
+                    let (stdout_buf, stderr_buf) = {
+                        let running = self.running.lock().await;
+                        match running.get(&pid) {
+                            Some(proc) => (proc.stdout_buf.clone(), proc.stderr_buf.clone()),
+                            None => (Arc::default(), Arc::default()),
+                        }
+                    };
+                    let progress = status_tx.clone();
+                    let event_store = event_store_for_notify.clone();
+                    let task_id = owner_task_id_for_notify.clone();
+                    let call_id = tool_call_id_for_notify.clone();
+                    let session = notify_session_id.trim().to_string();
+                    let semantics = completion_semantics_for_notify.clone();
+                    let max_output_chars = self.max_output_chars;
+                    let started = Instant::now() - foreground_wait;
+                    tokio::spawn(async move {
+                        let mut completion_rx = completion_rx;
+                        let mut tick = tokio::time::interval(COMMAND_OUTPUT_PROGRESS_EVERY);
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        tick.tick().await;
+                        let mut shown = String::new();
+                        let exit_code = loop {
+                            tokio::select! {
+                                exit = &mut completion_rx => break exit.ok().flatten(),
+                                _ = tick.tick() => {
+                                    let Some(tx) = progress.as_ref() else { continue };
+                                    let line = match latest_output_line(&stdout_buf.lock().await) {
+                                        Some(line) => Some(line),
+                                        None => latest_output_line(&stderr_buf.lock().await),
+                                    };
+                                    if let Some(line) = line.filter(|line| *line != shown) {
+                                        let _ = tx.try_send(StatusUpdate::CommandOutput {
+                                            name: "terminal".to_string(),
+                                            line: line.clone(),
+                                        });
+                                        shown = line;
+                                    }
+                                }
+                            }
+                        };
+                        let (Some(event_store), Some(task_id), Some(call_id)) =
+                            (event_store, task_id, call_id)
+                        else {
+                            return;
+                        };
+                        let stdout = String::from_utf8_lossy(&stdout_buf.lock().await).to_string();
+                        let stderr = String::from_utf8_lossy(&stderr_buf.lock().await).to_string();
+                        let (mut output, truncation) =
+                            format_output(&stdout, &stderr, max_output_chars);
+                        if let Some(info) = truncation.as_ref() {
+                            output.push('\n');
+                            output.push_str(&crate::utils::render_truncation_notice(info));
+                        }
+                        persist_background_completion_receipt(
+                            &event_store,
+                            &BackgroundCompletion {
+                                session_id: &session,
+                                task_id: &task_id,
+                                tool_call_id: &call_id,
+                                exit_code,
+                                output: &output,
+                                truncation,
+                                stderr: &stderr,
+                                semantics,
+                                elapsed_secs: started.elapsed().as_secs(),
+                            },
+                        )
+                        .await;
+                    });
                 } else if state_for_notify.is_some() || hub_for_notify.is_some() {
                     let goal_id_for_notify = notify_goal_id.unwrap_or("").to_string();
                     let session_for_notify = notify_session_id.trim().to_string();
@@ -5928,77 +6003,23 @@ impl TerminalTool {
                                             owner_task_id_for_notify.as_ref(),
                                             tool_call_id_for_notify.as_ref(),
                                         ) {
-                                            let outcome_status = exit_code.map_or(
-                                                ToolOutcomeStatus::FailedPermanent,
-                                                ToolOutcomeStatus::from_process_exit_code,
-                                            );
-                                            let mut metadata = foreground_terminal_metadata(exit_code);
-                                            metadata.receipt_kind =
-                                                crate::traits::ToolReceiptKind::Process;
-                                            metadata.effective_tool_name = Some("terminal".to_string());
-                                            metadata.truncation = truncation.clone();
-                                            metadata.semantics = completion_semantics_for_notify.clone();
-                                            metadata.access_denial =
-                                                sandbox_access_denial(&stderr, exit_code);
-                                            let provenance =
-                                                crate::traits::ToolResultProvenance::from_authoritative_result(
-                                                    &with_notice,
-                                                    &metadata,
-                                                    crate::traits::ToolResultContentSource::ToolOutput,
-                                                );
-                                            completion_parent_result_id = provenance.result_id.clone();
-                                            metadata.result_provenance = Some(provenance);
-                                            let mut receipt = crate::events::ToolReceiptV1::from_metadata(
-                                                &metadata,
-                                                outcome_status,
-                                                crate::events::ToolOutcomeEvidenceSource::ToolReported,
-                                                None,
-                                            );
-                                            receipt.completion_obligation_ids = event_store
-                                                .tool_completion_obligation_ids(
-                                                    &session_for_notify,
-                                                    parent_task_id,
-                                                    tool_call_id,
-                                                )
-                                                .await
-                                                .unwrap_or_default();
-                                            receipt.continuation_obligation_ids =
-                                                receipt.completion_obligation_ids.clone();
-                                            let emitter = crate::events::EventEmitter::new(
-                                                event_store.clone(),
-                                                session_for_notify.clone(),
-                                            )
-                                            .with_task_id(parent_task_id.clone());
-                                            if let Err(error) = emitter
-                                                .emit(
-                                                    crate::events::EventType::ToolResult,
-                                                    crate::events::ToolResultData {
-                                                        message_id: None,
-                                                        tool_call_id: tool_call_id.clone(),
-                                                        name: "terminal".to_string(),
-                                                        result: with_notice.clone(),
-                                                        success: outcome_status
-                                                            == ToolOutcomeStatus::Succeeded,
-                                                        duration_ms: elapsed_secs.saturating_mul(1000),
-                                                        error: (outcome_status == ToolOutcomeStatus::FailedPermanent)
-                                                            .then(|| "background process ended without an exit status".to_string()),
-                                                        task_id: Some(parent_task_id.clone()),
-                                                        annotations: Vec::new(),
-                                                        turn_id: None,
-                                                        attachments: Vec::new(),
-                                                        receipt: Some(receipt),
+                                            completion_parent_result_id =
+                                                persist_background_completion_receipt(
+                                                    event_store,
+                                                    &BackgroundCompletion {
+                                                        session_id: &session_for_notify,
+                                                        task_id: parent_task_id,
+                                                        tool_call_id,
+                                                        exit_code,
+                                                        output: &with_notice,
+                                                        truncation: truncation.clone(),
+                                                        stderr: &stderr,
+                                                        semantics: completion_semantics_for_notify
+                                                            .clone(),
+                                                        elapsed_secs,
                                                     },
                                                 )
-                                                .await
-                                            {
-                                                warn!(
-                                                    pid,
-                                                    %error,
-                                                    task_id = %parent_task_id,
-                                                    tool_call_id = %tool_call_id,
-                                                    "Failed to persist terminal background completion receipt"
-                                                );
-                                            }
+                                                .await;
                                         }
 
                                         // This continuation belongs to one immutable parent task.
@@ -7528,6 +7549,92 @@ fn background_process_semantics(command_semantics: &ToolCallSemantics) -> ToolCa
             .union(ToolMutationEffects::PROCESS_STATE),
     )
     .with_verification_mode(ToolVerificationMode::ResultContent)
+}
+
+/// A background command that ended, as its terminal receipt records it.
+struct BackgroundCompletion<'a> {
+    session_id: &'a str,
+    task_id: &'a str,
+    /// The launch's call: the receipt ends that same invocation.
+    tool_call_id: &'a str,
+    exit_code: Option<i32>,
+    output: &'a str,
+    truncation: Option<crate::traits::TruncationInfo>,
+    stderr: &'a str,
+    semantics: ToolCallSemantics,
+    elapsed_secs: u64,
+}
+
+/// Persist the terminal receipt of a background command that ended, under
+/// the launch's own call: the launch receipt is provisional, and until this
+/// one lands the run's ledger reads the command as still running, so a run
+/// that waited for it and read its result still could not count as done
+/// (live 2026-11-13: helpers that finished were reported as "Didn't
+/// finish"). Returns the receipt's result id.
+async fn persist_background_completion_receipt(
+    event_store: &Arc<EventStore>,
+    ended: &BackgroundCompletion<'_>,
+) -> Option<String> {
+    let outcome_status = ended.exit_code.map_or(
+        ToolOutcomeStatus::FailedPermanent,
+        ToolOutcomeStatus::from_process_exit_code,
+    );
+    let mut metadata = foreground_terminal_metadata(ended.exit_code);
+    metadata.receipt_kind = crate::traits::ToolReceiptKind::Process;
+    metadata.effective_tool_name = Some("terminal".to_string());
+    metadata.truncation = ended.truncation.clone();
+    metadata.semantics = ended.semantics.clone();
+    metadata.access_denial = sandbox_access_denial(ended.stderr, ended.exit_code);
+    let provenance = crate::traits::ToolResultProvenance::from_authoritative_result(
+        ended.output,
+        &metadata,
+        crate::traits::ToolResultContentSource::ToolOutput,
+    );
+    let result_id = provenance.result_id.clone();
+    metadata.result_provenance = Some(provenance);
+    let mut receipt = crate::events::ToolReceiptV1::from_metadata(
+        &metadata,
+        outcome_status,
+        crate::events::ToolOutcomeEvidenceSource::ToolReported,
+        None,
+    );
+    receipt.completion_obligation_ids = event_store
+        .tool_completion_obligation_ids(ended.session_id, ended.task_id, ended.tool_call_id)
+        .await
+        .unwrap_or_default();
+    receipt.continuation_obligation_ids = receipt.completion_obligation_ids.clone();
+    let emitter =
+        crate::events::EventEmitter::new(event_store.clone(), ended.session_id.to_string())
+            .with_task_id(ended.task_id.to_string());
+    if let Err(error) = emitter
+        .emit(
+            crate::events::EventType::ToolResult,
+            crate::events::ToolResultData {
+                message_id: None,
+                tool_call_id: ended.tool_call_id.to_string(),
+                name: "terminal".to_string(),
+                result: ended.output.to_string(),
+                success: outcome_status == ToolOutcomeStatus::Succeeded,
+                duration_ms: ended.elapsed_secs.saturating_mul(1000),
+                error: (outcome_status == ToolOutcomeStatus::FailedPermanent)
+                    .then(|| "background process ended without an exit status".to_string()),
+                task_id: Some(ended.task_id.to_string()),
+                annotations: Vec::new(),
+                turn_id: None,
+                attachments: Vec::new(),
+                receipt: Some(receipt),
+            },
+        )
+        .await
+    {
+        warn!(
+            %error,
+            task_id = %ended.task_id,
+            tool_call_id = %ended.tool_call_id,
+            "Failed to persist terminal background completion receipt"
+        );
+    }
+    result_id
 }
 
 fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
@@ -11671,6 +11778,90 @@ mod tests {
         assert!(SUB_AGENT_FOREGROUND_WAIT >= Duration::from_secs(120));
         assert_eq!(foreground_wait(initial, false, true), initial);
         assert_eq!(foreground_wait(initial, true, false), DETACH_STARTUP_GRACE);
+    }
+
+    /// A helper's long command shows its latest output line as it runs,
+    /// whether the call waits for it or it was moved to the background
+    /// (live 2026-11-13: "count slowly to 30" showed only its start line
+    /// until the end).
+    #[tokio::test]
+    async fn a_helpers_long_command_reports_its_output_as_it_runs() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec!["*".to_string()],
+            crate::tools::ApprovalBroker::new(approval_tx_raw),
+            30,
+            4000,
+            PermissionMode::Yolo,
+            state.pool(),
+        )
+        .await
+        .with_state(state as Arc<dyn StateStore>);
+        let helper = || ToolCallContext {
+            grant_session: "telegram:synthetic-chat".to_string(),
+            task_id: Some("helper-task".to_string()),
+            ..crate::testing::call_facts("specialist:executor:synthetic-count")
+        };
+        let lines = |rx: &mut mpsc::Receiver<StatusUpdate>| {
+            let mut lines = Vec::new();
+            while let Ok(update) = rx.try_recv() {
+                if let StatusUpdate::CommandOutput { line, .. } = update {
+                    lines.push(line);
+                }
+            }
+            lines
+        };
+
+        // One call that waits for the whole count.
+        let (tx, mut rx) = mpsc::channel(32);
+        let outcome = tool
+            .call_with_execution_context(
+                r#"{"action":"run","command":"for i in 1 2 3 4 5; do echo $i; sleep 1; done"}"#,
+                Some(tx),
+                helper(),
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.metadata.background_started);
+        let shown = lines(&mut rx);
+        assert!(
+            shown
+                .iter()
+                .any(|line| ["1", "2", "3", "4"].contains(&line.as_str())),
+            "{shown:?}"
+        );
+
+        // A count moved to the background keeps reporting after the call.
+        let (tx, mut rx) = mpsc::channel(32);
+        let outcome = tool
+            .call_with_execution_context(
+                r#"{"action":"run","command":"for i in 1 2 3 4 5 6; do echo $i; sleep 1; done","background":true}"#,
+                Some(tx),
+                helper(),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.metadata.background_started);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let shown = lines(&mut rx);
+        assert!(
+            shown
+                .iter()
+                .any(|line| ["3", "4", "5"].contains(&line.as_str())),
+            "{shown:?}"
+        );
+        while tool.jobs_ended_by_task_end("helper-task").await > 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// A sub-agent's job that outlives the foreground wait does not end the

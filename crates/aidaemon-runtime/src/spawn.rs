@@ -64,6 +64,38 @@ pub struct SpawnChildResult {
     /// `Untrusted` when the child's run read (or started with) untrusted
     /// content: its result carries that taint back to the parent.
     pub trust: aidaemon_core::SourceTrust,
+    /// The child's own typed verdict was `done`, and its outcome is partial
+    /// only because no receipt confirmed some of its listed steps
+    /// ([`reported_done_unconfirmed`]).
+    pub reported_done: bool,
+}
+
+/// Whether a child's partial outcome is only for want of receipts: it
+/// ended its run normally with its own typed verdict `done`, nothing it
+/// started still runs, the owner declined nothing, and it set none of its
+/// listed steps aside (failed, skipped or deferred); only some steps were
+/// never matched by a receipt. The owner is then told it finished.
+pub fn reported_done_unconfirmed(
+    outcome: TaskOutcome,
+    end: &TaskEndData,
+    aggregate: &aidaemon_events::RunAggregate,
+) -> bool {
+    use aidaemon_events::RunObligationState;
+    outcome == TaskOutcome::Partial
+        && end.status == aidaemon_events::TaskStatus::Completed
+        && aggregate.executor_claimed_outcome == Some(aidaemon_events::ExecutorClaimedOutcome::Done)
+        && !aggregate.has_background_in_flight()
+        && !aggregate.owner_declined()
+        && aggregate
+            .obligations
+            .iter()
+            .filter(|(id, _)| id.contains("/obligation:checklist:"))
+            .all(|(_, obligation)| {
+                matches!(
+                    obligation.state,
+                    RunObligationState::Satisfied | RunObligationState::Pending
+                )
+            })
 }
 
 #[derive(Debug)]
@@ -140,13 +172,20 @@ pub struct ListedChild {
     request: Option<String>,
     /// Stops the child when the owner asks.
     stop: tokio_util::sync::CancellationToken,
+    /// Its latest step, as its progress line says it.
+    step: ChildStep,
 }
+
+/// A running child's latest step, written by its status channel.
+pub type ChildStep = Arc<std::sync::Mutex<Option<String>>>;
 
 /// A listed child, as the chat's running work shows it.
 pub struct ListedChildView {
     pub key: String,
     pub child: aidaemon_channels::ports::RunningChild,
     pub request: Option<String>,
+    /// Its latest step, as `/tasks` and the status reply give it.
+    pub step: Option<String>,
 }
 
 /// A chat's running turn, recorded while it runs.
@@ -175,12 +214,18 @@ pub struct RunningChildEntry {
     registry: Arc<RunningChildren>,
     id: u64,
     stop: tokio_util::sync::CancellationToken,
+    step: ChildStep,
 }
 
 impl RunningChildEntry {
     /// Cancelled when the owner stops this child.
     pub fn stopped(&self) -> tokio_util::sync::CancellationToken {
         self.stop.clone()
+    }
+
+    /// Where the child's status channel writes its latest step.
+    pub fn step(&self) -> ChildStep {
+        self.step.clone()
     }
 }
 
@@ -200,6 +245,7 @@ impl RunningChildren {
             .get(session_id)
             .cloned();
         let stop = tokio_util::sync::CancellationToken::new();
+        let step = ChildStep::default();
         self.entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -212,11 +258,13 @@ impl RunningChildren {
                 child_session: child_session.to_string(),
                 request,
                 stop: stop.clone(),
+                step: step.clone(),
             });
         RunningChildEntry {
             registry: self.clone(),
             id,
             stop,
+            step,
         }
     }
 
@@ -302,6 +350,11 @@ impl RunningChildren {
                         started_at: child.started_at,
                     },
                     request: child.request.clone(),
+                    step: child
+                        .step
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
                 }
             })
             .collect()
@@ -392,6 +445,7 @@ pub const MAX_REPORT_TOOL_RECORDS: usize = 5_000;
 pub fn child_status_sender(
     parent: Option<mpsc::Sender<StatusUpdate>>,
     mission: &str,
+    step: Option<ChildStep>,
 ) -> Option<mpsc::Sender<StatusUpdate>> {
     let parent = parent?;
     let label = child_status_label(mission);
@@ -438,6 +492,22 @@ pub fn child_status_sender(
                 },
                 other => other,
             };
+            // Its own latest step, for `/tasks`.
+            if let (
+                Some(slot),
+                StatusUpdate::SubAgentProgress {
+                    label: of,
+                    progress,
+                },
+            ) = (step.as_ref(), &update)
+            {
+                if *of == label {
+                    *slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(progress.clone());
+                }
+            }
             if parent.send(update).await.is_err() {
                 break;
             }

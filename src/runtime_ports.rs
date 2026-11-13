@@ -24,6 +24,10 @@ pub(crate) struct ChildAgentRun {
     /// `Untrusted` when the child's run read (or started with) content
     /// someone other than the owner wrote.
     pub trust: aidaemon_core::SourceTrust,
+    /// The child's own typed verdict was `done`, and its outcome is partial
+    /// only because no receipt confirmed some of its listed steps: the owner
+    /// is told it finished, and that its tools did not confirm every step.
+    pub reported_done: bool,
 }
 
 /// A terminal task result recovered after a child run timed out.

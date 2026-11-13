@@ -1081,6 +1081,7 @@ impl Agent {
                 title: format!("Sub-agent: {}", child.child.label),
                 started_at: child.child.started_at,
                 request: child.request,
+                step: child.step,
             })
             .collect();
         for (index, tool) in self.tools.iter().enumerate() {
@@ -1091,6 +1092,7 @@ impl Agent {
                     title: job.title,
                     started_at: job.started_at,
                     request: job.task_id,
+                    step: None,
                 });
             }
         }

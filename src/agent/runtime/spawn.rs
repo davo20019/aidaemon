@@ -2497,7 +2497,11 @@ impl Agent {
         let session_for_task = child_session.clone();
         let task_for_task = task.to_string();
         let parent_status_tx = status_tx.clone();
-        let status_tx = child_status_sender(status_tx, &card_name);
+        let status_tx = child_status_sender(
+            status_tx,
+            &card_name,
+            listed.as_ref().map(RunningChildEntry::step),
+        );
         // Setup is done: from here the child counts toward its request's
         // total even if it then fails.
         crate::agent::authority::mark_child_began();
@@ -2643,18 +2647,32 @@ impl Agent {
 
         let child_end_record =
             latest_child_task_end(&self.event_store, &child_session_for_events).await;
+        let unlanded_write = outcome_coordination
+            .as_ref()
+            .is_some_and(|tree| tree.has_unlanded_write(&child_session_for_events));
         let child_outcome = settle_coordinated_outcome(
             resolve_child_outcome(result.is_ok(), &child_end_record),
-            outcome_coordination
-                .as_ref()
-                .is_some_and(|tree| tree.has_unlanded_write(&child_session_for_events)),
+            unlanded_write,
         );
+        let reported_done = match child_end_record.as_ref() {
+            Ok(Some(end)) if result.is_ok() && !unlanded_write => self
+                .event_store
+                .task_run_aggregate(&child_session_for_events, &end.task_id)
+                .await
+                .is_ok_and(|aggregate| reported_done_unconfirmed(child_outcome, end, &aggregate)),
+            _ => false,
+        };
         // The child's progress line on the parent's card ends with how the
         // child ended, not with the last step it reported.
         if let Some(tx) = &parent_status_tx {
+            let ended = if reported_done {
+                crate::events::TaskOutcome::Succeeded
+            } else {
+                child_outcome
+            };
             let _ = tx.try_send(StatusUpdate::SubAgentProgress {
                 label: child_status_label(&card_name),
-                progress: child_end_progress(child_outcome).to_string(),
+                progress: child_end_progress(ended).to_string(),
             });
         }
         let child_task_end = match child_end_record {
@@ -2797,6 +2815,7 @@ impl Agent {
             response,
             outcome: child_outcome,
             trust,
+            reported_done,
         })
     }
 
@@ -3103,7 +3122,7 @@ mod tests {
         assert_eq!(crate::tools::terminal::latest_output_line(b"\n \n"), None);
 
         let (parent_tx, mut parent_rx) = mpsc::channel(4);
-        let counter = child_status_sender(Some(parent_tx), "Slow counter").unwrap();
+        let counter = child_status_sender(Some(parent_tx), "Slow counter", None).unwrap();
         counter
             .send(StatusUpdate::CommandOutput {
                 name: "terminal".into(),
@@ -3131,11 +3150,15 @@ mod tests {
         let wordpress = child_status_sender(
             Some(parent_tx.clone()),
             "Build the WordPress demo site for Acme Corp",
+            None,
         )
         .unwrap();
-        let drupal =
-            child_status_sender(Some(parent_tx), "Build the Drupal demo site for Acme Corp")
-                .unwrap();
+        let drupal = child_status_sender(
+            Some(parent_tx),
+            "Build the Drupal demo site for Acme Corp",
+            None,
+        )
+        .unwrap();
         wordpress
             .send(StatusUpdate::Checklist {
                 text: rendered_checklist(5, 5),

@@ -260,15 +260,32 @@ fn bounded_child_response(
     (shown, Some(info))
 }
 
+/// The first line of a background helper's result in the chat, from its
+/// typed outcome.
+pub(crate) fn background_completion_label(outcome: TaskOutcome) -> &'static str {
+    match outcome {
+        TaskOutcome::Succeeded => "\u{2705} Finished in the background",
+        TaskOutcome::Partial => "\u{26a0}\u{fe0f} Didn't finish in the background",
+        TaskOutcome::Failed => "\u{274c} Failed in the background",
+    }
+}
+
+/// A background helper's result for the chat, headed by its typed outcome.
+/// A helper whose own typed verdict was `done` but whose tools did not
+/// confirm every step it listed (`reported_done` with a partial outcome)
+/// finished, and the result says what was not confirmed (live 2026-11-13:
+/// helpers whose reports said "Done." read "Didn't finish" because a
+/// step's receipts never matched how it was listed).
 fn format_background_completion(
     mission: &str,
     response: &str,
     outcome: TaskOutcome,
+    reported_done: bool,
     max_response_chars: usize,
 ) -> (&'static str, String) {
     // This goes straight to the chat, past the loop that renders truncation
     // metadata for tool results.
-    let text = match bounded_child_response(response, max_response_chars) {
+    let mut text = match bounded_child_response(response, max_response_chars) {
         (shown, Some(info)) => {
             format!(
                 "{shown}\n\n{}",
@@ -277,45 +294,88 @@ fn format_background_completion(
         }
         (shown, None) => shown.to_string(),
     };
-    match outcome {
-        TaskOutcome::Succeeded => (
-            "completed",
-            format!(
-                "\u{2705} Finished in the background: {}\n\n{}",
-                mission, text
-            ),
+    let outcome = match outcome {
+        TaskOutcome::Partial if reported_done => {
+            text.push_str(
+                "\n\nIt reported its work done; its tools didn't confirm every step it listed.",
+            );
+            TaskOutcome::Succeeded
+        }
+        outcome => outcome,
+    };
+    let kind = match outcome {
+        TaskOutcome::Succeeded => "completed",
+        TaskOutcome::Partial => "partial",
+        TaskOutcome::Failed => "failed",
+    };
+    (
+        kind,
+        format!(
+            "{}: {}\n\n{}",
+            background_completion_label(outcome),
+            mission,
+            text
         ),
-        TaskOutcome::Partial => (
-            "partial",
-            format!(
-                "\u{26a0}\u{fe0f} Didn't finish in the background: {}\n\n{}",
-                mission, text
-            ),
-        ),
-        TaskOutcome::Failed => (
-            "failed",
-            format!("\u{274c} Failed in the background: {}\n\n{}", mission, text),
-        ),
-    }
+    )
 }
 
 /// Each chat's background helpers still running, in the order they
-/// started: their job id and the name the card gives them. A plan card
-/// edited after its turn (a helper finished and settled its steps) keeps a
-/// start line for each one still running.
+/// started: their job id, the name the card gives them and their latest
+/// step. A plan card edited after its turn (a helper finished and settled
+/// its steps, or reported a step) keeps a start line for each one still
+/// running.
 static RUNNING_HELPERS: std::sync::LazyLock<std::sync::Mutex<RunningHelpers>> =
     std::sync::LazyLock::new(Default::default);
 
-/// Per chat: each running helper's job id and card name.
-type RunningHelpers = std::collections::HashMap<String, Vec<(String, String)>>;
+/// One running helper on its chat's card.
+struct RunningHelper {
+    job: String,
+    label: String,
+    step: Option<String>,
+}
+
+/// Per chat: its running helpers.
+type RunningHelpers = std::collections::HashMap<String, Vec<RunningHelper>>;
 
 fn note_running_helper(chat: &str, job_id: &str, label: &str) {
     if let Ok(mut running) = RUNNING_HELPERS.lock() {
         running
             .entry(chat.to_string())
             .or_default()
-            .push((job_id.to_string(), label.to_string()));
+            .push(RunningHelper {
+                job: job_id.to_string(),
+                label: label.to_string(),
+                step: None,
+            });
     }
+}
+
+/// The helper's latest step, for its line on the card.
+fn note_helper_step(chat: &str, job_id: &str, step: &str) {
+    if let Ok(mut running) = RUNNING_HELPERS.lock() {
+        if let Some(helper) = running
+            .get_mut(chat)
+            .and_then(|helpers| helpers.iter_mut().find(|helper| helper.job == job_id))
+        {
+            helper.step = Some(step.to_string());
+        }
+    }
+}
+
+/// The chat's running helpers: each one's card name and latest step.
+fn running_helper_lines(chat: &str) -> Vec<(String, Option<String>)> {
+    RUNNING_HELPERS
+        .lock()
+        .ok()
+        .and_then(|running| {
+            running.get(chat).map(|helpers| {
+                helpers
+                    .iter()
+                    .map(|helper| (helper.label.clone(), helper.step.clone()))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
 
 /// The job ended: its start line leaves the card. Returns the names of
@@ -327,12 +387,115 @@ fn helper_ended(chat: &str, job_id: &str) -> Vec<String> {
     let Some(helpers) = running.get_mut(chat) else {
         return Vec::new();
     };
-    helpers.retain(|(job, _)| job != job_id);
-    let left = helpers.iter().map(|(_, label)| label.clone()).collect();
+    helpers.retain(|helper| helper.job != job_id);
+    let left = helpers.iter().map(|helper| helper.label.clone()).collect();
     if helpers.is_empty() {
         running.remove(chat);
     }
     left
+}
+
+/// The card a background helper's turn leaves in the chat, for showing
+/// the helper's steps after that turn ended.
+struct HelperCard {
+    hub: Option<Weak<dyn OutboundRouter>>,
+    plans: Option<Arc<crate::plans::PlanStore>>,
+    plan_session: Option<String>,
+    chat: String,
+    job: String,
+    label: String,
+    /// The chat's kept card and background message when the helper
+    /// started: one that differs later is the card its own turn left.
+    at_start: (Option<String>, Option<String>),
+}
+
+/// How often a helper's steps may edit its card after its turn.
+const HELPER_CARD_EVERY: Duration = Duration::from_secs(3);
+
+impl HelperCard {
+    /// Redraw the card the helper's turn left (the plan, each running
+    /// helper's start line and latest step), when that turn has ended and
+    /// left one. While the turn runs, its own live card shows the steps.
+    async fn refresh(&self) {
+        let (Some(hub), Some(plans), Some(plan_session)) = (
+            self.hub.as_ref().and_then(Weak::upgrade),
+            self.plans.as_ref(),
+            self.plan_session.as_deref(),
+        ) else {
+            return;
+        };
+        if plan_session != self.chat {
+            return;
+        }
+        let now = (
+            hub.checklist_surface(&self.chat).await,
+            hub.background_status_surface(&self.chat).await,
+        );
+        let Some(surface) = now.0.clone().or_else(|| now.1.clone()) else {
+            return;
+        };
+        if now == self.at_start {
+            return;
+        }
+        let Some(plan) = plans
+            .get_recent_for_session(plan_session, 5)
+            .await
+            .ok()
+            .into_iter()
+            .flatten()
+            .find(|plan| {
+                plan.steps
+                    .iter()
+                    .any(|step| step.background_jobs.contains(&self.job))
+            })
+        else {
+            return;
+        };
+        let card = aidaemon_channels::live_status::with_helper_lines(
+            &plan.render_compact_checklist(),
+            running_helper_lines(&self.chat)
+                .iter()
+                .map(|(label, step)| (label.as_str(), step.as_deref())),
+        );
+        let _ = hub.edit_text(&self.chat, &surface, &card).await;
+    }
+}
+
+/// A background helper's status channel: every update goes on to its
+/// parent's, and its own steps are also noted for its line on the card and
+/// shown there once its turn has ended (live 2026-11-13: the turn's live
+/// card stopped with the turn, and a 60 s count showed nothing until it
+/// ended).
+fn show_helper_steps_on_card(
+    parent: Option<mpsc::Sender<StatusUpdate>>,
+    card: HelperCard,
+) -> Option<mpsc::Sender<StatusUpdate>> {
+    let parent = parent?;
+    let (tx, mut rx) = mpsc::channel::<StatusUpdate>(64);
+    tokio::spawn(async move {
+        let mut redraw = tokio::time::interval(HELPER_CARD_EVERY);
+        redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut changed = false;
+        loop {
+            tokio::select! {
+                update = rx.recv() => {
+                    let Some(update) = update else { break };
+                    if let StatusUpdate::SubAgentProgress { label, progress } = &update {
+                        if *label == card.label {
+                            note_helper_step(&card.chat, &card.job, progress);
+                            changed = true;
+                        }
+                    }
+                    let _ = parent.send(update).await;
+                }
+                _ = redraw.tick(), if changed => {
+                    changed = false;
+                    card.refresh().await;
+                }
+            }
+        }
+    });
+    Some(tx)
 }
 
 /// How much of a mission a background record keeps.
@@ -529,21 +692,46 @@ impl MeasuredRun {
         }
     }
 
-    fn total(&self) -> chrono::Duration {
-        (self.finished - self.started).max(chrono::Duration::zero())
+    /// When its work began: its first step, else when it was started.
+    fn began(&self) -> chrono::DateTime<chrono::Utc> {
+        self.steps.map_or(self.started, |(first, _)| first)
     }
 
-    /// Its steps' span, when it took any steps.
-    fn work(
-        &self,
-    ) -> Option<(
-        chrono::DateTime<chrono::Utc>,
-        chrono::DateTime<chrono::Utc>,
-        chrono::Duration,
-    )> {
-        let (first, last) = self.steps?;
-        Some((first, last, (last - first).max(chrono::Duration::zero())))
+    /// How long it took: from its first step to its report, its start-up
+    /// left out (live 2026-11-13: "Ran 1m 19s" from its first to its last
+    /// step, beside a footer time from its start).
+    fn took(&self) -> chrono::Duration {
+        (self.finished - self.began()).max(chrono::Duration::zero())
     }
+
+    /// Its first step to its report, on the owner's clock. A range under
+    /// ten minutes gives seconds, so the stated times agree with the
+    /// duration ("8:34:43 PM to 8:37:15 PM ET").
+    fn range(&self) -> String {
+        owner_clock_range(self.began(), self.finished)
+    }
+}
+
+/// `from` to `to` in the owner's zone and 12-hour clock, with seconds when
+/// the range is under ten minutes.
+fn owner_clock_range(
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> String {
+    if (to - from) >= chrono::Duration::minutes(10) {
+        return format!(
+            "{} to {}",
+            crate::cron_utils::owner_time(&from),
+            crate::cron_utils::owner_time(&to)
+        );
+    }
+    let local = |at: chrono::DateTime<chrono::Utc>| at.with_timezone(&chrono::Local);
+    let zone = crate::cron_utils::owner_zone_label(local(to).offset().local_minus_utc());
+    format!(
+        "{} to {} {zone}",
+        local(from).format("%-I:%M:%S %p"),
+        local(to).format("%-I:%M:%S %p")
+    )
 }
 
 fn compact(duration: chrono::Duration) -> String {
@@ -554,36 +742,25 @@ fn compact(duration: chrono::Duration) -> String {
 }
 
 /// When a child ran and how long it took, measured by the daemon, for the
-/// parent: one timing line naming the helper (start and finish in the
-/// owner's zone and 12-hour clock, "5:44 PM ET", the time in all, how long
-/// its own steps ran and its wait for the owner), then how to report it.
-/// The line keeps [`MEASURED_TIMING_MARK`], so a later turn still sees it
-/// when this result is cut to a summary. A parent sees which of its children
+/// parent: one timing line naming the helper (how long it took, from its
+/// first step to its report, and when, in the owner's zone and 12-hour
+/// clock, and its wait for the owner), then how to report it. The line
+/// keeps [`MEASURED_TIMING_MARK`], so a later turn still sees it when this
+/// result is cut to a summary. A parent sees which of its children
 /// overlapped, and the times, durations and waits it reports are these
 /// measurements, never arithmetic on times the child printed (live
 /// 2026-11-12: "about 16 minutes (17:44 to 18:00)", and a "5-minute wait for
 /// approval" the model guessed).
 fn run_window(name: &str, run: &MeasuredRun) -> String {
-    let total = run.total();
-    let work = match run.work() {
-        Some((first, last, ran)) => format!(
-            "; its steps ran {} ({}s), {} to {}",
-            compact(ran),
-            ran.num_seconds(),
-            crate::cron_utils::owner_time(&first),
-            crate::cron_utils::owner_time(&last),
-        ),
-        None => String::new(),
-    };
+    let took = run.took();
     format!(
-        "{MEASURED_TIMING_MARK}{name} ran {} to {}, {} ({}s) in all{work}.{}\n\
-         These are the daemon's measurements: report these times, durations and this wait as \
-         given (the owner's time zone, 12-hour clock); times in the sub-agent's own reply are \
-         its estimates.",
-        crate::cron_utils::owner_time(&run.started),
-        crate::cron_utils::owner_time(&run.finished),
-        compact(total),
-        total.num_seconds(),
+        "{MEASURED_TIMING_MARK}{name} took {} ({}s), {}.{}\n\
+         These are the daemon's measurements: report this time, this duration and this wait \
+         as given (the owner's time zone, 12-hour clock); times in the sub-agent's own reply \
+         are its estimates.",
+        compact(took),
+        took.num_seconds(),
+        run.range(),
         owner_wait_note(run.waited),
     )
 }
@@ -603,39 +780,27 @@ fn owner_wait_note(waited: Duration) -> String {
     )
 }
 
-/// A background child's measured run for the chat. The time it worked is
-/// its steps' span (live 2026-11-13: "Took 1m 18s" for a count that ran
-/// 62 s, the rest being its start-up and its report); the time since it
-/// started is said apart, labelled, when it differs.
+/// A background child's measured run for the chat: one duration, from its
+/// first step to its report, and the times it spans (live 2026-11-13: "Ran
+/// 2m 44s (8:34 PM ET to 8:37 PM ET)" read as the whole run, but was its
+/// first to last tool call, minutes apart from its own measurement).
 fn background_timing(run: &MeasuredRun) -> String {
-    let total = run.total();
     let wait = if run.waited.as_secs() == 0 {
         String::new()
     } else {
         format!(
-            " It waited {} for your answer.",
+            " It waited {} of that for your answer.",
             aidaemon_tools::duration_format::compact_seconds(
                 i64::try_from(run.waited.as_secs()).unwrap_or(i64::MAX),
                 aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
             )
         )
     };
-    let line = match run.work() {
-        Some((first, last, ran)) if compact(ran) != compact(total) => format!(
-            "Ran {} ({} to {}); {} in all since it started, with its start-up and report.",
-            compact(ran),
-            crate::cron_utils::owner_time(&first),
-            crate::cron_utils::owner_time(&last),
-            compact(total),
-        ),
-        _ => format!(
-            "Ran {} ({} to {}).",
-            compact(total),
-            crate::cron_utils::owner_time(&run.started),
-            crate::cron_utils::owner_time(&run.finished),
-        ),
-    };
-    format!("{MEASURED_TIMING_MARK}{line}{wait}")
+    format!(
+        "{MEASURED_TIMING_MARK}Took {} ({}).{wait}",
+        compact(run.took()),
+        run.range()
+    )
 }
 
 /// One result for a batch call: each child's result under its mission, in
@@ -894,8 +1059,10 @@ impl Tool for SpawnAgentTool {
                     "title": {
                         "type": "string",
                         "description": "A short name for this sub-agent that the owner reads on its \
-                            status lines and approval cards: two to four plain words naming its job \
-                            (e.g. 'Drupal install', 'Price research'), never a sentence."
+                            status lines and approval cards: a few plain words naming its job and, \
+                            when the work creates or works in a folder, that folder's name, so the \
+                            owner sees where it goes from the start (e.g. 'Drupal install in \
+                            claude-drupal-6', 'Price research'), never a sentence."
                     },
                     "task": {
                         "type": "string",
@@ -1289,6 +1456,25 @@ impl Tool for SpawnAgentTool {
                 .unwrap_or(args.mission.as_str()),
         );
         note_running_helper(&session_id, &background_id, &helper_label);
+        let at_start = match hub.as_ref() {
+            Some(hub) => (
+                hub.checklist_surface(&session_id).await,
+                hub.background_status_surface(&session_id).await,
+            ),
+            None => (None, None),
+        };
+        let status_tx = show_helper_steps_on_card(
+            status_tx,
+            HelperCard {
+                hub: hub_for_parent_delivery.clone(),
+                plans: plan_store.clone(),
+                plan_session: plan_session.clone(),
+                chat: session_id.clone(),
+                job: background_id.clone(),
+                label: helper_label.clone(),
+                at_start,
+            },
+        );
 
         tokio::spawn(async move {
             // This task owns `family_permit`, so the slot stays taken until
@@ -1401,6 +1587,7 @@ impl Tool for SpawnAgentTool {
                             &mission,
                             &run.response,
                             run.outcome,
+                            run.reported_done,
                             max_response_chars,
                         );
                         message.push_str(&coordination_trailer(tree_for_bg.as_ref(), &run.session));
@@ -1970,11 +2157,25 @@ mod tests {
             "Build and verify the site",
             "Blocked on workspace access.",
             TaskOutcome::Partial,
+            false,
             8_000,
         );
         assert_eq!(notification_type, "partial");
         assert!(message.starts_with("\u{26a0}\u{fe0f} Didn't finish in the background"));
         assert!(!message.contains("\u{2705} Finished in the background"));
+
+        // Its own typed verdict was done and only receipts are missing: it
+        // finished, and says what its tools did not confirm.
+        let (notification_type, message) = format_background_completion(
+            "Count to 30",
+            "Done. I counted from 1 to 30.",
+            TaskOutcome::Partial,
+            true,
+            8_000,
+        );
+        assert_eq!(notification_type, "completed");
+        assert!(message.starts_with("\u{2705} Finished in the background: Count to 30"));
+        assert!(message.ends_with("its tools didn't confirm every step it listed."));
     }
 
     #[test]
@@ -1983,10 +2184,38 @@ mod tests {
             "Build and verify the site",
             "Build passed.",
             TaskOutcome::Succeeded,
+            false,
             8_000,
         );
         assert_eq!(notification_type, "completed");
         assert!(message.starts_with("\u{2705} Finished in the background"));
+    }
+
+    /// A helper's title, and each plan item, names the folder the work
+    /// creates, so the owner's first "Started in the background" lines say
+    /// where it goes (live 2026-11-13: the new -6 folders showed up first in
+    /// a status reply).
+    #[tokio::test]
+    async fn titles_and_plan_items_name_the_folder_the_work_creates() {
+        let tool = SpawnAgentTool::new_deferred(8000, 300);
+        let schema = tool.schema();
+        let title = schema["parameters"]["properties"]["title"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            title.contains("when the work creates or works in a folder, that folder's name"),
+            "{title}"
+        );
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = crate::tools::track_requirements::TrackRequirementsTool::new(Arc::new(
+            crate::plans::PlanStore::new(pool).await.unwrap(),
+        ));
+        assert!(crate::traits::Tool::description(&plans)
+            .contains("name the folder or file an item creates"));
     }
 
     #[test]
@@ -2414,6 +2643,7 @@ mod child_runtime_tests {
                 response: self.response.clone(),
                 outcome: TaskOutcome::Succeeded,
                 trust: SourceTrust::Trusted,
+                reported_done: false,
             })
         }
         async fn background_cancel_token(
@@ -2655,7 +2885,7 @@ mod child_runtime_tests {
             .unwrap();
         let first = outcome.output.lines().next().unwrap_or_default();
         assert!(
-            first.starts_with(&format!("{MEASURED_TIMING_MARK}Slow count ran ")),
+            first.starts_with(&format!("{MEASURED_TIMING_MARK}Slow count took ")),
             "{first}"
         );
         assert!(first.contains(" AM ") || first.contains(" PM "), "{first}");
@@ -3337,70 +3567,75 @@ mod child_runtime_tests {
         assert!(!entry.message.contains("never delivered"));
     }
 
-    /// A child's result carries its measured run: start and finish in the
-    /// owner's clock, the time in all, and how long its own steps ran,
-    /// foreground and background. The chat's footer gives the steps' time
-    /// as how long it ran and labels the time since it started (live
-    /// 2026-11-13: "Took 1m 18s" for a count that ran 62 s).
+    /// A helper's result and its chat footer give one duration, how long it
+    /// took from its first step to its report, and the times it spans on
+    /// the owner's clock, with seconds when under ten minutes so the times
+    /// agree with the duration (live 2026-11-13: "Ran 2m 44s (8:34 PM ET to
+    /// 8:37 PM ET)" was its first to last tool call, beside its own 152 s).
     #[test]
-    fn a_childs_result_carries_its_measured_elapsed_time() {
+    fn a_helpers_time_is_its_first_step_to_its_report() {
         let started = chrono::Utc::now();
-        let run = |steps: Option<(i64, i64)>, waited: u64| MeasuredRun {
+        let run = |first_step: Option<i64>, finished: i64, waited: u64| MeasuredRun {
             started,
-            finished: started + chrono::Duration::seconds(78),
-            steps: steps.map(|(a, b)| {
+            finished: started + chrono::Duration::seconds(finished),
+            steps: first_step.map(|a| {
                 (
                     started + chrono::Duration::seconds(a),
-                    started + chrono::Duration::seconds(b),
+                    started + chrono::Duration::seconds(finished - 9),
                 )
             }),
             waited: Duration::from_secs(waited),
         };
-        let window = run_window("Slow counter", &run(Some((7, 69)), 0));
+        let seconds = |at: i64| {
+            (started + chrono::Duration::seconds(at))
+                .with_timezone(&chrono::Local)
+                .format("%-I:%M:%S %p")
+                .to_string()
+        };
+
+        let footer = background_timing(&run(Some(7), 78, 0));
+        assert_eq!(
+            footer,
+            format!(
+                "{MEASURED_TIMING_MARK}Took 1m 11s ({} to {} {}).",
+                seconds(7),
+                seconds(78),
+                crate::cron_utils::owner_zone_label(
+                    chrono::Local::now().offset().local_minus_utc()
+                )
+            )
+        );
+        let window = run_window("Slow counter", &run(Some(7), 78, 0));
         assert!(
-            window.starts_with(&format!("{MEASURED_TIMING_MARK}Slow counter ran ")),
+            window.starts_with(&format!(
+                "{MEASURED_TIMING_MARK}Slow counter took 1m 11s (71s), {} to {} ",
+                seconds(7),
+                seconds(78)
+            )),
             "{window}"
         );
-        assert!(window.contains(", 1m 18s (78s) in all; its steps ran 1m 2s (62s), "));
-        // The owner's zone and 12-hour clock, never a 24-hour reading.
+        assert!(!window.contains("in all"), "{window}");
+
+        // No steps: from when it was started.
+        let footer = background_timing(&run(None, 78, 20));
+        assert!(
+            footer.starts_with(&format!(
+                "{MEASURED_TIMING_MARK}Took 1m 18s ({} to ",
+                seconds(0)
+            )),
+            "{footer}"
+        );
+        assert!(
+            footer.ends_with(" It waited 20s of that for your answer."),
+            "{footer}"
+        );
+
+        // Ten minutes or more: the owner's usual clock, no seconds.
+        let long = background_timing(&run(Some(0), 900, 0));
         let owner_start = crate::cron_utils::owner_time(&started);
         assert!(
-            owner_start.contains(" AM ") || owner_start.contains(" PM "),
-            "{owner_start}"
-        );
-        assert!(
-            window.contains(&format!("ran {owner_start} to ")),
-            "{window}"
-        );
-        assert!(!window.contains("waited"), "{window}");
-
-        let footer = background_timing(&run(Some((7, 69)), 0));
-        assert!(
-            footer.starts_with(&format!("{MEASURED_TIMING_MARK}Ran 1m 2s (")),
-            "{footer}"
-        );
-        assert!(
-            footer.ends_with("; 1m 18s in all since it started, with its start-up and report."),
-            "{footer}"
-        );
-        // No steps: the one time it has.
-        let footer = background_timing(&run(None, 0));
-        assert!(
-            footer.starts_with(&format!("{MEASURED_TIMING_MARK}Ran 1m 18s (")),
-            "{footer}"
-        );
-        assert!(!footer.contains("in all"), "{footer}");
-
-        // A wait for the owner is the child's measured wait, said as such.
-        let waited = run_window("Slow counter", &run(Some((7, 69)), 300));
-        assert!(
-            waited.contains("Of that, it waited 5m for the owner's answer on an approval card."),
-            "{waited}"
-        );
-        let footer = background_timing(&run(Some((7, 69)), 20));
-        assert!(
-            footer.ends_with(" It waited 20s for your answer."),
-            "{footer}"
+            long.contains(&format!("Took 15m ({owner_start} to ")),
+            "{long}"
         );
     }
 
@@ -3418,7 +3653,7 @@ mod child_runtime_tests {
         assert!(
             entry
                 .message
-                .contains(&format!("\n\n{MEASURED_TIMING_MARK}Ran ")),
+                .contains(&format!("\n\n{MEASURED_TIMING_MARK}Took ")),
             "{}",
             entry.message
         );
@@ -3487,8 +3722,13 @@ mod child_runtime_tests {
 
     #[test]
     fn truncated_background_result_says_what_is_missing() {
-        let (_, message) =
-            format_background_completion("Report", &"x".repeat(500), TaskOutcome::Succeeded, 100);
+        let (_, message) = format_background_completion(
+            "Report",
+            &"x".repeat(500),
+            TaskOutcome::Succeeded,
+            false,
+            100,
+        );
         assert!(message.contains("OUTPUT TRUNCATED"));
     }
 
@@ -3559,6 +3799,8 @@ mod child_runtime_tests {
     #[derive(Default)]
     struct CardHub {
         edits: StdMutex<Vec<(String, String)>>,
+        /// No card is kept yet: the turn is still running.
+        turn_running: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -3606,7 +3848,8 @@ mod child_runtime_tests {
             None
         }
         async fn checklist_surface(&self, _session_id: &str) -> Option<String> {
-            Some("card-1".to_string())
+            (!self.turn_running.load(std::sync::atomic::Ordering::SeqCst))
+                .then(|| "card-1".to_string())
         }
         async fn request_inline_approval(
             &self,
@@ -3622,6 +3865,93 @@ mod child_runtime_tests {
             false
         }
         async fn unregister_session_route(&self, _child: &str, _parent: &str) {}
+    }
+
+    /// A helper's steps reach the card its turn left after that turn ended,
+    /// under its start line; while the turn runs, its live card shows them
+    /// and the kept card is left alone (live 2026-11-13: the card said only
+    /// "Started in the background: Slow count to 30" for the whole count).
+    #[tokio::test]
+    async fn a_helpers_steps_reach_its_card_after_its_turn() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(pool).await.unwrap());
+        let chat = "telegram:synthetic-steps-chat";
+        plans
+            .upsert_checklist(
+                chat,
+                Some("task-steps"),
+                "track_requirements",
+                &[(
+                    "Count slowly to 30".into(),
+                    crate::plans::StepStatus::Pending,
+                )],
+            )
+            .await
+            .unwrap();
+        plans
+            .link_background_job(chat, Some("task-steps"), &[0], "job-steps")
+            .await
+            .unwrap()
+            .expect("the step waits on the helper");
+        let hub = Arc::new(CardHub::default());
+        hub.turn_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        note_running_helper(chat, "job-steps", "Slow count to 30");
+        let (parent_tx, mut parent_rx) = mpsc::channel(8);
+        let helper = show_helper_steps_on_card(
+            Some(parent_tx),
+            HelperCard {
+                hub: Some(Arc::downgrade(&router)),
+                plans: Some(plans.clone()),
+                plan_session: Some(chat.to_string()),
+                chat: chat.to_string(),
+                job: "job-steps".to_string(),
+                label: "Slow count to 30".to_string(),
+                at_start: (None, None),
+            },
+        )
+        .unwrap();
+        let step = |line: &str| StatusUpdate::SubAgentProgress {
+            label: "Slow count to 30".into(),
+            progress: line.into(),
+        };
+
+        helper.send(step("running a command: 14")).await.unwrap();
+        assert!(matches!(
+            parent_rx.recv().await,
+            Some(StatusUpdate::SubAgentProgress { .. })
+        ));
+        tokio::time::sleep(HELPER_CARD_EVERY + Duration::from_millis(500)).await;
+        assert!(
+            hub.edits.lock().unwrap().is_empty(),
+            "the turn's own card shows it"
+        );
+
+        hub.turn_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        helper.send(step("running a command: 15")).await.unwrap();
+        let card = tokio::time::timeout(HELPER_CARD_EVERY * 3, async {
+            loop {
+                if let Some((id, text)) = hub.edits.lock().unwrap().last().cloned() {
+                    assert_eq!(id, "card-1");
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the kept card shows the helper's step");
+        assert!(card.contains("Count slowly to 30"), "{card}");
+        assert!(
+            card.contains("Started in the background: Slow count to 30\n🤖 running a command: 15"),
+            "{card}"
+        );
+        helper_ended(chat, "job-steps");
     }
 
     /// Launch a background child for checklist items 1 and 2 of a three-item

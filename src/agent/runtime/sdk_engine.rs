@@ -1471,8 +1471,8 @@ impl Agent {
                     DaemonCall::Tool(request) => {
                         let running = self.child_progress.as_ref().map(ProgressClock::begin);
                         // Each tool call is one of the run's steps: a
-                        // helper's result says how long its steps ran,
-                        // apart from its start-up and its report.
+                        // helper's time runs from its first step to its
+                        // report, its start-up left out.
                         let step = crate::tools::OwnerWaitClock::begin_step();
                         let call = self.dispatch_sdk_tool_call(&scope, request);
                         in_flight.push(
