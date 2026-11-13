@@ -5089,10 +5089,7 @@ fn local_site_card_carries_typed_facts() {
 async fn a_local_site_the_work_set_up_opens_without_a_card() {
     let (tool, backend, recorder) =
         approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
-    aidaemon_tools::local_sites::note(
-        "sess-site-setup",
-        &["127.0.0.1:8181".to_string()],
-    );
+    aidaemon_tools::local_sites::note("sess-site-setup", &["127.0.0.1:8181".to_string()]);
     tool.call_with(
         &local_navigate("http://127.0.0.1:8181/"),
         aidaemon_tools::testing::call_facts("sess-site-setup"),

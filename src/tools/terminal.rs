@@ -10650,8 +10650,18 @@ mod tests {
         // after a decline it is not asked about again (live 2026-11-12).
         let check = "curl -s -o /dev/null -w '%{http_code}' http://shop-synthetic.localhost/";
         assert!(ann(&host, check, false).read_only);
-        assert!(!ann(&host, "curl -s -o page.html http://shop-synthetic.localhost/", false).read_only);
-        assert!(!ann(&sandboxed, check, true).read_only, "network is never read-only");
+        assert!(
+            !ann(
+                &host,
+                "curl -s -o page.html http://shop-synthetic.localhost/",
+                false
+            )
+            .read_only
+        );
+        assert!(
+            !ann(&sandboxed, check, true).read_only,
+            "network is never read-only"
+        );
         let effects = terminal_call_effects_on(
             &serde_json::json!({"action":"run","command":check,"network":true}).to_string(),
             true,

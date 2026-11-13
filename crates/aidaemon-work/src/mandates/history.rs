@@ -403,14 +403,8 @@ mod tests {
             timestamp: "2026-08-01T01:00:00Z".to_string(),
             value: json!({"status": "succeeded"}),
         };
-        let rendered = render_bounded_history(
-            vec![huge, recent],
-            Vec::new(),
-            Vec::new(),
-            None,
-            None,
-        )
-        .unwrap();
+        let rendered =
+            render_bounded_history(vec![huge, recent], Vec::new(), Vec::new(), None, None).unwrap();
         assert!(rendered.len() <= MAX_HISTORY_BYTES);
         assert!(!rendered.contains("typed_identifier"));
         assert!(rendered.contains("succeeded"));

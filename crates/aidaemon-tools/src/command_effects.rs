@@ -736,9 +736,7 @@ pub fn reaches_only_this_computer(command: &str) -> bool {
 /// `wget` saves by default, and redirects into files, deletes and writes to
 /// a site are excluded.
 pub fn only_reads_this_computer(command: &str) -> bool {
-    if command_effects(command).deletes
-        || scan(command).writes_file
-        || sends_remote_write(command)
+    if command_effects(command).deletes || scan(command).writes_file || sends_remote_write(command)
     {
         return false;
     }
@@ -936,14 +934,17 @@ fn folder_name(operand: &str) -> Option<String> {
     let path = operand.trim_end_matches('/');
     if path.is_empty()
         || path.starts_with('~')
-        || path.chars().any(|c| matches!(c, '$' | '*' | '?' | '[' | '{'))
+        || path
+            .chars()
+            .any(|c| matches!(c, '$' | '*' | '?' | '[' | '{'))
     {
         return None;
     }
     let name = if path.starts_with('/') {
         path.rsplit('/').next()?
     } else {
-        path.split('/').find(|part| !part.is_empty() && *part != ".")?
+        path.split('/')
+            .find(|part| !part.is_empty() && *part != ".")?
     };
     (!matches!(name, "" | "." | "..")).then(|| name.to_string())
 }
@@ -3869,7 +3870,10 @@ mod tests {
 
         let deleting = INSPECT_SITES.replace("ls -la $d | head -30", "rm -rf $d");
         let effects = command_effects(&deleting);
-        assert!(effects.deletes && effects.delete_targets.is_none(), "{deleting}");
+        assert!(
+            effects.deletes && effects.delete_targets.is_none(),
+            "{deleting}"
+        );
         assert!(!effects.observation_only);
         assert!(!reaches_only_this_computer(&deleting));
         let writing = INSPECT_SITES.replace("ls -la $d | head -30", "ls -la $d > notes.txt");
@@ -3913,8 +3917,14 @@ mod tests {
             looked_inside(INSPECT_SITES),
             ["claude-drupal", "claude-wordpress"]
         );
-        assert_eq!(looked_inside("ls -la /srv/www/shop/ && du -sh logs/2026"), ["shop", "logs"]);
-        assert_eq!(looked_inside("tree -L 2 src && find app -name '*.php'"), ["src", "app"]);
+        assert_eq!(
+            looked_inside("ls -la /srv/www/shop/ && du -sh logs/2026"),
+            ["shop", "logs"]
+        );
+        assert_eq!(
+            looked_inside("tree -L 2 src && find app -name '*.php'"),
+            ["src", "app"]
+        );
         assert!(looked_inside("ls ~ . .. $HOME *.txt").is_empty());
         assert!(looked_inside("cat notes.txt").is_empty());
         for not_only_looking in [
@@ -3923,7 +3933,10 @@ mod tests {
             "ls site && curl -s http://localhost:5173/".to_string(),
             "ls site && cargo build".to_string(),
         ] {
-            assert!(looked_inside(&not_only_looking).is_empty(), "{not_only_looking}");
+            assert!(
+                looked_inside(&not_only_looking).is_empty(),
+                "{not_only_looking}"
+            );
         }
     }
 

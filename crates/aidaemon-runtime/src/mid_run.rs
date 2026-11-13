@@ -134,7 +134,11 @@ struct Verdict {
 
 impl Verdict {
     fn intent(&self) -> Option<Intent> {
-        let intent = self.intent.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        let intent = self
+            .intent
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '-'], "_");
         serde_json::from_value(Value::String(intent)).ok()
     }
 }
@@ -342,8 +346,7 @@ mod tests {
             .unwrap();
         assert_eq!(reading.intent, MidRunIntent::AboutRunningWork);
         assert_eq!(reading.answer, None);
-        let (gateway, _) =
-            gateway_with(provider_answering(r#"{"intent":"changes work"}"#)).await;
+        let (gateway, _) = gateway_with(provider_answering(r#"{"intent":"changes work"}"#)).await;
         let reading = read_mid_run_message(&gateway, "use port 8081", &work())
             .await
             .unwrap();

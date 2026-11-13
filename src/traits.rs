@@ -53,9 +53,9 @@ pub use aidaemon_work::mandates::{
     MandateObjectiveMeasurement, MandateOperatingUpdates, MandateOperationKind,
     MandateOperationScope, MandateReconciliationReason, MandateReconciliationResolution,
     MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunNotification,
-    MandateRunNotificationKind, MandateRunProofCounts, MandateStatus, MandateStrategySnapshot, MandateSuspension, MandateSuspensionKind,
-    MandateTerminationKind, MandateWakeSignal, MandateWakeSignalKind, ObjectiveMetricDirection,
-    SAFE_FALLBACK_WAIT_RATIONALE,
+    MandateRunNotificationKind, MandateRunProofCounts, MandateStatus, MandateStrategySnapshot,
+    MandateSuspension, MandateSuspensionKind, MandateTerminationKind, MandateWakeSignal,
+    MandateWakeSignalKind, ObjectiveMetricDirection, SAFE_FALLBACK_WAIT_RATIONALE,
 };
 #[cfg(test)]
 pub use channels::ChannelCapabilities;

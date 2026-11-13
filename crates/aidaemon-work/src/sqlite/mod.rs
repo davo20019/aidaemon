@@ -18,7 +18,6 @@ mod mandates;
 mod notifications;
 mod work;
 
-
 /// What the work stores need from whoever owns the database.
 pub trait WorkDatabase: Send + Sync {
     /// The pool every statement runs on.

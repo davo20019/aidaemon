@@ -608,7 +608,13 @@ mod tests {
              ```{COLLAPSED_FENCE}\n{INSPECT}\n```"
         );
         assert_eq!(text, expected);
-        for gone in ["Review carefully", "significant effects", "applies only", "⚠️", "owner"] {
+        for gone in [
+            "Review carefully",
+            "significant effects",
+            "applies only",
+            "⚠️",
+            "owner",
+        ] {
             assert!(!text.contains(gone), "{gone}: {text}");
         }
         // Prose never sits in a fenced block; only the command does.
@@ -698,7 +704,9 @@ mod tests {
             reason: Some(AskReason::ReadOutsideContent {
                 check_says: Some("This isn't part of your request.".to_string()),
             }),
-            impact: Some(HighImpact::Deletes { targets: Vec::new() }),
+            impact: Some(HighImpact::Deletes {
+                targets: Vec::new(),
+            }),
             ..ApprovalCard::new(CardAction::Command {
                 line: "rm -rf x".to_string(),
                 title: None,
