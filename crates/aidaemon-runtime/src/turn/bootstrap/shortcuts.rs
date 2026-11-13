@@ -1,16 +1,30 @@
-use crate::agent::*;
-use crate::events::TaskOutcome;
+use std::time::Instant;
+
+use aidaemon_channels::context::ChannelContext;
+use aidaemon_events::conversation::Message;
+use aidaemon_events::{DecisionType, TaskOutcome, TaskStatus};
+use aidaemon_tools::semantics::UserRole;
+use aidaemon_tools::status::StatusUpdate;
+use serde_json::json;
+use tokio::sync::mpsc;
+use tracing::info;
+
+use crate::eval::{HarnessEvalAccumulator, HarnessEvalSeed};
+use crate::host::TurnHost;
+use crate::turn::turn_context::TurnHistory;
+use chrono::Utc;
+use uuid::Uuid;
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn maybe_handle_stop_command(
-    agent: &Agent,
+pub async fn maybe_handle_stop_command(
+    agent: &dyn TurnHost,
     session_id: &str,
     user_text: &str,
     user_role: UserRole,
     channel_ctx: &ChannelContext,
     status_tx: Option<mpsc::Sender<StatusUpdate>>,
     task_id: &str,
-    emitter: &crate::events::EventEmitter,
+    emitter: &aidaemon_events::EventEmitter,
 ) -> anyhow::Result<Option<String>> {
     let lower_trimmed = user_text.trim().to_ascii_lowercase();
     let is_stop_command = matches!(lower_trimmed.as_str(), "stop" | "cancel" | "abort");
@@ -34,31 +48,7 @@ pub(super) async fn maybe_handle_stop_command(
     }
 
     let cancel_result = agent
-        .execute_tool_with_watchdog(
-            "cli_agent",
-            r#"{"action": "cancel_all"}"#,
-            &tool_exec::ToolExecCtx {
-                file_fence: None,
-                mcp_tool: None,
-                owner_approval_by_kernel: false,
-                session_id,
-                task_id: Some(task_id),
-                status_tx,
-                channel_visibility: channel_ctx.visibility,
-                channel_id: channel_ctx.channel_id.as_deref(),
-                project_scope: None,
-                trusted: channel_ctx.trusted,
-                user_role,
-                workspace_grant: channel_ctx.active_workspace_grant(user_role),
-                mandate_authority: None,
-                tool_call_id: None,
-                mutation_forbidden: false,
-                scope_escalation: None,
-                turn_authority: None,
-                trust_roots: None,
-                lone_root_call: false,
-            },
-        )
+        .cancel_cli_agents(session_id, task_id, status_tx, channel_ctx, user_role)
         .await;
     let cli_cancel_msg = cancel_result.ok();
 
@@ -114,9 +104,9 @@ pub(super) async fn maybe_handle_stop_command(
     Ok(Some(reply))
 }
 
-pub(super) async fn emit_bootstrap_direct_reply(
-    agent: &Agent,
-    emitter: &crate::events::EventEmitter,
+pub async fn emit_bootstrap_direct_reply(
+    agent: &dyn TurnHost,
+    emitter: &aidaemon_events::EventEmitter,
     task_id: &str,
     session_id: &str,
     task_start: Instant,
@@ -139,9 +129,9 @@ pub(super) async fn emit_bootstrap_direct_reply(
         .append_assistant_message_with_event(emitter, &assistant_msg, "system", None, None)
         .await?;
 
-    if agent.harness_eval_enabled() {
+    if agent.turn_runtime().harness_eval_enabled() {
         let turn_id = agent
-            .runtime
+            .turn_runtime()
             .current_turn_ids
             .read()
             .await
@@ -150,49 +140,52 @@ pub(super) async fn emit_bootstrap_direct_reply(
         let mut harness_eval = HarnessEvalAccumulator::new(HarnessEvalSeed {
             task_id: task_id.to_string(),
             turn_id,
-            depth: agent.depth as u32,
-            parent_task_id: agent.task_id.clone(),
-            goal_id: agent.goal_id.clone(),
-            durable_task_id: agent.task_id.clone(),
+            depth: agent.depth() as u32,
+            parent_task_id: agent.task_id().map(str::to_string),
+            goal_id: agent.goal_id().map(str::to_string),
+            durable_task_id: agent.task_id().map(str::to_string),
             completion_task_kind: "conversational".to_string(),
             followup_mode: None,
-            config: agent.runtime.harness_eval_config.clone(),
+            config: agent.turn_runtime().harness_eval_config.clone(),
         });
         harness_eval.record_bootstrap("bootstrap_direct_return", vec![], None);
-        agent.install_harness_eval(harness_eval).await;
+        agent
+            .turn_runtime()
+            .install_harness_eval(harness_eval)
+            .await;
     }
 
-    agent
-        .emit_decision_point(
-            emitter,
-            task_id,
-            0,
-            DecisionType::GateTelemetry,
-            "Bootstrap direct-return gate answered without LLM loop".to_string(),
-            json!({
-                "condition": "bootstrap_direct_return",
-                "gate_family": "bootstrap",
-                "action": "returned",
-                "reply_chars": reply_text.trim().chars().count(),
-                "agent_depth": agent.depth,
-            }),
-        )
-        .await;
+    crate::turn::task_end::emit_decision_point(
+        agent,
+        emitter,
+        task_id,
+        0,
+        DecisionType::GateTelemetry,
+        "Bootstrap direct-return gate answered without LLM loop".to_string(),
+        json!({
+            "condition": "bootstrap_direct_return",
+            "gate_family": "bootstrap",
+            "action": "returned",
+            "reply_chars": reply_text.trim().chars().count(),
+            "agent_depth": agent.depth(),
+        }),
+    )
+    .await;
 
-    agent
-        .emit_direct_return_task_end(
-            emitter,
-            task_id,
-            TaskStatus::Completed,
-            TaskOutcome::Succeeded,
-            task_start,
-            0,
-            0,
-            None,
-            Some(reply_text.chars().take(200).collect()),
-            true,
-        )
-        .await;
+    crate::turn::task_end::emit_direct_return_task_end(
+        agent,
+        emitter,
+        task_id,
+        TaskStatus::Completed,
+        TaskOutcome::Succeeded,
+        task_start,
+        0,
+        0,
+        None,
+        Some(reply_text.chars().take(200).collect()),
+        true,
+    )
+    .await;
 
     Ok(reply_text)
 }

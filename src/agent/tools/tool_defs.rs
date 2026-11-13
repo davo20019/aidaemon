@@ -262,6 +262,7 @@ impl Agent {
     ///
     /// Sort keys (name, serialized bytes) are computed ONCE per element so
     /// serialization cost is O(n), not O(n log n).
+    #[cfg(test)]
     pub(super) fn sort_tool_definitions_by_name(defs: &mut Vec<Value>) {
         aidaemon_runtime::turn::helpers::sort_tool_definitions_by_name(defs);
     }
@@ -389,28 +390,20 @@ impl Agent {
     /// public channels never do, so another participant's message cannot reach
     /// the desktop.
     pub(crate) fn visibility_allows_desktop_control(visibility: ChannelVisibility) -> bool {
-        matches!(
-            visibility,
-            ChannelVisibility::Private | ChannelVisibility::Internal
-        )
+        aidaemon_runtime::turn::helpers::visibility_allows_desktop_control(visibility)
     }
 
     /// Strip desktop-control tools from `defs`/`caps` when the channel visibility
     /// does not permit them. No-op for `Private`/`Internal`.
+    #[cfg(test)]
     pub(crate) fn restrict_desktop_control_for_visibility(
         defs: &mut Vec<Value>,
         caps: &mut HashMap<String, ToolCapabilities>,
         visibility: ChannelVisibility,
     ) {
-        if Self::visibility_allows_desktop_control(visibility) {
-            return;
-        }
-        defs.retain(|d| {
-            Self::tool_name_from_definition(d)
-                .map(|name| !Self::DESKTOP_CONTROL_TOOLS.contains(&name))
-                .unwrap_or(true)
-        });
-        caps.retain(|name, _| !Self::DESKTOP_CONTROL_TOOLS.contains(&name.as_str()));
+        aidaemon_runtime::turn::helpers::restrict_desktop_control_for_visibility(
+            defs, caps, visibility,
+        );
     }
 
     #[cfg(test)]

@@ -82,6 +82,8 @@ impl TaskPlan {
                 background_jobs: Vec::new(),
                 waits_on_jobs: false,
                 not_done: None,
+                said_done: false,
+                helper_not_started: false,
                 status: if index == 0 {
                     StepStatus::InProgress
                 } else {
@@ -162,6 +164,75 @@ impl TaskPlan {
             .iter()
             .filter(|s| s.status == StepStatus::Completed)
             .count()
+    }
+
+    /// Completed steps that typed evidence completed (not only the model's
+    /// word): what the card counts as done.
+    pub fn confirmed_steps(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Completed && !s.said_done)
+            .count()
+    }
+
+    /// Completed steps only the model said were done.
+    pub fn said_done_steps(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Completed && s.said_done)
+            .count()
+    }
+
+    /// The steps at `indices` were confirmed by typed evidence (the run's
+    /// receipts proved their checklist items): no longer said done only.
+    /// Returns whether any step changed.
+    pub fn confirm_steps(&mut self, indices: &std::collections::BTreeSet<usize>) -> bool {
+        let mut changed = false;
+        for step in &mut self.steps {
+            if step.said_done && indices.contains(&step.index) {
+                step.said_done = false;
+                changed = true;
+            }
+        }
+        if changed {
+            self.updated_at = Utc::now();
+        }
+        changed
+    }
+
+    /// The helper meant for the steps at `indices` never started (its
+    /// `spawn_agent` call failed): nothing works on them, so they are not
+    /// done, and the card says they didn't run. A step already done or set
+    /// aside is left alone. Returns whether any step changed.
+    pub fn helper_did_not_start(&mut self, indices: &[usize], reason: &str) -> bool {
+        let now = Utc::now();
+        let mut changed = false;
+        for &index in indices {
+            let Some(step) = self.steps.get_mut(index) else {
+                continue;
+            };
+            if matches!(
+                step.status,
+                StepStatus::Completed | StepStatus::Skipped | StepStatus::Deferred
+            ) || (step.status == StepStatus::Background && !step.background_jobs.is_empty())
+            {
+                continue;
+            }
+            step.status = StepStatus::Failed;
+            step.helper_not_started = true;
+            step.error = Some(reason.to_string());
+            step.completed_at = Some(now);
+            changed = true;
+        }
+        if changed {
+            if self.is_finished() {
+                self.status = self.resolved_status();
+            } else {
+                self.sync_active_step();
+            }
+            self.updated_at = now;
+        }
+        changed
     }
 
     /// Check if all steps are done (completed, failed, or skipped).
@@ -351,12 +422,17 @@ impl TaskPlan {
             let Some(step) = self.steps.get_mut(index) else {
                 continue;
             };
-            if matches!(
-                step.status,
-                StepStatus::Completed | StepStatus::Failed | StepStatus::Skipped
-            ) {
+            let retried = step.status == StepStatus::Failed && step.helper_not_started;
+            if !retried
+                && matches!(
+                    step.status,
+                    StepStatus::Completed | StepStatus::Failed | StepStatus::Skipped
+                )
+            {
                 continue;
             }
+            step.helper_not_started = false;
+            step.error = None;
             step.status = StepStatus::Background;
             step.started_at.get_or_insert_with(Utc::now);
             step.completed_at = None;
@@ -366,6 +442,11 @@ impl TaskPlan {
             changed = true;
         }
         if changed {
+            // A step whose helper didn't start may have resolved the plan;
+            // it is being worked on again.
+            if !self.status.is_incomplete() {
+                self.status = PlanStatus::InProgress;
+            }
             self.updated_at = Utc::now();
         }
         changed
@@ -428,7 +509,9 @@ impl TaskPlan {
                     step.waits_on_jobs = false;
                     step.status = StepStatus::Deferred;
                 } else if step.background_jobs.is_empty() {
+                    // The helper's own typed result completed it.
                     step.status = StepStatus::Completed;
+                    step.said_done = false;
                     step.completed_at = Some(now);
                 }
             } else {
@@ -502,7 +585,15 @@ impl TaskPlan {
     /// failure.
     pub fn render_compact_checklist(&self) -> String {
         let total = self.steps.len();
-        let done = self.completed_steps();
+        // Only steps typed evidence completed count as done; the ones only
+        // the model said were done are counted apart.
+        let done = self.confirmed_steps();
+        let said = self.said_done_steps();
+        let said_note = if said > 0 {
+            format!(", {said} said done")
+        } else {
+            String::new()
+        };
         let not_needed = self
             .steps
             .iter()
@@ -512,6 +603,7 @@ impl TaskPlan {
         if total == 1 && (self.status != PlanStatus::PartiallyCompleted || held.is_some()) {
             let step = &self.steps[0];
             let mark = match (self.status, step.status) {
+                (_, StepStatus::Completed) if step.said_done => "☑️",
                 (_, StepStatus::Completed) => "✅",
                 (_, StepStatus::Skipped) => "✅",
                 _ if held.is_some() => "⏭️",
@@ -521,6 +613,12 @@ impl TaskPlan {
                 _ => "⏳",
             };
             return match (step.status, held) {
+                (StepStatus::Completed, _) if step.said_done => {
+                    format!("{mark} {} ({SAID_DONE})", step.description)
+                }
+                (StepStatus::Failed, _) if step.helper_not_started => {
+                    format!("{mark} {} ({HELPER_NOT_STARTED})", step.description)
+                }
                 (StepStatus::Background, _) => {
                     format!("{mark} {} (running in the background)", step.description)
                 }
@@ -540,20 +638,30 @@ impl TaskPlan {
             // Work handed to a job that reports back is still being done:
             // never "stopped short" while it runs.
             _ if in_background => {
-                format!("⏳ Continuing in the background · {done} of {total} done")
+                format!("⏳ Continuing in the background · {done} of {total} done{said_note}")
             }
             // Everything left was held back for a known reason: the turn did
             // what it was allowed to, which is not a failure.
             _ if finished && held.is_some() => {
                 let reason = held.map(NotDoneReason::plain).unwrap_or_default();
-                format!("⏭️ Not done: {reason} · {done} of {total} done")
+                format!("⏭️ Not done: {reason} · {done} of {total} done{said_note}")
             }
             PlanStatus::Planning => "🧭 Planning…".to_string(),
             PlanStatus::InProgress => {
                 let position = self.current_step.saturating_add(1).min(total);
                 format!("⚙️ Working · step {position} of {total}")
             }
-            PlanStatus::Paused => format!("⏸️ Paused · {done} of {total} done"),
+            PlanStatus::Paused => format!("⏸️ Paused · {done} of {total} done{said_note}"),
+            // Every step resolved, some only on the model's word: never a
+            // ✅ the evidence does not back.
+            PlanStatus::Completed if said > 0 => {
+                let needed_note = if not_needed > 0 {
+                    format!(", {not_needed} not needed")
+                } else {
+                    String::new()
+                };
+                format!("☑️ Finished · {done} of {total} confirmed{said_note}{needed_note}")
+            }
             // The execution plan is resolved; the reply is still on its way,
             // which the typing indicator shows. Never claim the task is over.
             PlanStatus::Completed if not_needed > 0 => {
@@ -561,15 +669,23 @@ impl TaskPlan {
             }
             PlanStatus::Completed => format!("✅ Done · {done} of {total} steps"),
             PlanStatus::PartiallyCompleted => {
-                format!("⚠️ Stopped short · {done} of {total} done")
+                format!("⚠️ Stopped short · {done} of {total} done{said_note}")
             }
-            PlanStatus::Failed => format!("❌ Stopped · {done} of {total} done"),
-            PlanStatus::Abandoned => format!("⏹️ Cancelled · {done} of {total} done"),
+            PlanStatus::Failed => format!("❌ Stopped · {done} of {total} done{said_note}"),
+            PlanStatus::Abandoned => {
+                format!("⏹️ Cancelled · {done} of {total} done{said_note}")
+            }
         };
         let mut out = header;
         for step in &self.steps {
             let line = match (step.status, step.not_done) {
+                (StepStatus::Completed, _) if step.said_done => {
+                    format!("☑️ {} ({SAID_DONE})", step.description)
+                }
                 (StepStatus::Completed, _) => format!("✅ {}", step.description),
+                (StepStatus::Failed, _) if step.helper_not_started => {
+                    format!("⚠️ {} ({HELPER_NOT_STARTED})", step.description)
+                }
                 (StepStatus::InProgress, _) => format!("▶️ {}", step.description),
                 (StepStatus::Background, _) => {
                     format!("⏳ {} (running in the background)", step.description)
@@ -591,6 +707,17 @@ impl TaskPlan {
         }
         if self.status == PlanStatus::PartiallyCompleted && !in_background && held.is_none() {
             out.push_str("\n\nThe reply below says what was left undone and why.");
+        }
+        // A finished card says plainly what never ran.
+        let not_run: Vec<&str> = self
+            .steps
+            .iter()
+            .filter(|step| step.status == StepStatus::Failed && step.helper_not_started)
+            .map(|step| step.description.as_str())
+            .collect();
+        if finished && !in_background && !not_run.is_empty() {
+            out.push_str("\n\nDidn't run: ");
+            out.push_str(&not_run.join("; "));
         }
         out
     }
@@ -705,6 +832,19 @@ pub struct PlanStep {
     /// back correctly, so the card does not show it as a failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_done: Option<NotDoneReason>,
+
+    /// Completed only on the executing model's word: its checklist update
+    /// said done, and no receipt, background helper's result or other typed
+    /// evidence completed it (live 2026-11-13: "2 of 3 done" right after an
+    /// update that ticked two steps nothing had proven). The card shows such
+    /// a step as said done, never as ✅. Evidence clears it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub said_done: bool,
+
+    /// The step was handed to a helper whose `spawn_agent` call failed, so
+    /// nothing ever worked on it. A later launch for it takes it again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub helper_not_started: bool,
 
     /// Step status
     pub status: StepStatus,
@@ -841,6 +981,11 @@ impl StepStatus {
         s.parse().ok()
     }
 }
+
+/// How the card marks a step only the model said was done.
+const SAID_DONE: &str = "said done; nothing confirmed it";
+/// How the card marks a step whose helper never started.
+const HELPER_NOT_STARTED: &str = "didn't run: its helper didn't start";
 
 /// Why a step was correctly left undone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

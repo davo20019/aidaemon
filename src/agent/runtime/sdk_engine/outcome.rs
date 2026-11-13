@@ -41,6 +41,36 @@ pub(super) fn reconcile_plan_projection(plan: &mut crate::plans::TaskPlan) -> bo
 }
 
 impl Agent {
+    /// Mark the steps of this task's checklist that the run's receipts
+    /// proved as confirmed (no longer only the model's word). Returns the
+    /// card to show when anything changed.
+    pub(super) async fn confirm_checklist_from_receipts(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Option<String> {
+        let plan_store = self.plan_store.read().await.clone()?;
+        let proven = self
+            .event_store
+            .task_run_aggregate(session_id, task_id)
+            .await
+            .ok()?
+            .satisfied_checklist_items();
+        if proven.is_empty() {
+            return None;
+        }
+        match plan_store.confirm_steps(session_id, task_id, &proven).await {
+            // A one-step plan gets no card (`track_requirements`).
+            Ok(plan) => plan
+                .filter(|plan| plan.steps.len() > 1)
+                .map(|plan| plan.render_compact_checklist()),
+            Err(error) => {
+                warn!(task_id, %error, "SDK engine: could not confirm checklist steps");
+                None
+            }
+        }
+    }
+
     /// Reconcile this task's checklist after a completed run (see
     /// [`reconcile_plan_projection`]) and record its final shape.
     pub(super) async fn reconcile_checklist_projection(
@@ -49,6 +79,11 @@ impl Agent {
         session_id: &str,
         task_id: &str,
     ) {
+        // Receipts that landed after the last checklist update may prove
+        // steps the model ticked earlier.
+        let _ = self
+            .confirm_checklist_from_receipts(session_id, task_id)
+            .await;
         let Some(plan_store) = self.plan_store.read().await.clone() else {
             return;
         };

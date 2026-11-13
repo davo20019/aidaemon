@@ -11,8 +11,5 @@
 //! This module is now a re-export shim so consumers can keep importing the
 //! same names through `history::`.
 
-pub(super) use super::completion_contract::{
-    retain_structural_completion_contract, CompletionContract, CompletionProgress,
-    CompletionTaskKind,
-};
+pub(super) use super::completion_contract::{CompletionContract, CompletionProgress};
 pub(super) use super::turn_context::TurnContext;

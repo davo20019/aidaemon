@@ -13,7 +13,6 @@ mod store_host_tests;
 
 pub use consolidation::{Consolidator, Pruner};
 
-pub use aidaemon_events::context::SessionContextCompiler;
 #[allow(unused_imports)]
 pub use aidaemon_events::conversation_turn::{
     turn_from_event, ConversationTurn, ConversationTurnRole, FetchedTurn,

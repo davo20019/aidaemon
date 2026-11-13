@@ -5,6 +5,8 @@
 //! output, structural reply checks, the post-run learning context and the
 //! project instructions found for a turn's scope.
 
+pub mod bootstrap;
+pub mod budget;
 pub mod closeout;
 pub mod compaction;
 pub mod completion_checks;
@@ -21,6 +23,7 @@ pub mod project_dir;
 pub mod project_instructions;
 pub mod project_scope;
 pub mod reply_checks;
+pub mod resume;
 pub mod sliding_window;
 pub mod system_directives;
 pub mod task_end;

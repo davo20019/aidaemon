@@ -128,3 +128,20 @@ impl TurnRuntime {
         )
     }
 }
+
+/// Immutable execution identity for one worker inside one autonomous mandate
+/// decision cycle. The lease token is Rust-side control state and must never be
+/// serialized, logged, or exposed to the model.
+#[derive(Clone)]
+pub struct MandateExecutionFence {
+    pub mandate_id: String,
+    pub mandate_version: i64,
+    pub authority: aidaemon_work::mandates::MandateAuthority,
+    pub goal_id: String,
+    pub goal_run_id: String,
+    pub root_task_id: String,
+    pub root_task_attempt_id: String,
+    pub worker_task_id: String,
+    pub attempt_id: String,
+    pub lease_token: String,
+}

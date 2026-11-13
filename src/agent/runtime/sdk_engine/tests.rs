@@ -5163,3 +5163,101 @@ async fn a_sub_agents_local_site_report_covers_the_whole_chat() {
         "drupal-synthetic.localhost"
     ));
 }
+
+/// A checklist step the model ticks is done on the card only once the run's
+/// receipts prove it: the item a read proved is confirmed, the one ticked
+/// with nothing behind it stays said done (live 2026-11-13: "2 of 3 done"
+/// right after an update that ticked two steps).
+#[tokio::test]
+async fn a_ticked_step_is_confirmed_only_by_the_runs_receipts() {
+    use crate::testing::MockProvider;
+    let workspace = tempfile::tempdir().expect("workspace");
+    let cwd = workspace.path().to_string_lossy().to_string();
+    let read = workspace.path().join("read.txt");
+    let unread = workspace.path().join("unread.txt");
+    std::fs::write(&read, "SYNTHETIC_READ").unwrap();
+    std::fs::write(&unread, "SYNTHETIC_UNREAD").unwrap();
+    let (read, unread) = (
+        read.to_string_lossy().to_string(),
+        unread.to_string_lossy().to_string(),
+    );
+    let checklist = |status: &str| {
+        serde_json::json!({
+            "items": [
+                {"text": "read the first file", "status": status,
+                 "requires_observation": true, "targets": [read]},
+                {"text": "read the second file", "status": status,
+                 "requires_observation": true, "targets": [unread]}
+            ]
+        })
+        .to_string()
+    };
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", &checklist("pending")),
+        MockProvider::tool_call_response(
+            "terminal",
+            &serde_json::json!({
+                "command": format!("cat '{read}'"),
+                "working_dir": cwd,
+                "read_paths": [read]
+            })
+            .to_string(),
+        ),
+        MockProvider::tool_call_response("track_requirements", &checklist("completed")),
+        MockProvider::text_response("Both read."),
+        MockProvider::text_response("Both read."),
+        MockProvider::text_response("Both read."),
+    ]);
+    let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let plans = Arc::new(crate::plans::PlanStore::new(plan_pool).await.unwrap());
+    let track =
+        Arc::new(crate::tools::track_requirements::TrackRequirementsTool::new(plans.clone()));
+    let mut harness = crate::testing::setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![track as Arc<dyn crate::traits::Tool>],
+    )
+    .await
+    .unwrap();
+    harness.agent.set_sdk_engine(SdkEngineSettings::default());
+    harness.agent.set_plan_store(plans.clone()).await;
+
+    let session_id = "ticked_steps_confirmed_by_receipts";
+    harness
+        .agent
+        .handle_message(
+            session_id,
+            "Read both files.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let plan = plans
+        .get_recent_for_session(session_id, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(
+        !plan.steps[0].said_done,
+        "the read proved it: {:?}",
+        plan.steps
+    );
+    assert!(
+        plan.steps[1].said_done,
+        "nothing proved it: {:?}",
+        plan.steps
+    );
+    let card = plan.render_compact_checklist();
+    assert!(card.contains("✅ read the first file"), "{card}");
+    assert!(
+        card.contains("☑️ read the second file (said done; nothing confirmed it)"),
+        "{card}"
+    );
+}

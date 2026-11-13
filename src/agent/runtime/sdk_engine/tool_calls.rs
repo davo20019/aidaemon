@@ -1042,6 +1042,16 @@ impl Agent {
                 {
                     warn!(task_id = scope.task_id, %error, "SDK engine: could not record a checklist");
                 }
+                // A step the model ticked shows as done only once receipts
+                // prove it: the card is redrawn with what they proved.
+                if let Some(text) = self
+                    .confirm_checklist_from_receipts(scope.session_id, scope.task_id)
+                    .await
+                {
+                    if let Some(status_tx) = &scope.status_tx {
+                        let _ = status_tx.try_send(StatusUpdate::Checklist { text });
+                    }
+                }
             }
         }
         info!(
@@ -1350,35 +1360,6 @@ impl Agent {
 
     /// Record an assistant message that calls tools before the calls run, so
     /// history and the run ledger see each call with the message that made it.
-    pub(super) async fn persist_sdk_tool_call_message(
-        &self,
-        scope: &TurnScope<'_>,
-        response: &sdk::ModelResponse,
-    ) {
-        let calls: Vec<crate::traits::ToolCall> = response
-            .tool_calls
-            .iter()
-            .map(|call| crate::traits::ToolCall {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                arguments: call.arguments.to_string(),
-                extra_content: None,
-            })
-            .collect();
-        let mut assistant =
-            Message::new_runtime(Uuid::new_v4().to_string(), scope.session_id, "assistant");
-        let text = response.text.trim();
-        assistant.content = (!text.is_empty()).then(|| text.to_string());
-        assistant.tool_calls_json = serde_json::to_string(&calls).ok();
-        assistant.turn_id = Some(scope.turn_id.to_string());
-        if let Err(error) = self
-            .append_assistant_message_with_event(scope.emitter, &assistant, scope.model, None, None)
-            .await
-        {
-            warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool-call message");
-        }
-    }
-
     /// The idempotency key for a step-plan call: any call that is not a pure
     /// observation and mutates, has an external side effect, or is not
     /// idempotent.

@@ -1052,6 +1052,28 @@ primary = "gpt-4o"
         )));
     }
 
+    /// Live 2026-11-13: an install request sent again became "verify the
+    /// existing project and report its original install time", and the
+    /// helper gave an earlier run's 5m 15s as if current. The prompt says a
+    /// repeated request is new work and that a measurement belongs to the
+    /// run that made it.
+    #[test]
+    fn the_base_prompt_redoes_a_repeated_request_and_keeps_measurements_with_their_run() {
+        use crate::startup::prompt::MemoryPrompt;
+        let prompt =
+            build_base_system_prompt(&minimal_config(), &[], None, &MemoryPrompt::DaemonsOwn)
+                .unwrap();
+        assert!(prompt.contains(
+            "When the owner asks again for work you already did, here or earlier, do the work \
+             again as asked, with fresh names next to what already exists, unless they say \
+             otherwise."
+        ));
+        assert!(prompt.contains("never give an earlier run's measurement as this run's result"));
+        assert!(include_str!("../specialists/_executor_base.md").contains(
+            "An earlier run's measurement, from history or memory, is never this task's result"
+        ));
+    }
+
     /// Live 2026-11-13: a clear request for two fresh installs got "Did you
     /// want a fresh pair of installs?" because earlier ones existed, and a
     /// later turn gave install times it then retracted. The prompt says to

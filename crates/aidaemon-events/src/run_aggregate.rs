@@ -372,6 +372,19 @@ pub struct RunAggregate {
 }
 
 impl RunAggregate {
+    /// The indices of the executing model's checklist items that receipts
+    /// have proven (their `obligation:checklist:<n>` is satisfied).
+    pub fn satisfied_checklist_items(&self) -> BTreeSet<usize> {
+        self.obligations
+            .iter()
+            .filter(|(_, obligation)| obligation.state == RunObligationState::Satisfied)
+            .filter_map(|(id, _)| {
+                id.rsplit_once("/obligation:checklist:")
+                    .and_then(|(_, index)| index.parse().ok())
+            })
+            .collect()
+    }
+
     pub const SCHEMA_VERSION: u16 = 4;
 
     #[cfg(any(test, feature = "testing"))]
