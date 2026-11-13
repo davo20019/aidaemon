@@ -129,8 +129,8 @@ impl LiveWork {
                 "step {} of {total_steps}: {description}",
                 step_index + 1
             )),
-            StatusUpdate::Checklist { text } => {
-                progress.plan = Some(text.clone());
+            StatusUpdate::Checklist(plan) => {
+                progress.plan = Some(plan.text.clone());
                 None
             }
             _ => None,
@@ -331,9 +331,10 @@ mod tests {
         live.record(
             "s",
             7,
-            &StatusUpdate::Checklist {
+            &StatusUpdate::Checklist(aidaemon_core::card::PlanCard {
                 text: "☑ one\n☐ two".into(),
-            },
+                steps: 2,
+            }),
         );
         // A late update from an earlier turn changes nothing.
         live.record(

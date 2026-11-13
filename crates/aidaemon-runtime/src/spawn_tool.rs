@@ -269,14 +269,17 @@ pub fn bounded_child_response(
 }
 
 /// A background helper's result for the chat, rendered from its run record
-/// alone: the header is its phase, the one evidence line names the typed
-/// action steps nothing verified, and the footer is the time the runtime
-/// measured. The helper's report is the body, never what decides the rest.
+/// alone: the one evidence line names the typed action steps nothing
+/// verified, and the footer is the time the runtime measured. The helper's
+/// report is the body, never what decides the rest. How it ended is said
+/// once: when its card shows it (`on_card`), the result has no header of
+/// its own; else the header is its phase.
 pub fn render_run_result(
     state: &crate::run_state::RunState,
     name: &str,
     report: &str,
     max_response_chars: usize,
+    on_card: bool,
 ) -> String {
     // This goes straight to the chat, past the loop that renders truncation
     // metadata for tool results.
@@ -289,20 +292,28 @@ pub fn render_run_result(
         }
         (shown, None) => shown.to_string(),
     };
-    let mut message = format!("{}: {name}", state.phase.headline());
+    let mut parts: Vec<String> = Vec::new();
+    let mut lead = if on_card {
+        String::new()
+    } else {
+        format!("{}: {name}", state.phase.headline())
+    };
     if let Some(line) = state.evidence.line() {
-        message.push('\n');
-        message.push_str(&line);
+        if !lead.is_empty() {
+            lead.push('\n');
+        }
+        lead.push_str(&line);
+    }
+    if !lead.is_empty() {
+        parts.push(lead);
     }
     if !body.trim().is_empty() {
-        message.push_str("\n\n");
-        message.push_str(body.trim_end());
+        parts.push(body.trim_end().to_string());
     }
     if let Some(footer) = background_timing(state) {
-        message.push_str("\n\n");
-        message.push_str(&footer);
+        parts.push(footer);
     }
-    message
+    parts.join("\n\n")
 }
 
 /// The notification kind a run's phase is queued under.
@@ -331,9 +342,9 @@ pub fn kept_card(
     runs: &crate::run_state::RunStates,
     chat: &str,
 ) -> Option<String> {
-    let plan = plan.map(aidaemon_work::plans::TaskPlan::render_compact_checklist);
+    let plan = plan.map(aidaemon_work::plans::TaskPlan::card);
     aidaemon_channels::live_status::render_card(&aidaemon_channels::live_status::CardView {
-        plan: plan.as_deref(),
+        plan: plan.as_ref(),
         helpers: runs
             .for_chat(chat)
             .iter()
@@ -743,18 +754,25 @@ impl MeasuredRun {
         self.steps.map_or(self.started, |(first, _)| first)
     }
 
-    /// How long it took: from its first step to its report, its start-up
-    /// left out (live 2026-11-13: "Ran 1m 19s" from its first to its last
-    /// step, beside a footer time from its start).
+    /// From its first step to its report, its start-up left out (live
+    /// 2026-11-13: "Ran 1m 19s" from its first to its last step, beside a
+    /// footer time from its start), to the whole second
+    /// ([`crate::run_state::measured_span`]).
+    pub fn span(&self) -> crate::run_state::MeasuredSpan {
+        crate::run_state::measured_span(self.began(), self.finished)
+    }
+
+    /// How long it took ([`Self::span`]).
     pub fn took(&self) -> chrono::Duration {
-        (self.finished - self.began()).max(chrono::Duration::zero())
+        self.span().took()
     }
 
     /// Its first step to its report, on the owner's clock. A range under
     /// ten minutes gives seconds, so the stated times agree with the
     /// duration ("8:34:43 PM to 8:37:15 PM ET").
     pub fn range(&self) -> String {
-        owner_clock_range(self.began(), self.finished)
+        let span = self.span();
+        owner_clock_range(span.from, span.to)
     }
 }
 
@@ -790,7 +808,9 @@ pub fn compact(duration: chrono::Duration) -> String {
 /// When a child ran and how long it took, measured by the daemon, for the
 /// parent: one timing line naming the helper (how long it took, from its
 /// first step to its report, and when, in the owner's zone and 12-hour
-/// clock, and its wait for the owner), then how to report it. The line
+/// clock, and its wait for the owner), then that it is quoted, never
+/// recomputed. The owner reads the same measurement on the card
+/// ([`took_line`]). The line
 /// keeps [`MEASURED_TIMING_MARK`], so a later turn still sees it when this
 /// result is cut to a summary. A parent sees which of its children
 /// overlapped, and the times, durations and waits it reports are these
@@ -801,9 +821,9 @@ pub fn run_window(name: &str, run: &MeasuredRun) -> String {
     let took = run.took();
     format!(
         "{MEASURED_TIMING_MARK}{name} took {} ({}s), {}.{}\n\
-         These are the daemon's measurements: report this time, this duration and this wait \
-         as given (the owner's time zone, 12-hour clock); times in the sub-agent's own reply \
-         are its estimates.",
+         These are the daemon's measurements, already on the owner's card: quote them as \
+         given if you mention them (the owner's time zone, 12-hour clock), never work one \
+         out; times in the sub-agent's own reply are its estimates.",
         compact(took),
         took.num_seconds(),
         run.range(),
@@ -831,24 +851,32 @@ pub fn owner_wait_note(waited: Duration) -> String {
 /// (live 2026-11-13: "Ran 2m 44s (8:34 PM ET to 8:37 PM ET)" read as the
 /// whole run, but was its first to last tool call). `None` while it runs.
 pub fn background_timing(run: &crate::run_state::RunState) -> Option<String> {
-    let took = run.took()?;
-    let ended = run.ended_at?;
-    let wait = if run.waited.as_secs() == 0 {
+    Some(format!(
+        "{MEASURED_TIMING_MARK}{}",
+        took_line(run.span()?, run.waited)
+    ))
+}
+
+/// How long a helper took and when, for the owner, from what the runtime
+/// measured: "Took 21s (2:21:16 PM to 2:21:37 PM ET)." and its wait for the
+/// owner's answer. The one wording every surface shows a helper's time in.
+pub fn took_line(span: crate::run_state::MeasuredSpan, waited: Duration) -> String {
+    let wait = if waited.as_secs() == 0 {
         String::new()
     } else {
         format!(
             " It waited {} of that for your answer.",
             aidaemon_tools::duration_format::compact_seconds(
-                i64::try_from(run.waited.as_secs()).unwrap_or(i64::MAX),
+                i64::try_from(waited.as_secs()).unwrap_or(i64::MAX),
                 aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
             )
         )
     };
-    Some(format!(
-        "{MEASURED_TIMING_MARK}Took {} ({}).{wait}",
-        compact(took),
-        owner_clock_range(run.began(), ended)
-    ))
+    format!(
+        "Took {} ({}).{wait}",
+        compact(span.took()),
+        owner_clock_range(span.from, span.to)
+    )
 }
 
 /// One result for a batch call: each child's result under its mission, in
@@ -1192,17 +1220,17 @@ impl Tool for SpawnAgentTool {
                 "properties": {
                     "mission": {
                         "type": "string",
-                        "description": "Optional: high-level mission or role for the sub-agent \
-                            (e.g. 'Research assistant focused on Python packaging'). Left out, \
-                            it is the title."
+                        "description": "Optional: the wider goal this work serves, for the \
+                            sub-agent's own context. Left out, it is the title."
                     },
                     "title": {
                         "type": "string",
-                        "description": "A short name for this sub-agent that the owner reads on its \
-                            status lines and approval cards: a few plain words naming its job and, \
-                            when the work creates or works in a folder, that folder's name, so the \
-                            owner sees where it goes from the start (e.g. 'Drupal install in \
-                            claude-drupal-6', 'Price research'), never a sentence."
+                        "description": "What this sub-agent does, in a few plain words the owner \
+                            reads on its card and approval cards: the task itself, as the owner \
+                            would say it, and, when the work creates or works in a folder, that \
+                            folder's name, so the owner sees where it goes from the start (e.g. \
+                            'Count the lines in numbers.txt', 'Install Drupal in claude-drupal-6'). \
+                            It names the work, not the sub-agent doing it, and is never a sentence."
                     },
                     "task": {
                         "type": "string",
@@ -1330,9 +1358,7 @@ impl SpawnAgentTool {
             {
                 Ok(Some(plan)) => {
                     if let Some(tx) = aidaemon_tools::status::status_sender(facts) {
-                        let _ = tx.try_send(StatusUpdate::Checklist {
-                            text: plan.render_compact_checklist(),
-                        });
+                        let _ = tx.try_send(StatusUpdate::Checklist(plan.card()));
                     }
                 }
                 Ok(None) => {}
@@ -1663,9 +1689,7 @@ impl SpawnAgentTool {
             match linked {
                 Ok(Some(plan)) => {
                     if let Some(tx) = status_tx.as_ref() {
-                        let _ = tx.try_send(StatusUpdate::Checklist {
-                            text: plan.render_compact_checklist(),
-                        });
+                        let _ = tx.try_send(StatusUpdate::Checklist(plan.card()));
                     }
                 }
                 Ok(None) => {}
@@ -1693,6 +1717,7 @@ impl SpawnAgentTool {
                 goal_id: notify_goal_id.clone(),
                 name: name.clone(),
                 max_response_chars,
+                turn: aidaemon_channels::turns::TurnOver::current(),
             },
         ));
         let at_start = match hub.as_ref() {
@@ -1937,6 +1962,9 @@ pub struct ResultRoute {
     pub goal_id: String,
     pub name: String,
     pub max_response_chars: usize,
+    /// The turn that started the run, when one did: the run's end waits
+    /// until it is over.
+    pub turn: Option<aidaemon_channels::turns::TurnOver>,
 }
 
 /// The subscriber on one run's terminal transition: when the run ends it
@@ -1951,20 +1979,21 @@ pub async fn deliver_when_run_ends(
     let Some(ended) = ended.recv().await else {
         return;
     };
+    // The turn that started it shows everything first (its reply, the
+    // "Started in the background" ack, and the card it kept): the run's end
+    // never lands above the turn's own reply.
+    if let Some(turn) = route.turn.as_ref() {
+        turn.wait().await;
+    }
     let state = ended.state;
-    let message = render_run_result(
-        &state,
-        &route.name,
-        &ended.report.text,
-        route.max_response_chars,
-    );
     let trust = if ended.report.untrusted {
         SourceTrust::Untrusted
     } else {
         SourceTrust::Trusted
     };
-    // The card settles to its final header first; the result follows.
-    settle_background_steps(
+    // The card settles to its final header first; the result follows,
+    // without saying again how it ended.
+    let on_card = settle_background_steps(
         &route.runs,
         route.plans.as_ref(),
         route.hub.as_ref(),
@@ -1974,6 +2003,13 @@ pub async fn deliver_when_run_ends(
         job_end(state.phase),
     )
     .await;
+    let message = render_run_result(
+        &state,
+        &route.name,
+        &ended.report.text,
+        route.max_response_chars,
+        on_card,
+    );
     let notification_type = run_notification_type(state.phase);
     let delivery = BackgroundDelivery {
         agent: route.agent.as_ref(),
@@ -2026,6 +2062,7 @@ pub fn coordination_trailer(tree: Option<&crate::authority::SpawnFamily>, sessio
 /// header. A card with a plan edits the card the turn left (or the session's
 /// background status message) in place, else is sent fresh; a helper's own
 /// card is the one the turn kept. The result message follows on its own.
+/// `true` when a card now shows how the job ended.
 pub async fn settle_background_steps(
     runs: &crate::run_state::RunStates,
     plan_store: Option<&Arc<aidaemon_work::plans::PlanStore>>,
@@ -2034,7 +2071,7 @@ pub async fn settle_background_steps(
     chat_session: &str,
     job_id: &str,
     end: aidaemon_work::plans::JobEnd,
-) {
+) -> bool {
     // Its run record already says it ended, so a step redraw that starts
     // now draws nothing; this waits for any still in flight.
     let writer = card_writer(chat_session);
@@ -2053,22 +2090,26 @@ pub async fn settle_background_steps(
     };
     // A sub-agent's own checklist is not the card in the chat.
     if plan_session.is_some_and(|plan_session| plan_session != chat_session) {
-        return;
+        return false;
     }
     let Some(hub) = hub.and_then(Weak::upgrade) else {
-        return;
+        return false;
     };
     let Some(card) = kept_card(plan.as_ref(), runs, chat_session) else {
-        return;
+        return false;
     };
     if plan.is_some() {
-        update_checklist_card(hub.as_ref(), chat_session, &card).await;
-        return;
+        return update_checklist_card(hub.as_ref(), chat_session, &card).await;
     }
     // The card the run's own turn kept: a later turn's card is that turn's.
-    if let Some(surface) = run_card(hub.as_ref(), runs, job_id, chat_session).await {
-        if let Err(error) = hub.edit_text(chat_session, &surface, &card).await {
+    let Some(surface) = run_card(hub.as_ref(), runs, job_id, chat_session).await else {
+        return false;
+    };
+    match hub.edit_text(chat_session, &surface, &card).await {
+        Ok(edited) => edited,
+        Err(error) => {
             warn!(session_id = %chat_session, %error, "Could not settle a helper's card");
+            false
         }
     }
 }
@@ -2095,20 +2136,27 @@ pub async fn run_card(
 
 /// Show `card` in the session's chat: edit the plan card the turn left (or
 /// the background status message) in place, else send it as a new card.
-pub async fn update_checklist_card(hub: &dyn OutboundRouter, session_id: &str, card: &str) {
+/// `true` when the chat shows it.
+pub async fn update_checklist_card(hub: &dyn OutboundRouter, session_id: &str, card: &str) -> bool {
     let surface = match hub.checklist_surface(session_id).await {
         Some(id) => Some(id),
         None => hub.background_status_surface(session_id).await,
     };
     if let Some(id) = surface {
         if matches!(hub.edit_text(session_id, &id, card).await, Ok(true)) {
-            return;
+            return true;
         }
     }
     match hub.send_text_tracked(session_id, card).await {
-        Ok(Some(id)) => hub.register_checklist_surface(session_id, &id).await,
-        Ok(None) => {}
-        Err(error) => warn!(session_id, %error, "Could not show the updated checklist"),
+        Ok(Some(id)) => {
+            hub.register_checklist_surface(session_id, &id).await;
+            true
+        }
+        Ok(None) => true,
+        Err(error) => {
+            warn!(session_id, %error, "Could not show the updated checklist");
+            false
+        }
     }
 }
 
@@ -2273,6 +2321,7 @@ impl SpawnAgentTool {
         let waits = aidaemon_channels::owner_wait::OwnerWaitClock::current()
             .unwrap_or_default()
             .nested();
+        let card_tx = status_tx.clone();
         let result = aidaemon_channels::owner_wait::OwnerWaitClock::within(
             Some(waits.clone()),
             agent.run_child(ChildAgentRequest {
@@ -2293,7 +2342,25 @@ impl SpawnAgentTool {
             }),
         )
         .await;
-        let window = run_window(&helper_name, &MeasuredRun::ended_now(started, &waits));
+        let measured = MeasuredRun::ended_now(started, &waits);
+        let window = run_window(&helper_name, &measured);
+        // Its header on the turn's card ends with how it ended and the time
+        // the runtime measured: the owner reads the time there, never as
+        // the parent's arithmetic.
+        if let Some(tx) = card_tx {
+            let phase = match &result {
+                Ok(run) => run.phase,
+                Err(error) if error.downcast_ref::<ChildTimedOut>().is_some() => RunPhase::Stopped,
+                Err(_) => RunPhase::Failed,
+            };
+            let _ = tx.try_send(StatusUpdate::Helper(aidaemon_core::card::HelperView {
+                label: helper_name.clone(),
+                phase,
+                background: false,
+                step: None,
+                took: Some(took_line(measured.span(), measured.waited)),
+            }));
+        }
 
         match result {
             Ok(run) => {
@@ -2312,8 +2379,8 @@ impl SpawnAgentTool {
                 let (shown, truncation) =
                     bounded_child_response(&response, self.max_response_chars);
                 // The measured run leads, so a cut of a long result never
-                // loses it: the parent's final reply gives each helper's
-                // start, end and duration from it.
+                // loses it: whatever the parent says of the helper's time
+                // quotes it.
                 let mut outcome = reported(
                     format!(
                         "{window}\n\n{shown}{}",

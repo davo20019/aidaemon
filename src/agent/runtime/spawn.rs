@@ -2496,7 +2496,6 @@ impl Agent {
         }
         let session_for_task = child_session.clone();
         let task_for_task = task.to_string();
-        let parent_status_tx = status_tx.clone();
         let status_tx = child_status_sender(
             status_tx,
             &card_name,
@@ -2667,16 +2666,10 @@ impl Agent {
             }
             _ => aidaemon_runtime::spawn::run_phase(child_outcome, None, None),
         };
-        // The child's header on the parent's card ends with how the child
-        // ended, not with the last step it reported.
-        if let Some(tx) = &parent_status_tx {
-            let _ = tx.try_send(StatusUpdate::Helper(aidaemon_core::card::HelperView {
-                label: child_status_label(&card_name),
-                phase,
-                background: in_background,
-                step: None,
-            }));
-        }
+        // How the child ended reaches the parent's card from the one that
+        // measured it: a waited-on child's call (`run_sync`), a background
+        // child's run record once its turn is over. Never from here, before
+        // the turn's own reply.
         let child_task_end = match child_end_record {
             Ok(record) => record,
             Err(error) => {
@@ -3144,7 +3137,7 @@ mod tests {
                 assert_eq!(view.step, Some(Step::Output("42".into())));
                 assert_eq!(
                     view.step.unwrap().words(),
-                    "Running a command: 42",
+                    "Running a command · last output: 42",
                     "the owner reads plain words"
                 );
             }
@@ -3174,15 +3167,17 @@ mod tests {
         )
         .unwrap();
         wordpress
-            .send(StatusUpdate::Checklist {
+            .send(StatusUpdate::Checklist(aidaemon_core::card::PlanCard {
                 text: rendered_checklist(5, 5),
-            })
+                steps: 5,
+            }))
             .await
             .unwrap();
         drupal
-            .send(StatusUpdate::Checklist {
+            .send(StatusUpdate::Checklist(aidaemon_core::card::PlanCard {
                 text: rendered_checklist(1, 4),
-            })
+                steps: 4,
+            }))
             .await
             .unwrap();
         drupal
@@ -3211,7 +3206,7 @@ mod tests {
         let mut lines = Vec::new();
         while let Some(update) = parent_rx.recv().await {
             match update {
-                StatusUpdate::Checklist { .. } => panic!("child checklist reached the parent card"),
+                StatusUpdate::Checklist(_) => panic!("child checklist reached the parent card"),
                 StatusUpdate::Helper(view) => {
                     assert!(!view.background);
                     lines.push(format!(

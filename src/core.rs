@@ -1093,10 +1093,14 @@ primary = "gpt-4o"
         assert!(prompt
             .contains("Ask first only when the choices would destroy or change existing work."));
         assert!(prompt.contains(&format!(
-            "a result's line starting \"{}\" is the daemon's own measurement",
+            "A result's line starting \"{}\" is the daemon's own measurement",
             aidaemon_runtime::turn::sliding_window::MEASURED_TIMING_MARK.trim_end()
         )));
         assert!(prompt.contains("say it wasn't measured rather than giving or recalling a number"));
+        assert!(prompt.contains(
+            "Never state a duration or a time you did not receive from a measurement: quote a \
+             measured value exactly as given"
+        ));
     }
 
     #[test]

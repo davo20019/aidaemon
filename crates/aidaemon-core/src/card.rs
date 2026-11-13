@@ -78,8 +78,6 @@ pub enum ActivityKind {
     Check,
     /// Any other change.
     Change,
-    /// Between steps: the model decides what comes next.
-    Think,
 }
 
 impl ActivityKind {
@@ -97,7 +95,6 @@ impl ActivityKind {
             Self::Remind => "Setting a reminder",
             Self::Check => "Checking things",
             Self::Change => "Making a change",
-            Self::Think => "Working out the next step",
         }
     }
 }
@@ -110,7 +107,8 @@ pub enum Step {
     /// A step of this kind handed its work on to something that keeps
     /// running: the work goes on, so it never reads as finished.
     HandedOff(ActivityKind),
-    /// The latest line a running command printed (secrets redacted).
+    /// A command is running, and this is the latest line it printed
+    /// (secrets redacted): shown as its output, never as a label.
     Output(String),
 }
 
@@ -123,7 +121,10 @@ impl Step {
                 "Handed to a helper; it works in the background".to_string()
             }
             Self::HandedOff(kind) => format!("{} · goes on in the background", kind.words()),
-            Self::Output(line) => format!("{}: {}", ActivityKind::Run.words(), line.trim()),
+            Self::Output(line) => match line.trim() {
+                "" => ActivityKind::Run.words().to_string(),
+                line => format!("{} · last output: {line}", ActivityKind::Run.words()),
+            },
         }
     }
 }
@@ -138,6 +139,10 @@ pub struct HelperView {
     pub background: bool,
     /// Its latest step while it runs.
     pub step: Option<Step>,
+    /// Once it ended, how long it took and when, as the runtime measured it
+    /// and already worded for the owner ("Took 21s (2:21:16 PM to 2:21:37 PM
+    /// ET)."). Never worked out from anything a model wrote.
+    pub took: Option<String>,
 }
 
 impl HelperView {
@@ -148,6 +153,40 @@ impl HelperView {
             phase: RunPhase::Running,
             background,
             step,
+            took: None,
+        }
+    }
+}
+
+/// A plan as the card shows it: its own rendering and how many steps it
+/// has. The step count, not the text, decides how the card ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanCard {
+    pub text: String,
+    pub steps: usize,
+}
+
+/// How a turn's card ends, decided once from its typed state for every
+/// channel path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardEnd {
+    /// The card is the record of the work: it stays, settled to its final
+    /// header (each helper's end, the plan's closing state).
+    Keep,
+    /// The card was only progress for one step: it goes, and the reply
+    /// says what was done.
+    Collapse,
+}
+
+impl CardEnd {
+    /// A card with a helper on it, or a plan of more than one step, is
+    /// kept; only a single-step card with no helper collapses into the
+    /// reply.
+    pub fn of(plan: Option<&PlanCard>, helpers: usize) -> Self {
+        if helpers > 0 || plan.is_some_and(|plan| plan.steps > 1) {
+            Self::Keep
+        } else {
+            Self::Collapse
         }
     }
 }

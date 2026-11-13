@@ -3,18 +3,21 @@
 //! task shows one calm, updating line/checklist instead of many messages.
 //!
 //! Every card, the live one during a turn and the one a turn leaves behind,
-//! is drawn by [`render_card`] from one view: the plan's rendered steps, each
-//! helper's record ([`HelperView`]) and the turn's own typed [`Step`].
+//! is drawn by [`render_card`] from one view: the plan's card, each helper's
+//! record ([`HelperView`]) and the turn's own typed [`Step`]. How a card ends
+//! with its turn is decided once, from that view ([`CardView::end`]): every
+//! channel path keeps or collapses the same card the same way.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use aidaemon_core::card::{HelperView, RunPhase, Step};
+use aidaemon_core::card::{CardEnd, HelperView, PlanCard, RunPhase, Step};
+use aidaemon_tools::status::StatusUpdate;
 
 use crate::hub::ChannelHub;
 
 /// Whether a plan card (a rendered checklist) shows every step finished.
-/// Such a card is only progress: the reply covers the result.
+/// Such a card drops the turn's own step line: the work is done.
 pub fn is_completed_checklist(rendered: &str) -> bool {
     rendered.trim_start().starts_with('✅')
 }
@@ -23,7 +26,7 @@ pub fn is_completed_checklist(rendered: &str) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct CardView<'a> {
     /// The plan's card, as the plan renders itself.
-    pub plan: Option<&'a str>,
+    pub plan: Option<&'a PlanCard>,
     /// Each helper's record, in the order they started, with how long its
     /// latest step has run when that is known.
     pub helpers: Vec<(HelperView, Option<Duration>)>,
@@ -31,19 +34,29 @@ pub struct CardView<'a> {
     pub activity: Option<(&'a Step, Duration)>,
 }
 
+impl CardView<'_> {
+    /// How this card ends with its turn ([`CardEnd::of`]).
+    pub fn end(&self) -> CardEnd {
+        CardEnd::of(self.plan, self.helpers.len())
+    }
+}
+
 /// The card for `view`: the plan (when there is one), each helper's header
-/// and its latest step while it runs, and the turn's own step, each long
-/// step with how long it has run. A plan never hides the helpers or the
-/// step running now; a finished plan drops the turn's own step.
+/// and its latest step while it runs (its measured time once it ended), and
+/// the turn's own step, each long step with how long it has run. A plan
+/// never hides the helpers or the step running now; a finished plan drops
+/// the turn's own step.
 pub fn render_card(view: &CardView<'_>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(plan) = view.plan {
-        parts.push(plan.trim_end().to_string());
+        parts.push(plan.text.trim_end().to_string());
     }
     for (helper, elapsed) in &view.helpers {
         parts.push(helper_block(helper, *elapsed));
     }
-    let done = view.plan.is_some_and(is_completed_checklist);
+    let done = view
+        .plan
+        .is_some_and(|plan| is_completed_checklist(&plan.text));
     if !done {
         if let Some((step, elapsed)) = view.activity {
             parts.push(format!("⏳ {}", line_with_elapsed(&step.words(), elapsed)));
@@ -65,19 +78,26 @@ pub fn helper_status_words(helper: &HelperView) -> String {
 }
 
 /// A helper's lines on a card: its header, then its latest step while it
-/// runs.
+/// runs, or how long it took once it ended.
 fn helper_block(helper: &HelperView, elapsed: Option<Duration>) -> String {
     let mut block = format!(
         "{}: {}",
         helper.phase.helper_headline(helper.background),
         helper.label.trim()
     );
-    if let (RunPhase::Running, Some(step)) = (helper.phase, helper.step.as_ref()) {
-        block.push('\n');
-        block.push_str(&line_with_elapsed(
-            &step.words(),
-            elapsed.unwrap_or_default(),
-        ));
+    match (helper.phase, helper.step.as_ref(), helper.took.as_deref()) {
+        (RunPhase::Running, Some(step), _) => {
+            block.push('\n');
+            block.push_str(&line_with_elapsed(
+                &step.words(),
+                elapsed.unwrap_or_default(),
+            ));
+        }
+        (phase, _, Some(took)) if phase.is_terminal() => {
+            block.push('\n');
+            block.push_str(took.trim());
+        }
+        _ => {}
     }
     block
 }
@@ -94,10 +114,11 @@ pub trait SurfaceSink: Send + Sync {
 }
 
 /// Per-turn live-status state. Shared as `Arc<tokio::sync::Mutex<LiveStatus>>`
-/// between the status-consumer task and the outer request handler.
+/// between the status-consumer task and the turn runner, which owns how the
+/// card ends.
 pub struct LiveStatus {
     message_id: Option<String>,
-    checklist: Option<String>,
+    checklist: Option<PlanCard>,
     /// The turn's own current step and when it began.
     activity: Option<(Step, std::time::Instant)>,
     /// Each helper's record, in the order they started, and when its
@@ -144,7 +165,7 @@ impl LiveStatus {
     /// The card as it is now.
     fn view(&self, with_activity: bool) -> CardView<'_> {
         CardView {
-            plan: self.checklist.as_deref(),
+            plan: self.checklist.as_ref(),
             helpers: self
                 .helpers
                 .iter()
@@ -166,9 +187,39 @@ impl LiveStatus {
         self.render()
     }
 
+    /// How this card ends with its turn: the one rule ([`CardView::end`]).
+    pub fn end(&self) -> CardEnd {
+        self.view(false).end()
+    }
+
+    /// Note one of the turn's status updates on the card; `true` when the
+    /// card should show it at once: the plan, a handoff and a helper's
+    /// start or end are never held back. Each step is its typed kind; a
+    /// tool ending is not a step, and between steps (the model choosing
+    /// the next one) the card keeps the latest step while the working
+    /// indicator says the turn is busy.
+    pub fn note(&mut self, update: &StatusUpdate) -> bool {
+        match update {
+            StatusUpdate::Checklist(plan) => {
+                self.note_checklist(plan.clone());
+                true
+            }
+            StatusUpdate::ToolStart { kind, .. } => {
+                self.note_activity(Step::Doing(*kind));
+                false
+            }
+            StatusUpdate::StepHandedOff { kind } => {
+                self.note_activity(Step::HandedOff(*kind));
+                true
+            }
+            StatusUpdate::Helper(helper) => self.note_helper(helper.clone()),
+            _ => false,
+        }
+    }
+
     /// Note the plan card without sending it.
-    pub fn note_checklist(&mut self, text: String) {
-        self.checklist = Some(text);
+    pub fn note_checklist(&mut self, plan: PlanCard) {
+        self.checklist = Some(plan);
     }
 
     /// Note the turn's current step without sending it; the same step
@@ -195,7 +246,7 @@ impl LiveStatus {
                 if known.phase.is_terminal() && !helper.phase.is_terminal() {
                     return false;
                 }
-                let header_changed = known.phase != helper.phase;
+                let header_changed = known.phase != helper.phase || known.took != helper.took;
                 if known.step != helper.step {
                     *since = std::time::Instant::now();
                 }
@@ -207,25 +258,6 @@ impl LiveStatus {
                 true
             }
         }
-    }
-
-    /// Whether a helper on the card still runs: the card stays its own
-    /// message, to settle when the helper ends, and is never turned into
-    /// the turn's reply.
-    pub fn has_running_helpers(&self) -> bool {
-        self.helpers
-            .iter()
-            .any(|(helper, _)| helper.phase == RunPhase::Running)
-    }
-
-    /// Whether the card outlives the turn: a plan with work left (or with
-    /// no reply to say what was done), or a helper still running.
-    fn kept(&self, reply_delivered: bool) -> bool {
-        let plan_kept = self
-            .checklist
-            .as_deref()
-            .is_some_and(|plan| !reply_delivered || !is_completed_checklist(plan));
-        plan_kept || self.has_running_helpers()
     }
 
     /// Send the card when what it would show changed since it was last
@@ -270,8 +302,8 @@ impl LiveStatus {
         }
     }
 
-    pub async fn set_checklist(&mut self, sink: &dyn SurfaceSink, text: String) {
-        self.note_checklist(text);
+    pub async fn set_checklist(&mut self, sink: &dyn SurfaceSink, plan: PlanCard) {
+        self.note_checklist(plan);
         self.flush(sink).await;
     }
 
@@ -280,34 +312,42 @@ impl LiveStatus {
         self.flush(sink).await;
     }
 
-    /// Edit the surface into the final reply. Returns true if the caller no
-    /// longer needs to send the reply separately.
-    pub async fn finalize_text(&mut self, sink: &dyn SurfaceSink, reply: &str) -> bool {
-        if reply.trim().is_empty() {
-            return false;
+    /// Edit the card into the turn's reply, when the card collapses
+    /// ([`Self::end`]) and can be edited. Returns the message that now holds
+    /// the reply; `None` when the caller sends the reply itself (a card
+    /// that is kept never becomes the reply).
+    pub async fn become_reply(&mut self, sink: &dyn SurfaceSink, reply: &str) -> Option<String> {
+        if reply.trim().is_empty() || self.end() == CardEnd::Keep {
+            return None;
         }
         if let (Some(id), true) = (&self.message_id, self.edit_supported) {
             if matches!(sink.edit(id, reply).await, Ok(true)) {
                 // The surface is the reply now: no later refresh may turn
                 // it back into the card.
                 self.finalized = true;
-                return true;
+                return Some(id.clone());
             }
         }
-        false
+        None
     }
 
-    /// Remove the temporary surface when the turn is over. The turn's own
-    /// step always goes. The card stays as the record of the work when
-    /// [`Self::kept`]: a plan with unfinished, failed or deferred steps, a
-    /// finished plan no reply described, or a helper still running (it
-    /// settles this card to its final header when it ends). A finished
-    /// plan the reply describes, or a bare activity line, is removed.
-    pub async fn clear(&mut self, sink: &dyn SurfaceSink, reply_delivered: bool) {
+    /// End the card with its turn, by the one rule ([`Self::end`]). The
+    /// turn's own step always goes. A card that is kept (a helper on it, or
+    /// a plan of more than one step) is settled to its final state and
+    /// stays as the record of the work; a background helper still running
+    /// settles it again when it ends. Any other card is removed: the reply
+    /// says what was done. Safe to call more than once.
+    pub async fn close(&mut self, sink: &dyn SurfaceSink) {
+        if self.finalized {
+            return;
+        }
         self.activity = None;
-        if self.kept(reply_delivered) {
-            let card = render_card(&self.view(false));
-            if card.is_some() && self.shown != card {
+        match self.end() {
+            CardEnd::Keep => {
+                let card = render_card(&self.view(false));
+                if card.is_none() || self.shown == card {
+                    return;
+                }
                 if let (Some(id), true, Some(body)) =
                     (&self.message_id, self.edit_supported, card.as_deref())
                 {
@@ -317,19 +357,17 @@ impl LiveStatus {
                     }
                 }
             }
-            return;
+            CardEnd::Collapse => {
+                if let Some(id) = self.message_id.take() {
+                    let _ = sink.delete(&id).await;
+                }
+                self.shown = None;
+            }
         }
-        if let Some(id) = self.message_id.take() {
-            let _ = sink.delete(&id).await;
-        }
-        self.helpers.clear();
-        self.shown = None;
-        self.edit_supported = true;
     }
 
-    /// The surface's editable message id, when one exists and editing still
-    /// works this turn. Read before `reset()` — e.g. to register a delivered
-    /// background-handoff reply so a later completion ping can edit it.
+    /// The card's editable message id, when one exists and editing still
+    /// works this turn.
     pub fn surface_message_id(&self) -> Option<String> {
         if self.edit_supported {
             self.message_id.clone()
@@ -339,24 +377,13 @@ impl LiveStatus {
     }
 
     /// The message showing this turn's kept card, when one is on screen
-    /// and still editable. Read before `reset()`, so work that outlives the
-    /// turn (a background job settling its steps, a helper ending) can
-    /// update the card.
+    /// and still editable, so work that outlives the turn (a background
+    /// job settling its steps, a helper ending) can update the card.
     pub fn kept_card_message_id(&self) -> Option<String> {
-        if self.checklist.is_none() && self.helpers.is_empty() {
+        if self.finalized || self.end() == CardEnd::Collapse {
             return None;
         }
         self.surface_message_id()
-    }
-
-    pub fn reset(&mut self) {
-        self.message_id = None;
-        self.checklist = None;
-        self.activity = None;
-        self.helpers.clear();
-        self.shown = None;
-        self.finalized = false;
-        self.edit_supported = true;
     }
 }
 
@@ -440,6 +467,20 @@ mod tests {
         Step::Doing(kind)
     }
 
+    fn plan(text: &str, steps: usize) -> PlanCard {
+        PlanCard {
+            text: text.to_string(),
+            steps,
+        }
+    }
+
+    fn ended(label: &str, phase: RunPhase, background: bool) -> HelperView {
+        HelperView {
+            phase,
+            ..HelperView::running(label, background, None)
+        }
+    }
+
     #[tokio::test]
     async fn creates_once_then_edits_in_place() {
         let sink = FakeSink::new(true);
@@ -458,33 +499,161 @@ mod tests {
     async fn the_plan_card_shows_each_helper_and_the_step_running_now() {
         let sink = FakeSink::new(true);
         let mut s = LiveStatus::new();
-        s.set_checklist(&sink, "📋 Plan\n☐ a".into()).await;
-        s.note_helper(HelperView::running("Counter A", true, None));
-        s.note_helper(HelperView::running("Counter B", true, None));
+        s.set_checklist(&sink, plan("📋 Plan\n☐ a\n☐ b", 2)).await;
+        s.note_helper(HelperView::running("Count A", true, None));
+        s.note_helper(HelperView::running("Count B", true, None));
         s.note_helper(HelperView::running(
-            "Counter B",
+            "Count B",
             true,
             Some(doing(ActivityKind::Run)),
         ));
-        s.set_activity(&sink, doing(ActivityKind::Think)).await;
+        s.set_activity(&sink, doing(ActivityKind::Read)).await;
         assert_eq!(sink.creates.lock().unwrap().len(), 1);
         let card = sink.edits.lock().unwrap().last().unwrap().1.clone();
         assert_eq!(
             card,
-            "📋 Plan\n☐ a\n\n⏳ Running in the background: Counter A\n\n⏳ Running in the \
-             background: Counter B\nRunning a command\n\n⏳ Working out the next step"
+            "📋 Plan\n☐ a\n☐ b\n\n⏳ Running in the background: Count A\n\n⏳ Running in the \
+             background: Count B\nRunning a command\n\n⏳ Reading files"
         );
         // Nothing changed: nothing is re-sent.
         assert!(!s.flush_if_changed(&sink).await);
         assert_eq!(sink.edits.lock().unwrap().len(), 1);
         // The turn's own step goes when the turn ends; the helpers stay.
-        s.clear(&sink, true).await;
+        s.close(&sink).await;
         assert_eq!(
             sink.edits.lock().unwrap().last().unwrap().1,
-            "📋 Plan\n☐ a\n\n⏳ Running in the background: Counter A\n\n⏳ Running in the \
-             background: Counter B\nRunning a command"
+            "📋 Plan\n☐ a\n☐ b\n\n⏳ Running in the background: Count A\n\n⏳ Running in the \
+             background: Count B\nRunning a command"
         );
         assert_eq!(s.kept_card_message_id().as_deref(), Some("m1"));
+    }
+
+    /// Two helpers started together each get their own header on the card,
+    /// whatever order or batch their updates arrive in (live 2026-11-12:
+    /// only "Counter B" showed), and every line is a typed kind in plain
+    /// words: a tool ending and the model choosing its next step add
+    /// nothing.
+    #[test]
+    fn parallel_helpers_each_get_their_own_line() {
+        let mut live = LiveStatus::new();
+        assert!(live.note(&StatusUpdate::Helper(HelperView::running(
+            "Count A", true, None
+        ))));
+        assert!(live.note(&StatusUpdate::Helper(HelperView::running(
+            "Count B", true, None
+        ))));
+        assert!(!live.note(&StatusUpdate::Helper(HelperView::running(
+            "Count B",
+            true,
+            Some(Step::Doing(ActivityKind::Run)),
+        ))));
+        assert!(!live.note(&StatusUpdate::ToolComplete {
+            name: "reading a file".into(),
+            summary: "done".into(),
+        }));
+        assert!(live.note(&StatusUpdate::StepHandedOff {
+            kind: ActivityKind::Delegate,
+        }));
+        assert!(!live.note(&StatusUpdate::Thinking(3)));
+        assert_eq!(
+            live.preview().unwrap(),
+            "⏳ Running in the background: Count A\n\n⏳ Running in the background: \
+             Count B\nRunning a command\n\n⏳ Handed to a helper; it works in the background"
+        );
+    }
+
+    /// How a card ends is decided once from its typed state: a helper on
+    /// it, or a plan of more than one step, keeps it; anything else
+    /// collapses. The rendered text never decides.
+    #[test]
+    fn a_cards_end_comes_from_its_typed_state() {
+        let mut live = LiveStatus::new();
+        live.note_activity(doing(ActivityKind::Run));
+        assert_eq!(live.end(), CardEnd::Collapse);
+        live.note_checklist(plan("✅ Remember X", 1));
+        assert_eq!(live.end(), CardEnd::Collapse);
+        live.note_checklist(plan("✅ Done · 2 of 2 steps\n\n✅ a\n✅ b", 2));
+        assert_eq!(live.end(), CardEnd::Keep);
+
+        let mut helpers = LiveStatus::new();
+        helpers.note_helper(ended("Count lines", RunPhase::Succeeded, false));
+        assert_eq!(helpers.end(), CardEnd::Keep);
+    }
+
+    /// A foreground turn whose helpers ran side by side keeps its card,
+    /// settled to each helper's final header and its measured time, after
+    /// the reply (live 2026-11-13: the card vanished at turn end).
+    #[tokio::test]
+    async fn a_card_with_helpers_is_kept_and_settled() {
+        let sink = FakeSink::new(true);
+        let mut live = LiveStatus::new();
+        live.note_helper(HelperView::running("Count lines", false, None));
+        live.note_helper(HelperView::running("Count words", false, None));
+        live.set_activity(&sink, Step::Doing(ActivityKind::Delegate))
+            .await;
+        live.note_helper(HelperView {
+            took: Some("Took 21s (2:21:16 PM to 2:21:37 PM ET).".into()),
+            ..ended("Count lines", RunPhase::Succeeded, false)
+        });
+        live.note_helper(ended("Count words", RunPhase::Failed, false));
+        assert!(live.become_reply(&sink, "Lines: 12").await.is_none());
+        live.close(&sink).await;
+        assert!(sink.deletes.lock().unwrap().is_empty());
+        assert_eq!(
+            sink.edits.lock().unwrap().last().unwrap().1,
+            "✅ A helper finished: Count lines\nTook 21s (2:21:16 PM to 2:21:37 PM ET).\n\n❌ A \
+             helper failed: Count words"
+        );
+        assert_eq!(live.kept_card_message_id().as_deref(), Some("m1"));
+    }
+
+    /// A single-step card with no helper is only progress: it collapses,
+    /// into the reply when it may become it, else it is removed.
+    #[tokio::test]
+    async fn a_single_step_card_collapses() {
+        let sink = FakeSink::new(true);
+        let mut live = LiveStatus::new();
+        live.set_activity(&sink, doing(ActivityKind::Check)).await;
+        assert_eq!(
+            live.become_reply(&sink, "Done — results attached.")
+                .await
+                .as_deref(),
+            Some("m1")
+        );
+        assert_eq!(
+            sink.edits.lock().unwrap().last().unwrap().1,
+            "Done — results attached."
+        );
+        live.close(&sink).await;
+        assert!(
+            sink.deletes.lock().unwrap().is_empty(),
+            "it is the reply now"
+        );
+
+        let sink = FakeSink::new(true);
+        let mut live = LiveStatus::new();
+        live.set_checklist(&sink, plan("⏳ Remember X", 1)).await;
+        live.set_checklist(&sink, plan("✅ Remember X", 1)).await;
+        live.close(&sink).await;
+        assert_eq!(*sink.deletes.lock().unwrap(), vec!["m1".to_string()]);
+        assert_eq!(live.kept_card_message_id(), None);
+    }
+
+    /// A plan of more than one step stays as the record of the work,
+    /// finished or not.
+    #[tokio::test]
+    async fn a_plan_of_several_steps_is_kept() {
+        for card in [
+            "⚠️ Stopped short · 1 of 2 done\n\n✅ Step 1\n⏭️ Step 2 (not done)",
+            "✅ Done · 2 of 2 steps\n\n✅ a\n✅ b",
+        ] {
+            let sink = FakeSink::new(true);
+            let mut live = LiveStatus::new();
+            live.set_checklist(&sink, plan(card, 2)).await;
+            live.close(&sink).await;
+            assert!(sink.deletes.lock().unwrap().is_empty(), "{card}");
+            assert_eq!(live.kept_card_message_id().as_deref(), Some("m1"));
+        }
     }
 
     /// The live card and the card a turn leaves behind are one renderer
@@ -492,19 +661,22 @@ mod tests {
     /// whichever path draws it.
     #[tokio::test]
     async fn the_live_and_the_kept_card_agree_for_the_same_records() {
-        let plan = "⏳ Continuing in the background · 0 of 1 done\n\n⏳ Count (running in the \
-                    background)";
+        let plan = plan(
+            "⏳ Continuing in the background · 0 of 1 done\n\n⏳ Count (running in the \
+             background)",
+            1,
+        );
         let record = HelperView::running("Slow count", true, Some(Step::Output("13".into())));
         let sink = FakeSink::new(true);
         let mut live = LiveStatus::new();
-        live.set_checklist(&sink, plan.into()).await;
+        live.set_checklist(&sink, plan.clone()).await;
         live.note_helper(record.clone());
         live.set_activity(&sink, Step::HandedOff(ActivityKind::Delegate))
             .await;
-        live.clear(&sink, true).await;
+        live.close(&sink).await;
         let kept = sink.edits.lock().unwrap().last().unwrap().1.clone();
         let drawn_after_the_turn = render_card(&CardView {
-            plan: Some(plan),
+            plan: Some(&plan),
             helpers: vec![(record.clone(), None)],
             activity: None,
         })
@@ -532,13 +704,24 @@ mod tests {
         );
     }
 
+    /// A running command's latest line reads as its output, never as a
+    /// label or a counter of the step.
+    #[test]
+    fn a_commands_latest_line_reads_as_its_output() {
+        assert_eq!(
+            Step::Output("3".into()).words(),
+            "Running a command · last output: 3"
+        );
+        assert_eq!(Step::Output("  ".into()).words(), "Running a command");
+    }
+
     /// Nothing the owner reads names a tool, an internal label or a raw
     /// step: every line is plain words from a typed kind.
     #[test]
     fn no_owner_facing_line_carries_an_internal_label() {
         use ActivityKind::*;
         let kinds = [
-            Read, Search, Write, Run, Web, Delegate, Recall, Remember, Remind, Check, Change, Think,
+            Read, Search, Write, Run, Web, Delegate, Recall, Remember, Remind, Check, Change,
         ];
         let mut lines: Vec<String> = Vec::new();
         for kind in kinds {
@@ -557,10 +740,11 @@ mod tests {
                     render_card(&CardView {
                         helpers: vec![(
                             HelperView {
-                                label: "Letters file helper".into(),
+                                label: "Count the letters".into(),
                                 phase,
                                 background,
                                 step: Some(Step::Doing(Search)),
+                                took: None,
                             },
                             None,
                         )],
@@ -581,6 +765,7 @@ mod tests {
                 "searching files",
                 "started in the background",
                 "finished reading",
+                "next step",
                 "...",
             ] {
                 assert!(!lower.contains(internal), "{internal:?} in {line:?}");
@@ -619,10 +804,7 @@ mod tests {
             "Running a command · goes on in the background"
         );
         let mut live = LiveStatus::new();
-        live.note_helper(HelperView {
-            phase: RunPhase::Succeeded,
-            ..HelperView::running("Count", false, None)
-        });
+        live.note_helper(ended("Count", RunPhase::Succeeded, false));
         live.note_helper(HelperView::running(
             "Count",
             false,
@@ -651,60 +833,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_text_edits_surface_into_reply() {
+    async fn become_reply_none_when_no_surface_or_edit_fails() {
         let sink = FakeSink::new(true);
         let mut s = LiveStatus::new();
-        s.set_activity(&sink, doing(ActivityKind::Check)).await;
-        let handled = s.finalize_text(&sink, "Done — results attached.").await;
-        assert!(handled, "final reply consumed by editing the surface");
-        assert_eq!(
-            sink.edits.lock().unwrap().last().unwrap().1,
-            "Done — results attached."
-        );
-    }
+        assert!(s.become_reply(&sink, "Answer").await.is_none());
 
-    #[tokio::test]
-    async fn finalize_text_false_when_no_surface() {
-        let sink = FakeSink::new(true);
-        let mut s = LiveStatus::new();
-        let handled = s.finalize_text(&sink, "Answer").await;
-        assert!(!handled, "no surface -> caller sends normally");
-    }
-
-    #[tokio::test]
-    async fn finalize_text_false_when_edit_fails() {
         let sink = FakeSink::new(false); // edit always returns Ok(false)
         let mut s = LiveStatus::new();
         s.set_activity(&sink, doing(ActivityKind::Check)).await;
         assert!(
-            !s.finalize_text(&sink, "huge reply").await,
-            "edit failed -> finalize returns false -> caller sends normally"
-        );
-    }
-
-    #[tokio::test]
-    async fn clear_removes_surface_without_done_marker() {
-        let sink = FakeSink::new(true);
-        let mut s = LiveStatus::new();
-        s.set_activity(&sink, doing(ActivityKind::Check)).await;
-        s.clear(&sink, false).await;
-        assert_eq!(*sink.deletes.lock().unwrap(), vec!["m1".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn clear_keeps_unfinished_checklist() {
-        let sink = FakeSink::new(true);
-        let mut s = LiveStatus::new();
-        s.set_checklist(
-            &sink,
-            "⚠️ Stopped short · 1 of 2 done\n\n✅ Step 1\n⏭️ Step 2 (not done)".into(),
-        )
-        .await;
-        s.clear(&sink, true).await;
-        assert_eq!(
-            sink.deletes.lock().unwrap().len(),
-            0,
-            "a card with unfinished steps stays as the record of what was left"
+            s.become_reply(&sink, "huge reply").await.is_none(),
+            "edit failed -> the caller sends normally"
         );
     }
 
@@ -719,35 +858,10 @@ mod tests {
         assert_eq!(s.kept_card_message_id(), None);
         s.set_checklist(
             &sink,
-            "⏳ Continuing in the background · 0 of 1 done".into(),
+            plan("⏳ Continuing in the background · 0 of 2 done", 2),
         )
         .await;
-        s.clear(&sink, true).await;
+        s.close(&sink).await;
         assert_eq!(s.kept_card_message_id().as_deref(), Some("m1"));
-
-        let mut done = LiveStatus::new();
-        done.set_checklist(&sink, "✅ Remember X".into()).await;
-        done.clear(&sink, true).await;
-        assert_eq!(done.kept_card_message_id(), None);
-    }
-
-    #[tokio::test]
-    async fn clear_drops_fully_done_checklist() {
-        let sink = FakeSink::new(true);
-        let mut s = LiveStatus::new();
-        s.set_checklist(&sink, "⏳ Remember X".into()).await;
-        s.set_checklist(&sink, "✅ Remember X".into()).await;
-        s.clear(&sink, true).await;
-        assert_eq!(*sink.deletes.lock().unwrap(), vec!["m1".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn clear_keeps_fully_done_checklist_when_no_reply_went_out() {
-        let sink = FakeSink::new(true);
-        let mut s = LiveStatus::new();
-        s.set_checklist(&sink, "✅ Done · 2 of 2 steps\n\n✅ a\n✅ b".into())
-            .await;
-        s.clear(&sink, false).await;
-        assert_eq!(sink.deletes.lock().unwrap().len(), 0);
     }
 }

@@ -106,7 +106,9 @@ fn status_of(update: &StatusUpdate) -> Option<TurnStatus> {
             description: description.clone(),
             state: StepState::Failed,
         },
-        StatusUpdate::Checklist { text } => TurnStatus::Checklist { text: text.clone() },
+        StatusUpdate::Checklist(plan) => TurnStatus::Checklist {
+            text: plan.text.clone(),
+        },
         StatusUpdate::Helper(helper) => TurnStatus::Note {
             text: format!(
                 "{}: {}",

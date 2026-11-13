@@ -11,8 +11,8 @@ mod run_helpers {
 mod send_file_scope_tests;
 
 pub(in crate::agent) use aidaemon_runtime::engine::tool_gate::{
-    durable_replay_preflight, mandate_gate_for_tool_call, parse_checklist_from_result,
-    DurableReplayPreflight, MandateGateDecision,
+    durable_replay_preflight, mandate_gate_for_tool_call, DurableReplayPreflight,
+    MandateGateDecision,
 };
 pub(in crate::agent) use project_dir::project_instruction_targets_for_tool_call;
 #[cfg(test)]

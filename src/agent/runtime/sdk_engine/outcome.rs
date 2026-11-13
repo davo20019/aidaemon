@@ -44,11 +44,30 @@ impl Agent {
     /// Mark the steps of this task's checklist that the run's receipts
     /// proved as confirmed (no longer only the model's word). Returns the
     /// card to show when anything changed.
+    /// The card for this task's checklist as stored now. A one-step plan
+    /// gets no card (`track_requirements`): the step is the request.
+    pub(super) async fn plan_card(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Option<aidaemon_core::card::PlanCard> {
+        let plan_store = self.plan_store.read().await.clone()?;
+        match plan_store.for_task(session_id, task_id).await {
+            Ok(plan) => plan
+                .filter(|plan| plan.steps.len() > 1)
+                .map(|plan| plan.card()),
+            Err(error) => {
+                warn!(task_id, %error, "SDK engine: could not read the checklist");
+                None
+            }
+        }
+    }
+
     pub(super) async fn confirm_checklist_from_receipts(
         &self,
         session_id: &str,
         task_id: &str,
-    ) -> Option<String> {
+    ) -> Option<aidaemon_core::card::PlanCard> {
         let plan_store = self.plan_store.read().await.clone()?;
         let proven = self
             .event_store
@@ -63,7 +82,7 @@ impl Agent {
             // A one-step plan gets no card (`track_requirements`).
             Ok(plan) => plan
                 .filter(|plan| plan.steps.len() > 1)
-                .map(|plan| plan.render_compact_checklist()),
+                .map(|plan| plan.card()),
             Err(error) => {
                 warn!(task_id, %error, "SDK engine: could not confirm checklist steps");
                 None

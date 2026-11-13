@@ -88,7 +88,8 @@ mod live_status_surface_tests {
     ///   1. First `set_activity`  → creates ONE tracked message (creates = 1, edits = 0)
     ///   2. Second `set_activity` → edits that message in place      (edits = 1)
     ///   3. `set_checklist`       → edits in place again             (edits = 2)
-    ///   4. `finalize_text`       → edits the surface into the final reply (edits = 3)
+    ///   4. `close`               → a two-step plan is kept, settled without the
+    ///      turn's own step (edits = 3), and never becomes the reply
     ///
     /// Also asserts that no raw command (`cd '/tmp'`) or pid (`pid=`) leaks into
     /// any edit payload.
@@ -127,14 +128,22 @@ mod live_status_surface_tests {
         )
         .await;
         // Checklist — edit in place (checklist owns the surface from here)
-        live.set_checklist(sink_ref, "📋 Plan\n✅ Create script\n✅ Run it".to_string())
-            .await;
-        // Finalize — edits the surface into the final reply
-        let handled = live
-            .finalize_text(sink_ref, "Done — result file attached.")
-            .await;
+        live.set_checklist(
+            sink_ref,
+            aidaemon_core::card::PlanCard {
+                text: "📋 Plan\n✅ Create script\n✅ Run it".to_string(),
+                steps: 2,
+            },
+        )
+        .await;
+        // A plan of two steps is the record of the work: it never becomes
+        // the reply, and the turn's end keeps it.
+        assert!(live
+            .become_reply(sink_ref, "Done — result file attached.")
+            .await
+            .is_none());
+        live.close(sink_ref).await;
 
-        assert!(handled, "finalize_text must return true when edit succeeds");
         assert_eq!(
             channel.messages.lock().await.len(),
             1,
@@ -145,7 +154,7 @@ mod live_status_surface_tests {
         assert_eq!(
             edits.len(),
             3,
-            "activity edit + checklist edit + final reply edit"
+            "activity edit + checklist edit + the kept card settled without the turn's step"
         );
 
         // No raw command or pid must appear in any edit payload.
