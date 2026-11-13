@@ -36,8 +36,10 @@ channels = ["dep:aidaemon-channels"]
 telegram = ["channels", "dep:aidaemon-channel-telegram"]
 slack = ["channels", "dep:aidaemon-channel-slack"]
 discord = ["channels", "dep:aidaemon-channel-discord"]
-testing = ["aidaemon-core/testing", "aidaemon-channels?/testing", "dep:tokio"]
-full = ["macros", "providers", "tools", "policies", "agents", "sqlite", "mcp", "eval", "testing", "memory", "events", "work", "telegram", "slack", "discord", "otel"]
+conformance = ["channels", "aidaemon-channels/conformance"]
+secrets = ["dep:aidaemon-secrets"]
+testing = ["aidaemon-core/testing", "aidaemon-channels?/testing", "dep:tokio", "tokio/test-util"]
+full = ["macros", "providers", "tools", "policies", "agents", "sqlite", "mcp", "eval", "testing", "memory", "events", "work", "telegram", "slack", "discord", "otel", "conformance", "secrets"]
 
 [dependencies]
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
@@ -62,6 +64,7 @@ aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels", optional
 aidaemon-channel-telegram = { version = "0.2.0", path = "../aidaemon-channel-telegram", optional = true }
 aidaemon-channel-slack = { version = "0.2.0", path = "../aidaemon-channel-slack", optional = true }
 aidaemon-channel-discord = { version = "0.2.0", path = "../aidaemon-channel-discord", optional = true }
+aidaemon-secrets = { version = "0.2.0", path = "../aidaemon-secrets", optional = true }
 
 [dev-dependencies]
 axum = "0.8"
@@ -123,6 +126,14 @@ required-features = ["testing", "memory"]
 
 [[example]]
 name = "channel_bot"
+required-features = ["macros", "testing", "channels"]
+
+[[example]]
+name = "scheduled_worker"
+required-features = ["testing"]
+
+[[example]]
+name = "own_channel"
 required-features = ["macros", "testing", "channels"]
 
 [[example]]

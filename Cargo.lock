@@ -151,6 +151,7 @@ version = "0.2.0"
 dependencies = [
  "aidaemon-core",
  "async-trait",
+ "futures",
  "serde",
  "serde_json",
  "tokio",
@@ -627,6 +628,7 @@ dependencies = [
  "aidaemon-memory",
  "aidaemon-policies",
  "aidaemon-providers",
+ "aidaemon-secrets",
  "aidaemon-store-sqlite",
  "aidaemon-tools",
  "aidaemon-work",

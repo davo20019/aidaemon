@@ -74,9 +74,9 @@ use tokio_util::task::TaskTracker;
 
 use crate::approvals::{ApprovalStore, StoredApproval};
 use crate::channel::{
-    ApprovalChoice, ApprovalPrompt, Attachment, AttachmentKind, Channel, ChannelError,
-    ChannelEvent, CommandInvocation, CommandSpec, Conversation, ConversationKind, InboundMessage,
-    MessageRef, OutboundMessage,
+    ApprovalChoice, ApprovalDetails, ApprovalPrompt, Attachment, AttachmentKind, Channel,
+    ChannelError, ChannelEvent, CommandInvocation, CommandSpec, Conversation, ConversationKind,
+    InboundMessage, MessageRef, OutboundMessage, RunEnding,
 };
 use crate::commands::{
     builtin_commands, invalid_spec, is_builtin, CommandContext, CommandHandler, CommandReply,
@@ -1281,7 +1281,6 @@ impl Inner {
     {
         let channel = self.channels[origin.channel].clone();
         let caps = channel.capabilities();
-        let max = caps.max_message_len;
         let mut events = self.router.as_ref().map(|r| r.attach(session, run_id));
         let mut handle = tokio::spawn(run);
 
@@ -1289,10 +1288,7 @@ impl Inner {
         let mut status_ref = None;
         if caps.edit_messages && events.is_some() {
             match channel
-                .send(
-                    &origin.conversation,
-                    &OutboundMessage::text(progress.render(max)),
-                )
+                .send_status(&origin.conversation, &progress.working())
                 .await
             {
                 Ok(r) => status_ref = Some(r),
@@ -1327,8 +1323,7 @@ impl Inner {
                 }
                 _ = tokio::time::sleep_until(last_edit + interval), if dirty && status_ref.is_some() => {
                     if let Some(r) = &status_ref {
-                        let text = self.outbound_text(channel.as_ref(), &progress.render(max));
-                        if let Err(err) = channel.edit(r, &text).await {
+                        if let Err(err) = channel.update_status(r, &progress.working()).await {
                             tracing::debug!(error = %err, "status edit failed");
                         }
                     }
@@ -1347,12 +1342,11 @@ impl Inner {
             router.detach(session);
         }
         if let Some(r) = &status_ref {
-            let word = match &result {
-                Ok(outcome) => render::outcome_word(outcome),
-                Err(_) => "Failed",
+            let ending = match &result {
+                Ok(outcome) => render::outcome_ending(outcome),
+                Err(_) => RunEnding::Failed,
             };
-            let text = self.outbound_text(channel.as_ref(), &progress.render_final(word, max));
-            if let Err(err) = channel.edit(r, &text).await {
+            if let Err(err) = channel.update_status(r, &progress.ended(ending)).await {
                 tracing::debug!(error = %err, "final status edit failed");
             }
         }
@@ -1373,11 +1367,11 @@ impl Inner {
     async fn open_approval(self: &Arc<Self>, pending: PendingApproval) {
         let prompt_id = pending.prompt_id.clone();
         let origin = pending.origin.clone();
-        let prompt = ApprovalPrompt {
-            id: prompt_id.clone(),
-            conversation: origin.conversation.clone(),
-            text: pending.prompt_text.clone(),
-            choices: vec![
+        let mut prompt = ApprovalPrompt::new(
+            prompt_id.clone(),
+            origin.conversation.clone(),
+            pending.prompt_text.clone(),
+            vec![
                 ApprovalChoice {
                     id: APPROVE_CHOICE.to_string(),
                     label: "Approve".to_string(),
@@ -1387,7 +1381,10 @@ impl Inner {
                     label: "Deny".to_string(),
                 },
             ],
-        };
+        );
+        if let Some(waiting) = &pending.state.pending {
+            prompt = prompt.with_details(ApprovalDetails::from_interruption(&waiting.interruption));
+        }
         // Saved before it is shown, so a prompt on screen is always one a
         // restart can still settle.
         self.persist_approval(&pending).await;
@@ -1397,7 +1394,14 @@ impl Inner {
             .insert(prompt_id.clone(), pending);
 
         let channel = self.channels[origin.channel].clone();
-        let prompt_ref = match channel.ask(&prompt).await {
+        // A channel without buttons is never asked for them: it gets the
+        // text prompt and its commands, whatever its `ask` would do.
+        let asked = if channel.capabilities().buttons {
+            channel.ask(&prompt).await
+        } else {
+            Err(ChannelError::Unsupported("buttons"))
+        };
+        let prompt_ref = match asked {
             Ok(r) => Some(r),
             Err(err) => {
                 if !matches!(err, ChannelError::Unsupported(_)) {

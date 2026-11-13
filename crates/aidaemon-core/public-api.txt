@@ -1,5 +1,69 @@
 pub mod aidaemon_core
 pub use aidaemon_core::CancellationToken
+pub mod aidaemon_core::card
+pub enum aidaemon_core::card::ActivityKind
+pub aidaemon_core::card::ActivityKind::Change
+pub aidaemon_core::card::ActivityKind::Check
+pub aidaemon_core::card::ActivityKind::Delegate
+pub aidaemon_core::card::ActivityKind::Read
+pub aidaemon_core::card::ActivityKind::Recall
+pub aidaemon_core::card::ActivityKind::Remember
+pub aidaemon_core::card::ActivityKind::Remind
+pub aidaemon_core::card::ActivityKind::Run
+pub aidaemon_core::card::ActivityKind::Search
+pub aidaemon_core::card::ActivityKind::Web
+pub aidaemon_core::card::ActivityKind::Write
+impl aidaemon_core::card::ActivityKind
+pub fn aidaemon_core::card::ActivityKind::says_what(self) -> bool
+impl aidaemon_core::card::ActivityKind
+pub fn aidaemon_core::card::ActivityKind::words(self) -> &'static str
+pub enum aidaemon_core::card::CardEnd
+pub aidaemon_core::card::CardEnd::Collapse
+pub aidaemon_core::card::CardEnd::Keep
+impl aidaemon_core::card::CardEnd
+pub fn aidaemon_core::card::CardEnd::of(core::option::Option<&aidaemon_core::card::PlanCard>, usize) -> Self
+pub enum aidaemon_core::card::RunPhase
+pub aidaemon_core::card::RunPhase::Failed
+pub aidaemon_core::card::RunPhase::Running
+pub aidaemon_core::card::RunPhase::Stopped
+pub aidaemon_core::card::RunPhase::Succeeded
+impl aidaemon_core::card::RunPhase
+pub fn aidaemon_core::card::RunPhase::headline(self) -> &'static str
+pub fn aidaemon_core::card::RunPhase::helper_headline(self, bool) -> &'static str
+pub fn aidaemon_core::card::RunPhase::is_terminal(self) -> bool
+pub enum aidaemon_core::card::Step
+pub aidaemon_core::card::Step::Doing(aidaemon_core::card::ActivityKind)
+pub aidaemon_core::card::Step::HandedOff(aidaemon_core::card::ActivityKind)
+pub aidaemon_core::card::Step::Output(alloc::string::String)
+pub aidaemon_core::card::Step::Reporting
+impl aidaemon_core::card::Step
+pub fn aidaemon_core::card::Step::is_shown(&self) -> bool
+pub fn aidaemon_core::card::Step::words(&self) -> alloc::string::String
+pub enum aidaemon_core::card::StepEvidence
+pub aidaemon_core::card::StepEvidence::HelperNotStarted
+pub aidaemon_core::card::StepEvidence::ModelSaid
+pub aidaemon_core::card::StepEvidence::Settled
+impl aidaemon_core::card::StepEvidence
+pub fn aidaemon_core::card::StepEvidence::is_settled(&self) -> bool
+pub struct aidaemon_core::card::HelperView
+pub aidaemon_core::card::HelperView::background: bool
+pub aidaemon_core::card::HelperView::label: alloc::string::String
+pub aidaemon_core::card::HelperView::phase: aidaemon_core::card::RunPhase
+pub aidaemon_core::card::HelperView::since_request: core::option::Option<aidaemon_core::card::SinceRequest>
+pub aidaemon_core::card::HelperView::step: core::option::Option<aidaemon_core::card::Step>
+pub aidaemon_core::card::HelperView::took: core::option::Option<alloc::string::String>
+impl aidaemon_core::card::HelperView
+pub fn aidaemon_core::card::HelperView::running(&str, bool, core::option::Option<aidaemon_core::card::Step>) -> Self
+pub struct aidaemon_core::card::PlanCard
+pub aidaemon_core::card::PlanCard::done: usize
+pub aidaemon_core::card::PlanCard::settled: bool
+pub aidaemon_core::card::PlanCard::steps: usize
+pub aidaemon_core::card::PlanCard::text: alloc::string::String
+impl aidaemon_core::card::PlanCard
+pub fn aidaemon_core::card::PlanCard::header_with_runs(&self, &[aidaemon_core::card::RunPhase]) -> core::option::Option<alloc::string::String>
+pub struct aidaemon_core::card::SinceRequest
+pub aidaemon_core::card::SinceRequest::secs: u64
+pub aidaemon_core::card::SinceRequest::words: alloc::string::String
 pub mod aidaemon_core::conformance
 pub mod aidaemon_core::conformance::provider_checks
 pub const aidaemon_core::conformance::provider_checks::COMPLETE_MATCHES_STREAM: &str
@@ -73,6 +137,44 @@ pub fn aidaemon_core::mandate_card::MandateConfirmationCard::essentials(&self) -
 pub fn aidaemon_core::mandate_card::MandateConfirmationCard::from_lines(&[alloc::string::String]) -> core::option::Option<Self>
 pub fn aidaemon_core::mandate_card::MandateConfirmationCard::into_lines(self) -> alloc::vec::Vec<alloc::string::String>
 pub mod aidaemon_core::testing
+pub enum aidaemon_core::testing::ProviderError
+pub aidaemon_core::testing::ProviderError::Auth(alloc::string::String)
+pub aidaemon_core::testing::ProviderError::Billing
+pub aidaemon_core::testing::ProviderError::Billing::affordable_tokens: core::option::Option<u64>
+pub aidaemon_core::testing::ProviderError::Billing::message: alloc::string::String
+pub aidaemon_core::testing::ProviderError::ContextOverflow
+pub aidaemon_core::testing::ProviderError::ContextOverflow::limit: core::option::Option<u64>
+pub aidaemon_core::testing::ProviderError::ContextOverflow::message: alloc::string::String
+pub aidaemon_core::testing::ProviderError::InvalidRequest(alloc::string::String)
+pub aidaemon_core::testing::ProviderError::Malformed
+pub aidaemon_core::testing::ProviderError::Malformed::message: alloc::string::String
+pub aidaemon_core::testing::ProviderError::Malformed::parse: bool
+pub aidaemon_core::testing::ProviderError::NotFound(alloc::string::String)
+pub aidaemon_core::testing::ProviderError::Other(alloc::string::String)
+pub aidaemon_core::testing::ProviderError::QuotaExhausted
+pub aidaemon_core::testing::ProviderError::QuotaExhausted::in_stream: bool
+pub aidaemon_core::testing::ProviderError::QuotaExhausted::message: alloc::string::String
+pub aidaemon_core::testing::ProviderError::QuotaExhausted::per_model: bool
+pub aidaemon_core::testing::ProviderError::QuotaExhausted::resets_at: core::option::Option<std::time::SystemTime>
+pub aidaemon_core::testing::ProviderError::RateLimited
+pub aidaemon_core::testing::ProviderError::RateLimited::retry_after: core::option::Option<core::time::Duration>
+pub aidaemon_core::testing::ProviderError::Transient(alloc::string::String)
+impl aidaemon_core::ProviderError
+pub fn aidaemon_core::ProviderError::is_retryable(&self) -> bool
+pub fn aidaemon_core::ProviderError::proves_nothing_spent(&self) -> bool
+pub struct aidaemon_core::testing::ModelRequest
+pub aidaemon_core::testing::ModelRequest::max_output_tokens: core::option::Option<u32>
+pub aidaemon_core::testing::ModelRequest::messages: alloc::vec::Vec<aidaemon_core::Message>
+pub aidaemon_core::testing::ModelRequest::model: alloc::string::String
+pub aidaemon_core::testing::ModelRequest::options: aidaemon_core::RequestOptions
+pub aidaemon_core::testing::ModelRequest::tool_choice: aidaemon_core::ToolChoice
+pub aidaemon_core::testing::ModelRequest::tools: alloc::vec::Vec<aidaemon_core::ToolSpec>
+pub struct aidaemon_core::testing::ModelResponse
+pub aidaemon_core::testing::ModelResponse::note: core::option::Option<alloc::string::String>
+pub aidaemon_core::testing::ModelResponse::reasoning: core::option::Option<alloc::string::String>
+pub aidaemon_core::testing::ModelResponse::text: alloc::string::String
+pub aidaemon_core::testing::ModelResponse::tool_calls: alloc::vec::Vec<aidaemon_core::ToolCall>
+pub aidaemon_core::testing::ModelResponse::usage: aidaemon_core::Usage
 pub struct aidaemon_core::testing::ScriptedProvider
 impl aidaemon_core::testing::ScriptedProvider
 pub fn aidaemon_core::testing::ScriptedProvider::new(impl core::iter::traits::collect::IntoIterator<Item = aidaemon_core::ModelResponse>) -> Self
@@ -82,15 +184,18 @@ pub fn aidaemon_core::testing::ScriptedProvider::then_repeat(self, aidaemon_core
 pub fn aidaemon_core::testing::ScriptedProvider::with_results(impl core::iter::traits::collect::IntoIterator<Item = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>>) -> Self
 impl aidaemon_core::Provider for aidaemon_core::testing::ScriptedProvider
 pub fn aidaemon_core::testing::ScriptedProvider::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::testing::ScriptedProvider::default_model(&self) -> core::option::Option<&str>
 pub fn aidaemon_core::testing::ScriptedProvider::name(&self) -> &str
 pub fn aidaemon_core::testing::ScriptedProvider::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 pub fn aidaemon_core::testing::ScriptedProvider::unavailable_until(&self, &str) -> core::option::Option<std::time::SystemTime>
 pub struct aidaemon_core::testing::StreamingProvider<P>(pub P)
 impl<P: aidaemon_core::Provider> aidaemon_core::Provider for aidaemon_core::testing::StreamingProvider<P>
 pub fn aidaemon_core::testing::StreamingProvider<P>::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::testing::StreamingProvider<P>::default_model(&self) -> core::option::Option<&str>
 pub fn aidaemon_core::testing::StreamingProvider<P>::name(&self) -> &str
 pub fn aidaemon_core::testing::StreamingProvider<P>::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 pub fn aidaemon_core::testing::StreamingProvider<P>::unavailable_until(&self, &str) -> core::option::Option<std::time::SystemTime>
+pub const aidaemon_core::testing::SCRIPTED_MODEL: &str
 pub const aidaemon_core::testing::SCRIPTED_USAGE: aidaemon_core::Usage
 pub fn aidaemon_core::testing::call(&str, &str, serde_json::value::Value) -> aidaemon_core::ToolCall
 pub fn aidaemon_core::testing::spec(&str, &str, &[&str]) -> aidaemon_core::ToolSpec
@@ -160,6 +265,7 @@ impl core::fmt::Display for aidaemon_core::EffectClass
 pub fn aidaemon_core::EffectClass::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub enum aidaemon_core::Event
 pub aidaemon_core::Event::Finished
+pub aidaemon_core::Event::Finished::elapsed_ms: u64
 pub aidaemon_core::Event::Finished::status: aidaemon_core::RunStatus
 pub aidaemon_core::Event::Finished::turns: u32
 pub aidaemon_core::Event::Finished::usage: aidaemon_core::Usage
@@ -404,25 +510,35 @@ pub enum aidaemon_core::SameToolStreak
 pub aidaemon_core::SameToolStreak::Standard
 pub aidaemon_core::SameToolStreak::Stepwise
 pub aidaemon_core::SameToolStreak::Versatile
-pub enum aidaemon_core::Schedule
+#[non_exhaustive] pub enum aidaemon_core::Schedule
 pub aidaemon_core::Schedule::Continuous
+pub aidaemon_core::Schedule::DailyUtc
+pub aidaemon_core::Schedule::DailyUtc::hour: u8
+pub aidaemon_core::Schedule::DailyUtc::minute: u8
 pub aidaemon_core::Schedule::Every(core::time::Duration)
 pub aidaemon_core::Schedule::EveryTick
-pub enum aidaemon_core::ServiceEvent
-pub aidaemon_core::ServiceEvent::Failed
-pub aidaemon_core::ServiceEvent::Failed::error: alloc::string::String
-pub aidaemon_core::ServiceEvent::Failed::failures: u32
-pub aidaemon_core::ServiceEvent::Failed::service: alloc::string::String
-pub aidaemon_core::ServiceEvent::Finished
-pub aidaemon_core::ServiceEvent::Finished::service: alloc::string::String
+impl aidaemon_core::Schedule
+pub fn aidaemon_core::Schedule::daily_utc(u8, u8) -> core::option::Option<Self>
+#[non_exhaustive] pub enum aidaemon_core::ServiceEvent
+pub aidaemon_core::ServiceEvent::Ended
+pub aidaemon_core::ServiceEvent::Ended::elapsed: core::time::Duration
+pub aidaemon_core::ServiceEvent::Ended::outcome: aidaemon_core::ServiceRunEnd
+pub aidaemon_core::ServiceEvent::Ended::run: u64
+pub aidaemon_core::ServiceEvent::Ended::service: alloc::string::String
 pub aidaemon_core::ServiceEvent::Launched
+pub aidaemon_core::ServiceEvent::Launched::run: u64
 pub aidaemon_core::ServiceEvent::Launched::service: alloc::string::String
 pub aidaemon_core::ServiceEvent::StartFailed
 pub aidaemon_core::ServiceEvent::StartFailed::error: alloc::string::String
 pub aidaemon_core::ServiceEvent::StartFailed::service: alloc::string::String
-pub aidaemon_core::ServiceEvent::Succeeded
-pub aidaemon_core::ServiceEvent::Succeeded::previous_failures: u32
-pub aidaemon_core::ServiceEvent::Succeeded::service: alloc::string::String
+#[non_exhaustive] pub enum aidaemon_core::ServiceRunEnd
+pub aidaemon_core::ServiceRunEnd::Aborted
+pub aidaemon_core::ServiceRunEnd::Failed
+pub aidaemon_core::ServiceRunEnd::Failed::error: alloc::string::String
+pub aidaemon_core::ServiceRunEnd::Failed::failures: u32
+pub aidaemon_core::ServiceRunEnd::Skipped
+pub aidaemon_core::ServiceRunEnd::Succeeded
+pub aidaemon_core::ServiceRunEnd::Succeeded::previous_failures: u32
 pub enum aidaemon_core::SourceTrust
 pub aidaemon_core::SourceTrust::Trusted
 pub aidaemon_core::SourceTrust::Untrusted
@@ -476,6 +592,8 @@ pub aidaemon_core::ToolDecision::Interrupt::kind: aidaemon_core::InterruptKind
 pub aidaemon_core::ToolDecision::Interrupt::reason: alloc::string::String
 pub aidaemon_core::ToolDecision::Rewrite
 pub aidaemon_core::ToolDecision::Rewrite::arguments: serde_json::value::Value
+impl aidaemon_core::ToolDecision
+pub fn aidaemon_core::ToolDecision::ask(aidaemon_core::OwnerApprovalRequest) -> Self
 pub enum aidaemon_core::UntrustedMode
 pub aidaemon_core::UntrustedMode::Enforce
 pub aidaemon_core::UntrustedMode::MarkOnly
@@ -583,7 +701,13 @@ pub aidaemon_core::CallEffects::keys: alloc::vec::Vec<aidaemon_core::EffectKey>
 pub aidaemon_core::CallEffects::understood: bool
 impl aidaemon_core::CallEffects
 pub fn aidaemon_core::CallEffects::none() -> Self
+pub fn aidaemon_core::CallEffects::touches_no_paths(&self) -> bool
 pub fn aidaemon_core::CallEffects::unknown() -> Self
+pub struct aidaemon_core::CallResult<'a>
+pub aidaemon_core::CallResult::receipt: &'a aidaemon_core::Receipt
+pub aidaemon_core::CallResult::text: core::option::Option<&'a str>
+impl aidaemon_core::CallResult<'_>
+pub fn aidaemon_core::CallResult<'_>::succeeded(&self) -> bool
 pub struct aidaemon_core::Cooldown
 pub aidaemon_core::Cooldown::error: aidaemon_core::ProviderError
 pub aidaemon_core::Cooldown::model: core::option::Option<alloc::string::String>
@@ -626,6 +750,7 @@ pub fn aidaemon_core::Failover::policy(self, impl aidaemon_core::FailoverPolicy 
 pub fn aidaemon_core::Failover::steps(&self) -> &[aidaemon_core::FailoverStep]
 impl aidaemon_core::Provider for aidaemon_core::Failover
 pub fn aidaemon_core::Failover::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::Failover::default_model(&self) -> core::option::Option<&str>
 pub fn aidaemon_core::Failover::name(&self) -> &str
 pub fn aidaemon_core::Failover::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 pub fn aidaemon_core::Failover::unavailable_until(&self, &str) -> core::option::Option<std::time::SystemTime>
@@ -756,6 +881,9 @@ pub aidaemon_core::OwnerApprovalRequest::risk: aidaemon_core::ApprovalRisk
 pub aidaemon_core::OwnerApprovalRequest::subject: alloc::string::String
 pub aidaemon_core::OwnerApprovalRequest::summary: alloc::string::String
 pub aidaemon_core::OwnerApprovalRequest::warnings: alloc::vec::Vec<alloc::string::String>
+impl aidaemon_core::OwnerApprovalRequest
+pub fn aidaemon_core::OwnerApprovalRequest::for_call(&aidaemon_core::ToolCall, &aidaemon_core::ToolInfo, &str) -> Self
+pub fn aidaemon_core::OwnerApprovalRequest::for_tool(&str, &serde_json::value::Value, &aidaemon_core::ToolInfo, &str) -> Self
 pub struct aidaemon_core::Pending
 pub aidaemon_core::Pending::child: core::option::Option<alloc::boxed::Box<aidaemon_core::RunState>>
 pub aidaemon_core::Pending::interruption: aidaemon_core::Interruption
@@ -771,6 +899,7 @@ pub fn aidaemon_core::QuotaGuard::from_arc(alloc::sync::Arc<dyn aidaemon_core::P
 pub fn aidaemon_core::QuotaGuard::new(impl aidaemon_core::Provider + 'static) -> Self
 impl aidaemon_core::Provider for aidaemon_core::QuotaGuard
 pub fn aidaemon_core::QuotaGuard::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::QuotaGuard::default_model(&self) -> core::option::Option<&str>
 pub fn aidaemon_core::QuotaGuard::name(&self) -> &str
 pub fn aidaemon_core::QuotaGuard::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 pub fn aidaemon_core::QuotaGuard::unavailable_until(&self, &str) -> core::option::Option<std::time::SystemTime>
@@ -803,6 +932,7 @@ pub fn aidaemon_core::Retry<P>::max_attempts(self, u32) -> Self
 pub fn aidaemon_core::Retry<P>::new(P) -> Self
 impl<P: aidaemon_core::Provider> aidaemon_core::Provider for aidaemon_core::Retry<P>
 pub fn aidaemon_core::Retry<P>::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::Retry<P>::default_model(&self) -> core::option::Option<&str>
 pub fn aidaemon_core::Retry<P>::name(&self) -> &str
 pub fn aidaemon_core::Retry<P>::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 pub fn aidaemon_core::Retry<P>::unavailable_until(&self, &str) -> core::option::Option<std::time::SystemTime>
@@ -818,10 +948,12 @@ pub aidaemon_core::RunOutcome::final_text: core::option::Option<alloc::string::S
 pub aidaemon_core::RunOutcome::state: aidaemon_core::RunState
 pub aidaemon_core::RunOutcome::status: aidaemon_core::RunStatus
 impl aidaemon_core::RunOutcome
+pub fn aidaemon_core::RunOutcome::elapsed(&self) -> core::time::Duration
 pub fn aidaemon_core::RunOutcome::is_completed(&self) -> bool
 pub fn aidaemon_core::RunOutcome::is_succeeded(&self) -> bool
 pub fn aidaemon_core::RunOutcome::receipts(&self) -> &[aidaemon_core::Receipt]
 pub fn aidaemon_core::RunOutcome::run_usage(&self) -> aidaemon_core::Usage
+pub fn aidaemon_core::RunOutcome::tool_results(&self) -> alloc::vec::Vec<aidaemon_core::CallResult<'_>>
 pub fn aidaemon_core::RunOutcome::turns(&self) -> u32
 pub fn aidaemon_core::RunOutcome::unmet(&self) -> &[alloc::string::String]
 pub fn aidaemon_core::RunOutcome::usage(&self) -> aidaemon_core::Usage
@@ -858,6 +990,8 @@ pub fn aidaemon_core::RunState::with_untrusted_context(self) -> Self
 pub fn aidaemon_core::RunState::with_user_message(self, impl core::convert::Into<aidaemon_core::Message>) -> Self
 pub struct aidaemon_core::ServiceContext
 impl aidaemon_core::ServiceContext
+pub fn aidaemon_core::ServiceContext::failures(&self) -> u32
+pub fn aidaemon_core::ServiceContext::run(&self) -> u64
 pub fn aidaemon_core::ServiceContext::shutdown(&self) -> &tokio_util::sync::cancellation_token::CancellationToken
 pub struct aidaemon_core::ServiceError(pub alloc::string::String)
 impl aidaemon_core::ServiceError
@@ -929,6 +1063,8 @@ pub fn aidaemon_core::ToolContext::with_declines(self, aidaemon_core::SharedDecl
 pub fn aidaemon_core::ToolContext::with_extensions(self, aidaemon_core::Extensions) -> Self
 pub fn aidaemon_core::ToolContext::with_run(self, aidaemon_core::RunId, u32) -> Self
 pub struct aidaemon_core::ToolError(pub alloc::string::String)
+impl aidaemon_core::ToolError
+pub fn aidaemon_core::ToolError::new(impl core::convert::Into<alloc::string::String>) -> Self
 impl core::convert::From<&str> for aidaemon_core::ToolError
 pub fn aidaemon_core::ToolError::from(&str) -> Self
 impl core::convert::From<alloc::string::String> for aidaemon_core::ToolError
@@ -1070,36 +1206,43 @@ pub trait aidaemon_core::InterruptResolver: core::marker::Send + core::marker::S
 pub fn aidaemon_core::InterruptResolver::resolve<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 aidaemon_core::RunState, &'life2 aidaemon_core::Interruption) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::Resolution>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub trait aidaemon_core::Provider: core::marker::Send + core::marker::Sync
 pub fn aidaemon_core::Provider::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::Provider::default_model(&self) -> core::option::Option<&str>
 pub fn aidaemon_core::Provider::name(&self) -> &str
 pub fn aidaemon_core::Provider::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 pub fn aidaemon_core::Provider::unavailable_until(&self, &str) -> core::option::Option<std::time::SystemTime>
 impl aidaemon_core::Provider for aidaemon_core::Failover
 pub fn aidaemon_core::Failover::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::Failover::default_model(&self) -> core::option::Option<&str>
 pub fn aidaemon_core::Failover::name(&self) -> &str
 pub fn aidaemon_core::Failover::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 pub fn aidaemon_core::Failover::unavailable_until(&self, &str) -> core::option::Option<std::time::SystemTime>
 impl aidaemon_core::Provider for aidaemon_core::QuotaGuard
 pub fn aidaemon_core::QuotaGuard::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::QuotaGuard::default_model(&self) -> core::option::Option<&str>
 pub fn aidaemon_core::QuotaGuard::name(&self) -> &str
 pub fn aidaemon_core::QuotaGuard::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 pub fn aidaemon_core::QuotaGuard::unavailable_until(&self, &str) -> core::option::Option<std::time::SystemTime>
 impl aidaemon_core::Provider for aidaemon_core::testing::ScriptedProvider
 pub fn aidaemon_core::testing::ScriptedProvider::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::testing::ScriptedProvider::default_model(&self) -> core::option::Option<&str>
 pub fn aidaemon_core::testing::ScriptedProvider::name(&self) -> &str
 pub fn aidaemon_core::testing::ScriptedProvider::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 pub fn aidaemon_core::testing::ScriptedProvider::unavailable_until(&self, &str) -> core::option::Option<std::time::SystemTime>
 impl<P: aidaemon_core::Provider + ?core::marker::Sized> aidaemon_core::Provider for alloc::sync::Arc<P>
 pub fn alloc::sync::Arc<P>::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn alloc::sync::Arc<P>::default_model(&self) -> core::option::Option<&str>
 pub fn alloc::sync::Arc<P>::name(&self) -> &str
 pub fn alloc::sync::Arc<P>::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 pub fn alloc::sync::Arc<P>::unavailable_until(&self, &str) -> core::option::Option<std::time::SystemTime>
 impl<P: aidaemon_core::Provider> aidaemon_core::Provider for aidaemon_core::Retry<P>
 pub fn aidaemon_core::Retry<P>::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::Retry<P>::default_model(&self) -> core::option::Option<&str>
 pub fn aidaemon_core::Retry<P>::name(&self) -> &str
 pub fn aidaemon_core::Retry<P>::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 pub fn aidaemon_core::Retry<P>::unavailable_until(&self, &str) -> core::option::Option<std::time::SystemTime>
 impl<P: aidaemon_core::Provider> aidaemon_core::Provider for aidaemon_core::testing::StreamingProvider<P>
 pub fn aidaemon_core::testing::StreamingProvider<P>::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::testing::StreamingProvider<P>::default_model(&self) -> core::option::Option<&str>
 pub fn aidaemon_core::testing::StreamingProvider<P>::name(&self) -> &str
 pub fn aidaemon_core::testing::StreamingProvider<P>::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 pub fn aidaemon_core::testing::StreamingProvider<P>::unavailable_until(&self, &str) -> core::option::Option<std::time::SystemTime>

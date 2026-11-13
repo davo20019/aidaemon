@@ -55,6 +55,7 @@ pub struct TestChannel {
     prompt_refs: Mutex<HashMap<String, MessageRef>>,
     removed_buttons: Mutex<Vec<MessageRef>>,
     strips_latex: bool,
+    asks_regardless: bool,
     registered_commands: Mutex<Option<Vec<CommandSpec>>>,
     command_answers: Mutex<Vec<(String, String)>>,
 }
@@ -80,6 +81,7 @@ impl TestChannel {
             prompt_refs: Mutex::new(HashMap::new()),
             removed_buttons: Mutex::new(Vec::new()),
             strips_latex: true,
+            asks_regardless: false,
             registered_commands: Mutex::new(None),
             command_answers: Mutex::new(Vec::new()),
         }
@@ -97,6 +99,13 @@ impl TestChannel {
 
     pub fn with_buttons(mut self, on: bool) -> Self {
         self.caps.buttons = on;
+        self
+    }
+
+    /// Answer [`Channel::ask`] with buttons even when the capabilities say
+    /// there are none, as a careless adapter would.
+    pub fn asks_regardless(mut self, on: bool) -> Self {
+        self.asks_regardless = on;
         self
     }
 
@@ -372,7 +381,7 @@ impl Channel for TestChannel {
     }
 
     async fn ask(&self, prompt: &ApprovalPrompt) -> Result<MessageRef, ChannelError> {
-        if !self.caps.buttons {
+        if !self.caps.buttons && !self.asks_regardless {
             return Err(ChannelError::Unsupported("buttons"));
         }
         self.prompts.lock().expect("poisoned").push(prompt.clone());

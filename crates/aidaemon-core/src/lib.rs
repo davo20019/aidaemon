@@ -69,7 +69,7 @@ pub use hook::{
 pub use limits::LimitGrants;
 pub use limits::{LimitKind, Limits, RunSnapshot, StopCondition, HARD_TURN_CAP};
 pub use message::{Audio, Image, Message, MessageOrigin, Role, ToolCall};
-pub use outcome::{FinishOutcome, RunOutcome, RunStatus};
+pub use outcome::{CallResult, FinishOutcome, RunOutcome, RunStatus};
 pub use provider::{
     collect_stream, ModelRequest, ModelResponse, Provider, ProviderError, RequestOptions,
     ResponseFormat, Retry, StreamEvent, ToolChoice, ToolSpec, Usage,
@@ -79,7 +79,7 @@ pub use receipt::{InvocationStage, Receipt, ReceiptStatus};
 pub use safeguard::Safeguard;
 pub use service::{
     FnService, Schedule, Service, ServiceContext, ServiceError, ServiceEvent, ServiceGate,
-    ServiceHost, ServiceObserver, ServiceWaker,
+    ServiceHost, ServiceObserver, ServiceRunEnd, ServiceWaker,
 };
 /// Kernel bookkeeping types inside [`RunState`]; not part of the stable API.
 #[doc(hidden)]

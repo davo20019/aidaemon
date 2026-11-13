@@ -15,24 +15,30 @@
 //! # }
 //! ```
 //!
-//! What the preset adds, and how to change each part:
+//! What the preset adds, and how to change each part. The rule behind the
+//! defaults: the preset adds what keeps an agent safe and running (the
+//! safeguards, a run store); what the model is offered (tools, memory) is
+//! only what you name.
 //!
 //! | Part | Default | Change with |
 //! |---|---|---|
 //! | Provider | none: name one | [`Preset::provider`], [`Preset::provider_from_env`], [`Preset::provider_from_env_or`] |
-//! | Model | `AIDAEMON_MODEL`, else the provider's default | [`Preset::model`] |
+//! | Model | [`Preset::model`]; else `AIDAEMON_MODEL`; else the provider's default (the env providers' [`DEFAULT_ANTHROPIC_MODEL`] / [`DEFAULT_OPENAI_MODEL`], or [`Provider::default_model`], `"scripted"` for a [`ScriptedProvider`](crate::testing)). A provider with no default needs [`Preset::model`]: building fails with [`PresetError::NoModel`] | [`Preset::model`] |
 //! | Safeguards | [`AuthorityHook`] (full authority), [`ScopeGuard`] over the workspace, [`EgressGuard`], [`ApprovalPolicy`] (`DestructiveOnly`), [`Redactor`], [`UntrustedOutput`] | [`Preset::authority`], [`Preset::approvals`], [`Preset::undeclared_writes`], [`Preset::undeclared_reads`], [`Preset::path_free_tool`], [`Preset::without_default_hooks`] |
 //! | Tools | none; with a workspace, [`default_tools`](crate::tools::default_tools) | [`Preset::tool`], [`Preset::workspace`] |
 //! | Run store | in memory ([`MemoryStore`]) | [`Preset::store`], [`Preset::sqlite`] |
-//! | Memory | with the `memory` feature (default), aidaemon's full memory system (`aidaemon_memory::full::FullMemory`: recall plus `remember_fact`, `manage_memories`, `manage_people`, `share_memory`), in memory or in [`Preset::memory_path`] (there it also learns in the background: episodes, fact consolidation, decay, on the agent's provider); else none. A memory system's `services()` run while the agent lives | [`Preset::memory`]: any [`MemorySystem`]; [`Preset::without_memory`] |
+//! | Memory | none | [`Preset::with_memory`] (feature `memory`, on by default): aidaemon's full memory system (`aidaemon_memory::full::FullMemory`: recall plus the `remember_fact`, `manage_memories`, `manage_people` and `share_memory` tools), kept in memory; [`Preset::memory_path`]: the same in a SQLite file, where it also learns in the background (episodes, fact consolidation, decay, on the agent's provider); [`Preset::memory`]: any [`MemorySystem`]. A memory system's `services()` run while the agent lives |
 //! | Anything else | | [`Preset::hook`], [`Preset::configure`] (the [`AgentBuilder`]) |
 //!
 //! A destructive call pauses the run for the owner
 //! ([`RunStatus::Interrupted`](crate::RunStatus)): answer it with
 //! [`Agent::resume`]. So does, without a workspace, any call that may
 //! change things and declares no paths, since no scope check covers it;
-//! with a workspace, a call that declares no paths is refused. Mark tools
-//! that touch no files with [`Preset::path_free_tool`].
+//! with a workspace, a call that declares no paths is refused. A tool that
+//! touches no files says so: by name with [`Preset::path_free_tool`], or,
+//! for one that may change things, by declaring complete effects with no
+//! path ([`CallEffects::none`](crate::CallEffects::none); sub-agents
+//! (`aidaemon_agents::AgentTool`) do).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,6 +69,12 @@ pub fn preset(id: impl Into<String>) -> Preset {
 pub enum PresetError {
     #[error("no provider: call .provider(..), or set ANTHROPIC_API_KEY or OPENAI_API_KEY")]
     NoProvider,
+    /// The provider names no default model and none was set.
+    #[error(
+        "no model: call .model(..) (or set AIDAEMON_MODEL); provider `{provider}` names no \
+         default model"
+    )]
+    NoModel { provider: String },
     #[error("provider configuration: {0}")]
     Provider(String),
     #[error("workspace: {0}")]
@@ -216,12 +228,14 @@ impl Preset {
             undeclared_writes: None,
             undeclared_reads: None,
             path_free: Vec::new(),
-            memory: MemoryChoice::Default(None),
+            memory: MemoryChoice::None,
             configure: Vec::new(),
         }
     }
 
-    /// Use this provider. Set the model with [`Preset::model`].
+    /// Use this provider. The model is [`Preset::model`], else
+    /// `AIDAEMON_MODEL`, else the provider's [`Provider::default_model`]
+    /// (a [`ScriptedProvider`](crate::testing) names `"scripted"`).
     pub fn provider(mut self, provider: impl Provider + 'static) -> Self {
         self.provider = ProviderChoice::Explicit(Arc::new(provider));
         self
@@ -242,7 +256,8 @@ impl Preset {
 
     /// Read the provider from the environment, and use `fallback` (a
     /// scripted provider, a local server) when no key is set. With the
-    /// fallback and no [`Preset::model`], the model is `"scripted"`.
+    /// fallback and no [`Preset::model`], the model is the fallback's
+    /// [`Provider::default_model`], else `"scripted"`.
     pub fn provider_from_env_or(mut self, fallback: impl Provider + 'static) -> Self {
         self.provider = ProviderChoice::EnvOr(Arc::new(fallback));
         self
@@ -373,15 +388,26 @@ impl Preset {
         self
     }
 
-    /// Keep the default memory in this SQLite file, so it survives a
-    /// restart (default: in memory, for the life of the agent).
+    /// Long-term memory: aidaemon's full memory system, kept in memory for
+    /// the life of the agent. It offers the model four tools
+    /// (`remember_fact`, `manage_memories`, `manage_people`,
+    /// `share_memory`) and adds recall to every request.
+    #[cfg(feature = "memory")]
+    pub fn with_memory(mut self) -> Self {
+        self.memory = MemoryChoice::Default(None);
+        self
+    }
+
+    /// [`Preset::with_memory`], kept in this SQLite file so it survives a
+    /// restart, and learning in the background.
     #[cfg(feature = "memory")]
     pub fn memory_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.memory = MemoryChoice::Default(Some(path.into()));
         self
     }
 
-    /// No long-term memory.
+    /// No long-term memory (the default; undoes [`Preset::memory`] and its
+    /// kin).
     pub fn without_memory(mut self) -> Self {
         self.memory = MemoryChoice::None;
         self
@@ -398,27 +424,44 @@ impl Preset {
     }
 
     pub async fn build(self) -> Result<Agent, PresetError> {
+        let mut stand_in = false;
         let (provider, default_model) = match self.provider {
             ProviderChoice::None => return Err(PresetError::NoProvider),
-            ProviderChoice::Explicit(provider) => (provider, None),
+            ProviderChoice::Explicit(provider) => {
+                let model = provider.default_model().map(str::to_string);
+                (provider, model)
+            }
             ProviderChoice::Env => {
                 let (provider, model) = provider_from_env()?.ok_or(PresetError::NoProvider)?;
-                (provider, Some(model))
+                (provider, Some(model.to_string()))
             }
             ProviderChoice::EnvOr(fallback) => match provider_from_env()? {
-                Some((provider, model)) => (provider, Some(model)),
-                None => (fallback, Some("scripted")),
+                Some((provider, model)) => (provider, Some(model.to_string())),
+                None => {
+                    stand_in = true;
+                    let model = fallback.default_model().unwrap_or("scripted").to_string();
+                    (fallback, Some(model))
+                }
             },
         };
-        let model = self
+        // An `AIDAEMON_MODEL` meant for the env providers is not the
+        // stand-in's business.
+        let model = match self
             .model
-            .or_else(|| env("AIDAEMON_MODEL").filter(|_| default_model != Some("scripted")))
-            .or_else(|| default_model.map(str::to_string));
+            .or_else(|| env("AIDAEMON_MODEL").filter(|_| !stand_in))
+            .or(default_model)
+        {
+            Some(model) => model,
+            None => {
+                return Err(PresetError::NoModel {
+                    provider: provider.name().to_string(),
+                })
+            }
+        };
 
-        let mut builder = Agent::builder(self.id.clone()).provider(provider.clone());
-        if let Some(model) = model.clone() {
-            builder = builder.model(model);
-        }
+        let mut builder = Agent::builder(self.id.clone())
+            .provider(provider.clone())
+            .model(model.clone());
 
         let mut instructions = self.instructions;
         let mut tools = self.tools;
@@ -436,7 +479,7 @@ impl Preset {
                 // the agent's own provider and model.
                 if path.is_some() {
                     system = system
-                        .with_background(provider.clone(), model.clone().unwrap_or_default())
+                        .with_background(provider.clone(), model.clone())
                         .await
                         .map_err(memory_error)?;
                 }

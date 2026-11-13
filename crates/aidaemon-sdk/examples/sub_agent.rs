@@ -3,9 +3,18 @@
 //! session with its own budget; the parent gets its condensed answer, and
 //! the child's token use counts against the parent's budget.
 //!
+//! A delegation declares that it changes no file itself (each of the
+//! child's calls is judged by the child's own hooks), so under the preset
+//! it runs without asking the owner. `.read_only()` lets several
+//! delegations in one model turn run at the same time; without it they run
+//! one after another. A child that fails becomes a failed call for the
+//! parent's model, not a failed parent run: read how each ended from
+//! `outcome.tool_results()`. To fan out without a model choosing, use
+//! `agents::run_all`, shown at the end.
+//!
 //! Live with ANTHROPIC_API_KEY or OPENAI_API_KEY, otherwise scripted:
 //! cargo run -p aidaemon-sdk --example sub_agent --features testing
-use aidaemon_sdk::agents::{AgentTool, ChildBudget};
+use aidaemon_sdk::agents::{run_all, AgentTool, ChildBudget};
 use aidaemon_sdk::prelude::*;
 use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
 use serde_json::json;
@@ -60,10 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "A gift for the kitchen, under $50?",
         )
         .await?;
-    for receipt in outcome.receipts() {
+    // Each delegation: how it ended and the answer the parent's model saw.
+    for result in outcome.tool_results() {
         println!(
-            "[{}] {:?} {}",
-            receipt.tool, receipt.status, receipt.details
+            "[{}] {:?}: {}",
+            result.receipt.tool,
+            result.receipt.status,
+            result.text.unwrap_or_default()
         );
     }
     println!(
@@ -71,5 +83,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         outcome.usage().billable_tokens()
     );
     println!("{}", outcome.final_text.unwrap_or_default());
+
+    // Fan out without a model: two tasks at once, results in order.
+    let helper = aidaemon_sdk::preset("summarizer")
+        .provider_from_env_or(
+            ScriptedProvider::new([]).then_repeat(text("A short synthetic summary.")),
+        )
+        .build()
+        .await?;
+    let tasks = [
+        "Summarize the kettle reviews",
+        "Summarize the toaster reviews",
+    ];
+    let outcomes = run_all(
+        "shop:synthetic-user-1",
+        tasks.iter().map(|task| (&helper, task.to_string())),
+    )
+    .await;
+    for (task, outcome) in tasks.iter().zip(outcomes) {
+        let answer = outcome?.final_text.unwrap_or_default();
+        println!("{task}: {answer}");
+    }
     Ok(())
 }

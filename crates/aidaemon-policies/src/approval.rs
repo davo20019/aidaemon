@@ -7,8 +7,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use aidaemon_core::{
-    ApprovalRisk, EffectClass, Hook, HookContext, InterruptKind, OwnerApprovalRequest, Safeguard,
-    ToolCall, ToolDecision, ToolInfo, OWNER_DECLINED,
+    EffectClass, Hook, HookContext, InterruptKind, OwnerApprovalRequest, Safeguard, ToolCall,
+    ToolDecision, ToolInfo, OWNER_DECLINED,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -296,6 +296,7 @@ impl ApprovalPolicy {
                 && self.mode != ApprovalMode::Never
                 && !ann.read_only
                 && info.access.is_empty()
+                && !info.effects.touches_no_paths()
                 && !self.path_free.contains(tool_name))
             .then(|| {
                 format!(
@@ -331,61 +332,16 @@ impl ApprovalPolicy {
     }
 }
 
-/// The request for a call the policy itself asks about: the tool name and
-/// arguments, High risk, or Critical when the tool is destructive.
+/// The request for a call the policy itself asks about
+/// ([`OwnerApprovalRequest::for_tool`]): the tool name and arguments, High
+/// risk, or Critical when the tool is destructive.
 fn call_request(
     tool_name: &str,
     arguments: &Value,
     info: &ToolInfo,
     why: String,
 ) -> OwnerApprovalRequest {
-    let subject = if arguments.is_null() {
-        tool_name.to_string()
-    } else {
-        format!("{tool_name} {arguments}")
-    };
-    OwnerApprovalRequest {
-        card: Some(Box::new(call_card(tool_name, arguments, info))),
-        effects: info.effects.keys.clone(),
-        summary: format!("Run {subject}: {why}"),
-        subject,
-        risk: if info.annotations.destructive {
-            ApprovalRisk::Critical
-        } else {
-            ApprovalRisk::High
-        },
-        warnings: Vec::new(),
-    }
-}
-
-/// The card for a call the policy asks about, from the call's own fields
-/// and its annotations: a command line (with its own title) shown collapsed
-/// under a plain sentence, else the tool's name with its arguments
-/// collapsed. Never the raw JSON as the headline.
-fn call_card(tool_name: &str, arguments: &Value, info: &ToolInfo) -> aidaemon_core::ApprovalCard {
-    let text = |key: &str| arguments.get(key).and_then(Value::as_str);
-    let action = match text("command").or_else(|| text("script")) {
-        Some(line) => aidaemon_core::CardAction::Command {
-            line: line.to_string(),
-            title: text("description")
-                .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
-                .filter(|title| !title.is_empty()),
-            looks_inside: Vec::new(),
-        },
-        None => aidaemon_core::CardAction::Use {
-            what: format!("use {}", tool_name.replace('_', " ")),
-            detail: (!arguments.is_null()).then(|| arguments.to_string()),
-        },
-    };
-    aidaemon_core::ApprovalCard {
-        impact: info
-            .annotations
-            .destructive
-            .then(|| aidaemon_core::HighImpact::Deletes {
-                targets: Vec::new(),
-            }),
-        ..aidaemon_core::ApprovalCard::new(action)
-    }
+    OwnerApprovalRequest::for_tool(tool_name, arguments, info, &why)
 }
 
 /// Requests carry the call's declared effects, whoever wrote them.
@@ -395,11 +351,7 @@ fn with_effects(mut request: OwnerApprovalRequest, info: &ToolInfo) -> OwnerAppr
 }
 
 fn interrupt(request: OwnerApprovalRequest, info: &ToolInfo) -> ToolDecision {
-    let request = with_effects(request, info);
-    ToolDecision::Interrupt {
-        reason: format!("approval required: {}", request.summary),
-        kind: InterruptKind::OwnerApproval(request),
-    }
+    ToolDecision::ask(with_effects(request, info))
 }
 
 /// The refusal for a request whose subject the owner declined in this run
@@ -532,11 +484,7 @@ impl Hook for ApprovalPolicy {
             // a grant does not cover it either. Why it is asked stays in the
             // interruption's reason (the run's record): the owner's card
             // names only the action.
-            let mut request = with_effects(
-                call_request(&call.name, &call.arguments, info, String::new()),
-                info,
-            );
-            request.summary = format!("Run {}", request.subject);
+            let mut request = with_effects(OwnerApprovalRequest::for_call(call, info, ""), info);
             if let Some(refusal) = declined_subject(ctx, &request) {
                 return refusal;
             }

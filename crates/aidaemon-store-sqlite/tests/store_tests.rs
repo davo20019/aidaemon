@@ -477,6 +477,7 @@ async fn a_run_is_ended_only_while_its_last_event_is_the_end() {
         status: RunStatus::Cancelled,
         usage: Default::default(),
         turns: 1,
+        elapsed_ms: 0,
     };
     store.append(run, &finished).await.unwrap();
     assert!(store.run_ended(run).await.unwrap());
@@ -500,6 +501,7 @@ async fn a_run_paused_for_an_answer_has_not_ended() {
         },
         usage: Default::default(),
         turns: 1,
+        elapsed_ms: 0,
     };
     store.append(run, &paused).await.unwrap();
     assert!(
