@@ -538,6 +538,9 @@ struct RootFacts {
 #[derive(Debug, Default)]
 struct Shared {
     ledger: std::sync::Mutex<Ledger>,
+    /// Artifacts delivered to the owner, by subject: who delivered each and
+    /// when. The first claim owns the delivery.
+    deliveries: std::sync::Mutex<HashMap<String, (String, chrono::DateTime<chrono::Utc>)>>,
     path_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Escalations are answered one at a time, so the second sees the first.
     answering: tokio::sync::Mutex<()>,
@@ -583,6 +586,58 @@ impl Coordination {
         }
         ledger.escalations += 1;
         true
+    }
+
+    /// `member` delivers the artifact `subject` names to the owner, unless a
+    /// member of the tree already did: then who did and when.
+    pub fn claim_delivery(
+        &self,
+        member: &str,
+        subject: &str,
+    ) -> Result<(), aidaemon_tools::semantics::DeliveredArtifact> {
+        let mut deliveries = self.0.deliveries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((by, at)) = deliveries.get(subject) {
+            return Err(aidaemon_tools::semantics::DeliveredArtifact {
+                by: if by == member {
+                    "you".to_string()
+                } else {
+                    self.member_name(by)
+                },
+                at: *at,
+            });
+        }
+        deliveries.insert(
+            subject.to_string(),
+            (member.to_string(), chrono::Utc::now()),
+        );
+        Ok(())
+    }
+
+    /// Give back `member`'s claim on `subject`: its delivery did not happen.
+    pub fn release_delivery(&self, member: &str, subject: &str) {
+        let mut deliveries = self.0.deliveries.lock().unwrap_or_else(|e| e.into_inner());
+        if deliveries.get(subject).is_some_and(|(by, _)| by == member) {
+            deliveries.remove(subject);
+        }
+    }
+
+    /// A member as the owner reads it: a helper by its mission, the
+    /// top-level agent as the main agent.
+    fn member_name(&self, session: &str) -> String {
+        let ledger = self.ledger();
+        if ledger
+            .root
+            .as_ref()
+            .is_some_and(|root| root.session == session)
+        {
+            return "the main agent".to_string();
+        }
+        ledger
+            .roster
+            .iter()
+            .find(|member| member.session == session)
+            .map(|member| format!("the helper \"{}\"", member.mission))
+            .unwrap_or_else(|| "another agent of this request".to_string())
     }
 
     fn ledger(&self) -> std::sync::MutexGuard<'_, Ledger> {
@@ -1597,6 +1652,17 @@ impl FileFence for CallFence {
             judged,
         }))
     }
+
+    async fn claim_delivery(
+        &self,
+        subject: &str,
+    ) -> Result<(), aidaemon_tools::semantics::DeliveredArtifact> {
+        self.coordination.claim_delivery(&self.member, subject)
+    }
+
+    async fn release_delivery(&self, subject: &str) {
+        self.coordination.release_delivery(&self.member, subject);
+    }
 }
 
 /// What a coordinator can decide. Each escalation offers only the ones that
@@ -2249,6 +2315,42 @@ impl sdk::Hook for CoordinationHook {
 
 #[cfg(test)]
 mod tests {
+
+    /// One request delivers each artifact once: the first to claim it owns
+    /// it, a later claim by anyone in the tree is told who sent it, and a
+    /// claim given back after a failed delivery frees it.
+    #[test]
+    fn an_artifact_is_delivered_once_per_request() {
+        let tree = Coordination::new(3, 12);
+        tree.bind_root("telegram:synthetic", "Install two sites", "turn-1");
+        let page = "screenshot:drupal.ddev.site";
+        assert!(tree.claim_delivery("specialist:code:a", page).is_ok());
+        let again = tree
+            .claim_delivery("telegram:synthetic", page)
+            .expect_err("the helper already sent it");
+        assert!(
+            again.by.contains("helper") || again.by.contains("agent"),
+            "{}",
+            again.by
+        );
+        assert_eq!(
+            tree.claim_delivery("specialist:code:a", page)
+                .unwrap_err()
+                .by,
+            "you"
+        );
+        // Another page is its own artifact.
+        assert!(tree
+            .claim_delivery("telegram:synthetic", "screenshot:wp.ddev.site")
+            .is_ok());
+        // A released claim (its delivery failed) frees the page; only its
+        // holder can release it.
+        tree.release_delivery("telegram:synthetic", page);
+        assert!(tree.claim_delivery("telegram:synthetic", page).is_err());
+        tree.release_delivery("specialist:code:a", page);
+        assert!(tree.claim_delivery("telegram:synthetic", page).is_ok());
+    }
+
     use super::*;
 
     /// Far-apart changes are described one by one, removals included.
