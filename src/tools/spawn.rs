@@ -189,10 +189,16 @@ mod tests {
                 assert!(!message.contains(header), "{header:?} in {message:?}");
             }
             assert!(!message.contains("Slow count"), "{message}");
+            // A failed run's line is why it failed, from its record; any
+            // other's is what its report alone records.
+            let lead = match phase {
+                RunPhase::Failed => run.reason().expect("a failed run has its reason"),
+                _ => {
+                    "Its report is the only record of one step: Capture the screenshot.".to_string()
+                }
+            };
             assert!(
-                message.starts_with(
-                    "Its report is the only record of one step: Capture the screenshot.\n\nCounted to 30."
-                ),
+                message.starts_with(&format!("{lead}\n\nCounted to 30.")),
                 "{message}"
             );
             assert!(message.contains("Took 1m"), "{message}");
@@ -2855,10 +2861,21 @@ mod child_runtime_tests {
                 seen.final_card
             );
             // The card settles to the helper's final header, the same one
-            // its result starts with.
+            // its result starts with; one that failed or was cancelled says
+            // why under it, from its record.
+            let header = match (phase, cancel) {
+                (RunPhase::Failed, _) => format!(
+                    "{}: Site install\nIt stopped on an error: synthetic failure.",
+                    phase.headline()
+                ),
+                (_, true) => format!(
+                    "{}: Site install\nYou cancelled it before it finished.",
+                    phase.headline()
+                ),
+                _ => format!("{}: Site install", phase.headline()),
+            };
             assert!(
-                seen.final_card
-                    .ends_with(&format!("{}: Site install", phase.headline())),
+                seen.final_card.ends_with(&header),
                 "{case}: {}",
                 seen.final_card
             );
