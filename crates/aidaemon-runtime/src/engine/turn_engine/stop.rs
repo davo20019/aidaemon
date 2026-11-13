@@ -2,14 +2,14 @@
 //! and the stop-time demands, each judged by the closeout arbiter.
 
 use super::*;
-pub(super) use aidaemon_runtime::engine::stop::*;
+pub use crate::engine::stop::*;
 
 /// The tools the closeout may count as reachable: the registered daemon
 /// tools, minus daemon memory tools the active memory plugin does not own,
 /// and the MCP tools bridged for the turn.
-pub(super) fn closeout_visible_tools<'a>(
-    tools: &'a [Arc<dyn crate::traits::Tool>],
-    mcp_tools: &'a [Arc<dyn crate::traits::Tool>],
+pub fn closeout_visible_tools<'a>(
+    tools: &'a [Arc<dyn aidaemon_tools::OutcomeTool>],
+    mcp_tools: &'a [Arc<dyn aidaemon_tools::OutcomeTool>],
     user_role: UserRole,
     owned_memory_tools: &[&str],
 ) -> Vec<&'a str> {
@@ -34,11 +34,11 @@ const UNREPORTED_JOB_POLL: std::time::Duration = std::time::Duration::from_milli
 /// The longest one held stop waits for the run's jobs.
 const UNREPORTED_JOB_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-impl Agent {
-    pub(super) async fn serve_sdk_stop(&self, scope: &TurnScope<'_>, check: StopCheck) {
+impl TurnEngine<'_> {
+    pub async fn serve_sdk_stop(&self, scope: &TurnScope<'_>, check: StopCheck) {
         if let Some(ended) = self.sdk_wait_for_unreported_jobs(scope).await {
             let _ = check.reply.send(sdk::StopDecision::Continue {
-                message: crate::agent::system_directives::SystemDirective::BackgroundJobHeld {
+                message: crate::turn::system_directives::SystemDirective::BackgroundJobHeld {
                     ended,
                 }
                 .render(),
@@ -93,29 +93,28 @@ impl Agent {
     /// work that has not finished (live 2026-11-11: a run polled a running
     /// Codex job, gave up, and reported the task as failed while Codex went
     /// on to build it).
-    pub(super) async fn sdk_background_handoff(&self, scope: &TurnScope<'_>) -> bool {
+    pub async fn sdk_background_handoff(&self, scope: &TurnScope<'_>) -> bool {
         if scope.open_background_jobs.load(Ordering::Relaxed) == 0 {
             return false;
         }
         scope.background_handoff.store(true, Ordering::Relaxed);
         scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
         scope.verdict.record_handoff_reply(
-            crate::agent::post_task::build_friendly_background_handoff(scope.user_text),
+            crate::turn::post_task::build_friendly_background_handoff(scope.user_text),
         );
-        self.engine()
-            .emit_decision_point(
-                scope.emitter,
-                scope.task_id,
-                scope.model_calls.load(Ordering::Relaxed) as usize,
-                crate::events::DecisionType::PostExecutionValidation,
-                "Stop with a background job still running: handed off".to_string(),
-                serde_json::json!({
-                    "condition": "background_job_running_at_stop",
-                    "open_jobs": scope.open_background_jobs.load(Ordering::Relaxed),
-                    "engine": "sdk",
-                }),
-            )
-            .await;
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            scope.model_calls.load(Ordering::Relaxed) as usize,
+            aidaemon_events::payloads::DecisionType::PostExecutionValidation,
+            "Stop with a background job still running: handed off".to_string(),
+            serde_json::json!({
+                "condition": "background_job_running_at_stop",
+                "open_jobs": scope.open_background_jobs.load(Ordering::Relaxed),
+                "engine": "sdk",
+            }),
+        )
+        .await;
         true
     }
 
@@ -129,19 +128,18 @@ impl Agent {
     /// running, else whether they ended, so the run reads their result (or
     /// stops them and says so) before it answers. Read from the tools' typed
     /// process state, never from the reply.
-    pub(super) async fn sdk_wait_for_unreported_jobs(&self, scope: &TurnScope<'_>) -> Option<bool> {
+    pub async fn sdk_wait_for_unreported_jobs(&self, scope: &TurnScope<'_>) -> Option<bool> {
         if scope.unreported_jobs_wait_spent.load(Ordering::Relaxed) {
             return None;
         }
         let mut waited = false;
         let started = std::time::Instant::now();
         let _running = self
-            .child_progress
-            .as_ref()
-            .map(crate::tools::ProgressClock::begin);
+            .child_progress()
+            .map(aidaemon_channels::owner_wait::ProgressClock::begin);
         loop {
             let mut open = 0usize;
-            for tool in &self.tools {
+            for tool in self.tools() {
                 open += tool.jobs_ended_by_task_end(scope.task_id).await;
             }
             if open == 0 {
@@ -155,20 +153,19 @@ impl Agent {
             }
             if !waited {
                 waited = true;
-                self.engine()
-                    .emit_decision_point(
-                        scope.emitter,
-                        scope.task_id,
-                        scope.model_calls.load(Ordering::Relaxed) as usize,
-                        crate::events::DecisionType::PostExecutionValidation,
-                        "Stop held until the run's unreported jobs end".to_string(),
-                        serde_json::json!({
-                            "condition": "unreported_job_running_at_stop",
-                            "open_jobs": open,
-                            "engine": "sdk",
-                        }),
-                    )
-                    .await;
+                self.emit_decision_point(
+                    scope.emitter,
+                    scope.task_id,
+                    scope.model_calls.load(Ordering::Relaxed) as usize,
+                    aidaemon_events::payloads::DecisionType::PostExecutionValidation,
+                    "Stop held until the run's unreported jobs end".to_string(),
+                    serde_json::json!({
+                        "condition": "unreported_job_running_at_stop",
+                        "open_jobs": open,
+                        "engine": "sdk",
+                    }),
+                )
+                .await;
             }
             tokio::time::sleep(UNREPORTED_JOB_POLL).await;
         }
@@ -179,9 +176,9 @@ impl Agent {
     /// only a follow-up observation (which clears the flag) can confirm it
     /// (2026-07-12: an unverified click at a guessed position was reported as
     /// a successful Like). Bounded, so a model that never looks cannot loop.
-    pub(super) async fn sdk_gui_click_check(&self, scope: &TurnScope<'_>) -> sdk::StopDecision {
-        use crate::agent::closeout::{StopDemand, StopDemandVerdict};
-        if self.depth != 0 {
+    pub async fn sdk_gui_click_check(&self, scope: &TurnScope<'_>) -> sdk::StopDecision {
+        use crate::turn::closeout::{StopDemand, StopDemandVerdict};
+        if self.depth() != 0 {
             return sdk::StopDecision::Accept;
         }
         let unverified = match self.computer_use() {
@@ -201,17 +198,17 @@ impl Agent {
             return sdk::StopDecision::Accept;
         }
         scope.gui_verify_demands.fetch_add(1, Ordering::Relaxed);
-        self.engine().emit_warning_decision_point(
+        self.emit_warning_decision_point(
             scope.emitter,
             scope.task_id,
             scope.model_calls.load(Ordering::Relaxed) as usize,
-            crate::events::DecisionType::PostExecutionValidation,
+            aidaemon_events::payloads::DecisionType::PostExecutionValidation,
             "GUI success claim blocked: unverified coordinate click".to_string(),
             serde_json::json!({ "condition": "gui_coordinate_click_unverified", "engine": "sdk" }),
         )
         .await;
         sdk::StopDecision::Continue {
-            message: crate::agent::system_directives::SystemDirective::GuiCoordinateClickUnverified
+            message: crate::turn::system_directives::SystemDirective::GuiCoordinateClickUnverified
                 .render(),
         }
     }
@@ -219,11 +216,11 @@ impl Agent {
     /// A file more than one agent changed is checked once before the
     /// top-level agent reports: a read or command after the last change,
     /// recorded by the tree, closes it. Children are asked nothing.
-    pub(super) async fn sdk_combined_verification_check(
+    pub async fn sdk_combined_verification_check(
         &self,
         scope: &TurnScope<'_>,
     ) -> sdk::StopDecision {
-        use crate::agent::closeout::{StopDemand, StopDemandVerdict};
+        use crate::turn::closeout::{StopDemand, StopDemandVerdict};
         let Some(coordination) = scope.spawn_family.active_coordination() else {
             return sdk::StopDecision::Accept;
         };
@@ -254,15 +251,12 @@ impl Agent {
     /// A mandate task lead's prose is never its decision: a missing typed
     /// commit gets one bounded correction turn when the run could still make
     /// it, then the run fails closed.
-    pub(super) async fn sdk_mandate_commit_check(
-        &self,
-        scope: &TurnScope<'_>,
-    ) -> sdk::StopDecision {
-        use crate::agent::closeout::{StopDemand, StopDemandVerdict};
-        use crate::agent::mandate_run::{
+    pub async fn sdk_mandate_commit_check(&self, scope: &TurnScope<'_>) -> sdk::StopDecision {
+        use crate::engine::mandate_run::{
             mandate_decision_commit_state, MandateDecisionCommitState,
         };
-        let state = match mandate_decision_commit_state(self).await {
+        use crate::turn::closeout::{StopDemand, StopDemandVerdict};
+        let state = match mandate_decision_commit_state(self.host).await {
             Ok(state) => state,
             Err(error) => {
                 warn!(task_id = scope.task_id, %error, "SDK engine: mandate decision lookup failed");
@@ -283,24 +277,23 @@ impl Agent {
                 match self.sdk_stop_demand_verdict(scope, demand, used).await {
                     StopDemandVerdict::Demand => {
                         scope.mandate_commit_retries.fetch_add(1, Ordering::Relaxed);
-                        self.engine()
-                            .emit_warning_decision_point(
-                                scope.emitter,
-                                scope.task_id,
-                                scope.model_calls.load(Ordering::Relaxed) as usize,
-                                crate::events::DecisionType::PostExecutionValidation,
-                                "Blocked mandate prose completion without a durable decision"
-                                    .to_string(),
-                                serde_json::json!({
-                                    "condition": demand.condition(),
-                                    "retry": used + 1,
-                                    "engine": "sdk",
-                                }),
-                            )
-                            .await;
+                        self.emit_warning_decision_point(
+                            scope.emitter,
+                            scope.task_id,
+                            scope.model_calls.load(Ordering::Relaxed) as usize,
+                            aidaemon_events::payloads::DecisionType::PostExecutionValidation,
+                            "Blocked mandate prose completion without a durable decision"
+                                .to_string(),
+                            serde_json::json!({
+                                "condition": demand.condition(),
+                                "retry": used + 1,
+                                "engine": "sdk",
+                            }),
+                        )
+                        .await;
                         return sdk::StopDecision::Continue {
                             message:
-                                crate::agent::system_directives::SystemDirective::MandateDecisionCommitRequired
+                                crate::turn::system_directives::SystemDirective::MandateDecisionCommitRequired
                                     .render(),
                         };
                     }
@@ -325,23 +318,23 @@ impl Agent {
     /// Ask the closeout arbiter whether `demand` may be made now, against the
     /// same authority and visible tools the ledger closeout uses, and record
     /// the verdict.
-    pub(super) async fn sdk_stop_demand_verdict(
+    pub async fn sdk_stop_demand_verdict(
         &self,
         scope: &TurnScope<'_>,
-        demand: crate::agent::closeout::StopDemand,
+        demand: crate::turn::closeout::StopDemand,
         used: u32,
-    ) -> crate::agent::closeout::StopDemandVerdict {
+    ) -> crate::turn::closeout::StopDemandVerdict {
         let authority =
-            crate::agent::closeout::ClosingAuthority::from_resolved(&scope.authority.authority)
+            crate::turn::closeout::ClosingAuthority::from_resolved(&scope.authority.authority)
                 .without_tool_demands(scope.contract.forbids_tool_use);
         let visible_tools = closeout_visible_tools(
-            &self.tools,
+            self.tools(),
             &scope.mcp_tools,
             scope.user_role,
             scope.owned_memory_tools,
         );
-        let find = |name: &str| self.tools.iter().find(|tool| tool.name() == name);
-        let verdict = crate::agent::closeout::stop_demand_verdict(
+        let find = |name: &str| self.tools().iter().find(|tool| tool.name() == name);
+        let verdict = crate::turn::closeout::stop_demand_verdict(
             demand,
             used,
             &authority,
@@ -351,31 +344,30 @@ impl Agent {
                 find(name).is_some_and(|tool| tool.owner_control_plane_call(arguments))
             },
         );
-        self.engine()
-            .emit_decision_point(
-                scope.emitter,
-                scope.task_id,
-                scope.model_calls.load(Ordering::Relaxed) as usize,
-                crate::events::DecisionType::PostExecutionValidation,
-                format!("Stop demand {}: {}", demand.condition(), verdict.as_str()),
-                serde_json::json!({
-                    "condition": "stop_demand",
-                    "demand": demand.condition(),
-                    "verdict": verdict.as_str(),
-                    "used": used,
-                    "budget": demand.budget(),
-                    "authoritative": true,
-                    "engine": "sdk",
-                }),
-            )
-            .await;
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            scope.model_calls.load(Ordering::Relaxed) as usize,
+            aidaemon_events::payloads::DecisionType::PostExecutionValidation,
+            format!("Stop demand {}: {}", demand.condition(), verdict.as_str()),
+            serde_json::json!({
+                "condition": "stop_demand",
+                "demand": demand.condition(),
+                "verdict": verdict.as_str(),
+                "used": used,
+                "budget": demand.budget(),
+                "authoritative": true,
+                "engine": "sdk",
+            }),
+        )
+        .await;
         verdict
     }
 
     /// One shared retry for a reply that must not ship (empty, only internal
     /// markers, pasted tool output, or written to a closeout demand that
     /// ended unmet); after it, the finalizer's honest fallback applies.
-    pub(super) async fn sdk_reply_check(
+    pub async fn sdk_reply_check(
         &self,
         scope: &TurnScope<'_>,
         final_text: &str,
@@ -396,9 +388,9 @@ impl Agent {
         };
         let used = u32::from(scope.reply_retry_used.load(Ordering::Relaxed));
         if self
-            .sdk_stop_demand_verdict(scope, crate::agent::closeout::StopDemand::ReplyRepair, used)
+            .sdk_stop_demand_verdict(scope, crate::turn::closeout::StopDemand::ReplyRepair, used)
             .await
-            != crate::agent::closeout::StopDemandVerdict::Demand
+            != crate::turn::closeout::StopDemandVerdict::Demand
         {
             return sdk::StopDecision::Accept;
         }
@@ -415,16 +407,16 @@ impl Agent {
             // the retry must answer in text from the receipts it holds.
             ReplyDefect::Empty if scope.succeeded_calls.load(Ordering::Relaxed) > 0 => {
                 scope.text_only_next_call.store(true, Ordering::Relaxed);
-                crate::agent::system_directives::SystemDirective::EmptyFinalReplyPlainText
+                crate::turn::system_directives::SystemDirective::EmptyFinalReplyPlainText
             }
             ReplyDefect::Empty => {
-                crate::agent::system_directives::SystemDirective::EmptyResponseRetry
+                crate::turn::system_directives::SystemDirective::EmptyResponseRetry
             }
             ReplyDefect::InternalMarkers => {
-                crate::agent::system_directives::SystemDirective::FinalAnswerRejectedInternalMarkers
+                crate::turn::system_directives::SystemDirective::FinalAnswerRejectedInternalMarkers
             }
             ReplyDefect::ToolOutputPaste => {
-                crate::agent::system_directives::SystemDirective::FinalAnswerWasFilePaste
+                crate::turn::system_directives::SystemDirective::FinalAnswerWasFilePaste
             }
             // The work is over: the rewrite answers the user from what the
             // run already holds, and an empty rewrite ships this reply.
@@ -433,7 +425,7 @@ impl Agent {
                     .verdict
                     .record_interrupted_answer(final_text.to_string());
                 scope.text_only_next_call.store(true, Ordering::Relaxed);
-                crate::agent::system_directives::SystemDirective::FinalAnswerAfterUnmetCloseout
+                crate::turn::system_directives::SystemDirective::FinalAnswerAfterUnmetCloseout
             }
         };
         sdk::StopDecision::Continue {
@@ -444,14 +436,14 @@ impl Agent {
     /// The ledger-first closeout: replay the run
     /// ledger, ask which expectations an admissible tool could still satisfy,
     /// and demand a bounded extra pass only when the receipts say so.
-    pub(super) async fn sdk_closeout(
+    pub async fn sdk_closeout(
         &self,
         scope: &TurnScope<'_>,
         completed_results: usize,
         failed_without_success: bool,
     ) -> sdk::StopDecision {
         let Ok(aggregate) = self
-            .event_store
+            .events()
             .task_run_aggregate(scope.session_id, scope.task_id)
             .await
         else {
@@ -466,20 +458,19 @@ impl Agent {
             .filter(|claim| claim.unfinished())
         {
             scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
-            self.engine()
-                .emit_decision_point(
-                    scope.emitter,
-                    scope.task_id,
-                    iteration,
-                    crate::events::DecisionType::PostExecutionValidation,
-                    format!("Agent reported the request as {}", claim.as_str()),
-                    serde_json::json!({
-                        "condition": "executor_claimed_outcome",
-                        "claimed_outcome": claim.as_str(),
-                        "engine": "sdk",
-                    }),
-                )
-                .await;
+            self.emit_decision_point(
+                scope.emitter,
+                scope.task_id,
+                iteration,
+                aidaemon_events::payloads::DecisionType::PostExecutionValidation,
+                format!("Agent reported the request as {}", claim.as_str()),
+                serde_json::json!({
+                    "condition": "executor_claimed_outcome",
+                    "claimed_outcome": claim.as_str(),
+                    "engine": "sdk",
+                }),
+            )
+            .await;
             return sdk::StopDecision::AcceptUnmet {
                 unmet: vec![format!(
                     "the agent reported the request as {}",
@@ -488,22 +479,22 @@ impl Agent {
             };
         }
         let authority =
-            crate::agent::closeout::ClosingAuthority::from_resolved(&scope.authority.authority)
+            crate::turn::closeout::ClosingAuthority::from_resolved(&scope.authority.authority)
                 .without_tool_demands(scope.contract.forbids_tool_use);
         let visible_tools = closeout_visible_tools(
-            &self.tools,
+            self.tools(),
             &scope.mcp_tools,
             scope.user_role,
             scope.owned_memory_tools,
         );
         let read_only = |name: &str| {
-            self.tools
+            self.tools()
                 .iter()
                 .find(|tool| tool.name() == name)
                 .map(|tool| tool.capabilities().read_only)
         };
         let decision = aggregate.closeout(|obligation| {
-            crate::agent::closeout::obligation_admissible(
+            crate::turn::closeout::obligation_admissible(
                 obligation,
                 &authority,
                 &visible_tools,
@@ -511,20 +502,22 @@ impl Agent {
             )
         });
         let reachable = match &decision {
-            crate::events::CloseoutDecision::Reachable { obligation_ids } => obligation_ids.clone(),
+            aidaemon_events::run_aggregate::CloseoutDecision::Reachable { obligation_ids } => {
+                obligation_ids.clone()
+            }
             _ => Vec::new(),
         };
-        self.engine().emit_decision_point(
+        self.emit_decision_point(
             scope.emitter,
             scope.task_id,
             iteration,
-            crate::events::DecisionType::PostExecutionValidation,
+            aidaemon_events::payloads::DecisionType::PostExecutionValidation,
             format!("Ledger closeout verdict: {}", decision.verdict()),
             serde_json::json!({
                 "condition": "ledger_closeout",
                 "verdict": decision.verdict(),
                 "proof_basis": match &decision {
-                    crate::events::CloseoutDecision::Closed { proof_basis } => Some(*proof_basis),
+                    aidaemon_events::run_aggregate::CloseoutDecision::Closed { proof_basis } => Some(*proof_basis),
                     _ => None,
                 },
                 "reachable_obligation_ids": reachable,
@@ -538,11 +531,12 @@ impl Agent {
         // could verify, so it does not earn the verify-once pass.
         let mutation_succeeded = aggregate.operations.values().any(|operation| {
             operation.changes_verifiable_state()
-                && operation.outcome == Some(crate::traits::ToolOutcomeStatus::Succeeded)
+                && operation.outcome
+                    == Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded)
         });
         let observation_reachable = reachable.iter().any(|id| {
             aggregate.obligations.get(id).is_some_and(|obligation| {
-                obligation.class == crate::events::RunObligationClass::Observe
+                obligation.class == aidaemon_events::run_aggregate::RunObligationClass::Observe
             })
         });
         let verification_after_mutation = mutation_succeeded
@@ -550,10 +544,9 @@ impl Agent {
             && !scope.verification_demanded.load(Ordering::Relaxed);
         // A failure that is itself the expected observation satisfies its
         // obligation; only an uncredited failure earns the recovery pass.
-        let failure_credited = aggregate
-            .obligations
-            .values()
-            .any(|obligation| obligation.state == crate::events::RunObligationState::Satisfied);
+        let failure_credited = aggregate.obligations.values().any(|obligation| {
+            obligation.state == aidaemon_events::run_aggregate::RunObligationState::Satisfied
+        });
         let unrecovered_failure = failed_without_success
             && !failure_credited
             && !scope.recovery_demanded.load(Ordering::Relaxed);
@@ -589,7 +582,7 @@ impl Agent {
                 .unwrap_or_default();
             return sdk::StopDecision::Continue {
                 message:
-                    crate::agent::system_directives::SystemDirective::ExternalMutationRecoveryRequired(
+                    crate::turn::system_directives::SystemDirective::ExternalMutationRecoveryRequired(
                         evidence.chars().take(600).collect(),
                     )
                     .render(),
@@ -603,23 +596,22 @@ impl Agent {
                 .executor_demanded_at
                 .store(completed_results as u64, Ordering::Relaxed);
         }
-        self.engine()
-            .emit_decision_point(
-                scope.emitter,
-                scope.task_id,
-                iteration,
-                crate::events::DecisionType::IntentGate,
-                "Ledger expectations still reachable: bounded evidence pass requested",
-                serde_json::json!({
-                    "condition": "ledger_expectations_required",
-                    "reachable_obligation_ids": reachable,
-                    "demands": demands,
-                    "engine": "sdk",
-                }),
-            )
-            .await;
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            iteration,
+            aidaemon_events::payloads::DecisionType::IntentGate,
+            "Ledger expectations still reachable: bounded evidence pass requested",
+            serde_json::json!({
+                "condition": "ledger_expectations_required",
+                "reachable_obligation_ids": reachable,
+                "demands": demands,
+                "engine": "sdk",
+            }),
+        )
+        .await;
         sdk::StopDecision::Continue {
-            message: crate::agent::system_directives::SystemDirective::LedgerExpectationsRequired {
+            message: crate::turn::system_directives::SystemDirective::LedgerExpectationsRequired {
                 expectations: aggregate.expectation_summaries(&reachable),
             }
             .render(),

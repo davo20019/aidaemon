@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 
 const SETTING_KEY: &str = "deferred_provider_retries";
-/// Attempts before the request is abandoned (initial failure counts as 0).
-pub(crate) const MAX_DEFERRED_ATTEMPTS: u16 = 4;
+
+#[cfg(test)]
+pub(crate) use aidaemon_runtime::engine::deferral::deferral_notice;
+pub(crate) use aidaemon_runtime::engine::deferral::MAX_DEFERRED_ATTEMPTS;
 /// Delay before the first automatic re-run; each later attempt triples it
 /// (2 min, 6 min, 18 min, 54 min ≈ 80 minutes of coverage).
 const BASE_DELAY_SECS: i64 = 120;
@@ -162,40 +164,6 @@ fn not_before(error: &anyhow::Error) -> Option<String> {
     let provider = error.downcast_ref::<crate::providers::ProviderError>()?;
     let reset = chrono::DateTime::<chrono::Utc>::from(provider.resets_at?);
     Some((reset + chrono::Duration::seconds(QUOTA_RESET_SLACK_SECS)).to_rfc3339())
-}
-
-/// What the user is told when their request was queued (`attempt` 0) or
-/// re-queued after another failure.
-pub(crate) fn deferral_notice(attempt: u16, error: &anyhow::Error) -> String {
-    let notice = queued_request_notice(attempt, error);
-    match error
-        .downcast_ref::<crate::providers::ProviderError>()
-        .and_then(crate::providers::ProviderError::fallback_failures_note)
-    {
-        Some(note) => format!("{notice}\n\n{note}"),
-        None => notice,
-    }
-}
-
-fn queued_request_notice(attempt: u16, error: &anyhow::Error) -> String {
-    let quota = error
-        .downcast_ref::<crate::providers::ProviderError>()
-        .filter(|e| e.kind == crate::providers::ProviderErrorKind::QuotaExhausted);
-    if let Some(quota) = quota {
-        return match quota.resets_at {
-            Some(at) => format!(
-                "The model plan's usage limit has been reached; it resets {}. I saved this request and will run it automatically after the reset, then reply here.",
-                crate::providers::describe_reset(at, std::time::SystemTime::now())
-            ),
-            None => "The model plan's usage limit has been reached. I saved this request and will retry it automatically, then reply here.".to_string(),
-        };
-    }
-    match attempt {
-        0 => "The model provider is unavailable right now. I saved this request and will retry it automatically once the provider recovers, then reply here.".to_string(),
-        attempt => format!(
-            "The model provider is still unavailable (automatic retry {attempt} of {MAX_DEFERRED_ATTEMPTS}). I will keep retrying with a longer wait and reply here when it succeeds."
-        ),
-    }
 }
 
 fn kind_label(kind: crate::providers::ProviderErrorKind) -> &'static str {

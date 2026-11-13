@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use chrono::Utc;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, RwLock};
@@ -27,7 +28,9 @@ use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
 use crate::runtime_ports::OutboundRouter;
 use crate::skills;
-use crate::traits::{AgentRole, Message, StateStore, Tool, ToolCapabilities, ToolRole};
+#[cfg(test)]
+use crate::traits::Message;
+use crate::traits::{AgentRole, StateStore, Tool, ToolCapabilities, ToolRole};
 use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
 #[cfg(test)]
@@ -84,9 +87,6 @@ mod execution_state;
 #[cfg(test)]
 pub(crate) use execution_state::ExecutionBudget;
 pub(crate) use execution_state::TargetScope;
-pub(in crate::agent) use execution_state::{
-    select_initial_execution_budget, ExecutionPersistence, ExecutionState,
-};
 /// Tool-failure classification lives in `aidaemon-runtime`.
 mod loop_utils {
     pub(in crate::agent) use aidaemon_runtime::turn::loop_utils::*;
@@ -95,8 +95,6 @@ mod loop_utils {
 mod recall_guardrails {
     pub(super) use aidaemon_runtime::policy::recall_guardrails::*;
 }
-#[path = "policy/trust_tier.rs"]
-pub(crate) mod trust_tier;
 use loop_utils::is_trigger_session;
 /// The post-run learning context lives in `aidaemon-runtime`.
 mod post_task {
@@ -113,15 +111,8 @@ pub(crate) mod approvals;
 pub(crate) mod authority;
 #[path = "turn/bootstrap/mod.rs"]
 mod bootstrap;
-/// The ledger closeout's admissibility lives in `aidaemon-runtime`.
-mod closeout {
-    pub(in crate::agent) use aidaemon_runtime::turn::closeout::*;
-}
-/// Replies built from tool output live in `aidaemon-runtime`.
-mod completion_checks {
-    pub(in crate::agent) use aidaemon_runtime::turn::completion_checks::*;
-}
 /// Completion contracts live in `aidaemon-runtime`.
+#[cfg(test)]
 mod completion_contract {
     pub(in crate::agent) use aidaemon_runtime::turn::completion_contract::*;
 }
@@ -137,6 +128,7 @@ mod core_prompt {
 mod deferred_retry;
 /// Dialogue state lives in `aidaemon-runtime`.
 mod dialogue_state {
+    #[cfg(test)]
     pub(in crate::agent) use aidaemon_runtime::turn::dialogue_state::*;
 }
 #[cfg(test)]
@@ -144,14 +136,14 @@ mod dialogue_state {
 mod dialogue_state_tests;
 /// Follow-up classification lives in `aidaemon-runtime`.
 mod followup {
+    #[cfg(test)]
     pub(in crate::agent) use aidaemon_runtime::turn::followup::*;
 }
 #[path = "runtime/graceful.rs"]
 mod graceful;
+#[cfg(test)]
 #[path = "runtime/history.rs"]
 mod history;
-#[path = "runtime/known_resources.rs"]
-pub(crate) mod known_resources;
 pub(crate) mod memory_plugin;
 #[path = "runtime/notes.rs"]
 mod notes;
@@ -167,6 +159,7 @@ mod project_scope {
 pub(crate) mod sdk_engine;
 #[path = "runtime/sdk_provider.rs"]
 mod sdk_provider;
+#[cfg(test)]
 #[path = "turn/services.rs"]
 mod services;
 pub(crate) mod specialists;
@@ -180,14 +173,13 @@ pub(crate) mod untrusted;
 pub(in crate::agent) use completion_contract::CompletionTaskKind;
 #[cfg(test)]
 pub(in crate::agent) use followup::FollowupMode;
+#[cfg(test)]
 pub(in crate::agent) use history::CompletionContract;
+#[cfg(test)]
 pub(in crate::agent) use history::CompletionProgress;
+#[cfg(test)]
 pub(in crate::agent) use history::TurnContext;
 pub(in crate::agent) mod eval;
-/// Evidence routing lives in `aidaemon-runtime`.
-mod inquiry {
-    pub(in crate::agent) use aidaemon_runtime::turn::inquiry::*;
-}
 #[path = "runtime/llm.rs"]
 mod llm;
 #[path = "turn/main_loop.rs"]
@@ -200,6 +192,7 @@ mod message_build;
 mod models;
 /// Prefix fingerprints live in `aidaemon-runtime`.
 mod prefix_fingerprint {
+    #[cfg(test)]
     pub(crate) use aidaemon_runtime::prompt::fingerprint::*;
 }
 #[path = "runtime/resume.rs"]
@@ -208,18 +201,16 @@ mod runtime_ports;
 #[path = "runtime/spawn.rs"]
 mod spawn;
 mod turn_host;
-pub(crate) use aidaemon_runtime::engine::tool_result_fit::ToolResultFit;
 pub(crate) use aidaemon_runtime::engine::work_scope::WorkScope;
 /// Session notes and parent-visible deliveries, on any TurnHost.
 pub(crate) use aidaemon_runtime::turn::notes::TurnNotes;
-/// The session history appends and turn-context assembly, on any TurnHost.
-pub(in crate::agent) use aidaemon_runtime::turn::turn_context::TurnHistory;
 /// The speech-to-text fallback lives in `aidaemon-runtime`.
 #[cfg(test)]
 pub(crate) mod stt {
     pub(crate) use aidaemon_runtime::media::stt::*;
 }
 /// System directives live in `aidaemon-runtime`.
+#[cfg(test)]
 mod system_directives {
     pub(in crate::agent) use aidaemon_runtime::turn::system_directives::*;
 }
@@ -231,18 +222,9 @@ mod tool_defs;
 mod tool_exec;
 #[path = "turn/tool_execution/mod.rs"]
 mod tool_execution;
-/// Tool-result notices live in `aidaemon-runtime`.
-mod tool_result_notices {
-    pub(in crate::agent) use aidaemon_runtime::turn::tool_result_notices::*;
-}
-/// Image attachments live in `aidaemon-runtime`.
-pub(crate) mod vision {
-    pub(crate) use aidaemon_runtime::media::vision::*;
-}
 
 pub(in crate::agent) use eval::{HarnessEvalAccumulator, HarnessEvalConfig};
 use system_prompt::format_goal_context;
-pub(in crate::agent) use tool_result_notices::ToolResultNotice;
 
 /// Policy runtime metrics and bounded autotuning live in `aidaemon-runtime`.
 mod policy_metrics {
@@ -254,7 +236,6 @@ pub use policy_metrics::{
 };
 // `PolicyAutotuneSnapshot` is part of the public surface but currently has no
 // in-tree consumer (the legacy definition carried `#[allow(dead_code)]`).
-pub(in crate::agent) use policy_metrics::record_failed_task_tokens;
 #[allow(unused_imports)]
 pub use policy_metrics::PolicyAutotuneSnapshot;
 pub(in crate::agent) use policy_metrics::POLICY_METRICS;
@@ -263,7 +244,7 @@ pub(in crate::agent) use policy_metrics::POLICY_METRICS;
 // filtering, intent-gate merge). Implementation lives in `agent_helpers.rs`.
 #[path = "agent_helpers.rs"]
 mod agent_helpers;
-pub(in crate::agent) use agent_helpers::is_untrusted_external_reference_blocked_tool;
+#[cfg(test)]
 pub use agent_helpers::touch_heartbeat;
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::IntentGateDecision;
@@ -415,6 +396,7 @@ pub struct Agent {
     interactive_slot: Option<u32>,
 }
 
+#[cfg(test)]
 pub(in crate::agent) use system_directives::SystemDirective;
 
 struct AgentLimits {
@@ -451,11 +433,10 @@ impl AgentLimits {
 mod goal_dispatch;
 pub use goal_dispatch::is_group_session;
 pub(in crate::agent) use goal_dispatch::{
-    active_scheduled_root_task_id, auto_dispatch_scheduled_run_extension_budget,
-    clear_scheduled_run_state, effective_goal_daily_budget, goal_has_scheduled_provenance,
-    parse_goal_leading_wait, parse_wait_task_seconds, persist_scheduled_run_state,
-    strip_leading_wait, task_has_scheduled_provenance, truncate_goal_result_text,
-    user_facing_task_description,
+    auto_dispatch_scheduled_run_extension_budget, clear_scheduled_run_state,
+    effective_goal_daily_budget, goal_has_scheduled_provenance, parse_goal_leading_wait,
+    parse_wait_task_seconds, persist_scheduled_run_state, strip_leading_wait,
+    task_has_scheduled_provenance, truncate_goal_result_text, user_facing_task_description,
 };
 pub(crate) use goal_dispatch::{
     build_goal_failure_summary, build_goal_task_results_summary, extract_file_paths_from_text,
@@ -588,10 +569,6 @@ impl Agent {
     #[cfg(test)]
     pub(crate) fn event_store(&self) -> &Arc<EventStore> {
         &self.event_store
-    }
-
-    pub(in crate::agent) async fn install_harness_eval(&self, accumulator: HarnessEvalAccumulator) {
-        self.runtime.install_harness_eval(accumulator).await;
     }
 
     pub(in crate::agent) async fn with_harness_eval<R>(
@@ -856,6 +833,7 @@ impl Agent {
         }
 
         let reply = self
+            .engine()
             .handle_message_impl(
                 session_id,
                 &execution_user_text,
@@ -891,21 +869,22 @@ impl Agent {
         &self,
         request: &crate::runtime_ports::ConversationRequest,
     ) -> anyhow::Result<String> {
-        self.handle_message_impl(
-            &request.session_id,
-            &request.user_text,
-            &[],
-            request.status_tx.clone(),
-            request.user_role,
-            request.channel_ctx.clone(),
-            request.heartbeat.clone(),
-            None,
-            true,
-            request.parent_task_id.as_deref(),
-            request.parent_tool_call_id.as_deref(),
-            request.parent_result_id.as_deref(),
-        )
-        .await
+        self.engine()
+            .handle_message_impl(
+                &request.session_id,
+                &request.user_text,
+                &[],
+                request.status_tx.clone(),
+                request.user_role,
+                request.channel_ctx.clone(),
+                request.heartbeat.clone(),
+                None,
+                true,
+                request.parent_task_id.as_deref(),
+                request.parent_tool_call_id.as_deref(),
+                request.parent_result_id.as_deref(),
+            )
+            .await
     }
 
     /// Cancel all active/pending goals for a session.

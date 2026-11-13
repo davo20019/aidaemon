@@ -12,7 +12,6 @@ pub use aidaemon_agents::specialist::SpecialistKind;
 pub use aidaemon_tools::OutcomeTool as Tool;
 
 pub use aidaemon_tools::status::{status_sender, with_status, ToolStatus};
-pub use aidaemon_tools::NothingSentError;
 
 /// Calling a tool directly from a test.
 #[cfg(test)]

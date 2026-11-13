@@ -1,3 +1,4 @@
+#[cfg(test)]
 pub(in crate::agent) use aidaemon_runtime::engine::mandate_run::*;
 
 #[cfg(test)]

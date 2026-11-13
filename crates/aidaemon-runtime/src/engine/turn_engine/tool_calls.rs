@@ -4,9 +4,9 @@
 
 use super::*;
 #[allow(unused_imports)]
-use crate::agent::{ToolResultFit, WorkScope};
+use crate::engine::{tool_result_fit::ToolResultFit, work_scope::WorkScope};
 
-pub(in crate::agent) use aidaemon_runtime::engine::tool_calls::*;
+pub use crate::engine::tool_calls::*;
 
 /// Stands in for a call's result between the tool returning and the
 /// after-tool hook writing what the model reads.
@@ -17,12 +17,12 @@ const RESULT_PENDING: &str = "[tool result pending]";
 /// (`dispatch_facts().runs_as_judged`, the terminal, whose approval ladder
 /// the kernel runs and the tool then skips), `Some(None)` when the call was
 /// never judged in `run`.
-pub(super) fn take_terminal_judgment(
-    judged: &crate::agent::approvals::JudgedCalls,
+pub fn take_terminal_judgment(
+    judged: &crate::approvals::JudgedCalls,
     run: sdk::RunId,
-    tool: Option<&dyn crate::traits::Tool>,
+    tool: Option<&dyn aidaemon_tools::OutcomeTool>,
     call_id: &str,
-) -> Option<Option<crate::agent::approvals::JudgedTerminal>> {
+) -> Option<Option<crate::approvals::JudgedTerminal>> {
     let runs_as_judged = tool.is_some_and(|tool| tool.dispatch_facts().runs_as_judged);
     runs_as_judged.then(|| judged.take(run, call_id))
 }
@@ -32,9 +32,9 @@ pub(super) fn take_terminal_judgment(
 /// other call is canonicalized now. The model's explicit directory refines
 /// the turn's known project directory. Returns the injected directory and
 /// the kernel's judgment.
-pub(super) fn canonicalize_dispatched_call(
+pub fn canonicalize_dispatched_call(
     scope: &TurnScope<'_>,
-    tool: Option<&dyn crate::traits::Tool>,
+    tool: Option<&dyn aidaemon_tools::OutcomeTool>,
     request: &mut ToolRequest,
 ) -> (Option<String>, DispatchJudgment) {
     let taken = take_terminal_judgment(
@@ -43,9 +43,9 @@ pub(super) fn canonicalize_dispatched_call(
         tool,
         &request.call_id,
     );
-    #[cfg(test)]
-    let taken = match crate::agent::approvals::judgment_seam(scope.session_id) {
-        Some(crate::agent::approvals::JudgmentSeam::DropJudgment) => taken.map(|_| None),
+    #[cfg(any(test, feature = "testing"))]
+    let taken = match crate::approvals::judgment_seam(scope.session_id) {
+        Some(crate::approvals::JudgmentSeam::DropJudgment) => taken.map(|_| None),
         _ => taken,
     };
     let (judged, judgment) = match taken {
@@ -104,15 +104,15 @@ pub(super) fn canonicalize_dispatched_call(
     (canonical.injected_dir, judgment)
 }
 
-impl Agent {
+impl TurnEngine<'_> {
     /// The tool this turn runs under `name`: a daemon tool, else an
     /// MCP-registry tool bridged for the turn.
-    pub(super) fn turn_tool<'s>(
+    pub fn turn_tool<'s>(
         &'s self,
         scope: &'s TurnScope<'_>,
         name: &str,
-    ) -> Option<&'s Arc<dyn crate::traits::Tool>> {
-        self.tools
+    ) -> Option<&'s Arc<dyn aidaemon_tools::OutcomeTool>> {
+        self.tools()
             .iter()
             .find(|tool| tool.name() == name)
             .or_else(|| scope.mcp_tools.iter().find(|tool| tool.name() == name))
@@ -121,12 +121,12 @@ impl Agent {
     /// What a call of the tool this turn runs under `name` does: the
     /// instance judged at turn start, never a fresh registry lookup (an MCP
     /// server reloaded mid-run could answer differently).
-    pub(super) fn sdk_call_semantics(
+    pub fn sdk_call_semantics(
         &self,
         scope: &TurnScope<'_>,
         name: &str,
         arguments: &str,
-    ) -> crate::traits::ToolCallSemantics {
+    ) -> aidaemon_tools::semantics::ToolCallSemantics {
         self.turn_tool(scope, name)
             .map(|tool| tool.call_semantics(arguments))
             .unwrap_or_default()
@@ -137,12 +137,12 @@ impl Agent {
     /// Who authored what this call returned: only executed calls carry the
     /// tool's own class (or what the tool reported for this exact output);
     /// every other output is the daemon's.
-    fn call_output_trust(
+    pub fn call_output_trust(
         &self,
         scope: &TurnScope<'_>,
         name: &str,
         arguments: &str,
-        metadata: Option<&crate::traits::ToolCallMetadata>,
+        metadata: Option<&aidaemon_tools::semantics::ToolCallMetadata>,
     ) -> sdk::SourceTrust {
         let reported = metadata.and_then(|metadata| metadata.output_trust);
         self.turn_tool(scope, name)
@@ -150,7 +150,7 @@ impl Agent {
                 reported.unwrap_or_else(|| {
                     tool.output_trust(
                         arguments,
-                        &crate::traits::TrustRoots::new(&scope.trust_roots)
+                        &aidaemon_tools::semantics::TrustRoots::new(&scope.trust_roots)
                             .with_cwd(Some(&scope.cwd)),
                     )
                 })
@@ -161,7 +161,7 @@ impl Agent {
     /// How a step reads on the owner's status line: the plain title the
     /// call gave it ("running the site installer"), else the tool's
     /// friendly label and a cleaned summary.
-    fn step_activity(
+    pub fn step_activity(
         &self,
         scope: &TurnScope<'_>,
         tool: &str,
@@ -174,18 +174,18 @@ impl Agent {
         {
             return (title, String::new());
         }
-        crate::tools::sanitize::user_facing_tool_activity(
+        aidaemon_tools::sanitize::user_facing_tool_activity(
             tool,
             &summary(),
             scope.channel_ctx.visibility,
         )
     }
 
-    pub(super) fn turn_tool_facts(
+    pub fn turn_tool_facts(
         &self,
         scope: &TurnScope<'_>,
         name: &str,
-    ) -> crate::traits::ToolDispatchFacts {
+    ) -> aidaemon_tools::semantics::ToolDispatchFacts {
         self.turn_tool(scope, name)
             .map(|tool| tool.dispatch_facts())
             .unwrap_or_default()
@@ -193,12 +193,12 @@ impl Agent {
 
     /// Judge the call's access manifest against the task's filesystem
     /// authority. `None`: in scope (or not a known tool).
-    pub(super) fn sdk_scope_check(
+    pub fn sdk_scope_check(
         &self,
         scope: &TurnScope<'_>,
         tool_name: &str,
         arguments: &str,
-    ) -> Option<crate::agent::tool_execution::ScopeCheck> {
+    ) -> Option<crate::turn::tool_dispatch::ScopeCheck> {
         let tool = self.turn_tool(scope, tool_name)?;
         let known = scope
             .known_project_dir
@@ -209,22 +209,18 @@ impl Agent {
             tool.as_ref(),
             arguments,
             &CallScopeFacts {
-                backend: &*self.execution_backend,
+                backend: &*self.execution_backend_handle(),
                 session_id: scope.session_id,
                 task_access: scope.authority.task_access.as_ref(),
                 authorized_scopes: &scope.authorized_scopes,
                 scopes_are_guess: scope.scopes_are_guess,
                 known_project_dir: known.as_deref(),
-                paths: &self.daemon_paths,
+                paths: self.daemon_paths(),
             },
         )
     }
 
-    pub(super) async fn dispatch_sdk_tool_call(
-        &self,
-        scope: &TurnScope<'_>,
-        mut request: ToolRequest,
-    ) {
+    pub async fn dispatch_sdk_tool_call(&self, scope: &TurnScope<'_>, mut request: ToolRequest) {
         let tool = self.turn_tool(scope, &request.name).cloned();
         let (injected_dir, judgment) =
             canonicalize_dispatched_call(scope, tool.as_deref(), &mut request);
@@ -251,13 +247,13 @@ impl Agent {
 
     /// An unrestricted owner's egress after untrusted content runs without
     /// a check (the kernel only marks it); every such call is recorded.
-    async fn record_unrestricted_egress(
+    pub async fn record_unrestricted_egress(
         &self,
         scope: &TurnScope<'_>,
         tool_name: &str,
         arguments: &str,
     ) {
-        if scope.authority.owner_level != Some(crate::config::OwnerLevel::Unrestricted)
+        if scope.authority.owner_level != Some(crate::authority::OwnerLevel::Unrestricted)
             || !scope
                 .untrusted_seen
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -267,7 +263,7 @@ impl Agent {
         let egress = self.turn_tool(scope, tool_name).is_some_and(|tool| {
             tool.call_annotations_in(
                 arguments,
-                &crate::traits::TrustRoots::new(&scope.trust_roots),
+                &aidaemon_tools::semantics::TrustRoots::new(&scope.trust_roots),
             )
             .egress
                 || tool.call_outbound(arguments) != sdk::Outbound::Nothing
@@ -275,39 +271,39 @@ impl Agent {
         if !egress {
             return;
         }
-        self.engine()
-            .emit_decision_point(
-                scope.emitter,
-                scope.task_id,
-                0,
-                crate::events::DecisionType::GateTelemetry,
-                "unrestricted owner: egress after untrusted content ran unchecked",
-                serde_json::json!({
-                    "condition": "untrusted_egress_unrestricted",
-                    "tool": tool_name,
-                }),
-            )
-            .await;
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            0,
+            aidaemon_events::payloads::DecisionType::GateTelemetry,
+            "unrestricted owner: egress after untrusted content ran unchecked",
+            serde_json::json!({
+                "condition": "untrusted_egress_unrestricted",
+                "tool": tool_name,
+            }),
+        )
+        .await;
     }
 
     /// What a child spawned from this turn inherits: the turn's resolved
     /// authority, owner level and workspace, the chat whose `/readonly`
     /// narrows it, whether the turn has seen untrusted content so far, and
     /// the root request with its trust.
-    async fn turn_authority_for_children(
+    pub async fn turn_authority_for_children(
         &self,
         scope: &TurnScope<'_>,
-    ) -> crate::agent::authority::InheritedAuthority {
+    ) -> crate::authority::InheritedAuthority {
         // What this run has reached so far, with what its transcript and its
         // own parent already held: the child starts from these identities.
-        let known_resources = self
-            .known_resources(
-                scope.session_id,
-                Some(scope.task_id),
-                &scope.projected_source_turn_ids,
-            )
-            .await;
-        crate::agent::authority::InheritedAuthority {
+        let known_resources = crate::known_resources::known_resources(
+            self.events(),
+            self.inherited_authority(),
+            scope.session_id,
+            Some(scope.task_id),
+            &scope.projected_source_turn_ids,
+        )
+        .await;
+        crate::authority::InheritedAuthority {
             authority: scope.authority.authority.clone(),
             owner_level: scope.authority.owner_level,
             task_access: scope.authority.task_access.clone(),
@@ -317,16 +313,16 @@ impl Agent {
                 scope
                     .origin_request
                     .chars()
-                    .take(crate::agent::authority::INHERITED_REQUEST_CHARS)
+                    .take(crate::authority::INHERITED_REQUEST_CHARS)
                     .collect(),
             ),
             origin_trusted: scope.origin_trusted,
             trusted_roots: scope.trust_roots.clone(),
             // What the owner declined in this run so far (the run's
             // declines already hold what this turn itself inherited).
-            declined: crate::agent::authority::union_declines(
-                &crate::agent::authority::union_declines(
-                    self.inherited_authority
+            declined: crate::authority::union_declines(
+                &crate::authority::union_declines(
+                    self.inherited_authority()
                         .as_ref()
                         .map(|parent| parent.declined.as_slice())
                         .unwrap_or_default(),
@@ -347,7 +343,7 @@ impl Agent {
             // The spawn tool appends the child's own mission.
             card_title: None,
             lineage: self
-                .inherited_authority
+                .inherited_authority()
                 .as_ref()
                 .map(|parent| parent.lineage.clone())
                 .unwrap_or_default(),
@@ -360,7 +356,7 @@ impl Agent {
 
     /// Run one call and record it: a `ToolCall` event, then the tool message with a typed receipt, so the run ledger
     /// sees every operation while the run is still going.
-    pub(super) async fn run_sdk_tool_call(
+    pub async fn run_sdk_tool_call(
         &self,
         scope: &TurnScope<'_>,
         request: &KernelCall,
@@ -383,7 +379,7 @@ impl Agent {
             GateOutcome::Answer(output) => return output,
         };
         let scope_escalation = match &clearance.scope_check {
-            Some(crate::agent::tool_execution::ScopeCheck::Escalatable { escalation, .. }) => {
+            Some(crate::turn::tool_dispatch::ScopeCheck::Escalatable { escalation, .. }) => {
                 Some(escalation.clone())
             }
             _ => None,
@@ -412,12 +408,12 @@ impl Agent {
         // The same file and caption go out once per task.
         let send_file_key = facts
             .delivers_files
-            .then(|| crate::agent::loop_utils::extract_send_file_dedupe_key_from_args(arguments))
+            .then(|| crate::turn::loop_utils::extract_send_file_dedupe_key_from_args(arguments))
             .flatten();
         let idempotency_key = self.sdk_idempotency_key(scope, request, &call_semantics);
         self.record_unrestricted_egress(scope, &request.name, arguments)
             .await;
-        let mut call_data = crate::events::ToolCallData::from_tool_call(
+        let mut call_data = aidaemon_events::payloads::ToolCallData::from_tool_call(
             request.call_id.clone(),
             request.name.clone(),
             request.arguments.clone(),
@@ -433,7 +429,7 @@ impl Agent {
         // `track_requirements` shows its checklist instead.
         if !facts.requirement_checklist {
             let (name, summary) = self.step_activity(scope, &request.name, arguments, || {
-                crate::agent::agent_helpers::summarize_tool_args(&request.name, arguments)
+                crate::turn::tool_summary::summarize_tool_args(&request.name, arguments)
             });
             let kind = step_kind(
                 &request.name,
@@ -457,13 +453,13 @@ impl Agent {
                 // An executed call keeps the semantics it was admitted with
                 // (an observation stays an observation even when it returns a
                 // negative result).
-                crate::agent::tool_execution::complete_tool_result_semantics(
+                crate::turn::tool_dispatch::complete_tool_result_semantics(
                     &request.name,
                     arguments,
                     &call_semantics,
                     &mut outcome.metadata,
                 );
-                let status = crate::agent::loop_utils::classify_tool_outcome_status(
+                let status = crate::turn::loop_utils::classify_tool_outcome_status(
                     &request.name,
                     &outcome.output,
                     Some(arguments),
@@ -475,35 +471,35 @@ impl Agent {
                 // A tool that returns `Err` made an explicit typed failure: it
                 // gets a `FailedPermanent` receipt, so the run ledger and the task outcome see it.
                 let prepared = self.turn_tool(scope, &request.name).and_then(|tool| {
-                    crate::traits::prepare_invocation(tool.as_ref(), arguments).ok()
+                    aidaemon_tools::semantics::prepare_invocation(tool.as_ref(), arguments).ok()
                 });
-                let mut metadata = crate::traits::ToolCallMetadata {
+                let mut metadata = aidaemon_tools::semantics::ToolCallMetadata {
                     outcome_status: Some(
                         if error
-                            .downcast_ref::<crate::traits::NothingSentError>()
+                            .downcast_ref::<aidaemon_tools::NothingSentError>()
                             .is_some()
                         {
-                            crate::traits::ToolOutcomeStatus::FailedRetryable
+                            aidaemon_tools::semantics::ToolOutcomeStatus::FailedRetryable
                         } else {
-                            crate::traits::ToolOutcomeStatus::FailedPermanent
+                            aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent
                         },
                     ),
                     transport_error: Some(error.to_string()),
                     invocation_stage: if error
-                        .downcast_ref::<crate::agent::tool_exec::UnknownToolError>()
+                        .downcast_ref::<crate::engine::tool_exec::UnknownToolError>()
                         .is_some()
                     {
-                        crate::traits::ToolInvocationStage::RejectedBeforeDispatch
+                        aidaemon_tools::semantics::ToolInvocationStage::RejectedBeforeDispatch
                     } else {
-                        crate::traits::ToolInvocationStage::Dispatched
+                        aidaemon_tools::semantics::ToolInvocationStage::Dispatched
                     },
-                    ..crate::traits::ToolCallMetadata::default()
+                    ..aidaemon_tools::semantics::ToolCallMetadata::default()
                 };
                 if let Some(prepared) = prepared {
                     metadata.receipt_kind = prepared.receipt_kind;
                     metadata.access_manifest = Some(prepared.access_manifest);
                 }
-                crate::agent::tool_execution::complete_tool_result_semantics(
+                crate::turn::tool_dispatch::complete_tool_result_semantics(
                     &request.name,
                     arguments,
                     &call_semantics,
@@ -533,17 +529,15 @@ impl Agent {
                 .is_some_and(|tool| tool.output_reports_local_sites(arguments));
         if reports_sites {
             if let ExecutedOutcome::Returned { outcome, .. } = &executed {
-                let grant = crate::agent::approvals::grant_session(
-                    self.approval_session_id.as_deref(),
-                    scope.session_id,
-                );
+                let grant =
+                    crate::approvals::grant_session(self.approval_session_id(), scope.session_id);
                 aidaemon_tools::local_sites::note_sites_in(&grant, &outcome.output).await;
             }
         }
         // The first untrusted read records the turn as tainted at once, so a
         // run that never finishes still taints later turns that see it.
         if trust == sdk::SourceTrust::Untrusted {
-            self.read_untrusted
+            self.untrusted_read_flag()
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         if trust == sdk::SourceTrust::Untrusted
@@ -551,8 +545,8 @@ impl Agent {
                 .untrusted_seen
                 .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            if let Err(error) = crate::agent::untrusted::record_tainted_turn(
-                self.state.as_ref(),
+            if let Err(error) = crate::untrusted::record_tainted_turn(
+                self.settings(),
                 scope.session_id,
                 scope.turn_id,
             )
@@ -594,7 +588,7 @@ impl Agent {
     /// What happens after a call returned, run from the kernel's `after_tool`
     /// hook: the result is fitted for the model, the receipt, status line and
     /// learning are written, and the kernel gets what the model will read.
-    pub(super) async fn finish_sdk_tool_call(&self, scope: &TurnScope<'_>, check: AfterCallCheck) {
+    pub async fn finish_sdk_tool_call(&self, scope: &TurnScope<'_>, check: AfterCallCheck) {
         let Some(call) = scope.executed_calls.take(check.run_id, &check.call_id) else {
             let _ = check.reply.send(None);
             return;
@@ -608,23 +602,23 @@ impl Agent {
     /// `remote_change`, from its typed effects whatever the tool: the
     /// heartbeat reads it so a goal run never repeats an external action
     /// that already happened.
-    async fn record_remote_change(
+    pub async fn record_remote_change(
         &self,
         tool: &str,
         arguments: &str,
-        metadata: &crate::traits::ToolCallMetadata,
-        status: crate::traits::ToolOutcomeStatus,
+        metadata: &aidaemon_tools::semantics::ToolCallMetadata,
+        status: aidaemon_tools::semantics::ToolOutcomeStatus,
     ) {
-        let Some(task_id) = self.task_id.as_deref() else {
+        let Some(task_id) = self.task_id() else {
             return;
         };
         if !changed_remotely(metadata, status) {
             return;
         }
-        let activity = crate::traits::TaskActivity {
+        let activity = aidaemon_work::goals::TaskActivity {
             id: 0,
             task_id: task_id.to_string(),
-            activity_type: crate::traits::REMOTE_CHANGE_ACTIVITY.to_string(),
+            activity_type: aidaemon_work::goals::REMOTE_CHANGE_ACTIVITY.to_string(),
             tool_name: Some(tool.to_string()),
             tool_args: Some(arguments.to_string()),
             result: None,
@@ -632,12 +626,12 @@ impl Agent {
             tokens_used: None,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
-        if let Err(error) = self.state.log_task_activity(&activity).await {
+        if let Err(error) = self.tasks().log_task_activity(&activity).await {
             warn!(task_id, %error, "Could not record a remote change on its task");
         }
     }
 
-    async fn record_sdk_tool_result(
+    pub async fn record_sdk_tool_result(
         &self,
         scope: &TurnScope<'_>,
         call: ExecutedCall,
@@ -663,20 +657,20 @@ impl Agent {
                 status,
             } => {
                 let evidence =
-                    crate::agent::loop_utils::tool_outcome_evidence_source(&outcome.metadata);
+                    crate::turn::loop_utils::tool_outcome_evidence_source(&outcome.metadata);
                 // What the model sees: untrusted output wrapped, oversized
                 // output capped. Fitted before the receipt so its provenance
                 // records how much the model saw; status and contract binding
                 // stay on the raw result.
                 let fitted = self
                     .fit_tool_result_for_model(
-                        &crate::agent::tool_result_fit::FitScope {
+                        &crate::engine::tool_result_fit::FitScope {
                             tool_name: &request.name,
                             session_id: scope.session_id,
                             task_id: scope.task_id,
                             model: scope.model,
                             emitter: scope.emitter,
-                            mandate_execution: self.mandate_execution.is_some(),
+                            mandate_execution: self.mandate_execution().is_some(),
                             trust: self.call_output_trust(
                                 scope,
                                 &request.name,
@@ -700,7 +694,7 @@ impl Agent {
                 if let Some(provenance) = outcome.metadata.result_provenance.as_mut() {
                     provenance.record_durable_view(&durable, durable_is_summary);
                 }
-                let mut receipt = crate::events::ToolReceiptV1::from_metadata(
+                let mut receipt = aidaemon_events::payloads::ToolReceiptV1::from_metadata(
                     &outcome.metadata,
                     status,
                     evidence,
@@ -726,12 +720,12 @@ impl Agent {
                 // text only.
                 if let Some(info) = outcome.metadata.truncation.as_ref() {
                     output.push('\n');
-                    output.push_str(&crate::utils::render_truncation_notice(info));
+                    output.push_str(&crate::turn::helpers::render_truncation_notice(info));
                 }
                 if let Some(dir) = injected_dir {
                     output.push_str("\n\n");
                     output.push_str(
-                        &crate::agent::ToolResultNotice::PathAutoInjectedFromProjectContext {
+                        &crate::turn::tool_result_notices::ToolResultNotice::PathAutoInjectedFromProjectContext {
                             injected_dir: dir.to_string(),
                         }
                         .render(),
@@ -744,7 +738,7 @@ impl Agent {
                     .filter(|a| a.provenance == AttachmentProvenance::ToolObservation)
                     .collect();
                 let (images, skipped) =
-                    sdk_images(&observed, &self.runtime.vision_config, scope.model);
+                    sdk_images(&observed, &self.turn_runtime().vision_config, scope.model);
                 if skipped {
                     output.push_str(
                         "\n\n[SYSTEM] The image this tool observed could not be shown to you \
@@ -768,22 +762,30 @@ impl Agent {
                     && outcome.metadata.completion_notifications_enabled
                     && !outcome.metadata.detached
                     && outcome.metadata.outcome_status
-                        != Some(crate::traits::ToolOutcomeStatus::FailedPermanent)
+                        != Some(aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent)
                 {
                     scope.open_background_jobs.fetch_add(1, Ordering::Relaxed);
                 }
                 if outcome.metadata.background_settled {
-                    let _ = scope.open_background_jobs.try_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |open| open.checked_sub(1),
-                    );
+                    let jobs = &scope.open_background_jobs;
+                    let mut open = jobs.load(Ordering::Relaxed);
+                    while open > 0 {
+                        match jobs.compare_exchange_weak(
+                            open,
+                            open - 1,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(now) => open = now,
+                        }
+                    }
                 }
                 if outcome.metadata.background_started || outcome.metadata.background_handoff {
                     // A call the tool itself typed as a permanent failure hands
                     // nothing off, whatever it started: the run goes on.
                     let typed_failure = outcome.metadata.outcome_status
-                        == Some(crate::traits::ToolOutcomeStatus::FailedPermanent);
+                        == Some(aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent);
                     // The call that started the job is one open item at most;
                     // a second means the model declared work beyond it.
                     let work_remains = scope.open_checklist_items.load(Ordering::Relaxed) > 1;
@@ -807,11 +809,11 @@ impl Agent {
                         // Without them, the ack says how to check on it.
                         let reply = if outcome.metadata.completion_notifications_enabled {
                             scope.background_handoff.store(true, Ordering::Relaxed);
-                            crate::agent::post_task::build_friendly_background_handoff(
+                            crate::turn::post_task::build_friendly_background_handoff(
                                 scope.user_text,
                             )
                         } else {
-                            crate::agent::tool_execution::build_background_detach_ack(
+                            crate::turn::tool_dispatch::build_background_detach_ack(
                                 &output,
                                 &outcome.metadata,
                             )
@@ -819,12 +821,12 @@ impl Agent {
                         if let Some(finish) = finish.as_mut() {
                             finish.reply = Some(reply);
                         }
-                        crate::agent::system_directives::SystemDirective::BackgroundHandoff {
+                        crate::turn::system_directives::SystemDirective::BackgroundHandoff {
                             notifications_active: outcome.metadata.completion_notifications_enabled,
                         }
                     } else {
                         finish = None;
-                        crate::agent::system_directives::SystemDirective::BackgroundProcessContinue
+                        crate::turn::system_directives::SystemDirective::BackgroundProcessContinue
                     };
                     output = format!("{output}\n\n{}", directive.render());
                 }
@@ -844,7 +846,7 @@ impl Agent {
                             .is_none_or(|reply| reply.trim().is_empty())
                         {
                             finish.reply = Some(
-                                crate::agent::completion_checks::strip_untrusted_wrapper(&output)
+                                crate::turn::completion_checks::strip_untrusted_wrapper(&output)
                                     .to_string(),
                             );
                         }
@@ -866,13 +868,13 @@ impl Agent {
                 // are capped like results.
                 let fitted = self
                     .fit_tool_result_for_model(
-                        &crate::agent::tool_result_fit::FitScope {
+                        &crate::engine::tool_result_fit::FitScope {
                             tool_name: &request.name,
                             session_id: scope.session_id,
                             task_id: scope.task_id,
                             model: scope.model,
                             emitter: scope.emitter,
-                            mandate_execution: self.mandate_execution.is_some(),
+                            mandate_execution: self.mandate_execution().is_some(),
                             trust: self.call_output_trust(
                                 scope,
                                 &request.name,
@@ -885,9 +887,9 @@ impl Agent {
                         &mut metadata,
                     )
                     .await;
-                let status = crate::traits::ToolOutcomeStatus::FailedPermanent;
-                let evidence = crate::agent::loop_utils::tool_outcome_evidence_source(&metadata);
-                let mut receipt = crate::events::ToolReceiptV1::from_metadata(
+                let status = aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent;
+                let evidence = crate::turn::loop_utils::tool_outcome_evidence_source(&metadata);
+                let mut receipt = aidaemon_events::payloads::ToolReceiptV1::from_metadata(
                     &metadata,
                     status,
                     evidence,
@@ -922,7 +924,7 @@ impl Agent {
             let operation = format!(
                 "{}:{}",
                 request.name,
-                crate::agent::prefix_fingerprint::hash_canonical(&request.arguments)
+                crate::prompt::fingerprint::hash_canonical(&request.arguments)
             );
             if let Ok(mut seen) = scope.succeeded_operations.lock() {
                 let new_operation = seen.insert(operation);
@@ -944,8 +946,7 @@ impl Agent {
                 if failed {
                     None
                 } else {
-                    self.engine()
-                        .plan_card(scope.session_id, scope.task_id)
+                    self.plan_card(scope.session_id, scope.task_id)
                         .await
                         .map(StatusUpdate::Checklist)
                 }
@@ -971,14 +972,12 @@ impl Agent {
                     let (name, summary) =
                         self.step_activity(scope, &request.name, arguments, || {
                             if facts.status_from_arguments {
-                                crate::agent::agent_helpers::summarize_tool_args(
+                                crate::turn::tool_summary::summarize_tool_args(
                                     &request.name,
                                     arguments,
                                 )
                             } else {
-                                crate::agent::tool_execution::summarize_completed_tool_result(
-                                    &output,
-                                )
+                                crate::turn::tool_dispatch::summarize_completed_tool_result(&output)
                             }
                         });
                     StatusUpdate::ToolComplete { name, summary }
@@ -999,10 +998,8 @@ impl Agent {
         if external_mutation {
             if let Ok(mut ack) = scope.verdict.external_action_ack.lock() {
                 *ack = (!failed
-                    && crate::agent::tool_execution::should_build_external_action_ack(&output))
-                .then(|| {
-                    crate::agent::tool_execution::build_external_action_completion_ack(&output)
-                });
+                    && crate::turn::tool_dispatch::should_build_external_action_ack(&output))
+                .then(|| crate::turn::tool_dispatch::build_external_action_completion_ack(&output));
             }
         }
         if let Ok(mut learning) = scope.learning.lock() {
@@ -1049,7 +1046,7 @@ impl Agent {
         // The executor's own checklist becomes ledger expectations.
         if facts.requirement_checklist && !failed {
             if let Some(declared) =
-                crate::tools::track_requirements::executor_expectations_from_checklist_arguments(
+                aidaemon_work::plans::checklist_args::executor_expectations_from_checklist_arguments(
                     scope.task_id,
                     arguments,
                 )
@@ -1078,7 +1075,6 @@ impl Agent {
                 // A step the model ticked shows as done only once receipts
                 // prove it: the card is redrawn with what they proved.
                 if let Some(plan) = self
-                    .engine()
                     .confirm_checklist_from_receipts(scope.session_id, scope.task_id)
                     .await
                 {
@@ -1108,28 +1104,28 @@ impl Agent {
     }
 
     /// The dispatcher's context for executing or gating `request`.
-    fn sdk_exec_ctx<'s>(
+    pub fn sdk_exec_ctx<'s>(
         &'s self,
         scope: &'s TurnScope<'_>,
         request: &'s KernelCall,
         ceiling_set: bool,
-        scope_escalation: Option<&'s crate::traits::ScopeEscalation>,
-        turn_authority: Option<&'s crate::agent::authority::InheritedAuthority>,
+        scope_escalation: Option<&'s aidaemon_tools::semantics::ScopeEscalation>,
+        turn_authority: Option<&'s crate::authority::InheritedAuthority>,
     ) -> ToolExecCtx<'s> {
         ToolExecCtx {
             file_fence: scope
                 .spawn_family
                 .active_coordination()
                 .map(|coordination| {
-                    Arc::new(crate::agent::coordination::CallFence {
+                    Arc::new(crate::coordination::CallFence {
                         coordination: coordination.clone(),
                         member: scope.session_id.to_string(),
                         call_id: request.call_id.clone(),
-                        backend: self.execution_backend.clone(),
-                        escalator: crate::agent::coordination::Escalator::new(
-                            self.side_calls.clone(),
-                            self.state.clone(),
-                            self.state.clone(),
+                        backend: self.execution_backend_handle().clone(),
+                        escalator: crate::coordination::Escalator::new(
+                            self.side_calls().clone(),
+                            self.settings_store(),
+                            self.message_log(),
                         ),
                         untrusted_seen: scope.untrusted_seen.load(Ordering::SeqCst),
                     })
@@ -1156,13 +1152,13 @@ impl Agent {
             scope_escalation,
             turn_authority,
             trust_roots: Some((scope.trust_roots.as_slice(), scope.cwd.as_str())),
-            lone_root_call: self.depth == 0 && scope.last_batch_size.load(Ordering::Relaxed) == 1,
+            lone_root_call: self.depth() == 0 && scope.last_batch_size.load(Ordering::Relaxed) == 1,
         }
     }
 
     /// How the kernel judged a call's filesystem scope, without taking the
     /// judgment (the dispatcher takes it when the call runs).
-    fn peek_judgment(&self, scope: &TurnScope<'_>, request: &KernelCall) -> DispatchJudgment {
+    pub fn peek_judgment(&self, scope: &TurnScope<'_>, request: &KernelCall) -> DispatchJudgment {
         let runs_as_judged = self
             .turn_tool(scope, &request.name)
             .is_some_and(|tool| tool.dispatch_facts().runs_as_judged);
@@ -1172,9 +1168,9 @@ impl Agent {
         let judged = scope
             .judged_terminal_calls
             .get(request.run_id, &request.call_id);
-        #[cfg(test)]
-        let judged = match crate::agent::approvals::judgment_seam(scope.session_id) {
-            Some(crate::agent::approvals::JudgmentSeam::DropJudgment) => None,
+        #[cfg(any(test, feature = "testing"))]
+        let judged = match crate::approvals::judgment_seam(scope.session_id) {
+            Some(crate::approvals::JudgmentSeam::DropJudgment) => None,
             _ => judged,
         };
         match judged {
@@ -1185,7 +1181,7 @@ impl Agent {
 
     /// Serve [`hooks::DispatchGate`]: gate the call once and tell the
     /// kernel what was decided.
-    pub(super) async fn serve_sdk_gate(&self, scope: &TurnScope<'_>, request: GateRequest) {
+    pub async fn serve_sdk_gate(&self, scope: &TurnScope<'_>, request: GateRequest) {
         let call = &request.call;
         let outcome = match scope.gate_outcomes.get(call.run_id, &call.call_id) {
             Some(outcome) => outcome,
@@ -1209,7 +1205,7 @@ impl Agent {
     /// new nested project instructions defer the call; a duplicate
     /// `send_file` and a durable replay answer in its place. Refusals and
     /// answers are recorded in the run ledger here.
-    pub(super) async fn sdk_gate_call(
+    pub async fn sdk_gate_call(
         &self,
         scope: &TurnScope<'_>,
         request: &KernelCall,
@@ -1228,7 +1224,7 @@ impl Agent {
             }
         };
         let scope_escalation = match &scope_check {
-            Some(crate::agent::tool_execution::ScopeCheck::Escalatable { reason, escalation }) => {
+            Some(crate::turn::tool_dispatch::ScopeCheck::Escalatable { reason, escalation }) => {
                 info!(
                     tool = %request.name,
                     reads = ?escalation.read_paths,
@@ -1249,7 +1245,7 @@ impl Agent {
                 .map(|tool| {
                     tool.call_annotations_in(
                         arguments,
-                        &crate::traits::TrustRoots::new(&scope.trust_roots),
+                        &aidaemon_tools::semantics::TrustRoots::new(&scope.trust_roots),
                     )
                 })
                 .unwrap_or_default();
@@ -1258,7 +1254,7 @@ impl Agent {
         // A matched skill that references untrusted external content blocks
         // the tools that could act on it.
         let untrusted_block = scope.restrict_untrusted_reference_tools
-            && crate::agent::is_untrusted_external_reference_blocked_tool(&request.name);
+            && crate::turn::helpers::is_untrusted_external_reference_blocked_tool(&request.name);
         let gate = if *judgment == DispatchJudgment::Unjudged {
             Err((unjudged_terminal_refusal(), "kernel_judgment_missing"))
         } else if let Some(reason) = ceiling_denial {
@@ -1267,23 +1263,22 @@ impl Agent {
                     "[AUTHORITY BLOCKED] `{}` is outside what this session allows ({reason}). \
                      Use a permitted tool or report the limitation. {}",
                     request.name,
-                    crate::agent::authority::READ_ONLY_MODE_NOTE
+                    crate::authority::READ_ONLY_MODE_NOTE
                 ),
                 "session_mode_ceiling",
             ))
         } else if untrusted_block {
             Err((
-                crate::agent::tool_execution::blocked_for_untrusted_external_reference_message(
+                crate::turn::tool_dispatch::blocked_for_untrusted_external_reference_message(
                     &request.name,
                     &scope.untrusted_reference_skills,
                 ),
                 "untrusted_external_reference_blocked",
             ))
-        } else if let Some(crate::agent::tool_execution::ScopeCheck::Rejected(reason)) =
-            &scope_check
+        } else if let Some(crate::turn::tool_dispatch::ScopeCheck::Rejected(reason)) = &scope_check
         {
             Err((
-                crate::agent::ToolResultNotice::ScopeLockBlockedResult {
+                crate::turn::tool_result_notices::ToolResultNotice::ScopeLockBlockedResult {
                     tool_name: request.name.clone(),
                     reason: reason.clone(),
                 }
@@ -1318,7 +1313,7 @@ impl Agent {
                     reason_code,
                     "SDK engine: authority gate refused the call"
                 );
-                let call = crate::traits::ToolCall {
+                let call = aidaemon_events::conversation::ToolCall {
                     id: request.call_id.clone(),
                     name: request.name.clone(),
                     arguments: arguments.to_string(),
@@ -1363,7 +1358,7 @@ impl Agent {
         let facts = self.turn_tool_facts(scope, &request.name);
         let send_file_key = facts
             .delivers_files
-            .then(|| crate::agent::loop_utils::extract_send_file_dedupe_key_from_args(arguments))
+            .then(|| crate::turn::loop_utils::extract_send_file_dedupe_key_from_args(arguments))
             .flatten();
         if let Some(key) = &send_file_key {
             let already_sent = scope.sent_files.lock().is_ok_and(|sent| sent.contains(key));
@@ -1375,8 +1370,8 @@ impl Agent {
         // and the canonical arguments: a repeat reuses the durable receipt
         // instead of performing the effect twice.
         let idempotency_key = self.sdk_idempotency_key(scope, request, &call_semantics);
-        let preflight = crate::agent::tool_execution::durable_replay_preflight(
-            self,
+        let preflight = crate::engine::tool_gate::durable_replay_preflight(
+            self.host,
             scope.session_id,
             &request.name,
             arguments,
@@ -1397,11 +1392,11 @@ impl Agent {
     /// The idempotency key for a step-plan call: any call that is not a pure
     /// observation and mutates, has an external side effect, or is not
     /// idempotent.
-    pub(super) fn sdk_idempotency_key(
+    pub fn sdk_idempotency_key(
         &self,
         scope: &TurnScope<'_>,
         request: &KernelCall,
-        semantics: &crate::traits::ToolCallSemantics,
+        semantics: &aidaemon_tools::semantics::ToolCallSemantics,
     ) -> Option<String> {
         let capabilities = self
             .turn_tool(scope, &request.name)
@@ -1412,14 +1407,14 @@ impl Agent {
                 || capabilities.external_side_effect
                 || !capabilities.idempotent);
         needs_key.then(|| {
-            let hash = crate::agent::prefix_fingerprint::hash_canonical(&request.arguments);
+            let hash = crate::prompt::fingerprint::hash_canonical(&request.arguments);
             format!("exec:{}:{}:{hash}", scope.task_id, request.name)
         })
     }
 
     /// A duplicate `send_file` in the same task: record a no-op result and
     /// tell the model the file already went out.
-    pub(super) async fn sdk_suppress_duplicate_send(
+    pub async fn sdk_suppress_duplicate_send(
         &self,
         scope: &TurnScope<'_>,
         request: &KernelCall,
@@ -1429,7 +1424,7 @@ impl Agent {
             tool_call_id = %request.call_id,
             "SDK engine: suppressed a duplicate send_file"
         );
-        let mut call_data = crate::events::ToolCallData::from_tool_call(
+        let mut call_data = aidaemon_events::payloads::ToolCallData::from_tool_call(
             request.call_id.clone(),
             request.name.clone(),
             request.arguments.clone(),
@@ -1461,20 +1456,20 @@ impl Agent {
         }
         sdk::ToolOutput::text(format!(
             "{result_text}\n\n{}",
-            crate::agent::system_directives::SystemDirective::DuplicateSendFileAlreadySent.render()
+            crate::turn::system_directives::SystemDirective::DuplicateSendFileAlreadySent.render()
         ))
     }
 
     /// Act on the durable preflight: replay a completed earlier result
     /// (recorded as a replayed receipt) or refuse an indeterminate repeat.
-    pub(super) async fn sdk_replay_or_block(
+    pub async fn sdk_replay_or_block(
         &self,
         scope: &TurnScope<'_>,
         request: &KernelCall,
         arguments: &str,
-        preflight: &crate::agent::tool_execution::DurableReplayPreflight,
+        preflight: &crate::engine::tool_gate::DurableReplayPreflight,
     ) -> Option<sdk::ToolOutput> {
-        let call = crate::traits::ToolCall {
+        let call = aidaemon_events::conversation::ToolCall {
             id: request.call_id.clone(),
             name: request.name.clone(),
             arguments: arguments.to_string(),
@@ -1482,27 +1477,26 @@ impl Agent {
         };
         if let Some((operation_id, result_id, reason)) = &preflight.replay_invalidation {
             // The earlier effect no longer holds, so the call runs again.
-            self.engine()
-                .emit_decision_point(
-                    scope.emitter,
-                    scope.task_id,
-                    scope.model_calls.load(Ordering::Relaxed) as usize,
-                    crate::events::DecisionType::IdempotencyReceiptInvalidated,
-                    format!(
-                        "Reconciled durable receipt for {} is no longer authoritative",
-                        request.name
-                    ),
-                    serde_json::json!({
-                        "condition": "idempotency_receipt_invalidated",
-                        "tool": request.name,
-                        "tool_call_id": request.call_id,
-                        "operation_id": operation_id,
-                        "result_id": result_id,
-                        "reason": reason,
-                        "engine": "sdk",
-                    }),
-                )
-                .await;
+            self.emit_decision_point(
+                scope.emitter,
+                scope.task_id,
+                scope.model_calls.load(Ordering::Relaxed) as usize,
+                aidaemon_events::payloads::DecisionType::IdempotencyReceiptInvalidated,
+                format!(
+                    "Reconciled durable receipt for {} is no longer authoritative",
+                    request.name
+                ),
+                serde_json::json!({
+                    "condition": "idempotency_receipt_invalidated",
+                    "tool": request.name,
+                    "tool_call_id": request.call_id,
+                    "operation_id": operation_id,
+                    "result_id": result_id,
+                    "reason": reason,
+                    "engine": "sdk",
+                }),
+            )
+            .await;
         }
         if let Some(reason) = &preflight.block_reason {
             if let Err(error) = self
@@ -1513,10 +1507,10 @@ impl Agent {
                     &call,
                     arguments,
                     format!("Error: {reason}"),
-                    crate::traits::ToolOutcomeStatus::Blocked,
-                    crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                    aidaemon_tools::semantics::ToolOutcomeStatus::Blocked,
+                    aidaemon_tools::semantics::ToolInvocationStage::RejectedBeforeDispatch,
                     false,
-                    crate::traits::ToolCallSemantics::default(),
+                    aidaemon_tools::semantics::ToolCallSemantics::default(),
                     None,
                     None,
                     None,
@@ -1528,11 +1522,11 @@ impl Agent {
             return Some(sdk::ToolOutput::error(format!("Error: {reason}")));
         }
         let previous = preflight.replayed_result.as_ref()?;
-        self.engine().emit_decision_point(
+        self.emit_decision_point(
             scope.emitter,
             scope.task_id,
             scope.model_calls.load(Ordering::Relaxed) as usize,
-            crate::events::DecisionType::IdempotencyReceiptReplayed,
+            aidaemon_events::payloads::DecisionType::IdempotencyReceiptReplayed,
             format!(
                 "Replayed durable receipt for {} without repeating I/O",
                 request.name
@@ -1552,7 +1546,7 @@ impl Agent {
             source = %previous.tool_call_id,
             "SDK engine: replayed a durable receipt instead of repeating the call"
         );
-        let mut call_data = crate::events::ToolCallData::from_tool_call(
+        let mut call_data = aidaemon_events::payloads::ToolCallData::from_tool_call(
             request.call_id.clone(),
             request.name.clone(),
             request.arguments.clone(),
@@ -1562,8 +1556,9 @@ impl Agent {
         let _ = scope.emitter.emit(EventType::ToolCall, call_data).await;
         let mut receipt = previous.receipt.clone();
         if let Some(receipt) = receipt.as_mut() {
-            receipt.invocation_stage = crate::traits::ToolInvocationStage::Replayed;
-            receipt.outcome_evidence = crate::events::ToolOutcomeEvidenceSource::DurableReplay;
+            receipt.invocation_stage = aidaemon_tools::semantics::ToolInvocationStage::Replayed;
+            receipt.outcome_evidence =
+                aidaemon_events::payloads::ToolOutcomeEvidenceSource::DurableReplay;
         }
         let output = replay_notice(&previous.result);
         let mut tool = Message::new_runtime(Uuid::new_v4().to_string(), scope.session_id, "tool");
@@ -1596,19 +1591,19 @@ impl Agent {
     /// Resolve nested project instructions for a call's targets. When new
     /// guidance applies, it joins the run's system context and the call is
     /// recorded as deferred, not executed.
-    pub(super) async fn sdk_load_nested_instructions(
+    pub async fn sdk_load_nested_instructions(
         &self,
         scope: &TurnScope<'_>,
         request: &KernelCall,
         arguments: &str,
-        semantics: &crate::traits::ToolCallSemantics,
+        semantics: &aidaemon_tools::semantics::ToolCallSemantics,
     ) -> Option<sdk::ToolOutput> {
-        if self.mandate_execution.is_some() {
+        if self.mandate_execution().is_some() {
             return None;
         }
         let tracker = scope.instruction_tracker.as_ref()?;
-        let targets = crate::agent::tool_execution::project_instruction_targets_for_tool_call(
-            &*self.execution_backend,
+        let targets = crate::turn::project_dir::project_instruction_targets_for_tool_call(
+            &*self.execution_backend_handle(),
             &request.name,
             arguments,
             semantics,
@@ -1619,7 +1614,7 @@ impl Agent {
         let discovered = tracker
             .lock()
             .await
-            .discover_for_targets(self.execution_backend.clone(), &targets)
+            .discover_for_targets(self.execution_backend_handle().clone(), &targets)
             .await;
         let instructions = match discovered {
             Ok(Some(instructions)) => instructions,
@@ -1641,28 +1636,28 @@ impl Agent {
                 instructions.render_for_prompt()
             ));
         }
-        self.engine()
-            .emit_decision_point(
-                scope.emitter,
-                scope.task_id,
-                scope.model_calls.load(Ordering::Relaxed) as usize,
-                crate::events::DecisionType::InstructionsSnapshot,
-                format!("Loaded nested project instructions before {}", request.name),
-                serde_json::json!({
-                    "condition": "jit_project_instructions_discovered",
-                    "tool": request.name,
-                    "targets": &targets,
-                    "sources": &sources,
-                    "action_executed": false,
-                }),
-            )
-            .await;
-        let notice = crate::agent::ToolResultNotice::ProjectInstructionsDiscovered {
-            tool_name: request.name.clone(),
-            sources: sources.join(", "),
-        }
-        .render();
-        let call = crate::traits::ToolCall {
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            scope.model_calls.load(Ordering::Relaxed) as usize,
+            aidaemon_events::payloads::DecisionType::InstructionsSnapshot,
+            format!("Loaded nested project instructions before {}", request.name),
+            serde_json::json!({
+                "condition": "jit_project_instructions_discovered",
+                "tool": request.name,
+                "targets": &targets,
+                "sources": &sources,
+                "action_executed": false,
+            }),
+        )
+        .await;
+        let notice =
+            crate::turn::tool_result_notices::ToolResultNotice::ProjectInstructionsDiscovered {
+                tool_name: request.name.clone(),
+                sources: sources.join(", "),
+            }
+            .render();
+        let call = aidaemon_events::conversation::ToolCall {
             id: request.call_id.clone(),
             name: request.name.clone(),
             arguments: arguments.to_string(),
@@ -1676,10 +1671,10 @@ impl Agent {
                 &call,
                 arguments,
                 notice.clone(),
-                crate::traits::ToolOutcomeStatus::Blocked,
-                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                aidaemon_tools::semantics::ToolOutcomeStatus::Blocked,
+                aidaemon_tools::semantics::ToolInvocationStage::RejectedBeforeDispatch,
                 false,
-                crate::traits::ToolCallSemantics::default(),
+                aidaemon_tools::semantics::ToolCallSemantics::default(),
                 None,
                 None,
                 None,
@@ -1693,21 +1688,21 @@ impl Agent {
 
     /// Outside a mandate run: `Ok(None)`. Inside one: the grant for this exact
     /// call, or the refusal text the model should see.
-    pub(super) async fn sdk_mandate_gate(
+    pub async fn sdk_mandate_gate(
         &self,
         scope: &TurnScope<'_>,
         ctx: &ToolExecCtx<'_>,
         request: &KernelCall,
         arguments: &str,
-    ) -> Result<Option<crate::traits::MandateAuthorityGrant>, String> {
+    ) -> Result<Option<aidaemon_work::mandates::MandateAuthorityGrant>, String> {
         let goal_id = match self.mandate_goal_id_for_tool_exec(ctx.task_id).await {
             Ok(Some(goal_id)) => goal_id,
             Ok(None) => return Ok(None),
             Err(error) => return Err(format!("[MANDATE AUTHORITY BLOCKED] {error}")),
         };
         let semantics = self.sdk_call_semantics(scope, &request.name, arguments);
-        match crate::agent::tool_execution::mandate_gate_for_tool_call(
-            self,
+        match crate::engine::tool_gate::mandate_gate_for_tool_call(
+            self.host,
             &goal_id,
             &request.call_id,
             &request.name,
@@ -1716,17 +1711,17 @@ impl Agent {
         )
         .await
         {
-            Ok(crate::agent::tool_execution::MandateGateDecision::NotApplicable) => Ok(None),
-            Ok(crate::agent::tool_execution::MandateGateDecision::Allow { grant }) => Ok(grant),
-            Ok(crate::agent::tool_execution::MandateGateDecision::Deny { reason }) => {
+            Ok(crate::engine::tool_gate::MandateGateDecision::NotApplicable) => Ok(None),
+            Ok(crate::engine::tool_gate::MandateGateDecision::Allow { grant }) => Ok(grant),
+            Ok(crate::engine::tool_gate::MandateGateDecision::Deny { reason }) => {
                 let is_task_lead = self
-                    .mandate_execution
+                    .mandate_execution()
                     .as_ref()
                     .is_none_or(|fence| fence.worker_task_id == fence.root_task_id);
                 Err(format!(
                     "[MANDATE AUTHORITY BLOCKED] `{}` cannot run in this decision cycle ({reason}). {}",
                     request.name,
-                    crate::mandates::mandate_denial_next_step(&reason, is_task_lead)
+                    aidaemon_work::mandates::policy::mandate_denial_next_step(&reason, is_task_lead)
                 ))
             }
             Err(error) => Err(format!("[MANDATE AUTHORITY BLOCKED] {error}")),
@@ -1739,12 +1734,12 @@ impl Agent {
 fn step_kind(
     tool: &str,
     arguments: &str,
-    facts: &crate::traits::ToolDispatchFacts,
+    facts: &aidaemon_tools::semantics::ToolDispatchFacts,
     mutates: bool,
 ) -> aidaemon_core::card::ActivityKind {
-    crate::tools::sanitize::tool_activity_kind(
+    aidaemon_tools::sanitize::tool_activity_kind(
         tool,
-        &crate::agent::agent_helpers::summarize_tool_args(tool, arguments),
+        &crate::turn::tool_summary::summarize_tool_args(tool, arguments),
         facts.spawns_child_agents,
         mutates,
     )

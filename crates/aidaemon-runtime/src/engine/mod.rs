@@ -11,6 +11,7 @@ use std::time::Duration;
 pub mod budgets;
 pub mod calls;
 pub mod compaction;
+pub mod deferral;
 pub mod hooks;
 pub mod mandate_run;
 pub mod outcome;

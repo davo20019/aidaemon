@@ -136,6 +136,10 @@ impl EngineContext for Agent {
     fn running_children(&self) -> &std::sync::Arc<aidaemon_runtime::spawn::RunningChildren> {
         &self.running_children
     }
+
+    fn file_policy(&self) -> std::sync::Arc<dyn aidaemon_tools::FilePolicy> {
+        crate::tools::daemon_file_policy(self.daemon_paths.clone())
+    }
 }
 
 #[async_trait::async_trait]
@@ -296,6 +300,10 @@ impl TurnHost for Agent {
         &*self.state
     }
 
+    fn settings_store(&self) -> std::sync::Arc<dyn aidaemon_tools::services::SettingsStore> {
+        self.state.clone()
+    }
+
     fn goal_budgets(&self) -> &dyn aidaemon_work::stores::GoalBudgetStore {
         &*self.state
     }
@@ -453,6 +461,11 @@ impl TurnHost for Agent {
 
     fn tools(&self) -> &[std::sync::Arc<dyn crate::traits::Tool>] {
         &self.tools
+    }
+
+    #[cfg(test)]
+    fn execution_budget_override(&self) -> Option<super::ExecutionBudget> {
+        self.execution_budget_override.clone()
     }
 }
 

@@ -168,6 +168,7 @@ pub(in crate::agent) async fn task_has_scheduled_provenance(
     aidaemon_work::scheduled_runs::task_has_scheduled_provenance(&**state, task_id).await
 }
 
+#[cfg(test)]
 pub(in crate::agent) async fn active_scheduled_root_task_id(
     state: &Arc<dyn StateStore>,
     goal_id: &str,

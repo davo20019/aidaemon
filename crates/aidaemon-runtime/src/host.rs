@@ -97,6 +97,8 @@ pub trait EngineContext: Send + Sync {
     fn untrusted_read_flag(&self) -> &std::sync::Arc<std::sync::atomic::AtomicBool>;
     /// The sub-agents running for the requests of this agent's tree.
     fn running_children(&self) -> &std::sync::Arc<crate::spawn::RunningChildren>;
+    /// How the file tools treat the host's own and secret files.
+    fn file_policy(&self) -> std::sync::Arc<dyn aidaemon_tools::FilePolicy>;
 }
 
 /// The limits one turn runs under.
@@ -229,6 +231,8 @@ pub trait TurnHost:
     fn depth(&self) -> usize;
     /// Settings: default alert sessions, goal budget overrides.
     fn settings(&self) -> &dyn aidaemon_tools::services::SettingsStore;
+    /// The settings store, as a shared handle.
+    fn settings_store(&self) -> std::sync::Arc<dyn aidaemon_tools::services::SettingsStore>;
     /// Goals' daily token counters.
     fn goal_budgets(&self) -> &dyn aidaemon_work::stores::GoalBudgetStore;
     /// The notification queue token alerts go through.
@@ -332,4 +336,9 @@ pub trait TurnHost:
     ) -> std::sync::Arc<dyn crate::spawn::ChildAgent>;
     /// The agent's tools (their task-end hooks run when a task ends).
     fn tools(&self) -> &[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>];
+    /// The execution budget a test pins for this agent's turns.
+    #[cfg(any(test, feature = "testing"))]
+    fn execution_budget_override(&self) -> Option<crate::turn::execution_state::ExecutionBudget> {
+        None
+    }
 }

@@ -1,8 +1,8 @@
 //! The turn's hook chain and the daemon-only kernel-side adapters. The
-//! forwarding hooks and bridged tools live in `aidaemon_runtime::engine::hooks`.
+//! forwarding hooks and bridged tools live in `crate::engine::hooks`.
 
 use super::*;
-pub(super) use aidaemon_runtime::engine::hooks::{
+pub use crate::engine::hooks::{
     read_only_tool_names, same_tool_streaks, tool_spec, tool_spec_from_schema, AfterCallRecord,
     BudgetGate, CutoffAdjust, DispatchGate, LedgerStop, ModelRetry, StuckNotice, TextOnlyNext,
     SAME_TOOL_LIMITS,
@@ -10,7 +10,7 @@ pub(super) use aidaemon_runtime::engine::hooks::{
 
 /// Where a hook sits in the turn's `before_tool` chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HookSlot {
+pub enum HookSlot {
     AfterCall,
     Canonical,
     Authority,
@@ -41,30 +41,30 @@ pub(super) enum HookSlot {
 /// after everything else, against the file as it is when the call would run.
 /// No hook after `UntrustedHook` may rewrite a call. The kernel's decline
 /// check runs before all of them.
-pub(super) struct TurnHooks {
-    pub(super) canonical: super::tool_calls::CanonicalCallHook,
-    pub(super) authority: sdk::AuthorityHook,
-    pub(super) same_tool: aidaemon_policies::SameToolStreakGuard,
-    pub(super) ledger: LedgerStop,
-    pub(super) text_only: TextOnlyNext,
-    pub(super) budget: BudgetGate,
-    pub(super) stuck: StuckNotice,
-    pub(super) model_pin: ModelPin,
-    pub(super) cutoff: CutoffAdjust,
-    pub(super) retry: ModelRetry,
-    pub(super) memory: Vec<Arc<dyn sdk::Hook>>,
-    pub(super) protected_paths: aidaemon_tools::ProtectedPathGuard,
-    pub(super) network: aidaemon_tools::NetworkGuard,
-    pub(super) egress: aidaemon_policies::EgressGuard,
-    pub(super) untrusted: sdk::UntrustedHook,
-    pub(super) approval: aidaemon_policies::ApprovalPolicy,
-    pub(super) dispatch: DispatchGate,
-    pub(super) coordination: crate::agent::coordination::CoordinationHook,
-    pub(super) after_call: AfterCallRecord,
+pub struct TurnHooks {
+    pub canonical: super::tool_calls::CanonicalCallHook,
+    pub authority: sdk::AuthorityHook,
+    pub same_tool: aidaemon_policies::SameToolStreakGuard,
+    pub ledger: LedgerStop,
+    pub text_only: TextOnlyNext,
+    pub budget: BudgetGate,
+    pub stuck: StuckNotice,
+    pub model_pin: ModelPin,
+    pub cutoff: CutoffAdjust,
+    pub retry: ModelRetry,
+    pub memory: Vec<Arc<dyn sdk::Hook>>,
+    pub protected_paths: aidaemon_tools::ProtectedPathGuard,
+    pub network: aidaemon_tools::NetworkGuard,
+    pub egress: aidaemon_policies::EgressGuard,
+    pub untrusted: sdk::UntrustedHook,
+    pub approval: aidaemon_policies::ApprovalPolicy,
+    pub dispatch: DispatchGate,
+    pub coordination: crate::coordination::CoordinationHook,
+    pub after_call: AfterCallRecord,
 }
 
 impl TurnHooks {
-    pub(super) fn chain(self) -> Vec<(HookSlot, Arc<dyn sdk::Hook>)> {
+    pub fn chain(self) -> Vec<(HookSlot, Arc<dyn sdk::Hook>)> {
         let mut chain: Vec<(HookSlot, Arc<dyn sdk::Hook>)> = vec![
             (HookSlot::AfterCall, Arc::new(self.after_call)),
             (HookSlot::Canonical, Arc::new(self.canonical)),
@@ -93,9 +93,9 @@ impl TurnHooks {
 /// A computer_use GUI loop pins a vision-capable model for its task; every
 /// later call of the task uses it. Early in the chain, so hooks that size the
 /// request by its model see the one that will answer.
-pub(super) struct ModelPin {
-    pub(super) task_id: String,
-    pub(super) computer_use: Option<Arc<dyn aidaemon_runtime::host::ComputerUseState>>,
+pub struct ModelPin {
+    pub task_id: String,
+    pub computer_use: Option<Arc<dyn crate::host::ComputerUseState>>,
 }
 
 #[async_trait]
@@ -114,19 +114,19 @@ impl sdk::Hook for ModelPin {
 /// report bad ones through the dispatcher; only the goal-actions view of
 /// the memory tool is narrowed here, so the kernel records that refusal in
 /// the run ledger.
-pub(super) fn turn_tool(
+pub fn turn_tool(
     spec: sdk::ToolSpec,
-    tool: Arc<dyn crate::traits::Tool>,
+    tool: Arc<dyn aidaemon_tools::OutcomeTool>,
     goal_actions_only: bool,
     calls: mpsc::Sender<DaemonCall>,
     trust_roots: Arc<Vec<String>>,
-) -> aidaemon_tools::KernelAdapter<dyn crate::traits::Tool> {
-    aidaemon_runtime::engine::hooks::turn_tool(
+) -> aidaemon_tools::KernelAdapter<dyn aidaemon_tools::OutcomeTool> {
+    crate::engine::hooks::turn_tool(
         spec,
         tool,
         Arc::new(move |arguments| {
             if goal_actions_only {
-                crate::agent::memory_plugin::check_goal_action(arguments)?;
+                crate::turn::memory::check_goal_action(arguments)?;
             }
             Ok(())
         }),

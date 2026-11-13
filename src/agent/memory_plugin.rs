@@ -20,7 +20,10 @@ use crate::traits::StateStore;
 #[cfg(test)]
 use crate::types::{ChannelContext, UserRole};
 
-mod opt_out;
+/// Opting a turn out of learning lives in `aidaemon-runtime`.
+mod opt_out {
+    pub(crate) use aidaemon_runtime::turn::opt_out::*;
+}
 #[cfg(test)]
 mod opt_out_tests;
 mod recall;
@@ -29,26 +32,27 @@ mod swap_tests;
 mod system_memory;
 /// What the turn knows about memory tools lives in `aidaemon-runtime`.
 mod tool_facts {
+    #[cfg(test)]
     pub(in crate::agent) use aidaemon_runtime::turn::tool_facts::*;
 }
 mod writer;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use opt_out::{
-    mark_turn_opted_out, set_next_message_private, take_next_message_private, PrivateTurnGuard,
-    SkipLearningTool, OPTED_OUT_REASON,
+    mark_turn_opted_out, set_next_message_private, take_next_message_private, OPTED_OUT_REASON,
 };
 pub(crate) use recall::DaemonRecall;
 pub(crate) use system_memory::SystemMemory;
 #[cfg(test)]
 pub(in crate::agent) use tool_facts::memory_tool_facts;
-pub(in crate::agent) use tool_facts::register_memory_system_tool;
 pub(crate) use writer::{DaemonMemoryWriter, MemoryWrites, WriterSettings};
 
 #[cfg(test)]
 pub(crate) use aidaemon_runtime::turn::memory::MANAGE_MEMORIES_GOAL_ACTIONS;
+#[cfg(test)]
+pub(crate) use aidaemon_runtime::turn::memory::{check_goal_action, memory_parts};
 pub(crate) use aidaemon_runtime::turn::memory::{
-    check_goal_action, daemon_tool_offer, goal_actions_view, memory_parts, DaemonToolOffer,
-    MemoryParts, MemoryPlugin, MemoryTurn, DAEMON_MEMORY_TOOLS,
+    daemon_tool_offer, goal_actions_view, DaemonToolOffer, MemoryParts, MemoryPlugin, MemoryTurn,
+    DAEMON_MEMORY_TOOLS,
 };
 
 /// The memory system this daemon runs with.

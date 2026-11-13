@@ -2009,13 +2009,15 @@ impl Agent {
                     None => None,
                 };
                 let configured = self.configured_trust_roots();
-                let cwd = super::sdk_engine::turn_cwd(&*self.execution_backend);
-                super::sdk_engine::turn_trust_roots(super::sdk_engine::TrustRootSources {
-                    configured: &configured,
-                    cwd: Some(&cwd),
-                    bound_workspace: goal_binding.as_deref(),
-                    ..Default::default()
-                })
+                let cwd = aidaemon_runtime::engine::settings::turn_cwd(&*self.execution_backend);
+                aidaemon_runtime::engine::settings::turn_trust_roots(
+                    aidaemon_runtime::engine::settings::TrustRootSources {
+                        configured: &configured,
+                        cwd: Some(&cwd),
+                        bound_workspace: goal_binding.as_deref(),
+                        ..Default::default()
+                    },
+                )
             }
         };
         let mode_session = inherited.and_then(|inherited| inherited.mode_session.clone());

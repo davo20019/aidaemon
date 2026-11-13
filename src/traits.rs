@@ -77,7 +77,6 @@ pub use memory::{
 };
 #[allow(unused_imports)]
 pub use people::{Person, PersonFact};
-pub use tools::NothingSentError;
 #[cfg(test)]
 pub use tools::ToolCalls;
 #[allow(unused_imports)]

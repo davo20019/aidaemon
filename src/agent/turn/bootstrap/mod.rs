@@ -2,17 +2,13 @@
 //! ([`aidaemon_runtime::turn::bootstrap`]); the agent runs it as its
 //! [`aidaemon_runtime::host::TurnHost`].
 
-/// Task planning and the turn digest live in `aidaemon-runtime`.
 #[cfg(test)]
-pub(crate) mod task_planning {
-    pub(crate) use aidaemon_runtime::turn::task_planning::*;
-}
-
-pub(in crate::agent) use aidaemon_runtime::turn::bootstrap::{
-    BootstrapCtx, BootstrapData, BootstrapOutcome,
-};
+pub(in crate::agent) use aidaemon_runtime::turn::bootstrap::BootstrapData;
+#[cfg(test)]
+pub(in crate::agent) use aidaemon_runtime::turn::bootstrap::{BootstrapCtx, BootstrapOutcome};
 
 /// Bootstrap one turn of `services.agent`.
+#[cfg(test)]
 pub(in crate::agent) async fn run_bootstrap(
     services: &super::services::AgentServices<'_>,
     ctx: &BootstrapCtx<'_>,

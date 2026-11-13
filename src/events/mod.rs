@@ -20,10 +20,8 @@ pub use aidaemon_events::conversation_turn::{
 pub use aidaemon_events::payloads::*;
 #[cfg(test)]
 pub(crate) use aidaemon_events::run_aggregate::RunAggregate;
-pub(crate) use aidaemon_events::run_aggregate::{
-    CloseoutDecision, RunObligationClass, RunObligationState, RunTerminalDecision,
-    OWNER_APPROVAL_DECLINED,
-};
+#[cfg(test)]
+pub(crate) use aidaemon_events::run_aggregate::{RunObligationState, RunTerminalDecision};
 #[cfg(test)]
 pub(crate) use aidaemon_events::store::GeneratedResponseRef;
 pub(crate) use aidaemon_events::store::{capture_generated_responses, CapturedGeneratedResponse};

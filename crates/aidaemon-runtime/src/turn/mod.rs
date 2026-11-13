@@ -21,6 +21,7 @@ pub mod memory;
 pub mod memory_writer;
 pub mod message_build;
 pub mod notes;
+pub mod opt_out;
 pub mod post_task;
 pub mod project_dir;
 pub mod project_instructions;

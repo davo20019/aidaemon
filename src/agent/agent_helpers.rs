@@ -8,8 +8,10 @@
 #[cfg(test)]
 use super::contains_keyword_as_words;
 
+#[cfg(test)]
 pub use aidaemon_runtime::turn::helpers::touch_heartbeat;
 
+#[cfg(test)]
 pub(in crate::agent) use aidaemon_runtime::turn::tool_summary::summarize_tool_args;
 
 /// Legacy intent-gate test fixture. Production routing is model-directed.
@@ -92,8 +94,6 @@ pub(in crate::agent) fn user_explicitly_requests_local_file_inspection(user_text
 
     mentions_local_subject && mentions_inspection_verb
 }
-
-pub(in crate::agent) use aidaemon_runtime::turn::helpers::is_untrusted_external_reference_blocked_tool;
 
 #[cfg(test)]
 mod tests {

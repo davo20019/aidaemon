@@ -3,9 +3,12 @@
 
 pub(crate) use aidaemon_runtime::turn::execution_state::*;
 
+#[cfg(test)]
 use crate::agent::TurnContext;
+#[cfg(test)]
 use crate::traits::AgentRole;
 
+#[cfg(test)]
 pub(in crate::agent) fn select_initial_execution_budget(
     _user_text: &str,
     _turn_context: &TurnContext,

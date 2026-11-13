@@ -13,9 +13,10 @@ use crate::traits::{
     ToolCallContext, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolSemanticFacet,
 };
 
+#[cfg(test)]
+pub use aidaemon_work::plans::checklist_args::executor_expectations_from_checklist_arguments;
 pub use aidaemon_work::plans::checklist_args::{
-    executor_expectations_from_checklist_arguments, parse_expectation_target,
-    parse_expectation_targets, unbound_targets_of, UNBOUND_TARGETS_KEY,
+    parse_expectation_target, parse_expectation_targets, unbound_targets_of, UNBOUND_TARGETS_KEY,
 };
 pub use aidaemon_work::plans::CHECKLIST_HEADER;
 

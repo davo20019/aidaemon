@@ -4442,9 +4442,22 @@ async fn dispatcher_keeps_the_judged_scope() {
 #[test]
 fn no_name_keyed_dispatch_remains() {
     let sources = [
-        ("tool_calls.rs", include_str!("tool_calls.rs")),
-        ("hooks.rs", include_str!("hooks.rs")),
-        ("sdk_engine.rs", include_str!("../sdk_engine.rs")),
+        (
+            "tool_calls.rs",
+            include_str!(
+                "../../../../crates/aidaemon-runtime/src/engine/turn_engine/tool_calls.rs"
+            ),
+        ),
+        (
+            "turn_hooks.rs",
+            include_str!(
+                "../../../../crates/aidaemon-runtime/src/engine/turn_engine/turn_hooks.rs"
+            ),
+        ),
+        (
+            "turn_engine/mod.rs",
+            include_str!("../../../../crates/aidaemon-runtime/src/engine/turn_engine/mod.rs"),
+        ),
         ("approvals.rs", include_str!("../approvals.rs")),
         ("tool_defs.rs", include_str!("../../tools/tool_defs.rs")),
     ];

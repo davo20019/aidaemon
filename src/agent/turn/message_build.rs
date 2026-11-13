@@ -8,6 +8,7 @@ use super::*;
 pub(super) use aidaemon_runtime::turn::message_build::*;
 
 /// Build the provider payload for one iteration of `services.agent`'s turn.
+#[cfg(test)]
 pub(super) async fn build_turn_messages(
     services: &super::services::AgentServices<'_>,
     ctx: &mut MessageBuildCtx<'_>,
