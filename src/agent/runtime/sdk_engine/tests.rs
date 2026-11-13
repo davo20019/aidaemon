@@ -2092,7 +2092,7 @@ async fn tools_declare_their_source_class() {
     let http = crate::tools::HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(
         std::collections::HashMap::new(),
     )));
-    let mcp = crate::mcp::McpTool::detached_for_test(
+    let mcp = crate::mcp::McpTool::detached(
         "acme",
         serde_json::json!({"name": "synthetic_mcp_tool", "description": "x"}),
     );

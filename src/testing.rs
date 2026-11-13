@@ -862,7 +862,7 @@ pub fn fake_mcp_server_path() -> PathBuf {
 /// An MCP registry with the synthetic `fake` server (`fake_mcp_server`)
 /// running: its tools are named `fake__<tool>` and offered on `mcp:fake`.
 pub async fn fake_mcp_registry(state: Arc<SqliteStateStore>) -> crate::mcp::McpRegistry {
-    let registry = crate::mcp::McpRegistry::new(state);
+    let registry = crate::mcp::McpRegistry::new(state, crate::config::secret_store().clone());
     registry
         .add_server(
             "fake",

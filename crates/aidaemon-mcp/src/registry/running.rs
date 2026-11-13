@@ -1,13 +1,25 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aidaemon_mcp::{McpError, McpServer, McpServerSpec};
+use aidaemon_secrets::SecretStore;
+use aidaemon_tools::OutcomeTool as Tool;
+use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::config::{store_in_keychain, McpServerConfig};
-use crate::mcp::McpTool;
-use crate::traits::{DynamicMcpServer, MandateAuthority, McpRegistryStore, Tool};
+use super::{DynamicMcpServer, McpRegistryStore, RegisteredMcpTool};
+use crate::{McpError, McpServer, McpServerSpec};
+
+/// How to start one MCP server: the command, its arguments and the
+/// environment it gets on top of the safe allowlist.
+#[derive(Debug, Deserialize, Clone)]
+pub struct McpServerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
 
 /// A running MCP server entry in the registry.
 pub struct McpServerEntry {
@@ -34,38 +46,42 @@ pub struct ServerInfo {
 }
 
 /// Runtime registry of MCP servers. Clone is cheap (Arc-based).
+///
+/// Server environment values live in `secrets` under `mcp_{server}_{KEY}`;
+/// the store keeps only their key names.
 #[derive(Clone)]
 pub struct McpRegistry {
     servers: Arc<RwLock<HashMap<String, McpServerEntry>>>,
     state: Arc<dyn McpRegistryStore>,
-    mandate_authority: Option<Arc<MandateAuthority>>,
+    secrets: Arc<dyn SecretStore>,
+    mandate_scoped: bool,
 }
 
 impl McpRegistry {
-    pub fn new(state: Arc<dyn McpRegistryStore>) -> Self {
+    pub fn new(state: Arc<dyn McpRegistryStore>, secrets: Arc<dyn SecretStore>) -> Self {
         Self {
             servers: Arc::new(RwLock::new(HashMap::new())),
             state,
-            mandate_authority: None,
+            secrets,
+            mandate_scoped: false,
         }
     }
 
-    /// Create a read/execution view that exposes only MCP tools named in one
-    /// immutable mandate authority snapshot. V1 mandates expose no MCP tools:
-    /// server-advertised safety metadata is not an owner-pinned authority fact.
-    /// The snapshot is retained so a future pinned-manifest implementation can
-    /// safely narrow this view without changing child construction.
-    pub fn scoped_to_mandate(&self, authority: &MandateAuthority) -> Self {
+    /// The view a mandate's run gets: no MCP tools. Server-advertised safety
+    /// metadata is not an owner-pinned authority fact, so a mandate's
+    /// authority never covers a server's tool.
+    pub fn scoped_to_mandate(&self) -> Self {
         Self {
             servers: self.servers.clone(),
             state: self.state.clone(),
-            mandate_authority: Some(Arc::new(authority.clone())),
+            secrets: self.secrets.clone(),
+            mandate_scoped: true,
         }
     }
 
     fn allows_tool_name(&self, tool_name: &str) -> bool {
         let _ = tool_name;
-        self.mandate_authority.is_none()
+        !self.mandate_scoped
     }
 
     /// Validate an MCP server name: lowercase alphanumeric + underscores, 1-32 chars.
@@ -114,7 +130,7 @@ impl McpRegistry {
         let spec = McpServerSpec::new(name, &config.command)
             .with_args(&config.args)
             .with_env(&config.env)
-            .with_options(crate::mcp::server_options());
+            .with_options(super::server_options());
         let server = McpServer::connect(spec)
             .await
             .map_err(|error| start_error(name, error))?;
@@ -142,7 +158,7 @@ impl McpRegistry {
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
         for tool in server.mcp_tools() {
-            let tool = McpTool::wrap(name, tool);
+            let tool = RegisteredMcpTool::wrap(name, tool);
             tool_names.push(tool.name().to_string());
             tools.push(Arc::new(tool));
         }
@@ -215,7 +231,7 @@ impl McpRegistry {
         .unwrap_or_default();
         for key in &env_keys {
             let keychain_key = format!("mcp_{}_{}", name, key);
-            if let Err(e) = delete_from_keychain(&keychain_key) {
+            if let Err(e) = self.secrets.delete(&keychain_key) {
                 warn!(key = %keychain_key, error = %e, "Failed to delete keychain entry");
             }
         }
@@ -229,7 +245,7 @@ impl McpRegistry {
         Self::validate_server_name(name)?;
         Self::validate_env_key(key)?;
         let keychain_key = format!("mcp_{}_{}", name, key);
-        store_in_keychain(&keychain_key, value)?;
+        self.secrets.set(&keychain_key, value)?;
 
         // Update the env_keys in memory and DB.
         // Store only a sentinel — real value stays in keychain only.
@@ -279,7 +295,7 @@ impl McpRegistry {
         let env_keys: Vec<String> = config.env.keys().cloned().collect();
         for key in &env_keys {
             let keychain_key = format!("mcp_{}_{}", name, key);
-            match resolve_from_keychain(&keychain_key) {
+            match self.secrets.get(&keychain_key) {
                 Ok(val) => {
                     resolved_config.env.insert(key.clone(), val);
                 }
@@ -357,7 +373,7 @@ impl McpRegistry {
         let mut env = HashMap::new();
         for key in &env_keys {
             let keychain_key = format!("mcp_{}_{}", server.name, key);
-            match resolve_from_keychain(&keychain_key) {
+            match self.secrets.get(&keychain_key) {
                 Ok(val) => {
                     env.insert(key.clone(), val);
                 }
@@ -476,7 +492,7 @@ impl McpRegistry {
                     .filter(|tool| self.allows_tool_name(tool.name()))
                     .map(|tool| tool.name().to_string())
                     .collect::<Vec<_>>();
-                if self.mandate_authority.is_some() && tool_names.is_empty() {
+                if self.mandate_scoped && tool_names.is_empty() {
                     return None;
                 }
                 Some(ServerInfo {
@@ -484,7 +500,7 @@ impl McpRegistry {
                     command: e.config.command.clone(),
                     args: e.config.args.clone(),
                     tool_names,
-                    env_keys: if self.mandate_authority.is_some() {
+                    env_keys: if self.mandate_scoped {
                         Vec::new()
                     } else {
                         e.config.env.keys().cloned().collect()
@@ -499,7 +515,7 @@ impl McpRegistry {
 
     /// List known MCP servers with enabled status, including disabled dynamic servers.
     pub async fn list_servers_with_status(&self) -> anyhow::Result<Vec<ServerInfo>> {
-        if self.mandate_authority.is_some() {
+        if self.mandate_scoped {
             return Ok(self.list_servers().await);
         }
         let mut merged: HashMap<String, ServerInfo> = self
@@ -687,14 +703,6 @@ fn extract_explicit_mcp_server_refs(user_message: &str) -> Vec<String> {
     }
 
     refs
-}
-
-fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
-    crate::config::resolve_from_keychain(field_name)
-}
-
-fn delete_from_keychain(field_name: &str) -> anyhow::Result<()> {
-    crate::config::delete_from_keychain(field_name)
 }
 
 #[cfg(test)]

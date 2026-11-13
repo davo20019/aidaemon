@@ -1300,14 +1300,7 @@ fn default_folder() -> String {
     "INBOX".to_string()
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct McpServerConfig {
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-}
+pub use aidaemon_mcp::registry::McpServerConfig;
 
 pub use aidaemon_tool_browser::SessionIsolation;
 

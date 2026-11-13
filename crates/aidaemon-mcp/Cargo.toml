@@ -21,20 +21,26 @@ publish = false
 # Builds `fake_mcp_server`, a tiny scripted MCP server used by this crate's
 # tests (and handy for testing your own MCP integrations offline).
 test-server = []
+# The registry of running servers (`registry::McpRegistry`): their tools as
+# `aidaemon-tools` tools, environment values in a `SecretStore`.
+registry = ["dep:aidaemon-tools", "dep:aidaemon-secrets", "dep:tracing"]
 
 [dependencies]
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
+aidaemon-secrets = { version = "0.2.0", path = "../aidaemon-secrets", default-features = false, optional = true }
+aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools", optional = true }
 anyhow = "1"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+tracing = { version = "0.1", optional = true }
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt"] }
 
 [dev-dependencies]
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 # Enables the fake server binary for integration tests.
-aidaemon-mcp = { path = ".", features = ["test-server"] }
+aidaemon-mcp = { path = ".", features = ["test-server", "registry"] }
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt", "rt-multi-thread"] }
 
 [[bin]]

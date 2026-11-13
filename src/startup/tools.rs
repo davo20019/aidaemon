@@ -1423,8 +1423,10 @@ mod tests {
         )
         .await?;
 
-        let mcp_registry =
-            McpRegistry::new(state.clone() as Arc<dyn crate::traits::McpRegistryStore>);
+        let mcp_registry = McpRegistry::new(
+            state.clone() as Arc<dyn crate::traits::McpRegistryStore>,
+            crate::config::secret_store().clone(),
+        );
         let http_profiles: crate::oauth::SharedHttpProfiles =
             Arc::new(tokio::sync::RwLock::new(config.http_auth.clone()));
         let _runtime = register_runtime_tools(

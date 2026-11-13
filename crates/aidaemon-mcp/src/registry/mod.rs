@@ -1,5 +1,19 @@
 //! Runtime-managed MCP servers: the configuration a host keeps for servers
-//! added while it runs, and the store trait that persists it.
+//! added while it runs, and the store trait that persists it. With the
+//! `registry` feature, the registry of running servers and their tools as
+//! `aidaemon-tools` tools.
+
+#[cfg(feature = "registry")]
+mod proxied;
+#[cfg(feature = "registry")]
+mod render;
+#[cfg(feature = "registry")]
+mod running;
+
+#[cfg(feature = "registry")]
+pub use proxied::{mcp_tool_capabilities, server_options, RegisteredMcpTool};
+#[cfg(feature = "registry")]
+pub use running::{McpRegistry, McpServerConfig, McpServerEntry, ServerInfo};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

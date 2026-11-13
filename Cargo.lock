@@ -413,12 +413,15 @@ version = "0.2.0"
 dependencies = [
  "aidaemon-core",
  "aidaemon-mcp",
+ "aidaemon-secrets",
+ "aidaemon-tools",
  "anyhow",
  "async-trait",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
