@@ -117,30 +117,34 @@ impl ComputerHarness for MacOsHarness {
     }
 
     async fn list_apps(&self) -> Result<Vec<AppInfo>, String> {
-        self.check_permissions()?;
-        list_running_apps()
+        blocking(|| {
+            self.check_permissions()?;
+            list_running_apps()
+        })
     }
 
     async fn launch_app(&self, app: &str) -> Result<AppInfo, String> {
-        self.check_permissions()?;
-        // `/usr/bin/open` is deliberately called even when the process is
-        // already running. A macOS app can remain in the process list after its
-        // last window is closed; returning that process unchanged made
-        // launch_app a no-op and the following get_app_state failed with
-        // "No accessible window found for app".
-        let timeout = self.config.action_timeout().max(Duration::from_secs(5));
-        let resolved = open_and_wait_for_running_app(app, timeout)?;
-        if is_prohibited_bundle(&resolved.bundle_id) {
-            return Err(format!(
-                "App '{}' ({}) is blocked by computer_use policy",
-                resolved.name, resolved.bundle_id
-            ));
-        }
-        // `open` returns before the app has necessarily created its AX window.
-        // Wait for window readiness so launch_app's immediate get_app_state is
-        // not exposed to a launch race.
-        wait_for_accessible_window(&resolved, timeout)?;
-        Ok(resolved)
+        blocking(|| {
+            self.check_permissions()?;
+            // `/usr/bin/open` is deliberately called even when the process is
+            // already running. A macOS app can remain in the process list after its
+            // last window is closed; returning that process unchanged made
+            // launch_app a no-op and the following get_app_state failed with
+            // "No accessible window found for app".
+            let timeout = self.config.action_timeout().max(Duration::from_secs(5));
+            let resolved = open_and_wait_for_running_app(app, timeout)?;
+            if is_prohibited_bundle(&resolved.bundle_id) {
+                return Err(format!(
+                    "App '{}' ({}) is blocked by computer_use policy",
+                    resolved.name, resolved.bundle_id
+                ));
+            }
+            // `open` returns before the app has necessarily created its AX window.
+            // Wait for window readiness so launch_app's immediate get_app_state is
+            // not exposed to a launch race.
+            wait_for_accessible_window(&resolved, timeout)?;
+            Ok(resolved)
+        })
     }
 
     async fn get_app_state(
@@ -149,39 +153,43 @@ impl ComputerHarness for MacOsHarness {
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
     ) -> Result<AppSnapshot, String> {
-        self.check_permissions()?;
-        let resolved = resolve_app(app)?;
-        if is_prohibited_bundle(&resolved.bundle_id) {
-            return Err(format!(
-                "App '{}' ({}) is blocked by computer_use policy",
-                resolved.name, resolved.bundle_id
-            ));
-        }
-        capture_app(resolved, &self.config, cache, ctx)
+        blocking(|| {
+            self.check_permissions()?;
+            let resolved = resolve_app(app)?;
+            if is_prohibited_bundle(&resolved.bundle_id) {
+                return Err(format!(
+                    "App '{}' ({}) is blocked by computer_use policy",
+                    resolved.name, resolved.bundle_id
+                ));
+            }
+            capture_app(resolved, &self.config, cache, ctx)
+        })
     }
 
     async fn capture_screenshot(&self, app: &str) -> Result<AppSnapshot, String> {
-        self.check_permissions()?;
-        let resolved = resolve_app(app)?;
-        if is_prohibited_bundle(&resolved.bundle_id) {
-            return Err(format!(
-                "App '{}' ({}) is blocked by computer_use policy",
-                resolved.name, resolved.bundle_id
-            ));
-        }
-        // Image only: no AX walk, no cache.store — so the element generation is
-        // left untouched and a mutation issued after this screenshot is not stale.
-        let png = capture_window_png(resolved.pid, &resolved.name, &self.config)?;
-        Ok(AppSnapshot {
-            generation: 0,
-            bundle_id: resolved.bundle_id,
-            app_name: resolved.name,
-            pid: resolved.pid,
-            window_id: 1,
-            window_title: String::new(),
-            elements: Vec::new(),
-            truncated: false,
-            png,
+        blocking(|| {
+            self.check_permissions()?;
+            let resolved = resolve_app(app)?;
+            if is_prohibited_bundle(&resolved.bundle_id) {
+                return Err(format!(
+                    "App '{}' ({}) is blocked by computer_use policy",
+                    resolved.name, resolved.bundle_id
+                ));
+            }
+            // Image only: no AX walk, no cache.store — so the element generation is
+            // left untouched and a mutation issued after this screenshot is not stale.
+            let png = capture_window_png(resolved.pid, &resolved.name, &self.config)?;
+            Ok(AppSnapshot {
+                generation: 0,
+                bundle_id: resolved.bundle_id,
+                app_name: resolved.name,
+                pid: resolved.pid,
+                window_id: 1,
+                window_title: String::new(),
+                elements: Vec::new(),
+                truncated: false,
+                png,
+            })
         })
     }
 
@@ -192,24 +200,26 @@ impl ComputerHarness for MacOsHarness {
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
     ) -> Result<AppSnapshot, String> {
-        let resolved = resolve_app(app)?;
-        let key = snapshot_key(resolved.bundle_id.clone(), ctx);
-        if let Some(generation) = generation {
-            cache.validate_generation(&key, generation)?;
-        }
-        activate_app(&resolved)?;
-        // Setting a windowless process frontmost does not necessarily create a
-        // window. Re-open it through LaunchServices when needed, then wait for
-        // the new window before capturing state.
-        if !accessible_window_exists(&resolved).unwrap_or(false) {
-            launch_app_process(if resolved.bundle_id.is_empty() {
-                &resolved.name
-            } else {
-                &resolved.bundle_id
-            })?;
-        }
-        wait_for_accessible_window(&resolved, self.config.action_timeout())?;
-        capture_app(resolved, &self.config, cache, ctx)
+        blocking(|| {
+            let resolved = resolve_app(app)?;
+            let key = snapshot_key(resolved.bundle_id.clone(), ctx);
+            if let Some(generation) = generation {
+                cache.validate_generation(&key, generation)?;
+            }
+            activate_app(&resolved)?;
+            // Setting a windowless process frontmost does not necessarily create a
+            // window. Re-open it through LaunchServices when needed, then wait for
+            // the new window before capturing state.
+            if !accessible_window_exists(&resolved).unwrap_or(false) {
+                launch_app_process(if resolved.bundle_id.is_empty() {
+                    &resolved.name
+                } else {
+                    &resolved.bundle_id
+                })?;
+            }
+            wait_for_accessible_window(&resolved, self.config.action_timeout())?;
+            capture_app(resolved, &self.config, cache, ctx)
+        })
     }
 
     async fn click(
@@ -222,67 +232,69 @@ impl ComputerHarness for MacOsHarness {
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
     ) -> Result<(AppSnapshot, Option<u32>, &'static str), String> {
-        let resolved = resolve_app(app)?;
-        let key = snapshot_key(resolved.bundle_id.clone(), ctx);
+        blocking(|| {
+            let resolved = resolve_app(app)?;
+            let key = snapshot_key(resolved.bundle_id.clone(), ctx);
 
-        if let Some(index) = element_index {
-            // Element targeting reads the cached snapshot, so the generation
-            // must still be valid. Coordinate clicks (below) don't touch the
-            // cache and skip this — they need no prior get_app_state.
-            cache.validate_generation(&key, generation)?;
-            let element = cache.element_by_index(&key, generation, index)?.clone();
-            // Make the action visible: move the real pointer onto the target so
-            // the user can see where the agent is clicking (AX-press itself moves
-            // nothing). On by default; AIDAEMON_CU_SHOW_CURSOR=0 disables it.
-            show_cursor_on_element(&element);
-            // Web content frequently accepts an AX press without firing the page's
-            // JS click handler — AX reports success but nothing happens (e.g. a
-            // LinkedIn Like). So for browsers go straight to a real synthetic
-            // cursor click, which does fire web handlers. For native apps prefer
-            // AX-press: it needs no foreground and doesn't move the real cursor.
-            if !is_browser_bundle(&resolved.bundle_id)
-                && press_element_via_ax(resolved.pid, index, &self.config)?
-            {
+            if let Some(index) = element_index {
+                // Element targeting reads the cached snapshot, so the generation
+                // must still be valid. Coordinate clicks (below) don't touch the
+                // cache and skip this — they need no prior get_app_state.
+                cache.validate_generation(&key, generation)?;
+                let element = cache.element_by_index(&key, generation, index)?.clone();
+                // Make the action visible: move the real pointer onto the target so
+                // the user can see where the agent is clicking (AX-press itself moves
+                // nothing). On by default; AIDAEMON_CU_SHOW_CURSOR=0 disables it.
+                show_cursor_on_element(&element);
+                // Web content frequently accepts an AX press without firing the page's
+                // JS click handler — AX reports success but nothing happens (e.g. a
+                // LinkedIn Like). So for browsers go straight to a real synthetic
+                // cursor click, which does fire web handlers. For native apps prefer
+                // AX-press: it needs no foreground and doesn't move the real cursor.
+                if !is_browser_bundle(&resolved.bundle_id)
+                    && press_element_via_ax(resolved.pid, index, &self.config)?
+                {
+                    let refreshed = capture_app(resolved, &self.config, cache, ctx)?;
+                    return Ok((refreshed, Some(index), "ax_press"));
+                }
+                ensure_foreground(&resolved)?;
+                click_element(&element)?;
+                let method = if is_browser_bundle(&resolved.bundle_id) {
+                    "cursor_web"
+                } else {
+                    "cursor"
+                };
                 let refreshed = capture_app(resolved, &self.config, cache, ctx)?;
-                return Ok((refreshed, Some(index), "ax_press"));
+                return Ok((refreshed, Some(index), method));
             }
-            ensure_foreground(&resolved)?;
-            click_element(&element)?;
-            let method = if is_browser_bundle(&resolved.bundle_id) {
-                "cursor_web"
-            } else {
-                "cursor"
-            };
-            let refreshed = capture_app(resolved, &self.config, cache, ctx)?;
-            return Ok((refreshed, Some(index), method));
-        }
 
-        // Coordinate clicks: the model points in normalized image space
-        // ([0, NORMALIZED_COORD_MAX] per axis) over the screenshot it saw. We
-        // translate through the window's live frame to a global point — the
-        // model never handles global desktop coordinates it can't derive from a
-        // window-cropped image. Goes through the synthetic cursor (needs
-        // frontmost); no accessibility snapshot required.
-        let (nx, ny) = match (x, y) {
-            (Some(x), Some(y)) => (x, y),
-            _ => {
-                return Err(
-                    "click requires either element_index/element_title, or both x and y \
-                     normalized coordinates (0-1000, read off the screenshot)"
-                        .to_string(),
-                );
-            }
-        };
-        let frame = window_frame(resolved.pid, &resolved.name)
-            .ok_or_else(|| no_capturable_window_message(resolved.pid, &resolved.name))?;
-        let (px, py) = normalized_to_global_point(nx, ny, frame);
-        ensure_foreground(&resolved)?;
-        click_global_point(px, py)?;
-        Ok((
-            capture_app(resolved, &self.config, cache, ctx)?,
-            None,
-            "coordinate",
-        ))
+            // Coordinate clicks: the model points in normalized image space
+            // ([0, NORMALIZED_COORD_MAX] per axis) over the screenshot it saw. We
+            // translate through the window's live frame to a global point — the
+            // model never handles global desktop coordinates it can't derive from a
+            // window-cropped image. Goes through the synthetic cursor (needs
+            // frontmost); no accessibility snapshot required.
+            let (nx, ny) = match (x, y) {
+                (Some(x), Some(y)) => (x, y),
+                _ => {
+                    return Err(
+                        "click requires either element_index/element_title, or both x and y \
+                         normalized coordinates (0-1000, read off the screenshot)"
+                            .to_string(),
+                    );
+                }
+            };
+            let frame = window_frame(resolved.pid, &resolved.name)
+                .ok_or_else(|| no_capturable_window_message(resolved.pid, &resolved.name))?;
+            let (px, py) = normalized_to_global_point(nx, ny, frame);
+            ensure_foreground(&resolved)?;
+            click_global_point(px, py)?;
+            Ok((
+                capture_app(resolved, &self.config, cache, ctx)?,
+                None,
+                "coordinate",
+            ))
+        })
     }
 
     async fn type_text(
@@ -294,33 +306,35 @@ impl ComputerHarness for MacOsHarness {
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
     ) -> Result<AppSnapshot, String> {
-        let resolved = resolve_app(app)?;
-        let key = snapshot_key(resolved.bundle_id.clone(), ctx);
-        cache.validate_generation(&key, generation)?;
-        // If a target field was named, focus it first so the keystrokes land
-        // there instead of in whatever control currently holds focus. Prefer an
-        // AX press (no foreground needed); fall back to a synthetic cursor click.
-        if let Some(index) = element_index {
-            let element = cache.element_by_index(&key, generation, index)?.clone();
-            show_cursor_on_element(&element);
-            if !press_element_via_ax(resolved.pid, index, &self.config)? {
-                ensure_foreground(&resolved)?;
-                click_element(&element)?;
+        blocking(|| {
+            let resolved = resolve_app(app)?;
+            let key = snapshot_key(resolved.bundle_id.clone(), ctx);
+            cache.validate_generation(&key, generation)?;
+            // If a target field was named, focus it first so the keystrokes land
+            // there instead of in whatever control currently holds focus. Prefer an
+            // AX press (no foreground needed); fall back to a synthetic cursor click.
+            if let Some(index) = element_index {
+                let element = cache.element_by_index(&key, generation, index)?.clone();
+                show_cursor_on_element(&element);
+                if !press_element_via_ax(resolved.pid, index, &self.config)? {
+                    ensure_foreground(&resolved)?;
+                    click_element(&element)?;
+                }
+                // Focusing a text field places the cursor without selecting, so
+                // typing would insert into any leftover content (e.g. a stale URL in
+                // the address bar). Select-all first so the new text replaces it.
+                if is_text_input_element(&element) {
+                    ensure_foreground(&resolved)?;
+                    press_key_combo("Command+a")?;
+                }
             }
-            // Focusing a text field places the cursor without selecting, so
-            // typing would insert into any leftover content (e.g. a stale URL in
-            // the address bar). Select-all first so the new text replaces it.
-            if is_text_input_element(&element) {
-                ensure_foreground(&resolved)?;
-                press_key_combo("Command+a")?;
-            }
-        }
-        ensure_foreground(&resolved)?;
-        let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
-        enigo
-            .text(text)
-            .map_err(|e| format!("Failed to type text: {e}"))?;
-        capture_app(resolved, &self.config, cache, ctx)
+            ensure_foreground(&resolved)?;
+            let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+            enigo
+                .text(text)
+                .map_err(|e| format!("Failed to type text: {e}"))?;
+            capture_app(resolved, &self.config, cache, ctx)
+        })
     }
 
     async fn press_key(
@@ -331,12 +345,14 @@ impl ComputerHarness for MacOsHarness {
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
     ) -> Result<AppSnapshot, String> {
-        let resolved = resolve_app(app)?;
-        let key_id = snapshot_key(resolved.bundle_id.clone(), ctx);
-        cache.validate_generation(&key_id, generation)?;
-        ensure_foreground(&resolved)?;
-        press_key_combo(key)?;
-        capture_app(resolved, &self.config, cache, ctx)
+        blocking(|| {
+            let resolved = resolve_app(app)?;
+            let key_id = snapshot_key(resolved.bundle_id.clone(), ctx);
+            cache.validate_generation(&key_id, generation)?;
+            ensure_foreground(&resolved)?;
+            press_key_combo(key)?;
+            capture_app(resolved, &self.config, cache, ctx)
+        })
     }
 
     async fn scroll(
@@ -349,29 +365,31 @@ impl ComputerHarness for MacOsHarness {
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
     ) -> Result<(AppSnapshot, Option<u32>), String> {
-        let resolved = resolve_app(app)?;
-        let key = snapshot_key(resolved.bundle_id.clone(), ctx);
-        // A named element scopes the scroll to that pane: move the cursor over it
-        // so the wheel events target it. With no element, scroll the focused
-        // window (the common "scroll the page/feed" case).
-        match element_index {
-            Some(index) => {
-                let element = cache.element_by_index(&key, generation, index)?.clone();
-                ensure_foreground(&resolved)?;
-                if let Some(bounds) = element.bounds {
-                    let _ = move_cursor_to_element(&bounds);
+        blocking(|| {
+            let resolved = resolve_app(app)?;
+            let key = snapshot_key(resolved.bundle_id.clone(), ctx);
+            // A named element scopes the scroll to that pane: move the cursor over it
+            // so the wheel events target it. With no element, scroll the focused
+            // window (the common "scroll the page/feed" case).
+            match element_index {
+                Some(index) => {
+                    let element = cache.element_by_index(&key, generation, index)?.clone();
+                    ensure_foreground(&resolved)?;
+                    if let Some(bounds) = element.bounds {
+                        let _ = move_cursor_to_element(&bounds);
+                    }
+                }
+                None => {
+                    cache.validate_generation(&key, generation)?;
+                    ensure_foreground(&resolved)?;
                 }
             }
-            None => {
-                cache.validate_generation(&key, generation)?;
-                ensure_foreground(&resolved)?;
-            }
-        }
-        scroll_direction(direction, pages)?;
-        Ok((
-            capture_app(resolved, &self.config, cache, ctx)?,
-            element_index,
-        ))
+            scroll_direction(direction, pages)?;
+            Ok((
+                capture_app(resolved, &self.config, cache, ctx)?,
+                element_index,
+            ))
+        })
     }
 
     async fn set_value(
@@ -383,19 +401,33 @@ impl ComputerHarness for MacOsHarness {
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
     ) -> Result<(AppSnapshot, u32), String> {
-        let resolved = resolve_app(app)?;
-        let key = snapshot_key(resolved.bundle_id.clone(), ctx);
-        let element = cache
-            .element_by_index(&key, generation, element_index)?
-            .clone();
-        ensure_foreground(&resolved)?;
-        click_element(&element)?;
-        let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
-        enigo.text(value).map_err(|e| e.to_string())?;
-        Ok((
-            capture_app(resolved, &self.config, cache, ctx)?,
-            element_index,
-        ))
+        blocking(|| {
+            let resolved = resolve_app(app)?;
+            let key = snapshot_key(resolved.bundle_id.clone(), ctx);
+            let element = cache
+                .element_by_index(&key, generation, element_index)?
+                .clone();
+            ensure_foreground(&resolved)?;
+            click_element(&element)?;
+            let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+            enigo.text(value).map_err(|e| e.to_string())?;
+            Ok((
+                capture_app(resolved, &self.config, cache, ctx)?,
+                element_index,
+            ))
+        })
+    }
+}
+
+/// Run a synchronous harness call (osascript, AX tree walks, window capture,
+/// polling sleeps) without stalling the async worker it was called on. On a
+/// current-thread runtime (unit tests) it runs inline.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
     }
 }
 
