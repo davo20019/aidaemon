@@ -131,6 +131,13 @@ pub mod channel_checks {
 /// by the mock; the kit itself waits up to [`EVENT_TIMEOUT`] for the
 /// resulting event. Updates injected while `run` is not active should be
 /// delivered when it next runs (as a real platform would).
+///
+/// The kit calls `run` more than once and, between runs, drops the event
+/// receiver before injecting. For a pull channel (polling, a socket) the
+/// mock queues the update. A push channel (a webhook server) cannot queue
+/// for it: make injection best effort, bounded by a timeout, and never
+/// panic when the adapter's listener is not up (a refused connection is a
+/// dropped update, as on a real platform while the adapter is down).
 #[async_trait]
 pub trait ChannelHarness: Send + Sync {
     /// A direct (one-to-one) conversation that `send`, `edit` and `ask` can

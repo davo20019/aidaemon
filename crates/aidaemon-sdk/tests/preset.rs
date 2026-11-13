@@ -182,6 +182,44 @@ async fn memory_is_added_when_asked_for() {
     assert!(names.contains(&"remember_fact"), "{names:?}");
 }
 
+/// Its only effect is a synthetic ticket queue: it touches no files.
+fn no_effects<A>(_: &A) -> aidaemon_sdk::CallEffects {
+    aidaemon_sdk::CallEffects::none()
+}
+
+/// File a synthetic ticket.
+#[tool(write, effects = no_effects)]
+fn file_ticket(title: String) -> String {
+    format!("filed: {title}")
+}
+
+/// A tool that may change things declares it touches no file with its
+/// effects: neither refused under a workspace nor asked about without one.
+#[tokio::test]
+async fn effects_that_name_no_path_vouch_for_a_tool() {
+    for workspace in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = preset("x")
+            .provider(ScriptedProvider::new([
+                tool_calls([call("c1", "file_ticket", json!({"title": "printer"}))]),
+                text("Filed."),
+            ]))
+            .tool(FileTicket);
+        if workspace {
+            agent = agent.workspace(dir.path());
+        }
+        let outcome = agent
+            .build()
+            .await
+            .unwrap()
+            .run("test:synthetic-user", "file it")
+            .await
+            .unwrap();
+        assert!(outcome.is_completed(), "{:?}", outcome.status);
+        assert!(outcome.tool_results()[0].succeeded());
+    }
+}
+
 /// A sub-agent under a preset parent runs without asking the owner: the
 /// delegation declares it changes no file, and the child's own calls are
 /// judged by the child's hooks.
