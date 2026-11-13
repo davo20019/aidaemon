@@ -756,6 +756,47 @@ fn friendly_tool_label(name: &str) -> String {
     .to_string()
 }
 
+/// What kind of work a call is, as every card shows it: from the tool's
+/// typed identity, its dispatch facts (`delegates`) and its admitted
+/// semantics (`mutates`), never from its text. A tool without a kind of
+/// its own reads as a check or a change.
+pub fn tool_activity_kind(
+    name: &str,
+    action: &str,
+    delegates: bool,
+    mutates: bool,
+) -> aidaemon_core::card::ActivityKind {
+    use aidaemon_core::card::ActivityKind;
+    if delegates {
+        return ActivityKind::Delegate;
+    }
+    match name {
+        "spawn_agent" | "cli_agent" => ActivityKind::Delegate,
+        "read_file" => ActivityKind::Read,
+        "search_files" => ActivityKind::Search,
+        "write_file" | "edit_file" => ActivityKind::Write,
+        "terminal" | "run_command" => ActivityKind::Run,
+        "web_search" | "web_fetch" => ActivityKind::Web,
+        "search_history" => ActivityKind::Recall,
+        "manage_memories" | "manage_people" => {
+            let action = action
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if memory_action_is_read(&action) {
+                ActivityKind::Recall
+            } else {
+                ActivityKind::Remember
+            }
+        }
+        "remember_fact" => ActivityKind::Remember,
+        "set_reminder" => ActivityKind::Remind,
+        _ if mutates => ActivityKind::Change,
+        _ => ActivityKind::Check,
+    }
+}
+
 /// Whether a `manage_memories`/`manage_people` action only reads state (so the
 /// status ping should say "checking memory" rather than "updating memory").
 /// Unknown/new actions default to write — never mislabel a mutation as a read.

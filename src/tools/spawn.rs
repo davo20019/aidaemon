@@ -117,7 +117,7 @@ mod tests {
     }
 
     /// The result's header is the run's phase, its one evidence line names
-    /// only typed steps no tool confirmed, and its footer is the measured
+    /// only typed action steps nothing verified, and its footer is the measured
     /// time: what the helper wrote is only the body.
     #[test]
     fn a_runs_result_renders_from_its_record() {
@@ -161,7 +161,7 @@ mod tests {
         assert!(
             unconfirmed.starts_with(
                 "\u{2705} Finished in the background: Site install\n\
-                 Its tools didn't confirm one step: Capture the screenshot.\n\nDone."
+                 I couldn't verify one of its steps: Capture the screenshot.\n\nDone."
             ),
             "{unconfirmed}"
         );
@@ -1916,15 +1916,18 @@ mod child_runtime_tests {
             },
         )
         .unwrap();
-        let step = |line: &str| StatusUpdate::SubAgentProgress {
-            label: "Slow count to 30".into(),
-            progress: line.into(),
+        let step = |line: &str| {
+            StatusUpdate::Helper(aidaemon_core::card::HelperView::running(
+                "Slow count to 30",
+                true,
+                Some(aidaemon_core::card::Step::Output(line.into())),
+            ))
         };
 
-        helper.send(step("running a command: 14")).await.unwrap();
+        helper.send(step("14")).await.unwrap();
         assert!(matches!(
             parent_rx.recv().await,
-            Some(StatusUpdate::SubAgentProgress { .. })
+            Some(StatusUpdate::Helper(view)) if view == runs.get("job-steps").unwrap().view()
         ));
         tokio::time::sleep(HELPER_CARD_EVERY + Duration::from_millis(500)).await;
         assert!(
@@ -1934,7 +1937,7 @@ mod child_runtime_tests {
 
         hub.turn_running
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        helper.send(step("running a command: 15")).await.unwrap();
+        helper.send(step("15")).await.unwrap();
         let card = tokio::time::timeout(HELPER_CARD_EVERY * 3, async {
             loop {
                 if let Some((id, text)) = hub.edits.lock().unwrap().last().cloned() {
@@ -1948,12 +1951,12 @@ mod child_runtime_tests {
         .expect("the kept card shows the helper's step");
         assert!(card.contains("Count slowly to 30"), "{card}");
         assert!(
-            card.contains("Started in the background: Slow count to 30\n🤖 running a command: 15"),
+            card.contains("⏳ Running in the background: Slow count to 30\nRunning a command: 15"),
             "{card}"
         );
         assert_eq!(
-            runs.get("job-steps").and_then(|run| run.step).as_deref(),
-            Some("running a command: 15"),
+            runs.get("job-steps").and_then(|run| run.step),
+            Some(aidaemon_core::card::Step::Output("15".into())),
             "/tasks reads the same step from the run record"
         );
     }
@@ -2172,7 +2175,7 @@ mod child_runtime_tests {
             .unwrap()
             .remove(0);
         assert_eq!(plan.steps[1].status, crate::plans::StepStatus::Failed);
-        assert!(plan.steps[1].helper_not_started);
+        assert!(plan.steps[1].helper_not_started());
         assert!(
             plan.render_compact_checklist()
                 .contains("WordPress install in site-b (didn't run: its helper didn't start)"),
@@ -2195,7 +2198,7 @@ mod child_runtime_tests {
             .unwrap()
             .remove(0);
         assert_eq!(plan.steps[1].status, crate::plans::StepStatus::Background);
-        assert!(!plan.steps[1].helper_not_started);
+        assert!(!plan.steps[1].helper_not_started());
     }
 
     /// Records the card's edits when they land, each landing a while after
@@ -2324,10 +2327,13 @@ mod child_runtime_tests {
         )
         .unwrap();
         helper
-            .send(StatusUpdate::SubAgentProgress {
-                label: "Slow count".into(),
-                progress: "running a command: 13".into(),
-            })
+            .send(StatusUpdate::Helper(
+                aidaemon_core::card::HelperView::running(
+                    "Slow count",
+                    true,
+                    Some(aidaemon_core::card::Step::Output("13".into())),
+                ),
+            ))
             .await
             .unwrap();
         // The step's redraw is now on its way.
@@ -2364,7 +2370,11 @@ mod child_runtime_tests {
         let landed = hub.landed.lock().unwrap().clone();
         let last = landed.last().expect("the finished card was drawn");
         assert!(last.starts_with("✅ Done · 2 of 2 steps"), "{landed:?}");
-        assert!(!last.contains("running a command"), "{landed:?}");
+        assert!(!last.contains("Running a command"), "{landed:?}");
+        assert!(
+            last.ends_with("✅ Finished in the background: Slow count"),
+            "{landed:?}"
+        );
         drop(helper);
     }
 
@@ -2434,7 +2444,7 @@ mod child_runtime_tests {
     struct Surfaces {
         running_card: String,
         running_record: RunPhase,
-        running_lines: Vec<(String, Option<String>)>,
+        running_lines: Vec<aidaemon_core::card::HelperView>,
         message: String,
         final_card: String,
     }
@@ -2495,7 +2505,12 @@ mod child_runtime_tests {
         let records = child.runs.for_chat(session);
         assert_eq!(records.len(), 1, "one record per helper run");
         let running_record = records[0].phase;
-        let running_lines = running_helper_lines(&child.runs, session);
+        let running_lines: Vec<aidaemon_core::card::HelperView> = child
+            .runs
+            .for_chat(session)
+            .iter()
+            .map(aidaemon_runtime::run_state::RunState::view)
+            .collect();
         if cancel {
             child.cancel.cancel();
         }
@@ -2581,7 +2596,11 @@ mod child_runtime_tests {
             );
             assert_eq!(
                 seen.running_lines,
-                vec![("Site install".to_string(), None)],
+                vec![aidaemon_core::card::HelperView::running(
+                    "Site install",
+                    true,
+                    None
+                )],
                 "{case}"
             );
 
@@ -2609,6 +2628,14 @@ mod child_runtime_tests {
             );
             assert!(
                 seen.final_card.contains(step_line),
+                "{case}: {}",
+                seen.final_card
+            );
+            // The card settles to the helper's final header, the same one
+            // its result starts with.
+            assert!(
+                seen.final_card
+                    .ends_with(&format!("{}: Site install", phase.headline())),
                 "{case}: {}",
                 seen.final_card
             );

@@ -45,6 +45,7 @@ impl AgentIngress for ScriptedAgent {
                 .send(StatusUpdate::ToolStart {
                     name: "terminal".into(),
                     summary: "building the synthetic report".into(),
+                    kind: aidaemon_core::card::ActivityKind::Run,
                 })
                 .await;
         }

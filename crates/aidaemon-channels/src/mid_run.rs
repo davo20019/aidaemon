@@ -80,31 +80,24 @@ impl LiveWork {
     /// and steps are noted whichever turn started it.
     pub fn record(&self, session_id: &str, task_id: u64, update: &StatusUpdate) {
         let now = Instant::now();
-        let helper_line = match update {
-            StatusUpdate::HelperStarted { label } => Some((label, None)),
-            StatusUpdate::SubAgentProgress {
-                label,
-                progress: line,
-            } => Some((label, Some(line))),
-            _ => None,
-        };
-        if let Some((label, line)) = helper_line {
+        if let StatusUpdate::Helper(view) = update {
+            let line = crate::live_status::helper_status_words(view);
             let Ok(mut helpers) = self.helpers.lock() else {
                 return;
             };
             let helpers = helpers.entry(session_id.to_string()).or_default();
-            match helpers.iter_mut().find(|h| h.label == *label) {
+            match helpers.iter_mut().find(|h| h.label == view.label) {
                 Some(helper) => {
-                    if let Some(line) = line {
-                        helper.progress = line.clone();
+                    if helper.progress != line {
+                        helper.progress = line;
                         helper.at = now;
                     }
                 }
                 None => {
                     helpers.push(Helper {
                         task_id,
-                        label: label.clone(),
-                        progress: line.cloned().unwrap_or_else(|| "starting".to_string()),
+                        label: view.label.clone(),
+                        progress: line,
                         at: now,
                         started: now,
                     });
@@ -125,11 +118,7 @@ impl LiveWork {
             return;
         };
         let step = match update {
-            StatusUpdate::ToolStart { name, summary } => Some(if summary.trim().is_empty() {
-                name.clone()
-            } else {
-                summary.clone()
-            }),
+            StatusUpdate::ToolStart { kind, .. } => Some(kind.words().to_string()),
             StatusUpdate::ProgressSummary { summary, .. } => Some(summary.clone()),
             StatusUpdate::PlanStepStart {
                 step_index,
@@ -316,23 +305,28 @@ mod tests {
             &StatusUpdate::ToolStart {
                 name: "terminal".into(),
                 summary: "installing the site".into(),
+                kind: aidaemon_core::card::ActivityKind::Run,
             },
         );
         live.record(
             "s",
             7,
-            &StatusUpdate::SubAgentProgress {
-                label: "Set up the blog".into(),
-                progress: "step 2 of 4".into(),
-            },
+            &StatusUpdate::Helper(aidaemon_core::card::HelperView::running(
+                "Set up the blog",
+                true,
+                None,
+            )),
         );
         live.record(
             "s",
             7,
-            &StatusUpdate::SubAgentProgress {
-                label: "Set up the blog".into(),
-                progress: "step 3 of 4".into(),
-            },
+            &StatusUpdate::Helper(aidaemon_core::card::HelperView::running(
+                "Set up the blog",
+                true,
+                Some(aidaemon_core::card::Step::Doing(
+                    aidaemon_core::card::ActivityKind::Write,
+                )),
+            )),
         );
         live.record(
             "s",
@@ -348,13 +342,14 @@ mod tests {
             &StatusUpdate::ToolStart {
                 name: "terminal".into(),
                 summary: "old step".into(),
+                kind: aidaemon_core::card::ActivityKind::Web,
             },
         );
         let work = live.snapshot("s", "Set up two demo sites", Duration::from_secs(300));
-        assert_eq!(work.last_step.as_ref().unwrap().0, "installing the site");
+        assert_eq!(work.last_step.as_ref().unwrap().0, "Running a command");
         assert_eq!(work.plan.as_deref(), Some("☑ one\n☐ two"));
         assert_eq!(work.helpers.len(), 1);
-        assert_eq!(work.helpers[0].progress, "step 3 of 4");
+        assert_eq!(work.helpers[0].progress, "Changing files");
 
         live.end("s", 6);
         assert!(live.snapshot("s", "x", Duration::ZERO).last_step.is_some());

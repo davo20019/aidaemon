@@ -304,8 +304,10 @@ async fn test_full_stack_status_updates_received() {
     let dm_start_shows_command = updates.iter().any(|u| {
         matches!(
             u,
-            StatusUpdate::ToolStart { name, summary }
-                if name == "running a command" && summary.is_empty()
+            StatusUpdate::ToolStart { name, summary, kind }
+                if name == "running a command"
+                    && summary.is_empty()
+                    && *kind == aidaemon_core::card::ActivityKind::Run
         )
     });
     let has_tool_complete = updates.iter().any(

@@ -11,8 +11,14 @@ use crate::semantics::ToolCallContext;
 pub enum StatusUpdate {
     /// Sent before each LLM call (skipped on iteration 0).
     Thinking(usize),
-    /// Sent before each tool execution.
-    ToolStart { name: String, summary: String },
+    /// Sent before each tool execution. `kind` is what every card shows;
+    /// `name` and `summary` are the call's own words for clients that list
+    /// calls.
+    ToolStart {
+        name: String,
+        summary: String,
+        kind: aidaemon_core::card::ActivityKind,
+    },
     /// Streaming output chunk from a tool (e.g., CLI agent progress).
     ToolProgress { name: String, chunk: String },
     /// A tool is paused until the user completes an explicit action, such as
@@ -85,18 +91,16 @@ pub enum StatusUpdate {
     /// Replaces the separate checklist message previously posted by
     /// `track_requirements` directly through the hub.
     Checklist { text: String },
-    /// A sub-agent's own plan progress (`step 2 of 4`), named by its mission.
-    /// The parent's card keeps the parent's checklist and shows this as its
-    /// activity line, so a child's plan never stands in for the whole task.
-    SubAgentProgress { label: String, progress: String },
-    /// A helper (sub-agent) was created, named as the owner reads it. Each
-    /// helper gets its own start line, so parallel helpers never hide each
-    /// other behind one shared activity line.
-    HelperStarted { label: String },
+    /// A helper's record changed: it started, took a step or ended. The
+    /// view is the runtime's record of it, so the live card and the card a
+    /// turn leaves behind show the same thing.
+    Helper(aidaemon_core::card::HelperView),
     /// A step ended by handing its work to something that keeps running: a
-    /// helper (`to_helper`) or a background job. The work has not finished,
-    /// so the step must never read as finished.
-    StepHandedOff { name: String, to_helper: bool },
+    /// helper (`ActivityKind::Delegate`) or a background job. The work has
+    /// not finished, so the step must never read as finished.
+    StepHandedOff {
+        kind: aidaemon_core::card::ActivityKind,
+    },
     /// The latest line a long-running command printed (secrets redacted),
     /// sent at most every few seconds while it runs. A helper's card line
     /// shows it, so a long count or install visibly moves.

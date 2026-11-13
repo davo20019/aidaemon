@@ -19,6 +19,7 @@ mod agent;
 mod approval;
 mod audience;
 mod authority;
+pub mod card;
 mod endpoint;
 mod error;
 mod event;

@@ -896,43 +896,46 @@ fn throttled_status(
             if !immediate && last_sent.is_some_and(|at| now.duration_since(at) < STATUS_INTERVAL) {
                 continue;
             }
-            let _ = surface.say(&status_line(&update)).await;
+            let Some(line) = status_line(&update) else {
+                continue;
+            };
+            let _ = surface.say(&line).await;
             last_sent = Some(tokio::time::Instant::now());
         }
     })
 }
 
-/// The status line for one update, as Markdown.
-pub fn status_line(update: &StatusUpdate) -> String {
-    let progress = |text: String| format!("_{text}_");
-    match update {
-        StatusUpdate::Thinking(_) => progress("Thinking...".to_string()),
-        StatusUpdate::ToolStart { name, summary } => {
-            let mut chars = name.chars();
-            let name: String = match chars.next() {
-                None => String::new(),
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-            };
-            if summary.is_empty() {
-                progress(format!("{name}..."))
-            } else {
-                progress(format!("{name}: {summary}..."))
-            }
-        }
-        StatusUpdate::ToolProgress { name, chunk } => {
+/// The status line for one update, as Markdown, when it has one: progress
+/// in italics, a plan card or a needed action as they are.
+pub fn status_line(update: &StatusUpdate) -> Option<String> {
+    let text = status_text(update)?;
+    Some(match update {
+        StatusUpdate::UserActionRequired { .. } | StatusUpdate::Checklist { .. } => text,
+        _ => format!("_{text}_"),
+    })
+}
+
+/// The plain status text for one update, when it has one. A step reads as
+/// its typed kind in plain words; a tool ending is not a step.
+pub fn status_text(update: &StatusUpdate) -> Option<String> {
+    use aidaemon_core::card::{ActivityKind, Step};
+    let progress = |text: String| text;
+    Some(match update {
+        StatusUpdate::Thinking(_) => progress(format!("{}…", ActivityKind::Think.words())),
+        StatusUpdate::ToolStart { kind, .. } => progress(format!("{}…", kind.words())),
+        StatusUpdate::ToolProgress { chunk, .. } => {
             let preview: String = chunk.chars().take(100).collect();
             let more = if chunk.chars().count() > 100 {
-                "..."
+                "…"
             } else {
                 ""
             };
-            progress(format!("📤 {name}: {preview}{more}"))
+            progress(format!("📤 {preview}{more}"))
         }
         StatusUpdate::UserActionRequired { message } => message.clone(),
-        StatusUpdate::ToolComplete { name, summary } => progress(format!("✓ {name}: {summary}")),
-        StatusUpdate::ToolCancellable { name, task_id } => {
-            progress(format!("⏳ {name} started (task_id: {task_id})"))
-        }
+        StatusUpdate::ToolComplete { .. } => return None,
+        // Bookkeeping for `/stop`: no line of its own.
+        StatusUpdate::ToolCancellable { .. } => return None,
         StatusUpdate::ProgressSummary {
             elapsed_mins,
             summary,
@@ -1008,18 +1011,15 @@ pub fn status_line(update: &StatusUpdate) -> String {
             "💰 Auto-extended token budget {old_budget} → {new_budget} ({extension}/{max_extensions}) — continuing."
         )),
         StatusUpdate::Checklist { text } => text.clone(),
-        StatusUpdate::SubAgentProgress {
-            label,
-            progress: step,
-        } => progress(format!("🤖 {label}: {step}")),
-        StatusUpdate::HelperStarted { label } => {
-            progress(crate::live_status::helper_started_line(label))
+        StatusUpdate::Helper(helper) => {
+            progress(crate::live_status::render_card(&crate::live_status::CardView {
+                helpers: vec![(helper.clone(), None)],
+                ..Default::default()
+            })?)
         }
-        StatusUpdate::StepHandedOff { name, to_helper } => progress(
-            crate::live_status::step_handed_off_line(name, *to_helper),
-        ),
-        StatusUpdate::CommandOutput { name, line } => progress(format!("📤 {name}: {line}")),
-    }
+        StatusUpdate::StepHandedOff { kind } => progress(Step::HandedOff(*kind).words()),
+        StatusUpdate::CommandOutput { line, .. } => progress(Step::Output(line.clone()).words()),
+    })
 }
 
 /// Repeat `send` every `every` until `stop` is cancelled, the heartbeat has
@@ -1121,6 +1121,7 @@ mod tests {
                     .send(StatusUpdate::ToolStart {
                         name: "terminal".into(),
                         summary: "installing the blog".into(),
+                        kind: aidaemon_core::card::ActivityKind::Run,
                     })
                     .await;
             }
@@ -1277,10 +1278,7 @@ mod tests {
             reply.starts_with("Still working on \"Set up two demo sites\""),
             "{reply}"
         );
-        assert!(
-            reply.contains("Latest step: installing the blog"),
-            "{reply}"
-        );
+        assert!(reply.contains("Latest step: Running a command"), "{reply}");
         // Worded differently, it gets the same typed state.
         runner
             .submit(
@@ -1346,7 +1344,7 @@ mod tests {
                 "{notice}"
             );
             assert_eq!(
-                notice.contains("Latest step: installing the blog"),
+                notice.contains("Latest step: Running a command"),
                 unread,
                 "{notice}"
             );
@@ -1459,18 +1457,23 @@ mod tests {
         runner.live.record(
             session,
             7,
-            &StatusUpdate::HelperStarted {
-                label: "Counting agent A".into(),
-            },
+            &StatusUpdate::Helper(aidaemon_core::card::HelperView::running(
+                "Counting agent A",
+                true,
+                None,
+            )),
         );
         runner.live.end(session, 7);
         runner.live.record(
             session,
             7,
-            &StatusUpdate::SubAgentProgress {
-                label: "Counting agent A".into(),
-                progress: "running a command".into(),
-            },
+            &StatusUpdate::Helper(aidaemon_core::card::HelperView::running(
+                "Counting agent A",
+                true,
+                Some(aidaemon_core::card::Step::Doing(
+                    aidaemon_core::card::ActivityKind::Run,
+                )),
+            )),
         );
 
         let surface = Arc::new(Said::default());
@@ -1481,7 +1484,7 @@ mod tests {
         let reply = surface.0.lock().unwrap().last().cloned().unwrap();
         assert!(reply.starts_with("Working in the background:"), "{reply}");
         assert!(
-            reply.contains("\n• Counting agent A: running a command (1m so far)"),
+            reply.contains("\n• Counting agent A: Running a command (1m so far)"),
             "{reply}"
         );
         assert!(
@@ -1572,7 +1575,7 @@ mod tests {
     #[tokio::test]
     async fn tasks_lists_a_helpers_latest_step() {
         let mut work = two_counting_jobs();
-        work[0].step = Some("running a command: 14".into());
+        work[0].step = Some(aidaemon_core::card::Step::Output("14".into()));
         let agent = ScriptedAgent {
             release: tokio::sync::Notify::new(),
             reading: std::sync::Mutex::new(None),
@@ -1582,7 +1585,7 @@ mod tests {
         let running = crate::stop::running_work(&registry, &agent, "s1").await;
         let tasks = crate::slash::render_tasks(&running, &[], chrono::Utc::now(), None);
         assert!(
-            tasks.contains("Sub-agent: Counting agent A – running a command: 14 ("),
+            tasks.contains("Sub-agent: Counting agent A – Running a command: 14 ("),
             "{tasks}"
         );
         assert!(
