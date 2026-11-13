@@ -271,7 +271,6 @@ impl Agent {
             inherited_authority: None,
             root_tools: None, // Root agent — its own tools ARE the root tools
             read_untrusted: Arc::default(),
-            window_keep_from_tracker: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             #[cfg(test)]
             execution_budget_override: None,
             specialists,
@@ -536,7 +535,6 @@ impl Agent {
             inherited_authority: None,
             root_tools,
             read_untrusted: Arc::default(),
-            window_keep_from_tracker: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             #[cfg(test)]
             execution_budget_override: None,
             specialists,

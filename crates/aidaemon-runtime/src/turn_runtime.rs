@@ -145,3 +145,33 @@ pub struct MandateExecutionFence {
     pub attempt_id: String,
     pub lease_token: String,
 }
+
+/// An agent's limits, fixed when it is built and handed on to its children.
+pub struct AgentLimits {
+    pub max_depth: usize,
+    pub iteration_config: crate::settings::IterationLimitConfig,
+    pub max_iterations: usize,
+    pub max_iterations_cap: usize,
+    pub max_response_chars: usize,
+    pub timeout_secs: u64,
+    pub max_facts: usize,
+    pub llm_call_timeout: Option<std::time::Duration>,
+    pub task_token_budget: Option<u64>,
+    pub spawn_family: crate::authority::SpawnFamilyLimits,
+}
+
+impl AgentLimits {
+    /// Absolute timeout ceiling (seconds) a spawned specialist may request.
+    ///
+    /// `timeout_secs` defaults to 300, but a configured `0` means "no parent
+    /// timeout"; in that case we still impose a 1-hour implicit cap so a
+    /// specialist cannot request an unbounded timeout. Encapsulating this here
+    /// keeps the `> 0` guard in one place instead of inline at each call site.
+    pub fn timeout_cap(&self) -> u64 {
+        if self.timeout_secs > 0 {
+            self.timeout_secs
+        } else {
+            3600
+        }
+    }
+}

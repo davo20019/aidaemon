@@ -1128,15 +1128,7 @@ impl TerminalConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct PathAliasConfig {
-    /// Optional alias roots for "projects/..." paths.
-    /// Example:
-    /// [path_aliases]
-    /// projects = ["~/projects"]
-    #[serde(default)]
-    pub projects: Vec<String>,
-}
+pub use aidaemon_runtime::settings::PathAliasConfig;
 
 fn default_initial_timeout_secs() -> u64 {
     30
@@ -1519,22 +1511,7 @@ fn default_skills_enabled() -> bool {
     true
 }
 
-/// Iteration limit configuration for agent loops.
-/// Controls how iteration limits are enforced (or not enforced).
-#[derive(Debug, Deserialize, Clone, Default)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum IterationLimitConfig {
-    /// No iteration limit - run until natural completion, token budget, or timeout.
-    /// This is the recommended default for complex tasks.
-    #[default]
-    Unlimited,
-    /// Soft limit with warnings but no forced termination.
-    /// Agent will be warned at `warn_at` iterations and continue until natural completion.
-    Soft { threshold: usize, warn_at: usize },
-    /// Legacy hard limit behavior (backward compatibility).
-    /// Agent will be forced to stop at `cap` iterations.
-    Hard { initial: usize, cap: usize },
-}
+pub use aidaemon_runtime::settings::IterationLimitConfig;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SubagentsConfig {

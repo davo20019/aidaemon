@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
-use crate::config::{IterationLimitConfig, PathAliasConfig};
+use crate::config::PathAliasConfig;
 use crate::events::EventStore;
 #[cfg(test)]
 use crate::events::TaskStatus;
@@ -40,6 +40,7 @@ use crate::traits::{AgentRole, StateStore, Tool};
 #[cfg(test)]
 use crate::types::ChannelVisibility;
 use crate::types::{ChannelContext, UserRole};
+use aidaemon_runtime::turn_runtime::AgentLimits;
 // Re-export StatusUpdate from types for backwards compatibility
 #[cfg(test)]
 use crate::events::ToolCallInfo;
@@ -252,11 +253,6 @@ pub(in crate::agent) use agent_helpers::{
     user_explicitly_requests_local_file_inspection, user_text_references_filesystem_path,
 };
 
-/// Phase 0 per-session window-boundary memory: `session_id` →
-/// (last `keep_from` index, last oldest-kept persisted message id). Used by
-/// `message_build` to emit an explicit boundary-movement event.
-type WindowBoundaryMemory = Arc<tokio::sync::RwLock<HashMap<String, (usize, Option<String>)>>>;
-
 /// Immutable execution identity for one worker inside one autonomous mandate
 /// decision cycle. The lease token is Rust-side control state and must never be
 /// serialized, logged, or exposed to the model.
@@ -368,14 +364,6 @@ pub struct Agent {
     /// Kept in memory so a taint that could not be recorded still counts
     /// when a parent reads this child's result.
     read_untrusted: Arc<std::sync::atomic::AtomicBool>,
-    /// DEPRECATED (Pillar B Task 7): retired. This tracked the legacy
-    /// sliding-window `keep_from` boundary; the boundary signal is now the
-    /// turn-anchor (`turn_anchors`). The age-ladder/sliding-window block that
-    /// wrote here was deleted in Task 7, so the field is now unused (left in
-    /// place to avoid churning the `Agent` constructor; remove in a later
-    /// cleanup pass). No code reads or writes it.
-    #[allow(dead_code)]
-    window_keep_from_tracker: WindowBoundaryMemory,
     /// Test-only override for the execution budget selected at the start of
     /// the agent loop. When `Some`, `select_initial_execution_budget` is
     /// bypassed and this budget is used instead.
@@ -395,35 +383,6 @@ pub struct Agent {
 
 #[cfg(test)]
 pub(in crate::agent) use system_directives::SystemDirective;
-
-struct AgentLimits {
-    max_depth: usize,
-    iteration_config: IterationLimitConfig,
-    max_iterations: usize,
-    max_iterations_cap: usize,
-    max_response_chars: usize,
-    timeout_secs: u64,
-    max_facts: usize,
-    llm_call_timeout: Option<Duration>,
-    task_token_budget: Option<u64>,
-    spawn_family: authority::SpawnFamilyLimits,
-}
-
-impl AgentLimits {
-    /// Absolute timeout ceiling (seconds) a spawned specialist may request.
-    ///
-    /// `timeout_secs` defaults to 300, but a configured `0` means "no parent
-    /// timeout"; in that case we still impose a 1-hour implicit cap so a
-    /// specialist cannot request an unbounded timeout. Encapsulating this here
-    /// keeps the `> 0` guard in one place instead of inline at each call site.
-    fn timeout_cap(&self) -> u64 {
-        if self.timeout_secs > 0 {
-            self.timeout_secs
-        } else {
-            3600
-        }
-    }
-}
 
 // Goal/task dispatch helpers live in `aidaemon_runtime::goal_dispatch`.
 #[path = "goal_dispatch.rs"]
