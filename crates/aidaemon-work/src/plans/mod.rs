@@ -493,16 +493,32 @@ impl TaskPlan {
     }
 
     /// Record the end of background job `job_id`, as its run record says.
-    /// A step handed to it is completed once every job on it succeeded,
-    /// failed only when one failed (a typed failure), and not done when one
-    /// stopped before finishing. A step that only waited on the job settles
-    /// from the typed ends of the jobs it waited on: done once every one
-    /// succeeded, not done (with the plain reason) as soon as one failed or
-    /// stopped. The plan resolves once nothing is left to run. Returns
-    /// whether any step changed.
+    /// A step handed to several jobs (or waiting on them) settles once the
+    /// last of them ended, from all their typed ends: completed when every
+    /// one succeeded, failed when one failed (a step handed to it; a step
+    /// that only waited on it is not done, with that reason), and not done
+    /// when one stopped before finishing or ended short because the owner
+    /// declined one of its steps. While others still run it stays in the
+    /// background, so a later run's success is never lost (live 2026-11-13:
+    /// the WordPress helper's end marked steps both helpers shared as not
+    /// done, the Drupal helper then finished them, and the card read "1 of
+    /// 5 done" above its helpers' finished lines). The plan resolves once
+    /// nothing is left to run. Returns whether any step changed.
     pub fn settle_background_job(&mut self, job_id: &str, end: JobEnd) -> bool {
         let now = Utc::now();
         let mut changed = false;
+        let short = match end {
+            JobEnd::Succeeded => None,
+            JobEnd::Declined => Some(NotDoneReason::OwnerDeclined),
+            JobEnd::Stopped => Some(NotDoneReason::HelperStopped),
+            JobEnd::Failed => Some(NotDoneReason::WaitedOnFailed),
+        };
+        // The worse of two ends: a failure, then a stop, then a decline.
+        let rank = |reason: NotDoneReason| match reason {
+            NotDoneReason::WaitedOnFailed => 3,
+            NotDoneReason::HelperStopped => 2,
+            _ => 1,
+        };
         for step in &mut self.steps {
             if step.status != StepStatus::Background
                 || !step.background_jobs.iter().any(|job| job == job_id)
@@ -511,55 +527,30 @@ impl TaskPlan {
             }
             changed = true;
             step.background_jobs.retain(|job| job != job_id);
-            if step.waits_on_jobs {
-                // Live 2026-11-13: a step that only waited on a background
-                // job read "(not done)" after the job succeeded. Its runs'
-                // typed ends are what settle it.
-                let not_done = match end {
-                    JobEnd::Succeeded if step.background_jobs.is_empty() => None,
-                    JobEnd::Succeeded => continue,
-                    JobEnd::Stopped => Some(NotDoneReason::HelperStopped),
-                    JobEnd::Declined => Some(NotDoneReason::OwnerDeclined),
-                    JobEnd::Failed => Some(NotDoneReason::WaitedOnFailed),
-                };
-                step.waits_on_jobs = false;
-                step.background_jobs.clear();
-                step.completed_at = Some(now);
-                match not_done {
-                    None => {
-                        step.status = StepStatus::Completed;
-                        step.evidence = StepEvidence::Settled;
-                    }
-                    Some(reason) => {
-                        step.status = StepStatus::Deferred;
-                        step.not_done = Some(reason);
-                    }
-                }
+            if let Some(short) = short {
+                step.not_done = Some(match step.not_done {
+                    Some(earlier) if rank(earlier) >= rank(short) => earlier,
+                    _ => short,
+                });
+            }
+            if !step.background_jobs.is_empty() {
                 continue;
             }
-            match end {
-                JobEnd::Succeeded if step.background_jobs.is_empty() => {
-                    // The helper's run record completed it.
+            // Live 2026-11-13: a step that only waited on a background job
+            // read "(not done)" after the job succeeded. Its runs' typed
+            // ends are what settle it.
+            let waited = std::mem::take(&mut step.waits_on_jobs);
+            step.completed_at = Some(now);
+            match step.not_done {
+                None => {
                     step.status = StepStatus::Completed;
                     step.evidence = StepEvidence::Settled;
-                    step.completed_at = Some(now);
                 }
-                JobEnd::Succeeded => {}
-                JobEnd::Stopped | JobEnd::Declined => {
-                    step.background_jobs.clear();
-                    step.status = StepStatus::Deferred;
-                    step.not_done = Some(if end == JobEnd::Declined {
-                        NotDoneReason::OwnerDeclined
-                    } else {
-                        NotDoneReason::HelperStopped
-                    });
-                    step.completed_at = Some(now);
-                }
-                JobEnd::Failed => {
-                    step.background_jobs.clear();
+                Some(NotDoneReason::WaitedOnFailed) if !waited => {
                     step.status = StepStatus::Failed;
-                    step.completed_at = Some(now);
+                    step.not_done = None;
                 }
+                Some(_) => step.status = StepStatus::Deferred,
             }
         }
         if changed {
@@ -1601,8 +1592,9 @@ mod tests {
         assert!(is_completed_checklist(&card), "{card}");
     }
 
-    /// A step waiting on runs is not done, with the plain reason, as soon as
-    /// one of them failed; a later success of another run does not undo it.
+    /// A step waiting on runs settles once the last of them ended: not
+    /// done, with the plain reason, when one of them failed, even though
+    /// another succeeded.
     #[test]
     fn a_step_waiting_on_a_failed_run_is_not_done_with_the_reason() {
         let mut plan = TaskPlan::new(
@@ -1615,15 +1607,56 @@ mod tests {
         let jobs = vec!["job-a".to_string(), "job-b".to_string()];
         assert!(plan.wait_on_background_jobs(&jobs));
         assert!(plan.settle_background_job("job-a", JobEnd::Failed));
+        assert_eq!(plan.steps[0].status, StepStatus::Background);
+        assert!(!plan.is_finished());
+        assert!(plan.settle_background_job("job-b", JobEnd::Succeeded));
         assert_eq!(plan.steps[0].status, StepStatus::Deferred);
         assert_eq!(plan.steps[0].not_done, Some(NotDoneReason::WaitedOnFailed));
-        assert!(!plan.settle_background_job("job-b", JobEnd::Succeeded));
         assert!(plan.is_finished());
         let card = plan.render_compact_checklist();
         assert!(
             card.contains("wait for the build (not done: the work it waited on failed)"),
             "{card}"
         );
+    }
+
+    /// Live 2026-11-13: the owner declined the WordPress helper's password
+    /// rotation; it ended short while the Drupal helper still ran, and the
+    /// card read "Not done: its helper stopped before it finished · 1 of 5
+    /// done" above its helpers' finished lines. A step both helpers shared
+    /// waits for both; the WordPress step reads why it was not done; the
+    /// header's count is the rows' count.
+    #[test]
+    fn a_declined_helper_reads_as_declined_and_shared_steps_wait_for_every_run() {
+        let mut plan = TaskPlan::new(
+            "synthetic-session",
+            "synthetic-task",
+            "description",
+            vec![
+                "Install Drupal".into(),
+                "Install WordPress".into(),
+                "Screenshot both homepages".into(),
+            ],
+            "track_requirements",
+        );
+        assert!(plan.link_background_job(&[0, 2], "job-drupal"));
+        assert!(plan.link_background_job(&[1, 2], "job-wordpress"));
+        assert!(plan.settle_background_job("job-wordpress", JobEnd::Declined));
+        assert_eq!(plan.steps[1].not_done, Some(NotDoneReason::OwnerDeclined));
+        assert_eq!(plan.steps[2].status, StepStatus::Background);
+        assert!(plan.settle_background_job("job-drupal", JobEnd::Succeeded));
+        assert_eq!(plan.steps[0].status, StepStatus::Completed);
+        assert_eq!(plan.steps[2].status, StepStatus::Deferred);
+        assert_eq!(plan.steps[2].not_done, Some(NotDoneReason::OwnerDeclined));
+        let card = plan.render_compact_checklist();
+        assert!(
+            card.starts_with(
+                "⏭️ Not done: you declined a step its helper asked to take · 1 of 3 done"
+            ),
+            "{card}"
+        );
+        let done_rows = card.lines().filter(|line| line.starts_with('✅')).count();
+        assert_eq!(done_rows, plan.card().done, "{card}");
     }
 
     /// Live 2026-11-13: one helper launched for the Drupal step; the
