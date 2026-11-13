@@ -1,43 +1,7 @@
-//! The untrusted-content rule, daemon side: the pure rule lives in
-//! `aidaemon-runtime`; the agent supplies a mandate run's origin and settles
-//! a turn's interruptions with the verifier.
+//! The untrusted-content rule lives in `aidaemon-runtime`; a mandate run's
+//! origin is [`aidaemon_runtime::turn::notes::TurnNotes::mandate_origin`].
 
-use tracing::warn;
-
-use super::Agent;
 pub(crate) use aidaemon_runtime::untrusted::*;
-
-impl Agent {
-    /// The confirmed mandate as this run's owner request; `None` outside a
-    /// mandate run. A run whose fence no longer matches an owner-confirmed
-    /// policy has no owner request at all, so its egress is refused.
-    pub(in crate::agent) async fn mandate_origin(&self) -> Option<MandateOrigin> {
-        let fence = self.mandate_execution.as_ref()?;
-        let mandate = match self.state.get_mandate(&fence.mandate_id).await {
-            Ok(mandate) => mandate,
-            Err(error) => {
-                warn!(mandate_id = %fence.mandate_id, %error, "Mandate unreadable for the egress check");
-                None
-            }
-        };
-        Some(
-            match mandate.filter(|mandate| {
-                mandate.version == fence.mandate_version
-                    && mandate.authority == fence.authority
-                    && mandate.confirmed_at.is_some()
-            }) {
-                Some(mandate) => MandateOrigin {
-                    request: crate::mandates::verifier_request(&mandate),
-                    trusted: true,
-                },
-                None => MandateOrigin {
-                    request: format!("Stale or unconfirmed mandate {}.", fence.mandate_id),
-                    trusted: false,
-                },
-            },
-        )
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -45,6 +9,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::agent::TurnNotes;
     use serde_json::json;
 
     fn quota_exhausted() -> crate::providers::ProviderError {

@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use super::TurnNotes;
+
 use tracing::{error, info, warn};
 
 use crate::events::TaskOutcome;

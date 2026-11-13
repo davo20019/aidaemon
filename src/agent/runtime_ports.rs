@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use super::Agent;
+use super::TurnNotes;
 use crate::runtime_ports::{
     AgentIngress, AssistantNoteSink, ChannelAgentRuntime, ChildAgentRequest, ChildAgentRun,
     ChildAgentRuntime, ConversationRequest, ConversationRuntime, DaemonAgentRuntime,

@@ -209,6 +209,8 @@ mod spawn;
 mod turn_host;
 /// What the owner reads for a helper on cards, status lines and timing.
 pub(crate) use aidaemon_runtime::spawn::child_status_label as helper_card_label;
+/// Session notes and parent-visible deliveries, on any TurnHost.
+pub(crate) use aidaemon_runtime::turn::notes::TurnNotes;
 /// The session history appends and turn-context assembly, on any TurnHost.
 pub(in crate::agent) use aidaemon_runtime::turn::turn_context::TurnHistory;
 /// The speech-to-text fallback lives in `aidaemon-runtime`.
