@@ -1,84 +1,16 @@
-//! The daemon's policy for the SDK file tools.
+//! The file tools' policy is `aidaemon_tools::HostFilePolicy`, set up in
+//! `startup::tool_config`. This module keeps the test helpers that run a file
+//! tool behind the protected-path guard, as the dispatcher does.
 
 #[cfg(test)]
 use crate::traits::ToolCalls as _;
+#[cfg(test)]
 use std::path::Path;
-use std::sync::Arc;
-
-use aidaemon_core::CallEffects;
-use aidaemon_tools::FilePolicy;
-use async_trait::async_trait;
-
-use super::{command_effects, fs_utils};
-use crate::execution::{BackendPath, ExecutionBackend, SharedExecutionBackend};
 
 pub use aidaemon_tools::path_class::DaemonPaths;
 
-struct DaemonFilePolicy {
-    paths: DaemonPaths,
-}
+pub(crate) use crate::startup::tool_config::daemon_file_policy;
 
-#[async_trait]
-impl FilePolicy for DaemonFilePolicy {
-    fn is_secret(&self, path: &Path) -> bool {
-        self.paths.is_secret(path)
-    }
-
-    fn is_secret_ignoring_name_shape(&self, path: &Path) -> bool {
-        self.paths.is_secret_ignoring_name_shape(path)
-    }
-
-    fn is_sensitive(&self, path: &Path) -> bool {
-        self.paths.is_sensitive(path)
-    }
-
-    fn attaches_images(&self) -> bool {
-        true
-    }
-
-    fn refusal_hint(&self, path: &Path) -> Option<String> {
-        self.paths.is_own_file(path).then(|| {
-            "This is one of aidaemon's own files, which change only through manage_config: \
-             read the config with manage_config action 'read' (secrets hidden), and change one \
-             setting with 'set' or 'unset'."
-                .to_string()
-        })
-    }
-
-    fn shell_tool_name(&self) -> &str {
-        "terminal"
-    }
-
-    fn delivery_hint(&self) -> Option<&str> {
-        Some("When the file is complete, deliver it with send_file instead of pasting it inline.")
-    }
-
-    fn keeps_backups(&self) -> bool {
-        true
-    }
-
-    async fn backup_before_overwrite(&self, backend: &SharedExecutionBackend, path: &BackendPath) {
-        fs_utils::backup_before_overwrite(backend, path, file_backup_root().as_deref()).await;
-    }
-
-    async fn post_write_diagnostics(&self, backend: &dyn ExecutionBackend, path: &Path) -> String {
-        fs_utils::post_write_diagnostics(backend, path).await
-    }
-
-    fn write_effects(&self, backend: &dyn ExecutionBackend, arguments: &str) -> CallEffects {
-        command_effects::file_tool_write_effects(backend, arguments)
-    }
-
-    fn plants_configuration(&self, path: &str) -> bool {
-        command_effects::is_git_config_path(path)
-    }
-}
-
-pub(crate) fn daemon_file_policy(paths: DaemonPaths) -> Arc<dyn FilePolicy> {
-    Arc::new(DaemonFilePolicy { paths })
-}
-
-/// Run `tool` the way a turn does: the protected-path guard first.
 #[cfg(test)]
 pub(crate) async fn guarded_call(
     tool: &dyn crate::traits::Tool,
@@ -107,16 +39,8 @@ pub(crate) async fn guarded_call_protecting(
 }
 
 /// Where the file tools keep pre-change copies of local files.
-#[cfg(not(test))]
-pub(crate) fn file_backup_root() -> Option<std::path::PathBuf> {
-    Some(dirs::home_dir()?.join(".aidaemon").join("file-backups"))
-}
-
-/// Tests never write into the real home directory.
 #[cfg(test)]
-pub(crate) fn file_backup_root() -> Option<std::path::PathBuf> {
-    Some(std::env::temp_dir().join("aidaemon-test-file-backups"))
-}
+pub(crate) use crate::startup::tool_config::file_backup_root;
 
 #[cfg(test)]
 mod tests {

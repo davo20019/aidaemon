@@ -109,8 +109,8 @@ pub use exec::{
 };
 pub use fs::{
     format_with_line_numbers, render_read_file_output, render_read_file_output_within, EditFile,
-    FilePolicy, ProtectedPathGuard, ReadFile, ToolText, WorkspaceBackend, WorkspaceFilePolicy,
-    WriteFile, DEFAULT_IGNORE_DIRS, MAX_READ_CHARS,
+    FilePolicy, HostFilePolicy, HostFilePolicySettings, ProtectedPathGuard, ReadFile, ToolText,
+    WorkspaceBackend, WorkspaceFilePolicy, WriteFile, DEFAULT_IGNORE_DIRS, MAX_READ_CHARS,
 };
 pub use outcome::{CallValidator, KernelAdapter, NothingSentError, OutcomeRunner, OutcomeTool};
 pub use path_class::PathClassifier;

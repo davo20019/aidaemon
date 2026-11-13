@@ -14,5 +14,6 @@ pub mod runtime;
 pub mod skills;
 pub mod stores;
 pub(crate) mod terminal_bridge;
+pub(crate) mod tool_config;
 pub mod tools;
 pub mod wiring;

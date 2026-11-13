@@ -157,6 +157,100 @@ impl FilePolicy for WorkspaceFilePolicy {
     }
 }
 
+/// What a [`HostFilePolicy`] says and keeps, as the application words it.
+#[derive(Debug, Clone, Default)]
+pub struct HostFilePolicySettings {
+    /// The tool named in hints that suggest running a command.
+    pub shell_tool_name: String,
+    /// A sentence added after an append, on delivering the finished file.
+    pub delivery_hint: Option<String>,
+    /// Where to go instead when the refused path is one of the
+    /// application's own files.
+    pub own_file_hint: Option<String>,
+    /// Keep a copy of a file before it is replaced, under `backup_root`.
+    pub keeps_backups: bool,
+    /// Where backups go (`None`: none is kept).
+    pub backup_root: Option<std::path::PathBuf>,
+}
+
+/// The policy for file tools on the host's own filesystem: secret and
+/// sensitive paths (and the application's own files) by [`DaemonPaths`],
+/// images as attachments, backups before an overwrite, a syntax check after
+/// a write, and the effects of a write (git configuration among them).
+///
+/// [`DaemonPaths`]: crate::path_class::DaemonPaths
+#[derive(Debug, Clone)]
+pub struct HostFilePolicy {
+    paths: crate::path_class::DaemonPaths,
+    settings: HostFilePolicySettings,
+}
+
+impl HostFilePolicy {
+    /// A policy protecting `paths`, worded by `settings`.
+    pub fn new(paths: crate::path_class::DaemonPaths, settings: HostFilePolicySettings) -> Self {
+        Self { paths, settings }
+    }
+}
+
+#[async_trait]
+impl FilePolicy for HostFilePolicy {
+    fn is_secret(&self, path: &Path) -> bool {
+        self.paths.is_secret(path)
+    }
+
+    fn is_secret_ignoring_name_shape(&self, path: &Path) -> bool {
+        self.paths.is_secret_ignoring_name_shape(path)
+    }
+
+    fn is_sensitive(&self, path: &Path) -> bool {
+        self.paths.is_sensitive(path)
+    }
+
+    fn attaches_images(&self) -> bool {
+        true
+    }
+
+    fn refusal_hint(&self, path: &Path) -> Option<String> {
+        self.settings
+            .own_file_hint
+            .clone()
+            .filter(|_| self.paths.is_own_file(path))
+    }
+
+    fn shell_tool_name(&self) -> &str {
+        &self.settings.shell_tool_name
+    }
+
+    fn delivery_hint(&self) -> Option<&str> {
+        self.settings.delivery_hint.as_deref()
+    }
+
+    fn keeps_backups(&self) -> bool {
+        self.settings.keeps_backups
+    }
+
+    async fn backup_before_overwrite(&self, backend: &SharedBackend, path: &BackendPath) {
+        crate::fs_utils::backup_before_overwrite(
+            backend,
+            path,
+            self.settings.backup_root.as_deref(),
+        )
+        .await;
+    }
+
+    async fn post_write_diagnostics(&self, backend: &dyn ExecutionBackend, path: &Path) -> String {
+        crate::fs_utils::post_write_diagnostics(backend, path).await
+    }
+
+    fn write_effects(&self, backend: &dyn ExecutionBackend, arguments: &str) -> CallEffects {
+        crate::command_effects::file_tool_write_effects(backend, arguments)
+    }
+
+    fn plants_configuration(&self, path: &str) -> bool {
+        crate::command_effects::is_git_config_path(path)
+    }
+}
+
 pub(crate) fn workspace_parts(workspace: Workspace) -> (SharedBackend, Arc<dyn FilePolicy>) {
     let policy = Arc::new(WorkspaceFilePolicy::new(workspace.clone()));
     (Arc::new(WorkspaceBackend::new(workspace)), policy)
@@ -180,4 +274,32 @@ pub fn format_with_line_numbers(content: &str, start_line: usize) -> String {
         .map(|(i, line)| format!("{:>width$} | {}", start_line + i + 1, line, width = width))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::path_class::DaemonPaths;
+
+    #[test]
+    fn host_policy_points_own_files_to_the_hint_and_protects_them() {
+        let own = Path::new("/synthetic/app/config.toml");
+        let policy = HostFilePolicy::new(
+            DaemonPaths::new(vec![own.to_path_buf()]),
+            HostFilePolicySettings {
+                shell_tool_name: "terminal".to_string(),
+                own_file_hint: Some("use the config tool".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(policy.is_sensitive(own));
+        assert_eq!(
+            policy.refusal_hint(own).as_deref(),
+            Some("use the config tool")
+        );
+        assert_eq!(policy.refusal_hint(Path::new("/synthetic/other.rs")), None);
+        assert_eq!(policy.shell_tool_name(), "terminal");
+        assert!(!policy.keeps_backups());
+        assert!(policy.plants_configuration("/repo/.git/config"));
+    }
 }

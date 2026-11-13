@@ -75,6 +75,7 @@ REEXPORTS = {
     "oauth",
     "router.rs",
     "skills",
+    "tools",
     "traits",
     "traits.rs",
     "types.rs",
@@ -83,7 +84,6 @@ REEXPORTS = {
 
 # Behavior still in the app, and the plan step that moves it.
 PENDING = {
-    "tools": "9.4: spawn (tests only), file policy and the read/write/edit/search_files wrappers",
     "state": "9.3/9.6: the SQLite store behind the facade traits",
     "memory": "9.1/9.6: memory host adapters, procedures, task learning, retention",
 }

@@ -4,27 +4,8 @@
 
 pub use aidaemon_work::tools::manage_mandates::*;
 
-/// The daemon's filesystem skills under `dir`, as mandate strategies read
-/// them.
-pub(crate) fn strategy_skills_dir(dir: std::path::PathBuf) -> std::sync::Arc<dyn StrategySkills> {
-    std::sync::Arc::new(SkillsDirStrategies(dir))
-}
-
-struct SkillsDirStrategies(std::path::PathBuf);
-
-impl StrategySkills for SkillsDirStrategies {
-    fn find(&self, name: &str) -> Option<StrategySkill> {
-        let skills = crate::skills::load_skills(&self.0);
-        let skill = crate::skills::find_skill_by_name(&skills, name)?;
-        Some(StrategySkill {
-            name: skill.name.clone(),
-            description: skill.description.clone(),
-            body: crate::tools::sanitize::sanitize_external_content(&skill.body),
-            source: skill.source.clone(),
-            canonical: skill.to_markdown(),
-        })
-    }
-}
+#[cfg(test)]
+use crate::startup::tool_config::strategy_skills_dir;
 
 #[cfg(test)]
 mod tests {

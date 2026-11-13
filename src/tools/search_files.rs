@@ -1,37 +1,13 @@
-//! `search_files` is implemented in `aidaemon-tools`. This module holds the
-//! daemon's wording and policy for it, and the tests of its behaviour on the
-//! daemon's execution backend.
+//! Tests of `search_files` (`aidaemon-tools`, worded and given its policy in
+//! `startup::tool_config`) on the daemon's execution backend.
 
 #[cfg(test)]
 use crate::traits::Tool;
-use aidaemon_tools::ToolText;
 #[cfg(test)]
 use serde_json::json;
 
-use super::file_policy::{daemon_file_policy, DaemonPaths};
-use crate::execution::SharedExecutionBackend;
-
-/// The daemon's constructors for the SDK's [`aidaemon_tools::SearchFiles`].
-pub struct SearchFilesTool;
-
-#[allow(clippy::new_ret_no_self)]
-impl SearchFilesTool {
-    /// Without the daemon's own files protected; production passes them.
-    #[cfg(test)]
-    pub fn new(backend: SharedExecutionBackend) -> aidaemon_tools::SearchFiles {
-        Self::on_backend(backend, DaemonPaths::default())
-    }
-
-    pub fn on_backend(
-        backend: SharedExecutionBackend,
-        paths: DaemonPaths,
-    ) -> aidaemon_tools::SearchFiles {
-        aidaemon_tools::SearchFiles::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
-                short: "Search for files by name pattern or content regex".to_string(),
-                schema: "Search for files by name pattern (glob) and/or content (regex). Use this instead of terminal find/grep. Automatically skips .git, node_modules, target, etc.".to_string(),
-            })
-    }
-}
+#[cfg(test)]
+use super::SearchFilesTool;
 
 #[cfg(test)]
 mod tests {

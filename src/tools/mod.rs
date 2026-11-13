@@ -85,7 +85,6 @@ pub use manage_goal_tasks::ManageGoalTasksTool;
 pub mod report_blocker;
 pub use aidaemon_client_gateway::client_view::ClientViewTool;
 pub use aidaemon_skills::tools::{ManageSkillsTool, SkillResourcesTool, UseSkillTool};
-pub(crate) use aidaemon_tools::command_effects;
 pub use aidaemon_tools::command_risk;
 pub use manage_mcp::ManageMcpTool;
 pub use report_blocker::ReportBlockerTool;
@@ -93,12 +92,13 @@ pub use report_blocker::ReportBlockerTool;
 // Deterministic tools
 pub(crate) use aidaemon_tools::fs_utils;
 mod read_file;
-pub use read_file::ReadFileTool;
+pub use crate::startup::tool_config::ReadFileTool;
 mod write_file;
-pub use write_file::WriteFileTool;
+pub use crate::startup::tool_config::WriteFileTool;
 mod edit_file;
-pub use edit_file::EditFileTool;
+pub use crate::startup::tool_config::EditFileTool;
 mod search_files;
+pub use crate::startup::tool_config::SearchFilesTool;
 pub(crate) use aidaemon_runtime::tools::run_command;
 pub use aidaemon_tools::check_environment::CheckEnvironmentTool;
 pub use aidaemon_tools::checkpoints::ListCheckpointsTool;
@@ -107,7 +107,6 @@ pub use aidaemon_tools::git_info::GitInfoTool;
 pub use aidaemon_tools::project_inspect::ProjectInspectTool;
 pub use aidaemon_tools::service_status::ServiceStatusTool;
 pub use run_command::RunCommandTool;
-pub use search_files::SearchFilesTool;
 
 #[cfg(test)]
 mod execution_backend_injection_tests;

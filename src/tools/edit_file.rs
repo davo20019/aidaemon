@@ -1,38 +1,13 @@
-//! `edit_file` is implemented in `aidaemon-tools`. This module holds the daemon's
-//! wording and policy for it, and the tests of its behaviour on the daemon's
-//! execution backend.
-
-use aidaemon_tools::ToolText;
+//! Tests of `edit_file` (`aidaemon-tools`, worded and given its policy in
+//! `startup::tool_config`) on the daemon's execution backend.
 
 #[cfg(test)]
 use crate::traits::Tool;
 #[cfg(test)]
 use serde_json::json;
 
-use super::file_policy::{daemon_file_policy, DaemonPaths};
-use crate::execution::SharedExecutionBackend;
-
-/// The daemon's constructors for the SDK's [`aidaemon_tools::EditFile`].
-pub struct EditFileTool;
-
-#[allow(clippy::new_ret_no_self)]
-impl EditFileTool {
-    /// Without the daemon's own files protected; production passes them.
-    #[cfg(test)]
-    pub fn new(backend: SharedExecutionBackend) -> aidaemon_tools::EditFile {
-        Self::on_backend(backend, DaemonPaths::default())
-    }
-
-    pub fn on_backend(
-        backend: SharedExecutionBackend,
-        paths: DaemonPaths,
-    ) -> aidaemon_tools::EditFile {
-        aidaemon_tools::EditFile::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
-                short: "Find and replace text in a file".to_string(),
-                schema: "Find and replace text in a file. Use this instead of terminal sed/awk. Shows context around the change. Fails safely if the text isn't found or is ambiguous. On not-found/ambiguous text, read_file the same path and retry once before asking the user.".to_string(),
-            })
-    }
-}
+#[cfg(test)]
+use super::EditFileTool;
 
 #[cfg(test)]
 mod tests {
@@ -266,7 +241,7 @@ mod tests {
             assert!(effects.complete, "{key}");
             assert_eq!(
                 effects.keys,
-                vec![crate::tools::command_effects::path_effect(
+                vec![aidaemon_tools::command_effects::path_effect(
                     aidaemon_core::EffectClass::Write,
                     &format!("{dir}/acme.md"),
                     None

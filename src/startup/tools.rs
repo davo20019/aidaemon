@@ -1236,7 +1236,7 @@ async fn build_base_tool(
         BaseToolId::ManageMandates => BuiltBaseTool {
             tool: Arc::new(ManageMandatesTool::new(state).with_strategy_skills(
                 config.skills.enabled.then(|| {
-                    crate::tools::manage_mandates::strategy_skills_dir(
+                    crate::startup::tool_config::strategy_skills_dir(
                         config_path
                             .parent()
                             .unwrap_or_else(|| std::path::Path::new("."))

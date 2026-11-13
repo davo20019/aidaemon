@@ -1,38 +1,13 @@
-//! `write_file` is implemented in `aidaemon-tools`. This module holds the daemon's
-//! wording and policy for it, and the tests of its behaviour on the daemon's
-//! execution backend.
-
-use aidaemon_tools::ToolText;
+//! Tests of `write_file` (`aidaemon-tools`, worded and given its policy in
+//! `startup::tool_config`) on the daemon's execution backend.
 
 #[cfg(test)]
 use crate::traits::{DurableReplayDecision, Tool};
 #[cfg(test)]
 use serde_json::json;
 
-use super::file_policy::{daemon_file_policy, DaemonPaths};
-use crate::execution::SharedExecutionBackend;
-
-/// The daemon's constructors for the SDK's [`aidaemon_tools::WriteFile`].
-pub struct WriteFileTool;
-
-#[allow(clippy::new_ret_no_self)]
-impl WriteFileTool {
-    /// Without the daemon's own files protected; production passes them.
-    #[cfg(test)]
-    pub fn new(backend: SharedExecutionBackend) -> aidaemon_tools::WriteFile {
-        Self::on_backend(backend, DaemonPaths::default())
-    }
-
-    pub fn on_backend(
-        backend: SharedExecutionBackend,
-        paths: DaemonPaths,
-    ) -> aidaemon_tools::WriteFile {
-        aidaemon_tools::WriteFile::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
-                short: "Write or create a file with given content".to_string(),
-                schema: "Write content to a file, creating it if it doesn't exist. Use this instead of terminal echo/cat for file creation. Creates a backup of existing files before overwriting. ALWAYS prefer write_file over terminal heredocs (cat > file << EOF) — heredocs trigger the approval flow.".to_string(),
-            })
-    }
-}
+#[cfg(test)]
+use super::WriteFileTool;
 
 #[cfg(test)]
 mod durable_replay_tests {
@@ -131,12 +106,10 @@ mod tests {
             .await
             .unwrap();
         let args = json!({"path": config.to_str().unwrap()}).to_string();
-        let read = crate::tools::read_file::ReadFileTool::new(
-            crate::execution::active_execution_backend(),
-        )
-        .call(&args)
-        .await
-        .unwrap();
+        let read = crate::tools::ReadFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(read.contains("title = \"b\""), "{read}");
     }
 
@@ -412,7 +385,7 @@ mod tests {
             assert!(effects.complete, "{key}");
             assert_eq!(
                 effects.keys,
-                vec![crate::tools::command_effects::path_effect(
+                vec![aidaemon_tools::command_effects::path_effect(
                     aidaemon_core::EffectClass::Write,
                     &format!("{dir}/acme.md"),
                     None
