@@ -5349,3 +5349,84 @@ async fn one_request_sends_a_pages_screenshot_once() {
         "the page went to the owner once"
     );
 }
+
+/// A helper's run record as the host gives it: a declared deliverable is
+/// kept, the last of each kind, and sent when the run ends.
+#[derive(Default)]
+struct RunEndFence {
+    kept: std::sync::Mutex<Vec<aidaemon_tools::semantics::Deliverable>>,
+    captures: std::sync::Mutex<Vec<(String, aidaemon_tools::semantics::DeliverableKind)>>,
+}
+
+#[async_trait::async_trait]
+impl aidaemon_tools::semantics::FileFence for RunEndFence {
+    async fn observed(&self, _path: &str, _bytes: &[u8]) {}
+
+    async fn begin_write(
+        &self,
+        _path: &str,
+    ) -> Result<Box<dyn aidaemon_tools::semantics::FileWriteGuard>, String> {
+        Err("not used".to_string())
+    }
+
+    async fn declare_deliverable(
+        &self,
+        deliverable: aidaemon_tools::semantics::Deliverable,
+    ) -> aidaemon_tools::semantics::DeliveryPlan {
+        let mut kept = self.kept.lock().unwrap();
+        let replaced = kept.iter().any(|known| known.kind == deliverable.kind);
+        kept.retain(|known| known.kind != deliverable.kind);
+        kept.push(deliverable);
+        aidaemon_tools::semantics::DeliveryPlan::AtRunEnd { replaced }
+    }
+
+    async fn note_capture(&self, path: &str, kind: &aidaemon_tools::semantics::DeliverableKind) {
+        self.captures
+            .lock()
+            .unwrap()
+            .push((path.to_string(), kind.clone()));
+    }
+}
+
+/// Live 2026-11-13: a helper declared the WordPress homepage before its
+/// theme was on, then the styled one, and the owner got both. In a helper's
+/// run a declared capture is kept on its record, not sent mid-run; a later
+/// one of the same page replaces it, and only the last is sent, when the
+/// run ends. Every capture is noted with the page it shows.
+#[tokio::test]
+async fn a_helpers_declared_screenshot_is_sent_when_its_run_ends() {
+    let (tool, _backend, rx) = mock_tool();
+    let media = spawn_media_responder(rx, Ok(()));
+    let fence = Arc::new(RunEndFence::default());
+    let facts = || {
+        let mut facts = aidaemon_tools::testing::call_facts("sess-helper");
+        let shared: Arc<dyn aidaemon_tools::semantics::FileFence> = fence.clone();
+        facts
+            .extensions
+            .insert(aidaemon_tools::semantics::CallFileFence(shared));
+        facts
+    };
+    let args = json!({ "action": "screenshot", "deliver": true}).to_string();
+    let first = tool.call_with(&args, facts()).await.unwrap();
+    assert!(first.contains("kept as your deliverable"), "{first}");
+    let second = tool.call_with(&args, facts()).await.unwrap();
+    assert!(
+        second.contains("replaces the earlier screenshot"),
+        "{second}"
+    );
+    let check = json!({ "action": "screenshot" }).to_string();
+    tool.call_with(&check, facts()).await.unwrap();
+    assert!(
+        media.messages.lock().await.is_empty(),
+        "nothing is sent mid-run"
+    );
+    assert_eq!(fence.captures.lock().unwrap().len(), 3);
+
+    // The run ends: its one deliverable is sent, once.
+    let kept: Vec<_> = std::mem::take(&mut *fence.kept.lock().unwrap());
+    assert_eq!(kept.len(), 1);
+    for deliverable in kept {
+        (deliverable.send)().await.unwrap();
+    }
+    assert_eq!(media.messages.lock().await.len(), 1);
+}

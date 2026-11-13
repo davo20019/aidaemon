@@ -541,11 +541,84 @@ struct Shared {
     /// Artifacts delivered to the owner, by subject: who delivered each and
     /// when. The first claim owns the delivery.
     deliveries: std::sync::Mutex<HashMap<String, (String, chrono::DateTime<chrono::Utc>)>>,
+    /// Each helper's declared deliverables, by member, in the order first
+    /// declared: the last of each kind, sent when its run ends.
+    pending: std::sync::Mutex<HashMap<String, Vec<PendingDeliverable>>>,
+    /// What each saved capture shows, by its path.
+    captures: std::sync::Mutex<HashMap<String, aidaemon_tools::semantics::DeliverableKind>>,
     path_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Escalations are answered one at a time, so the second sees the first.
     answering: tokio::sync::Mutex<()>,
     max_per_child: usize,
     max_per_tree: usize,
+}
+
+/// A deliverable a helper declared, kept on its run's record until the run
+/// ends.
+struct PendingDeliverable(aidaemon_tools::semantics::Deliverable);
+
+impl std::fmt::Debug for PendingDeliverable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// What became of one deliverable a run declared, once the run ended: the
+/// typed list its result and its group's answer quote, never the helper's
+/// own words about what it sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunDelivery {
+    pub kind: aidaemon_tools::semantics::DeliverableKind,
+    /// What the owner read with it.
+    pub caption: String,
+    pub outcome: RunDeliveryOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunDeliveryOutcome {
+    /// The channel accepted it at this time.
+    Sent { at: chrono::DateTime<chrono::Utc> },
+    /// Another agent of the request had already sent this subject.
+    AlreadySent { by: String },
+    /// The channel refused it, or did not confirm it.
+    Failed { reason: String },
+}
+
+impl RunDelivery {
+    /// One plain line for a result or an answer ("Sent to the owner:
+    /// Screenshot of wp.ddev.site (at 11:39:51 AM)").
+    pub fn line(&self) -> String {
+        match &self.outcome {
+            RunDeliveryOutcome::Sent { at } => format!(
+                "Sent to the owner: {} (at {})",
+                self.caption.trim(),
+                at.with_timezone(&chrono::Local).format("%-I:%M:%S %p")
+            ),
+            RunDeliveryOutcome::AlreadySent { by } => format!(
+                "Not sent: {} had already sent the owner {}",
+                by,
+                self.kind.words()
+            ),
+            RunDeliveryOutcome::Failed { reason } => {
+                format!("Not delivered: {} ({reason})", self.kind.words())
+            }
+        }
+    }
+}
+
+/// The lines a run's deliveries give its result: each one, or that nothing
+/// was sent. `None` when no ledger recorded them.
+pub fn delivery_lines(delivered: Option<&[RunDelivery]>) -> Option<String> {
+    let delivered = delivered?;
+    if delivered.is_empty() {
+        return Some("Delivered to the owner by this run: nothing.".to_string());
+    }
+    let mut out = String::from("Delivered to the owner by this run:");
+    for delivery in delivered {
+        out.push_str("\n- ");
+        out.push_str(&delivery.line());
+    }
+    Some(out)
 }
 
 /// The tree's shared knowledge. Clones share it.
@@ -611,6 +684,95 @@ impl Coordination {
             (member.to_string(), chrono::Utc::now()),
         );
         Ok(())
+    }
+
+    /// `member` declares `deliverable` for the owner. A helper's is kept on
+    /// its run's record, replacing an earlier one of the same kind, and is
+    /// sent when its run ends ([`Self::deliver_run_end`]); the top-level
+    /// agent's is sent now by its caller.
+    pub fn declare_deliverable(
+        &self,
+        member: &str,
+        deliverable: aidaemon_tools::semantics::Deliverable,
+    ) -> aidaemon_tools::semantics::DeliveryPlan {
+        let helper = self
+            .ledger()
+            .roster
+            .iter()
+            .any(|known| known.session == member);
+        if !helper {
+            return aidaemon_tools::semantics::DeliveryPlan::Now(deliverable);
+        }
+        let mut pending = self.0.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let declared = pending.entry(member.to_string()).or_default();
+        let replaced = match declared
+            .iter_mut()
+            .find(|known| known.0.kind == deliverable.kind)
+        {
+            Some(known) => {
+                known.0 = deliverable;
+                true
+            }
+            None => {
+                declared.push(PendingDeliverable(deliverable));
+                false
+            }
+        };
+        aidaemon_tools::semantics::DeliveryPlan::AtRunEnd { replaced }
+    }
+
+    /// `member`'s run ended: send each deliverable it declared (the last
+    /// of each kind), once, under the request's delivery ledger. What
+    /// became of each is the run's typed record of its deliveries.
+    pub async fn deliver_run_end(&self, member: &str) -> Vec<RunDelivery> {
+        let declared = self
+            .0
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(member)
+            .unwrap_or_default();
+        let mut delivered = Vec::with_capacity(declared.len());
+        for PendingDeliverable(deliverable) in declared {
+            let subject = deliverable.kind.subject();
+            let outcome = match self.claim_delivery(member, &subject) {
+                Err(already) => RunDeliveryOutcome::AlreadySent { by: already.by },
+                Ok(()) => match (deliverable.send)().await {
+                    Ok(()) => RunDeliveryOutcome::Sent {
+                        at: chrono::Utc::now(),
+                    },
+                    Err(reason) => {
+                        self.release_delivery(member, &subject);
+                        RunDeliveryOutcome::Failed { reason }
+                    }
+                },
+            };
+            delivered.push(RunDelivery {
+                kind: deliverable.kind,
+                caption: deliverable.caption,
+                outcome,
+            });
+        }
+        delivered
+    }
+
+    /// A capture saved at `path` shows `kind`.
+    pub fn note_capture(&self, path: &str, kind: &aidaemon_tools::semantics::DeliverableKind) {
+        self.0
+            .captures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(capture_key(path), kind.clone());
+    }
+
+    /// What the capture saved at `path` shows, when one was noted.
+    pub fn capture_kind(&self, path: &str) -> Option<aidaemon_tools::semantics::DeliverableKind> {
+        self.0
+            .captures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&capture_key(path))
+            .cloned()
     }
 
     /// Give back `member`'s claim on `subject`: its delivery did not happen.
@@ -752,6 +914,14 @@ impl Coordination {
         }
         // A run stopped mid-shell never reports that shell's end.
         ledger.open_shells.retain(|open| open.member != session);
+        drop(ledger);
+        // A run that ended without delivering (stopped by the owner) leaves
+        // nothing to send later.
+        self.0
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session);
     }
 
     /// Roster and new log entries for an agent with children, once whenever
@@ -1298,6 +1468,13 @@ impl Drop for RosterEntry {
     }
 }
 
+/// A saved capture's path as one key, whichever spelling names it.
+fn capture_key(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
 /// One path contains the other, compared by whole components.
 fn paths_overlap(a: &str, b: &str) -> bool {
     let (a, b) = (std::path::Path::new(a), std::path::Path::new(b));
@@ -1662,6 +1839,22 @@ impl FileFence for CallFence {
 
     async fn release_delivery(&self, subject: &str) {
         self.coordination.release_delivery(&self.member, subject);
+    }
+
+    async fn declare_deliverable(
+        &self,
+        deliverable: aidaemon_tools::semantics::Deliverable,
+    ) -> aidaemon_tools::semantics::DeliveryPlan {
+        self.coordination
+            .declare_deliverable(&self.member, deliverable)
+    }
+
+    async fn note_capture(&self, path: &str, kind: &aidaemon_tools::semantics::DeliverableKind) {
+        self.coordination.note_capture(path, kind);
+    }
+
+    async fn capture_kind(&self, path: &str) -> Option<aidaemon_tools::semantics::DeliverableKind> {
+        self.coordination.capture_kind(path)
     }
 }
 
@@ -2315,6 +2508,91 @@ impl sdk::Hook for CoordinationHook {
 
 #[cfg(test)]
 mod tests {
+
+    /// Live 2026-11-13: a WordPress helper declared its homepage before the
+    /// theme was on, then sent the styled capture, and the owner got both.
+    /// A helper's declared deliverable is kept on its run's record and sent
+    /// once, when the run ends: only the last of each kind, its final
+    /// version. A capture noted by the tool is that kind whichever tool
+    /// sends it. The top-level agent's is sent by its caller now.
+    #[tokio::test]
+    async fn a_helpers_deliverable_is_sent_once_when_its_run_ends() {
+        use aidaemon_tools::semantics::{Deliverable, DeliverableKind, DeliveryPlan};
+        let tree = Coordination::new(3, 12);
+        tree.bind_root("telegram:synthetic", "Install two sites", "turn-1");
+        tree.add_member(Member {
+            session: "specialist:executor:wp".to_string(),
+            parent: "telegram:synthetic".to_string(),
+            mission: "Install WordPress".to_string(),
+            specialist: None,
+            scope: Vec::new(),
+            running: true,
+        });
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let deliverable = |kind: &DeliverableKind, caption: &str| {
+            let sent = sent.clone();
+            let caption = caption.to_string();
+            Deliverable {
+                kind: kind.clone(),
+                caption: caption.clone(),
+                send: Box::new(move || {
+                    Box::pin(async move {
+                        sent.lock().unwrap().push(caption);
+                        Ok(())
+                    })
+                }),
+            }
+        };
+        let page = DeliverableKind::Screenshot {
+            page: "claude-wordpress-8.ddev.site".to_string(),
+        };
+        let helper = "specialist:executor:wp";
+        assert!(matches!(
+            tree.declare_deliverable(helper, deliverable(&page, "unstyled placeholder")),
+            DeliveryPlan::AtRunEnd { replaced: false }
+        ));
+        // Nothing is sent mid-run.
+        assert!(sent.lock().unwrap().is_empty());
+        // The styled capture, sent with send_file of the noted path, is the
+        // same kind and replaces it.
+        tree.note_capture("/tmp/ed7237a2_screenshot.png", &page);
+        let kind = tree
+            .capture_kind("/tmp/ed7237a2_screenshot.png")
+            .expect("the capture was noted");
+        assert_eq!(kind, page);
+        assert!(matches!(
+            tree.declare_deliverable(helper, deliverable(&kind, "styled homepage")),
+            DeliveryPlan::AtRunEnd { replaced: true }
+        ));
+        let delivered = tree.deliver_run_end(helper).await;
+        assert_eq!(*sent.lock().unwrap(), vec!["styled homepage".to_string()]);
+        assert_eq!(delivered.len(), 1);
+        assert!(matches!(
+            delivered[0].outcome,
+            RunDeliveryOutcome::Sent { .. }
+        ));
+        let lines = delivery_lines(Some(&delivered)).unwrap();
+        assert!(lines.contains("styled homepage"), "{lines}");
+        // Its run ended: nothing is left to send twice.
+        assert!(tree.deliver_run_end(helper).await.is_empty());
+        // The page was delivered in this request: the main agent's own
+        // capture of it is not sent again.
+        let DeliveryPlan::Now(_) =
+            tree.declare_deliverable("telegram:synthetic", deliverable(&page, "main"))
+        else {
+            panic!("the top-level agent's deliverable is sent by its caller");
+        };
+        assert!(tree
+            .claim_delivery("telegram:synthetic", &page.subject())
+            .is_err());
+        // A run outside any ledger records nothing; one with no deliverable
+        // says it sent nothing.
+        assert_eq!(delivery_lines(None), None);
+        assert_eq!(
+            delivery_lines(Some(&[])).as_deref(),
+            Some("Delivered to the owner by this run: nothing.")
+        );
+    }
 
     /// One request delivers each artifact once: the first to claim it owns
     /// it, a later claim by anyone in the tree is told who sent it, and a

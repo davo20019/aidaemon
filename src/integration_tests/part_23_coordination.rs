@@ -27,6 +27,7 @@ mod coordination_tests {
             parent_run: None,
             known_resources: Default::default(),
             card_title: None,
+            card_steps: Vec::new(),
             lineage: Vec::new(),
             parent_task: None,
         }

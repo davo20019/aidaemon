@@ -169,6 +169,7 @@ pub fn program_phase(end: &ProgramEnd) -> (RunPhase, RunEvidence) {
                 failure: Some(RunFailure::Exited {
                     code: end.exit_code,
                 }),
+                ..Default::default()
             },
         );
     }
@@ -189,6 +190,7 @@ pub fn program_phase(end: &ProgramEnd) -> (RunPhase, RunEvidence) {
             RunEvidence {
                 unconfirmed: Vec::new(),
                 failure: Some(failure),
+                ..Default::default()
             },
         ),
         None => (RunPhase::Succeeded, RunEvidence::default()),
@@ -406,6 +408,7 @@ mod tests {
             known_resources: Default::default(),
             lineage: Vec::new(),
             card_title: None,
+            card_steps: Vec::new(),
             parent_task: None,
         };
         let spec = HelperSpec {

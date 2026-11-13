@@ -362,6 +362,74 @@ impl SendFileTool {
             format!("{:.0} KB", ready.size_bytes as f64 / 1024.0)
         };
 
+        // What this file is for the owner: a capture a tool noted (a page's
+        // screenshot) is that kind, anything else a file of its own. A
+        // helper's file is its run's deliverable, kept on its record and
+        // sent once when the run ends, the last of its kind (live
+        // 2026-11-13: a helper declared a WordPress homepage before its
+        // theme was on, then sent the styled capture with send_file, and the
+        // owner got both). Anyone else's is sent now, once per request.
+        let delivered_path = ready.canonical_path.to_string_lossy().to_string();
+        let fence = aidaemon_tools::semantics::file_fence(facts);
+        let kind = match fence {
+            Some(fence) => fence.capture_kind(&delivered_path).await,
+            None => None,
+        }
+        .unwrap_or_else(|| aidaemon_tools::semantics::DeliverableKind::File {
+            name: ready.filename.clone(),
+        });
+        if let Some(fence) = fence {
+            let deliverable = aidaemon_tools::semantics::Deliverable {
+                kind: kind.clone(),
+                caption: if caption.trim().is_empty() {
+                    ready.filename.clone()
+                } else {
+                    caption.to_string()
+                },
+                send: document_send(
+                    self.media_tx.clone(),
+                    session_id,
+                    caption,
+                    &delivered_path,
+                    &ready.filename,
+                    self.receipt_timeout,
+                ),
+            };
+            if let aidaemon_tools::semantics::DeliveryPlan::AtRunEnd { replaced } =
+                fence.declare_deliverable(deliverable).await
+            {
+                let replaced = if replaced {
+                    format!(
+                        " It replaces the earlier {} you declared.",
+                        kind_noun(&kind)
+                    )
+                } else {
+                    String::new()
+                };
+                return Ok(SendReply::sent(format!(
+                    "File kept as your deliverable: {} ({}), {}. It is sent to the owner once, \
+                     when your run ends; a later delivery of the same kind replaces it.{replaced}",
+                    ready.filename,
+                    size_display,
+                    kind.words()
+                )));
+            }
+            if let Err(delivered) = fence.claim_delivery(&kind.subject()).await {
+                return Ok(SendReply::sent(format!(
+                    "Not sent again: {} already sent the owner {} at {} in this request, and \
+                     each is sent once.",
+                    delivered.by,
+                    kind.words(),
+                    delivered.owner_time()
+                )));
+            }
+        }
+        let release = || async {
+            if let Some(fence) = fence {
+                fence.release_delivery(&kind.subject()).await;
+            }
+        };
+
         // Await the media listener's delivery receipt so "File sent" is a
         // statement of fact, not a queue acknowledgment. Without this the
         // model tells the user "I've sent it" while the document waits out a
@@ -384,6 +452,7 @@ impl SendFileTool {
         match tokio::time::timeout(self.receipt_timeout, receipt_rx).await {
             Ok(Ok(Ok(()))) => {} // delivered — fall through to the success text
             Ok(Ok(Err(reason))) => {
+                release().await;
                 return Ok(SendReply::failed(format!(
                     "The file {} could not be delivered: {}. Do NOT tell the user it was sent; \
                      report the delivery failure instead.",
@@ -421,6 +490,58 @@ impl SendFileTool {
             )))
         }
     }
+}
+
+/// A deliverable's kind as one noun ("screenshot of demo.ddev.site").
+fn kind_noun(kind: &aidaemon_tools::semantics::DeliverableKind) -> String {
+    match kind {
+        aidaemon_tools::semantics::DeliverableKind::Screenshot { page } => {
+            format!("screenshot of {page}")
+        }
+        aidaemon_tools::semantics::DeliverableKind::File { name } => format!("file {name}"),
+    }
+}
+
+/// The send of one file kept for a run's end: hand it to the media listener
+/// and wait (bounded) for the channel's receipt.
+fn document_send(
+    media_tx: mpsc::Sender<MediaMessage>,
+    session_id: &str,
+    caption: &str,
+    file_path: &str,
+    filename: &str,
+    receipt_timeout: std::time::Duration,
+) -> aidaemon_tools::semantics::DeliverySend {
+    let (session_id, caption, file_path, filename) = (
+        session_id.to_string(),
+        caption.to_string(),
+        file_path.to_string(),
+        filename.to_string(),
+    );
+    Box::new(move || {
+        Box::pin(async move {
+            let (receipt_tx, receipt_rx) = tokio::sync::oneshot::channel();
+            media_tx
+                .send(MediaMessage {
+                    session_id,
+                    caption,
+                    kind: MediaKind::Document {
+                        file_path,
+                        filename: filename.clone(),
+                    },
+                    result_tx: Some(receipt_tx),
+                })
+                .await
+                .map_err(|e| format!("Failed to send file: {e}"))?;
+            match tokio::time::timeout(receipt_timeout, receipt_rx).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(reason))) => Err(format!("{filename} could not be delivered: {reason}")),
+                Ok(Err(_)) | Err(_) => Err(format!(
+                    "{filename} was queued, but its delivery was not confirmed"
+                )),
+            }
+        })
+    })
 }
 
 /// What a `send_file` call did, typed where the reply is produced.

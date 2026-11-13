@@ -1776,13 +1776,19 @@ mod tests {
             Default::default(),
         )
         .await;
+        // The card already reads settled once both helpers ended (the turn
+        // waiting on them is no step of its own), and it is kept after the
+        // reply, never deleted.
         let reply = log.iter().position(|e| e == "say:Lines: 12. Words: 80.");
         let settled = log.iter().rposition(|e| {
             e == "card:✅ A helper finished: Count lines\n\n✅ A helper finished: Count words"
         });
-        assert!(reply.is_some() && settled > reply, "{log:#?}");
+        let kept = log.iter().position(|e| e == "card kept card-1");
+        assert!(
+            settled.is_some() && reply.is_some() && kept > reply,
+            "{log:#?}"
+        );
         assert!(!log.contains(&"card deleted".to_string()), "{log:#?}");
-        assert!(log.contains(&"card kept card-1".to_string()), "{log:#?}");
 
         let log = run_card_turn(
             vec![StatusUpdate::ToolStart {

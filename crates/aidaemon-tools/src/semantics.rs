@@ -2255,6 +2255,88 @@ pub trait FileFence: Send + Sync {
 
     /// Give back a claim whose delivery did not happen.
     async fn release_delivery(&self, _subject: &str) {}
+
+    /// The call declares `deliverable` for the owner. A helper's run keeps
+    /// it on its record and sends it once, when the run ends: the last one
+    /// of each kind it declared, so a capture taken before the work was
+    /// done is replaced by the final one, never sent beside it. Anyone
+    /// else's (the turn's own agent, a host with no run record) is sent now
+    /// by the caller, under [`Self::claim_delivery`].
+    async fn declare_deliverable(&self, deliverable: Deliverable) -> DeliveryPlan {
+        DeliveryPlan::Now(deliverable)
+    }
+
+    /// The call saved a capture at `path` that shows `kind`: a later
+    /// `send_file` of that path delivers that kind, not a file of its own.
+    async fn note_capture(&self, _path: &str, _kind: &DeliverableKind) {}
+
+    /// What a capture saved at `path` shows, when a call noted it.
+    async fn capture_kind(&self, _path: &str) -> Option<DeliverableKind> {
+        None
+    }
+}
+
+/// What a deliverable is, by kind: each run delivers one of each kind (the
+/// last it declared), and each request delivers each subject once.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DeliverableKind {
+    /// A page's screenshot, named by its page ("demo.ddev.site").
+    Screenshot { page: String },
+    /// Any other file, named by its file name.
+    File { name: String },
+}
+
+impl DeliverableKind {
+    /// The delivery ledger's key for it.
+    pub fn subject(&self) -> String {
+        match self {
+            Self::Screenshot { page } => format!("screenshot:{page}"),
+            Self::File { name } => format!("file:{name}"),
+        }
+    }
+
+    /// The kind in the owner's words ("a screenshot of demo.ddev.site").
+    pub fn words(&self) -> String {
+        match self {
+            Self::Screenshot { page } => format!("a screenshot of {page}"),
+            Self::File { name } => format!("the file {name}"),
+        }
+    }
+}
+
+/// The send a tool hands over with a deliverable sent later: run once, it
+/// reports whether the channel accepted it.
+pub type DeliverySend = Box<
+    dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// One artifact a call declares for the owner.
+pub struct Deliverable {
+    pub kind: DeliverableKind,
+    /// What the owner reads with it ("Screenshot of demo.ddev.site").
+    pub caption: String,
+    pub send: DeliverySend,
+}
+
+impl std::fmt::Debug for Deliverable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Deliverable")
+            .field("kind", &self.kind)
+            .field("caption", &self.caption)
+            .finish_non_exhaustive()
+    }
+}
+
+/// When a declared deliverable is sent ([`FileFence::declare_deliverable`]).
+#[derive(Debug)]
+pub enum DeliveryPlan {
+    /// The caller sends it now, under a delivery claim.
+    Now(Deliverable),
+    /// It is on the run's record and is sent when the run ends. `replaced`:
+    /// it took the place of an earlier one of the same kind.
+    AtRunEnd { replaced: bool },
 }
 
 /// An artifact one of the request's agents already delivered to the owner.

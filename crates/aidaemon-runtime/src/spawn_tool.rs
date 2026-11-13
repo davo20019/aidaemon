@@ -991,9 +991,11 @@ pub struct SpawnArgs {
     /// When true, spawn the sub-agent in the background and return immediately.
     #[serde(default)]
     pub background: bool,
-    /// Zero-based indices of the `track_requirements` items a background
-    /// child does: they show as running in the background, and its end
-    /// marks them done or failed.
+    /// Zero-based indices of the `track_requirements` items the child does:
+    /// the typed link from a plan step to each run started for it. A
+    /// background child's steps show as running in the background and its
+    /// end marks them done or failed; a later run for the same steps
+    /// supersedes an earlier one that didn't finish.
     #[serde(default)]
     pub checklist_items: Vec<usize>,
     /// Task ID — when provided by a task lead, the executor tracks activity against this task.
@@ -1344,7 +1346,7 @@ impl Tool for SpawnAgentTool {
                         "type": "array",
                         "items": { "type": "integer", "minimum": 0 },
                         "uniqueItems": true,
-                        "description": "With background=true: the zero-based indices of your track_requirements items this sub-agent does. They show as running in the background until it ends, then as done or failed by its result."
+                        "description": "The zero-based indices of your track_requirements items this sub-agent does. With background=true they show as running in the background until it ends, then as done or failed by its result. To retry a step an earlier sub-agent didn't finish, name the same items: the new run takes the step over, and the earlier try shows as history, not as a failure."
                     },
                     "task_id": {
                         "type": "string",
@@ -1656,6 +1658,7 @@ impl SpawnAgentTool {
                 .map(str::trim)
                 .filter(|title| !title.is_empty())
                 .map(str::to_string);
+            parent.card_steps = args.checklist_items.clone();
         }
 
         // TaskLead -> Executor spawns must target a concrete, pre-claimed task and
@@ -1813,6 +1816,7 @@ impl SpawnAgentTool {
         let runs = agent.helper_runs();
         let (ended_tx, ended_rx) = mpsc::unbounded_channel();
         runs.begin(&background_id, &session_id, &helper_label, Some(ended_tx));
+        runs.link_steps(&background_id, &args.checklist_items);
         // The runs one chat turn starts are one group: once the last of them
         // ends, the turn's request is answered once, from all their results
         // ([`answer_group`]). A sub-agent's own helpers answer to it, not to
@@ -2236,6 +2240,12 @@ pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usi
             out.push_str(&line);
             out.push('\n');
         }
+        if let Some(lines) =
+            crate::coordination::delivery_lines(state.evidence.delivered.as_deref())
+        {
+            out.push_str(&lines);
+            out.push('\n');
+        }
         let (report, _) = bounded_child_response(end.report.text.trim(), max_report_chars);
         let report = if end.report.untrusted {
             aidaemon_tools::sanitize::wrap_untrusted_output("spawn_agent", report)
@@ -2257,7 +2267,10 @@ pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usi
     out.push_str(
         "\nAnswer the owner's original request now, once, from these results. The chat's card \
          already shows how each helper ended and its time, and each helper already sent what it \
-         delivered: don't list them again line by line or resend anything. The \"Times\" lines \
+         delivered: don't list them again line by line or resend anything. What reached the \
+         owner is each record's \"Delivered to the owner\" list, the only record of it: if you \
+         mention what was sent, say exactly that (a helper whose list says nothing sent \
+         nothing), never what a report claims it sent. The \"Times\" lines \
          are the only durations there are: \"took\" is a helper's own work from its start to its \
          end, \"after your request\" counts from the owner's request. If you mention a time, \
          quote one of these figures with its own words (\"took …\" or \"… after your request\"); \
@@ -2593,6 +2606,11 @@ impl SpawnAgentTool {
                 .and_then(|parent| parent.card_title.as_deref())
                 .unwrap_or(mission),
         );
+        // The plan steps it was started for: its end record keeps the link.
+        let card_steps = parent_authority
+            .as_ref()
+            .map(|parent| parent.card_steps.clone())
+            .unwrap_or_default();
         // The child's own wait clock: its card waits, apart from its
         // siblings', still counting for the turn.
         let waits = aidaemon_channels::owner_wait::OwnerWaitClock::current()
@@ -2664,6 +2682,7 @@ impl SpawnAgentTool {
                 phase,
                 background: false,
                 step: None,
+                steps: card_steps,
                 took: Some(times.line()),
                 since_request: since,
             }));
@@ -2685,8 +2704,12 @@ impl SpawnAgentTool {
                             .as_ref()
                             .map(|failure| format!("{}\n\n", failure.reason()))
                             .unwrap_or_default();
+                        let delivered =
+                            crate::coordination::delivery_lines(run.evidence.delivered.as_deref())
+                                .map(|lines| format!("\n{lines}"))
+                                .unwrap_or_default();
                         return Err(anyhow::anyhow!(
-                            "Sub-agent failed. {reason}Its own report: {}\n{window}",
+                            "Sub-agent failed. {reason}Its own report: {}\n{window}{delivered}",
                             run.response
                         ));
                     }
@@ -2696,9 +2719,16 @@ impl SpawnAgentTool {
                 // The measured run leads, so a cut of a long result never
                 // loses it: whatever the parent says of the helper's time
                 // quotes it.
+                // What it sent the owner is its run's typed record, quoted
+                // as given: the parent's answer says what was delivered from
+                // this, never from the helper's own account of it.
+                let delivered =
+                    crate::coordination::delivery_lines(run.evidence.delivered.as_deref())
+                        .map(|lines| format!("\n{lines}"))
+                        .unwrap_or_default();
                 let mut outcome = reported(
                     format!(
-                        "{window}\n\n{shown}{}",
+                        "{window}{delivered}\n\n{shown}{}",
                         coordination_trailer(tree, &run.session)
                     ),
                     run.trust,
@@ -2946,6 +2976,7 @@ mod group_tests {
             work_began: Some(at(began)),
             waited: Duration::ZERO,
             step: None,
+            steps: Vec::new(),
             evidence: Default::default(),
             card: Default::default(),
         };
@@ -3019,6 +3050,76 @@ mod group_tests {
         assert!(followup.contains("DDEV could not start: low Docker disk space."));
         assert!(followup.contains("WordPress is up at https://wp.ddev.site"));
         assert!(followup.contains("quote one of these figures with its own words"));
+    }
+
+    /// Live 2026-11-13: the answer said "each agent sent a rendered homepage
+    /// screenshot", which was not what reached the owner. The group's
+    /// continuation carries each run's typed record of what it delivered,
+    /// so the answer can quote it, and says a run with none sent nothing.
+    #[test]
+    fn the_group_followup_lists_what_each_run_delivered() {
+        use crate::coordination::{RunDelivery, RunDeliveryOutcome};
+        use aidaemon_tools::semantics::DeliverableKind;
+        let started = chrono::Utc::now();
+        let run = |id: &str, label: &str, delivered: Option<Vec<RunDelivery>>| GroupEnd {
+            state: RunState {
+                id: id.to_string(),
+                chat: "chat".to_string(),
+                label: label.to_string(),
+                phase: RunPhase::Succeeded,
+                requested_at: None,
+                started_at: started,
+                ended_at: Some(started),
+                work_began: None,
+                waited: Duration::ZERO,
+                step: None,
+                steps: Vec::new(),
+                evidence: crate::run_state::RunEvidence {
+                    delivered,
+                    ..Default::default()
+                },
+                card: Default::default(),
+            },
+            report: RunReport {
+                text: "I sent a rendered homepage screenshot.".to_string(),
+                untrusted: false,
+            },
+            message: String::new(),
+        };
+        let ends = vec![
+            run(
+                "w",
+                "Install WordPress",
+                Some(vec![RunDelivery {
+                    kind: DeliverableKind::Screenshot {
+                        page: "claude-wordpress-8.ddev.site".to_string(),
+                    },
+                    caption: "Screenshot of claude-wordpress-8.ddev.site".to_string(),
+                    outcome: RunDeliveryOutcome::Sent { at: started },
+                }]),
+            ),
+            run("d", "Install Drupal", Some(Vec::new())),
+            run("c", "A shell loop", None),
+        ];
+        let followup = group_followup(&ends, 8_000);
+        assert!(
+            followup.contains(
+                "Delivered to the owner by this run:\n- Sent to the owner: Screenshot of \
+                 claude-wordpress-8.ddev.site (at "
+            ),
+            "{followup}"
+        );
+        assert_eq!(
+            followup
+                .matches("Delivered to the owner by this run: nothing.")
+                .count(),
+            1,
+            "{followup}"
+        );
+        assert!(
+            followup.contains("never what a report claims it sent"),
+            "{followup}"
+        );
     }
 
     /// A run alone in its group, or in none, is its own answer; a group's

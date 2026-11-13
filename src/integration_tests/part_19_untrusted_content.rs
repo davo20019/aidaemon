@@ -961,6 +961,7 @@ async fn a_mandate_workers_egress_is_judged_against_the_confirmed_mandate() {
             parent_run: None,
             known_resources: Default::default(),
             card_title: None,
+            card_steps: Vec::new(),
             lineage: Vec::new(),
             parent_task: None,
         });

@@ -111,9 +111,11 @@ mod tests {
             work_began: first_step.map(|secs| start + chrono::Duration::seconds(secs)),
             waited: Duration::from_secs(waited),
             step: None,
+            steps: Vec::new(),
             evidence: aidaemon_runtime::run_state::RunEvidence {
                 unconfirmed: unconfirmed.iter().map(|s| s.to_string()).collect(),
                 failure: None,
+                ..Default::default()
             },
             card: Default::default(),
         }
@@ -339,6 +341,7 @@ mod tests {
             parent_run: None,
             known_resources: Default::default(),
             card_title: None,
+            card_steps: Vec::new(),
             lineage: Vec::new(),
             parent_task: None,
         };
@@ -1202,6 +1205,7 @@ mod child_runtime_tests {
                 parent_run: None,
                 known_resources: Default::default(),
                 card_title: None,
+                card_steps: Vec::new(),
                 lineage: Vec::new(),
                 parent_task: None,
             });
@@ -1319,6 +1323,7 @@ mod child_runtime_tests {
                 parent_run: None,
                 known_resources: Default::default(),
                 card_title: None,
+                card_steps: Vec::new(),
                 lineage: Vec::new(),
                 parent_task: None,
             });
@@ -1361,6 +1366,7 @@ mod child_runtime_tests {
                 parent_run: None,
                 known_resources: Default::default(),
                 card_title: None,
+                card_steps: Vec::new(),
                 lineage: Vec::new(),
                 parent_task: None,
             });
@@ -1466,6 +1472,7 @@ mod child_runtime_tests {
                 parent_run: None,
                 known_resources: Default::default(),
                 card_title: None,
+                card_steps: Vec::new(),
                 lineage: Vec::new(),
                 parent_task: None,
             });
@@ -3013,6 +3020,7 @@ mod child_runtime_tests {
             failure: Some(aidaemon_runtime::run_state::RunFailure::NothingDone {
                 undone: vec!["Install WordPress with DDEV".to_string()],
             }),
+            ..Default::default()
         };
         let tool = tool_for(&child);
         let args = json!({
