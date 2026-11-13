@@ -69,11 +69,10 @@ fn urls_in(text: &str) -> Vec<String> {
 pub fn local_sites_in(text: &str) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     for url in urls_in(text) {
-        if let Some(key) = crate::web::local_site_key(&url) {
-            if !keys.contains(&key) {
+        if let Some(key) = crate::web::local_site_key(&url)
+            && !keys.contains(&key) {
                 keys.push(key);
             }
-        }
     }
     keys
 }

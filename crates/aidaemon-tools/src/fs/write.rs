@@ -127,8 +127,8 @@ impl OutcomeTool for WriteFile {
             if let Some(parent) = path.parent() {
                 backend.create_dir_all(&parent).await?;
             }
-        } else if let Some(parent) = path.parent() {
-            if !backend
+        } else if let Some(parent) = path.parent()
+            && !backend
                 .metadata(&parent)
                 .await
                 .is_ok_and(|metadata| metadata.is_dir())
@@ -138,7 +138,6 @@ impl OutcomeTool for WriteFile {
                     parent
                 );
             }
-        }
 
         // Write mode: "overwrite" (default, replaces with backup) or "append"
         // (additive, no backup — lets the model build a large file in chunks

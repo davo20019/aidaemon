@@ -434,8 +434,8 @@ pub trait ExecutionBackend: Send + Sync {
                 ],
             );
             let output = self.execute(request, Duration::from_secs(5)).await?;
-            if output.exit_code == 0 {
-                if let Some(resolved) = output
+            if output.exit_code == 0
+                && let Some(resolved) = output
                     .stdout_lossy()
                     .lines()
                     .map(str::trim)
@@ -443,7 +443,6 @@ pub trait ExecutionBackend: Send + Sync {
                 {
                     return Ok(Some(BackendPath::new(resolved.to_string())));
                 }
-            }
         }
         Ok(None)
     }

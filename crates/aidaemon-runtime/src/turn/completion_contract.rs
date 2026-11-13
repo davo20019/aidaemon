@@ -145,11 +145,9 @@ impl CompletionContract {
             .scope_task_id
             .as_deref()
             .filter(|prior| *prior != task_id)
-        {
-            if !self.adopted_from_task_ids.iter().any(|id| id == prior) {
+            && !self.adopted_from_task_ids.iter().any(|id| id == prior) {
                 self.adopted_from_task_ids.push(prior.to_string());
             }
-        }
         self.scope_task_id = Some(task_id.to_string());
     }
 
@@ -308,13 +306,12 @@ pub fn inherit_unfinished_request_contract(
     mut current: CompletionContract,
     unfinished: &CompletionContract,
 ) -> CompletionContract {
-    if let Some(origin) = unfinished.scope_task_id.as_ref() {
-        if current.scope_task_id.as_ref() != Some(origin)
+    if let Some(origin) = unfinished.scope_task_id.as_ref()
+        && current.scope_task_id.as_ref() != Some(origin)
             && !current.adopted_from_task_ids.contains(origin)
         {
             current.adopted_from_task_ids.push(origin.clone());
         }
-    }
     for origin in &unfinished.adopted_from_task_ids {
         if current.scope_task_id.as_ref() != Some(origin)
             && !current.adopted_from_task_ids.contains(origin)
@@ -444,13 +441,12 @@ pub fn inherit_request_constraints(
     mut current: CompletionContract,
     antecedent: &CompletionContract,
 ) -> CompletionContract {
-    if let Some(origin) = antecedent.scope_task_id.as_ref() {
-        if current.scope_task_id.as_ref() != Some(origin)
+    if let Some(origin) = antecedent.scope_task_id.as_ref()
+        && current.scope_task_id.as_ref() != Some(origin)
             && !current.adopted_from_task_ids.contains(origin)
         {
             current.adopted_from_task_ids.push(origin.clone());
         }
-    }
     for origin in &antecedent.adopted_from_task_ids {
         if current.scope_task_id.as_ref() != Some(origin)
             && !current.adopted_from_task_ids.contains(origin)
@@ -1077,15 +1073,14 @@ impl CompletionProgress {
                 } else {
                     effects.contains(required_effect)
                 };
-                if observed_matches && self.mutation_obligation_ids.contains(&obligation_id) {
-                    if let Err(error) = self.proof_graph.satisfy_with_evidence(
+                if observed_matches && self.mutation_obligation_ids.contains(&obligation_id)
+                    && let Err(error) = self.proof_graph.satisfy_with_evidence(
                         &obligation_id,
                         &receipt_id,
                         Some(tool_call_id.to_string()),
                     ) {
                         tracing::warn!(%error, %obligation_id, "Completion proof was rejected");
                     }
-                }
             }
             let generic_id = self.scoped_node_id("obligation:mutation:any");
             if self.proof_graph_initialized
@@ -1093,20 +1088,18 @@ impl CompletionProgress {
                     .mutation_obligation_ids
                     .iter()
                     .any(|id| id == &generic_id)
-            {
-                if let Err(error) = self.proof_graph.satisfy_with_evidence(
+                && let Err(error) = self.proof_graph.satisfy_with_evidence(
                     &generic_id,
                     &receipt_id,
                     Some(tool_call_id.to_string()),
                 ) {
                     tracing::warn!(%error, "Generic mutation completion proof was rejected");
                 }
-            }
         }
         if contract.requires_reverification_after_mutation {
             self.verification_pending = true;
-            if self.proof_graph_initialized {
-                if let Some(receipt_id) = self.record_receipt_node(tool_call_id) {
+            if self.proof_graph_initialized
+                && let Some(receipt_id) = self.record_receipt_node(tool_call_id) {
                     let mut invalidated = self
                         .verification_obligation_id
                         .iter()
@@ -1134,7 +1127,6 @@ impl CompletionProgress {
                         }
                     }
                 }
-            }
         }
     }
 

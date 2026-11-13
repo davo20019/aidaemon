@@ -1,7 +1,7 @@
 [package]
 name = "aidaemon"
 version = "0.12.9"
-edition = "2021"
+edition = "2024"
 description = "A personal AI agent that runs as a background daemon, accessible via Telegram, Slack, or Discord, with tool use, MCP integration, and persistent memory"
 license = "MIT"
 repository = "https://github.com/davo20019/aidaemon"
@@ -17,7 +17,7 @@ exclude = ["*.db", "*.db-shm", "*.db-wal", ".env", "config.toml", "lcov.info", "
 # daemon's own. The daemon pins them exactly (`=0.2.x`).
 # aidaemon-node-protocol and aidaemon-node-sdk keep their own versions.
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
 # Floor set by the SDK crates' dependency tree with all features
 # (sqlx 0.9: 1.94); verified in CI by the MSRV job.
 rust-version = "1.94"

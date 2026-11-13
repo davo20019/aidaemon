@@ -56,8 +56,8 @@ pub fn format_goal_context(ctx_json: &str) -> String {
 
     let mut output = String::new();
 
-    if let Some(facts) = ctx.get("relevant_facts").and_then(|v| v.as_array()) {
-        if !facts.is_empty() {
+    if let Some(facts) = ctx.get("relevant_facts").and_then(|v| v.as_array())
+        && !facts.is_empty() {
             output.push_str("\n### Relevant Facts\n");
             for f in facts {
                 let cat = f.get("category").and_then(|v| v.as_str()).unwrap_or("?");
@@ -66,10 +66,9 @@ pub fn format_goal_context(ctx_json: &str) -> String {
                 output.push_str(&format!("- [{}] {}: {}\n", cat, key, val));
             }
         }
-    }
 
-    if let Some(procs) = ctx.get("relevant_procedures").and_then(|v| v.as_array()) {
-        if !procs.is_empty() {
+    if let Some(procs) = ctx.get("relevant_procedures").and_then(|v| v.as_array())
+        && !procs.is_empty() {
             output.push_str("\n### Relevant Procedures\n");
             for p in procs {
                 let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
@@ -83,10 +82,9 @@ pub fn format_goal_context(ctx_json: &str) -> String {
                 }
             }
         }
-    }
 
-    if let Some(hints) = ctx.get("project_hints").and_then(|v| v.as_array()) {
-        if !hints.is_empty() {
+    if let Some(hints) = ctx.get("project_hints").and_then(|v| v.as_array())
+        && !hints.is_empty() {
             output.push_str("\n### Project Hints\n");
             for hint in hints.iter().filter_map(|h| h.as_str()) {
                 if !hint.trim().is_empty() {
@@ -94,10 +92,9 @@ pub fn format_goal_context(ctx_json: &str) -> String {
                 }
             }
         }
-    }
 
-    if let Some(messages) = ctx.get("recent_messages").and_then(|v| v.as_array()) {
-        if !messages.is_empty() {
+    if let Some(messages) = ctx.get("recent_messages").and_then(|v| v.as_array())
+        && !messages.is_empty() {
             output.push_str("\n### Recent Parent Conversation\n");
             for row in messages {
                 let role = row.get("role").and_then(|v| v.as_str()).unwrap_or("?");
@@ -105,10 +102,9 @@ pub fn format_goal_context(ctx_json: &str) -> String {
                 output.push_str(&format!("- [{}] {}\n", role, content));
             }
         }
-    }
 
-    if let Some(results) = ctx.get("task_results").and_then(|v| v.as_array()) {
-        if !results.is_empty() {
+    if let Some(results) = ctx.get("task_results").and_then(|v| v.as_array())
+        && !results.is_empty() {
             output.push_str("\n### Completed Task Results\n");
             for r in results {
                 if let Some(s) = r.as_str() {
@@ -124,7 +120,6 @@ pub fn format_goal_context(ctx_json: &str) -> String {
                 }
             }
         }
-    }
 
     if output.is_empty() {
         "(no relevant prior knowledge)".to_string()

@@ -70,7 +70,7 @@ impl Hook for AskOwner {
 
 type Ran = Arc<Mutex<Vec<String>>>;
 
-fn recording_tool(name: &str, ran: &Ran) -> impl aidaemon_core::Tool {
+fn recording_tool(name: &str, ran: &Ran) -> impl aidaemon_core::Tool + use<> {
     let ran = ran.clone();
     let tool_name = name.to_string();
     FnTool::new(

@@ -97,11 +97,10 @@ impl ManageGoalTasksTool {
             return task_id.to_string();
         }
         // Try exact lookup first
-        if let Ok(Some(task)) = self.state.get_task(task_id).await {
-            if self.task_in_scope(&task) && self.task_id_in_scope(task_id).await.unwrap_or(false) {
+        if let Ok(Some(task)) = self.state.get_task(task_id).await
+            && self.task_in_scope(&task) && self.task_id_in_scope(task_id).await.unwrap_or(false) {
                 return task_id.to_string();
             }
-        }
         // Prefix-match against all tasks in this goal
         if let Ok(tasks) = self.scoped_tasks().await {
             let matches: Vec<&Task> = tasks.iter().filter(|t| t.id.starts_with(task_id)).collect();
@@ -585,13 +584,12 @@ impl ManageGoalTasksTool {
             .description
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("create_task requires 'description'"))?;
-        if let Some(profile_id) = args.worker_profile.as_deref() {
-            if self.state.get_worker_profile(profile_id).await?.is_none() {
+        if let Some(profile_id) = args.worker_profile.as_deref()
+            && self.state.get_worker_profile(profile_id).await?.is_none() {
                 return Ok(format!(
                     "Cannot create task: worker profile {profile_id} not found"
                 ));
             }
-        }
         if let Some(policy) = args.workspace_policy.as_deref() {
             anyhow::ensure!(
                 matches!(policy, "shared" | "isolated" | "worktree"),
@@ -603,14 +601,13 @@ impl ManageGoalTasksTool {
         let task_id = uuid::Uuid::new_v4().to_string();
 
         // Validate dependencies don't create cycles
-        if let Some(ref dep_ids) = args.depends_on {
-            if !dep_ids.is_empty() {
+        if let Some(ref dep_ids) = args.depends_on
+            && !dep_ids.is_empty() {
                 let existing = self.scoped_tasks().await?;
                 if let Err(reason) = validate_no_cycles(&existing, &task_id, dep_ids) {
                     return Ok(format!("Cannot create task: {}", reason));
                 }
             }
-        }
 
         let task = Task {
             id: task_id,
@@ -667,24 +664,22 @@ impl ManageGoalTasksTool {
             self.state.create_task(&task).await?;
         }
         if mandate_fence.is_none() {
-            if let Some(profile_id) = args.worker_profile.as_deref() {
-                if !self
+            if let Some(profile_id) = args.worker_profile.as_deref()
+                && !self
                     .state
                     .assign_task_worker_profile(&task.id, profile_id, "task-lead", None)
                     .await?
                 {
                     anyhow::bail!("worker profile '{}' is unavailable", profile_id);
                 }
-            }
-            if let Some(policy) = args.workspace_policy.as_deref() {
-                if !self
+            if let Some(policy) = args.workspace_policy.as_deref()
+                && !self
                     .state
                     .set_task_workspace_policy(&task.id, policy)
                     .await?
                 {
                     anyhow::bail!("workspace policy could not be applied to the new task");
                 }
-            }
         }
         info!(goal_id = %self.goal_id, task_id = %task.id, "Created task");
 
@@ -713,17 +708,15 @@ impl ManageGoalTasksTool {
             if let Some(ref pg) = task.parallel_group {
                 details.push(format!("group: {}", pg));
             }
-            if let Some(ref deps) = task.depends_on {
-                if let Ok(dep_ids) = serde_json::from_str::<Vec<String>>(deps) {
-                    if !dep_ids.is_empty() {
+            if let Some(ref deps) = task.depends_on
+                && let Ok(dep_ids) = serde_json::from_str::<Vec<String>>(deps)
+                    && !dep_ids.is_empty() {
                         let short_deps: Vec<String> = dep_ids
                             .iter()
                             .map(|d| d[..8.min(d.len())].to_string())
                             .collect();
                         details.push(format!("deps: [{}]", short_deps.join(", ")));
                     }
-                }
-            }
             if let Some(ref aid) = task.agent_id {
                 details.push(format!("agent: {}", aid));
             }
@@ -733,8 +726,8 @@ impl ManageGoalTasksTool {
                     task.retry_count, task.max_retries
                 ));
             }
-            if let Ok(journal) = self.state.get_task_journal(&task.id, 12).await {
-                if let Some(entry) = journal.iter().find(|entry| entry.actor_type == "human") {
+            if let Ok(journal) = self.state.get_task_journal(&task.id, 12).await
+                && let Some(entry) = journal.iter().find(|entry| entry.actor_type == "human") {
                     let end = aidaemon_tools::text::floor_char_boundary(&entry.body, 120);
                     details.push(format!(
                         "latest human {}: {}",
@@ -742,7 +735,6 @@ impl ManageGoalTasksTool {
                         &entry.body[..end]
                     ));
                 }
-            }
 
             let result_suffix = task
                 .result
@@ -798,16 +790,14 @@ impl ManageGoalTasksTool {
         }
 
         // Dependency enforcement: prevent moving to "running" or "claimed" if deps unmet
-        if let Some(ref new_status) = args.status {
-            if new_status == "running" || new_status == "claimed" {
-                if let Err(reason) = check_dependencies_met(self.state.as_ref(), &task).await {
+        if let Some(ref new_status) = args.status
+            && (new_status == "running" || new_status == "claimed")
+                && let Err(reason) = check_dependencies_met(self.state.as_ref(), &task).await {
                     return Ok(format!(
                         "Cannot set task {} to {}: {}",
                         task_id, new_status, reason
                     ));
                 }
-            }
-        }
 
         if let Some(status) = &args.status {
             task.status = status.clone();
@@ -945,11 +935,10 @@ impl ManageGoalTasksTool {
         info!(goal_id = %self.goal_id, task_id, status = %task.status, "Updated task");
 
         // Accumulate context when a task completes with a result
-        if task.status == "completed" && task.result.is_some() {
-            if let Err(e) = self.accumulate_goal_context(&task).await {
+        if task.status == "completed" && task.result.is_some()
+            && let Err(e) = self.accumulate_goal_context(&task).await {
                 tracing::warn!(goal_id = %self.goal_id, "Failed to accumulate goal context: {}", e);
             }
-        }
 
         Ok(format!(
             "Updated task {} → status: {}",
@@ -1187,9 +1176,9 @@ impl ManageGoalTasksTool {
         let is_continuous = goal.goal_type == "continuous";
         if is_continuous {
             goal.dispatch_failures = 0;
-            if let Some(raw_context) = goal.context.as_deref() {
-                if let Ok(mut context) = serde_json::from_str::<Value>(raw_context) {
-                    if let Some(object) = context.as_object_mut() {
+            if let Some(raw_context) = goal.context.as_deref()
+                && let Ok(mut context) = serde_json::from_str::<Value>(raw_context)
+                    && let Some(object) = context.as_object_mut() {
                         object.remove("failure_summary");
                         goal.context = if object.is_empty() {
                             None
@@ -1197,8 +1186,6 @@ impl ManageGoalTasksTool {
                             Some(context.to_string())
                         };
                     }
-                }
-            }
         } else {
             goal.status = "completed".to_string();
             goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
@@ -1277,11 +1264,10 @@ impl ManageGoalTasksTool {
 
         // Compress if context > 32KB: older entries get one-line summaries
         let serialized = serde_json::to_string(&ctx)?;
-        if serialized.len() > 32_000 {
-            if let Some(arr) = ctx.get_mut("task_results").and_then(|v| v.as_array_mut()) {
+        if serialized.len() > 32_000
+            && let Some(arr) = ctx.get_mut("task_results").and_then(|v| v.as_array_mut()) {
                 compress_old_entries(arr);
             }
-        }
 
         goal.context = Some(serde_json::to_string(&ctx)?);
         goal.updated_at = chrono::Utc::now().to_rfc3339();

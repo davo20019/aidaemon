@@ -14,7 +14,10 @@
 //! it from model requests, events, receipts, approval questions and saved
 //! state without being told about it.
 
-#![forbid(unsafe_code)]
+// Tests need one `unsafe` helper to set environment variables (edition 2024);
+// the library itself stays free of `unsafe`.
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(test, deny(unsafe_code))]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -185,11 +188,10 @@ impl EnvSecretStore {
             EnvFileLocation::Fixed(path) => path.clone(),
             EnvFileLocation::FromVars { vars, default } => {
                 for var in vars {
-                    if let Ok(path) = std::env::var(var) {
-                        if !path.trim().is_empty() {
+                    if let Ok(path) = std::env::var(var)
+                        && !path.trim().is_empty() {
                             return PathBuf::from(path);
                         }
-                    }
                 }
                 default.clone()
             }
@@ -202,11 +204,10 @@ impl SecretStore for EnvSecretStore {
         let env_key = key.to_uppercase();
         let env_path = self.env_file_path();
         if env_path.exists() {
-            if let Some(val) = read_env_secret_from_file(&env_path, &env_key)? {
-                if !val.is_empty() {
+            if let Some(val) = read_env_secret_from_file(&env_path, &env_key)?
+                && !val.is_empty() {
                     return Ok(Secret::new(val));
                 }
-            }
             anyhow::bail!(
                 "Keychain disabled and env var '{}' not found in '{}'",
                 env_key,
@@ -214,11 +215,10 @@ impl SecretStore for EnvSecretStore {
             );
         }
 
-        if let Ok(val) = std::env::var(&env_key) {
-            if !val.is_empty() {
+        if let Ok(val) = std::env::var(&env_key)
+            && !val.is_empty() {
                 return Ok(Secret::new(val));
             }
-        }
 
         anyhow::bail!(
             "Keychain disabled and env var '{}' not set for '{}'",
@@ -442,11 +442,10 @@ fn upsert_env_secret(env_path: &Path, field_name: &str, value: &str) -> anyhow::
         lines.push(assignment);
     }
 
-    if let Some(parent) = env_path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = env_path.parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
-    }
 
     let mut body = lines.join("\n");
     if !body.is_empty() {
@@ -540,11 +539,10 @@ fn read_env_secret_from_file(env_path: &Path, env_key: &str) -> anyhow::Result<O
     let content = std::fs::read_to_string(env_path)?;
     let mut found_via_loose_scan: Option<String> = None;
     for line in content.lines() {
-        if is_env_key_assignment(line, env_key) {
-            if let Some((_, raw_value)) = line.split_once('=') {
+        if is_env_key_assignment(line, env_key)
+            && let Some((_, raw_value)) = line.split_once('=') {
                 found_via_loose_scan = Some(decode_env_value_loose(raw_value));
             }
-        }
     }
     Ok(found_via_loose_scan)
 }
@@ -552,6 +550,29 @@ fn read_env_secret_from_file(env_path: &Path, env_key: &str) -> anyhow::Result<O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sets an environment variable that no other test uses, and removes it
+    /// again when dropped.
+    struct ScopedVar(&'static str);
+
+    #[allow(unsafe_code)]
+    impl ScopedVar {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            // SAFETY: test-only, and the name is private to one test. std
+            // serializes its own environment reads and writes; foreign code
+            // calling getenv concurrently is a risk the test binary accepts.
+            unsafe { std::env::set_var(name, value) };
+            Self(name)
+        }
+    }
+
+    #[allow(unsafe_code)]
+    impl Drop for ScopedVar {
+        fn drop(&mut self) {
+            // SAFETY: as in `ScopedVar::set`.
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
 
     #[test]
     fn env_store_set_quotes_and_keeps_other_lines() {
@@ -650,14 +671,17 @@ mod tests {
         // Private variable names, so no other test races on them.
         let first = "AIDAEMON_SECRETS_TEST_FIRST_ENV_FILE";
         let second = "AIDAEMON_SECRETS_TEST_SECOND_ENV_FILE";
-        std::env::set_var(first, "/daemon/root/.env");
-        std::env::set_var(second, "/some/other/.env");
+        let second_set = ScopedVar::set(second, "/some/other/.env");
         let store = EnvSecretStore::from_env_vars([first, second], ".env");
-        assert_eq!(store.env_file_path(), PathBuf::from("/daemon/root/.env"));
-        std::env::set_var(first, "  ");
-        assert_eq!(store.env_file_path(), PathBuf::from("/some/other/.env"));
-        std::env::remove_var(first);
-        std::env::remove_var(second);
+        {
+            let _first = ScopedVar::set(first, "/daemon/root/.env");
+            assert_eq!(store.env_file_path(), PathBuf::from("/daemon/root/.env"));
+        }
+        {
+            let _first = ScopedVar::set(first, "  ");
+            assert_eq!(store.env_file_path(), PathBuf::from("/some/other/.env"));
+        }
+        drop(second_set);
         assert_eq!(store.env_file_path(), PathBuf::from(".env"));
     }
 
@@ -667,8 +691,8 @@ mod tests {
         let file_var = "AIDAEMON_SECRETS_TEST_KEYCHAIN_ENV_FILE";
         let tmp = tempfile::tempdir().unwrap();
         let env_path = tmp.path().join(".env");
-        std::env::set_var(disable, "true");
-        std::env::set_var(file_var, &env_path);
+        let _disable = ScopedVar::set(disable, "true");
+        let _file_var = ScopedVar::set(file_var, &env_path);
         let store = KeychainSecretStore::new(KeychainSettings {
             disable_var: Some(disable.into()),
             env_file_vars: vec![file_var.into()],
@@ -682,8 +706,6 @@ mod tests {
             .contains("BOT_TOKEN=abc"));
         store.delete("bot_token").unwrap();
         assert!(!store.contains("bot_token"));
-        std::env::remove_var(disable);
-        std::env::remove_var(file_var);
     }
 
     #[test]

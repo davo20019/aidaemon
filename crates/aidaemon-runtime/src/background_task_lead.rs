@@ -211,11 +211,10 @@ pub fn sqlite_busy_code(value: &str) -> bool {
 
 pub fn is_sqlite_busy_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        if let Some(sqlx::Error::Database(database)) = cause.downcast_ref::<sqlx::Error>() {
-            if database.code().is_some_and(|code| sqlite_busy_code(&code)) {
+        if let Some(sqlx::Error::Database(database)) = cause.downcast_ref::<sqlx::Error>()
+            && database.code().is_some_and(|code| sqlite_busy_code(&code)) {
                 return true;
             }
-        }
         let message = cause.to_string().to_ascii_lowercase();
         message.contains("database is locked")
             || message.contains("database table is locked")
@@ -814,12 +813,11 @@ pub async fn rebind_scheduled_recovery_state(
     goal_id: &str,
     recovery_task_id: &str,
 ) {
-    if let Some(registry) = registry {
-        if let Some(status) = registry.get_run_budget(goal_id).await {
+    if let Some(registry) = registry
+        && let Some(status) = registry.get_run_budget(goal_id).await {
             persist_scheduled_run_state(state, goal_id, Some(recovery_task_id), &status).await;
             return;
         }
-    }
 
     // A restart or terminal transition can clear the in-memory registry before
     // recovery is created. Preserve the persisted counters and health while
@@ -1629,14 +1627,13 @@ pub fn spawn_background_task_lead(
                         let _ = keepalive_handle.await;
                         let now = chrono::Utc::now().to_rfc3339();
                         let msg = format!("Waited for {} second(s).", wait_secs);
-                        if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
-                            if g.status == "active" || g.status == "pending" {
+                        if let Ok(Some(mut g)) = state.get_goal(&goal_id).await
+                            && (g.status == "active" || g.status == "pending") {
                                 g.status = "completed".to_string();
                                 g.completed_at = Some(now.clone());
                                 g.updated_at = now.clone();
                                 let _ = state.update_goal(&g).await;
                             }
-                        }
 
                         // Finalize any non-terminal tasks so we don't leave pending rows behind
                         // after a local pure-wait short-circuit.
@@ -1647,8 +1644,8 @@ pub fn spawn_background_task_lead(
                                 && task.status != "failed"
                                 && task.status != "cancelled"
                             {
-                                if Some(task.id.as_str()) == dispatch_trigger_task_id.as_deref() {
-                                    if let Some(attempt) = dispatch_attempt.as_ref() {
+                                if Some(task.id.as_str()) == dispatch_trigger_task_id.as_deref()
+                                    && let Some(attempt) = dispatch_attempt.as_ref() {
                                         let handoff = aidaemon_work::traits::TaskHandoff {
                                             id: uuid::Uuid::new_v4().to_string(),
                                             task_id: task.id.clone(),
@@ -1677,7 +1674,6 @@ pub fn spawn_background_task_lead(
                                             .await;
                                         continue;
                                     }
-                                }
                                 let mut updated = task.clone();
                                 updated.status = "completed".to_string();
                                 updated.error = None;
@@ -1784,8 +1780,8 @@ pub fn spawn_background_task_lead(
                     return;
                 }
             }
-            if is_mandate_run {
-                if let Err(error) = &task_lead_run {
+            if is_mandate_run
+                && let Err(error) = &task_lead_run {
                     warn!(
                         goal_id = %goal_id,
                         run_id = goal_run_id.as_deref().unwrap_or("missing"),
@@ -1793,7 +1789,6 @@ pub fn spawn_background_task_lead(
                         "Mandate deliberator exited before returning a semantic outcome"
                     );
                 }
-            }
             let task_lead_outcome = task_lead_run.as_ref().ok().map(|run| run.outcome);
             let result = task_lead_run.map(|run| run.response);
 
@@ -1912,8 +1907,8 @@ pub fn spawn_background_task_lead(
                                     } else {
                                         None
                                     };
-                                if let Some(run_budget) = run_budget {
-                                    if run_budget.tokens_used
+                                if let Some(run_budget) = run_budget
+                                    && run_budget.tokens_used
                                         >= run_budget.effective_budget_per_check
                                     {
                                         let old_budget = run_budget.effective_budget_per_check;
@@ -1963,11 +1958,9 @@ pub fn spawn_background_task_lead(
                                             break;
                                         }
                                     }
-                                }
                             } else if let Some(budget_daily) =
                                 effective_goal_daily_budget(&g, goal_token_registry.as_ref()).await
-                            {
-                                if g.tokens_used_today >= budget_daily {
+                                && g.tokens_used_today >= budget_daily {
                                     budget_exhausted = true;
                                     info!(
                                         goal_id = %goal_id,
@@ -1977,7 +1970,6 @@ pub fn spawn_background_task_lead(
                                     );
                                     break;
                                 }
-                            }
                         }
 
                         if let Some(group) = task.parallel_group.as_ref() {
@@ -2125,9 +2117,9 @@ pub fn spawn_background_task_lead(
             // the trigger result. A stale finalizer must not close the run that
             // a replacement task lead now owns.
             let mut trigger_finalization_authoritative = dispatch_attempt.is_none();
-            if let Some(ref trigger_task_id) = dispatch_trigger_task_id {
-                if let Ok(Some(trigger_task)) = state.get_task(trigger_task_id).await {
-                    if trigger_task.status == "running" || trigger_task.status == "claimed" {
+            if let Some(ref trigger_task_id) = dispatch_trigger_task_id
+                && let Ok(Some(trigger_task)) = state.get_task(trigger_task_id).await
+                    && (trigger_task.status == "running" || trigger_task.status == "claimed") {
                         let semantic_task_lead_success = task_lead_semantically_succeeded(
                             task_lead_outcome,
                             is_mandate_run,
@@ -2249,8 +2241,6 @@ pub fn spawn_background_task_lead(
                             }
                         }
                     }
-                }
-            }
 
             // Stop the heartbeat
             let _ = heartbeat_cancel_tx.send(());
@@ -2602,8 +2592,7 @@ pub fn spawn_background_task_lead(
                             Ok(outcome) => {
                                 if outcome.recorded
                                     && notice.kind == MandateRunNotificationKind::Ask
-                                {
-                                    if let Err(error) = agent
+                                    && let Err(error) = agent
                                         .record_mandate_owner_input_context(
                                             &session_id,
                                             &notice.mandate_id,
@@ -2619,7 +2608,6 @@ pub fn spawn_background_task_lead(
                                             "Failed to bind delivered mandate ASK to owner dialogue state"
                                         );
                                     }
-                                }
                                 if outcome.sent {
                                     let _ =
                                         state.mark_notification_delivered(&notification_id).await;
@@ -2646,8 +2634,8 @@ pub fn spawn_background_task_lead(
             let run_status =
                 goal_run_terminal_status(status, trigger_status.as_deref(), &final_run_tasks);
             let continuous_controller = initial_goal.goal_type == "continuous";
-            if let Some(run_id) = goal_run_id.as_deref() {
-                if let Some(run_status) = run_status {
+            if let Some(run_id) = goal_run_id.as_deref()
+                && let Some(run_status) = run_status {
                     let summary = build_goal_task_results_summary(
                         &final_run_tasks,
                         dispatch_trigger_task_id.as_deref(),
@@ -2669,7 +2657,6 @@ pub fn spawn_background_task_lead(
                         );
                     }
                 }
-            }
 
             // A recurring goal stays active after each cycle, but an individual
             // cycle can still complete or fail. Surface that terminal run outcome instead
@@ -2776,11 +2763,10 @@ pub fn spawn_background_task_lead(
                     }
 
                     // Clean up cancellation token and return.
-                    if run_status.is_some() {
-                        if let Some(ref registry) = goal_token_registry {
+                    if run_status.is_some()
+                        && let Some(ref registry) = goal_token_registry {
                             registry.remove(&goal_id).await;
                         }
-                    }
                     return;
                 }
             }
@@ -2831,9 +2817,9 @@ pub fn spawn_background_task_lead(
                 let local_hour = chrono::Timelike::hour(&chrono::Local::now());
                 if aidaemon_work::traits::NotificationEntry::routine_delivery_allowed_at_local_hour(
                     local_hour,
-                ) {
-                    if let Some(hub_weak) = &hub {
-                        if let Some(hub_arc) = hub_weak.upgrade() {
+                )
+                    && let Some(hub_weak) = &hub
+                        && let Some(hub_arc) = hub_weak.upgrade() {
                             let retry_text = if is_scheduled_run {
                                 "⏳ **Scheduled run in progress**\n\nThe first attempt did not finish, so I’m retrying safely…"
                             } else {
@@ -2854,8 +2840,6 @@ pub fn spawn_background_task_lead(
                                 let _ = hub_arc.send_text(&session_id, retry_text).await;
                             }
                         }
-                    }
-                }
 
                 let now = chrono::Utc::now().to_rfc3339();
                 let recovery_task_id = uuid::Uuid::new_v4().to_string();
@@ -2968,10 +2952,9 @@ pub fn spawn_background_task_lead(
                                 superseded.completed_at = Some(chrono::Utc::now().to_rfc3339());
                                 let _ = state.update_task(&superseded).await;
                             }
-                            if let Some(trigger_task_id) = dispatch_trigger_task_id.as_deref() {
-                                if let Ok(Some(mut trigger)) = state.get_task(trigger_task_id).await
-                                {
-                                    if !trigger.satisfies_run_completion() {
+                            if let Some(trigger_task_id) = dispatch_trigger_task_id.as_deref()
+                                && let Ok(Some(mut trigger)) = state.get_task(trigger_task_id).await
+                                    && !trigger.satisfies_run_completion() {
                                         trigger.status = "superseded".to_string();
                                         trigger.error = None;
                                         trigger.blocker = None;
@@ -2982,8 +2965,6 @@ pub fn spawn_background_task_lead(
                                             Some(chrono::Utc::now().to_rfc3339());
                                         let _ = state.update_task(&trigger).await;
                                     }
-                                }
-                            }
                             if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
                                 if continuous_controller {
                                     g.status = "active".to_string();
@@ -3240,8 +3221,8 @@ pub fn spawn_background_task_lead(
 
                             // Auto-send any files referenced in the completion message
                             let file_paths = extract_file_paths_from_text(&msg);
-                            if let Some(hub_weak) = &hub {
-                                if let Some(hub_arc) = hub_weak.upgrade() {
+                            if let Some(hub_weak) = &hub
+                                && let Some(hub_arc) = hub_weak.upgrade() {
                                     for path in file_paths {
                                         let filename = std::path::Path::new(&path)
                                             .file_name()
@@ -3264,7 +3245,6 @@ pub fn spawn_background_task_lead(
                                         }
                                     }
                                 }
-                            }
                         }
                         Ok(_) => {}
                         Err(err) => {

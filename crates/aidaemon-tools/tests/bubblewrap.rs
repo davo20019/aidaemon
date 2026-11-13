@@ -13,6 +13,27 @@ use aidaemon_core::{CancellationToken, Tool, ToolContext};
 use aidaemon_tools::{BubblewrapSandbox, CommandOutput, Sandbox, SandboxCommand, Shell, Workspace};
 use serde_json::json;
 
+/// Sets an environment variable that no other test uses, and removes it
+/// again when dropped.
+struct ScopedVar(&'static str);
+
+impl ScopedVar {
+    fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        // SAFETY: test-only, and the name is private to one test. std
+        // serializes its own environment reads and writes; foreign code
+        // calling getenv concurrently is a risk the test binary accepts.
+        unsafe { std::env::set_var(name, value) };
+        Self(name)
+    }
+}
+
+impl Drop for ScopedVar {
+    fn drop(&mut self) {
+        // SAFETY: as in `ScopedVar::set`.
+        unsafe { std::env::remove_var(self.0) };
+    }
+}
+
 fn bwrap() -> Option<BubblewrapSandbox> {
     let backend = BubblewrapSandbox::new();
     if backend.is_available() {
@@ -233,7 +254,7 @@ async fn network_is_off_unless_allowed() {
 async fn environment_is_only_the_spec() {
     let Some(backend) = bwrap() else { return };
     let ws = workspace();
-    std::env::set_var("AIDAEMON_BWRAP_TEST_SECRET", "synthetic-secret");
+    let _secret = ScopedVar::set("AIDAEMON_BWRAP_TEST_SECRET", "synthetic-secret");
     let mut s = spec(
         "echo \"[$AIDAEMON_BWRAP_TEST_SECRET][$GREETING]\"",
         &ws.root,

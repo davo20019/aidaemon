@@ -148,15 +148,13 @@ impl ExposureConfig {
                 ..
             }),
         ) = (&self.client_gateway, &self.node_gateway)
-        {
-            if a.trim() == b.trim() {
+            && a.trim() == b.trim() {
                 return Err(
                     "exposure.client_gateway and exposure.node_gateway must use different \
                      Cloudflare tunnels: one tunnel publishes one service"
                         .to_string(),
                 );
             }
-        }
         if let (
             Some(ServiceExposureConfig::Tailscale { .. }),
             Some(ServiceExposureConfig::Tailscale { .. }),

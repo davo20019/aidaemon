@@ -325,12 +325,11 @@ fn chatgpt_error(
     headers: &reqwest::header::HeaderMap,
     body: &str,
 ) -> ProviderError {
-    if status.as_u16() == 429 {
-        if let Some(error) = plan_limit(headers, body, SystemTime::now()) {
+    if status.as_u16() == 429
+        && let Some(error) = plan_limit(headers, body, SystemTime::now()) {
             tracing::warn!(%error, "ChatGPT plan limit");
             return error;
         }
-    }
     map_status(status, headers, body)
 }
 

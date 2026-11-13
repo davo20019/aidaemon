@@ -198,13 +198,12 @@ fn strip_inline_dollars(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] == '$' {
-            if let Some(close) = inline_math_close(&chars, i) {
+        if chars[i] == '$'
+            && let Some(close) = inline_math_close(&chars, i) {
                 out.extend(&chars[i + 1..close]);
                 i = close + 1;
                 continue;
             }
-        }
         out.push(chars[i]);
         i += 1;
     }

@@ -73,11 +73,10 @@ fn set_db_file_permissions(db_path: &str) {
     // WAL and shared-memory files created by SQLite in WAL journal mode
     for suffix in &["-wal", "-shm"] {
         let path = format!("{}{}", db_path, suffix);
-        if std::path::Path::new(&path).exists() {
-            if let Err(e) = std::fs::set_permissions(&path, mode.clone()) {
+        if std::path::Path::new(&path).exists()
+            && let Err(e) = std::fs::set_permissions(&path, mode.clone()) {
                 tracing::warn!("Failed to set permissions on {}: {}", path, e);
             }
-        }
     }
 }
 
@@ -223,13 +222,12 @@ impl SqliteStateStore {
         // SQLCipher: set encryption key via connect options so it applies to
         // every connection in the pool (PRAGMA key must be the first statement).
         #[cfg(feature = "encryption")]
-        if let Some(key) = encryption_key {
-            if !key.is_empty() {
+        if let Some(key) = encryption_key
+            && !key.is_empty() {
                 let escaped_key = key.replace('\'', "''");
                 opts = opts.pragma("key", format!("'{}'", escaped_key));
                 tracing::info!("SQLCipher encryption enabled for database");
             }
-        }
 
         #[cfg(not(feature = "encryption"))]
         if let Some(key) = encryption_key {

@@ -409,11 +409,10 @@ fn sample_number(obj: &Map<String, Value>, integer: bool) -> Value {
         (None, Some(m)) => m + 1.0,
         (None, None) => 1.0,
     };
-    if let Some(max) = max {
-        if n > max {
+    if let Some(max) = max
+        && n > max {
             n = max;
         }
-    }
     if integer {
         Value::from(n.ceil() as i64)
     } else {

@@ -286,12 +286,11 @@ impl DiscordBot {
             tokio::spawn(async move { transport.run(events_tx, shutdown).await })
         };
         while let Some(event) = events.recv().await {
-            if let Some(username) = transport.bot_username() {
-                if username != self.get_bot_username() {
+            if let Some(username) = transport.bot_username()
+                && username != self.get_bot_username() {
                     info!(username = %username, "Discord bot connected");
                     self.set_bot_username(username);
                 }
-            }
             let this = self.clone();
             tokio::spawn(async move { this.handle_event(event).await });
         }

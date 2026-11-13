@@ -595,8 +595,8 @@ impl GoalCycle {
             // the recurring schedule's `last_run_at` has not advanced.
             // See docs/2026-06-30-telegram-edge-case-findings.md (2026-07-04
             // escalation: 5 duplicate tweets from repeated goal dispatch).
-            if is_scheduled_goal {
-                if let Some(current_run) = current_goal_run.as_ref() {
+            if is_scheduled_goal
+                && let Some(current_run) = current_goal_run.as_ref() {
                     let mutating_success_task_ids =
                         self.goal_run_mutating_success_tasks(&current_run.id).await;
                     if !mutating_success_task_ids.is_empty() {
@@ -664,7 +664,6 @@ impl GoalCycle {
                         continue;
                     }
                 }
-            }
 
             // Try to atomically claim the first pending task and spawn a task lead.
             let first_task = eligible_tasks[0];

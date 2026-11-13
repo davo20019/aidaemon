@@ -323,24 +323,22 @@ pub fn collect_executor_expected_targets(
 ) -> Vec<aidaemon_tools::semantics::ToolTargetHint> {
     let mut targets = Vec::new();
 
-    if let Some(scope) = project_scope {
-        if let Some(target) = aidaemon_tools::semantics::ToolTargetHint::new(
+    if let Some(scope) = project_scope
+        && let Some(target) = aidaemon_tools::semantics::ToolTargetHint::new(
             aidaemon_tools::semantics::ToolTargetHintKind::ProjectScope,
             scope,
         ) {
             targets.push(target);
         }
-    }
 
     let mut add_dir = |dir: String| {
         if let Some(target) = aidaemon_tools::semantics::ToolTargetHint::new(
             aidaemon_tools::semantics::ToolTargetHintKind::Path,
             dir,
-        ) {
-            if !targets.iter().any(|existing| existing == &target) {
+        )
+            && !targets.iter().any(|existing| existing == &target) {
                 targets.push(target);
             }
-        }
     };
 
     for dir in extract_directory_paths(mission) {

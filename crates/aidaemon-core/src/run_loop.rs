@@ -673,14 +673,13 @@ impl<'a> Driver<'a> {
             // fetch that taints the run before a send is judged), so queued
             // read-only calls run before a call that is not concurrent-safe
             // is put to them.
-            if !may_run_concurrently || annotations.egress {
-                if let Some(end) = self
+            if (!may_run_concurrently || annotations.egress)
+                && let Some(end) = self
                     .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
                     .await?
                 {
                     return Ok(end);
                 }
-            }
 
             // This call is already inside its tool: it passed policy when it
             // started, and the answer is for the run paused below it.
@@ -746,14 +745,13 @@ impl<'a> Driver<'a> {
                         .iter()
                         .filter(|queued| queued.call.name == call.name)
                         .count();
-                    if peers > 0 && queued_peers >= peers {
-                        if let Some(end) = self
+                    if peers > 0 && queued_peers >= peers
+                        && let Some(end) = self
                             .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
                             .await?
                         {
                             return Ok(end);
                         }
-                    }
                     group.push(Approved { call, annotations });
                 }
                 Verdict::Allow if suspends => {
@@ -1343,14 +1341,13 @@ impl<'a> Driver<'a> {
         );
         // Results are appended in call order, so the first finish kept is
         // the first in call order.
-        if receipt.stage == InvocationStage::Dispatched && self.state.finishing.is_none() {
-            if let Some(finish) = output.finish.clone() {
+        if receipt.stage == InvocationStage::Dispatched && self.state.finishing.is_none()
+            && let Some(finish) = output.finish.clone() {
                 self.state.finishing = Some(PendingFinish {
                     finish,
                     tool: receipt.tool.clone(),
                 });
             }
-        }
         if receipt.stage == InvocationStage::Dispatched && receipt.source == SourceTrust::Untrusted
         {
             self.state.untrusted_seen = true;
@@ -1616,8 +1613,8 @@ impl<'a> Driver<'a> {
         if !crate::binding::same(&expected, given) {
             return Ok(Vec::new());
         }
-        if let Some(store) = &self.agent.store {
-            if let Some(stored) = store.load_state(self.state.run_id).await? {
+        if let Some(store) = &self.agent.store
+            && let Some(stored) = store.load_state(self.state.run_id).await? {
                 let still_waiting = stored.pending.as_ref().is_some_and(|p| {
                     p.interruption
                         .digest
@@ -1628,7 +1625,6 @@ impl<'a> Driver<'a> {
                     return Err(CoreError::ApprovalAlreadyUsed);
                 }
             }
-        }
         if !crate::binding::consume(given) {
             return Err(CoreError::ApprovalAlreadyUsed);
         }
@@ -1850,11 +1846,10 @@ impl<'a> Driver<'a> {
     /// read-only calls are waiting to run and count toward `max_tool_calls`.
     fn call_limit(&self, queued: usize) -> Option<LimitKind> {
         let limits = self.limits();
-        if let Some(max) = limits.max_tool_calls {
-            if u64::from(self.state.tool_calls) + queued as u64 >= u64::from(max) {
+        if let Some(max) = limits.max_tool_calls
+            && u64::from(self.state.tool_calls) + queued as u64 >= u64::from(max) {
                 return Some(LimitKind::ToolCalls);
             }
-        }
         if self.remaining() == Some(Duration::ZERO) {
             return Some(LimitKind::WallClock);
         }

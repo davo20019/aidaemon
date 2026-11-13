@@ -415,12 +415,11 @@ impl SseDecoder for ChatDecoder {
             }
             let delta = choice.get("delta").or_else(|| choice.get("message"));
             if let Some(delta) = delta {
-                if let Some(text) = delta.get("content").and_then(Value::as_str) {
-                    if !text.is_empty() {
+                if let Some(text) = delta.get("content").and_then(Value::as_str)
+                    && !text.is_empty() {
                         self.text.push_str(text);
                         deltas.push(text.to_string());
                     }
-                }
                 // DeepSeek and Moonshot send `reasoning_content`, OpenRouter
                 // sends `reasoning`.
                 let thought = ["reasoning_content", "reasoning"]

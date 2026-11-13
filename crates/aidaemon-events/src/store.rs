@@ -1218,19 +1218,17 @@ impl EventStore {
             );
         }
         tx.commit().await?;
-        if matches!(event_type_str, "user_message" | "assistant_response") {
-            if let Err(error) = self.host.project_history(&self.pool, event_id).await {
+        if matches!(event_type_str, "user_message" | "assistant_response")
+            && let Err(error) = self.host.project_history(&self.pool, event_id).await {
                 // Never couple the canonical append transaction to FTS health.
                 tracing::debug!(%error, event_id, "Deferred exact-history projection");
             }
-        }
         if let Some(generated_response) = generated_response {
             let _ = GENERATED_RESPONSE_CAPTURE.try_with(|capture| {
-                if capture.session_id == event.session_id {
-                    if let Ok(mut responses) = capture.responses.lock() {
+                if capture.session_id == event.session_id
+                    && let Ok(mut responses) = capture.responses.lock() {
                         responses.push(generated_response);
                     }
-                }
             });
         }
         Ok(event_id)
@@ -1786,13 +1784,12 @@ impl EventStore {
                 .await?;
             let mut calls = std::collections::HashMap::new();
             for event in &child_events {
-                if event.event_type == EventType::ToolCall {
-                    if let Ok(call) =
+                if event.event_type == EventType::ToolCall
+                    && let Ok(call) =
                         serde_json::from_value::<super::ToolCallData>(event.data.clone())
                     {
                         calls.insert(call.tool_call_id.clone(), call);
                     }
-                }
             }
             for event in &child_events {
                 if event.event_type != EventType::ToolResult {
@@ -2234,14 +2231,13 @@ impl EventStore {
                     result,
                     task_id,
                     &format!("obligation:mutation:{effect_name}"),
-                ) {
-                    if let Some(effect) =
+                )
+                    && let Some(effect) =
                         crate::traits::ToolMutationEffects::from_protocol_name(effect_name)
                     {
                         closure.observed_mutation_effects =
                             closure.observed_mutation_effects.union(effect);
                     }
-                }
             }
             if result.succeeded()
                 && receipt.invocation_stage.reached_dispatch()
@@ -4119,13 +4115,11 @@ impl EventEmitter {
         let mut json_data = serde_json::to_value(data)?;
 
         // Inject task_id if present and not already in data
-        if let Some(task_id) = &self.current_task_id {
-            if let Some(obj) = json_data.as_object_mut() {
-                if !obj.contains_key("task_id") {
+        if let Some(task_id) = &self.current_task_id
+            && let Some(obj) = json_data.as_object_mut()
+                && !obj.contains_key("task_id") {
                     obj.insert("task_id".to_string(), serde_json::json!(task_id));
                 }
-            }
-        }
 
         let event = Event::new(&self.session_id, event_type, json_data);
         self.store.append(event).await
@@ -4156,11 +4150,10 @@ impl EventEmitter {
         usage: Option<&TokenUsage>,
         call_id: &str,
     ) -> anyhow::Result<i64> {
-        if data.task_id.trim().is_empty() {
-            if let Some(task_id) = &self.current_task_id {
+        if data.task_id.trim().is_empty()
+            && let Some(task_id) = &self.current_task_id {
                 data.task_id = task_id.clone();
             }
-        }
         let event = Event::new(
             &self.session_id,
             EventType::LlmCall,

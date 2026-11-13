@@ -152,13 +152,11 @@ impl ManageMemoriesTool {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        if schedule_inputs.is_empty() {
-            if let Some(schedule) = args.schedule.as_deref().map(str::trim) {
-                if !schedule.is_empty() {
+        if schedule_inputs.is_empty()
+            && let Some(schedule) = args.schedule.as_deref().map(str::trim)
+                && !schedule.is_empty() {
                     schedule_inputs.push(schedule.to_string());
                 }
-            }
-        }
         if schedule_inputs.is_empty() {
             anyhow::bail!(
                 "'schedule' (or a non-empty 'schedules' list) is required for create_scheduled_goal"
@@ -371,11 +369,10 @@ impl ManageMemoriesTool {
         }
 
         // Fast path: exact match + domain check.
-        if let Some(g) = self.state.get_goal(trimmed).await? {
-            if g.domain == "personal" {
+        if let Some(g) = self.state.get_goal(trimmed).await?
+            && g.domain == "personal" {
                 return Ok(trimmed.to_string());
             }
-        }
 
         let goals = self.state.get_active_personal_goals(100).await?;
         let mut matches: Vec<&crate::tools::traits::Goal> =
@@ -418,13 +415,11 @@ impl ManageMemoriesTool {
             return true;
         }
 
-        if let Some(ctx) = &goal.context {
-            if let Ok(v) = serde_json::from_str::<Value>(ctx) {
-                if v.get("system_protected").and_then(|x| x.as_bool()) == Some(true) {
+        if let Some(ctx) = &goal.context
+            && let Ok(v) = serde_json::from_str::<Value>(ctx)
+                && v.get("system_protected").and_then(|x| x.as_bool()) == Some(true) {
                     return true;
                 }
-            }
-        }
 
         false
     }

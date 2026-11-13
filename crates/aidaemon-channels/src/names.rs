@@ -139,11 +139,10 @@ impl DisplayNameCache {
         };
         let mut entries = self.lock();
         if !entries.names.contains_key(id) {
-            if entries.names.len() >= self.capacity {
-                if let Some(oldest) = entries.order.pop_front() {
+            if entries.names.len() >= self.capacity
+                && let Some(oldest) = entries.order.pop_front() {
                     entries.names.remove(&oldest);
                 }
-            }
             entries.order.push_back(id.to_string());
         }
         entries

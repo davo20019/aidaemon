@@ -211,8 +211,8 @@ fn normalize_file_shared_message(
         Value::String(channel_type.to_string()),
     );
 
-    if !message_object.contains_key("user") {
-        if let Some(user_id) = file_event
+    if !message_object.contains_key("user")
+        && let Some(user_id) = file_event
             .get("user_id")
             .or_else(|| file_event.get("user"))
             .and_then(Value::as_str)
@@ -220,7 +220,6 @@ fn normalize_file_shared_message(
         {
             message_object.insert("user".to_string(), Value::String(user_id.to_string()));
         }
-    }
 
     let has_files = message_object
         .get("files")
@@ -835,11 +834,10 @@ impl SlackBot {
                     let mut guard = self.bot_user_id.lock().await;
                     *guard = Some(user_id.to_string());
                 }
-                if let Some(team_id) = resp.get("team_id").and_then(|v| v.as_str()) {
-                    if let Ok(mut guard) = self.team_id.write() {
+                if let Some(team_id) = resp.get("team_id").and_then(|v| v.as_str())
+                    && let Ok(mut guard) = self.team_id.write() {
                         *guard = Some(team_id.to_string());
                     }
-                }
                 // Extract bot name from response (field is "user")
                 if let Some(bot_name) = resp.get("user").and_then(|v| v.as_str()) {
                     self.set_bot_name(bot_name.to_string());
@@ -972,11 +970,10 @@ impl SlackBot {
         const MEMBERS_TTL: Duration = Duration::from_secs(600); // 10 minutes
 
         // Check cache (with TTL)
-        if let Some((names, fetched_at)) = self.channel_members_cache.read().await.get(channel_id) {
-            if fetched_at.elapsed() < MEMBERS_TTL {
+        if let Some((names, fetched_at)) = self.channel_members_cache.read().await.get(channel_id)
+            && fetched_at.elapsed() < MEMBERS_TTL {
                 return names.clone();
             }
-        }
 
         // Call conversations.members API (limit 50)
         let resp = match self
@@ -1086,8 +1083,8 @@ impl SlackBot {
             .query(params)
             .send()
             .await?;
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            if let Some(delay) = aidaemon_channels::rate_limit::retry_after_from_headers(
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+            && let Some(delay) = aidaemon_channels::rate_limit::retry_after_from_headers(
                 resp.headers(),
                 aidaemon_channels::rate_limit::default_retry_after_cap(),
             ) {
@@ -1100,7 +1097,6 @@ impl SlackBot {
                     .send()
                     .await?;
             }
-        }
 
         let status = resp.status();
         let response_text = resp.text().await?;
@@ -1286,8 +1282,8 @@ impl SlackBot {
             .body(body_bytes.clone())
             .send()
             .await?;
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            if let Some(delay) = aidaemon_channels::rate_limit::retry_after_from_headers(
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+            && let Some(delay) = aidaemon_channels::rate_limit::retry_after_from_headers(
                 resp.headers(),
                 aidaemon_channels::rate_limit::default_retry_after_cap(),
             ) {
@@ -1301,7 +1297,6 @@ impl SlackBot {
                     .send()
                     .await?;
             }
-        }
         let result: Value = resp.json().await?;
         if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             let error = result
@@ -1528,15 +1523,14 @@ impl SlackBot {
         // Strip bot @mention from text before processing
         let raw_agent_text = {
             let bot_id_guard = self.bot_user_id.lock().await;
-            let stripped = if let Some(ref bid) = *bot_id_guard {
+            if let Some(bid) = bot_id_guard.as_ref() {
                 raw_text
                     .replace(&format!("<@{}>", bid), "")
                     .trim()
                     .to_string()
             } else {
                 raw_text.clone()
-            };
-            stripped
+            }
         };
         // Resolve remaining <@USERID> mentions to display names for ordinary
         // model input, but retain raw stable IDs for security-sensitive commands.
@@ -1554,8 +1548,8 @@ impl SlackBot {
 
         // Check for file attachments (skip for Public users)
         let mut inbound_attachments = Vec::new();
-        if self.deps.files_enabled && user_role != UserRole::Public {
-            if let Some(files) = event.get("files").and_then(|v| v.as_array()) {
+        if self.deps.files_enabled && user_role != UserRole::Public
+            && let Some(files) = event.get("files").and_then(|v| v.as_array()) {
                 match self.handle_incoming_files(files).await {
                     Ok(attachments) => inbound_attachments = attachments,
                     Err(e) => {
@@ -1571,7 +1565,6 @@ impl SlackBot {
                     }
                 }
             }
-        }
 
         // Build the text to send to the agent
         let agent_text = if inbound_attachments.is_empty() {
@@ -2082,15 +2075,14 @@ impl SlackBot {
             if !resp.status().is_success() {
                 anyhow::bail!("Failed to download Slack file: HTTP {}", resp.status());
             }
-            if let Some(content_length) = resp.content_length() {
-                if content_length > max_bytes {
+            if let Some(content_length) = resp.content_length()
+                && content_length > max_bytes {
                     anyhow::bail!(
                         "File too large ({:.1} MB). Maximum is {} MB.",
                         content_length as f64 / 1_048_576.0,
                         self.deps.max_file_size_mb
                     );
                 }
-            }
             let bytes = resp.bytes().await?;
             if bytes.len() as u64 > max_bytes {
                 anyhow::bail!(
@@ -2347,8 +2339,8 @@ impl TurnSurface for SlackSurface {
     /// A queued guest message keeps a workspace grant only if the grant is
     /// still in force.
     async fn before_queued(&self, mut queued: QueuedMessage) -> QueuedMessage {
-        if queued.user_role == UserRole::Guest {
-            if let Some(original) = queued.channel_ctx.workspace_grant.clone() {
+        if queued.user_role == UserRole::Guest
+            && let Some(original) = queued.channel_ctx.workspace_grant.clone() {
                 queued.channel_ctx.workspace_grant = match revalidate_queued_workspace_grant(
                     self.host.as_ref(),
                     &original,
@@ -2362,7 +2354,6 @@ impl TurnSurface for SlackSurface {
                     }
                 };
             }
-        }
         queued
     }
 }
@@ -2452,8 +2443,8 @@ async fn slack_post_message(
         .json(&body)
         .send()
         .await?;
-    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        if let Some(delay) = aidaemon_channels::rate_limit::retry_after_from_headers(
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+        && let Some(delay) = aidaemon_channels::rate_limit::retry_after_from_headers(
             resp.headers(),
             aidaemon_channels::rate_limit::default_retry_after_cap(),
         ) {
@@ -2465,7 +2456,6 @@ async fn slack_post_message(
                 .send()
                 .await?;
         }
-    }
     let result: Value = resp.json().await?;
     if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         let error = result

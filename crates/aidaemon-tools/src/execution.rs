@@ -680,11 +680,10 @@ impl RemoteBackendCore {
     ) -> String {
         let mut values = BTreeMap::new();
         for name in &self.env_allowlist {
-            if !removed_env.contains(name) {
-                if let Ok(value) = std::env::var(name) {
+            if !removed_env.contains(name)
+                && let Ok(value) = std::env::var(name) {
                     values.insert(name.clone(), value);
                 }
-            }
         }
         values.extend(request_env.clone());
         values

@@ -2208,15 +2208,14 @@ impl AppConfig {
         let mut bots = self.telegram_bots.clone();
 
         // Add legacy config as "default" if present and has a token
-        if let Some(ref legacy) = self.telegram {
-            if !legacy.bot_token.is_empty() {
+        if let Some(ref legacy) = self.telegram
+            && !legacy.bot_token.is_empty() {
                 bots.push(TelegramBotConfig {
                     bot_token: legacy.bot_token.clone(),
                     allowed_user_ids: legacy.allowed_user_ids.clone(),
                     webhook: legacy.webhook.clone(),
                 });
             }
-        }
 
         bots
     }
@@ -2226,15 +2225,14 @@ impl AppConfig {
     pub fn all_discord_bots(&self) -> Vec<DiscordBotConfig> {
         let mut bots = self.discord_bots.clone();
 
-        if let Some(ref legacy) = self.discord {
-            if !legacy.bot_token.is_empty() {
+        if let Some(ref legacy) = self.discord
+            && !legacy.bot_token.is_empty() {
                 bots.push(DiscordBotConfig {
                     bot_token: legacy.bot_token.clone(),
                     allowed_user_ids: legacy.allowed_user_ids.clone(),
                     guild_id: legacy.guild_id,
                 });
             }
-        }
 
         bots
     }
@@ -2269,11 +2267,10 @@ impl AppConfig {
         }
 
         // Legacy telegram config
-        if let Some(ref mut telegram) = self.telegram {
-            if telegram.bot_token == "keychain" {
+        if let Some(ref mut telegram) = self.telegram
+            && telegram.bot_token == "keychain" {
                 telegram.bot_token = resolve_from_keychain("bot_token")?;
             }
-        }
 
         // Telegram bots array
         for (i, bot) in self.telegram_bots.iter_mut().enumerate() {
@@ -2283,19 +2280,17 @@ impl AppConfig {
             }
         }
 
-        if let Some(ref email) = self.triggers.email {
-            if email.password == "keychain" {
+        if let Some(ref email) = self.triggers.email
+            && email.password == "keychain" {
                 let password = resolve_from_keychain("email_password")?;
                 let mut email = email.clone();
                 email.password = password;
                 self.triggers.email = Some(email);
             }
-        }
-        if let Some(ref key) = self.state.encryption_key {
-            if key == "keychain" {
+        if let Some(ref key) = self.state.encryption_key
+            && key == "keychain" {
                 self.state.encryption_key = Some(resolve_from_keychain("encryption_key")?);
             }
-        }
         if self.search.api_key == "keychain" {
             self.search.api_key = resolve_from_keychain("search_api_key")?;
         }
@@ -2315,11 +2310,10 @@ impl AppConfig {
 
         #[cfg(feature = "discord")]
         {
-            if let Some(ref mut discord) = self.discord {
-                if discord.bot_token == "keychain" {
+            if let Some(ref mut discord) = self.discord
+                && discord.bot_token == "keychain" {
                     discord.bot_token = resolve_from_keychain("discord_bot_token")?;
                 }
-            }
             for (i, bot) in self.discord_bots.iter_mut().enumerate() {
                 if bot.bot_token == "keychain" {
                     let key = aidaemon_secrets::names::bot_token(
@@ -2368,11 +2362,9 @@ impl AppConfig {
                 ("password", &mut profile.password),
             ];
             for (field, value) in fields.iter_mut() {
-                if let Some(ref v) = value {
-                    if v == "keychain" {
-                        let keychain_key = aidaemon_secrets::names::http_auth(name, field);
-                        **value = Some(resolve_from_keychain(&keychain_key)?);
-                    }
+                if value.as_deref() == Some("keychain") {
+                    let keychain_key = aidaemon_secrets::names::http_auth(name, field);
+                    **value = Some(resolve_from_keychain(&keychain_key)?);
                 }
             }
         }
@@ -2384,7 +2376,7 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::KeychainIsolation;
+    use crate::testing::{EnvVars, KeychainIsolation};
     use std::sync::LazyLock;
 
     /// A config written before a policy key was retired must still parse:
@@ -2663,17 +2655,18 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
     #[serial_test::serial(env_vars)]
     fn expand_env_vars_replaces_set_variable() {
         let _guard = ENV_EXPANSION_LOCK.lock().unwrap();
-        std::env::set_var("AIDAEMON_TEST_VAR", "hello");
+        let mut env = EnvVars::default();
+        env.set("AIDAEMON_TEST_VAR", "hello");
         let result = expand_env_vars("key = \"${AIDAEMON_TEST_VAR}\"").unwrap();
         assert_eq!(result, "key = \"hello\"");
-        std::env::remove_var("AIDAEMON_TEST_VAR");
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn expand_env_vars_errors_on_missing() {
         let _guard = ENV_EXPANSION_LOCK.lock().unwrap();
-        std::env::remove_var("AIDAEMON_MISSING_VAR");
+        let mut env = EnvVars::default();
+        env.unset("AIDAEMON_MISSING_VAR");
         let result = expand_env_vars("key = \"${AIDAEMON_MISSING_VAR}\"");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -2691,13 +2684,12 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
     #[serial_test::serial(env_vars)]
     fn expand_env_vars_handles_multiple() {
         let _guard = ENV_EXPANSION_LOCK.lock().unwrap();
-        std::env::set_var("AIDAEMON_TEST_A", "aaa");
-        std::env::set_var("AIDAEMON_TEST_B", "bbb");
+        let mut env = EnvVars::default();
+        env.set("AIDAEMON_TEST_A", "aaa");
+        env.set("AIDAEMON_TEST_B", "bbb");
         let result =
             expand_env_vars("a = \"${AIDAEMON_TEST_A}\"\nb = \"${AIDAEMON_TEST_B}\"").unwrap();
         assert_eq!(result, "a = \"aaa\"\nb = \"bbb\"");
-        std::env::remove_var("AIDAEMON_TEST_A");
-        std::env::remove_var("AIDAEMON_TEST_B");
     }
 
     #[test]
@@ -2799,8 +2791,9 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
     #[serial_test::serial(env_vars)]
     fn expand_env_vars_reports_all_missing() {
         let _guard = ENV_EXPANSION_LOCK.lock().unwrap();
-        std::env::remove_var("AIDAEMON_MISS_X");
-        std::env::remove_var("AIDAEMON_MISS_Y");
+        let mut env = EnvVars::default();
+        env.unset("AIDAEMON_MISS_X");
+        env.unset("AIDAEMON_MISS_Y");
         let result = expand_env_vars("a = \"${AIDAEMON_MISS_X}\"\nb = \"${AIDAEMON_MISS_Y}\"");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -2812,21 +2805,18 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
     #[serial_test::serial(env_vars)]
     fn terminal_web_app_url_defaults_to_hosted_terminal() {
         let _guard = TERMINAL_WEB_APP_URL_ENV_LOCK.lock().unwrap();
-        let old = std::env::var("AIDAEMON_TERMINAL_WEB_APP_URL").ok();
-        std::env::remove_var("AIDAEMON_TERMINAL_WEB_APP_URL");
+        let mut env = EnvVars::default();
+        env.unset("AIDAEMON_TERMINAL_WEB_APP_URL");
         let cfg = TerminalConfig::default();
         assert_eq!(cfg.effective_web_app_url(), "https://terminal.aidaemon.ai");
-        if let Some(old) = old {
-            std::env::set_var("AIDAEMON_TERMINAL_WEB_APP_URL", old);
-        }
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn terminal_web_app_url_env_override_wins() {
         let _guard = TERMINAL_WEB_APP_URL_ENV_LOCK.lock().unwrap();
-        let old = std::env::var("AIDAEMON_TERMINAL_WEB_APP_URL").ok();
-        std::env::set_var(
+        let mut env = EnvVars::default();
+        env.set(
             "AIDAEMON_TERMINAL_WEB_APP_URL",
             "https://terminal.dev.aidaemon.ai",
         );
@@ -2838,73 +2828,52 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
             cfg.effective_web_app_url(),
             "https://terminal.dev.aidaemon.ai"
         );
-        if let Some(old) = old {
-            std::env::set_var("AIDAEMON_TERMINAL_WEB_APP_URL", old);
-        } else {
-            std::env::remove_var("AIDAEMON_TERMINAL_WEB_APP_URL");
-        }
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn terminal_bridge_enabled_defaults_to_true() {
         let _guard = TERMINAL_BRIDGE_ENABLED_ENV_LOCK.lock().unwrap();
-        let old = std::env::var("AIDAEMON_TERMINAL_BRIDGE_ENABLED").ok();
-        std::env::remove_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED");
+        let mut env = EnvVars::default();
+        env.unset("AIDAEMON_TERMINAL_BRIDGE_ENABLED");
         let cfg = TerminalConfig::default();
         assert!(cfg.effective_bridge_enabled());
-        if let Some(old) = old {
-            std::env::set_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED", old);
-        }
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn terminal_bridge_enabled_env_override_wins() {
         let _guard = TERMINAL_BRIDGE_ENABLED_ENV_LOCK.lock().unwrap();
-        let old = std::env::var("AIDAEMON_TERMINAL_BRIDGE_ENABLED").ok();
-        std::env::set_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED", "false");
+        let mut env = EnvVars::default();
+        env.set("AIDAEMON_TERMINAL_BRIDGE_ENABLED", "false");
         let cfg = TerminalConfig {
             bridge_enabled: true,
             ..TerminalConfig::default()
         };
         assert!(!cfg.effective_bridge_enabled());
-        if let Some(old) = old {
-            std::env::set_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED", old);
-        } else {
-            std::env::remove_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED");
-        }
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn terminal_static_fallback_defaults_to_disabled() {
         let _guard = TERMINAL_STATIC_FALLBACK_ENV_LOCK.lock().unwrap();
-        let old = std::env::var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK").ok();
-        std::env::remove_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK");
+        let mut env = EnvVars::default();
+        env.unset("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK");
         let cfg = TerminalConfig::default();
         assert!(!cfg.effective_allow_static_token_fallback());
-        if let Some(old) = old {
-            std::env::set_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK", old);
-        }
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn terminal_static_fallback_env_override_wins() {
         let _guard = TERMINAL_STATIC_FALLBACK_ENV_LOCK.lock().unwrap();
-        let old = std::env::var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK").ok();
-        std::env::set_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK", "true");
+        let mut env = EnvVars::default();
+        env.set("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK", "true");
         let cfg = TerminalConfig {
             allow_static_token_fallback: false,
             ..TerminalConfig::default()
         };
         assert!(cfg.effective_allow_static_token_fallback());
-        if let Some(old) = old {
-            std::env::set_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK", old);
-        } else {
-            std::env::remove_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK");
-        }
     }
 
     #[test]

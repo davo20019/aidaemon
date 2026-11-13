@@ -30,7 +30,7 @@ impl Hook for Watch {
     }
 }
 
-fn write_tool(received: &Seen) -> impl Tool {
+fn write_tool(received: &Seen) -> impl Tool + use<> {
     let received = received.clone();
     FnTool::new(
         ToolSpec {

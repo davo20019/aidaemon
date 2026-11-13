@@ -502,11 +502,10 @@ pub fn root_holds_repository(root: &str, base: Option<&str>) -> bool {
         return false;
     }
     let mut path = std::path::PathBuf::from(expand_home(root));
-    if path.is_relative() {
-        if let Some(base) = base.map(str::trim).filter(|base| !base.is_empty()) {
+    if path.is_relative()
+        && let Some(base) = base.map(str::trim).filter(|base| !base.is_empty()) {
             path = std::path::PathBuf::from(expand_home(base)).join(path);
         }
-    }
     path.join(".git").exists()
 }
 
@@ -805,15 +804,14 @@ fn curl_saves_files(args: &[String]) -> bool {
         }
         // `-so FILE`: the cluster's last letter takes the next word; an
         // `o` inside a cluster takes the rest of it.
-        if arg.starts_with('-') && !arg.starts_with("--") {
-            if let Some(at) = arg.find('o') {
+        if arg.starts_with('-') && !arg.starts_with("--")
+            && let Some(at) = arg.find('o') {
                 return if at + 1 == arg.len() {
                     !to_null(next)
                 } else {
                     &arg[at + 1..] != "/dev/null"
                 };
             }
-        }
         false
     })
 }
@@ -909,11 +907,10 @@ pub fn looked_inside(command: &str) -> Vec<String> {
         if ok && FOLDER_LISTERS.contains(&program) {
             let mut folders = folders.borrow_mut();
             for operand in lister_operands(program, args) {
-                if let Some(name) = folder_name(operand) {
-                    if !folders.contains(&name) {
+                if let Some(name) = folder_name(operand)
+                    && !folders.contains(&name) {
                         folders.push(name);
                     }
-                }
             }
         }
         ok
@@ -1679,11 +1676,10 @@ fn tree_args_ok(args: &[String]) -> bool {
             if !matches!(long, "noreport" | "dirsfirst") {
                 return false;
             }
-        } else if let Some(cluster) = arg.strip_prefix('-') {
-            if cluster.is_empty() || !cluster.chars().all(|c| "adfshDCn".contains(c)) {
+        } else if let Some(cluster) = arg.strip_prefix('-')
+            && (cluster.is_empty() || !cluster.chars().all(|c| "adfshDCn".contains(c))) {
                 return false;
             }
-        }
     }
     true
 }
@@ -1812,12 +1808,11 @@ fn substitution_bodies(command: &str) -> Vec<String> {
             }
             let end = if depth == 0 { j - 1 } else { j };
             bodies.push(chars[i + 2..end].iter().collect());
-        } else if !in_single && c == '`' {
-            if let Some(len) = chars[i + 1..].iter().position(|&x| x == '`') {
+        } else if !in_single && c == '`'
+            && let Some(len) = chars[i + 1..].iter().position(|&x| x == '`') {
                 bodies.push(chars[i + 1..i + 1 + len].iter().collect());
                 i += len + 1;
             }
-        }
         i += 1;
     }
     bodies
@@ -2094,11 +2089,10 @@ fn resolved_on_disk(class: EffectClass, lexical: EffectKey) -> EffectKey {
         let Ok(mut real) = std::fs::canonicalize(ancestor) else {
             continue;
         };
-        if let Ok(rest) = base.strip_prefix(ancestor) {
-            if !rest.as_os_str().is_empty() {
+        if let Ok(rest) = base.strip_prefix(ancestor)
+            && !rest.as_os_str().is_empty() {
                 real.push(rest);
             }
-        }
         if let Some(leaf) = leaf {
             real.push(leaf);
         }
@@ -3735,11 +3729,10 @@ fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
     // Repository config can run code for any subcommand: never complete.
     out.opaque();
     if subcommand == "ls-remote" {
-        if let [remote] = rest {
-            if let Some(key) = url_effect(remote) {
+        if let [remote] = rest
+            && let Some(key) = url_effect(remote) {
                 out.add(key);
             }
-        }
         return;
     }
     let spec = match subcommand.as_str() {
@@ -3762,11 +3755,10 @@ fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
     if let Ok(Some(key)) = git_remote(remote) {
         out.add(key);
     }
-    if subcommand == "clone" {
-        if let Some(directory) = parsed.positionals.get(1) {
+    if subcommand == "clone"
+        && let Some(directory) = parsed.positionals.get(1) {
             out.path(EffectClass::Write, directory, cwd);
         }
-    }
 }
 
 #[cfg(test)]

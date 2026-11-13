@@ -1803,11 +1803,10 @@ pub async fn canonical_path(backend: &SharedExecutionBackend, raw: &str) -> anyh
     if let Ok(real) = tokio::fs::canonicalize(&path).await {
         return Ok(real.to_string_lossy().into_owned());
     }
-    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
-        if let Ok(real) = tokio::fs::canonicalize(parent).await {
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(real) = tokio::fs::canonicalize(parent).await {
             return Ok(real.join(name).to_string_lossy().into_owned());
         }
-    }
     Ok(resolved.as_str().to_string())
 }
 

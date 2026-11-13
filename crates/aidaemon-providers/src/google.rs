@@ -218,14 +218,12 @@ impl Provider for GoogleGenai {
         if !request.options.single_attempt
             && rejection.status == StatusCode::BAD_REQUEST
             && is_missing_thought_signature_error(&rejection.body)
-        {
-            if let Some(retry) = body_without_unsigned_calls(&body) {
+            && let Some(retry) = body_without_unsigned_calls(&body) {
                 return match self.send(&url, &retry).await? {
                     Ok(data) => Ok(parse_response(&data)),
                     Err(rejection) => Err(rejection.into_error()),
                 };
             }
-        }
         Err(rejection.into_error())
     }
 }
@@ -658,11 +656,10 @@ fn blocked_safety_categories(ratings: Option<&Vec<Value>>) -> Vec<String> {
         {
             continue;
         }
-        if let Some(category) = rating.get("category").and_then(Value::as_str) {
-            if !categories.iter().any(|c| c == category) {
+        if let Some(category) = rating.get("category").and_then(Value::as_str)
+            && !categories.iter().any(|c| c == category) {
                 categories.push(category.to_string());
             }
-        }
     }
     categories
 }

@@ -336,7 +336,7 @@ impl Tool for Shell {
 mod tests {
     use super::*;
     use crate::exec::LocalSandbox;
-    use crate::testutil::{ctx, ws};
+    use crate::testutil::{ctx, ws, ScopedVar};
 
     fn shell(ws: &Workspace) -> Shell {
         Shell::new(ws.clone(), Arc::new(LocalSandbox))
@@ -431,7 +431,7 @@ mod tests {
     #[tokio::test]
     async fn environment_is_allowlisted() {
         let (_d, ws) = ws();
-        std::env::set_var("AIDAEMON_TOOLS_TEST_SECRET", "synthetic-secret");
+        let _secret = ScopedVar::set("AIDAEMON_TOOLS_TEST_SECRET", "synthetic-secret");
         let tool = shell(&ws).env("GREETING", "hi");
         let out = tool
             .call(

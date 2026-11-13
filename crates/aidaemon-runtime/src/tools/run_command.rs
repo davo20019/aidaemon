@@ -420,11 +420,10 @@ impl RunCommandTool {
         let output = format_output(&result, trimmed, parse_format)?;
         let mut actual_access_manifest = self.call_access_manifest(arguments);
         for path in adapter_read_paths {
-            if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path) {
-                if !actual_access_manifest.read_targets.contains(&target) {
+            if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path)
+                && !actual_access_manifest.read_targets.contains(&target) {
                     actual_access_manifest.read_targets.push(target);
                 }
-            }
         }
         Ok(ToolCallOutcome {
             output,

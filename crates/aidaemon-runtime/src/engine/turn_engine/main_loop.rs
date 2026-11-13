@@ -593,8 +593,7 @@ impl TurnEngine<'_> {
         if let Some(antecedent_user_message_id) = preserve_archived_context
             .then_some(turn_context.visible_antecedent_user_message_id.as_deref())
             .flatten()
-        {
-            if let Some(projection) = project_required_antecedent_context(
+            && let Some(projection) = project_required_antecedent_context(
                 &turn_context.assessment_recent_messages,
                 antecedent_user_message_id,
             ) {
@@ -618,7 +617,6 @@ impl TurnEngine<'_> {
                 )
                 .await;
             }
-        }
 
         // The bootstrap policy was compiled from this exact assessment before
         // optional memory access. Reassert the deny edge after contract
@@ -644,8 +642,7 @@ impl TurnEngine<'_> {
         if let Some(antecedent_user_message_id) = turn_context
             .visible_antecedent_user_message_id
             .as_deref()
-        {
-            if let Some(assimilation) = assimilate_visible_antecedent_context(
+            && let Some(assimilation) = assimilate_visible_antecedent_context(
                 &turn_context.completion_contract,
                 &mut completion_progress,
                 &turn_context.assessment_recent_messages,
@@ -666,7 +663,6 @@ impl TurnEngine<'_> {
                 )
                 .await;
             }
-        }
 
         // A background completion re-enters as a child task. Import only the
         // exact terminal receipt named by that typed continuation edge, and
@@ -700,9 +696,9 @@ impl TurnEngine<'_> {
                     "parent_task_not_adopted"
                 },
             });
-            if lineage_adopted {
-                if let Some((parent_tool_call_id, parent_result_id)) = exact_reference {
-                    if let Some(evidence) = self
+            if lineage_adopted
+                && let Some((parent_tool_call_id, parent_result_id)) = exact_reference
+                    && let Some(evidence) = self
                         .events()
                         .continuation_tool_evidence(
                             session_id,
@@ -762,8 +758,6 @@ impl TurnEngine<'_> {
                             telemetry["reason_code"] = json!("receipt_missing_typed_metadata");
                         }
                     }
-                }
-            }
             self.emit_decision_point(
                 &emitter,
                 &task_id,
@@ -813,13 +807,12 @@ impl TurnEngine<'_> {
             } else {
                 true
             };
-            if epistemic_uncertainty >= 0.55 && guided_model && !model_override_active {
-                if let Some(router) = llm_router.as_ref() {
+            if epistemic_uncertainty >= 0.55 && guided_model && !model_override_active
+                && let Some(router) = llm_router.as_ref() {
                     model = router
                         .select_for_profile(policy_bundle.policy.model_profile)
                         .to_string();
                 }
-            }
             if epistemic_uncertainty >= 0.55
                 && guided_model
                 && self.turn_runtime().policy_config.tool_filter_enforce
@@ -997,9 +990,9 @@ impl TurnEngine<'_> {
         } else {
             None
         };
-        if is_scheduled_goal {
-            if let Some(registry) = self.goal_tokens().as_ref() {
-                if let Some(goal_id) = resolved_goal_id.as_deref() {
+        if is_scheduled_goal
+            && let Some(registry) = self.goal_tokens().as_ref()
+                && let Some(goal_id) = resolved_goal_id.as_deref() {
                     if is_root_scheduled_run {
                         let persisted_state = self
                             .work()
@@ -1075,8 +1068,6 @@ impl TurnEngine<'_> {
                         }
                     }
                 }
-            }
-        }
         // The kernel runs the iteration loop from the per-turn setup above
         // (assessment, contract, harness eval, budgets, pending directives).
         // Budget extensions, hard token caps and the goal's effective daily
@@ -1388,15 +1379,14 @@ impl TurnEngine<'_> {
         // intentionally `Failed` and is excluded from that central branch.
         // If an earlier phase already emitted TaskEnd, its accounting has
         // already happened; this pass only repairs the missing response.
-        if !terminal_boundary_already_closed && status == aidaemon_events::TaskStatus::Failed {
-            if let Some(efficiency) = self.task_efficiency_data(&unhandled_error_task_id).await {
+        if !terminal_boundary_already_closed && status == aidaemon_events::TaskStatus::Failed
+            && let Some(efficiency) = self.task_efficiency_data(&unhandled_error_task_id).await {
                 crate::policy::metrics::record_failed_task_tokens(
                     efficiency
                         .input_tokens
                         .saturating_add(efficiency.output_tokens),
                 );
             }
-        }
         if !terminal_boundary_already_closed {
             self.emit_task_end(
                 &unhandled_error_emitter,

@@ -2720,8 +2720,8 @@ impl<S: WorkDatabase> MandateStore for S {
         decision
             .validate_content_bounds()
             .map_err(anyhow::Error::msg)?;
-        if let Some(updates) = operating_updates {
-            if let Some(note) = updates.learning_note.as_ref() {
+        if let Some(updates) = operating_updates
+            && let Some(note) = updates.learning_note.as_ref() {
                 note.validate().map_err(anyhow::Error::msg)?;
                 anyhow::ensure!(
                     note.mandate_id == decision.mandate_id
@@ -2736,7 +2736,6 @@ impl<S: WorkDatabase> MandateStore for S {
                     "learning evidence must be a subset of current decision evidence"
                 );
             }
-        }
         anyhow::ensure!(
             decision.action_attempts == 0,
             "a new decision cannot pre-spend actions"
@@ -2749,13 +2748,12 @@ impl<S: WorkDatabase> MandateStore for S {
         // the SQLite writer lock. The same checks are repeated below against
         // the transaction-fenced mandate snapshot, so a racing policy update
         // still fails closed.
-        if let Some(intention) = intention {
-            if let Some(mandate) = self.get_mandate(&decision.mandate_id).await? {
+        if let Some(intention) = intention
+            && let Some(mandate) = self.get_mandate(&decision.mandate_id).await? {
                 intention
                     .validate_value_against(&mandate)
                     .map_err(anyhow::Error::msg)?;
             }
-        }
         if decision.outcome == MandateDecisionOutcome::Ask {
             anyhow::ensure!(
                 decision
@@ -2986,8 +2984,8 @@ impl<S: WorkDatabase> MandateStore for S {
 
         let mut next_review_at =
             clamped_next_review_at(&mandate, decision.reconsider_at.as_deref(), now)?;
-        if decision.outcome != MandateDecisionOutcome::Stop {
-            if let Some(control) = mandate.objective_control.as_ref() {
+        if decision.outcome != MandateDecisionOutcome::Stop
+            && let Some(control) = mandate.objective_control.as_ref() {
                 let measurement_due =
                     now + chrono::Duration::seconds(control.measurement_cadence_secs);
                 let selected = chrono::DateTime::parse_from_rfc3339(&next_review_at)?
@@ -2996,7 +2994,6 @@ impl<S: WorkDatabase> MandateStore for S {
                     next_review_at = measurement_due.to_rfc3339();
                 }
             }
-        }
         let persisted_reconsider_at = if decision.outcome == MandateDecisionOutcome::Stop {
             None
         } else {
@@ -3077,8 +3074,8 @@ impl<S: WorkDatabase> MandateStore for S {
             .await?;
         }
 
-        if let Some(updates) = operating_updates {
-            if let Some(note) = updates.learning_note.as_ref() {
+        if let Some(updates) = operating_updates
+            && let Some(note) = updates.learning_note.as_ref() {
                 sqlx::query(
                     "INSERT INTO mandate_learning_notes (
                         id, mandate_id, mandate_version, learned_in_decision_cycle_id,
@@ -3095,7 +3092,6 @@ impl<S: WorkDatabase> MandateStore for S {
                 .execute(&mut *tx)
                 .await?;
             }
-        }
 
         // The durable decision remains provisional until the root task itself
         // is durably successful and the proof finalizer closes the run. This

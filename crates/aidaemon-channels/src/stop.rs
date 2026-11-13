@@ -303,11 +303,10 @@ pub async fn stop_background_work(
     let list = running_work(registry, agent, session_id).await;
     let mut stopped = Vec::new();
     for entry in &list.entries {
-        if let Target::Work(key) = &entry.target {
-            if agent.stop_chat_work(session_id, key).await {
+        if let Target::Work(key) = &entry.target
+            && agent.stop_chat_work(session_id, key).await {
                 stopped.push(entry.title.clone());
             }
-        }
     }
     stopped
 }

@@ -108,19 +108,23 @@ fn resolve_runtime_env_file_path(working_dir: &Path) -> PathBuf {
     working_dir.join(".env")
 }
 
+/// Publish the resolved paths in the process environment, where the secret
+/// store, `check_environment` and the daemon's child processes read them.
+///
+/// Must run while the process is still single-threaded: [`run`] calls it
+/// first, before logging, the Tokio runtime or anything else starts a thread.
 fn export_runtime_context(config_path: &Path, env_file_path: &Path, working_dir: &Path) {
-    std::env::set_var(
-        RUNTIME_CONFIG_PATH_ENV_KEY,
-        config_path.to_string_lossy().to_string(),
-    );
-    std::env::set_var(
-        RUNTIME_ENV_FILE_ENV_KEY,
-        env_file_path.to_string_lossy().to_string(),
-    );
-    std::env::set_var(
-        RUNTIME_WORKDIR_ENV_KEY,
-        working_dir.to_string_lossy().to_string(),
-    );
+    let vars = [
+        (RUNTIME_CONFIG_PATH_ENV_KEY, config_path),
+        (RUNTIME_ENV_FILE_ENV_KEY, env_file_path),
+        (RUNTIME_WORKDIR_ENV_KEY, working_dir),
+    ];
+    for (key, path) in vars {
+        // SAFETY: called from the top of `run` on the main thread before any
+        // other thread exists, so nothing can read the environment
+        // concurrently.
+        unsafe { std::env::set_var(key, &*path.to_string_lossy()) };
+    }
 }
 
 fn load_startup_env_file(env_file_path: &Path) {
@@ -334,13 +338,12 @@ pub fn run() -> anyhow::Result<()> {
             for candidate in &candidates {
                 if candidate.exists() {
                     eprintln!("Trying restore from {}...", candidate.display());
-                    if let Ok(()) = std::fs::copy(candidate, &config_path).map(|_| ()) {
-                        if config::AppConfig::load(&config_path).is_ok() {
+                    if let Ok(()) = std::fs::copy(candidate, &config_path).map(|_| ())
+                        && config::AppConfig::load(&config_path).is_ok() {
                             eprintln!("Restored config from {}", candidate.display());
                             restored = true;
                             break;
                         }
-                    }
                 }
             }
 

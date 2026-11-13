@@ -179,8 +179,8 @@ pub trait TurnNotes: TurnHost + crate::turn::turn_context::TurnHistory {
             });
         }
 
-        if let (Some(hub_weak), Some(surface_id)) = (hub, surface_id) {
-            if let Some(hub_arc) = hub_weak.upgrade() {
+        if let (Some(hub_weak), Some(surface_id)) = (hub, surface_id)
+            && let Some(hub_arc) = hub_weak.upgrade() {
                 match hub_arc
                     .edit_text(parent_session_id, surface_id, trimmed)
                     .await
@@ -206,7 +206,6 @@ pub trait TurnNotes: TurnHost + crate::turn::turn_context::TurnHistory {
                     ),
                 }
             }
-        }
 
         self.deliver_parent_text_result(hub, parent_session_id, trimmed, kind)
             .await

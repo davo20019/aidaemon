@@ -80,14 +80,13 @@ pub fn start(
             Err(error) => tracing::warn!(%error, "Client Gateway listener not exposable"),
         }
     }
-    if config.nodes.gateway.enabled {
-        if let Ok(ip) = config.nodes.gateway.bind.parse::<std::net::IpAddr>() {
+    if config.nodes.gateway.enabled
+        && let Ok(ip) = config.nodes.gateway.bind.parse::<std::net::IpAddr>() {
             let addr = std::net::SocketAddr::new(ip, config.nodes.gateway.port);
             if let Err(error) = listeners.register(ExposedService::NodeGateway, addr) {
                 tracing::warn!(%error, "Node Gateway listener not exposable");
             }
         }
-    }
     let state_dir = state_dir();
     let mut plans = Vec::new();
     for (service, settings) in config.exposure.services() {

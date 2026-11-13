@@ -639,14 +639,13 @@ impl McpServer {
     pub async fn shutdown(&self) {
         self.inner.shared.stdin.lock().await.take();
         let child = self.inner.child.lock().expect("child poisoned").take();
-        if let Some(mut child) = child {
-            if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        if let Some(mut child) = child
+            && tokio::time::timeout(Duration::from_secs(2), child.wait())
                 .await
                 .is_err()
             {
                 let _ = child.kill().await;
             }
-        }
         self.inner.shared.close();
     }
 }

@@ -55,12 +55,11 @@ impl ProbeStats {
             }
 
             // Check against explicit threshold
-            if let Some(threshold) = latency_threshold_ms {
-                if p95 > threshold {
+            if let Some(threshold) = latency_threshold_ms
+                && p95 > threshold {
                     self.is_degraded = true;
                     return;
                 }
-            }
         }
 
         self.is_degraded = false;
@@ -127,12 +126,11 @@ impl TrendAnalyzer {
             parts.push(format!("uptime {} {:.2}%", direction, uptime_diff.abs()));
         }
 
-        if let Some(diff) = latency_diff {
-            if diff.abs() >= 10 {
+        if let Some(diff) = latency_diff
+            && diff.abs() >= 10 {
                 let direction = if diff < 0 { "improved" } else { "increased" };
                 parts.push(format!("latency {} by {}ms", direction, diff.abs()));
             }
-        }
 
         let description = if parts.is_empty() {
             "No significant change".to_string()
@@ -163,12 +161,11 @@ impl TrendAnalyzer {
         }
 
         // Latency penalty (up to -30 points)
-        if let Some(p95) = stats.p95_latency_ms {
-            if p95 > 1000 {
+        if let Some(p95) = stats.p95_latency_ms
+            && p95 > 1000 {
                 let latency_penalty = ((p95 - 1000) / 100).min(30);
                 score = score.saturating_sub(latency_penalty);
             }
-        }
 
         // Degradation penalty
         if stats.is_degraded {

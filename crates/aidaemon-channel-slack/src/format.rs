@@ -113,58 +113,51 @@ fn convert_inline(s: &str) -> String {
         let c = chars[i];
 
         // Inline code: copy through, escaped.
-        if c == '`' {
-            if let Some(end) = find_char(&chars, '`', i + 1) {
+        if c == '`'
+            && let Some(end) = find_char(&chars, '`', i + 1) {
                 out.push('`');
                 push_escaped(&mut out, &collect(&chars[i + 1..end]));
                 out.push('`');
                 i = end + 1;
                 continue;
             }
-        }
 
         // Bold: **x** or __x__ → *x*
-        if (c == '*' || c == '_') && i + 1 < len && chars[i + 1] == c {
-            if let Some(end) = find_double(&chars, c, i + 2) {
-                if end > i + 2 {
+        if (c == '*' || c == '_') && i + 1 < len && chars[i + 1] == c
+            && let Some(end) = find_double(&chars, c, i + 2)
+                && end > i + 2 {
                     out.push('*');
                     out.push_str(&convert_inline(&collect(&chars[i + 2..end])));
                     out.push('*');
                     i = end + 2;
                     continue;
                 }
-            }
-        }
 
         // Strikethrough: ~~x~~ → ~x~
-        if c == '~' && i + 1 < len && chars[i + 1] == '~' {
-            if let Some(end) = find_double(&chars, '~', i + 2) {
-                if end > i + 2 {
+        if c == '~' && i + 1 < len && chars[i + 1] == '~'
+            && let Some(end) = find_double(&chars, '~', i + 2)
+                && end > i + 2 {
                     out.push('~');
                     out.push_str(&convert_inline(&collect(&chars[i + 2..end])));
                     out.push('~');
                     i = end + 2;
                     continue;
                 }
-            }
-        }
 
         // Italic: *x* → _x_ (opening star must touch a word).
-        if c == '*' && i + 1 < len && !chars[i + 1].is_whitespace() {
-            if let Some(end) = find_single_star(&chars, i + 1) {
-                if !chars[end - 1].is_whitespace() {
+        if c == '*' && i + 1 < len && !chars[i + 1].is_whitespace()
+            && let Some(end) = find_single_star(&chars, i + 1)
+                && !chars[end - 1].is_whitespace() {
                     out.push('_');
                     out.push_str(&convert_inline(&collect(&chars[i + 1..end])));
                     out.push('_');
                     i = end + 1;
                     continue;
                 }
-            }
-        }
 
         // Link: [text](url) → <url|text>
-        if c == '[' {
-            if let Some((text, url, end)) = parse_link(&chars, i) {
+        if c == '['
+            && let Some((text, url, end)) = parse_link(&chars, i) {
                 out.push('<');
                 push_escaped(&mut out, &sanitize_url(&url));
                 out.push('|');
@@ -173,11 +166,10 @@ fn convert_inline(s: &str) -> String {
                 i = end;
                 continue;
             }
-        }
 
         // `<...>` tokens: autolinks and user/channel mentions survive.
-        if c == '<' {
-            if let Some(end) = find_char(&chars, '>', i + 1) {
+        if c == '<'
+            && let Some(end) = find_char(&chars, '>', i + 1) {
                 let inner = collect(&chars[i + 1..end]);
                 if is_preserved_token(&inner) {
                     out.push('<');
@@ -191,7 +183,6 @@ fn convert_inline(s: &str) -> String {
                     continue;
                 }
             }
-        }
 
         match c {
             '&' => out.push_str("&amp;"),
@@ -307,12 +298,11 @@ pub fn split_mrkdwn(text: &str, max_chars: usize) -> Vec<String> {
         let mut split = split.unwrap_or(limit);
 
         // Do not cut a `<url|text>` or `<@U...>` token in half.
-        if let Some(lt) = current[..split].rfind('<') {
-            if lt > 0 && !current[lt..split].contains('>') {
+        if let Some(lt) = current[..split].rfind('<')
+            && lt > 0 && !current[lt..split].contains('>') {
                 split = lt;
                 split_at_space = false;
             }
-        }
 
         let mut chunk = current[..split].trim_end().to_string();
         let mut remainder = &current[split..];

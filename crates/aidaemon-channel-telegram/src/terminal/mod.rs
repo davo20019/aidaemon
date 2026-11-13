@@ -382,8 +382,8 @@ impl Cx<'_> {
         };
 
         let namespace = self.session_namespace().await;
-        if !refresh {
-            if let Some(cached) =
+        if !refresh
+            && let Some(cached) =
                 cli_agent_flags::load_agent_flags_cache(&*self.state, &namespace, user_id, &agent)
                     .await
             {
@@ -396,7 +396,6 @@ impl Cx<'_> {
                     return;
                 }
             }
-        }
 
         let _ = bot
             .send_message(msg.chat.id, format!("Discovering flags for {}...", agent))
@@ -901,8 +900,8 @@ impl Cx<'_> {
                     used_saved_args = !agent_args.is_empty();
                 }
             }
-        } else if invoked_cmd == "/agent" && !agent_args.is_empty() {
-            if let Some(agent_name) = agent.as_deref() {
+        } else if invoked_cmd == "/agent" && !agent_args.is_empty()
+            && let Some(agent_name) = agent.as_deref() {
                 let mut defaults = cli_agent_flags::load_terminal_agent_defaults(
                     &*self.state,
                     &namespace,
@@ -928,7 +927,6 @@ impl Cx<'_> {
                     }
                 }
             }
-        }
 
         let cwd = if cwd_parts.is_empty() {
             None
@@ -1020,11 +1018,10 @@ impl Cx<'_> {
             if let Some(agent) = agent.as_deref() {
                 query.append_pair("agent", agent);
             }
-            if let Some(cwd) = cwd.as_deref() {
-                if !cwd.trim().is_empty() {
+            if let Some(cwd) = cwd.as_deref()
+                && !cwd.trim().is_empty() {
                     query.append_pair("cwd", cwd);
                 }
-            }
             if let Some(relay_session_id) = prestarted_relay_session_id.as_deref() {
                 query.append_pair("relay_session_id", relay_session_id);
             }
@@ -1526,14 +1523,12 @@ async fn sync_tenant_bot_token(
         if let Some(label) = label
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
-        {
-            if let Some(map) = payload.as_object_mut() {
+            && let Some(map) = payload.as_object_mut() {
                 map.insert(
                     "label".to_string(),
                     serde_json::Value::String(label.to_string()),
                 );
             }
-        }
 
         let response = match client.post(url.clone()).json(&payload).send().await {
             Ok(response) => response,

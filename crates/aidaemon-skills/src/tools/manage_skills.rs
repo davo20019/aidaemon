@@ -240,11 +240,10 @@ impl ManageSkillsTool {
         }
 
         let mut candidate_registry_urls = Vec::new();
-        if let Some(preferred) = preferred_registry_url {
-            if self.registry_urls.iter().any(|url| url == preferred) {
+        if let Some(preferred) = preferred_registry_url
+            && self.registry_urls.iter().any(|url| url == preferred) {
                 candidate_registry_urls.push(preferred.to_string());
             }
-        }
         for url in &self.registry_urls {
             if !candidate_registry_urls.iter().any(|item| item == url) {
                 candidate_registry_urls.push(url.clone());
@@ -262,13 +261,12 @@ impl ManageSkillsTool {
                         })
                         .collect();
 
-                    if let Some(preferred_url) = preferred_url {
-                        if let Some(index) =
+                    if let Some(preferred_url) = preferred_url
+                        && let Some(index) =
                             matches.iter().position(|entry| entry.url == preferred_url)
                         {
                             return Ok(Some((registry_url.clone(), matches.remove(index))));
                         }
-                    }
 
                     if let Some(entry) = matches.into_iter().next() {
                         return Ok(Some((registry_url.clone(), entry)));
@@ -439,8 +437,8 @@ impl ManageSkillsTool {
         match value {
             Value::Object(map) => {
                 if let Some(ref_value) = map.get("$ref").and_then(Value::as_str) {
-                    if !ref_value.starts_with("#/") {
-                        if let Ok((document_url, fragment)) =
+                    if !ref_value.starts_with("#/")
+                        && let Ok((document_url, fragment)) =
                             Self::split_ref_target(base_url, ref_value)
                         {
                             found.push(ExternalRefOccurrence {
@@ -449,7 +447,6 @@ impl ManageSkillsTool {
                                 fragment,
                             });
                         }
-                    }
                     return;
                 }
                 for (key, child) in map {
@@ -485,8 +482,8 @@ impl ManageSkillsTool {
     }
 
     fn merge_ref_overrides(node: &mut Value, replacement: &Value) {
-        if let Value::Object(existing) = node {
-            if let Value::Object(target) = replacement {
+        if let Value::Object(existing) = node
+            && let Value::Object(target) = replacement {
                 let existing_overrides: Vec<(String, Value)> = existing
                     .iter()
                     .filter(|(key, _)| key.as_str() != "$ref")
@@ -499,7 +496,6 @@ impl ManageSkillsTool {
                 *existing = merged;
                 return;
             }
-        }
 
         *node = replacement.clone();
     }
@@ -929,13 +925,11 @@ impl ManageSkillsTool {
                 }
                 continue;
             }
-            if let Some(source) = source.as_ref() {
-                if let Ok(joined) = source.join(&server_url) {
-                    if joined.scheme() == "https" {
+            if let Some(source) = source.as_ref()
+                && let Ok(joined) = source.join(&server_url)
+                    && joined.scheme() == "https" {
                         urls.push(joined);
                     }
-                }
-            }
         }
         urls
     }
@@ -1413,11 +1407,10 @@ impl ManageSkillsTool {
             .into_iter()
             .filter_map(|endpoint| Self::normalize_graphql_endpoint(source_url, &endpoint))
             .collect::<Vec<String>>();
-        if Self::looks_like_graphql_endpoint_url(source_url) {
-            if let Some(normalized) = Self::normalize_graphql_endpoint(source_url, source_url) {
+        if Self::looks_like_graphql_endpoint_url(source_url)
+            && let Some(normalized) = Self::normalize_graphql_endpoint(source_url, source_url) {
                 endpoints.push(normalized);
             }
-        }
         endpoints.sort();
         endpoints.dedup();
         endpoints
@@ -1823,8 +1816,8 @@ impl ManageSkillsTool {
                 })
             }
             ApiLearnKind::Docs => {
-                if Self::looks_like_graphql_endpoint_url(source_url) {
-                    if let Some(summary) =
+                if Self::looks_like_graphql_endpoint_url(source_url)
+                    && let Some(summary) =
                         self.try_graphql_introspection(source_url, profile).await?
                     {
                         return Ok(LearnApiBuildOutcome {
@@ -1839,7 +1832,6 @@ impl ManageSkillsTool {
                             safe_probe: Some(Self::safe_probe_from_graphql(&summary)),
                         });
                     }
-                }
 
                 let bundle = self.crawl_docs_bundle(source_url).await?;
                 let raw_docs = if bundle.combined_text.trim().is_empty() {
@@ -1877,8 +1869,8 @@ impl ManageSkillsTool {
                 })
             }
             ApiLearnKind::Auto => {
-                if Self::looks_like_graphql_endpoint_url(source_url) {
-                    if let Some(summary) =
+                if Self::looks_like_graphql_endpoint_url(source_url)
+                    && let Some(summary) =
                         self.try_graphql_introspection(source_url, profile).await?
                     {
                         return Ok(LearnApiBuildOutcome {
@@ -1893,7 +1885,6 @@ impl ManageSkillsTool {
                             safe_probe: Some(Self::safe_probe_from_graphql(&summary)),
                         });
                     }
-                }
 
                 let raw_content = self.fetch_remote_text(source_url).await?;
                 if Self::parse_openapi_value(&raw_content).is_some() {
@@ -3294,11 +3285,10 @@ impl ManageSkillsTool {
             }
             "install" => {
                 for registry in registries {
-                    if let Some(key) = url_effect(registry) {
-                        if !effects.keys.contains(&key) {
+                    if let Some(key) = url_effect(registry)
+                        && !effects.keys.contains(&key) {
                             effects.keys.push(key);
                         }
-                    }
                 }
             }
             _ => {}

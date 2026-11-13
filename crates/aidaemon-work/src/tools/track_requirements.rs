@@ -671,8 +671,8 @@ impl crate::traits::ToolSemantics for TrackRequirementsTool {
         let value: Value = serde_json::from_str(arguments).map_err(|error| {
             ToolArgumentContractViolation::new(format!("invalid JSON arguments: {error}"))
         })?;
-        if let Some(outcome) = value.get("outcome") {
-            if outcome
+        if let Some(outcome) = value.get("outcome")
+            && outcome
                 .as_str()
                 .and_then(aidaemon_events::ExecutorClaimedOutcome::from_protocol_name)
                 .is_none()
@@ -682,9 +682,8 @@ impl crate::traits::ToolSemantics for TrackRequirementsTool {
                     aidaemon_events::ExecutorClaimedOutcome::PROTOCOL_NAMES.join(", ")
                 )));
             }
-        }
-        if let Some(short_of) = value.get("short_of") {
-            if short_of
+        if let Some(short_of) = value.get("short_of")
+            && short_of
                 .as_str()
                 .and_then(aidaemon_events::ShortResource::from_protocol_name)
                 .is_none()
@@ -694,7 +693,6 @@ impl crate::traits::ToolSemantics for TrackRequirementsTool {
                     aidaemon_events::ShortResource::PROTOCOL_NAMES.join(", ")
                 )));
             }
-        }
         if let Some(items) = value.get("items").and_then(Value::as_array) {
             for (index, item) in items.iter().enumerate() {
                 parse_expectation_targets(item.get("targets")).map_err(|error| {

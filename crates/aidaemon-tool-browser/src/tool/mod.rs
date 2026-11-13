@@ -938,13 +938,11 @@ impl BrowserTool {
         let Err(blocked) = policy::validate_network_url(url) else {
             return Ok(());
         };
-        if blocked.is_loopback() {
-            if let Some(key) = policy::local_site_key(url) {
-                if self.local_site_allowed(session_id, &key).await {
+        if blocked.is_loopback()
+            && let Some(key) = policy::local_site_key(url)
+                && self.local_site_allowed(session_id, &key).await {
                     return Ok(());
                 }
-            }
-        }
         Err(blocked)
     }
 
@@ -987,8 +985,8 @@ impl BrowserTool {
         page: &Arc<dyn PageHandle>,
         session_id: &str,
     ) -> Result<(), String> {
-        if let Some(current_url) = page.url().await {
-            if let Err(blocked) = self.check_network(session_id, &current_url).await {
+        if let Some(current_url) = page.url().await
+            && let Err(blocked) = self.check_network(session_id, &current_url).await {
                 warn!(
                     class = blocked.class.label(),
                     "observation/JS action refused: current page is on a blocked host"
@@ -998,7 +996,6 @@ impl BrowserTool {
                     blocked.class.label()
                 ));
             }
-        }
         Ok(())
     }
 
@@ -1042,8 +1039,8 @@ impl BrowserTool {
         // blocked and surface ONLY the host class — never the committed URL,
         // which may carry a path/query/token.
         let final_url = page.url().await;
-        if let Some(final_url) = final_url.as_deref() {
-            if let Err(blocked) = self.check_network(session_id, final_url).await {
+        if let Some(final_url) = final_url.as_deref()
+            && let Err(blocked) = self.check_network(session_id, final_url).await {
                 warn!(
                     class = blocked.class.label(),
                     "navigation landed on a blocked host after redirect; blocking"
@@ -1060,7 +1057,6 @@ impl BrowserTool {
                     blocked.class.label()
                 ));
             }
-        }
 
         if let Some(final_url) = final_url {
             self.sessions
@@ -1227,8 +1223,8 @@ impl BrowserTool {
         // helper sent the Drupal homepage, then the main agent sent it again).
         // A later capture is kept for looking at, not sent.
         let subject = kind.subject();
-        if let Some(fence) = fence {
-            if let Err(delivered) = fence.claim_delivery(&subject).await {
+        if let Some(fence) = fence
+            && let Err(delivered) = fence.claim_delivery(&subject).await {
                 return Ok(DispatchResult {
                     text: format!(
                         "Screenshot captured, not sent: {} already sent the owner a screenshot \
@@ -1243,7 +1239,6 @@ impl BrowserTool {
                     semantics: None,
                 });
             }
-        }
         if let Err(reason) = (deliverable.send)().await {
             if let Some(fence) = fence {
                 fence.release_delivery(&subject).await;
@@ -1496,13 +1491,12 @@ impl BrowserTool {
 
         // A same-tab click may have navigated. Refresh the last-known URL so a
         // later point-of-action prompt names the actual site origin.
-        if let Some(current_url) = page.url().await {
-            if self.check_network(session_id, &current_url).await.is_ok() {
+        if let Some(current_url) = page.url().await
+            && self.check_network(session_id, &current_url).await.is_ok() {
                 self.sessions
                     .update_active_tab_url(session_id, current_url)
                     .await;
             }
-        }
 
         match new_tab_id {
             Some(tab_id) => Ok(format!(
@@ -1682,13 +1676,12 @@ impl BrowserTool {
 
         // Arbitrary JavaScript can change `location`. Preserve the last observed
         // public URL so the next approval prompt names the resulting origin.
-        if let Some(current_url) = page.url().await {
-            if self.check_network(session_id, &current_url).await.is_ok() {
+        if let Some(current_url) = page.url().await
+            && self.check_network(session_id, &current_url).await.is_ok() {
                 self.sessions
                     .update_active_tab_url(session_id, current_url)
                     .await;
             }
-        }
 
         let value_str = match result {
             Some(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| format!("{:?}", v)),
@@ -2141,8 +2134,8 @@ impl BrowserTool {
         // Revalidate the new tab's FINAL committed URL the same way navigate
         // does, so a redirect to a blocked host can't leave a live tab pointed
         // at an internal address. Close the tab and report the host class only.
-        if let Some(ref final_url) = current_url {
-            if let Err(blocked) = self.check_network(session_id, final_url).await {
+        if let Some(ref final_url) = current_url
+            && let Err(blocked) = self.check_network(session_id, final_url).await {
                 warn!(
                     class = blocked.class.label(),
                     "new tab landed on a blocked host after redirect; closing"
@@ -2154,7 +2147,6 @@ impl BrowserTool {
                     blocked.class.label()
                 ));
             }
-        }
 
         let preview = if url.is_some() {
             page_text_preview(page.as_ref()).await
@@ -2276,8 +2268,8 @@ impl BrowserTool {
                     "Error: Missing required parameter: url".to_string(),
                 ));
             }
-            if let Some(url) = url {
-                if let Err(blocked) = self.check_network(session_id, url).await {
+            if let Some(url) = url
+                && let Err(blocked) = self.check_network(session_id, url).await {
                     // A local site goes on to the owner's approval gate.
                     if policy::local_site_key(url).is_none() {
                         return Ok(DispatchResult::text_only(format!(
@@ -2286,7 +2278,6 @@ impl BrowserTool {
                         )));
                     }
                 }
-            }
         }
 
         let action_args = ActionArgs {
@@ -2362,8 +2353,8 @@ impl Tool for BrowserTool {
             facts.session_id.as_str(),
             facts.trusted_session,
         );
-        if let Some(args) = local_site {
-            if let Some(key) = self.unapproved_local_site(&args).await {
+        if let Some(args) = local_site
+            && let Some(key) = self.unapproved_local_site(&args).await {
                 let expires_at = matches!(response, ApprovalResponse::AllowOnce)
                     .then(|| tokio::time::Instant::now() + LOCAL_SITE_ONCE);
                 self.sessions
@@ -2371,7 +2362,6 @@ impl Tool for BrowserTool {
                     .await;
                 return;
             }
-        }
         let Some((request, point_of_action)) =
             self.kernel_approval_need(call.arguments, facts).await
         else {

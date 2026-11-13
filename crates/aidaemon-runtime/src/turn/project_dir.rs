@@ -108,15 +108,12 @@ fn resolve_injected_working_dir(
         return project_dir.to_string();
     }
     let resolved = aidaemon_tools::fs_utils::validate_path(backend, project_dir).ok();
-    if let Some(path) = resolved {
-        if !path.is_dir() {
-            if let Some(parent) = path.parent() {
-                if parent.is_dir() {
+    if let Some(path) = resolved
+        && !path.is_dir()
+            && let Some(parent) = path.parent()
+                && parent.is_dir() {
                     return parent.to_string_lossy().to_string();
                 }
-            }
-        }
-    }
     project_dir.to_string()
 }
 

@@ -1409,11 +1409,10 @@ async fn print_fabrication_audit(pool: &SqlitePool, hours: i64) -> anyhow::Resul
         if material {
             material_tasks.insert(task_id.clone());
         }
-        if let Some(raw) = row.try_get::<Option<String>, _>("completion_proof")? {
-            if let Ok(proof) = serde_json::from_str::<aidaemon::TaskCompletionProofData>(&raw) {
+        if let Some(raw) = row.try_get::<Option<String>, _>("completion_proof")?
+            && let Ok(proof) = serde_json::from_str::<aidaemon::TaskCompletionProofData>(&raw) {
                 proofs.insert(task_id, proof);
             }
-        }
     }
 
     let total = tasks.len();

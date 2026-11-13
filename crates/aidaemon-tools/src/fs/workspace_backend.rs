@@ -109,11 +109,10 @@ impl ExecutionBackend for WorkspaceBackend {
         create_parents: bool,
     ) -> anyhow::Result<()> {
         let target = self.confine(path)?;
-        if create_parents {
-            if let Some(parent) = target.parent() {
+        if create_parents
+            && let Some(parent) = target.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-        }
         match mode {
             WriteMode::Overwrite => tokio::fs::write(&target, content).await?,
             WriteMode::Append => {

@@ -125,21 +125,18 @@ impl Limits {
         if snapshot.turn >= self.max_turns.min(HARD_TURN_CAP) {
             return Some(LimitKind::Turns);
         }
-        if let Some(max) = self.max_tokens {
-            if snapshot.usage.billable_tokens() >= max {
+        if let Some(max) = self.max_tokens
+            && snapshot.usage.billable_tokens() >= max {
                 return Some(LimitKind::Tokens);
             }
-        }
-        if let Some(max) = self.max_tool_calls {
-            if snapshot.tool_calls >= max {
+        if let Some(max) = self.max_tool_calls
+            && snapshot.tool_calls >= max {
                 return Some(LimitKind::ToolCalls);
             }
-        }
-        if let Some(max) = self.timeout {
-            if snapshot.elapsed >= max {
+        if let Some(max) = self.timeout
+            && snapshot.elapsed >= max {
                 return Some(LimitKind::WallClock);
             }
-        }
         None
     }
 }

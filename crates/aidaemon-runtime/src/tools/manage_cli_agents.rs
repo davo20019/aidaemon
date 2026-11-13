@@ -72,13 +72,12 @@ impl ManageCliAgentsTool {
             return CallEffects::none();
         }
         let mut effects = CallEffects::unknown();
-        if args.action == "add" {
-            if let Some(command) = args.command.filter(|command| !command.is_empty()) {
+        if args.action == "add"
+            && let Some(command) = args.command.filter(|command| !command.is_empty()) {
                 effects
                     .keys
                     .push(EffectKey::named(EffectClass::Process, &command));
             }
-        }
         effects
     }
 

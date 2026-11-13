@@ -299,8 +299,8 @@ pub async fn build_system_prompt_for_message(
         &fresh_tail
     };
 
-    if let Some(checkpoint) = resume_checkpoint {
-        if host.turn_runtime().record_decision_points {
+    if let Some(checkpoint) = resume_checkpoint
+        && host.turn_runtime().record_decision_points {
             crate::turn::task_end::emit_decision_point(
                 host,
                 emitter,
@@ -320,7 +320,6 @@ pub async fn build_system_prompt_for_message(
             )
             .await;
         }
-    }
 
     let active_skill_names: Vec<String> = active_skills
         .iter()

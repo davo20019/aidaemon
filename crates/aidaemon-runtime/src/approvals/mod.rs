@@ -548,12 +548,11 @@ impl ApprovalRules for AppApprovalRules {
                 &self.call_facts(None),
             )
             .await;
-        if !matches!(need, OwnerApprovalNeed::Ask(_)) {
-            if let Some(request) = self.write_outside_guess_request(tool.as_ref(), &call.arguments)
+        if !matches!(need, OwnerApprovalNeed::Ask(_))
+            && let Some(request) = self.write_outside_guess_request(tool.as_ref(), &call.arguments)
             {
                 return RuleDecision::Ask(request);
             }
-        }
         rule_decision(need)
     }
 }

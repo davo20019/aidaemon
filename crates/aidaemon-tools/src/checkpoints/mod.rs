@@ -1639,17 +1639,15 @@ fn checkpoint_access_manifest(
     .filter(|value| !value.is_empty())
     .map(str::to_string);
     let mut write_targets = Vec::new();
-    if matches!(tool, "write_file" | "edit_file") {
-        if let Some(path) = parsed.as_ref().and_then(|args| {
+    if matches!(tool, "write_file" | "edit_file")
+        && let Some(path) = parsed.as_ref().and_then(|args| {
             ["path", "file_path", "file", "filename"]
                 .iter()
                 .find_map(|key| args.get(*key).and_then(Value::as_str))
-        }) {
-            if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path) {
+        })
+            && let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path) {
                 write_targets.push(target);
             }
-        }
-    }
     ToolCallAccessManifest {
         execution_cwd,
         read_targets: Vec::new(),

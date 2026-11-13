@@ -358,11 +358,10 @@ fn decode_ddg_redirect(href: &str) -> String {
             .host_str()
             .is_some_and(|h| h == "duckduckgo.com" || h.ends_with(".duckduckgo.com"))
             && url.path() == "/l/";
-        if is_ddg_redirect {
-            if let Some((_, target)) = url.query_pairs().find(|(k, _)| k == "uddg") {
+        if is_ddg_redirect
+            && let Some((_, target)) = url.query_pairs().find(|(k, _)| k == "uddg") {
                 return target.into_owned();
             }
-        }
         return absolute;
     }
 

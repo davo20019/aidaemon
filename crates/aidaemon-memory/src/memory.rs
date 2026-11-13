@@ -210,7 +210,7 @@ impl Memory {
     fn visible_ids(
         access: Result<HashMap<String, FactAccess>>,
         audience: &RecallAudience,
-    ) -> impl Fn(&str) -> bool {
+    ) -> impl Fn(&str) -> bool + use<> {
         let access = access.unwrap_or_else(|error| {
             tracing::warn!(%error, "access lookup failed; hiding restricted memories");
             HashMap::new()

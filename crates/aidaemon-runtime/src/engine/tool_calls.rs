@@ -84,11 +84,10 @@ pub fn grant_own_spill_reads(
         if let Some(hint) = aidaemon_tools::semantics::ToolTargetHint::new(
             aidaemon_tools::semantics::ToolTargetHintKind::ProjectScope,
             path,
-        ) {
-            if !manifest.adapter_read_targets.contains(&hint) {
+        )
+            && !manifest.adapter_read_targets.contains(&hint) {
                 manifest.adapter_read_targets.push(hint);
             }
-        }
     }
 }
 
@@ -130,8 +129,8 @@ pub fn canonicalize_call(
     // owner's answer to the exact call (`browser`) then never finds it.
     let mut call = CanonicalCall::stripped(tool, raw);
     let mut known = facts.known_project_dir.map(str::to_string);
-    if !facts.workspace_grant {
-        if let Ok(text) = serde_json::to_string(&call.arguments) {
+    if !facts.workspace_grant
+        && let Ok(text) = serde_json::to_string(&call.arguments) {
             if let Some(explicit) =
                 crate::turn::project_dir::project_dir_from_tool_args(facts.backend, name, &text)
             {
@@ -145,14 +144,11 @@ pub fn canonicalize_call(
                     &text,
                     known.as_deref(),
                 )
-            {
-                if let Ok(updated) = serde_json::from_str(&updated) {
+                && let Ok(updated) = serde_json::from_str(&updated) {
                     call.arguments = updated;
                     call.injected_dir = Some(injected);
                 }
-            }
         }
-    }
     if terminal {
         call.stripped_read_roots = crate::turn::tool_dispatch::attenuate_unauthorized_read_roots(
             &mut call.arguments,
@@ -259,11 +255,10 @@ impl sdk::Hook for CanonicalCallHook {
             },
         );
         if recorded.is_none() {
-            if let Some(explicit) = &canonical.explicit_dir {
-                if let Ok(mut known) = self.known_project_dir.lock() {
+            if let Some(explicit) = &canonical.explicit_dir
+                && let Ok(mut known) = self.known_project_dir.lock() {
                     *known = Some(explicit.clone());
                 }
-            }
             if !canonical.stripped_read_roots.is_empty() {
                 info!(
                     tool = %call.name,

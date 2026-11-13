@@ -67,11 +67,10 @@ impl SpecialistRegistry {
             }
         }
 
-        if let Some(dir) = user_dir {
-            if dir.is_dir() {
+        if let Some(dir) = user_dir
+            && dir.is_dir() {
                 Self::load_user_overrides(dir, &mut by_kind);
             }
-        }
 
         SpecialistRegistry { by_kind }
     }

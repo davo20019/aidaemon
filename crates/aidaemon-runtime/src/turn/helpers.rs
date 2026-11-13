@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 /// Best-effort send — never blocks the agent loop if the receiver is slow/full.
 pub fn send_status(tx: &Option<mpsc::Sender<StatusUpdate>>, update: StatusUpdate) {
-    if let Some(ref tx) = tx {
+    if let Some(tx) = tx {
         let _ = tx.try_send(update);
     }
 }
@@ -19,7 +19,7 @@ pub fn send_status(tx: &Option<mpsc::Sender<StatusUpdate>>, update: StatusUpdate
 /// Update the heartbeat timestamp to signal the agent is alive.
 /// No-op when heartbeat is None (sub-agents, triggers, tests).
 pub fn touch_heartbeat(hb: &Option<Arc<AtomicU64>>) {
-    if let Some(ref hb) = hb {
+    if let Some(hb) = hb {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

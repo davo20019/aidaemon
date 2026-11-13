@@ -847,11 +847,11 @@ async fn repeated_identical_click_is_cautioned() {
         dir.path().to_path_buf(),
     )
     .await;
-    let mk = |gen: u64| {
+    let mk = |generation: u64| {
         json!({
             "action": "click",
             "app": "Calculator",
-            "snapshot_generation": gen,
+            "snapshot_generation": generation,
             "element_index": 1
         })
     };

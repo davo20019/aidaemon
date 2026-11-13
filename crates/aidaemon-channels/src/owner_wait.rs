@@ -264,11 +264,10 @@ impl Drop for OwnerWaiting {
     fn drop(&mut self) {
         let mut state = self.clock.0.lock().unwrap_or_else(|e| e.into_inner());
         state.open = state.open.saturating_sub(1);
-        if state.open == 0 {
-            if let Some(since) = state.since.take() {
+        if state.open == 0
+            && let Some(since) = state.since.take() {
                 state.waited += since.elapsed();
             }
-        }
     }
 }
 

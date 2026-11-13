@@ -295,8 +295,8 @@ async fn finalize_turn_assessment(
     {
         warn!(session_id, task_id, %error, "Failed to bind finalized dialogue task");
     }
-    if !internal_continuation {
-        if let Err(error) = crate::turn::dialogue_state::record_dialogue_completion_contract(
+    if !internal_continuation
+        && let Err(error) = crate::turn::dialogue_state::record_dialogue_completion_contract(
             agent,
             session_id,
             user_text,
@@ -306,7 +306,6 @@ async fn finalize_turn_assessment(
         {
             warn!(session_id, %error, "Failed to persist finalized completion contract");
         }
-    }
 
     Ok(turn_context)
 }

@@ -131,11 +131,10 @@ async fn insert_owner_session_events(
             "user_role": "owner",
             "channel_visibility": "private"
         });
-        if index == 0 {
-            if let Some(origin) = execution_origin {
+        if index == 0
+            && let Some(origin) = execution_origin {
                 data["execution_origin"] = json!(origin);
             }
-        }
         sqlx::query(
             "INSERT INTO events (session_id, event_type, data, created_at)
              VALUES (?, 'user_message', ?, ?)",

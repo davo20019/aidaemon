@@ -957,8 +957,8 @@ impl TurnEngine<'_> {
                 }
                 _ => {}
             }
-            if let Some(tx) = reply_text.as_ref() {
-                if let Ok(mut pending) = pending_text.lock() {
+            if let Some(tx) = reply_text.as_ref()
+                && let Ok(mut pending) = pending_text.lock() {
                     match event {
                         sdk::Event::TextDelta { text, .. } => pending.push(text),
                         sdk::Event::TurnStarted { .. } => pending.next_call(),
@@ -966,7 +966,6 @@ impl TurnEngine<'_> {
                     }
                     pending.flush(tx);
                 }
-            }
             let Some(status_tx) = sink_status.as_ref() else {
                 return;
             };

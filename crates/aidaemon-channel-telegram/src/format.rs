@@ -197,19 +197,18 @@ fn convert_inline_chars(chars: &[char], out: &mut String) {
     while i < len {
         let c = chars[i];
 
-        if c == '`' {
-            if let Some(end) = find_char(chars, '`', i + 1) {
+        if c == '`'
+            && let Some(end) = find_char(chars, '`', i + 1) {
                 out.push_str("<code>");
                 out.extend(&chars[i + 1..end]);
                 out.push_str("</code>");
                 i = end + 1;
                 continue;
             }
-        }
 
-        if (c == '*' || c == '~') && i + 1 < len && chars[i + 1] == c {
-            if let Some(end) = find_double(chars, c, i + 2) {
-                if end > i + 2 {
+        if (c == '*' || c == '~') && i + 1 < len && chars[i + 1] == c
+            && let Some(end) = find_double(chars, c, i + 2)
+                && end > i + 2 {
                     let tag = if c == '*' { "b" } else { "s" };
                     out.push('<');
                     out.push_str(tag);
@@ -221,11 +220,9 @@ fn convert_inline_chars(chars: &[char], out: &mut String) {
                     i = end + 2;
                     continue;
                 }
-            }
-        }
 
-        if c == '[' {
-            if let Some((text_end, url_start, url_end)) = parse_link(chars, i) {
+        if c == '['
+            && let Some((text_end, url_start, url_end)) = parse_link(chars, i) {
                 let url: String = chars[url_start..url_end].iter().collect();
                 out.push_str("<a href=\"");
                 out.push_str(&url.replace('"', "&quot;"));
@@ -235,11 +232,10 @@ fn convert_inline_chars(chars: &[char], out: &mut String) {
                 i = url_end + 1;
                 continue;
             }
-        }
 
         // _italic_ only at word boundaries, so snake_case stays intact.
-        if c == '_' && (i == 0 || !chars[i - 1].is_alphanumeric()) {
-            if let Some(end) = find_char(chars, '_', i + 1) {
+        if c == '_' && (i == 0 || !chars[i - 1].is_alphanumeric())
+            && let Some(end) = find_char(chars, '_', i + 1) {
                 let boundary_after = end + 1 >= len || !chars[end + 1].is_alphanumeric();
                 if end > i + 1 && boundary_after && !chars[i + 1].is_whitespace() {
                     out.push_str("<i>");
@@ -249,19 +245,16 @@ fn convert_inline_chars(chars: &[char], out: &mut String) {
                     continue;
                 }
             }
-        }
 
-        if c == '*' && (i + 1 >= len || chars[i + 1] != '*') {
-            if let Some(end) = find_single_star(chars, i + 1) {
-                if end > i + 1 && !chars[i + 1].is_whitespace() {
+        if c == '*' && (i + 1 >= len || chars[i + 1] != '*')
+            && let Some(end) = find_single_star(chars, i + 1)
+                && end > i + 1 && !chars[i + 1].is_whitespace() {
                     out.push_str("<i>");
                     convert_inline_chars(&chars[i + 1..end], out);
                     out.push_str("</i>");
                     i = end + 1;
                     continue;
                 }
-            }
-        }
 
         out.push(c);
         i += 1;
@@ -307,13 +300,12 @@ pub fn html_to_plain(html: &str) -> String {
                     continue;
                 }
                 if info.closing {
-                    if let Some(Some((href, start))) = href_stack.pop() {
-                        if out[start..] != href[..] && !href.is_empty() {
+                    if let Some(Some((href, start))) = href_stack.pop()
+                        && out[start..] != href[..] && !href.is_empty() {
                             out.push_str(" (");
                             out.push_str(&href);
                             out.push(')');
                         }
-                    }
                 } else {
                     let href = extract_href(tag).map(|h| decode_entities(&h));
                     href_stack.push(href.map(|h| (h, out.len())));
@@ -365,15 +357,14 @@ fn atoms(html: &str) -> Vec<Atom<'_>> {
     let mut out = Vec::new();
     let mut rest = html;
     while let Some(c) = rest.chars().next() {
-        if c == '<' {
-            if let Some(end) = rest.find('>') {
+        if c == '<'
+            && let Some(end) = rest.find('>') {
                 out.push(Atom::Tag(&rest[..=end]));
                 rest = &rest[end + 1..];
                 continue;
             }
-        }
-        if c == '&' {
-            if let Some(end) = rest.find(';') {
+        if c == '&'
+            && let Some(end) = rest.find(';') {
                 let body = &rest[1..end];
                 if end <= 10
                     && !body.is_empty()
@@ -384,7 +375,6 @@ fn atoms(html: &str) -> Vec<Atom<'_>> {
                     continue;
                 }
             }
-        }
         out.push(Atom::Char(c));
         rest = &rest[c.len_utf8()..];
     }
@@ -467,8 +457,8 @@ pub fn split_html(html: &str, max_len: usize) -> Vec<String> {
             let atom = atoms[j];
             // Stack after this atom, to know closing cost.
             let mut next_stack = stack.clone();
-            if let Atom::Tag(raw) = atom {
-                if let Some(info) = parse_tag(raw) {
+            if let Atom::Tag(raw) = atom
+                && let Some(info) = parse_tag(raw) {
                     if info.closing {
                         if let Some(pos) = next_stack.iter().rposition(|(n, _)| *n == info.name) {
                             next_stack.truncate(pos);
@@ -477,7 +467,6 @@ pub fn split_html(html: &str, max_len: usize) -> Vec<String> {
                         next_stack.push((info.name, raw));
                     }
                 }
-            }
             let cost = atom.len();
             if used + cost + closing_len(&next_stack) > max_len && j > i {
                 overflow = true;

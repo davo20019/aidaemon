@@ -47,7 +47,7 @@ look correct.) Stop and ask the user to unlock the Mac, then retry.";
 // CGSessionCopyCurrentDictionary exposes the login-session state (incl. screen
 // lock); it returns NULL when there is no owning GUI session.
 #[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
     fn CGSessionCopyCurrentDictionary() -> *const std::ffi::c_void;
@@ -58,7 +58,7 @@ extern "C" {
 // these four entry points avoids taking a direct core-foundation crate dep
 // (two major versions are already in the tree).
 #[link(name = "CoreFoundation", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     fn CFStringCreateWithCString(
         alloc: *const std::ffi::c_void,
         c_str: *const std::ffi::c_char,
@@ -819,11 +819,10 @@ fn collapse_passthrough(parent: &AXUIElement, children: Vec<AXUIElement>) -> Vec
     // collapsed, otherwise value-bearing groups exhaust the depth budget before
     // the real controls are reached.
     let title = structural_label(parent);
-    if title.is_empty() && role.contains("Group") {
-        if let Ok(grandchildren) = children[0].children() {
+    if title.is_empty() && role.contains("Group")
+        && let Ok(grandchildren) = children[0].children() {
             return collapse_passthrough(&children[0], grandchildren);
         }
-    }
     children
 }
 
@@ -868,11 +867,10 @@ fn structural_label(element: &AXUIElement) -> String {
 
 fn structural_label_opt(element: &AXUIElement) -> Option<String> {
     for attr in [AX_TITLE_ATTRIBUTE, AX_DESCRIPTION_ATTRIBUTE] {
-        if let Some(value) = optional_string_attr(element, attr) {
-            if !value.is_empty() {
+        if let Some(value) = optional_string_attr(element, attr)
+            && !value.is_empty() {
                 return Some(value);
             }
-        }
     }
     None
 }

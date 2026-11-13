@@ -74,23 +74,21 @@ impl ManageMcpTool {
             return CallEffects::none();
         }
         let mut effects = CallEffects::unknown();
-        if args.action == "add" {
-            if let Some(command) = args.command.filter(|command| !command.is_empty()) {
+        if args.action == "add"
+            && let Some(command) = args.command.filter(|command| !command.is_empty()) {
                 effects
                     .keys
                     .push(EffectKey::named(EffectClass::Process, &command));
             }
-        }
         // Every call that can start a server's process names that server, so
         // a declined add, restart or enable binds the others for it.
-        if matches!(args.action.as_str(), "add" | "restart" | "enable") {
-            if let Some(name) = args.name.filter(|name| !name.trim().is_empty()) {
+        if matches!(args.action.as_str(), "add" | "restart" | "enable")
+            && let Some(name) = args.name.filter(|name| !name.trim().is_empty()) {
                 effects.keys.push(EffectKey::named(
                     EffectClass::Process,
                     &server_process_key(&name),
                 ));
             }
-        }
         effects
     }
 
@@ -393,14 +391,13 @@ impl ToolSemantics for ManageMcpTool {
         if call.refused {
             return OwnerApprovalNeed::NotNeeded;
         }
-        if let Ok(args) = serde_json::from_value::<ManageMcpArgs>(call.arguments.clone()) {
-            if matches!(args.action.as_str(), "restart" | "enable") {
+        if let Ok(args) = serde_json::from_value::<ManageMcpArgs>(call.arguments.clone())
+            && matches!(args.action.as_str(), "restart" | "enable") {
                 let Some(name) = args.name.as_deref().filter(|name| !name.trim().is_empty()) else {
                     return OwnerApprovalNeed::NotNeeded;
                 };
                 return self.respawn_approval(&args.action, name).await;
             }
-        }
         Self::owner_approval(call.arguments)
     }
 

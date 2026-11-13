@@ -55,15 +55,14 @@ pub fn without_permission_bypass(args: &[String], agent: &str) -> Vec<String> {
             index += 1;
             continue;
         }
-        if let Some(value) = args.get(index + 1) {
-            if PERMISSION_BYPASS_OPTION_VALUES
+        if let Some(value) = args.get(index + 1)
+            && PERMISSION_BYPASS_OPTION_VALUES
                 .iter()
                 .any(|(flag, v)| arg == *flag && value == v)
             {
                 index += 2;
                 continue;
             }
-        }
         out.push(args[index].clone());
         index += 1;
     }

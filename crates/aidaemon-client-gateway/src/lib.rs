@@ -384,8 +384,8 @@ impl ClientGateway {
         };
         // A reply worth retrying for is not remembered.
         let keep = !matches!(&reply, ServerFrame::Error { error, .. } if error.retryable);
-        if keep {
-            if let Ok(text) = serde_json::to_string(&reply) {
+        if keep
+            && let Ok(text) = serde_json::to_string(&reply) {
                 match log
                     .remember_reply(OWNER, request_id, bus::now_ms(), &text)
                     .await
@@ -398,7 +398,6 @@ impl ClientGateway {
                     Err(error) => warn!(%error, "Could not remember a client reply"),
                 }
             }
-        }
         reply
     }
 
@@ -421,14 +420,13 @@ impl ClientGateway {
             | Command::GetSnapshot => Some(Scope::Observe),
             Command::Unknown => None,
         };
-        if let Some(scope) = needs {
-            if !caller.principal.may(scope) {
+        if let Some(scope) = needs
+            && !caller.principal.may(scope) {
                 return Err(ProtocolError::new(
                     ErrorCode::Forbidden,
                     format!("This device may not {scope:?}"),
                 ));
             }
-        }
         match command {
             Command::SendMessage {
                 session_id,

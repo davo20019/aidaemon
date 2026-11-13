@@ -197,11 +197,9 @@ impl SqliteEmbeddingIndex {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
-        {
-            if set.generation == generation && set.dim == dim {
+            && set.generation == generation && set.dim == dim {
                 return Ok(set.clone());
             }
-        }
         let set = Arc::new(self.load(filter, dim, generation).await?);
         self.cache
             .lock()

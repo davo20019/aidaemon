@@ -72,12 +72,11 @@ impl Updater {
             if let (Ok(current), Ok(latest_parsed)) = (
                 semver::Version::parse(CURRENT_VERSION),
                 semver::Version::parse(latest_version),
-            ) {
-                if latest_parsed > current {
+            )
+                && latest_parsed > current {
                     let notes = latest.body().unwrap_or("No release notes.");
                     return Ok(Some((latest_version.to_string(), notes.to_string())));
                 }
-            }
         }
 
         Ok(None)

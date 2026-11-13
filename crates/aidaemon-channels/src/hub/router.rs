@@ -368,11 +368,10 @@ impl ChannelHub {
                     return None;
                 }
             };
-        if let Some(channel_name) = map.get(&routed_session) {
-            if let Some(ch) = channels.iter().find(|c| &c.name() == channel_name) {
+        if let Some(channel_name) = map.get(&routed_session)
+            && let Some(ch) = channels.iter().find(|c| &c.name() == channel_name) {
                 return Some((ch.clone(), routed_session));
             }
-        }
         None
     }
 
@@ -639,15 +638,14 @@ impl ChannelHub {
                 },
             );
         }
-        if let Some((response, _)) = outcome {
-            if response_tx.send(response).is_err() {
+        if let Some((response, _)) = outcome
+            && response_tx.send(response).is_err() {
                 had_error = true;
                 warn!(
                     session_id = %request.session_id,
                     "Approval response receiver dropped before response could be sent"
                 );
             }
-        }
         had_error
     }
 
@@ -808,13 +806,12 @@ impl ChannelHub {
             .await
             {
                 Ok(mut last) => {
-                    if let Some((prev, prev_at)) = last.get(&routed_session) {
-                        if prev.trim() == text_norm
+                    if let Some((prev, prev_at)) = last.get(&routed_session)
+                        && prev.trim() == text_norm
                             && now.duration_since(*prev_at) < std::time::Duration::from_secs(10)
                         {
                             return Ok(());
                         }
-                    }
                     last.insert(routed_session.clone(), (text_norm.to_string(), now));
                     delivery_claim = Some((text_norm.to_string(), now));
                 }
@@ -828,9 +825,9 @@ impl ChannelHub {
         }
 
         let result = channel.send_text(&routed_session, &presented).await;
-        if result.is_err() {
-            if let Some((claimed_text, claimed_at)) = delivery_claim {
-                if let Ok(mut last) = tokio::time::timeout(
+        if result.is_err()
+            && let Some((claimed_text, claimed_at)) = delivery_claim
+                && let Ok(mut last) = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     self.last_sent_text.write(),
                 )
@@ -843,8 +840,6 @@ impl ChannelHub {
                         last.remove(&routed_session);
                     }
                 }
-            }
-        }
         result
     }
 
@@ -965,14 +960,13 @@ impl ChannelHub {
     /// Errors are logged but don't stop the broadcast.
     pub async fn broadcast_text(&self, session_ids: &[String], text: &str) {
         for session_id in session_ids {
-            if let Some((channel, routed_session)) = self.routed_channel(session_id).await {
-                if let Err(e) = channel.send_text(&routed_session, text).await {
+            if let Some((channel, routed_session)) = self.routed_channel(session_id).await
+                && let Err(e) = channel.send_text(&routed_session, text).await {
                     warn!(
                         channel = channel.name(),
                         session_id, "Broadcast send failed: {}", e
                     );
                 }
-            }
         }
     }
 }

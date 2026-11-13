@@ -126,13 +126,12 @@ async fn main() -> anyhow::Result<()> {
             Err(error) => return Err(error.into()),
         }
     }
-    if let Ok(text) = std::str::from_utf8(&received) {
-        if let Some(reason) = text
+    if let Ok(text) = std::str::from_utf8(&received)
+        && let Some(reason) = text
             .lines()
             .find_map(|line| line.trim().strip_prefix("PROVISIONING_REJECTED:"))
         {
             anyhow::bail!("K10 rejected provisioning: {reason}");
         }
-    }
     anyhow::bail!("K10 did not confirm provisioning before the deadline")
 }

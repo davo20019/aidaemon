@@ -223,11 +223,9 @@ impl TurnEngine<'_> {
             .spawn_family
             .active_coordination()
             .and_then(|coordination| coordination.parent_note(scope.session_id))
-        {
-            if let Ok(mut extra) = scope.extra_system.lock() {
+            && let Ok(mut extra) = scope.extra_system.lock() {
                 extra.push(note);
             }
-        }
         self.sdk_note_delivered_notices(scope).await;
         let run = {
             let raised: Vec<String> = scope
@@ -292,8 +290,8 @@ impl TurnEngine<'_> {
                 // already committed completed the review, which closes from
                 // that decision. Without one the call fails, and the review
                 // closes as failed: retried with backoff, owner told.
-                if error.to_string().contains(MANDATE_BUDGET_EXHAUSTED) {
-                    if let Some(summary) =
+                if error.to_string().contains(MANDATE_BUDGET_EXHAUSTED)
+                    && let Some(summary) =
                         crate::engine::mandate_run::committed_non_action_mandate_summary(self.host)
                             .await
                     {
@@ -305,7 +303,6 @@ impl TurnEngine<'_> {
                             .verdict
                             .record_budget_stop(summary, TaskOutcome::Succeeded);
                     }
-                }
                 return Err(error);
             }
         };
@@ -540,11 +537,10 @@ impl TurnEngine<'_> {
             .pending_charge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = usage;
-        if let Some(note) = response.response_note.clone() {
-            if let Ok(mut latest) = scope.verdict.response_note.lock() {
+        if let Some(note) = response.response_note.clone()
+            && let Ok(mut latest) = scope.verdict.response_note.lock() {
                 *latest = Some(note);
             }
-        }
         scope
             .last_batch_size
             .store(response.tool_calls.len(), Ordering::Relaxed);

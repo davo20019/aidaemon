@@ -424,11 +424,10 @@ impl TurnEngine<'_> {
         &self,
         goal_id: &str,
     ) -> Option<tokio_util::sync::CancellationToken> {
-        if let Some(registry) = self.goal_tokens() {
-            if let Some(token) = registry.child_token(goal_id).await {
+        if let Some(registry) = self.goal_tokens()
+            && let Some(token) = registry.child_token(goal_id).await {
                 return Some(token);
             }
-        }
 
         self.cancel_token().map(|t| t.child_token())
     }
@@ -1137,25 +1136,19 @@ impl TurnEngine<'_> {
                     if task_id.is_some() && task_attempt.is_none() {
                         anyhow::bail!("Task is not ready or is already owned by another worker");
                     }
-                    if mandate.is_none() {
-                        if let Some(profile_id) = task_attempt
+                    if mandate.is_none()
+                        && let Some(profile_id) = task_attempt
                             .as_ref()
                             .and_then(|attempt| attempt.worker_profile_id.as_deref())
-                        {
-                            if profile_id != "profile-executor" {
-                                if let Some(profile) =
+                            && profile_id != "profile-executor"
+                                && let Some(profile) =
                                     self.work().get_worker_profile(profile_id).await?
-                                {
-                                    if let Some(assigned_kind) =
+                                    && let Some(assigned_kind) =
                                         SpecialistKind::from_str(&profile.specialist)
                                     {
                                         specialist_kind = assigned_kind;
                                         self.sync_worker_profile(specialist_kind).await?;
                                     }
-                                }
-                            }
-                        }
-                    }
                     let has_cli_agent = full_tools
                         .iter()
                         .any(|t| t.name() == "cli_agent" && t.is_available());
@@ -1191,11 +1184,10 @@ impl TurnEngine<'_> {
                         tools.retain(|t| !recall_guardrails::is_delegation_blocked_tool(t.name()));
                     }
                     // The claimed attempt's blocker report.
-                    if let Some(tid) = task_id {
-                        if let Some(attempt) = task_attempt.clone() {
+                    if let Some(tid) = task_id
+                        && let Some(attempt) = task_attempt.clone() {
                             tools.push(self.report_blocker_tool(tid, attempt, mandate.is_some()));
                         }
-                    }
                     // The kind resolved here writes the prompt and is passed
                     // to `spawn_child_inner`, which applies its tools and
                     // budget: one resolution for both.
@@ -1589,20 +1581,15 @@ impl TurnEngine<'_> {
         } else {
             compose::resolve_specialist_kind(original_child_role, arg_specialist, mission, task)
         };
-        if mandate_execution.is_none() && resolved_kind.is_none() {
-            if let Some(profile_id) = task_attempt
+        if mandate_execution.is_none() && resolved_kind.is_none()
+            && let Some(profile_id) = task_attempt
                 .as_ref()
                 .and_then(|attempt| attempt.worker_profile_id.as_deref())
-            {
-                if profile_id != "profile-executor" {
-                    if let Some(profile) = self.work().get_worker_profile(profile_id).await? {
-                        if let Some(assigned_kind) = SpecialistKind::from_str(&profile.specialist) {
+                && profile_id != "profile-executor"
+                    && let Some(profile) = self.work().get_worker_profile(profile_id).await?
+                        && let Some(assigned_kind) = SpecialistKind::from_str(&profile.specialist) {
                             specialist_kind = assigned_kind;
                         }
-                    }
-                }
-            }
-        }
         let child_session = compose::build_specialist_session_id(specialist_kind, Uuid::new_v4());
         if mandate_execution.is_none() {
             self.sync_worker_profile(specialist_kind).await?;
@@ -1776,8 +1763,8 @@ impl TurnEngine<'_> {
         // Save task_id for post-completion knowledge extraction (Phase 4)
         let saved_task_id = task_id.clone();
         let child_is_mandate_execution = mandate_execution.is_some();
-        if role == AgentRole::Executor {
-            if let Some(task_id) = saved_task_id.as_deref() {
+        if role == AgentRole::Executor
+            && let Some(task_id) = saved_task_id.as_deref() {
                 let handoff = compose::build_executor_handoff(
                     task_id,
                     mission,
@@ -1790,7 +1777,6 @@ impl TurnEngine<'_> {
                         .await;
                 }
             }
-        }
         let cancel_token =
             cancel_token_override.or_else(|| self.cancel_token().map(|t| t.child_token()));
         let effective_approval_session_id = self
@@ -2023,9 +2009,9 @@ impl TurnEngine<'_> {
                     let _ = (&mut join).await;
                     // Release the durable task's attempt now rather than
                     // leaving its lease to expire.
-                    if role == AgentRole::Executor {
-                        if let Some(task_id) = saved_task_id.as_deref() {
-                            if let Err(error) = self
+                    if role == AgentRole::Executor
+                        && let Some(task_id) = saved_task_id.as_deref()
+                            && let Err(error) = self
                                 .finalize_executor_task_outcome(
                                     task_id,
                                     task_attempt.as_ref(),
@@ -2037,8 +2023,6 @@ impl TurnEngine<'_> {
                             {
                                 warn!(task_id, %error, "Could not record a stopped executor's task");
                             }
-                        }
-                    }
                     return Err(crate::spawn::ChildStoppedByOwner.into());
                 }
                 _ = heartbeat.tick(), if task_attempt.is_some() => {
@@ -2161,8 +2145,8 @@ impl TurnEngine<'_> {
         };
         let mut result = enforce_child_terminal_outcome(result, child_task_end.as_ref());
 
-        if self.turn_runtime().harness_eval_enabled() {
-            if let Some(child_snapshot) = child_task_end
+        if self.turn_runtime().harness_eval_enabled()
+            && let Some(child_snapshot) = child_task_end
                 .as_ref()
                 .and_then(|data| data.harness_eval.clone())
             {
@@ -2170,10 +2154,9 @@ impl TurnEngine<'_> {
                     .with_harness_eval(|eval| eval.rollup_sub_agent(&child_snapshot))
                     .await;
             }
-        }
 
-        if role == AgentRole::Executor {
-            if let Some(task_id) = saved_task_id.as_deref() {
+        if role == AgentRole::Executor
+            && let Some(task_id) = saved_task_id.as_deref() {
                 let error_text = result.as_ref().err().map(|error| error.to_string());
                 if let Err(finalize_error) = self
                     .finalize_executor_task_outcome(
@@ -2191,7 +2174,6 @@ impl TurnEngine<'_> {
                     ));
                 }
             }
-        }
 
         let duration = start.elapsed();
 
@@ -2232,11 +2214,11 @@ impl TurnEngine<'_> {
             crate::untrusted::tainted_turns(self.work(), &child_session_for_events).await;
 
         // Spawn background knowledge extraction for completed executor tasks.
-        if !child_is_mandate_execution {
-            if let Some(ref task_id) = saved_task_id {
-                if result.is_ok() {
-                    if let Ok(Some(completed_task)) = self.work().get_task(task_id).await {
-                        if completed_task.status == "completed" && self.memory_is_daemons_own() {
+        if !child_is_mandate_execution
+            && let Some(ref task_id) = saved_task_id
+                && result.is_ok()
+                    && let Ok(Some(completed_task)) = self.work().get_task(task_id).await
+                        && completed_task.status == "completed" && self.memory_is_daemons_own() {
                             let taint = run_taint(child_flagged_untrusted, &child_tainted_turns);
                             let model = match tokio::time::timeout(
                                 Duration::from_secs(2),
@@ -2256,10 +2238,6 @@ impl TurnEngine<'_> {
                             self.transcript_writes()
                                 .learn_from_task(completed_task, model, taint);
                         }
-                    }
-                }
-            }
-        }
 
         let trust = child_result_trust(child_flagged_untrusted, &child_tainted_turns);
         result.map(|response| SpawnChildResult {

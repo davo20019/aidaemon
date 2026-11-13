@@ -384,8 +384,8 @@ pub fn truncate_with_anchor(messages: Vec<Message>, limit: usize) -> Vec<Message
     let anchor_idx = messages.iter().position(|m| m.role == "user");
     let skip = messages.len().saturating_sub(limit);
 
-    if let Some(anchor) = anchor_idx {
-        if skip > anchor {
+    if let Some(anchor) = anchor_idx
+        && skip > anchor {
             // We would skip past the anchor - preserve it
             let anchor_msg = messages[anchor].clone();
             let remaining: Vec<_> = messages.into_iter().skip(skip).collect();
@@ -403,7 +403,6 @@ pub fn truncate_with_anchor(messages: Vec<Message>, limit: usize) -> Vec<Message
             }
             return remaining;
         }
-    }
 
     // Normal case - just take last N
     messages.into_iter().skip(skip).collect()

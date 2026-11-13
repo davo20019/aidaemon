@@ -308,11 +308,10 @@ pub fn render_run_result(
     if has_body {
         parts.push(body.trim_end().to_string());
     }
-    if state.reason().is_none() {
-        if let Some(evidence) = state.evidence.after_report(has_body) {
+    if state.reason().is_none()
+        && let Some(evidence) = state.evidence.after_report(has_body) {
             parts.push(evidence);
         }
-    }
     if let Some(delivered) =
         crate::coordination::owner_delivery_lines(state.evidence.delivered.as_deref())
     {
@@ -2133,13 +2132,12 @@ impl SpawnAgentTool {
                             };
                             // Nothing to salvage: release the executor's claimed
                             // task, as a waited-on executor does.
-                            if salvaged.is_none() && child_role == Some(AgentRole::Executor) {
-                                if let Some(task_id) = durable_task_id.as_deref() {
+                            if salvaged.is_none() && child_role == Some(AgentRole::Executor)
+                                && let Some(task_id) = durable_task_id.as_deref() {
                                     agent
                                         .mark_executor_task_timeout(task_id, timeout_secs)
                                         .await;
                                 }
-                            }
                             match salvaged {
                                 Some(outcome) => (
                                     match outcome.status.as_str() {
@@ -2192,11 +2190,10 @@ impl SpawnAgentTool {
                 );
             }
 
-            if let Some(state) = state.as_ref() {
-                if let Err(error) = state.finish_background_spawn(&background_id).await {
+            if let Some(state) = state.as_ref()
+                && let Err(error) = state.finish_background_spawn(&background_id).await {
                     warn!(%error, "Could not clear a background sub-agent's record");
                 }
-            }
             agent.release_background_cancel_token(&background_id).await;
 
             if let Some(task_id) = executor_task_id_for_bg {
@@ -2590,11 +2587,10 @@ pub async fn run_card(
 /// Show `card` in the session's chat: edit the plan card the turn left in
 /// place, else send it as a new card. `true` when the chat shows it.
 pub async fn update_checklist_card(hub: &dyn OutboundRouter, session_id: &str, card: &str) -> bool {
-    if let Some(id) = hub.checklist_surface(session_id).await {
-        if matches!(hub.edit_text(session_id, &id, card).await, Ok(true)) {
+    if let Some(id) = hub.checklist_surface(session_id).await
+        && matches!(hub.edit_text(session_id, &id, card).await, Ok(true)) {
             return true;
         }
-    }
     match hub.send_text_tracked(session_id, card).await {
         Ok(Some(id)) => {
             hub.register_checklist_surface(session_id, &id).await;

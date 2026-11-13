@@ -322,11 +322,9 @@ pub fn relationship_candidate_ids(conversation_context: &str) -> Vec<String> {
         if let Some(id) = id
             .map(str::trim)
             .filter(|id| !id.is_empty() && *id != "unknown")
-        {
-            if !ids.iter().any(|known| known == id) {
+            && !ids.iter().any(|known| known == id) {
                 ids.push(id.to_string());
             }
-        }
     }
     ids
 }

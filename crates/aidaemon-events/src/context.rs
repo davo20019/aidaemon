@@ -141,8 +141,8 @@ impl SessionContext {
         }
 
         // Last completed task
-        if !active_task_is_uploaded_artifact {
-            if let Some(task) = &self.last_completed_task {
+        if !active_task_is_uploaded_artifact
+            && let Some(task) = &self.last_completed_task {
                 let status_str = match task.status {
                     TaskStatus::Completed => "completed",
                     TaskStatus::Cancelled => "CANCELLED",
@@ -162,7 +162,6 @@ impl SessionContext {
                     error_suffix
                 ));
             }
-        }
 
         // Last error
         if let Some(error) = &self.last_error {
@@ -310,11 +309,10 @@ impl SessionContextCompiler {
                     }
                 }
                 EventType::ToolCall => {
-                    if let Ok(data) = event.parse_data::<ToolCallData>() {
-                        if let Some(task_id) = &data.task_id {
+                    if let Ok(data) = event.parse_data::<ToolCallData>()
+                        && let Some(task_id) = &data.task_id {
                             *task_tool_calls.entry(task_id.clone()).or_insert(0) += 1;
                         }
-                    }
                 }
                 EventType::ToolResult => {
                     if let Ok(data) = event.parse_data::<ToolResultData>() {
@@ -333,8 +331,8 @@ impl SessionContextCompiler {
                     }
                 }
                 EventType::DecisionPoint => {
-                    if let Ok(data) = event.parse_data::<DecisionPointData>() {
-                        if data.severity.is_warning_or_higher() {
+                    if let Ok(data) = event.parse_data::<DecisionPointData>()
+                        && data.severity.is_warning_or_higher() {
                             recent_diagnostics.push(RecentDiagnostic {
                                 severity: data.severity.as_str().to_string(),
                                 code: data
@@ -344,7 +342,6 @@ impl SessionContextCompiler {
                                 timestamp: event.created_at,
                             });
                         }
-                    }
                 }
                 EventType::SubAgentSpawn => {
                     if let Ok(data) = event.parse_data::<SubAgentSpawnData>() {

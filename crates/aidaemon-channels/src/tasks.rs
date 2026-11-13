@@ -255,8 +255,8 @@ impl TaskRegistry {
     /// Cancel a running task. Returns true if the task was found and cancelled.
     pub async fn cancel(&self, task_id: u64) -> bool {
         let mut tasks = self.tasks.write().await;
-        if let Some(handle) = tasks.get_mut(&task_id) {
-            if matches!(handle.entry.status, TaskStatus::Running) {
+        if let Some(handle) = tasks.get_mut(&task_id)
+            && matches!(handle.entry.status, TaskStatus::Running) {
                 handle.cancel_token.cancel();
                 if let Some(ref typing) = handle.typing_cancel {
                     typing.cancel();
@@ -264,7 +264,6 @@ impl TaskRegistry {
                 handle.entry.status = TaskStatus::Cancelling;
                 return true;
             }
-        }
         false
     }
 
@@ -473,11 +472,10 @@ impl TaskRegistry {
             // Prune stale entries while we hold the lock.
             seen.retain(|_, ts| (now - *ts).num_seconds() < DEDUP_WINDOW_SECS);
 
-            if let Some(first_seen) = seen.get(&key) {
-                if (now - *first_seen).num_seconds() < DEDUP_WINDOW_SECS {
+            if let Some(first_seen) = seen.get(&key)
+                && (now - *first_seen).num_seconds() < DEDUP_WINDOW_SECS {
                     return None; // Duplicate — silently drop
                 }
-            }
             seen.insert(key, now);
         }
 
@@ -612,11 +610,10 @@ impl TaskRegistry {
         {
             let mut seen = self.recently_seen.write().await;
             seen.retain(|_, ts| (now - *ts).num_seconds() < DEDUP_WINDOW_SECS);
-            if let Some(first_seen) = seen.get(&key) {
-                if (now - *first_seen).num_seconds() < DEDUP_WINDOW_SECS {
+            if let Some(first_seen) = seen.get(&key)
+                && (now - *first_seen).num_seconds() < DEDUP_WINDOW_SECS {
                     return QueueOutcome::Duplicate;
                 }
-            }
             seen.insert(key, now);
         }
         let mut queues = self.queues.write().await;

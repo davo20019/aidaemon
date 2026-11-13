@@ -644,8 +644,8 @@ impl SqliteMemory {
         .bind(procedure.updated_at.to_rfc3339())
         .fetch_one(&self.pool)
         .await?;
-        if let Some(vector) = trigger_vector {
-            if let Err(error) = self
+        if let Some(vector) = trigger_vector
+            && let Err(error) = self
                 .upsert_owner_embedding(
                     "procedure",
                     id,
@@ -657,7 +657,6 @@ impl SqliteMemory {
             {
                 tracing::warn!(%error, procedure_id = id, "Deferred procedure embedding projection");
             }
-        }
         Ok(id)
     }
 
@@ -1014,14 +1013,13 @@ impl SqliteMemory {
         .bind(solution.created_at.to_rfc3339())
         .fetch_one(&self.pool)
         .await?;
-        if let Some(vector) = error_vector {
-            if let Err(error) = self
+        if let Some(vector) = error_vector
+            && let Err(error) = self
                 .upsert_owner_embedding("error_solution", row.0, "error", &error_pattern, vector)
                 .await
             {
                 tracing::warn!(%error, error_solution_id = row.0, "Deferred error-solution embedding projection");
             }
-        }
         Ok(row.0)
     }
 

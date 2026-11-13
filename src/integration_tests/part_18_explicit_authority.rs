@@ -21,11 +21,10 @@ async fn authority_tool_results(harness: &crate::testing::TestHarness) -> Vec<St
     let mut results = Vec::new();
     for call in log.iter() {
         for message in call.messages.iter().filter(|m| m["role"] == "tool") {
-            if let Some(content) = message["content"].as_str() {
-                if !results.iter().any(|seen| seen == content) {
+            if let Some(content) = message["content"].as_str()
+                && !results.iter().any(|seen| seen == content) {
                     results.push(content.to_string());
                 }
-            }
         }
     }
     results
@@ -419,11 +418,10 @@ async fn readonly_blocks_writes_then_full_restores() {
         let mut seen = Vec::new();
         for call in log.iter() {
             for message in call.messages.iter().filter(|m| m["role"] == "tool") {
-                if let Some(content) = message["content"].as_str() {
-                    if !seen.iter().any(|s: &String| s == content) {
+                if let Some(content) = message["content"].as_str()
+                    && !seen.iter().any(|s: &String| s == content) {
                         seen.push(content.to_string());
                     }
-                }
             }
         }
         seen
@@ -651,11 +649,10 @@ async fn readonly_parent_child_cannot_write() {
         let mut seen = Vec::new();
         for call in log.iter() {
             for message in call.messages.iter().filter(|m| m["role"] == "tool") {
-                if let Some(content) = message["content"].as_str() {
-                    if !seen.iter().any(|s: &String| s == content) {
+                if let Some(content) = message["content"].as_str()
+                    && !seen.iter().any(|s: &String| s == content) {
                         seen.push(content.to_string());
                     }
-                }
             }
         }
         seen

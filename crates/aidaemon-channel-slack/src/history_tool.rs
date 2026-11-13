@@ -149,14 +149,13 @@ impl ReadChannelHistoryTool {
             .ok()?;
 
         let body = resp.json::<Value>().await.ok()?;
-        if body["ok"].as_bool() == Some(true) {
-            if let Some(url) = body["url"].as_str() {
+        if body["ok"].as_bool() == Some(true)
+            && let Some(url) = body["url"].as_str() {
                 let url = url.trim_end_matches('/').to_string();
                 let mut cached = self.workspace_url.write().await;
                 cached.insert(token_index, url.clone());
                 return Some(url);
             }
-        }
         None
     }
 
@@ -317,18 +316,16 @@ impl ReadChannelHistoryTool {
         let mut meta_parts: Vec<String> = Vec::new();
 
         // Check if bot owner was mentioned
-        if let Some(owner_id) = bot_owner_id {
-            if raw_text.contains(&format!("<@{}>", owner_id)) {
+        if let Some(owner_id) = bot_owner_id
+            && raw_text.contains(&format!("<@{}>", owner_id)) {
                 meta_parts.push("⚠️ You were mentioned".to_string());
             }
-        }
 
         // Thread reply count
-        if let Some(reply_count) = msg["reply_count"].as_u64() {
-            if reply_count > 0 {
+        if let Some(reply_count) = msg["reply_count"].as_u64()
+            && reply_count > 0 {
                 meta_parts.push(format!("💬 {} replies", reply_count));
             }
-        }
 
         // Reactions
         if let Some(reactions) = msg["reactions"].as_array() {

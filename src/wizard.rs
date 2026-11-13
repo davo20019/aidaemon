@@ -1756,14 +1756,12 @@ fn assign_listen_ports(
             .listen_addr
             .as_deref()
             .and_then(parse_listen_port)
-        {
-            if all_port_usage.get(&existing_port).copied().unwrap_or(0) <= 1
+            && all_port_usage.get(&existing_port).copied().unwrap_or(0) <= 1
                 && !assigned.values().any(|&port| port == existing_port)
             {
                 assigned.insert(bot.target, existing_port);
                 continue;
             }
-        }
 
         let mut candidate = 8443u16;
         while occupied.contains(&candidate) {

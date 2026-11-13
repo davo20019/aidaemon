@@ -145,13 +145,12 @@ fn heredoc_specs(line: &str) -> Vec<(String, bool)> {
             {
                 break;
             }
-            if current == b'\\' && delimiter_quote != Some(b'\'') {
-                if let Some(&literal) = bytes.get(index + 1) {
+            if current == b'\\' && delimiter_quote != Some(b'\'')
+                && let Some(&literal) = bytes.get(index + 1) {
                     delimiter.push(literal);
                     index += 2;
                     continue;
                 }
-            }
             if matches!(current, b'\'' | b'"') {
                 if delimiter_quote == Some(current) {
                     delimiter_quote = None;

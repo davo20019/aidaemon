@@ -1979,14 +1979,13 @@ impl ConfigManagerTool {
         if let Some(refusal) = Self::writes_exposure_command(&content, &new_content) {
             return Ok(ConfigReply::refused(refusal));
         }
-        if let Some(value) = &new_value {
-            if !path.ends_in_index() && !self.config_reads(&doc, &path, value) {
+        if let Some(value) = &new_value
+            && !path.ends_in_index() && !self.config_reads(&doc, &path, value) {
                 return Ok(ConfigReply::refused(format!(
                     "Refused: aidaemon does not read a setting at `{path}`, so it would have no effect. \
                      The config was NOT modified. Check the key name with action 'read'."
                 )));
             }
-        }
 
         if let Err(e) = self.create_backup().await {
             warn!("Failed to create backup: {}", e);
@@ -2072,11 +2071,10 @@ impl ConfigManagerTool {
         let Ok(path) = ConfigPath::parse(&args.key) else {
             return Self::requires_approval(&args.key);
         };
-        if let Some(key) = path.last_key() {
-            if APPROVAL_REQUIRED_KEYS.contains(&key) {
+        if let Some(key) = path.last_key()
+            && APPROVAL_REQUIRED_KEYS.contains(&key) {
                 return true;
             }
-        }
         if args.action == "unset" {
             return path.last_key().is_none();
         }

@@ -291,13 +291,12 @@ fn extract_nested_payloads(input: &str) -> Vec<String> {
             continue;
         }
 
-        if INLINE_CODE_WRAPPERS.contains(&base.as_str()) {
-            if let Some(payload) =
+        if INLINE_CODE_WRAPPERS.contains(&base.as_str())
+            && let Some(payload) =
                 extract_flag_payload(&parts, cmd_index + 1, PayloadMode::InlineCode)
             {
                 push_unique_owned(&mut out, &mut seen, payload);
             }
-        }
     }
 
     out

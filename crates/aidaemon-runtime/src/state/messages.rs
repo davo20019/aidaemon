@@ -387,14 +387,12 @@ impl crate::state::types::MessageStore for SqliteStateStore {
             .bind(session_id)
             .execute(&self.pool)
             .await
-        {
-            if !e
+            && !e
                 .to_string()
                 .contains("no such table: conversation_summaries")
             {
                 return Err(e.into());
             }
-        }
         Ok(())
     }
 

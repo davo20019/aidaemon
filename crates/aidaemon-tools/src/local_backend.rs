@@ -225,11 +225,10 @@ impl ExecutionBackend for LocalBackend {
     ) -> anyhow::Result<()> {
         let host = self.host_path(path);
         self.ensure_allowed(&host).await?;
-        if create_parents {
-            if let Some(parent) = host.parent() {
+        if create_parents
+            && let Some(parent) = host.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-        }
         match mode {
             WriteMode::Append => {
                 let mut file = tokio::fs::OpenOptions::new()

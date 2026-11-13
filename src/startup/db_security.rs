@@ -101,17 +101,15 @@ fn resolve_or_create_encryption_key(
     config_path: &Path,
     db_mode: DbMode,
 ) -> anyhow::Result<String> {
-    if let Some(ref key) = config.state.encryption_key {
-        if !key.trim().is_empty() {
+    if let Some(ref key) = config.state.encryption_key
+        && !key.trim().is_empty() {
             return Ok(key.trim().to_string());
         }
-    }
 
-    if let Ok(key) = std::env::var(DB_ENCRYPTION_ENV_KEY) {
-        if !key.trim().is_empty() {
+    if let Ok(key) = std::env::var(DB_ENCRYPTION_ENV_KEY)
+        && !key.trim().is_empty() {
             return Ok(key.trim().to_string());
         }
-    }
 
     if db_mode == DbMode::EncryptedOrUnknown {
         anyhow::bail!(
@@ -124,7 +122,8 @@ fn resolve_or_create_encryption_key(
     let key = generate_encryption_key_hex();
     let env_path = resolve_env_file_path(config_path);
     persist_key_to_env_file(&env_path, &key)?;
-    std::env::set_var(DB_ENCRYPTION_ENV_KEY, &key);
+    // The caller stores the key in `config.state.encryption_key`, which every
+    // database opener reads first; later runs load it from the env file.
     info!(
         env_path = %env_path.display(),
         "Generated a new database encryption key and stored it in .env"
@@ -430,11 +429,10 @@ fn detect_db_mode(db_path: &Path) -> anyhow::Result<DbMode> {
 
 #[cfg(feature = "encryption")]
 fn resolve_env_file_path(config_path: &Path) -> PathBuf {
-    if let Ok(path) = std::env::var(DB_ENV_FILE_ENV_KEY) {
-        if !path.trim().is_empty() {
+    if let Ok(path) = std::env::var(DB_ENV_FILE_ENV_KEY)
+        && !path.trim().is_empty() {
             return PathBuf::from(path);
         }
-    }
     config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -530,11 +528,10 @@ fn shm_path(db_path: &Path) -> PathBuf {
 
 #[cfg(feature = "encryption")]
 fn remove_if_exists(path: PathBuf) {
-    if path.exists() {
-        if let Err(e) = std::fs::remove_file(&path) {
+    if path.exists()
+        && let Err(e) = std::fs::remove_file(&path) {
             warn!(path = %path.display(), error = %e, "Failed to remove stale SQLite sidecar file");
         }
-    }
 }
 
 fn set_file_mode_0600(path: &Path) -> anyhow::Result<()> {

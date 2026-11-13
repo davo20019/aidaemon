@@ -1343,8 +1343,8 @@ async fn view_actions_within(socket: &mut Socket, wait: Duration) -> Vec<ViewAct
     let mut actions = Vec::new();
     let until = tokio::time::Instant::now() + wait;
     while let Ok(Some(Ok(message))) = tokio::time::timeout_at(until, socket.next()).await {
-        if let Message::Text(text) = message {
-            if let ServerFrame::Event {
+        if let Message::Text(text) = message
+            && let ServerFrame::Event {
                 event: Event::ViewAction { action, .. },
                 seq,
                 ..
@@ -1353,7 +1353,6 @@ async fn view_actions_within(socket: &mut Socket, wait: Duration) -> Vec<ViewAct
                 assert_eq!(seq, None, "view actions are never logged");
                 actions.push(action);
             }
-        }
     }
     actions
 }

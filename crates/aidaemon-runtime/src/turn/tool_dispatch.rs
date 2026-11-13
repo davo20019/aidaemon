@@ -779,8 +779,8 @@ fn requirement_target_matches(
     {
         return true;
     }
-    if let Some(read) = metadata.read_file.as_ref() {
-        if [&read.canonical_path, &read.display_path]
+    if let Some(read) = metadata.read_file.as_ref()
+        && [&read.canonical_path, &read.display_path]
             .iter()
             .any(|value| {
                 ToolTargetHint::new(ToolTargetHintKind::Path, value.as_str()).is_some_and(|hint| {
@@ -790,7 +790,6 @@ fn requirement_target_matches(
         {
             return true;
         }
-    }
 
     let mut haystacks = vec![raw_arguments.to_string()];
     if let Some(command) = extract_command_from_args(raw_arguments) {

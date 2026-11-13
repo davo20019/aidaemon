@@ -353,11 +353,10 @@ pub fn extract_critical_fact_summary(facts: &[Fact]) -> CriticalFactSummary {
             );
             if (owner_name_key && owner_name_category) || lower_key == "owner_name" {
                 summary.owner_name = normalize_name_candidate(value);
-            } else if let Some(name) = extract_name_from_phrase(value) {
-                if lower_key.contains("name") || lower_key.contains("owner") {
+            } else if let Some(name) = extract_name_from_phrase(value)
+                && (lower_key.contains("name") || lower_key.contains("owner")) {
                     summary.owner_name = Some(name);
                 }
-            }
         }
 
         if summary.assistant_name.is_none() {

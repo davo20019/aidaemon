@@ -550,8 +550,8 @@ async fn test_old_interaction_assistant_content_truncated() {
 
     // Archived winning content remains bounded independently of its prose.
     for m in &assistant_msgs {
-        if let Some(content) = m.get("content").and_then(|c| c.as_str()) {
-            if content.starts_with('B') && content.ends_with("TAIL-B") {
+        if let Some(content) = m.get("content").and_then(|c| c.as_str())
+            && content.starts_with('B') && content.ends_with("TAIL-B") {
                 assert!(
                     content.chars().count() <= 2_100,
                     "Archived content should stay within its structural cap, got {} chars: {}...",
@@ -559,7 +559,6 @@ async fn test_old_interaction_assistant_content_truncated() {
                     &content[..50.min(content.len())]
                 );
             }
-        }
     }
 }
 

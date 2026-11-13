@@ -87,13 +87,11 @@ impl<'a> ClosingAuthority<'a> {
         // Exact beats broad: a tool the request named explicitly is admitted
         // even when a scope-level prohibition would otherwise cover it (the
         // same rule as an exact write path beating a directory root).
-        if !explicitly_allowed {
-            if let Some(scope) = crate::turn::tool_facts::fallback_tool_semantic_scope(tool) {
-                if self.forbidden_tool_scopes.contains(&scope) {
+        if !explicitly_allowed
+            && let Some(scope) = crate::turn::tool_facts::fallback_tool_semantic_scope(tool)
+                && self.forbidden_tool_scopes.contains(&scope) {
                     return Some("forbidden_scope");
                 }
-            }
-        }
         if self.forbids_mutation && read_only == Some(false) {
             return Some("forbids_mutation");
         }
@@ -110,14 +108,13 @@ pub fn obligation_admissible(
     read_only: impl Fn(&str) -> Option<bool>,
 ) -> bool {
     let admits = |tool: &str| authority.admits_tool(tool, read_only(tool));
-    if let Some(predicate) = obligation.receipt.as_ref() {
-        if !predicate.tool_names.is_empty() {
+    if let Some(predicate) = obligation.receipt.as_ref()
+        && !predicate.tool_names.is_empty() {
             return predicate
                 .tool_names
                 .iter()
                 .any(|tool| visible_tools.contains(&tool.as_str()) && admits(tool));
         }
-    }
     if let Some(requirement) = obligation.evidence_requirement.as_ref() {
         // Candidate routing is ranked and capped for model guidance. Apply
         // authority first so unavailable candidates cannot crowd out an

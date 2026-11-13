@@ -359,11 +359,10 @@ fn build_body(
         .filter(|m| !m.content.is_empty())
         .map(|m| json!({"type": "text", "text": m.content}))
         .collect();
-    if caching {
-        if let Some(last) = system.last_mut() {
+    if caching
+        && let Some(last) = system.last_mut() {
             last["cache_control"] = ephemeral();
         }
-    }
 
     // Anthropic rejects thinking with a forced tool choice, and a forced
     // choice is a contract the caller relies on: it wins.
@@ -388,11 +387,10 @@ fn build_body(
     }
 
     let mut messages = wire_messages(&request.messages[leading..]);
-    if caching {
-        if let Some(last) = messages.last_mut() {
+    if caching
+        && let Some(last) = messages.last_mut() {
             tail_breakpoint(last);
         }
-    }
     let mut body = json!({
         "model": request.model,
         "max_tokens": max_tokens,
@@ -409,15 +407,14 @@ fn build_body(
         }
         (None, None) => {}
     }
-    if let ResponseFormat::JsonSchema { schema, .. } = &request.options.response_format {
-        if takes_structured_output(&request.model) {
+    if let ResponseFormat::JsonSchema { schema, .. } = &request.options.response_format
+        && takes_structured_output(&request.model) {
             if !body["output_config"].is_object() {
                 body["output_config"] = json!({});
             }
             body["output_config"]["format"] =
                 json!({"type": "json_schema", "schema": output_schema(schema)});
         }
-    }
     if !system.is_empty() {
         body["system"] = Value::Array(system);
     }
@@ -433,11 +430,10 @@ fn build_body(
                 })
             })
             .collect();
-        if caching {
-            if let Some(last) = tools.last_mut() {
+        if caching
+            && let Some(last) = tools.last_mut() {
                 last["cache_control"] = ephemeral();
             }
-        }
         body["tools"] = Value::Array(tools);
         body["tool_choice"] = match &request.tool_choice {
             ToolChoice::Auto => json!({"type": "auto"}),
@@ -783,11 +779,10 @@ impl SseDecoder for MessagesDecoder {
         }
         // A tool-use turn continued with thinking must replay its signed
         // thinking blocks; they ride on the first tool call.
-        if let Some(first) = tool_calls.first_mut() {
-            if !thinking_blocks.is_empty() {
+        if let Some(first) = tool_calls.first_mut()
+            && !thinking_blocks.is_empty() {
                 first.provider_data = Some(json!({ THINKING_BLOCKS_KEY: thinking_blocks }));
             }
-        }
         Ok(ModelResponse {
             text: std::mem::take(&mut self.text),
             tool_calls,

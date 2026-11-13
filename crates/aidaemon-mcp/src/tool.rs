@@ -271,11 +271,10 @@ pub fn render_result(server: &str, result: &Value) -> ToolOutput {
         .filter(|v| !v.is_null())
         .cloned();
     let mut content = parts.join("\n");
-    if content.trim().is_empty() {
-        if let Some(structured) = &structured {
+    if content.trim().is_empty()
+        && let Some(structured) = &structured {
             content = structured.to_string();
         }
-    }
 
     let mut details = Map::new();
     details.insert("server".into(), json!(server));

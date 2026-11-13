@@ -1006,8 +1006,8 @@ async fn resolve_agent_launch(
         .ok_or_else(|| format!("launcher executable '{command}' was not found"))?;
     let mut resolved_args = args.to_vec();
 
-    if is_env_launcher(&resolved_command) {
-        if let Some(index) = env_wrapped_program_index(&resolved_args) {
+    if is_env_launcher(&resolved_command)
+        && let Some(index) = env_wrapped_program_index(&resolved_args) {
             let nested = resolved_args[index].clone();
             let resolved_nested = resolve_executable(backend, &nested).await.ok_or_else(|| {
                 format!(
@@ -1016,7 +1016,6 @@ async fn resolve_agent_launch(
             })?;
             resolved_args[index] = resolved_nested;
         }
-    }
 
     Ok((resolved_command, resolved_args))
 }
@@ -1291,11 +1290,10 @@ impl CliAgentTool {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.eq_ignore_ascii_case("codex"))
         };
-        if let Some(preferred) = preferred {
-            if tools.get(preferred).is_some_and(supports_split_access) {
+        if let Some(preferred) = preferred
+            && tools.get(preferred).is_some_and(supports_split_access) {
                 return Some(preferred.to_string());
             }
-        }
         let mut compatible = tools
             .iter()
             .filter(|(_, entry)| supports_split_access(entry))
@@ -1886,8 +1884,8 @@ impl CliAgentTool {
 
         // Conversation context (truncated first if over budget)
         let mut context_text = String::new();
-        if let Ok(history) = self.state.get_history(session_id, 10).await {
-            if !history.is_empty() {
+        if let Ok(history) = self.state.get_history(session_id, 10).await
+            && !history.is_empty() {
                 let mut lines = Vec::new();
                 for msg in history.iter().rev().take(10) {
                     let role = &msg.role;
@@ -1902,7 +1900,6 @@ impl CliAgentTool {
                 }
                 context_text = lines.join("\n");
             }
-        }
 
         // Relevant facts (query both task prompt and recent user message)
         let mut facts_text = String::new();
@@ -1918,22 +1915,19 @@ impl CliAgentTool {
                 }
             }
 
-            if let Ok(history) = self.state.get_history(session_id, 10).await {
-                if let Some(last_user_msg) = history.iter().rev().find(|m| m.role == "user") {
-                    if let Some(content) = last_user_msg.content.as_deref() {
+            if let Ok(history) = self.state.get_history(session_id, 10).await
+                && let Some(last_user_msg) = history.iter().rev().find(|m| m.role == "user")
+                    && let Some(content) = last_user_msg.content.as_deref() {
                         let user_text: String = content.chars().take(500).collect();
-                        if user_text != task_prompt {
-                            if let Ok(facts) = store.get_relevant_facts(&user_text, 10).await {
+                        if user_text != task_prompt
+                            && let Ok(facts) = store.get_relevant_facts(&user_text, 10).await {
                                 for fact in facts {
                                     if seen.insert((fact.category.clone(), fact.key.clone())) {
                                         facts_accum.push(fact);
                                     }
                                 }
                             }
-                        }
                     }
-                }
-            }
 
             facts_accum.truncate(20);
             let recalled: Vec<i64> = facts_accum.iter().map(|fact| fact.id).collect();
@@ -1949,14 +1943,13 @@ impl CliAgentTool {
 
         // Active goal context
         let mut active_goal_text = String::new();
-        if let Ok(goals) = self.state.get_goals_for_session(session_id).await {
-            if let Some(active_goal) = goals
+        if let Ok(goals) = self.state.get_goals_for_session(session_id).await
+            && let Some(active_goal) = goals
                 .iter()
                 .find(|g| g.status == "active" || g.status == "in_progress")
             {
                 active_goal_text = active_goal.description.chars().take(500).collect();
             }
-        }
 
         // Scoped repository instructions. Native coding CLIs also perform
         // their own discovery from cwd; this shared snapshot keeps enriched
@@ -2391,12 +2384,11 @@ impl CliAgentTool {
             }
             Err(error) => {
                 // Auto-disable dynamic agents that disappeared
-                if let Ok(agents) = self.state.list_dynamic_cli_agents().await {
-                    if let Some(mut agent) = agents.into_iter().find(|a| a.name == tool_name) {
+                if let Ok(agents) = self.state.list_dynamic_cli_agents().await
+                    && let Some(mut agent) = agents.into_iter().find(|a| a.name == tool_name) {
                         agent.enabled = false;
                         let _ = self.state.update_dynamic_cli_agent(&agent).await;
                     }
-                }
                 let message = format!(
                     "ERROR: CLI agent '{tool_name}' could not start: {error}. \
                  Re-register it with an absolute executable path or reinstall it."
@@ -3042,8 +3034,8 @@ impl CliAgentTool {
             }
 
             // Send any remaining lines (with JSON parsing)
-            if !pending_lines.is_empty() {
-                if let Some(ref tx) = status_tx_clone {
+            if !pending_lines.is_empty()
+                && let Some(ref tx) = status_tx_clone {
                     let mut progress_items: Vec<String> = Vec::new();
                     for line in &pending_lines {
                         if looks_like_json(line) {
@@ -3063,7 +3055,6 @@ impl CliAgentTool {
                         });
                     }
                 }
-            }
 
             // Wait for process to complete and signal via channel
             let exit_code = if loop_detected {
@@ -4381,8 +4372,8 @@ fn extract_progress_from_json(line: &str) -> Option<String> {
         match event_type {
             "assistant" => {
                 // Assistant is thinking/responding - extract tool use details
-                if let Some(content) = v.get("message").and_then(|m| m.get("content")) {
-                    if let Some(arr) = content.as_array() {
+                if let Some(content) = v.get("message").and_then(|m| m.get("content"))
+                    && let Some(arr) = content.as_array() {
                         for item in arr {
                             if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                                 let name = item
@@ -4450,7 +4441,6 @@ fn extract_progress_from_json(line: &str) -> Option<String> {
                             }
                         }
                     }
-                }
                 return None; // Don't show generic "assistant" events
             }
             "tool_use" => {
@@ -4501,22 +4491,20 @@ fn extract_terminal_commands_from_json(line: &str) -> Vec<String> {
     let mut out = Vec::new();
 
     // Claude Code stream-json tool_use: { "name": "Bash", "input": {"command": "..."} }
-    if let Some(tool_name) = v.get("name").and_then(|n| n.as_str()) {
-        if matches!(tool_name, "Bash" | "bash" | "terminal") {
-            if let Some(cmd) = v
+    if let Some(tool_name) = v.get("name").and_then(|n| n.as_str())
+        && matches!(tool_name, "Bash" | "bash" | "terminal")
+            && let Some(cmd) = v
                 .get("input")
                 .and_then(|i| i.get("command"))
                 .and_then(|c| c.as_str())
             {
                 out.push(cmd.to_string());
             }
-        }
-    }
 
     // Claude Code assistant wrapper:
     // { "type": "assistant", "message": {"content":[{"type":"tool_use","name":"Bash","input":{"command":"..."}}]}}
-    if v.get("type").and_then(|t| t.as_str()) == Some("assistant") {
-        if let Some(items) = v
+    if v.get("type").and_then(|t| t.as_str()) == Some("assistant")
+        && let Some(items) = v
             .get("message")
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_array())
@@ -4538,7 +4526,6 @@ fn extract_terminal_commands_from_json(line: &str) -> Vec<String> {
                 }
             }
         }
-    }
 
     // Generic tool_use format: { "type": "tool_use", "tool": "bash", "command": "..." }
     if v.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
@@ -4547,11 +4534,10 @@ fn extract_terminal_commands_from_json(line: &str) -> Vec<String> {
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        if tool == "bash" || tool == "terminal" {
-            if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+        if (tool == "bash" || tool == "terminal")
+            && let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
                 out.push(cmd.to_string());
             }
-        }
     }
 
     out
@@ -4609,11 +4595,9 @@ fn extract_jsonl_content(raw: &str) -> Option<String> {
             // unfinished and cause the orchestrator to repeat it.
             if v.get("type").and_then(Value::as_str) == Some("item.completed")
                 && v.pointer("/item/type").and_then(Value::as_str) == Some("agent_message")
-            {
-                if let Some(text) = v.pointer("/item/text").and_then(Value::as_str) {
+                && let Some(text) = v.pointer("/item/text").and_then(Value::as_str) {
                     return Some(text.to_string());
                 }
-            }
 
             if let Some(content) = v
                 .pointer("/item/content")
@@ -5027,11 +5011,10 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
             .and_then(Value::as_str)
             .unwrap_or("read_write");
         let mut read_targets = Vec::new();
-        if let Some(cwd) = execution_cwd.as_deref() {
-            if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd) {
+        if let Some(cwd) = execution_cwd.as_deref()
+            && let Some(target) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd) {
                 read_targets.push(target);
             }
-        }
         for path in parsed
             .as_ref()
             .and_then(|value| value.get("read_paths"))
@@ -5045,11 +5028,10 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
                 .filter(|_| !aidaemon_tools::BackendPath::is_anchored(path))
                 .map(|cwd| aidaemon_tools::BackendPath::new(cwd).join(path).to_string())
                 .unwrap_or_else(|| path.to_string());
-            if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path) {
-                if !read_targets.contains(&target) {
+            if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path)
+                && !read_targets.contains(&target) {
                     read_targets.push(target);
                 }
-            }
         }
         let mut write_targets = parsed
             .as_ref()
@@ -5226,13 +5208,11 @@ impl CliAgentTool {
         // route background notifications and cancel_all scoping to the *origin*
         // session_id (goal.session_id), which is routable via the ChannelHub.
         let mut session_id = args.call_session.clone().unwrap_or_default();
-        if let Some(ref goal_id) = args.call_goal_id {
-            if let Ok(Some(goal)) = self.state.get_goal(goal_id).await {
-                if !goal.session_id.trim().is_empty() {
+        if let Some(ref goal_id) = args.call_goal_id
+            && let Ok(Some(goal)) = self.state.get_goal(goal_id).await
+                && !goal.session_id.trim().is_empty() {
                     session_id = goal.session_id;
                 }
-            }
-        }
 
         match action {
             "run" => {

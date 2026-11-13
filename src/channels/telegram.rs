@@ -462,12 +462,11 @@ impl Cx<'_> {
             telegram.insert("allowed_user_ids".to_string(), ids_toml.clone());
             updated = true;
         }
-        if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut()) {
-            if let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
+        if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut())
+            && let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
                 first.insert("allowed_user_ids".to_string(), ids_toml);
                 updated = true;
             }
-        }
 
         if !updated {
             anyhow::bail!("No [telegram] or [[telegram_bots]] section found in config");
@@ -687,13 +686,12 @@ impl Cx<'_> {
                     }
                 }
                 let wrangler_present = crate::wizard::command_exists("wrangler").await;
-                if !wrangler_present {
-                    if let Some(spec) =
+                if !wrangler_present
+                    && let Some(spec) =
                         crate::wizard::installer_for_missing_tool("wrangler", has_brew, has_npm)
                     {
                         install_specs.push(("wrangler".to_string(), spec));
                     }
-                }
 
                 let mut install_report = String::new();
                 if !install_specs.is_empty() {
@@ -1762,8 +1760,8 @@ impl Cx<'_> {
 
         // Try to spawn the bot immediately if we have a hub reference
         let hub_ref = self.channel_hub_weak();
-        if let Some(weak_hub) = hub_ref {
-            if let Some(hub) = weak_hub.upgrade() {
+        if let Some(weak_hub) = hub_ref
+            && let Some(hub) = weak_hub.upgrade() {
                 // Create the new channel with same config as this one
                 let new_channel = Arc::new(new_telegram_bot(
                     token,
@@ -1801,7 +1799,6 @@ impl Cx<'_> {
                         .unwrap_or_default()
                 );
             }
-        }
 
         // Fallback: hub not available, require restart
         format!(
@@ -1865,8 +1862,8 @@ impl Cx<'_> {
 
         // Try to spawn the bot immediately if we have a hub reference
         let hub_ref = self.channel_hub_weak();
-        if let Some(weak_hub) = hub_ref {
-            if let Some(hub) = weak_hub.upgrade() {
+        if let Some(weak_hub) = hub_ref
+            && let Some(hub) = weak_hub.upgrade() {
                 // Create the new Discord channel with empty allowed_user_ids —
                 // the bot will auto-claim the first DM user.
                 let new_channel = Arc::new(super::discord::new_discord_bot(
@@ -1896,7 +1893,6 @@ impl Cx<'_> {
                     bot_name
                 );
             }
-        }
 
         // Fallback: hub not available, require restart
         format!(
@@ -1970,8 +1966,8 @@ impl Cx<'_> {
 
         // Try to spawn the bot immediately if we have a hub reference
         let hub_ref = self.channel_hub_weak();
-        if let Some(weak_hub) = hub_ref {
-            if let Some(hub) = weak_hub.upgrade() {
+        if let Some(weak_hub) = hub_ref
+            && let Some(hub) = weak_hub.upgrade() {
                 // Create the new Slack channel with same config as this Telegram channel
                 let new_channel = Arc::new(super::slack::new_slack_bot(
                     app_token,
@@ -2002,7 +1998,6 @@ impl Cx<'_> {
                     bot_name, team_name
                 );
             }
-        }
 
         // Fallback: hub not available, require restart
         format!(
@@ -2221,11 +2216,10 @@ allowed_user_ids = []
                 .map(|&id| toml::Value::Integer(id as i64))
                 .collect(),
         );
-        if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut()) {
-            if let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
+        if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut())
+            && let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
                 first.insert("allowed_user_ids".to_string(), ids_toml);
             }
-        }
         let new_content = toml::to_string_pretty(&toml::Value::Table(doc)).unwrap();
         tokio::fs::write(&config_path, &new_content).await.unwrap();
 

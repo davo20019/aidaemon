@@ -1827,13 +1827,11 @@ impl ToolCallData {
             }
             _ => {
                 // Generic: show first argument value if simple
-                if let Some(obj) = arguments.as_object() {
-                    if let Some((_, first_val)) = obj.iter().next() {
-                        if let Some(s) = first_val.as_str() {
+                if let Some(obj) = arguments.as_object()
+                    && let Some((_, first_val)) = obj.iter().next()
+                        && let Some(s) = first_val.as_str() {
                             return truncate_str(s, 30);
                         }
-                    }
-                }
                 name.to_string()
             }
         }

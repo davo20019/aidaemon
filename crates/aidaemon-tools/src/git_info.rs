@@ -158,17 +158,14 @@ async fn get_status(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String
     // Branch
     if let Ok(out) =
         fs_utils::run_cmd_backend(backend, "git rev-parse --abbrev-ref HEAD", Some(dir), 5).await
-    {
-        if out.exit_code == 0 {
+        && out.exit_code == 0 {
             result.push_str(&format!("Branch: {}\n", out.stdout.trim()));
         }
-    }
 
     // Status
     if let Ok(out) =
         fs_utils::run_cmd_backend(backend, "git status --porcelain", Some(dir), 5).await
-    {
-        if out.exit_code == 0 {
+        && out.exit_code == 0 {
             let lines: Vec<&str> = out.stdout.lines().collect();
             if lines.is_empty() {
                 result.push_str("Working tree: clean\n");
@@ -182,7 +179,6 @@ async fn get_status(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String
                 }
             }
         }
-    }
 
     // Ahead/behind
     if let Ok(out) = fs_utils::run_cmd_backend(
@@ -192,8 +188,7 @@ async fn get_status(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String
         5,
     )
     .await
-    {
-        if out.exit_code == 0 {
+        && out.exit_code == 0 {
             let parts: Vec<&str> = out.stdout.trim().split('\t').collect();
             if parts.len() == 2 {
                 let ahead = parts[0].trim();
@@ -203,7 +198,6 @@ async fn get_status(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String
                 }
             }
         }
-    }
 
     result
 }
@@ -216,11 +210,9 @@ async fn get_log(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
         5,
     )
     .await
-    {
-        if out.exit_code == 0 && !out.stdout.trim().is_empty() {
+        && out.exit_code == 0 && !out.stdout.trim().is_empty() {
             return out.stdout.clone();
         }
-    }
     String::new()
 }
 
@@ -232,38 +224,33 @@ async fn get_branches(backend: &dyn ExecutionBackend, dir: &BackendPath) -> Stri
         5,
     )
     .await
-    {
-        if out.exit_code == 0 && !out.stdout.trim().is_empty() {
+        && out.exit_code == 0 && !out.stdout.trim().is_empty() {
             return out.stdout.clone();
         }
-    }
     String::new()
 }
 
 async fn get_remotes(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
-    if let Ok(out) = fs_utils::run_cmd_backend(backend, "git remote -v", Some(dir), 5).await {
-        if out.exit_code == 0 && !out.stdout.trim().is_empty() {
+    if let Ok(out) = fs_utils::run_cmd_backend(backend, "git remote -v", Some(dir), 5).await
+        && out.exit_code == 0 && !out.stdout.trim().is_empty() {
             return out.stdout.clone();
         }
-    }
     String::new()
 }
 
 async fn get_diff(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
-    if let Ok(out) = fs_utils::run_cmd_backend(backend, "git diff --stat", Some(dir), 10).await {
-        if out.exit_code == 0 && !out.stdout.trim().is_empty() {
+    if let Ok(out) = fs_utils::run_cmd_backend(backend, "git diff --stat", Some(dir), 10).await
+        && out.exit_code == 0 && !out.stdout.trim().is_empty() {
             return out.stdout.clone();
         }
-    }
     String::new()
 }
 
 async fn get_stash(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
-    if let Ok(out) = fs_utils::run_cmd_backend(backend, "git stash list", Some(dir), 5).await {
-        if out.exit_code == 0 && !out.stdout.trim().is_empty() {
+    if let Ok(out) = fs_utils::run_cmd_backend(backend, "git stash list", Some(dir), 5).await
+        && out.exit_code == 0 && !out.stdout.trim().is_empty() {
             return out.stdout.clone();
         }
-    }
     String::from("No stashes\n")
 }
 

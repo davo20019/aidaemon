@@ -130,11 +130,10 @@ impl sdk_policies::SummaryStore for DaemonSummaries {
                 _ => None,
             }
         };
-        if let Some(next) = next {
-            if let Err(error) = self.state.set_setting(&key, &next).await {
+        if let Some(next) = next
+            && let Err(error) = self.state.set_setting(&key, &next).await {
                 tracing::warn!(session_id, %error, "could not record the summary's taint");
             }
-        }
     }
 }
 

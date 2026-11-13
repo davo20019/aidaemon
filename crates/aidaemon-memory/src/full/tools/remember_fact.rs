@@ -372,12 +372,11 @@ impl Tool for RememberFactTool {
                         canonical_name_confirmed: matches!(key.as_str(), "name" | "full_name"),
                     });
                     owner_added = true;
-                } else if matches!(key.as_str(), "name" | "full_name") {
-                    if let Some(owner) = structured.entities.first_mut() {
+                } else if matches!(key.as_str(), "name" | "full_name")
+                    && let Some(owner) = structured.entities.first_mut() {
                         owner.canonical_name = entry.value.clone();
                         owner.canonical_name_confirmed = true;
                     }
-                }
                 match key.as_str() {
                     "name" | "full_name" => structured.aliases.push(PersonalAliasCandidate {
                         entity_local_id: "owner".to_string(),

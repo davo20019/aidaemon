@@ -144,8 +144,8 @@ pub async fn project_event(pool: &SqlitePool, event_id: i64) -> anyhow::Result<b
 
     // Assistant payloads predate explicit channel provenance. Resolve it from
     // the closest preceding canonical user event in the same session.
-    if role == "assistant" && (visibility.is_none() || channel_id.is_none()) {
-        if let Some(origin) = sqlx::query(
+    if role == "assistant" && (visibility.is_none() || channel_id.is_none())
+        && let Some(origin) = sqlx::query(
             "SELECT data FROM events
              WHERE session_id = ? AND event_type = 'user_message' AND id <= ?
              ORDER BY id DESC LIMIT 1",
@@ -180,7 +180,6 @@ pub async fn project_event(pool: &SqlitePool, event_id: i64) -> anyhow::Result<b
                 });
             }
         }
-    }
 
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("DELETE FROM history_message_fts WHERE rowid = ?")

@@ -42,7 +42,7 @@ impl Hook for AskBeforeWrite {
     }
 }
 
-fn tool(name: &str, secret: &'static str) -> impl aidaemon_core::Tool {
+fn tool(name: &str, secret: &'static str) -> impl aidaemon_core::Tool + use<> {
     let spec = ToolSpec {
         name: name.into(),
         description: "test".into(),

@@ -53,9 +53,9 @@ impl ChannelBundle {
     }
 
     pub async fn send_startup_notifications(&self, config: &AppConfig) {
-        if let Some(first_tg) = self.telegram_bots.first() {
-            if let Some(first_config) = config.all_telegram_bots().first() {
-                if !first_config.allowed_user_ids.is_empty() {
+        if let Some(first_tg) = self.telegram_bots.first()
+            && let Some(first_config) = config.all_telegram_bots().first()
+                && !first_config.allowed_user_ids.is_empty() {
                     let mode = if first_config.webhook.enabled {
                         "webhook"
                     } else {
@@ -66,8 +66,6 @@ impl ChannelBundle {
                         let _ = first_tg.send_text(&user_id.to_string(), &msg).await;
                     }
                 }
-            }
-        }
     }
 
     /// The first Telegram bot and its allowed users, who get the startup
@@ -186,13 +184,11 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
     let defaults = &config.telegram_webhook_defaults;
     let mut occupied_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
     for bot_config in config.all_telegram_bots() {
-        if bot_config.webhook.enabled {
-            if let Some(addr) = &bot_config.webhook.listen_addr {
-                if let Some(port) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
+        if bot_config.webhook.enabled
+            && let Some(addr) = &bot_config.webhook.listen_addr
+                && let Some(port) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
                     occupied_ports.insert(port);
                 }
-            }
-        }
     }
 
     let mut seen_bot_credentials = std::collections::HashSet::new();

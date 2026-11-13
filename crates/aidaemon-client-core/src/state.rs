@@ -264,13 +264,12 @@ impl State {
                         .is_some_and(|live| live.turn_id == turn_id)
                 }) else {
                     // Its start was before this client's window.
-                    if let Some(session_id) = session_id {
-                        if !text.is_empty() {
+                    if let Some(session_id) = session_id
+                        && !text.is_empty() {
                             self.session(&session_id)
                                 .lines
                                 .push(Line::Assistant { text });
                         }
-                    }
                     return;
                 };
                 view.live = None;

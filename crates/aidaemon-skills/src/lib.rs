@@ -306,20 +306,17 @@ pub fn remove_skill_file(dir: &Path, skill_name: &str) -> anyhow::Result<bool> {
             let path = entry.path();
             if path.is_dir() {
                 let skill_md = path.join("SKILL.md");
-                if skill_md.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                        if let Some(parsed) = Skill::parse(&content) {
-                            if parsed.name == skill_name {
+                if skill_md.exists()
+                    && let Ok(content) = std::fs::read_to_string(&skill_md)
+                        && let Some(parsed) = Skill::parse(&content)
+                            && parsed.name == skill_name {
                                 std::fs::remove_dir_all(&path)?;
                                 return Ok(true);
                             }
-                        }
-                    }
-                }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Some(parsed) = Skill::parse(&content) {
-                        if parsed.name == skill_name {
+            } else if path.extension().and_then(|e| e.to_str()) == Some("md")
+                && let Ok(content) = std::fs::read_to_string(&path)
+                    && let Some(parsed) = Skill::parse(&content)
+                        && parsed.name == skill_name {
                             std::fs::remove_file(&path)?;
                             let marker = single_file_disabled_marker(&path);
                             if marker.exists() {
@@ -327,9 +324,6 @@ pub fn remove_skill_file(dir: &Path, skill_name: &str) -> anyhow::Result<bool> {
                             }
                             return Ok(true);
                         }
-                    }
-                }
-            }
         }
     }
 
@@ -371,14 +365,13 @@ fn scan_skill_resources(dir: &Path) -> Vec<ResourceEntry> {
         if let Ok(files) = std::fs::read_dir(&subdir_path) {
             for file in files.flatten() {
                 let path = file.path();
-                if path.is_file() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if path.is_file()
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         entries.push(ResourceEntry {
                             path: format!("{}/{}", subdir_name, name),
                             category: category.clone(),
                         });
                     }
-                }
             }
         }
     }
@@ -591,12 +584,11 @@ impl SkillCache {
             path_repr.hash(hasher);
             metadata.is_file().hash(hasher);
             metadata.len().hash(hasher);
-            if let Ok(modified) = metadata.modified() {
-                if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
+            if let Ok(modified) = metadata.modified()
+                && let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
                     dur.as_secs().hash(hasher);
                     dur.subsec_nanos().hash(hasher);
                 }
-            }
 
             if metadata.is_dir() {
                 let mut children: Vec<PathBuf> = std::fs::read_dir(path)

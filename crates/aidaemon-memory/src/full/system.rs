@@ -233,11 +233,10 @@ impl MemorySystem for FullMemory {
         let mut hooks: Vec<Arc<dyn Hook>> = vec![Arc::new(MemoryInjection::new(recall))];
         hooks.extend(extra);
         // Only the owner's own turns teach the jobs.
-        if let Some(recorder) = &self.recorder {
-            if turn.write && turn.scope == "owner" {
+        if let Some(recorder) = &self.recorder
+            && turn.write && turn.scope == "owner" {
                 hooks.push(recorder.clone());
             }
-        }
         MemoryParts {
             hooks,
             tools: if turn.read || turn.write {

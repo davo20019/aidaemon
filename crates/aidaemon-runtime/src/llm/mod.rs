@@ -85,12 +85,11 @@ fn cheap_first(router: Option<&Router>, mut models: Vec<String>) -> Vec<String> 
         router
             .select(aidaemon_providers::routing::Tier::Fast)
             .to_string()
-    }) {
-        if let Some(index) = models.iter().position(|model| *model == fast) {
+    })
+        && let Some(index) = models.iter().position(|model| *model == fast) {
             let fast = models.remove(index);
             models.insert(0, fast);
         }
-    }
     models
 }
 

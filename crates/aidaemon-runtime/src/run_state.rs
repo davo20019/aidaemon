@@ -639,21 +639,19 @@ impl RunStates {
     /// The chat's kept card when run `id` began: its own card is the first
     /// one the chat keeps after this. Ignored once the card is known.
     pub fn card_before(&self, id: &str, before: Option<String>) {
-        if let Some(entry) = self.lock().get_mut(id) {
-            if matches!(entry.state.card, RunCard::Pending { .. }) {
+        if let Some(entry) = self.lock().get_mut(id)
+            && matches!(entry.state.card, RunCard::Pending { .. }) {
                 entry.state.card = RunCard::Pending { before };
             }
-        }
     }
 
     /// Run `id`'s line is drawn on card `message_id`, the card its starting
     /// turn kept. Set once: a later card belongs to a later turn.
     pub fn keep_card(&self, id: &str, message_id: &str) {
-        if let Some(entry) = self.lock().get_mut(id) {
-            if matches!(entry.state.card, RunCard::Pending { .. }) {
+        if let Some(entry) = self.lock().get_mut(id)
+            && matches!(entry.state.card, RunCard::Pending { .. }) {
                 entry.state.card = RunCard::Kept(message_id.to_string());
             }
-        }
     }
 
     /// Record how run `id` ended, with what the runtime measured, and push

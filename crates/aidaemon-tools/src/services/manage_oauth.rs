@@ -479,8 +479,8 @@ impl ManageOAuthTool {
                         .keys
                         .push(EffectKey::named(EffectClass::Credential, &service));
                 }
-                if args.action == "bind_account" {
-                    if let Some(host) = args
+                if args.action == "bind_account"
+                    && let Some(host) = args
                         .identity_url
                         .as_deref()
                         .map(str::trim)
@@ -488,7 +488,6 @@ impl ManageOAuthTool {
                     {
                         effects.keys.push(host);
                     }
-                }
                 effects
             }
             _ => CallEffects::unknown(),
@@ -1006,8 +1005,8 @@ impl ManageOAuthTool {
             }
             Err(_) => {
                 warn!(service = %service, "OAuth flow timed out");
-                if let Some(state) = pending_state.as_deref() {
-                    if let Err(err) = self
+                if let Some(state) = pending_state.as_deref()
+                    && let Err(err) = self
                         .gateway
                         .expire_pending_flow(
                             state,
@@ -1022,7 +1021,6 @@ impl ManageOAuthTool {
                             "Failed to expire timed out OAuth flow"
                         );
                     }
-                }
                 Self::send_connect_progress(
                     status_tx.as_ref(),
                     OAuthGateway::expired_flow_message().to_string(),
@@ -1197,11 +1195,10 @@ impl ManageOAuthTool {
         Self::require_kernel_approval(kernel_approved, "remove_provider")?;
 
         providers_table.remove(service);
-        if providers_table.is_empty() {
-            if let Some(oauth_table) = doc.get_mut("oauth").and_then(toml::Value::as_table_mut) {
+        if providers_table.is_empty()
+            && let Some(oauth_table) = doc.get_mut("oauth").and_then(toml::Value::as_table_mut) {
                 oauth_table.remove("providers");
             }
-        }
         self.save_config_doc(&doc).await?;
 
         let _ = self.gateway.unregister_provider(service).await;
@@ -1503,14 +1500,13 @@ impl crate::semantics::ToolSemantics for ManageOAuthTool {
                     Self::OAUTH_CONNECTION_COLLECTION_ID,
                 );
             }
-            if let Some(service) = args.service.as_deref() {
-                if let Ok(service) = Self::validate_service_name(service) {
+            if let Some(service) = args.service.as_deref()
+                && let Ok(service) = Self::validate_service_name(service) {
                     semantics = semantics.with_target_hint(
                         ToolTargetHintKind::ResourceId,
                         HttpRequestTool::auth_profile_resource_id(&service),
                     );
                 }
-            }
         }
         semantics
     }

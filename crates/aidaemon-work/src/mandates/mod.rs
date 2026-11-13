@@ -1615,14 +1615,13 @@ impl MandateDecisionCycle {
                 );
             }
         }
-        if let Some(question) = self.question.as_deref() {
-            if !canonical_text_within(question, MAX_DECISION_QUESTION_TEXT) {
+        if let Some(question) = self.question.as_deref()
+            && !canonical_text_within(question, MAX_DECISION_QUESTION_TEXT) {
                 return Err(
                     "decision question must be canonical non-empty text of at most 500 characters and bytes"
                         .to_string(),
                 );
             }
-        }
         if self.evidence_receipt_ids.len() > MAX_MANDATE_EVIDENCE_REFS
             || self.evidence_receipt_ids.iter().any(|value| {
                 !canonical_text_within(value, 256)
@@ -1633,11 +1632,10 @@ impl MandateDecisionCycle {
         {
             return Err("decision evidence receipt IDs exceed their canonical bounds".to_string());
         }
-        if let Some(matched) = self.termination_match.as_deref() {
-            if !canonical_text_within(matched, MAX_MANDATE_POLICY_ENTRY_TEXT) {
+        if let Some(matched) = self.termination_match.as_deref()
+            && !canonical_text_within(matched, MAX_MANDATE_POLICY_ENTRY_TEXT) {
                 return Err("decision termination match exceeds its canonical bound".to_string());
             }
-        }
         Ok(())
     }
 }

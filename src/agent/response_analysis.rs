@@ -256,11 +256,10 @@ pub(super) fn sanitize_response_analysis(analysis: &str) -> String {
                 if next.is_empty() {
                     break;
                 }
-                if let Some(name) = parse_name_field(next) {
-                    if is_tool_name_like(&name) {
+                if let Some(name) = parse_name_field(next)
+                    && is_tool_name_like(&name) {
                         block_has_tool_signature = true;
                     }
-                }
                 let next_lower = next.to_ascii_lowercase();
                 if next_lower.starts_with("cmd:")
                     || next_lower.starts_with("command:")

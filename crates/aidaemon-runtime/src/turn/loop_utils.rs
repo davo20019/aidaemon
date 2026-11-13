@@ -203,25 +203,21 @@ fn classify_json_error(value: &Value) -> Option<ToolFailureClass> {
                 "httpStatus",
                 "code",
             ] {
-                if let Some(status_value) = map.get(key) {
-                    if let Some(status) = extract_status_from_value(status_value) {
-                        if let Some(kind) = classify_http_status(status) {
+                if let Some(status_value) = map.get(key)
+                    && let Some(status) = extract_status_from_value(status_value)
+                        && let Some(kind) = classify_http_status(status) {
                             return Some(kind);
                         }
-                    }
-                }
             }
 
             if map.get("success").and_then(Value::as_bool) == Some(false)
                 || map.get("ok").and_then(Value::as_bool) == Some(false)
             {
-                if let Some(error_value) = map.get("error") {
-                    if !error_value.is_null() {
-                        if let Some(kind) = classify_json_error(error_value) {
+                if let Some(error_value) = map.get("error")
+                    && !error_value.is_null()
+                        && let Some(kind) = classify_json_error(error_value) {
                             return Some(kind);
                         }
-                    }
-                }
                 if let Some(message) = map.get("message").and_then(Value::as_str) {
                     let lower = message.to_ascii_lowercase();
                     if looks_like_error_signal(&lower) {
@@ -231,14 +227,13 @@ fn classify_json_error(value: &Value) -> Option<ToolFailureClass> {
                 return Some(ToolFailureClass::Semantic);
             }
 
-            if let Some(error_value) = map.get("error") {
-                if !error_value.is_null() {
+            if let Some(error_value) = map.get("error")
+                && !error_value.is_null() {
                     if let Some(kind) = classify_json_error(error_value) {
                         return Some(kind);
                     }
                     return Some(ToolFailureClass::Semantic);
                 }
-            }
 
             if let Some(errors_value) = map.get("errors") {
                 match errors_value {
@@ -291,11 +286,10 @@ fn classify_json_error(value: &Value) -> Option<ToolFailureClass> {
 fn extract_http_status_from_text(text: &str) -> Option<u16> {
     let caps = HTTP_STATUS_RE.captures(text)?;
     for idx in 1..caps.len() {
-        if let Some(m) = caps.get(idx) {
-            if let Ok(code) = m.as_str().parse::<u16>() {
+        if let Some(m) = caps.get(idx)
+            && let Ok(code) = m.as_str().parse::<u16>() {
                 return Some(code);
             }
-        }
     }
     None
 }
@@ -345,20 +339,18 @@ fn classify_embedded_json_error(text: &str) -> Option<ToolFailureClass> {
                     continue;
                 }
                 depth -= 1;
-                if depth == 0 {
-                    if let Some(s) = start.take() {
+                if depth == 0
+                    && let Some(s) = start.take() {
                         let end = idx + ch.len_utf8();
-                        if let Ok(value) = serde_json::from_str::<Value>(&text[s..end]) {
-                            if let Some(kind) = classify_json_error(&value) {
+                        if let Ok(value) = serde_json::from_str::<Value>(&text[s..end])
+                            && let Some(kind) = classify_json_error(&value) {
                                 return Some(kind);
                             }
-                        }
                         candidates += 1;
                         if candidates >= 8 {
                             break;
                         }
                     }
-                }
             }
             _ => {}
         }
@@ -485,8 +477,8 @@ pub fn classify_tool_result_failure(
         return None;
     }
 
-    if cleaned.starts_with('{') || cleaned.starts_with('[') {
-        if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
+    if (cleaned.starts_with('{') || cleaned.starts_with('['))
+        && let Ok(value) = serde_json::from_str::<Value>(cleaned) {
             if let Some(kind) = classify_json_error(&value) {
                 return Some(kind);
             }
@@ -495,7 +487,6 @@ pub fn classify_tool_result_failure(
             // `watchdog_timeout_seconds` as if they were failure prose.
             return None;
         }
-    }
 
     if let Some(kind) = classify_embedded_json_error(cleaned) {
         return Some(kind);
@@ -808,8 +799,8 @@ pub fn merge_consecutive_messages(messages: &mut Vec<Value>) {
             };
             messages[i - 1]["content"] = json!(merged);
             // Merge assistant tool_calls arrays if both have them.
-            if curr_role == "assistant" {
-                if let Some(curr_tcs) = messages[i]
+            if curr_role == "assistant"
+                && let Some(curr_tcs) = messages[i]
                     .get("tool_calls")
                     .and_then(|v| v.as_array())
                     .cloned()
@@ -823,7 +814,6 @@ pub fn merge_consecutive_messages(messages: &mut Vec<Value>) {
                         messages[i - 1]["tool_calls"] = json!(curr_tcs);
                     }
                 }
-            }
             messages.remove(i);
         } else {
             i += 1;
@@ -1452,8 +1442,8 @@ pub fn fixup_message_ordering(messages: &mut Vec<Value>) {
             .get("role")
             .and_then(|r| r.as_str())
             .unwrap_or("");
-        if first_role != "user" {
-            if let Some(first_user_rel) = messages[first_non_system..]
+        if first_role != "user"
+            && let Some(first_user_rel) = messages[first_non_system..]
                 .iter()
                 .position(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
             {
@@ -1464,7 +1454,6 @@ pub fn fixup_message_ordering(messages: &mut Vec<Value>) {
                 );
                 messages.drain(first_non_system..abs_end);
             }
-        }
     }
 
     // Pass 5: Gemini-specific - ensure assistant messages with tool_calls only follow

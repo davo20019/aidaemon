@@ -323,9 +323,9 @@ impl GoalCycle {
         // goal becomes visible instead of being skipped forever. The alert is
         // gated on `notified_at` so we don't re-alert on every tick while the
         // goal stays idle (e.g. blocked by an open task via coalescing).
-        if goal.goal_type == "continuous" && goal.notified_at.is_none() {
-            if let Some(ref last_action) = goal.last_useful_action {
-                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_action) {
+        if goal.goal_type == "continuous" && goal.notified_at.is_none()
+            && let Some(ref last_action) = goal.last_useful_action
+                && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_action) {
                     let days_idle =
                         (chrono::Utc::now() - ts.with_timezone(&chrono::Utc)).num_days();
                     if days_idle > 30 {
@@ -364,8 +364,6 @@ impl GoalCycle {
                         }
                     }
                 }
-            }
-        }
 
         // Only work belonging to an open goal run can apply backpressure to a
         // new scheduled firing. Historical blocked tasks are intentionally
@@ -544,8 +542,8 @@ impl GoalCycle {
         }
 
         let run_root_task_id = uuid::Uuid::new_v4().to_string();
-        if coalesce {
-            if let Some(open_run) = self.state.get_current_goal_run(&goal.id).await? {
+        if coalesce
+            && let Some(open_run) = self.state.get_current_goal_run(&goal.id).await? {
                 let run_tasks = self.state.get_tasks_for_goal_run(&open_run.id).await?;
                 if !run_tasks.is_empty() {
                     let active_or_human_blocked = run_tasks
@@ -589,7 +587,6 @@ impl GoalCycle {
                         .await?;
                 }
             }
-        }
         let goal_run = self
             .state
             .start_goal_run(
@@ -731,11 +728,10 @@ impl GoalCycle {
 
         // Clean up one-shot schedules after successful task creation.
         // (Recurring schedules were already advanced before task creation.)
-        if schedule.is_one_shot {
-            if let Err(e) = self.state.delete_goal_schedule(&schedule.id).await {
+        if schedule.is_one_shot
+            && let Err(e) = self.state.delete_goal_schedule(&schedule.id).await {
                 warn!(schedule_id = %schedule.id, error = %e, "Failed to delete one-shot schedule after fire");
             }
-        }
 
         info!(
             goal_id = %goal.id,
@@ -753,8 +749,7 @@ impl GoalCycle {
         let local_hour = chrono::Timelike::hour(&chrono::Local::now());
         if !aidaemon_events::session::is_group_session(&goal.session_id)
             && crate::traits::NotificationEntry::routine_delivery_allowed_at_local_hour(local_hour)
-        {
-            if let Some(hub_arc) = self.hub.clone() {
+            && let Some(hub_arc) = self.hub.clone() {
                 let short_desc = self.presenter.goal_label(&goal.description);
                 running_surface_id = hub_arc
                     .send_text_tracked(
@@ -765,7 +760,6 @@ impl GoalCycle {
                     .ok()
                     .flatten();
             }
-        }
 
         // Dispatch immediately instead of waiting for the orphan-recovery pass
         // (which only picks up tasks older than 60s, so every scheduled run

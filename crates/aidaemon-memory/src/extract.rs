@@ -270,13 +270,11 @@ fn json_in_text(text: &str) -> Option<Value> {
         return Some(value);
     }
     for (open, close) in [('{', '}'), ('[', ']')] {
-        if let (Some(start), Some(end)) = (trimmed.find(open), trimmed.rfind(close)) {
-            if start < end {
-                if let Ok(value) = serde_json::from_str::<Value>(&trimmed[start..=end]) {
+        if let (Some(start), Some(end)) = (trimmed.find(open), trimmed.rfind(close))
+            && start < end
+                && let Ok(value) = serde_json::from_str::<Value>(&trimmed[start..=end]) {
                     return Some(value);
                 }
-            }
-        }
     }
     None
 }

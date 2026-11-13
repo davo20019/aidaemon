@@ -268,14 +268,13 @@ impl ScheduledGoalRunsTool {
             "Updated budget for scheduled goal {}.\n- budget_per_check: {:?} -> {:?}\n- budget_daily: {:?} -> {:?}",
             goal.id, old_per_check, goal.budget_per_check, old_daily, goal.budget_daily
         );
-        if let Some(budget_daily) = goal.budget_daily {
-            if goal.tokens_used_today >= budget_daily {
+        if let Some(budget_daily) = goal.budget_daily
+            && goal.tokens_used_today >= budget_daily {
                 out.push_str(&format!(
                     "\nNote: tokens_used_today={} already exceeds the new budget_daily={}, so new scheduled runs may be skipped until the UTC daily reset.",
                     goal.tokens_used_today, budget_daily
                 ));
             }
-        }
         Ok(out)
     }
 
@@ -611,8 +610,7 @@ impl ScheduledGoalRunsTool {
 
             if used_today >= effective_budget
                 && extensions_count < crate::goal_tokens::SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS
-            {
-                if let Some(next_budget) = crate::goal_tokens::next_goal_daily_budget(
+                && let Some(next_budget) = crate::goal_tokens::next_goal_daily_budget(
                     effective_budget,
                     used_today,
                     crate::goal_tokens::SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
@@ -627,7 +625,6 @@ impl ScheduledGoalRunsTool {
                     adaptive_extension = Some((effective_budget, persisted.budget_daily));
                     effective_budget = persisted.budget_daily;
                 }
-            }
 
             if used_today >= effective_budget {
                 return Ok(format!(

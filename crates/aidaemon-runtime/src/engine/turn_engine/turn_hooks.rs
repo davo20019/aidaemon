@@ -101,11 +101,10 @@ pub struct ModelPin {
 #[async_trait]
 impl sdk::Hook for ModelPin {
     async fn before_model(&self, _ctx: &sdk::HookContext<'_>, request: &mut sdk::ModelRequest) {
-        if let Some(computer_use) = &self.computer_use {
-            if let Some(model) = computer_use.pinned_model(&self.task_id).await {
+        if let Some(computer_use) = &self.computer_use
+            && let Some(model) = computer_use.pinned_model(&self.task_id).await {
                 request.model = model;
             }
-        }
     }
 }
 

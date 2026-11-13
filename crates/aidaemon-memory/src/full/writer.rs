@@ -94,8 +94,8 @@ pub async fn learn_from_run(store: &dyn MemoryStores, run: RunLearning) -> anyho
         }
     }
 
-    if let Some(error) = run.first_error.clone() {
-        if !run.recovery_actions.is_empty() {
+    if let Some(error) = run.first_error.clone()
+        && !run.recovery_actions.is_empty() {
             let solution = crate::new_error_solution(
                 crate::error_pattern(&error),
                 domains.into_iter().next(),
@@ -106,7 +106,6 @@ pub async fn learn_from_run(store: &dyn MemoryStores, run: RunLearning) -> anyho
                 warn!(error_pattern = %solution.error_pattern, error = %e, "Failed to save error solution");
             }
         }
-    }
 
     Ok(())
 }

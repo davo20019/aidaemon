@@ -380,11 +380,10 @@ pub(crate) async fn spawn(
                 }
             }
         };
-        if let Some(cleanup) = &options.cleanup {
-            if let Err(error) = cleanup.output(Duration::from_secs(10)).await {
+        if let Some(cleanup) = &options.cleanup
+            && let Err(error) = cleanup.output(Duration::from_secs(10)).await {
                 warn!(program = %label, %error, "Tunnel cleanup failed");
             }
-        }
         if let Some(pidfile) = &options.pidfile {
             let _ = tokio::fs::remove_file(pidfile).await;
         }
@@ -402,6 +401,27 @@ pub(crate) async fn spawn(
 mod tests {
     use super::*;
     use crate::{OriginStability, PublicEndpoint};
+
+    /// Sets an environment variable that no other test uses, and removes it
+    /// again when dropped.
+    struct ScopedVar(&'static str);
+
+    impl ScopedVar {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            // SAFETY: test-only, and the name is private to one test. std
+            // serializes its own environment reads and writes; foreign code
+            // calling getenv concurrently is a risk the test binary accepts.
+            unsafe { std::env::set_var(name, value) };
+            Self(name)
+        }
+    }
+
+    impl Drop for ScopedVar {
+        fn drop(&mut self) {
+            // SAFETY: as in `ScopedVar::set`.
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
 
     struct FirstLineUp;
     impl Watcher for FirstLineUp {
@@ -473,7 +493,7 @@ mod tests {
 
     #[tokio::test]
     async fn scrubs_the_environment() {
-        std::env::set_var("AIDAEMON_SYNTHETIC_SECRET", "s3cr3t");
+        let _secret = ScopedVar::set("AIDAEMON_SYNTHETIC_SECRET", "s3cr3t");
         let exposure = spawn(
             sh("echo \"x${AIDAEMON_SYNTHETIC_SECRET}x\"; sleep 5"),
             FirstLineUp,

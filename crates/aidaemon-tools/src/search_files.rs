@@ -155,17 +155,15 @@ impl SearchFiles {
                 .trim_end()
                 .trim_end_matches([')', ':', ',', ';', '.'])
                 .trim_end();
-            if trimmed != path_str && !trimmed.is_empty() {
-                if let Ok(candidate) = backend.resolve_path(trimmed).await {
-                    if backend
+            if trimmed != path_str && !trimmed.is_empty()
+                && let Ok(candidate) = backend.resolve_path(trimmed).await
+                    && backend
                         .metadata(&candidate)
                         .await
                         .is_ok_and(|metadata| metadata.is_dir())
                     {
                         search_dir = candidate;
                     }
-                }
-            }
         }
         let search_metadata = backend
             .metadata(&search_dir)
@@ -523,16 +521,15 @@ async fn walk_dir(
             }
 
             // Check glob match on filename
-            if let Some(ref matcher) = glob_matcher {
-                if !matcher.is_match(&file_name) {
+            if let Some(matcher) = glob_matcher
+                && !matcher.is_match(&file_name) {
                     continue;
                 }
-            }
 
             stats.files_scanned += 1;
 
             // If content pattern specified, search contents
-            if let Some(ref content_re) = content_regex {
+            if let Some(content_re) = content_regex {
                 if entry.metadata.len > MAX_CONTENT_SEARCH_FILE_SIZE {
                     stats.oversized_files_skipped += 1;
                     continue;

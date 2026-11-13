@@ -103,7 +103,7 @@ async fn handler(State(mock): State<Arc<Mock>>, uri: Uri, body: Bytes) -> axum::
     json_handler(mock, path, body).await.into_response()
 }
 
-async fn json_handler(mock: Arc<Mock>, path: &str, body: Bytes) -> impl IntoResponse {
+async fn json_handler(mock: Arc<Mock>, path: &str, body: Bytes) -> impl IntoResponse + use<> {
     let prefix = format!("/bot{TOKEN}/");
     let Some(method) = path.strip_prefix(&prefix) else {
         return (

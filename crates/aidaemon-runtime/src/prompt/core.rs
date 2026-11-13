@@ -158,15 +158,14 @@ pub fn core_cache_decision(prev: Option<&CachedCore>, inputs: &CoreInputs) -> Co
     let new_components = inputs.component_hashes();
     let new_aggregate = new_components.aggregate();
 
-    if let Some(prev) = prev {
-        if prev.aggregate == new_aggregate {
+    if let Some(prev) = prev
+        && prev.aggregate == new_aggregate {
             return CoreCacheDecision {
                 bytes: prev.bytes.clone(),
                 updated_entry: None,
                 changed: Vec::new(),
             };
         }
-    }
 
     let changed: Vec<String> = match prev {
         Some(prev) => prev

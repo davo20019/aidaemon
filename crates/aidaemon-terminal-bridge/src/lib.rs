@@ -604,11 +604,10 @@ fn decode_utf8_stream_chunk(carry: &mut Vec<u8>, incoming: &[u8]) -> String {
             }
             Err(err) => {
                 let valid_up_to = err.valid_up_to();
-                if valid_up_to > 0 {
-                    if let Ok(prefix) = std::str::from_utf8(&carry[..valid_up_to]) {
+                if valid_up_to > 0
+                    && let Ok(prefix) = std::str::from_utf8(&carry[..valid_up_to]) {
                         out.push_str(prefix);
                     }
-                }
                 if let Some(error_len) = err.error_len() {
                     let drain_to = valid_up_to.saturating_add(error_len).min(carry.len());
                     let invalid = &carry[valid_up_to..drain_to];
@@ -1294,19 +1293,17 @@ fn requested_fresh_start_from_client_hello(frame: &Value) -> bool {
         "startFresh",
     ];
     for key in key_order {
-        if let Some(raw) = frame.get(key) {
-            if let Some(value) = parse_boolish_client_hello_value(raw) {
+        if let Some(raw) = frame.get(key)
+            && let Some(value) = parse_boolish_client_hello_value(raw) {
                 return value;
             }
-        }
     }
     if let Some(launch_obj) = frame.get("launch").and_then(Value::as_object) {
         for key in key_order {
-            if let Some(raw) = launch_obj.get(key) {
-                if let Some(value) = parse_boolish_client_hello_value(raw) {
+            if let Some(raw) = launch_obj.get(key)
+                && let Some(value) = parse_boolish_client_hello_value(raw) {
                     return value;
                 }
-            }
         }
     }
     false
@@ -1395,11 +1392,10 @@ fn build_child_env() -> Vec<(String, String)> {
     ];
     let mut out = Vec::new();
     for key in keys {
-        if let Ok(v) = std::env::var(key) {
-            if !v.is_empty() {
+        if let Ok(v) = std::env::var(key)
+            && !v.is_empty() {
                 out.push((key.to_string(), v));
             }
-        }
     }
     // PTY sessions should always advertise terminal capabilities even when
     // aidaemon is started from a non-interactive context.
@@ -1597,11 +1593,10 @@ fn should_decode_stdin_control_escapes(data: &str) -> bool {
         return false;
     }
 
-    if let Some(token_len) = escaped_control_token_len(trimmed) {
-        if token_len == trimmed.len() {
+    if let Some(token_len) = escaped_control_token_len(trimmed)
+        && token_len == trimmed.len() {
             return true;
         }
-    }
 
     if trimmed.ends_with("\\r") || trimmed.ends_with("\\n") {
         return true;
@@ -1747,18 +1742,15 @@ fn extract_json_content(raw: &str) -> Option<String> {
 fn extract_jsonl_content(raw: &str) -> Option<String> {
     let mut last_content: Option<String> = None;
     for line in raw.lines().rev() {
-        if let Ok(v) = serde_json::from_str::<Value>(line) {
-            if let Some(content) = v
+        if let Ok(v) = serde_json::from_str::<Value>(line)
+            && let Some(content) = v
                 .pointer("/item/content")
                 .or_else(|| v.pointer("/content"))
                 .or_else(|| v.pointer("/result"))
-            {
-                if let Some(text) = content.as_str() {
+                && let Some(text) = content.as_str() {
                     last_content = Some(text.to_string());
                     break;
                 }
-            }
-        }
     }
     last_content
 }
@@ -1815,8 +1807,8 @@ fn extract_review_candidate_from_json_objects(raw: &str) -> Option<ReviewRespons
         if ch == '}' && depth > 0 {
             depth = depth.saturating_sub(1);
             if depth == 0 {
-                if let Some(s) = start {
-                    if let Some(slice) = raw.get(s..=idx) {
+                if let Some(s) = start
+                    && let Some(slice) = raw.get(s..=idx) {
                         if let Some(candidate) = parse_review_candidate(slice) {
                             return Some(candidate);
                         }
@@ -1828,15 +1820,13 @@ fn extract_review_candidate_from_json_objects(raw: &str) -> Option<ReviewRespons
                                 "/message",
                                 "/item/content",
                             ] {
-                                if let Some(text) = value.pointer(pointer).and_then(Value::as_str) {
-                                    if let Some(candidate) = parse_review_candidate(text) {
+                                if let Some(text) = value.pointer(pointer).and_then(Value::as_str)
+                                    && let Some(candidate) = parse_review_candidate(text) {
                                         return Some(candidate);
                                     }
-                                }
                             }
                         }
                     }
-                }
                 start = None;
             }
         }
@@ -3255,11 +3245,10 @@ async fn mint_connect_token_from_bot_proof(
             };
 
             if status.is_success() && parsed.ok {
-                if let Some(token) = parsed.daemon_connect_token {
-                    if !token.trim().is_empty() {
+                if let Some(token) = parsed.daemon_connect_token
+                    && !token.trim().is_empty() {
                         return Ok(token);
                     }
-                }
                 last_error = Some(anyhow::anyhow!(
                     "daemon token endpoint response missing token (status {})",
                     status
@@ -4290,8 +4279,8 @@ impl TerminalBridge {
         );
 
         // Native-started sessions still run through the same shell bootstrap path.
-        if let Some(active) = self.sessions.get_mut(&session_id) {
-            if let Some(agent_name) = active.crypto.agent.clone() {
+        if let Some(active) = self.sessions.get_mut(&session_id)
+            && let Some(agent_name) = active.crypto.agent.clone() {
                 if active
                     .crypto
                     .agent_args
@@ -4309,10 +4298,9 @@ impl TerminalBridge {
                     .await?;
                 active.crypto.bootstrapped_agent = true;
             }
-        }
 
-        if let Some(owner_user_id) = self.owner_user_id() {
-            if let Err(err) = self
+        if let Some(owner_user_id) = self.owner_user_id()
+            && let Err(err) = self
                 .host
                 .set_last_active_relay_session_id(owner_user_id, &session_id)
                 .await
@@ -4323,7 +4311,6 @@ impl TerminalBridge {
                     "Failed to persist last active relay session after native start"
                 );
             }
-        }
 
         Ok(session_id)
     }
@@ -4649,8 +4636,8 @@ impl TerminalBridge {
             } => {
                 let payload =
                     self.record_review_progress_payload(&session_id, &request_id, &stage, &message);
-                if let Some(queue) = outbound_queue {
-                    if queue
+                if let Some(queue) = outbound_queue
+                    && queue
                         .enqueue(
                             OutboundPriority::High,
                             QueuedOutboundPayload {
@@ -4665,7 +4652,6 @@ impl TerminalBridge {
                             "Terminal bridge high-priority outbound queue saturated; dropped oldest progress frame"
                         );
                     }
-                }
             }
             ShellEvent::ReviewResult {
                 session_id,
@@ -4673,8 +4659,8 @@ impl TerminalBridge {
                 payload,
             } => {
                 let payload = self.record_review_result_payload(&session_id, &request_id, payload);
-                if let Some(queue) = outbound_queue {
-                    if queue
+                if let Some(queue) = outbound_queue
+                    && queue
                         .enqueue(
                             OutboundPriority::High,
                             QueuedOutboundPayload {
@@ -4689,7 +4675,6 @@ impl TerminalBridge {
                             "Terminal bridge high-priority outbound queue saturated; dropped oldest result frame"
                         );
                     }
-                }
             }
             ShellEvent::ReviewError {
                 session_id,
@@ -4699,8 +4684,8 @@ impl TerminalBridge {
             } => {
                 let payload =
                     self.record_review_error_payload(&session_id, &request_id, &code, &message);
-                if let Some(queue) = outbound_queue {
-                    if queue
+                if let Some(queue) = outbound_queue
+                    && queue
                         .enqueue(
                             OutboundPriority::High,
                             QueuedOutboundPayload {
@@ -4715,7 +4700,6 @@ impl TerminalBridge {
                             "Terminal bridge high-priority outbound queue saturated; dropped oldest error frame"
                         );
                     }
-                }
             }
             ShellEvent::ReviewStream {
                 session_id,
@@ -5012,8 +4996,8 @@ impl TerminalBridge {
             .await?;
             return Ok(());
         }
-        if let Ok(owner_user_id) = self.cfg.user_id.parse::<u64>() {
-            if let Err(err) = self
+        if let Ok(owner_user_id) = self.cfg.user_id.parse::<u64>()
+            && let Err(err) = self
                 .host
                 .set_last_active_relay_session_id(owner_user_id, relay_session_id)
                 .await
@@ -5024,7 +5008,6 @@ impl TerminalBridge {
                     "Failed to persist last active relay session id"
                 );
             }
-        }
         let resume_from_seq = frame
             .get("resume_from_seq")
             .and_then(|v| v.as_u64())
@@ -5040,16 +5023,15 @@ impl TerminalBridge {
         let requested_fresh_start = requested_fresh_start_from_client_hello(frame);
         let mut remap_source_session_id: Option<String> = None;
         let mut remap_reason: Option<&'static str> = None;
-        if let Some(explicit_relay_session_id) = requested_relay_session_id.as_deref() {
-            if explicit_relay_session_id != relay_session_id
+        if let Some(explicit_relay_session_id) = requested_relay_session_id.as_deref()
+            && explicit_relay_session_id != relay_session_id
                 && self.sessions.contains_key(explicit_relay_session_id)
             {
                 remap_source_session_id = Some(explicit_relay_session_id.to_string());
                 remap_reason = Some("explicit relay_session_id from client hello");
             }
-        }
-        if remap_source_session_id.is_none() {
-            if let Some(telegram_session_id) = telegram_session_id.as_deref() {
+        if remap_source_session_id.is_none()
+            && let Some(telegram_session_id) = telegram_session_id.as_deref() {
                 match self
                     .host
                     .resolve_relay_for_telegram_session(telegram_session_id)
@@ -5071,7 +5053,6 @@ impl TerminalBridge {
                     }
                 }
             }
-        }
         if let Some(from_session_id) = remap_source_session_id.as_deref() {
             if let Err(err) = self
                 .remap_active_session_id(from_session_id, relay_session_id)
@@ -5105,9 +5086,9 @@ impl TerminalBridge {
         // Only tear down an already-bootstrapped session when the client explicitly
         // asks for a fresh start. A plain Mini App reopen resets local replay cursors
         // to zero, so resume_from_seq == 0 alone must not trigger session teardown.
-        if requested_fresh_start && requested_agent.is_some() && resume_from_seq == 0 {
-            if let Some(active) = self.sessions.get(relay_session_id) {
-                if active.crypto.bootstrapped_agent {
+        if requested_fresh_start && requested_agent.is_some() && resume_from_seq == 0
+            && let Some(active) = self.sessions.get(relay_session_id)
+                && active.crypto.bootstrapped_agent {
                     info!(
                         relay_session_id,
                         old_agent = active.crypto.agent.as_deref().unwrap_or("none"),
@@ -5117,8 +5098,6 @@ impl TerminalBridge {
                     self.remove_session(relay_session_id, "fresh agent start")
                         .await;
                 }
-            }
-        }
 
         if let Some(active) = self.sessions.get_mut(relay_session_id) {
             active.crypto.cipher = cipher;
@@ -5128,8 +5107,8 @@ impl TerminalBridge {
                 active.crypto.agent = requested_agent.clone();
                 active.crypto.agent_args = requested_agent_args.clone();
             }
-            if let Some(telegram_session_id) = telegram_session_id.as_deref() {
-                if let Err(err) = self
+            if let Some(telegram_session_id) = telegram_session_id.as_deref()
+                && let Err(err) = self
                     .host
                     .bind_telegram_session_to_relay(telegram_session_id, relay_session_id)
                     .await
@@ -5141,7 +5120,6 @@ impl TerminalBridge {
                         "Failed to persist Telegram-to-relay session mapping"
                     );
                 }
-            }
             Self::send_plain_json(
                 ws_write,
                 json!({
@@ -5224,8 +5202,8 @@ impl TerminalBridge {
                 last_review_result: None,
             },
         );
-        if let Some(telegram_session_id) = telegram_session_id.as_deref() {
-            if let Err(err) = self
+        if let Some(telegram_session_id) = telegram_session_id.as_deref()
+            && let Err(err) = self
                 .host
                 .bind_telegram_session_to_relay(telegram_session_id, relay_session_id)
                 .await
@@ -5237,7 +5215,6 @@ impl TerminalBridge {
                     "Failed to persist Telegram-to-relay session mapping"
                 );
             }
-        }
 
         Self::send_plain_json(
             ws_write,
@@ -5892,8 +5869,8 @@ impl TerminalBridge {
             }
         }
 
-        if let Some(owner_user_id) = self.owner_user_id() {
-            if let Err(err) = self
+        if let Some(owner_user_id) = self.owner_user_id()
+            && let Err(err) = self
                 .host
                 .set_last_active_relay_session_id(owner_user_id, to_session_id)
                 .await
@@ -5905,7 +5882,6 @@ impl TerminalBridge {
                     "Failed to persist remapped relay session id"
                 );
             }
-        }
 
         Ok(())
     }
@@ -6456,11 +6432,10 @@ fn run_local_attach_interactive(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     eprintln!("{} session {}. Press Ctrl+] to detach.", verb, session_id);
-    if let Some(code) = first_value.get("resume_code").and_then(|v| v.as_str()) {
-        if !code.trim().is_empty() {
+    if let Some(code) = first_value.get("resume_code").and_then(|v| v.as_str())
+        && !code.trim().is_empty() {
             eprintln!("Telegram command: /agent resume {}", code.trim());
         }
-    }
 
     if let Some((cols, rows)) = local_terminal_size() {
         let _ = send_local_attach_resize_and_redraw(&mut writer, cols, rows);

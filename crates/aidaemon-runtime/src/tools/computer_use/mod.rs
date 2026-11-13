@@ -378,11 +378,10 @@ impl ComputerUseTool {
     }
 
     fn parse_model_chain(facts: &ToolCallContext, current_model: &str) -> Vec<String> {
-        if let Some(chain) = facts.model_chain.as_ref() {
-            if !chain.is_empty() {
+        if let Some(chain) = facts.model_chain.as_ref()
+            && !chain.is_empty() {
                 return chain.clone();
             }
-        }
         vec![current_model.to_string()]
     }
 
@@ -514,8 +513,8 @@ impl ComputerUseTool {
     ) -> Result<ToolCallOutcome, String> {
         let text = Self::apply_lock_banner(text, self.harness.screen_is_locked());
         let mut metadata = ToolCallMetadata::default();
-        if let Some(snapshot) = snapshot {
-            if !snapshot.png.is_empty() {
+        if let Some(snapshot) = snapshot
+            && !snapshot.png.is_empty() {
                 let attachment = save_tool_observation_image(
                     &self.inbox_dir,
                     &snapshot.png,
@@ -540,7 +539,6 @@ impl ComputerUseTool {
                         .await;
                 }
             }
-        }
         Ok(ToolCallOutcome {
             output: format!("{text}{GUI_TASK_ANCHOR}"),
             metadata,
@@ -1575,21 +1573,18 @@ impl Tool for ComputerUseTool {
         let is_mutation = !matches!(action, "list_apps" | "get_app_state" | "screenshot");
 
         let mut element_target = pending.element_target;
-        if element_target.index.is_none() {
-            if let Some(index) = optional_u32(&args, "element_index") {
+        if element_target.index.is_none()
+            && let Some(index) = optional_u32(&args, "element_index") {
                 element_target.index = Some(index);
             }
-        }
-        if element_target.title.is_none() && !app.is_empty() {
-            if let Ok(ctx) = Self::parse_context(&facts) {
-                if let Ok(bundle_id) = self.resolve_bundle_id(app).await {
+        if element_target.title.is_none() && !app.is_empty()
+            && let Ok(ctx) = Self::parse_context(&facts)
+                && let Ok(bundle_id) = self.resolve_bundle_id(app).await {
                     let resolved = self.resolve_element_target(&args, &ctx, &bundle_id).await;
                     if resolved.title.is_some() || resolved.role.is_some() {
                         element_target = resolved;
                     }
                 }
-            }
-        }
 
         let click_method = pending.click_method.as_deref();
         let mut budget = pending.mutation_budget;

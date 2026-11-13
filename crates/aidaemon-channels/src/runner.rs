@@ -844,8 +844,8 @@ impl Inner {
                     .await;
             }
             None => {
-                if let Some((command, args)) = command_parts(&message.text) {
-                    if let Some(handler) = self.commands.get(&command).cloned() {
+                if let Some((command, args)) = command_parts(&message.text)
+                    && let Some(handler) = self.commands.get(&command).cloned() {
                         let context = CommandContext {
                             channel: name,
                             conversation: message.conversation.clone(),
@@ -863,7 +863,6 @@ impl Inner {
                         self.spawn_command(handler, call);
                         return;
                     }
-                }
                 self.submit(
                     session,
                     Job::Message {
@@ -901,15 +900,14 @@ impl Inner {
                             ),
                         ));
                     }
-                    if slot.queue.len() >= self.config.max_queued_per_session {
-                        if let Some(dropped) = slot.queue.pop_front() {
+                    if slot.queue.len() >= self.config.max_queued_per_session
+                        && let Some(dropped) = slot.queue.pop_front() {
                             notices.push((
                                 dropped.origin().clone(),
                                 "Too many messages are waiting, so I dropped the oldest one."
                                     .to_string(),
                             ));
                         }
-                    }
                     slot.queue.push_back(job);
                     None
                 }
@@ -985,8 +983,8 @@ impl Inner {
     async fn continuation(&self, session: &str) -> Option<RunState> {
         let usable =
             |state: &RunState| state.pending.is_none() && state.agent_id == self.agent.id();
-        if let Some(store) = &self.store {
-            if let Some(run_id) = self.index.latest_run(session).await {
+        if let Some(store) = &self.store
+            && let Some(run_id) = self.index.latest_run(session).await {
                 match store.load_state(run_id).await {
                     Ok(Some(state)) if usable(&state) => return Some(state),
                     Ok(Some(_)) => {
@@ -998,7 +996,6 @@ impl Inner {
                     }
                 }
             }
-        }
         let sessions = self.sessions.lock().expect("sessions poisoned");
         sessions
             .get(session)
@@ -1221,12 +1218,11 @@ impl Inner {
                 Err(_) => return Loaded::Listed("not loaded (the download timed out)"),
             },
         };
-        if wants_image && bytes.len() as u64 <= config.max_image_bytes {
-            if let Some(media_type) = sniff_image(&bytes) {
+        if wants_image && bytes.len() as u64 <= config.max_image_bytes
+            && let Some(media_type) = sniff_image(&bytes) {
                 let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 return Loaded::Image(Image::base64(media_type, data));
             }
-        }
         let Some(dir) = save_dir.cloned() else {
             return Loaded::Listed("not loaded (not a supported image)");
         };
@@ -1249,11 +1245,10 @@ impl Inner {
 
     /// Persist the outcome and make it the session's continuation.
     async fn remember(&self, session: &str, generation: u64, outcome: &RunOutcome) {
-        if let Some(store) = &self.store {
-            if let Err(err) = store.save_state(&outcome.state).await {
+        if let Some(store) = &self.store
+            && let Err(err) = store.save_state(&outcome.state).await {
                 tracing::warn!(session, error = %err, "saving run state failed");
             }
-        }
         if outcome.state.pending.is_some() || self.generation(session) != generation {
             return;
         }
@@ -1261,11 +1256,10 @@ impl Inner {
             self.index.set_latest(session, outcome.state.run_id).await;
         }
         let mut sessions = self.sessions.lock().expect("sessions poisoned");
-        if let Some(slot) = sessions.get_mut(session) {
-            if slot.generation == generation {
+        if let Some(slot) = sessions.get_mut(session)
+            && slot.generation == generation {
                 slot.last_state = Some(outcome.state.clone());
             }
-        }
     }
 
     /// Execute a run while showing progress and typing.
@@ -1322,11 +1316,10 @@ impl Inner {
                     let _ = channel.typing(&origin.conversation).await;
                 }
                 _ = tokio::time::sleep_until(last_edit + interval), if dirty && status_ref.is_some() => {
-                    if let Some(r) = &status_ref {
-                        if let Err(err) = channel.update_status(r, &progress.working()).await {
+                    if let Some(r) = &status_ref
+                        && let Err(err) = channel.update_status(r, &progress.working()).await {
                             tracing::debug!(error = %err, "status edit failed");
                         }
-                    }
                     last_edit = Instant::now();
                     dirty = false;
                 }
@@ -1433,11 +1426,10 @@ impl Inner {
             })
         };
         // Only while still open: an answer may have settled it during `ask`.
-        if let (Some(store), Some(record)) = (&self.approval_store, updated) {
-            if let Err(err) = store.save(&record).await {
+        if let (Some(store), Some(record)) = (&self.approval_store, updated)
+            && let Err(err) = store.save(&record).await {
                 tracing::warn!(prompt = %prompt_id, error = %err, "saving approval failed");
             }
-        }
 
         self.arm_expiry(prompt_id, self.config.approval_timeout);
     }
@@ -1492,20 +1484,18 @@ impl Inner {
     }
 
     async fn persist_approval(&self, pending: &PendingApproval) {
-        if let (Some(store), Some(record)) = (&self.approval_store, self.stored_approval(pending)) {
-            if let Err(err) = store.save(&record).await {
+        if let (Some(store), Some(record)) = (&self.approval_store, self.stored_approval(pending))
+            && let Err(err) = store.save(&record).await {
                 tracing::warn!(prompt = %pending.prompt_id, error = %err, "saving approval failed");
             }
-        }
     }
 
     /// Drop the durable record of an approval that has been settled.
     async fn forget_approval(&self, prompt_id: &str) {
-        if let Some(store) = &self.approval_store {
-            if let Err(err) = store.remove(prompt_id).await {
+        if let Some(store) = &self.approval_store
+            && let Err(err) = store.remove(prompt_id).await {
                 tracing::warn!(prompt = prompt_id, error = %err, "removing approval failed");
             }
-        }
     }
 
     /// Bring back the approvals open at the last stop, each with its session

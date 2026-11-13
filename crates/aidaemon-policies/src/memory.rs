@@ -300,11 +300,9 @@ impl<R: Recall> MemoryInjection<R> {
             .lock()
             .ok()
             .and_then(|c| c.get(session_id).cloned())
-        {
-            if cached_query == query {
+            && cached_query == query {
                 return note;
             }
-        }
         let note = self.recall.render(session_id, query, self.limit).await;
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(session_id.to_string(), (query.to_string(), note.clone()));

@@ -91,11 +91,10 @@ pub fn mint_local_token(config: &ClientGatewayConfig) -> std::io::Result<PathBuf
 /// The local token: `AIDAEMON_CLIENT_TOKEN`, else the owner's copy. A copy
 /// that no longer matches the gateway's hash (minted elsewhere) is `None`.
 pub fn local_token(config: &ClientGatewayConfig) -> Option<String> {
-    if let Ok(token) = std::env::var("AIDAEMON_CLIENT_TOKEN") {
-        if !token.trim().is_empty() {
+    if let Ok(token) = std::env::var("AIDAEMON_CLIENT_TOKEN")
+        && !token.trim().is_empty() {
             return Some(token.trim().to_string());
         }
-    }
     let token = std::fs::read_to_string(client_token_file(config)).ok()?;
     let token = token.trim().to_string();
     verify(&token_file(config), &token).then_some(token)

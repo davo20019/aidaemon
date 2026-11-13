@@ -132,11 +132,10 @@ pub async fn provision_task_workspace<S>(
 where
     S: TaskStore + WorkCoordinationStore + ?Sized,
 {
-    if let Some(existing) = state.get_task_workspace(task_id).await? {
-        if existing.attempt_id == attempt.id && existing.status != "failed" {
+    if let Some(existing) = state.get_task_workspace(task_id).await?
+        && existing.attempt_id == attempt.id && existing.status != "failed" {
             return Ok(existing);
         }
-    }
 
     let requested_policy = state.get_task_workspace_policy(task_id).await?;
     let task_description = state

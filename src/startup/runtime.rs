@@ -29,14 +29,12 @@ fn cleanup_inbox(dir: &str, retention: Duration) {
     };
     let cutoff = std::time::SystemTime::now() - retention;
     for entry in entries.flatten() {
-        if let Ok(meta) = entry.metadata() {
-            if let Ok(modified) = meta.modified() {
-                if modified < cutoff {
+        if let Ok(meta) = entry.metadata()
+            && let Ok(modified) = meta.modified()
+                && modified < cutoff {
                     let _ = std::fs::remove_file(entry.path());
                     tracing::info!(file = %entry.path().display(), "Cleaned up expired inbox file");
                 }
-            }
-        }
     }
 }
 

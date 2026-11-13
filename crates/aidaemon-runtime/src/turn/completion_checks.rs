@@ -147,11 +147,10 @@ fn structured_json_value(tool_output: &str) -> Option<serde_json::Value> {
         let leading = line.len().saturating_sub(line.trim_start().len());
         let start = offset.saturating_add(leading);
         let candidate = cleaned.get(start..)?.trim();
-        if candidate.starts_with('{') || candidate.starts_with('[') {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+        if (candidate.starts_with('{') || candidate.starts_with('['))
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
                 return Some(value);
             }
-        }
         offset = offset.saturating_add(line.len());
     }
     None

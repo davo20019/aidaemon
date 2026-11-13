@@ -30,8 +30,8 @@ pub async fn run_task_end_tool_hooks(host: &dyn TurnHost, task_id: &str, session
             );
         }
     }
-    if let Some(manager) = aidaemon_tools::checkpoints::active_manager() {
-        if let Err(error) = manager.finalize_task(task_id, session_id).await {
+    if let Some(manager) = aidaemon_tools::checkpoints::active_manager()
+        && let Err(error) = manager.finalize_task(task_id, session_id).await {
             warn!(
                 task_id,
                 session_id,
@@ -39,7 +39,6 @@ pub async fn run_task_end_tool_hooks(host: &dyn TurnHost, task_id: &str, session
                 "Failed to finalize filesystem checkpoint"
             );
         }
-    }
 }
 
 /// Emit TaskEnd after recording an exact bootstrap protocol direct-return.

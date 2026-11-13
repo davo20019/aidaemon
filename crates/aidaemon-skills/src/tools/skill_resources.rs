@@ -76,15 +76,14 @@ impl Tool for SkillResourcesTool {
             None => return Ok(format!("Skill '{}' not found.", skill_name)),
         };
 
-        if let Some(ref dir_path) = skill.dir_path {
-            if let Err(e) = self
+        if let Some(ref dir_path) = skill.dir_path
+            && let Err(e) = self
                 .resolver
                 .register_skill_directory(&skill.name, dir_path)
                 .await
             {
                 return Ok(format!("Error registering skill resources: {}", e));
             }
-        }
 
         match action {
             "list" => {

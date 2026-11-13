@@ -291,8 +291,7 @@ impl Ownership {
     ) -> Option<Contested> {
         if let (Self::Lines { lines: held, gaps }, Some(current), Some(proposed)) =
             (self, current, proposed)
-        {
-            if held.len() == lines(current).len() {
+            && held.len() == lines(current).len() {
                 let mut claims: Vec<Claim> = Vec::new();
                 let mut hunks = Vec::new();
                 for hunk in diff_lines(current, proposed) {
@@ -318,12 +317,10 @@ impl Ownership {
                     whole_file: false,
                 });
             }
-        }
-        if let (Some(current), Some(proposed)) = (current, proposed) {
-            if current == proposed {
+        if let (Some(current), Some(proposed)) = (current, proposed)
+            && current == proposed {
                 return None;
             }
-        }
         let claims: Vec<Claim> = self
             .claims()
             .into_iter()

@@ -105,10 +105,9 @@ pub(crate) fn consume(digest: &str) -> bool {
         return false;
     }
     order.push_back(digest.to_string());
-    if order.len() > USED_CAPACITY {
-        if let Some(oldest) = order.pop_front() {
+    if order.len() > USED_CAPACITY
+        && let Some(oldest) = order.pop_front() {
             set.remove(&oldest);
         }
-    }
     true
 }

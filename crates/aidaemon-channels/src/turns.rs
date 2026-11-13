@@ -518,15 +518,14 @@ impl TurnRunner {
                                 !turn.attachments.is_empty() || !steerable,
                             )
                         };
-                        if let Ok(ids) = surface.say(&notice).await {
-                            if let [message_id] = ids.as_slice() {
+                        if let Ok(ids) = surface.say(&notice).await
+                            && let [message_id] = ids.as_slice() {
                                 self.remember_queued_notice(
                                     &session_id,
                                     &turn.text,
                                     message_id.clone(),
                                 );
                             }
-                        }
                     }
                     return;
                 }
@@ -1743,8 +1742,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        let log = log.lock().unwrap().clone();
-        log
+        log.lock().unwrap().clone()
     }
 
     fn helper(label: &str, phase: aidaemon_core::card::RunPhase) -> StatusUpdate {

@@ -35,7 +35,7 @@ const RAW_ACCESS: &[&str] = &[
 
 /// Every `.rs` file under `dir` (relative to the crate root), as a path
 /// relative to the crate root with `/` separators.
-fn rust_files_under(dir: &str) -> impl Iterator<Item = String> {
+fn rust_files_under(dir: &str) -> impl Iterator<Item = String> + use<> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut pending = vec![root.join(dir)];
     let mut files = Vec::new();

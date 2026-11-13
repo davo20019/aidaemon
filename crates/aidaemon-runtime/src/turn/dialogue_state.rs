@@ -534,8 +534,8 @@ fn apply_user_message(
             if let Some(question) = state.open_question.take() {
                 state.last_closed_question = Some(question);
             }
-            if let Some(open_request) = state.open_request.as_mut() {
-                if matches!(
+            if let Some(open_request) = state.open_request.as_mut()
+                && matches!(
                     open_request.status,
                     OpenRequestStatus::Blocked | OpenRequestStatus::PartiallyAnswered
                 ) {
@@ -546,25 +546,23 @@ fn apply_user_message(
                     };
                     open_request.resolved_at = None;
                 }
-            }
         }
         UserTurnKind::Followup => {
             // A typed new TaskStart on a related turn reopens the request.
             // The user's choice of words ("retry", "continue", or any
             // paraphrase) is irrelevant to this lifecycle transition.
-            if state.active_task.is_some() {
-                if let Some(open_request) = state.open_request.as_mut() {
+            if state.active_task.is_some()
+                && let Some(open_request) = state.open_request.as_mut() {
                     open_request.status = OpenRequestStatus::InProgress;
                     open_request.resolved_at = None;
                 }
-            }
         }
         UserTurnKind::NewRequest => {
             // Owed work is not answered by a later message. Keep it in the
             // bounded owed list before the open slot is superseded, so a
             // continuation can still reach the owner's earlier request.
-            if let Some(open_request) = state.open_request.as_ref() {
-                if request_is_owed(open_request)
+            if let Some(open_request) = state.open_request.as_ref()
+                && request_is_owed(open_request)
                     && !state
                         .unfinished_requests
                         .iter()
@@ -577,16 +575,14 @@ fn apply_user_message(
                         .saturating_sub(UNFINISHED_REQUEST_LIMIT);
                     state.unfinished_requests.drain(..excess);
                 }
-            }
-            if let Some(open_request) = state.open_request.as_mut() {
-                if !matches!(
+            if let Some(open_request) = state.open_request.as_mut()
+                && !matches!(
                     open_request.status,
                     OpenRequestStatus::Answered | OpenRequestStatus::Superseded
                 ) {
                     open_request.status = OpenRequestStatus::Superseded;
                     open_request.resolved_at = Some(observed_at);
                 }
-            }
             // This relationship is provisional until semantic task
             // assessment. Keep the exact prior request and its typed contract
             // so a genuine continuation can restore it without reconstructing
@@ -702,17 +698,14 @@ fn apply_semantic_user_turn_assessment(
                 .open_request
                 .as_ref()
                 .is_some_and(|request| request.user_message_id == message_id)
-            {
-                if let Some(antecedent) = state.antecedent_request.take() {
+                && let Some(antecedent) = state.antecedent_request.take() {
                     state.open_request = Some(antecedent);
                 }
-            }
-            if let Some(request) = state.open_request.as_mut() {
-                if state.active_task.is_some() {
+            if let Some(request) = state.open_request.as_mut()
+                && state.active_task.is_some() {
                     request.status = OpenRequestStatus::InProgress;
                     request.resolved_at = None;
                 }
-            }
         }
         UserTurnKind::Courtesy | UserTurnKind::Unknown => {}
     }
@@ -845,8 +838,8 @@ fn apply_task_end(
         .and_then(|request| request.task_id.as_deref())
         .is_some_and(|request_task_id| request_task_id == task_id);
 
-    if let Some(open_request) = state.open_request.as_mut() {
-        if matches_request || open_request.task_id.is_none() {
+    if let Some(open_request) = state.open_request.as_mut()
+        && (matches_request || open_request.task_id.is_none()) {
             match status {
                 TaskStatus::Completed => {
                     match outcome {
@@ -902,7 +895,6 @@ fn apply_task_end(
                 }
             }
         }
-    }
 
     if matches_active_task {
         state.active_task = None;

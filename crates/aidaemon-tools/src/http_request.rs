@@ -286,21 +286,19 @@ impl HttpRequestTool {
                 }
                 "follow_redirects" => {
                     strip_from_url = true;
-                    if !map.contains_key("follow_redirects") {
-                        if let Ok(parsed) = value_owned.parse::<bool>() {
+                    if !map.contains_key("follow_redirects")
+                        && let Ok(parsed) = value_owned.parse::<bool>() {
                             map.insert("follow_redirects".to_string(), Value::Bool(parsed));
                             recovered.push("follow_redirects".to_string());
                         }
-                    }
                 }
                 "timeout_secs" | "max_response_bytes" => {
                     strip_from_url = true;
-                    if !map.contains_key(normalized.as_str()) {
-                        if let Ok(parsed) = value_owned.parse::<u64>() {
+                    if !map.contains_key(normalized.as_str())
+                        && let Ok(parsed) = value_owned.parse::<u64>() {
                             map.insert(normalized.clone(), Value::Number(parsed.into()));
                             recovered.push(normalized);
                         }
-                    }
                 }
                 "headers" => {
                     let looks_embedded = Self::query_value_looks_like_embedded_json(&value_owned);
@@ -817,14 +815,13 @@ impl HttpRequestTool {
             return Some(format!("OAuth diagnostic: {}", note));
         }
 
-        if status_code == 401 {
-            if let Some(profile_name) = auth_profile_name {
+        if status_code == 401
+            && let Some(profile_name) = auth_profile_name {
                 return Some(format!(
                     "OAuth diagnostic: HTTP 401 Unauthorized while using auth_profile='{}'. This response alone does not prove the token is expired. It may also indicate revoked credentials, missing scopes, or app permission mismatch.",
                     profile_name
                 ));
             }
-        }
 
         None
     }
@@ -894,15 +891,14 @@ impl HttpRequestTool {
         // Include form-encoded body params in signature (NOT JSON body)
         let is_form =
             content_type.is_some_and(|ct| ct.contains("application/x-www-form-urlencoded"));
-        if is_form {
-            if let Some(body_str) = body {
+        if is_form
+            && let Some(body_str) = body {
                 for pair in body_str.split('&') {
                     if let Some((k, v)) = pair.split_once('=') {
                         params.push((percent_decode(k), percent_decode(v)));
                     }
                 }
             }
-        }
 
         // Sort parameters
         params.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -1261,13 +1257,12 @@ impl HttpRequestTool {
             profile.password.as_deref().unwrap_or_default(),
         );
         let mut ready = make(AuthorizationPreflightStatus::Ready, None);
-        if let Some(gateway) = self.oauth_gateway.read().await.clone() {
-            if let Some(scopes) = gateway.managed_scopes(profile_name).await {
+        if let Some(gateway) = self.oauth_gateway.read().await.clone()
+            && let Some(scopes) = gateway.managed_scopes(profile_name).await {
                 ready.authorized_scopes = scopes;
                 ready.authorized_scopes.sort();
                 ready.authorized_scopes.dedup();
             }
-        }
         ready.credential_generation = Some(format!(
             "sha256:{}",
             hex::encode(Sha256::digest(generation_material.as_bytes()))
@@ -1317,11 +1312,10 @@ impl HttpRequestTool {
             if let Some(ct) = content_type {
                 builder = builder.header("Content-Type", ct);
             }
-            if let Some(payload) = body {
-                if redirect_count == 0 || resend_body {
+            if let Some(payload) = body
+                && (redirect_count == 0 || resend_body) {
                     builder = builder.body(payload.to_string());
                 }
-            }
 
             if let Some(headers) = custom_headers {
                 for (k, v) in headers {
@@ -1447,13 +1441,12 @@ impl HttpRequestTool {
                             ));
                         }
 
-                        if let Ok(next_parsed) = reqwest::Url::parse(&next_url) {
-                            if next_parsed.scheme() != "https" {
+                        if let Ok(next_parsed) = reqwest::Url::parse(&next_url)
+                            && next_parsed.scheme() != "https" {
                                 return Err(anyhow::anyhow!(
                                     "Redirect blocked: redirected to non-HTTPS URL"
                                 ));
                             }
-                        }
                     }
 
                     current_url = next_url;
@@ -1731,11 +1724,10 @@ impl HttpRequestTool {
         }
 
         // Step 2: SSRF validation (skip for localhost — local dev/testing)
-        if !is_localhost && local_site.is_none() {
-            if let Err(reason) = validate_url_for_ssrf(&url) {
+        if !is_localhost && local_site.is_none()
+            && let Err(reason) = validate_url_for_ssrf(&url) {
                 return Ok((format!("Request blocked: {}", reason), None, None));
             }
-        }
 
         // Step 3: Catch malformed tool calls where tool-only args were stuffed into the URL.
         let leaked_tool_params = Self::embedded_tool_params_in_url(&parsed_url);
@@ -1845,17 +1837,15 @@ impl HttpRequestTool {
         // inner request of an approved outer call) or an exact mandate
         // grant. Nothing in the arguments can stand in for either.
         let mandate_grant = mandate_execution && mandate_preapproved;
-        if !mandate_grant {
-            if let Some(request) = Self::owner_approval_request(&args) {
-                if !Self::scope_covers(kernel_approved, &request.subject) {
+        if !mandate_grant
+            && let Some(request) = Self::owner_approval_request(&args)
+                && !Self::scope_covers(kernel_approved, &request.subject) {
                     anyhow::bail!(
                         "http_request `{}` requires approval through the agent kernel; it was \
                          called outside an approved agent call",
                         request.subject
                     );
                 }
-            }
-        }
 
         // Refresh a known-expiring bearer before sending anything. Mandate
         // requests deliberately are not replayed after a 401, so this preflight
@@ -1948,8 +1938,8 @@ impl HttpRequestTool {
                     profile_name
                 ));
             }
-        } else if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            if let Some(profile_name) = auth_profile_name {
+        } else if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(profile_name) = auth_profile_name {
                 let is_bearer_profile = profile
                     .as_ref()
                     .is_some_and(|resolved| matches!(resolved.auth_type, HttpAuthType::Bearer));
@@ -2012,7 +2002,6 @@ aidaemon did not attempt an OAuth refresh because this profile is not bearer-tok
                     ));
                 }
             }
-        }
 
         // Step 9: Format response
         let status = response.status();
@@ -2158,15 +2147,14 @@ fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) =
+        if bytes[i] == b'%' && i + 2 < bytes.len()
+            && let Ok(byte) =
                 u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
             {
                 result.push(byte);
                 i += 3;
                 continue;
             }
-        }
         if bytes[i] == b'+' {
             result.push(b' ');
         } else {

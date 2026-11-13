@@ -413,8 +413,8 @@ impl DiagnoseTool {
                     }
                 }
                 DecisionType::ExecutionStateSnapshot => {
-                    if let Some(condition) = Self::metadata_string(metadata, "condition") {
-                        if condition == "execution_budget_exhausted" {
+                    if let Some(condition) = Self::metadata_string(metadata, "condition")
+                        && condition == "execution_budget_exhausted" {
                             let limit = Self::metadata_string(metadata, "budget_limit")
                                 .unwrap_or_else(|| "execution budget".to_string());
                             let line = format!(
@@ -425,7 +425,6 @@ impl DiagnoseTool {
                             Self::push_unique_line(&mut summary.validation_failures, line);
                             summary.validation_failure_evidence.push(evidence.clone());
                         }
-                    }
                 }
                 _ => {}
             }
@@ -515,33 +514,31 @@ impl DiagnoseTool {
                     }
                 }
                 EventType::ToolResult => {
-                    if let Ok(data) = event.parse_data::<ToolResultData>() {
-                        if data.failed() {
+                    if let Ok(data) = event.parse_data::<ToolResultData>()
+                        && data.failed() {
                             if first_error.is_none() {
                                 first_error = Some(ev.clone());
                             }
                             tool_failures.push(ev);
                         }
-                    }
                 }
                 EventType::ApprovalDenied => approval_denied.push(ev),
                 EventType::DecisionPoint => {
-                    if let Ok(data) = event.parse_data::<DecisionPointData>() {
-                        if matches!(
+                    if let Ok(data) = event.parse_data::<DecisionPointData>()
+                        && (matches!(
                             data.decision_type,
                             DecisionType::RepetitiveCallDetection
                                 | DecisionType::ConsecutiveSameToolDetection
                                 | DecisionType::AlternatingPatternDetection
                         ) || matches!(data.decision_type, DecisionType::StoppingCondition)
-                            && data.summary.to_ascii_lowercase().contains("stall")
+                            && data.summary.to_ascii_lowercase().contains("stall"))
                         {
                             loop_signals.push(ev);
                         }
-                    }
                 }
                 EventType::TaskEnd => {
-                    if let Ok(data) = event.parse_data::<TaskEndData>() {
-                        if data.effective_outcome() == aidaemon_events::TaskOutcome::Failed {
+                    if let Ok(data) = event.parse_data::<TaskEndData>()
+                        && data.effective_outcome() == aidaemon_events::TaskOutcome::Failed {
                             if data
                                 .error
                                 .as_deref()
@@ -551,7 +548,6 @@ impl DiagnoseTool {
                             }
                             task_end_failed = Some((data, ev));
                         }
-                    }
                 }
                 _ => {}
             }

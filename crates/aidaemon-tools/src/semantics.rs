@@ -1777,11 +1777,10 @@ fn default_access_manifest(
         .filter(|target| execution_cwd.as_deref() != Some(target.value.as_str()))
         .collect::<Vec<_>>();
     let mut read_targets = Vec::new();
-    if let Some(cwd) = execution_cwd.as_deref() {
-        if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd) {
+    if let Some(cwd) = execution_cwd.as_deref()
+        && let Some(target) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd) {
             read_targets.push(target);
         }
-    }
     if semantics.observes_state() {
         read_targets.extend(non_cwd_targets.iter().cloned());
     }

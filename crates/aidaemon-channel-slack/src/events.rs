@@ -40,11 +40,10 @@ impl SeenMessages {
         if self.set.contains(&key) {
             return false;
         }
-        if self.order.len() >= Self::CAPACITY {
-            if let Some(old) = self.order.pop_front() {
+        if self.order.len() >= Self::CAPACITY
+            && let Some(old) = self.order.pop_front() {
                 self.set.remove(&old);
             }
-        }
         self.set.insert(key.clone());
         self.order.push_back(key);
         true

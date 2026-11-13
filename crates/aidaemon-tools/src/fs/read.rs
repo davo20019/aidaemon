@@ -616,11 +616,10 @@ fn read_selected_lines(content: &str, selection: ReadSelection) -> SelectedLines
 
             for line in content.lines() {
                 total_lines += 1;
-                if lines.len() == count {
-                    if let Some(dropped) = lines.pop_front() {
+                if lines.len() == count
+                    && let Some(dropped) = lines.pop_front() {
                         stored_bytes = stored_bytes.saturating_sub(dropped.len() + 1);
                     }
-                }
                 let line = cap_line(line.to_string());
                 stored_bytes += line.len() + 1;
                 lines.push_back(line);

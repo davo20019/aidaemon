@@ -1737,10 +1737,9 @@ get_app_state below. Call get_app_state to re-read the current screen if you nee
         return;
     };
     for (i, m) in messages.iter_mut().enumerate() {
-        if i != last_idx && is_tree(m) {
-            if let Some(content) = m.get_mut("content") {
+        if i != last_idx && is_tree(m)
+            && let Some(content) = m.get_mut("content") {
                 *content = Value::String(STUB.to_string());
             }
-        }
     }
 }

@@ -805,14 +805,13 @@ impl TelegramBot {
             }
             // Remove an answered approval after a moment, so it isn't
             // mistaken for one still waiting.
-            if answered.approval {
-                if let Some(delay) = Self::resolved_approval_dismiss_delay() {
+            if answered.approval
+                && let Some(delay) = Self::resolved_approval_dismiss_delay() {
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
                         let _ = transport.delete(&message).await;
                     });
                 }
-            }
         }
     }
 
@@ -1191,11 +1190,10 @@ impl TelegramBot {
 
                 // Some Telegram clients/wrappers may nest the actual payload under another key.
                 for key in ["data", "payload", "message", "web_app_data", "webAppData"] {
-                    if let Some(nested) = map.get(key) {
-                        if let Some(action) = Self::parse_web_app_action_value(nested) {
+                    if let Some(nested) = map.get(key)
+                        && let Some(action) = Self::parse_web_app_action_value(nested) {
                             return Some(action);
                         }
-                    }
                 }
                 None
             }
@@ -1344,11 +1342,10 @@ impl TelegramBot {
                     return;
                 }
             }
-            if body_text.is_empty() {
-                if let Some(caption) = msg.caption() {
+            if body_text.is_empty()
+                && let Some(caption) = msg.caption() {
                     body_text = caption.to_string();
                 }
-            }
         } else if body_text.is_empty() {
             let _ = bot
                 .send_message(msg.chat.id, "I can only process text messages.")

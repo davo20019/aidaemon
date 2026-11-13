@@ -259,14 +259,13 @@ pub fn record_scenario_from_events(
             .parse_data::<crate::events::AssistantResponseData>()
             .with_context(|| format!("parse AssistantResponse event {}", event.id))?;
         let tool_calls = data.tool_calls.unwrap_or_default();
-        if tool_calls.is_empty() {
-            if let Some(text) = data.content.filter(|text| !text.trim().is_empty()) {
+        if tool_calls.is_empty()
+            && let Some(text) = data.content.filter(|text| !text.trim().is_empty()) {
                 script.push(RecordedReply {
                     text: Some(text),
                     tool_calls: Vec::new(),
                 });
             }
-        }
         // The mock serves one tool call per response, so a parallel batch
         // becomes consecutive turns. Order is kept; batching is not.
         for call in tool_calls {

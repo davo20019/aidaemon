@@ -319,11 +319,10 @@ impl ManagePeopleTool {
             };
 
             // Filter by relationship if specified
-            if let Some(ref filter) = args.relationship {
-                if p.relationship.as_deref() != Some(filter.as_str()) {
+            if let Some(ref filter) = args.relationship
+                && p.relationship.as_deref() != Some(filter.as_str()) {
                     continue;
                 }
-            }
 
             result.push_str(&format!(
                 "- **{}** (ID: {}) — {} | style: {}{}\n",
@@ -497,11 +496,10 @@ impl ManagePeopleTool {
                 if fact.category != "birthday" && fact.category != "important_date" {
                     continue;
                 }
-                if let Some(days) = Self::days_until_date(&fact.value, today) {
-                    if days >= 0 && days <= within_days as i64 {
+                if let Some(days) = Self::days_until_date(&fact.value, today)
+                    && days >= 0 && days <= within_days as i64 {
                         rows.push((days, person.clone(), fact));
                     }
-                }
             }
         }
 
@@ -595,12 +593,11 @@ impl ManagePeopleTool {
             None => return Ok("Person not found.".to_string()),
         };
 
-        if let Some(ref name) = args.name {
-            if args.id.is_some() {
+        if let Some(ref name) = args.name
+            && args.id.is_some() {
                 // Only update name if id was used to identify (name is being changed)
                 person.name = name.clone();
             }
-        }
         if let Some(ref rel) = args.relationship {
             person.relationship = Some(rel.clone());
         }

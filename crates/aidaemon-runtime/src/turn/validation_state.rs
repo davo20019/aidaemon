@@ -154,14 +154,13 @@ impl ExecutorHandoff {
             lines.push(format!("- expected targets (execution hint): {expected}"));
         }
 
-        if let Some(allowed_tools) = &self.allowed_tools {
-            if !allowed_tools.is_empty() {
+        if let Some(allowed_tools) = &self.allowed_tools
+            && !allowed_tools.is_empty() {
                 lines.push(format!(
                     "- allowed tools for this executor: {}",
                     allowed_tools.join(", ")
                 ));
             }
-        }
 
         lines.push(
             "- If finishing requires acting outside the allowed targets, stop and use report_blocker."
@@ -277,11 +276,10 @@ pub fn derive_executor_step_result(
     response: Option<&str>,
     error: Option<&str>,
 ) -> ExecutorStepResult {
-    if let Some(task) = task {
-        if let Some(existing) = extract_executor_result_context(task.context.as_deref()) {
+    if let Some(task) = task
+        && let Some(existing) = extract_executor_result_context(task.context.as_deref()) {
             return existing;
         }
-    }
 
     let handoff = task.and_then(|task| extract_executor_handoff_context(task.context.as_deref()));
     let artifacts = handoff

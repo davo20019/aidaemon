@@ -495,8 +495,8 @@ impl SlackChannel {
 
             let payload = envelope.get("payload").unwrap_or(&Value::Null);
             let kind = envelope.get("type").and_then(Value::as_str);
-            if let (Sink::Envelopes(envelopes), Some(kind)) = (sink, kind) {
-                if !matches!(kind, "hello" | "disconnect") {
+            if let (Sink::Envelopes(envelopes), Some(kind)) = (sink, kind)
+                && !matches!(kind, "hello" | "disconnect") {
                     let envelope = SlackEnvelope {
                         kind: kind.to_string(),
                         payload: payload.clone(),
@@ -511,7 +511,6 @@ impl SlackChannel {
                     }
                     continue;
                 }
-            }
             let Sink::Events(events) = sink else {
                 // hello and disconnect, handled below.
                 match kind {

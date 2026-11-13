@@ -1401,8 +1401,8 @@ impl RunAggregate {
     ) -> TaskKernelOperationClaim {
         let mut effective = claim.clone();
         effective.obligation_ids = self.effective_obligation_ids(&claim.obligation_ids);
-        if effective.obligation_ids != claim.obligation_ids {
-            if let Some(active_ceiling) = effective
+        if effective.obligation_ids != claim.obligation_ids
+            && let Some(active_ceiling) = effective
                 .obligation_ids
                 .iter()
                 .filter_map(|id| self.obligations.get(id))
@@ -1417,7 +1417,6 @@ impl RunAggregate {
                 effective.max_invocations = active_ceiling.max(1);
                 effective.max_attempts = effective.max_attempts.max(effective.max_invocations);
             }
-        }
         effective
     }
 
@@ -1547,11 +1546,10 @@ impl RunAggregate {
         if operation.evidence_capabilities.is_empty() {
             operation.evidence_capabilities = receipt.semantics.evidence.clone();
         }
-        if operation.evidence_capabilities.is_empty() {
-            if let Some(denial) = receipt.access_denial.as_ref() {
+        if operation.evidence_capabilities.is_empty()
+            && let Some(denial) = receipt.access_denial.as_ref() {
                 operation.evidence_capabilities = denial.proposed_evidence.clone();
             }
-        }
         if operation.targets.is_empty() {
             operation.targets = receipt_targets(receipt);
         }

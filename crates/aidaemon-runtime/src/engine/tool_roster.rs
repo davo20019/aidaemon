@@ -50,11 +50,10 @@ fn validate_required_fields_contract(parameters: &Value) -> Result<(), String> {
         }
     }
 
-    if let Some(additional) = parameters.get("additionalProperties") {
-        if !additional.is_boolean() {
+    if let Some(additional) = parameters.get("additionalProperties")
+        && !additional.is_boolean() {
             return Err("parameters.additionalProperties must be a boolean".to_string());
         }
-    }
 
     Ok(())
 }

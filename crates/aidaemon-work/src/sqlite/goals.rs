@@ -485,14 +485,12 @@ impl<S: WorkDatabase> crate::traits::GoalStore for S {
         .await?;
 
         let activated = result.rows_affected() > 0;
-        if activated {
-            if let Some(goal) = self.get_goal(goal_id).await? {
-                if goal.goal_type == "finite" && self.get_current_goal_run(goal_id).await?.is_none()
+        if activated
+            && let Some(goal) = self.get_goal(goal_id).await?
+                && goal.goal_type == "finite" && self.get_current_goal_run(goal_id).await?.is_none()
                 {
                     self.start_goal_run(goal_id, "finite", None, None).await?;
                 }
-            }
-        }
         Ok(activated)
     }
 }

@@ -177,11 +177,10 @@ impl aidaemon_core::FailoverPolicy for DaemonRecovery {
                 None => failures.push(failure),
             }
         }
-        if matches!(error, aidaemon_core::ProviderError::QuotaExhausted { .. }) {
-            if let Ok(mut quota) = self.quota.lock() {
+        if matches!(error, aidaemon_core::ProviderError::QuotaExhausted { .. })
+            && let Ok(mut quota) = self.quota.lock() {
                 quota.get_or_insert_with(|| error.clone());
             }
-        }
         // Too long for this model's window: retrying cannot help. Record
         // the window so the caller shrinks the request.
         if let aidaemon_core::ProviderError::ContextOverflow { limit, .. } = error {
@@ -203,8 +202,7 @@ impl aidaemon_core::FailoverPolicy for DaemonRecovery {
                     affordable_tokens: Some(affordable),
                     ..
                 } = error
-                {
-                    if *affordable >= MIN_USEFUL_TOKENS && request.max_output_tokens.is_none() {
+                    && *affordable >= MIN_USEFUL_TOKENS && request.max_output_tokens.is_none() {
                         let mut capped = request.clone();
                         capped.max_output_tokens =
                             Some(affordable.saturating_sub(100).max(MIN_USEFUL_TOKENS) as u32);
@@ -213,7 +211,6 @@ impl aidaemon_core::FailoverPolicy for DaemonRecovery {
                             request: Box::new(capped),
                         };
                     }
-                }
                 if let Ok(mut cache) = self.billing_failed_models.try_write() {
                     cache.insert(model.to_string(), Instant::now());
                     cache.retain(|_, at| at.elapsed() < BILLING_FAIL_CACHE_TTL);

@@ -661,8 +661,8 @@ pub async fn enforce_scheduled_run_budget_control(
         ctx.status,
         ctx.max_budget_extensions,
         ctx.hard_token_cap,
-    ) {
-        if let Some(registry) = host.goal_tokens() {
+    )
+        && let Some(registry) = host.goal_tokens() {
             let updated = registry
                 .auto_extend_run_budget(ctx.goal_id, new_budget)
                 .await;
@@ -713,7 +713,6 @@ pub async fn enforce_scheduled_run_budget_control(
             .await;
             return ScheduledRunBudgetControlOutcome::Continue;
         }
-    }
 
     ScheduledRunBudgetControlOutcome::Exhausted {
         tokens_used: ctx.status.tokens_used,
@@ -864,15 +863,13 @@ pub async fn fanout_token_alert(
             continue;
         }
 
-        if let Some(hub_weak) = &hub {
-            if let Some(hub_arc) = hub_weak.upgrade() {
-                if hub_arc.send_text(&target, message).await.is_ok() {
+        if let Some(hub_weak) = &hub
+            && let Some(hub_arc) = hub_weak.upgrade()
+                && hub_arc.send_text(&target, message).await.is_ok() {
                     let _ = host
                         .notifications()
                         .mark_notification_delivered(&entry.id)
                         .await;
                 }
-            }
-        }
     }
 }

@@ -845,8 +845,8 @@ async fn deliver_background_text(
             ),
         }
     }
-    if !delivered {
-        if let Some(state) = state {
+    if !delivered
+        && let Some(state) = state {
             let entry = crate::tools::traits::NotificationEntry::new(
                 goal_id, session_id, "progress", message,
             );
@@ -860,7 +860,6 @@ async fn deliver_background_text(
                 );
             }
         }
-    }
 }
 
 pub struct TerminalTool {
@@ -1198,11 +1197,10 @@ fn is_broad_scan_root(path: &str) -> bool {
     if p == "~" || p == "$HOME" {
         return true;
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() && p == home.trim_end_matches('/') {
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty() && p == home.trim_end_matches('/') {
             return true;
         }
-    }
     false
 }
 
@@ -1535,14 +1533,13 @@ fn disk_space(_path: &std::path::Path) -> Option<(u64, u64)> {
 
 /// The exit code line and, for a failure, the low-disk note.
 fn push_exit_status(output: &mut String, exit_code: Option<i32>) {
-    if let Some(code) = exit_code {
-        if code != 0 {
+    if let Some(code) = exit_code
+        && code != 0 {
             output.push_str(&format!("\n[exit code: {}]", code));
             if let Some(note) = low_disk_note() {
                 output.push_str(&note);
             }
         }
-    }
 }
 
 fn confined_opaque_failure_hint(
@@ -1705,11 +1702,10 @@ async fn confined_terminal_execution_request_inner(
     // root, never the host's global /tmp — and it is exported as TMPDIR/cache
     // below so no command has to discover or declare it.
     let managed_scratch = provision_managed_scratch(backend).await;
-    if let Some(scratch) = managed_scratch.as_ref() {
-        if !writes.contains(scratch) {
+    if let Some(scratch) = managed_scratch.as_ref()
+        && !writes.contains(scratch) {
             writes.push(scratch.clone());
         }
-    }
 
     // Task data authority and executable runtime support are separate lanes.
     // A native sandbox still needs to execute owner-installed toolchains, but
@@ -1815,12 +1811,11 @@ async fn confined_terminal_execution_request_inner(
             .metadata(&aidaemon_tools::BackendPath::new(target.clone()))
             .await
             .is_err()
+            && let Some(parent) = target_path.parent()
         {
-            if let Some(parent) = target_path.parent() {
-                let parent = parent.to_string_lossy().to_string();
-                if !policy_writes.contains(&parent) {
-                    policy_writes.push(parent);
-                }
+            let parent = parent.to_string_lossy().to_string();
+            if !policy_writes.contains(&parent) {
+                policy_writes.push(parent);
             }
         }
     }
@@ -2061,11 +2056,10 @@ fn macos_manifest_sandbox_policy(
         // — never the directory as a whole — so a script can use normal shell
         // syntax without reopening ambient temporary write authority.
         let mut temp_dirs = vec![std::env::temp_dir()];
-        if let Ok(canonical) = std::fs::canonicalize(&temp_dirs[0]) {
-            if !temp_dirs.iter().any(|path| path == &canonical) {
+        if let Ok(canonical) = std::fs::canonicalize(&temp_dirs[0])
+            && !temp_dirs.iter().any(|path| path == &canonical) {
                 temp_dirs.push(canonical);
             }
-        }
         // `/tmp` and `/var/tmp` are symlink/alias spellings on Darwin, and
         // shells launched by different service managers can inherit either
         // spelling. Keep the aliases in the same narrowly scoped transient
@@ -2402,8 +2396,8 @@ async fn add_macos_developer_runtime_support(
         .filter(|path| path.starts_with('/'));
     if sdk_root.is_none() {
         let xcrun = aidaemon_tools::BackendPath::new("/usr/bin/xcrun");
-        if backend.metadata(&xcrun).await.is_ok() {
-            if let Ok(output) = backend
+        if backend.metadata(&xcrun).await.is_ok()
+            && let Ok(output) = backend
                 .execute(
                     ExecutionRequest::argv(
                         xcrun.to_string(),
@@ -2416,8 +2410,7 @@ async fn add_macos_developer_runtime_support(
                     Duration::from_secs(5),
                 )
                 .await
-            {
-                if output.exit_code == 0 {
+                && output.exit_code == 0 {
                     sdk_root = output
                         .stdout_lossy()
                         .lines()
@@ -2425,8 +2418,6 @@ async fn add_macos_developer_runtime_support(
                         .find(|path| path.starts_with('/'))
                         .map(str::to_string);
                 }
-            }
-        }
     }
     if sdk_root.is_none() {
         for candidate in [
@@ -2511,13 +2502,11 @@ async fn native_sandbox_runtime_support(
             if let Some(prefix) = std::path::Path::new(location)
                 .parent()
                 .and_then(|bin| bin.parent())
-            {
-                if prefix.join("conda-meta").is_dir() {
+                && prefix.join("conda-meta").is_dir() {
                     let prefix = prefix.to_string_lossy().to_string();
                     support.add_read(prefix.clone());
                     support.add_executable(prefix);
                 }
-            }
         }
         // Standard prefix layout: an executable under `<prefix>/bin` loads
         // shared libraries from the sibling `<prefix>/lib` (and helpers from
@@ -2580,8 +2569,8 @@ async fn native_sandbox_runtime_support(
                     Duration::from_secs(5),
                 )
                 .await?;
-            if output.exit_code == 0 {
-                if let Some(actual) = output
+            if output.exit_code == 0
+                && let Some(actual) = output
                     .stdout_lossy()
                     .lines()
                     .map(str::trim)
@@ -2601,7 +2590,6 @@ async fn native_sandbox_runtime_support(
                         }
                     }
                 }
-            }
         }
 
         // Git aborts (exit 128) when its ordinary configuration files exist
@@ -2741,16 +2729,14 @@ async fn add_manifest_runtime_environment(
     // OUTPUT directory (e.g. a heredoc target). Create it before execution so
     // the confined process can write into it. This is independent of which
     // directory backs TMPDIR/caches below.
-    if future_scratch_root {
-        if let Some(path) = preferred_root.as_ref() {
-            if let Err(error) = backend
+    if future_scratch_root
+        && let Some(path) = preferred_root.as_ref()
+            && let Err(error) = backend
                 .create_dir_all(&aidaemon_tools::BackendPath::new(path.clone()))
                 .await
             {
                 tracing::warn!(path = %path, %error, "Failed to prepare declared future write root");
             }
-        }
-    }
     let mut scratch_root = (preferred_is_directory || future_scratch_root)
         .then(|| preferred_root.clone())
         .flatten();
@@ -3819,8 +3805,8 @@ impl TerminalTool {
         }
         // Approval history is useful context for the owner, but it never
         // changes the decision or lowers risk.
-        if let Some(ref pool) = self.pool {
-            if let Ok(Some((pattern, similarity))) = find_matching_pattern(pool, command).await {
+        if let Some(ref pool) = self.pool
+            && let Ok(Some((pattern, similarity))) = find_matching_pattern(pool, command).await {
                 approval_warnings.push(format!(
                     "Similar command history: '{}' (similarity {:.0}%, approvals {}, denials {}, confidence {:.0}%, trusted {})",
                     pattern.pattern,
@@ -3831,7 +3817,6 @@ impl TerminalTool {
                     pattern.is_trusted(),
                 ));
             }
-        }
         Some(LadderAsk {
             risk: approval_risk,
             warnings: approval_warnings,
@@ -4133,8 +4118,8 @@ impl TerminalTool {
                 if !persist {
                     continue;
                 }
-                if let Some(ref pool) = self.pool {
-                    if let Err(e) = sqlx::query(
+                if let Some(ref pool) = self.pool
+                    && let Err(e) = sqlx::query(
                         "INSERT OR IGNORE INTO terminal_capability_grants
                             (backend_scope, prefix, capability) VALUES (?, ?, ?)",
                     )
@@ -4146,7 +4131,6 @@ impl TerminalTool {
                     {
                         warn!(prefix = %key, capability = %capability, "Failed to persist capability grant: {}", e);
                     }
-                }
             }
         }
     }
@@ -4164,8 +4148,8 @@ impl TerminalTool {
                 prefixes.push(key.clone());
 
                 // Persist to SQLite
-                if let Some(ref pool) = self.pool {
-                    if let Err(e) = sqlx::query(
+                if let Some(ref pool) = self.pool
+                    && let Err(e) = sqlx::query(
                         "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
                             (backend_scope, prefix) VALUES (?, ?)",
                     )
@@ -4176,7 +4160,6 @@ impl TerminalTool {
                     {
                         warn!(prefix = %key, "Failed to persist allowed prefix: {}", e);
                     }
-                }
             }
         }
     }
@@ -4220,12 +4203,11 @@ impl TerminalTool {
                 .insert(key.to_string(), pid);
         }
 
-        if !detached {
-            if let Some(task_id) = owner_task_id {
+        if !detached
+            && let Some(task_id) = owner_task_id {
                 let mut task_map = self.task_processes.lock().await;
                 task_map.entry(task_id.to_string()).or_default().insert(pid);
             }
-        }
     }
 
     async fn remove_indexes_for_process(&self, pid: u32, proc: &RunningProcess) {
@@ -4236,8 +4218,8 @@ impl TerminalTool {
             }
         }
 
-        if !proc.detached {
-            if let Some(task_id) = proc.owner_task_id.as_ref() {
+        if !proc.detached
+            && let Some(task_id) = proc.owner_task_id.as_ref() {
                 let mut task_map = self.task_processes.lock().await;
                 let mut remove_task_key = false;
                 if let Some(pids) = task_map.get_mut(task_id) {
@@ -4248,7 +4230,6 @@ impl TerminalTool {
                     task_map.remove(task_id);
                 }
             }
-        }
     }
 
     async fn resolve_duplicate_running_pid(&self, dedupe_key: &str) -> Option<u32> {
@@ -4455,8 +4436,8 @@ impl TerminalTool {
         if !prefixes.iter().any(|p| p == "*") {
             prefixes.push("*".to_string());
             info!("Trust-all mode enabled: all commands will be auto-approved");
-            if let Some(ref pool) = self.pool {
-                if let Err(e) = sqlx::query(
+            if let Some(ref pool) = self.pool
+                && let Err(e) = sqlx::query(
                     "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
                         (backend_scope, prefix) VALUES (?, '*')",
                 )
@@ -4466,7 +4447,6 @@ impl TerminalTool {
                 {
                     warn!("Failed to persist trust-all mode: {}", e);
                 }
-            }
         }
         Ok(
             "Trust-all mode enabled. All commands will now run without approval prompts."
@@ -4788,8 +4768,8 @@ impl TerminalTool {
                 }
                 to_update.push((c.pid, len, sampled, made_progress, confirmations));
 
-                if conclusive_stall {
-                    if let Some(task_id) = c.owner_task_id.as_deref() {
+                if conclusive_stall
+                    && let Some(task_id) = c.owner_task_id.as_deref() {
                         watchdog_events.push((
                             c.session_id.clone(),
                             task_id.to_string(),
@@ -4837,7 +4817,6 @@ impl TerminalTool {
                             },
                         ));
                     }
-                }
             } else {
                 to_update.push((c.pid, len, sampled, made_progress, 0));
             }
@@ -5020,13 +4999,12 @@ impl TerminalTool {
                     }
                 };
                 let mut delivered = false;
-                if let Some(hub) = self.get_hub() {
-                    if hub.send_text(&session_id, &message).await.is_ok() {
+                if let Some(hub) = self.get_hub()
+                    && hub.send_text(&session_id, &message).await.is_ok() {
                         delivered = true;
                     }
-                }
-                if !delivered {
-                    if let Some(ref state) = self.notifications {
+                if !delivered
+                    && let Some(ref state) = self.notifications {
                         let entry = crate::tools::traits::NotificationEntry::new(
                             &goal_id,
                             &session_id,
@@ -5037,7 +5015,6 @@ impl TerminalTool {
                             warn!(pid, error = %e, "Failed to enqueue idle-reap notice");
                         }
                     }
-                }
             }
             reaped += 1;
         }
@@ -5317,26 +5294,24 @@ impl TerminalTool {
                 if !self_heal_note.is_empty() {
                     output.push_str(&self_heal_note);
                 }
-                if confined {
-                    if let Some(hint) = confined_opaque_failure_hint(exit_code, &stdout, &stderr) {
+                if confined
+                    && let Some(hint) = confined_opaque_failure_hint(exit_code, &stdout, &stderr) {
                         output.push_str(&hint);
                     }
-                }
                 // A signal-killed child reports no exit code, so the hint above
                 // (which keys on a non-zero code) stays silent for what is often
                 // the most confusing failure. Name the signal explicitly: it is
                 // the difference between "the program chose to exit" and "the OS
                 // killed it" (a sandbox denial the kernel enforces by SIGKILL, an
                 // out-of-memory kill, or a crash), which point at different fixes.
-                if exit_code != Some(0) {
-                    if let Some(signal) = terminating_signal {
+                if exit_code != Some(0)
+                    && let Some(signal) = terminating_signal {
                         output.push_str(&format!(
                             "\n[SYSTEM diagnostic] The command was terminated by signal {signal} ({}), not by exiting on its own. This is the OS killing the process, not the task failing: {}",
                             signal_name(signal),
                             signal_remedy_hint(signal),
                         ));
                     }
-                }
                 let mut metadata = foreground_terminal_metadata(exit_code);
                 metadata.truncation = truncation;
                 metadata.semantics = command_semantics.clone();
@@ -5770,8 +5745,8 @@ impl TerminalTool {
                                     // Its end still counts for its turn's
                                     // group: when it was the last, the others'
                                     // results go out now.
-                                    if let Some(state) = state {
-                                        if let crate::background_run::RunsTurn::Answer(answer) = run
+                                    if let Some(state) = state
+                                        && let crate::background_run::RunsTurn::Answer(answer) = run
                                             .end_in_group(
                                                 &state,
                                                 crate::run_state::RunReport {
@@ -5798,7 +5773,6 @@ impl TerminalTool {
                                                 .await;
                                             }
                                         }
-                                    }
                                 }
                                 return;
                             }
@@ -5896,8 +5870,8 @@ impl TerminalTool {
                                 DeliverableAttribution::None => None,
                             };
 
-                            if let DeliverableAttribution::One(path) = &deliverable_attribution {
-                                if exit_code == Some(0) {
+                            if let DeliverableAttribution::One(path) = &deliverable_attribution
+                                && exit_code == Some(0) {
                                     info!(
                                         pid,
                                         session_id = %session_for_notify,
@@ -5919,7 +5893,6 @@ impl TerminalTool {
                                     )
                                     .await;
                                 }
-                            }
                             // The runs its turn left running are answered
                             // together: until the last of them ends this
                             // one's end is on the card only, and the last
@@ -6285,17 +6258,16 @@ impl TerminalTool {
                             // already delivered. check/kill return early above
                             // and own their cleanup.
                             if let Some(reaped) = running_for_notify.lock().await.remove(&pid) {
-                                if let Some(ref key) = reaped.dedupe_key {
-                                    if key == &dedupe_key_for_notify {
+                                if let Some(ref key) = reaped.dedupe_key
+                                    && key == &dedupe_key_for_notify {
                                         let mut dedupe =
                                             running_by_dedupe_key_for_notify.lock().await;
                                         if dedupe.get(key).copied() == Some(pid) {
                                             dedupe.remove(key);
                                         }
                                     }
-                                }
-                                if !reaped.detached {
-                                    if let Some(ref task_id) = owner_task_id_for_notify {
+                                if !reaped.detached
+                                    && let Some(ref task_id) = owner_task_id_for_notify {
                                         let mut task_map = task_processes_for_notify.lock().await;
                                         let mut remove_task_key = false;
                                         if let Some(pids) = task_map.get_mut(task_id) {
@@ -6306,7 +6278,6 @@ impl TerminalTool {
                                             task_map.remove(task_id);
                                         }
                                     }
-                                }
                                 info!(
                                     pid,
                                     "Notifier removed finished process from running map after delivery"
@@ -6589,13 +6560,11 @@ impl TerminalTool {
         // Route background completion notifications to the origin session
         // when this terminal run is tied to a goal/task lead.
         let mut notify_session_id = exec_ctx.session_id.clone();
-        if let (Some(state), Some(goal_id)) = (self.goals.as_ref(), exec_ctx.goal_id.as_deref()) {
-            if let Ok(Some(goal)) = state.get_goal(goal_id).await {
-                if !goal.session_id.trim().is_empty() {
+        if let (Some(state), Some(goal_id)) = (self.goals.as_ref(), exec_ctx.goal_id.as_deref())
+            && let Ok(Some(goal)) = state.get_goal(goal_id).await
+                && !goal.session_id.trim().is_empty() {
                     notify_session_id = goal.session_id;
                 }
-            }
-        }
 
         let mut outcome = match TerminalAction::parse(&args.action) {
             TerminalAction::Check => {
@@ -6801,11 +6770,10 @@ impl TerminalTool {
                             .read_dir(path)
                             .await
                             .is_ok_and(|entries| entries.is_empty());
-                        if still_empty {
-                            if let Err(error) = self.backend.remove_empty_dir(path).await {
+                        if still_empty
+                            && let Err(error) = self.backend.remove_empty_dir(path).await {
                                 tracing::debug!(path = %path, %error, "Could not undo runtime-created future write root");
                             }
-                        }
                     }
                 }
                 run_outcome?
@@ -9327,11 +9295,9 @@ mod tests {
                     if let Some(prefix) = std::path::Path::new(location)
                         .parent()
                         .and_then(|bin| bin.parent())
-                    {
-                        if prefix.join("conda-meta").is_dir() {
+                        && prefix.join("conda-meta").is_dir() {
                             conda_prefix = Some((program, prefix.to_string_lossy().to_string()));
                         }
-                    }
                 }
             }
             if conda_prefix.is_some() {

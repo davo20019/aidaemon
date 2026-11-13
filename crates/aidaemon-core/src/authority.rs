@@ -73,11 +73,10 @@ impl Authority {
     /// Whether a call to `tool` with these (per-call) annotations is allowed.
     /// The error is the reason, as short text.
     pub fn permits(&self, tool: &str, annotations: ToolAnnotations) -> Result<(), String> {
-        if let Some(tools) = &self.tools {
-            if !tools.contains(tool) {
+        if let Some(tools) = &self.tools
+            && !tools.contains(tool) {
                 return Err("tool not available".into());
             }
-        }
         if self.level == AccessLevel::ReadOnly && !annotations.read_only {
             return Err("read-only".into());
         }
@@ -174,8 +173,8 @@ impl Hook for AuthorityHook {
         call: &ToolCall,
         tool: &ToolInfo,
     ) -> ToolDecision {
-        if self.delegated {
-            if let Err(reason) = self.authority.permits(&call.name, tool.annotations) {
+        if self.delegated
+            && let Err(reason) = self.authority.permits(&call.name, tool.annotations) {
                 return ToolDecision::Deny {
                     reason: format!(
                         "{AUTHORITY_BLOCKED} `{}` is outside the access this sub-agent was \
@@ -186,7 +185,6 @@ impl Hook for AuthorityHook {
                     ),
                 };
             }
-        }
         let narrowed = match &self.ceiling {
             Some(ceiling) => ceiling.ceiling().await.map(|c| self.authority.narrow(&c)),
             None => None,

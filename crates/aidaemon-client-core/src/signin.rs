@@ -196,11 +196,10 @@ pub async fn pair(
         },
     )
     .await?;
-    if let Some(expected) = &request.fingerprint {
-        if &enrollment.fingerprint != expected {
+    if let Some(expected) = &request.fingerprint
+        && &enrollment.fingerprint != expected {
             anyhow::bail!("this is not the daemon the pairing code came from");
         }
-    }
     while matches!(
         enrollment.state,
         EnrollmentState::Open | EnrollmentState::Pending
@@ -243,11 +242,10 @@ impl GrantCache {
         now_ms: u64,
     ) -> Result<String, SignInError> {
         let margin = u64::try_from(RENEW_BEFORE.as_millis()).unwrap_or(60_000);
-        if let Some(grant) = &self.grant {
-            if grant.expires_at_ms > now_ms.saturating_add(margin) {
+        if let Some(grant) = &self.grant
+            && grant.expires_at_ms > now_ms.saturating_add(margin) {
                 return Ok(grant.access_token.clone());
             }
-        }
         let grant = sign_in(http, device).await?;
         let token = grant.access_token.clone();
         self.grant = Some(grant);

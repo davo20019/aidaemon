@@ -151,11 +151,10 @@ pub fn classify_target(
             return ActionClass::Consequential;
         }
     }
-    if let Some(text) = typed_text {
-        if aidaemon_tools::consequential::names_consequential_action(text) {
+    if let Some(text) = typed_text
+        && aidaemon_tools::consequential::names_consequential_action(text) {
             return ActionClass::Consequential;
         }
-    }
     action.base_class()
 }
 

@@ -126,11 +126,10 @@ impl AlertManager {
         }
 
         // Check latency threshold
-        if is_healthy {
-            if let (Some(threshold), Some(latency)) =
+        if is_healthy
+            && let (Some(threshold), Some(latency)) =
                 (probe.latency_threshold_ms, result.latency_ms)
-            {
-                if latency > threshold {
+                && latency > threshold {
                     // Check cooldown
                     let should_alert = state
                         .last_alert_at
@@ -142,8 +141,6 @@ impl AlertManager {
                         state.last_alert_at = Some(now);
                     }
                 }
-            }
-        }
 
         state.last_status = Some(result.status.clone());
     }

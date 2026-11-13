@@ -124,12 +124,11 @@ impl SlackHost for DaemonSlackHost {
             slack.insert("allowed_user_ids".to_string(), ids_toml.clone());
             updated = true;
         }
-        if let Some(bots) = doc.get_mut("slack_bots").and_then(|v| v.as_array_mut()) {
-            if let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
+        if let Some(bots) = doc.get_mut("slack_bots").and_then(|v| v.as_array_mut())
+            && let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
                 first.insert("allowed_user_ids".to_string(), ids_toml);
                 updated = true;
             }
-        }
 
         if !updated {
             anyhow::bail!("No [slack] or [[slack_bots]] section found in config");

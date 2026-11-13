@@ -184,15 +184,14 @@ impl ContextWindowConfig {
         if let Some(&chars) = self.model_tool_result_chars.get(model) {
             return chars;
         }
-        if let Some(&budget) = self.model_budgets.get(model) {
-            if let Some(scaled) = self
+        if let Some(&budget) = self.model_budgets.get(model)
+            && let Some(scaled) = self
                 .max_tool_result_chars
                 .saturating_mul(budget)
                 .checked_div(self.default_budget)
             {
                 return scaled.max(MIN_TOOL_RESULT_CHARS);
             }
-        }
         self.max_tool_result_chars
     }
 

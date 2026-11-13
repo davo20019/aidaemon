@@ -346,24 +346,22 @@ pub fn check_trajectory<O, X>(expect: &Expect<X>, trajectory: &Trajectory<O>) ->
     let tools: Vec<&str> = receipts.iter().map(|r| r.tool.as_str()).collect();
     let actual_status = trajectory.status.as_str();
 
-    if let Some(expected) = expect.status {
-        if expected.as_str() != actual_status {
+    if let Some(expected) = expect.status
+        && expected.as_str() != actual_status {
             failures.push(format!(
                 "status: expected `{}`, got `{actual_status}` ({})",
                 expected.as_str(),
                 trajectory.status_detail
             ));
         }
-    }
 
-    if let Some(expected) = expect.succeeded {
-        if trajectory.succeeded != expected {
+    if let Some(expected) = expect.succeeded
+        && trajectory.succeeded != expected {
             failures.push(format!(
                 "succeeded: expected `{expected}`, got `{}` (status {actual_status}, unmet: {:?})",
                 trajectory.succeeded, trajectory.unmet
             ));
         }
-    }
 
     let text = trajectory.final_text.as_deref().unwrap_or_default();
     let lower = text.to_lowercase();
@@ -451,14 +449,13 @@ pub fn check_trajectory<O, X>(expect: &Expect<X>, trajectory: &Trajectory<O>) ->
         }
     }
 
-    if let Some(max) = expect.max_turns {
-        if trajectory.turns > max {
+    if let Some(max) = expect.max_turns
+        && trajectory.turns > max {
             failures.push(format!(
                 "max_turns: used {} turns, limit {max}",
                 trajectory.turns
             ));
         }
-    }
     if let Some(max) = expect.max_billable_tokens {
         let used = trajectory.billable_tokens;
         if used > max {

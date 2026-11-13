@@ -1151,8 +1151,8 @@ impl FactStore for SqliteMemory {
         {
             existing = Some((row.get("id"), row.get("key"), row.get("value")));
         } else {
-            if canonical_key != key_clean {
-                if let Some(row) = sqlx::query(
+            if canonical_key != key_clean
+                && let Some(row) = sqlx::query(
                     "SELECT id, key, value FROM facts WHERE category = ? AND key = ? AND superseded_at IS NULL",
                 )
                 .bind(category_clean)
@@ -1162,7 +1162,6 @@ impl FactStore for SqliteMemory {
                 {
                     existing = Some((row.get("id"), row.get("key"), row.get("value")));
                 }
-            }
 
             if existing.is_none() && !canonical_key.is_empty() {
                 // Canonical scan: match an existing key by canonical form.
@@ -1616,9 +1615,9 @@ impl FactStore for SqliteMemory {
         // - Lexical overlap: at least one significant word from the new
         //   fact's key or value must appear in the other fact's key or value
         //   (prevents cross-concept supersession in the same category)
-        if source == "agent" {
-            if let Some(ref new_emb_blob) = embedding_blob {
-                if let Ok(new_vec) = decode_embedding(new_emb_blob) {
+        if source == "agent"
+            && let Some(ref new_emb_blob) = embedding_blob
+                && let Ok(new_vec) = decode_embedding(new_emb_blob) {
                     let others = sqlx::query(
                         "SELECT id, key, value, embedding FROM facts
                          WHERE category = ? AND superseded_at IS NULL
@@ -1682,8 +1681,6 @@ impl FactStore for SqliteMemory {
                         }
                     }
                 }
-            }
-        }
 
         if let Err(error) = self.sync_fact_memory_written_at(category_clean, &now).await {
             tracing::warn!(%error, category = category_clean, "Deferred fact memory projection");

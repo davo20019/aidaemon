@@ -10,11 +10,10 @@ pub async fn task_has_scheduled_provenance<S: SchedulerStore + ?Sized>(
     state: &S,
     task_id: Option<&str>,
 ) -> bool {
-    if let Some(tid) = task_id {
-        if let Ok(Some(run)) = state.get_goal_run_for_task(tid).await {
+    if let Some(tid) = task_id
+        && let Ok(Some(run)) = state.get_goal_run_for_task(tid).await {
             return is_scheduled_cycle_trigger(&run.trigger_type);
         }
-    }
 
     false
 }
@@ -50,17 +49,15 @@ pub async fn goal_has_scheduled_provenance<S: SchedulerStore + ?Sized>(
         return true;
     }
 
-    if let Ok(schedules) = state.get_schedules_for_goal(goal_id).await {
-        if !schedules.is_empty() {
+    if let Ok(schedules) = state.get_schedules_for_goal(goal_id).await
+        && !schedules.is_empty() {
             return true;
         }
-    }
 
-    if let Ok(runs) = state.get_goal_runs(goal_id).await {
-        if runs.iter().any(|run| run.trigger_type == "scheduled") {
+    if let Ok(runs) = state.get_goal_runs(goal_id).await
+        && runs.iter().any(|run| run.trigger_type == "scheduled") {
             return true;
         }
-    }
 
     false
 }

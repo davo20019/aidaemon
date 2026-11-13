@@ -513,8 +513,8 @@ impl ManageHttpAuthTool {
                         .keys
                         .push(EffectKey::named(EffectClass::Credential, &profile));
                 }
-                if args.action == "verify" {
-                    if let Some(host) = args
+                if args.action == "verify"
+                    && let Some(host) = args
                         .url
                         .as_deref()
                         .map(str::trim)
@@ -523,7 +523,6 @@ impl ManageHttpAuthTool {
                     {
                         effects.keys.push(host);
                     }
-                }
                 effects
             }
             _ => CallEffects::unknown(),
@@ -1186,10 +1185,10 @@ impl Tool for ManageHttpAuthTool {
                 &[ToolSemanticFacet::Authorization],
                 members,
             ));
-        } else if matches!(args.action.as_str(), "describe" | "verify") {
-            if let Some(profile) = args.profile.as_deref() {
-                if let Ok(profile) = Self::validate_profile_name(profile) {
-                    if let Some(subject) = ToolTargetHint::new(
+        } else if matches!(args.action.as_str(), "describe" | "verify")
+            && let Some(profile) = args.profile.as_deref()
+                && let Ok(profile) = Self::validate_profile_name(profile)
+                    && let Some(subject) = ToolTargetHint::new(
                         ToolTargetHintKind::ResourceId,
                         HttpRequestTool::auth_profile_resource_id(&profile),
                     ) {
@@ -1198,9 +1197,6 @@ impl Tool for ManageHttpAuthTool {
                             &[ToolSemanticFacet::Authorization],
                         ));
                     }
-                }
-            }
-        }
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
@@ -1309,14 +1305,13 @@ impl crate::semantics::ToolSemantics for ManageHttpAuthTool {
                     Self::AUTH_PROFILE_COLLECTION_ID,
                 );
             }
-            if let Some(profile) = args.profile.as_deref() {
-                if let Ok(profile) = Self::validate_profile_name(profile) {
+            if let Some(profile) = args.profile.as_deref()
+                && let Ok(profile) = Self::validate_profile_name(profile) {
                     semantics = semantics.with_target_hint(
                         ToolTargetHintKind::ResourceId,
                         HttpRequestTool::auth_profile_resource_id(&profile),
                     );
                 }
-            }
         }
         semantics
     }

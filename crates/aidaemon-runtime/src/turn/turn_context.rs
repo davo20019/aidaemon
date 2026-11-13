@@ -587,8 +587,8 @@ pub trait TurnHistory: TurnHost {
         );
         let mut inherited_completion_contract = false;
         let mut inherited_outstanding_obligations = false;
-        if followup_mode != FollowupMode::NewTask {
-            if let Some(request) = related_open_request(dialogue_state.as_ref(), followup_mode) {
+        if followup_mode != FollowupMode::NewTask
+            && let Some(request) = related_open_request(dialogue_state.as_ref(), followup_mode) {
                 let mut unfinished_contract = request
                     .completion_contract
                     .as_ref()
@@ -620,7 +620,6 @@ pub trait TurnHistory: TurnHost {
                     inherit_unfinished_request_contract(completion_contract, &unfinished_contract)
                 };
             }
-        }
         if self.role() == aidaemon_events::traits::AgentRole::Executor {
             completion_contract = scope_contract_for_delegated_executor(completion_contract);
         }

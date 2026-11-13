@@ -89,11 +89,10 @@ pub fn canonicalize_dispatched_call(
             )
         }
     };
-    if let Some(explicit) = &canonical.explicit_dir {
-        if let Ok(mut known) = scope.known_project_dir.lock() {
+    if let Some(explicit) = &canonical.explicit_dir
+        && let Ok(mut known) = scope.known_project_dir.lock() {
             *known = Some(explicit.clone());
         }
-    }
     if !canonical.stripped_read_roots.is_empty() {
         info!(
             task_id = scope.task_id,
@@ -563,13 +562,12 @@ impl TurnEngine<'_> {
                                 aidaemon_tools::local_sites::served_within(cwd, &write_roots)
                             })
             );
-        if reports_sites {
-            if let ExecutedOutcome::Returned { outcome, .. } = &executed {
+        if reports_sites
+            && let ExecutedOutcome::Returned { outcome, .. } = &executed {
                 let grant =
                     crate::approvals::grant_session(self.approval_session_id(), scope.session_id);
                 aidaemon_tools::local_sites::note_sites_in(&grant, &outcome.output).await;
             }
-        }
         // The first untrusted read records the turn as tainted at once, so a
         // run that never finishes still taints later turns that see it.
         if trust == sdk::SourceTrust::Untrusted {
@@ -580,8 +578,7 @@ impl TurnEngine<'_> {
             && !scope
                 .untrusted_seen
                 .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            if let Err(error) = crate::untrusted::record_tainted_turn(
+            && let Err(error) = crate::untrusted::record_tainted_turn(
                 self.settings(),
                 scope.session_id,
                 scope.turn_id,
@@ -590,7 +587,6 @@ impl TurnEngine<'_> {
             {
                 warn!(session_id = scope.session_id, %error, "Could not record a tainted turn");
             }
-        }
         scope.executed_calls.insert(
             request.run_id,
             &request.call_id,
@@ -1051,13 +1047,11 @@ impl TurnEngine<'_> {
                     )
                     .read_only
             });
-            if changed {
-                if let Ok(mut after) = scope.after_helper.lock() {
-                    if let Some(after) = after.as_mut() {
+            if changed
+                && let Ok(mut after) = scope.after_helper.lock()
+                    && let Some(after) = after.as_mut() {
                         after.did_work = true;
                     }
-                }
-            }
         }
         // Budget progress counts distinct successful operations: repeating
         // an identical call is not new evidence.
@@ -1076,11 +1070,10 @@ impl TurnEngine<'_> {
                 scope.repeating.store(!new_operation, Ordering::Relaxed);
             }
         }
-        if let (Some(key), false) = (send_file_key, failed) {
-            if let Ok(mut sent) = scope.sent_files.lock() {
+        if let (Some(key), false) = (send_file_key, failed)
+            && let Ok(mut sent) = scope.sent_files.lock() {
                 sent.insert(key);
             }
-        }
         if let Some(status_tx) = &scope.status_tx {
             let update = if facts.requirement_checklist {
                 // The card is the plan as stored, with its step count: never
@@ -1137,13 +1130,12 @@ impl TurnEngine<'_> {
         }) && self
             .turn_tool(scope, &request.name)
             .is_some_and(|tool| tool.capabilities().external_side_effect);
-        if external_mutation {
-            if let Ok(mut ack) = scope.verdict.external_action_ack.lock() {
+        if external_mutation
+            && let Ok(mut ack) = scope.verdict.external_action_ack.lock() {
                 *ack = (!failed
                     && crate::turn::tool_dispatch::should_build_external_action_ack(&output))
                 .then(|| crate::turn::tool_dispatch::build_external_action_completion_ack(&output));
             }
-        }
         if let Ok(mut learning) = scope.learning.lock() {
             let rejected = metadata
                 .as_ref()
@@ -1186,8 +1178,8 @@ impl TurnEngine<'_> {
             warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool result");
         }
         // The executor's own checklist becomes ledger expectations.
-        if facts.requirement_checklist && !failed {
-            if let Some(declared) =
+        if facts.requirement_checklist && !failed
+            && let Some(declared) =
                 aidaemon_work::plans::checklist_args::executor_expectations_from_checklist_arguments(
                     scope.task_id,
                     arguments,
@@ -1219,13 +1211,10 @@ impl TurnEngine<'_> {
                 if let Some(plan) = self
                     .confirm_checklist_from_receipts(scope.session_id, scope.task_id)
                     .await
-                {
-                    if let Some(status_tx) = &scope.status_tx {
+                    && let Some(status_tx) = &scope.status_tx {
                         let _ = status_tx.try_send(StatusUpdate::Checklist(plan));
                     }
-                }
             }
-        }
         info!(
             session_id = scope.session_id,
             task_id = scope.task_id,

@@ -351,12 +351,11 @@ pub fn prune_spill_dir() {
                 continue;
             };
             for file in files.flatten() {
-                if let Ok(meta) = file.metadata() {
-                    if meta.is_file() {
+                if let Ok(meta) = file.metadata()
+                    && meta.is_file() {
                         let mtime = meta.modified().unwrap_or(now);
                         entries.push((file.path(), mtime, meta.len()));
                     }
-                }
             }
         }
     }

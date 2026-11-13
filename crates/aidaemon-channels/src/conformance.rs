@@ -348,14 +348,13 @@ pub async fn check_channel(
     {
         let result = session.next_message("probe named").await.and_then(|m| {
             let mut problems = Vec::new();
-            if let Ok(plain) = &first {
-                if m.sender.id != plain.sender.id {
+            if let Ok(plain) = &first
+                && m.sender.id != plain.sender.id {
                     problems.push(format!(
                         "sender id changed with the name: {:?} became {:?}",
                         plain.sender.id, m.sender.id
                     ));
                 }
-            }
             let name = m.sender.display_name.unwrap_or_default();
             if name.chars().any(|c| c.is_control() || c == '\u{202E}') {
                 problems.push(format!("control characters kept in {name:?}"));

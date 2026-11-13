@@ -372,13 +372,11 @@ impl App {
                 },
             ..
         } = frame
-        {
-            if self.awaiting_new {
+            && self.awaiting_new {
                 self.awaiting_new = false;
                 self.selected = Some(session_id.clone());
                 self.fetched.insert(session_id.clone());
             }
-        }
     }
 
     /// Show session `id`; the history request when it was never fetched.
@@ -564,8 +562,8 @@ impl App {
                     None
                 }
                 KeyCode::Char(pressed) if self.input.is_empty() && !ctrl && !alt => {
-                    if let Some(approval) = self.armed_card(now) {
-                        if let Some(decision) = approval
+                    if let Some(approval) = self.armed_card(now)
+                        && let Some(decision) = approval
                             .options
                             .iter()
                             .find(|decision| key_of(**decision).0 == pressed)
@@ -575,7 +573,6 @@ impl App {
                                 decision: *decision,
                             }));
                         }
-                    }
                     self.input.push(pressed);
                     None
                 }
@@ -1037,14 +1034,13 @@ impl App {
                 )),
                 _ => {}
             }
-            if let CardAction::Command { looks_inside, .. } = &card.action {
-                if !looks_inside.is_empty() {
+            if let CardAction::Command { looks_inside, .. } = &card.action
+                && !looks_inside.is_empty() {
                     lines.push(TextLine::from(format!(
                         "Only looks inside: {}",
                         looks_inside.join(", ")
                     )));
                 }
-            }
         }
         for warning in &approval.warnings {
             lines.push(TextLine::from(format!("• {warning}")));

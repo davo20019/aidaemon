@@ -368,8 +368,8 @@ impl SqliteMemory {
                 .fetch_one(&self.pool)
                 .await?;
 
-        if let Some(blob) = row.get::<Option<Vec<u8>>, _>("embedding") {
-            if let Ok(embedding) = decode_embedding(&blob) {
+        if let Some(blob) = row.get::<Option<Vec<u8>>, _>("embedding")
+            && let Ok(embedding) = decode_embedding(&blob) {
                 self.embedding_index
                     .upsert(EmbeddingItem {
                         owner: MemoryOwner::new("claim", claim_id),
@@ -380,7 +380,6 @@ impl SqliteMemory {
                     })
                     .await?;
             }
-        }
 
         self.project_claim_graph(claim_id, &category, &key, &privacy, channel_id.as_deref())
             .await?;
@@ -434,8 +433,8 @@ impl SqliteMemory {
                 .bind(episode_id)
                 .fetch_one(&self.pool)
                 .await?;
-        if let Some(blob) = row.get::<Option<Vec<u8>>, _>("embedding") {
-            if let Ok(embedding) = decode_embedding(&blob) {
+        if let Some(blob) = row.get::<Option<Vec<u8>>, _>("embedding")
+            && let Ok(embedding) = decode_embedding(&blob) {
                 self.embedding_index
                     .upsert(EmbeddingItem {
                         owner: MemoryOwner::new("span", span_id),
@@ -446,7 +445,6 @@ impl SqliteMemory {
                     })
                     .await?;
             }
-        }
         Ok(())
     }
 

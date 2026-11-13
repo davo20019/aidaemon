@@ -103,11 +103,10 @@ impl SqliteMemory {
                 ("Communication style", "communication_style"),
                 ("Language", "language_preference"),
             ] {
-                if let Some(value) = person.get::<Option<String>, _>(column) {
-                    if !value.trim().is_empty() && value != "[]" && value != "{}" {
+                if let Some(value) = person.get::<Option<String>, _>(column)
+                    && !value.trim().is_empty() && value != "[]" && value != "{}" {
                         let _ = writeln!(content, "- {label}: {}", one_line(&value));
                     }
-                }
             }
             let facts = sqlx::query(
                 "SELECT category, key, value FROM person_facts

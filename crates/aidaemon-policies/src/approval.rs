@@ -367,11 +367,10 @@ impl ApprovalPolicy {
         if let Some(refusal) = declined_subject(ctx, &request) {
             return refusal;
         }
-        if let Some(grants) = &self.grants {
-            if grants.covers(&request).await {
+        if let Some(grants) = &self.grants
+            && grants.covers(&request).await {
                 return ToolDecision::Allow;
             }
-        }
         interrupt(request, info)
     }
 }
@@ -534,11 +533,10 @@ impl Hook for ApprovalPolicy {
             }
             // The owner already allowed this exact call on the safety
             // check's card: one answer covers it.
-            if let Some(grants) = &self.grants {
-                if grants.take_call_allowed_once(&request.subject).await {
+            if let Some(grants) = &self.grants
+                && grants.take_call_allowed_once(&request.subject).await {
                     return decision;
                 }
-            }
             if let Some(card) = &mut request.card {
                 card.reason = Some(aidaemon_core::AskReason::AfterADecline {
                     declined: declined_in_words(ctx.declined),

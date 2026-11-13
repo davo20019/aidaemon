@@ -388,11 +388,10 @@ impl MockProvider {
             cache_key: None,
             ..options.clone()
         };
-        if let crate::traits::ResponseMode::JsonSchema { name, .. } = &options.response_mode {
-            if self.failing_response_schemas.contains(name) {
+        if let crate::traits::ResponseMode::JsonSchema { name, .. } = &options.response_mode
+            && self.failing_response_schemas.contains(name) {
                 return Err(ProviderError::from_status(503, "synthetic schema lane outage").into());
             }
-        }
         if self.reject_non_default_options && provider_facing != ChatOptions::default() {
             return Err(ProviderError::from_status(400, "unsupported chat options").into());
         }
@@ -1702,8 +1701,9 @@ pub fn test_policy_config() -> crate::config::PolicyConfig {
 /// test cannot leak its redirect into the next one, and a poisoned lock is
 /// recovered instead of cascading one failure into every later holder.
 pub struct KeychainIsolation {
+    // Declared first so the variables are restored before the lock is let go.
+    vars: EnvVars,
     _lock: std::sync::MutexGuard<'static, ()>,
-    previous: Vec<(String, Option<String>)>,
     env_file: tempfile::NamedTempFile,
 }
 
@@ -1718,8 +1718,8 @@ impl KeychainIsolation {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env_file = tempfile::NamedTempFile::new().expect("create isolated env file");
         let mut isolation = Self {
+            vars: EnvVars::default(),
             _lock: lock,
-            previous: Vec::new(),
             env_file,
         };
         isolation.set("AIDAEMON_NO_KEYCHAIN", "1");
@@ -1735,14 +1735,42 @@ impl KeychainIsolation {
 
     /// Override another process-global variable for the guard's lifetime.
     pub fn set(&mut self, name: &str, value: &str) {
-        self.remember(name);
-        std::env::set_var(name, value);
+        self.vars.set(name, value);
     }
 
     /// Clear another process-global variable for the guard's lifetime.
     pub fn unset(&mut self, name: &str) {
+        self.vars.unset(name);
+    }
+}
+
+/// Process environment overrides for one test, undone when dropped.
+///
+/// This is the one place the crate's tests write the process environment.
+/// It takes no lock of its own: tests that share a variable serialize on
+/// `#[serial_test::serial(env_vars)]` or a module lock, and secret-store
+/// tests go through [`KeychainIsolation`], which holds one of these.
+#[derive(Default)]
+pub struct EnvVars {
+    previous: Vec<(String, Option<String>)>,
+}
+
+impl EnvVars {
+    /// Set `name` for the guard's lifetime.
+    pub fn set(&mut self, name: &str, value: &str) {
         self.remember(name);
-        std::env::remove_var(name);
+        // SAFETY: test-only. std serializes its own environment reads and
+        // writes, and the tests sharing this variable are serialized as
+        // described on the type; what remains is foreign code calling
+        // getenv concurrently, a risk the test binary accepts.
+        unsafe { std::env::set_var(name, value) };
+    }
+
+    /// Clear `name` for the guard's lifetime.
+    pub fn unset(&mut self, name: &str) {
+        self.remember(name);
+        // SAFETY: as in `set`.
+        unsafe { std::env::remove_var(name) };
     }
 
     fn remember(&mut self, name: &str) {
@@ -1751,13 +1779,16 @@ impl KeychainIsolation {
     }
 }
 
-impl Drop for KeychainIsolation {
+impl Drop for EnvVars {
     fn drop(&mut self) {
         // Reverse order so a variable set twice lands on its original value.
         for (name, previous) in self.previous.drain(..).rev() {
-            match previous {
-                Some(value) => std::env::set_var(&name, value),
-                None => std::env::remove_var(&name),
+            // SAFETY: as in `EnvVars::set`.
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var(&name, value),
+                    None => std::env::remove_var(&name),
+                }
             }
         }
     }
@@ -1765,14 +1796,15 @@ impl Drop for KeychainIsolation {
 
 #[cfg(test)]
 mod keychain_isolation_tests {
-    use super::KeychainIsolation;
+    use super::{EnvVars, KeychainIsolation};
 
     #[test]
     fn acquire_redirects_and_drop_restores_original_values() {
         // Only the private marker is asserted after the drop: the shared
         // variables belong to whichever test acquires the lock next.
         let marker = "AIDAEMON_TEST_ISOLATION_MARKER";
-        std::env::set_var(marker, "before");
+        let mut outer = EnvVars::default();
+        outer.set(marker, "before");
 
         {
             let mut isolation = KeychainIsolation::acquire();
@@ -1790,6 +1822,6 @@ mod keychain_isolation_tests {
         }
 
         assert_eq!(std::env::var(marker).as_deref(), Ok("before"));
-        std::env::remove_var(marker);
+        drop(outer);
     }
 }

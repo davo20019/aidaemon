@@ -287,8 +287,8 @@ impl GoalCycle {
                 break;
             }
             delivery_attempts = delivery_attempts.saturating_add(1);
-            if entry.notification_type == "escalation" {
-                if let Some(task_id) = entry.task_id.as_deref() {
+            if entry.notification_type == "escalation"
+                && let Some(task_id) = entry.task_id.as_deref() {
                     // Give the coordinator a brief chance to reconcile the
                     // executor handoff, then verify the linked task is still
                     // blocked. This prevents a stale critical notification
@@ -322,7 +322,6 @@ impl GoalCycle {
                         }
                     }
                 }
-            }
             let sanitized = self.presenter.user_facing(&entry.message);
             let delivered = if let Some(hub) = self.hub.clone() {
                 let message = self

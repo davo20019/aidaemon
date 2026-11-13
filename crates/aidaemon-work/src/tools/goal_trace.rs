@@ -319,11 +319,10 @@ impl GoalTraceTool {
                 if let Some(err) = &t.error {
                     out.push_str(&format!("\n  error: {}", Self::truncate(err, 180)));
                 }
-            } else if t.status == "blocked" {
-                if let Some(blocker) = &t.blocker {
+            } else if t.status == "blocked"
+                && let Some(blocker) = &t.blocker {
                     out.push_str(&format!("\n  blocker: {}", Self::truncate(blocker, 180)));
                 }
-            }
         }
 
         Ok(out)

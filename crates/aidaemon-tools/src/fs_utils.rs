@@ -165,11 +165,10 @@ pub fn normalize_project_scope_path(
 ) -> anyhow::Result<PathBuf> {
     if backend.kind() != BackendKind::Local {
         let mut normalized = validate_path(backend, path)?;
-        if path_points_to_file(path.trim_end_matches('/')) {
-            if let Some(parent) = normalized.parent() {
+        if path_points_to_file(path.trim_end_matches('/'))
+            && let Some(parent) = normalized.parent() {
                 normalized = parent.to_path_buf();
             }
-        }
         return Ok(normalized);
     }
 
@@ -182,17 +181,15 @@ pub fn normalize_project_scope_path(
     }
 
     let trimmed = path.trim_end_matches('/');
-    if normalized.is_file() || (!normalized.exists() && path_points_to_file(trimmed)) {
-        if let Some(parent) = normalized.parent() {
+    if (normalized.is_file() || (!normalized.exists() && path_points_to_file(trimmed)))
+        && let Some(parent) = normalized.parent() {
             normalized = parent.to_path_buf();
         }
-    }
 
-    if normalized.exists() {
-        if let Some(root) = find_nearest_project_root(&normalized) {
+    if normalized.exists()
+        && let Some(root) = find_nearest_project_root(&normalized) {
             normalized = root;
         }
-    }
 
     Ok(normalized)
 }
@@ -409,13 +406,11 @@ static PROJECT_ROOT_CATALOG_CACHE: LazyLock<Mutex<HashMap<PathBuf, CachedProject
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn project_root_directory_entries(root: &Path) -> Vec<(String, PathBuf)> {
-    if let Ok(cache) = PROJECT_ROOT_CATALOG_CACHE.lock() {
-        if let Some(cached) = cache.get(root) {
-            if cached.scanned_at.elapsed() <= PROJECT_ROOT_CATALOG_TTL {
+    if let Ok(cache) = PROJECT_ROOT_CATALOG_CACHE.lock()
+        && let Some(cached) = cache.get(root)
+            && cached.scanned_at.elapsed() <= PROJECT_ROOT_CATALOG_TTL {
                 return cached.entries.clone();
             }
-        }
-    }
 
     let mut entries = Vec::new();
     let Ok(dir_entries) = std::fs::read_dir(root) else {
@@ -452,11 +447,10 @@ pub fn project_search_roots(
     if backend.kind() != BackendKind::Local {
         let mut roots = Vec::new();
         for raw_root in alias_roots {
-            if let Ok(root) = validate_path(backend, raw_root) {
-                if !roots.iter().any(|existing| existing == &root) {
+            if let Ok(root) = validate_path(backend, raw_root)
+                && !roots.iter().any(|existing| existing == &root) {
                     roots.push(root);
                 }
-            }
         }
         let workspace = PathBuf::from(backend.workspace_root().as_str());
         if !roots.iter().any(|existing| existing == &workspace) {
@@ -580,13 +574,12 @@ pub fn resolve_named_project_root(
 
     for root in project_search_roots(backend, alias_roots) {
         let direct = root.join(token);
-        if direct.is_dir() {
-            if let Ok(normalized) =
+        if direct.is_dir()
+            && let Ok(normalized) =
                 normalize_project_scope_path(backend, direct.to_string_lossy().as_ref())
             {
                 return Some(normalized);
             }
-        }
 
         for (name, path) in project_root_directory_entries(&root) {
             if name != target {
@@ -803,8 +796,8 @@ pub async fn backup_before_overwrite(
     path: &BackendPath,
     backup_root: Option<&Path>,
 ) {
-    if backend.kind() == BackendKind::Local {
-        if let Some(backup) =
+    if backend.kind() == BackendKind::Local
+        && let Some(backup) =
             backup_root.and_then(|root| local_backup_path(root, Path::new(path.as_str())))
         {
             if let Some(dir) = backup.parent() {
@@ -813,7 +806,6 @@ pub async fn backup_before_overwrite(
             let _ = tokio::fs::copy(path.as_str(), &backup).await;
             return;
         }
-    }
     let backup = path.with_extension(&format!("{}.bak", path.extension().unwrap_or_default()));
     let _ = backend.copy(path, &backup).await;
 }

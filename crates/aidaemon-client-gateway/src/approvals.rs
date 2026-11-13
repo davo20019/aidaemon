@@ -111,15 +111,14 @@ impl Approvals {
                 format!("{decision:?} is not offered for this approval"),
             ));
         }
-        if let Some(ceiling) = ceiling {
-            if decision != ApprovalDecision::Deny && open.approval.risk > ceiling {
+        if let Some(ceiling) = ceiling
+            && decision != ApprovalDecision::Deny && open.approval.risk > ceiling {
                 return Err(ProtocolError::new(
                     ErrorCode::Forbidden,
                     "This approval is above what this device may allow: open it on your phone \
                      or computer (denying it from here is fine)",
                 ));
             }
-        }
         let Some(answer) = open.answer.take() else {
             return Err(ProtocolError::new(
                 ErrorCode::Conflict,

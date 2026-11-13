@@ -26,14 +26,12 @@ fn collect_segments(command: &str, depth: usize, out: &mut Vec<Vec<String>>) {
             collect_segments(&stripped[1..].join(" "), depth + 1, out);
             continue;
         }
-        if depth < 4 && is_shell(&stripped[0]) {
-            if let Some(pos) = stripped.iter().position(|t| runs_a_string(t)) {
-                if let Some(inner) = stripped.get(pos + 1) {
+        if depth < 4 && is_shell(&stripped[0])
+            && let Some(pos) = stripped.iter().position(|t| runs_a_string(t))
+                && let Some(inner) = stripped.get(pos + 1) {
                     collect_segments(inner, depth + 1, out);
                     continue;
                 }
-            }
-        }
         out.push(stripped);
     }
 }
@@ -102,11 +100,10 @@ fn split_raw(command: &str) -> Vec<Vec<String>> {
             }
             '\\' => {
                 in_token = true;
-                if let Some(next) = chars.next() {
-                    if next != '\n' {
+                if let Some(next) = chars.next()
+                    && next != '\n' {
                         current.push(next);
                     }
-                }
             }
             '$' if chars.peek() == Some(&'(') => {
                 chars.next();
@@ -302,11 +299,10 @@ fn segment_reason(tokens: &[String]) -> Option<String> {
             if flags.iter().any(|f| f == "--no-preserve-root") {
                 return Some("`rm --no-preserve-root` is never allowed".into());
             }
-            if recursive {
-                if let Some(target) = operands.iter().find(|o| is_catastrophic_target(o)) {
+            if recursive
+                && let Some(target) = operands.iter().find(|o| is_catastrophic_target(o)) {
                     return Some(format!("recursive `rm` of `{target}` is never allowed"));
                 }
-            }
             None
         }
         "chmod" | "chown" | "chgrp" if recursive => operands

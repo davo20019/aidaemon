@@ -46,11 +46,10 @@ pub fn attach_source_provenance(value: &mut Value, messages: &[&Message]) {
         if !message.id.is_empty() && !message_ids.contains(&message.id) {
             message_ids.push(message.id.clone());
         }
-        if let Some(turn_id) = message.turn_id.as_ref() {
-            if !turn_id.is_empty() && !turn_ids.contains(turn_id) {
+        if let Some(turn_id) = message.turn_id.as_ref()
+            && !turn_id.is_empty() && !turn_ids.contains(turn_id) {
                 turn_ids.push(turn_id.clone());
             }
-        }
     }
     if !message_ids.is_empty() {
         object.insert(SOURCE_MESSAGE_IDS_KEY.to_string(), json!(message_ids));
@@ -227,11 +226,10 @@ fn wire_tool_calls(tc_json: &str, result_ids: &std::collections::HashSet<&str>) 
 
 /// Attach `name` / `tool_call_id` fields when present.
 fn attach_tool_routing(obj: &mut Value, m: &Message) {
-    if let Some(name) = &m.tool_name {
-        if !name.is_empty() {
+    if let Some(name) = &m.tool_name
+        && !name.is_empty() {
             obj["name"] = json!(name);
         }
-    }
     if let Some(tcid) = &m.tool_call_id {
         obj["tool_call_id"] = json!(tcid);
     }
@@ -696,17 +694,15 @@ fn maybe_emit_placeholder(
 /// the turn's assistant `tool_calls`.
 fn tool_args_for_call(turn_messages: &[Message], call_id: &str) -> Option<String> {
     for m in turn_messages.iter() {
-        if m.role == "assistant" {
-            if let Some(tc_json) = &m.tool_calls_json {
-                if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
+        if m.role == "assistant"
+            && let Some(tc_json) = &m.tool_calls_json
+                && let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
                     for tc in &tcs {
                         if tc.id == call_id {
                             return Some(tc.arguments.clone());
                         }
                     }
                 }
-            }
-        }
     }
     None
 }

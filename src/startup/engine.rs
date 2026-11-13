@@ -40,8 +40,8 @@ pub(crate) fn settings_from_config(
         // An engine api_key marks a config written for the engine's former
         // dedicated Anthropic client; its model pin named a model for that
         // client, which the daemon's own provider may not serve.
-        if config.provider.kind != ProviderKind::Anthropic {
-            if let Some(model) = model_override.take() {
+        if config.provider.kind != ProviderKind::Anthropic
+            && let Some(model) = model_override.take() {
                 warn!(
                     model = %model,
                     "[agent.engine] model is ignored: it was configured for the removed \
@@ -49,7 +49,6 @@ pub(crate) fn settings_from_config(
                      daemon's provider serves"
                 );
             }
-        }
     }
     let settings = SdkEngineSettings {
         model_override,

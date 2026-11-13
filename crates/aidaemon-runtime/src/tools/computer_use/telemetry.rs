@@ -121,8 +121,8 @@ impl SessionTelemetry {
             stats.mutations_budget_max = budget.max;
             stats.last_mutations_used = budget.used;
         }
-        if record.action == "click" {
-            if let Some(target) = record.target {
+        if record.action == "click"
+            && let Some(target) = record.target {
                 let label = target.label().unwrap_or_else(|| "?".to_string());
                 let index = target.index.unwrap_or(0);
                 let entry = format!("{index}:{label}");
@@ -133,7 +133,6 @@ impl SessionTelemetry {
                     stats.click_targets.drain(0..drain);
                 }
             }
-        }
     }
 
     pub async fn finish_task(&self, task_id: &str) -> Option<SessionSummary> {
@@ -209,8 +208,8 @@ pub fn log_action(log: &ActionLog<'_>) {
             is_mutation = log.is_mutation,
             "computer_use action"
         );
-        if let Some(budget) = log.budget {
-            if budget.near_limit() && !budget.at_limit() {
+        if let Some(budget) = log.budget
+            && budget.near_limit() && !budget.at_limit() {
                 tracing::warn!(
                     target: "computer_use",
                     task_id = log.task_id,
@@ -220,7 +219,6 @@ pub fn log_action(log: &ActionLog<'_>) {
                     "computer_use mutation budget nearly exhausted"
                 );
             }
-        }
     } else {
         tracing::warn!(
             target: "computer_use",

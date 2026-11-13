@@ -57,24 +57,22 @@ fn convert_inline_formatting_to_plain(s: &str) -> String {
     let mut i = 0;
 
     while i < len {
-        if chars[i] == '`' {
-            if let Some(end) = find_char(&chars, '`', i + 1) {
+        if chars[i] == '`'
+            && let Some(end) = find_char(&chars, '`', i + 1) {
                 result.extend(chars[i + 1..end].iter());
                 i = end + 1;
                 continue;
             }
-        }
 
-        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
-            if let Some(end) = find_double_char(&chars, '*', i + 2) {
+        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*'
+            && let Some(end) = find_double_char(&chars, '*', i + 2) {
                 result.extend(chars[i + 2..end].iter());
                 i = end + 2;
                 continue;
             }
-        }
 
-        if chars[i] == '[' {
-            if let Some((text, url, end)) = parse_link(&chars, i) {
+        if chars[i] == '['
+            && let Some((text, url, end)) = parse_link(&chars, i) {
                 result.push_str(&text);
                 if !url.is_empty() {
                     result.push_str(" (");
@@ -84,23 +82,20 @@ fn convert_inline_formatting_to_plain(s: &str) -> String {
                 i = end;
                 continue;
             }
-        }
 
-        if chars[i] == '_' {
-            if let Some(end) = find_char(&chars, '_', i + 1) {
+        if chars[i] == '_'
+            && let Some(end) = find_char(&chars, '_', i + 1) {
                 result.extend(chars[i + 1..end].iter());
                 i = end + 1;
                 continue;
             }
-        }
 
-        if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*') {
-            if let Some(end) = find_single_star(&chars, i + 1) {
+        if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*')
+            && let Some(end) = find_single_star(&chars, i + 1) {
                 result.extend(chars[i + 1..end].iter());
                 i = end + 1;
                 continue;
             }
-        }
 
         result.push(chars[i]);
         i += 1;

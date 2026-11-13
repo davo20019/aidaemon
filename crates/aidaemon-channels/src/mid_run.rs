@@ -66,14 +66,13 @@ impl LiveWork {
 
     /// Stop tracking `task_id` (its turn ended). Its helpers' steps stay.
     pub fn end(&self, session_id: &str, task_id: u64) {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            if sessions
+        if let Ok(mut sessions) = self.sessions.lock()
+            && sessions
                 .get(session_id)
                 .is_some_and(|p| p.task_id == task_id)
             {
                 sessions.remove(session_id);
             }
-        }
     }
 
     /// Note what `update` says about `task_id`'s work. A helper's start

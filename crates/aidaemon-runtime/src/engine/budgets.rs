@@ -234,8 +234,8 @@ pub async fn serve_sdk_budget(host: &dyn TurnHost, scope: &TurnScope<'_>, check:
         .take();
     let iteration = scope.model_calls.load(Ordering::Relaxed) as usize;
     let mut decision = sdk::ModelDecision::Accept;
-    if let Some(usage) = usage {
-        if let Some(stop) = sdk_charge_budgets(host, scope, &usage, iteration).await {
+    if let Some(usage) = usage
+        && let Some(stop) = sdk_charge_budgets(host, scope, &usage, iteration).await {
             // Closeout grace: a final answer on the first call, or after
             // real progress, still ships; otherwise the budget reply
             // replaces it and no further work runs.
@@ -248,7 +248,6 @@ pub async fn serve_sdk_budget(host: &dyn TurnHost, scope: &TurnScope<'_>, check:
                 };
             }
         }
-    }
     if decision == sdk::ModelDecision::Accept && !check.response.tool_calls.is_empty() {
         persist_sdk_tool_call_message(host, scope, &check.response).await;
     }

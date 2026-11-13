@@ -46,15 +46,14 @@ impl GoalCycle {
                     retry_at,
                     "No configured model can answer; mandate review moved to when one can"
                 );
-                if let Some(token) = mandate.review_lease_token.as_deref() {
-                    if let Err(error) = self
+                if let Some(token) = mandate.review_lease_token.as_deref()
+                    && let Err(error) = self
                         .state
                         .release_mandate_review_lease(&mandate.id, token, &retry_at)
                         .await
                     {
                         warn!(mandate_id = %mandate.id, %error, "Failed to defer mandate review");
                     }
-                }
             }
             return;
         }

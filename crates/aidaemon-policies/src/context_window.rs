@@ -446,11 +446,10 @@ mod tests {
             );
             assert!(well_formed(&v));
             assert_eq!(v[1].content, "Summarize the files for Alice Rivera");
-            if let Some(prev) = &previous {
-                if v.len() < prev.len() || v[..prev.len()] != prev[..] {
+            if let Some(prev) = &previous
+                && (v.len() < prev.len() || v[..prev.len()] != prev[..]) {
                     changes += 1;
                 }
-            }
             previous = Some(v);
         }
         changes

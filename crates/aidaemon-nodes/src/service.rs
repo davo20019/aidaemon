@@ -834,8 +834,8 @@ impl NodeService {
             anyhow::Ok(())
         }
         .await;
-        if let Err(error) = result {
-            if !self
+        if let Err(error) = result
+            && !self
                 .store
                 .turn_is_cancelled(&context.node_id, &turn_id)
                 .await
@@ -848,7 +848,6 @@ impl NodeService {
                     json!({"state":"error", "code":"processing_failed", "message":error.to_string()}),
                 ).await;
             }
-        }
     }
 
     async fn complete_with_response(

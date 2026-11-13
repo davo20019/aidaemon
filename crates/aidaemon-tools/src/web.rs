@@ -141,11 +141,10 @@ pub fn validate_url_for_ssrf(url: &str) -> Result<(), String> {
         }
         Err(_) => {
             // If we can't resolve, it might be a raw IP - try parsing it
-            if let Ok(ip) = host.parse::<IpAddr>() {
-                if is_blocked_ip(ip) {
+            if let Ok(ip) = host.parse::<IpAddr>()
+                && is_blocked_ip(ip) {
                     return Err(format!("Blocked IP address: {}", ip));
                 }
-            }
             // If resolution fails and it's not an IP, let the request fail naturally
         }
     }
@@ -448,11 +447,10 @@ pub fn classify_blocked_host(url: &str) -> Option<BlockedHostClass> {
         }
         Err(_) => {
             // Couldn't resolve via DNS — try parsing the host as a raw IP.
-            if let Ok(ip) = host.parse::<IpAddr>() {
-                if let Some(class) = classify_blocked_ip(ip) {
+            if let Ok(ip) = host.parse::<IpAddr>()
+                && let Some(class) = classify_blocked_ip(ip) {
                     return Some(class);
                 }
-            }
             // Unresolvable non-IP host: let the request fail naturally (matches
             // validate_url_for_ssrf). Not classified as blocked here.
         }
@@ -796,11 +794,10 @@ impl WebFetch {
 
     /// Check the policy, send the request and read the capped body.
     async fn fetch(&self, url: &str, follow: bool, read_error_body: bool) -> anyhow::Result<Fetch> {
-        if !self.allow_private {
-            if let Err(reason) = validate_url_for_ssrf(url) {
+        if !self.allow_private
+            && let Err(reason) = validate_url_for_ssrf(url) {
                 return Ok(Fetch::Blocked(reason));
             }
-        }
         let response = self.client_for(url, follow)?.get(url).send().await?;
         let status = response.status();
         let final_url = response.url().to_string();

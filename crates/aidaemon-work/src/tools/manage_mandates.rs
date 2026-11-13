@@ -2691,11 +2691,10 @@ impl Tool for ManageMandatesTool {
         // A committed non-action decision (WAIT, ASK, STOP) completes the
         // fenced review: the run ends on the durable decision's summary,
         // without another model call.
-        if args.action == "record_decision" && outcome_status == ToolOutcomeStatus::Succeeded {
-            if let Some(summary) = self.committed_non_action_summary(&facts).await {
+        if args.action == "record_decision" && outcome_status == ToolOutcomeStatus::Succeeded
+            && let Some(summary) = self.committed_non_action_summary(&facts).await {
                 outcome = outcome.with_finish(aidaemon_core::Finish::succeeded(summary));
             }
-        }
         Ok(outcome)
     }
 }

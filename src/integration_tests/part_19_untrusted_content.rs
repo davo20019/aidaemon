@@ -426,11 +426,10 @@ async fn tool_results_by_name(provider: &crate::testing::MockProvider) -> Vec<(S
                 .map(str::to_string)
                 .or_else(|| names.get(id).cloned())
                 .unwrap_or_default();
-            if let Some(content) = message["content"].as_str() {
-                if !results.iter().any(|(n, c)| *n == name && c == content) {
+            if let Some(content) = message["content"].as_str()
+                && !results.iter().any(|(n, c)| *n == name && c == content) {
                     results.push((name, content.to_string()));
                 }
-            }
         }
     }
     results
