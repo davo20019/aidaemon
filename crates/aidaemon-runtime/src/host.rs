@@ -21,6 +21,12 @@ pub trait TurnStores: Send + Sync {
     fn dialogue_states(&self) -> &dyn DialogueStateStore;
     /// The conversation's messages and its durable context boundary.
     fn messages(&self) -> &dyn MessageStore;
+    /// The rendered core prompts, by hash, for replaying past model calls.
+    fn prompt_snapshots(&self) -> &dyn aidaemon_events::stores::PromptSnapshotStore;
+    /// Tasks (a mandate executor's prompt reads the task it was claimed for).
+    fn tasks(&self) -> &dyn aidaemon_work::stores::TaskStore;
+    /// Mandates (a mandate worker's prompt reads its authority and history).
+    fn mandates(&self) -> &dyn aidaemon_work::stores::MandateStore;
     /// The conversation's cumulative summaries.
     fn summaries(&self) -> &dyn aidaemon_events::stores::ConversationSummaryStore;
     /// Goals (a goal's bound workspace scopes its tasks' turns).
@@ -65,9 +71,35 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
     /// worker): its transcript is an authority envelope, not a conversation
     /// with the user.
     fn is_worker(&self) -> bool;
+    /// The mandate run this agent works in, if it is a mandate's worker.
+    fn mandate_execution(&self) -> Option<&crate::turn_runtime::MandateExecutionFence>;
     /// Whether this agent is a mandate's worker (bound to one decision
     /// cycle's run).
-    fn works_for_mandate(&self) -> bool;
+    fn works_for_mandate(&self) -> bool {
+        self.mandate_execution().is_some()
+    }
+    /// The configured persona: the base of the system prompt.
+    fn persona(&self) -> &str;
+    /// The session-static tool roster the core prompt names: `(name,
+    /// serialized schema)`, sorted by name.
+    fn session_static_tool_roster(
+        &self,
+        user_role: aidaemon_tools::semantics::UserRole,
+        channel_ctx: &aidaemon_channels::context::ChannelContext,
+    ) -> Vec<(String, String)>;
+    /// Whether a tool named `name` is registered.
+    fn has_registered_tool(&self, name: &str) -> bool;
+    /// The specialists a parent may name, with their descriptions.
+    fn specialist_kinds(&self) -> Vec<(String, String)>;
+    /// The bundled specialists only (no user overrides), for a mandate
+    /// worker's prompt.
+    fn bundled_specialist_kinds(&self) -> Vec<(String, String)>;
+    /// Whether the memory system is the daemon's own.
+    fn memory_is_daemons_own(&self) -> bool;
+    /// Whether the memory system serves the daemon tool `name` itself.
+    fn memory_owns_daemon_tool(&self, name: &str) -> bool;
+    /// A shared handle to the execution backend.
+    fn execution_backend_handle(&self) -> aidaemon_tools::backend::SharedExecutionBackend;
     /// What a spawned child inherited from the turn that spawned it; `None`
     /// for a root agent.
     fn inherited_authority(&self) -> Option<&crate::authority::InheritedAuthority>;
@@ -151,29 +183,6 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
         risk_score: f32,
         widen: bool,
     ) -> Vec<serde_json::Value>;
-    /// The system prompt for a message: the core prompt, the fresh-task and
-    /// continuation context tails, the skills it activated, and the project
-    /// instruction tracker for its scope.
-    #[allow(clippy::too_many_arguments)]
-    async fn build_system_prompt_for_message(
-        &self,
-        emitter: &aidaemon_events::EventEmitter,
-        task_id: &str,
-        session_id: &str,
-        user_text: &str,
-        user_role: aidaemon_tools::semantics::UserRole,
-        channel_ctx: &aidaemon_channels::context::ChannelContext,
-        tools_count: usize,
-        resume_checkpoint: Option<&crate::turn::resume::ResumeCheckpoint>,
-        preserve_conversation_context: bool,
-        project_instruction_scope: Option<&str>,
-    ) -> anyhow::Result<(
-        String,
-        String,
-        String,
-        Vec<String>,
-        Option<crate::turn::project_instructions::ProjectInstructionTracker>,
-    )>;
     /// Stop the CLI agents running for the session (a stop command); the
     /// tool's reply.
     async fn cancel_cli_agents(

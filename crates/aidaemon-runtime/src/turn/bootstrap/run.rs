@@ -365,20 +365,20 @@ async fn build_isolated_mandate_bootstrap(
         continuation_task_context_tail,
         active_skill_names,
         project_instruction_tracker,
-    ) = agent
-        .build_system_prompt_for_message(
-            &emitter,
-            &task_id,
-            session_id,
-            user_text,
-            user_role,
-            channel_ctx,
-            tool_defs.len(),
-            None,
-            false,
-            None,
-        )
-        .await?;
+    ) = crate::prompt::system::build_system_prompt_for_message(
+        agent,
+        &emitter,
+        &task_id,
+        session_id,
+        user_text,
+        user_role,
+        channel_ctx,
+        tool_defs.len(),
+        None,
+        false,
+        None,
+    )
+    .await?;
     anyhow::ensure!(
         active_skill_names.is_empty() && project_instruction_tracker.is_none(),
         "isolated mandate prompt unexpectedly returned generic instruction state"
@@ -1400,20 +1400,20 @@ pub async fn run_bootstrap(
         continuation_task_context_tail,
         active_skill_names,
         project_instruction_tracker,
-    ) = agent
-        .build_system_prompt_for_message(
-            &emitter,
-            &task_id,
-            session_id,
-            user_text,
-            user_role,
-            &channel_ctx,
-            tool_defs.len(),
-            resume_checkpoint.as_ref(),
-            preserve_conversation_context,
-            project_instruction_scope,
-        )
-        .await?;
+    ) = crate::prompt::system::build_system_prompt_for_message(
+        agent,
+        &emitter,
+        &task_id,
+        session_id,
+        user_text,
+        user_role,
+        &channel_ctx,
+        tool_defs.len(),
+        resume_checkpoint.as_ref(),
+        preserve_conversation_context,
+        project_instruction_scope,
+    )
+    .await?;
 
     // A skill the user explicitly asked for this turn narrows the roster when
     // it is an external API reference.

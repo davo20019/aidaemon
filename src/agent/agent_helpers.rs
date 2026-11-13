@@ -22,6 +22,7 @@ pub(in crate::agent) struct IntentGateDecision {
     pub(in crate::agent) needs_tools: Option<bool>,
 }
 
+#[cfg(test)]
 pub(in crate::agent) use aidaemon_runtime::turn::resume::ResumeCheckpoint;
 
 #[cfg(test)]

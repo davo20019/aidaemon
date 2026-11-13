@@ -17,6 +17,18 @@ impl TurnStores for Agent {
         &*self.state
     }
 
+    fn prompt_snapshots(&self) -> &dyn aidaemon_events::stores::PromptSnapshotStore {
+        &*self.state
+    }
+
+    fn tasks(&self) -> &dyn aidaemon_work::stores::TaskStore {
+        &*self.state
+    }
+
+    fn mandates(&self) -> &dyn aidaemon_work::stores::MandateStore {
+        &*self.state
+    }
+
     fn summaries(&self) -> &dyn aidaemon_events::stores::ConversationSummaryStore {
         &*self.state
     }
@@ -77,8 +89,52 @@ impl TurnHost for Agent {
         self.depth > 0 || self.mandate_execution.is_some()
     }
 
-    fn works_for_mandate(&self) -> bool {
-        self.mandate_execution.is_some()
+    fn mandate_execution(&self) -> Option<&aidaemon_runtime::turn_runtime::MandateExecutionFence> {
+        self.mandate_execution.as_ref()
+    }
+
+    fn persona(&self) -> &str {
+        &self.system_prompt
+    }
+
+    fn session_static_tool_roster(
+        &self,
+        user_role: crate::types::UserRole,
+        channel_ctx: &crate::types::ChannelContext,
+    ) -> Vec<(String, String)> {
+        Agent::session_static_tool_roster(self, user_role, channel_ctx)
+    }
+
+    fn has_registered_tool(&self, name: &str) -> bool {
+        Agent::has_registered_tool(self, name)
+    }
+
+    fn specialist_kinds(&self) -> Vec<(String, String)> {
+        self.specialists
+            .llm_visible_kinds()
+            .into_iter()
+            .map(|(name, desc)| (name.to_string(), desc))
+            .collect()
+    }
+
+    fn bundled_specialist_kinds(&self) -> Vec<(String, String)> {
+        super::specialists::SpecialistRegistry::load(None)
+            .llm_visible_kinds()
+            .into_iter()
+            .map(|(name, description)| (name.to_string(), description))
+            .collect()
+    }
+
+    fn memory_is_daemons_own(&self) -> bool {
+        self.memory.is_daemons_own()
+    }
+
+    fn memory_owns_daemon_tool(&self, name: &str) -> bool {
+        self.memory.owned_daemon_tools().contains(&name)
+    }
+
+    fn execution_backend_handle(&self) -> crate::execution::SharedExecutionBackend {
+        self.execution_backend.clone()
     }
 
     fn role(&self) -> crate::traits::AgentRole {
@@ -211,41 +267,6 @@ impl TurnHost for Agent {
             risk_score,
             widen,
         )
-    }
-
-    async fn build_system_prompt_for_message(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        task_id: &str,
-        session_id: &str,
-        user_text: &str,
-        user_role: crate::types::UserRole,
-        channel_ctx: &crate::types::ChannelContext,
-        tools_count: usize,
-        resume_checkpoint: Option<&super::ResumeCheckpoint>,
-        preserve_conversation_context: bool,
-        project_instruction_scope: Option<&str>,
-    ) -> anyhow::Result<(
-        String,
-        String,
-        String,
-        Vec<String>,
-        Option<crate::project_instructions::ProjectInstructionTracker>,
-    )> {
-        Agent::build_system_prompt_for_message(
-            self,
-            emitter,
-            task_id,
-            session_id,
-            user_text,
-            user_role,
-            channel_ctx,
-            tools_count,
-            resume_checkpoint,
-            preserve_conversation_context,
-            project_instruction_scope,
-        )
-        .await
     }
 
     async fn cancel_cli_agents(

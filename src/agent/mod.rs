@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -133,6 +132,7 @@ pub(crate) mod conversation_compaction;
 #[path = "runtime/coordination.rs"]
 pub(crate) mod coordination;
 /// The cacheable core prompt lives in `aidaemon-runtime`.
+#[cfg(test)]
 mod core_prompt {
     pub(crate) use aidaemon_runtime::prompt::core::*;
 }
@@ -266,12 +266,12 @@ pub(in crate::agent) use policy_metrics::{
 // filtering, intent-gate merge). Implementation lives in `agent_helpers.rs`.
 #[path = "agent_helpers.rs"]
 mod agent_helpers;
+pub(in crate::agent) use agent_helpers::is_untrusted_external_reference_blocked_tool;
 pub use agent_helpers::touch_heartbeat;
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::IntentGateDecision;
-pub(in crate::agent) use agent_helpers::{
-    is_untrusted_external_reference_blocked_tool, ResumeCheckpoint,
-};
+#[cfg(test)]
+pub(in crate::agent) use agent_helpers::ResumeCheckpoint;
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::{
     user_explicitly_requests_local_file_inspection, user_text_references_filesystem_path,
@@ -285,19 +285,7 @@ type WindowBoundaryMemory = Arc<tokio::sync::RwLock<HashMap<String, (usize, Opti
 /// Immutable execution identity for one worker inside one autonomous mandate
 /// decision cycle. The lease token is Rust-side control state and must never be
 /// serialized, logged, or exposed to the model.
-#[derive(Clone)]
-pub(crate) struct MandateExecutionFence {
-    pub(crate) mandate_id: String,
-    pub(crate) mandate_version: i64,
-    pub(crate) authority: crate::traits::MandateAuthority,
-    pub(crate) goal_id: String,
-    pub(crate) goal_run_id: String,
-    pub(crate) root_task_id: String,
-    pub(crate) root_task_attempt_id: String,
-    pub(crate) worker_task_id: String,
-    pub(crate) attempt_id: String,
-    pub(crate) lease_token: String,
-}
+pub(crate) use aidaemon_runtime::turn_runtime::MandateExecutionFence;
 
 pub struct Agent {
     llm_runtime: SharedLlmRuntime,
