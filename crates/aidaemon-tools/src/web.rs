@@ -670,7 +670,8 @@ impl Default for WebFetch {
             text: ToolText {
                 short: "Fetch a web page and return its readable text".into(),
                 schema: "Fetch a URL with HTTP GET (http/https only) and return the readable text \
-                         of the page; plain text and JSON are returned as is. Private and \
+                         of the page; plain text and JSON are returned as is. A PDF or other \
+                         binary body is described (type and size), not shown. Private and \
                          internal addresses are refused. Redirects to a different host are not \
                          followed; the new location is reported instead."
                     .into(),
@@ -901,6 +902,8 @@ fn url_effect(url: &Url) -> Option<EffectKey> {
 struct FetchArgs {
     url: String,
     max_chars: Option<usize>,
+    #[serde(default)]
+    offset: usize,
 }
 
 #[async_trait]
@@ -927,6 +930,10 @@ impl OutcomeTool for WebFetch {
                     "max_chars": {
                         "type": "integer",
                         "description": "Maximum characters to return (default 20000, max 50000)"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Characters of page text to skip, to read past a truncated reply"
                     }
                 },
                 "required": ["url"],
@@ -950,7 +957,9 @@ impl OutcomeTool for WebFetch {
             .unwrap_or(self.max_chars)
             .clamp(1, MAX_MAX_CHARS);
 
-        let fetched = match self.fetch(url, !facts.mandate_execution, false).await? {
+        let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+
+        let fetched = match self.fetch(url, !facts.mandate_execution, true).await? {
             Fetch::Blocked(reason) => {
                 return Ok(ToolCallOutcome::from_output(format!(
                     "Request blocked: {reason}"
@@ -958,18 +967,11 @@ impl OutcomeTool for WebFetch {
             }
             Fetch::Response(fetched) => fetched,
         };
-        if !fetched.status.is_success() {
-            return Ok(ToolCallOutcome::from_output(format!(
-                "Error fetching {}: HTTP {}",
-                url, fetched.status
-            )));
-        }
-        let html = String::from_utf8_lossy(&fetched.body).into_owned();
-        let (output, truncation) = build_fetch_reply(url, &html, max_chars);
+        let reply = fetch_reply(&fetched, max_chars, offset);
         Ok(ToolCallOutcome {
-            output,
+            output: reply.text,
             metadata: ToolCallMetadata {
-                truncation,
+                truncation: reply.truncation,
                 ..Default::default()
             },
             finish: None,
@@ -1088,46 +1090,37 @@ impl Tool for WebFetch {
             .with_details(details));
         }
 
-        let lower = content_type.to_ascii_lowercase();
-        let is_html = lower.contains("html") || (lower.is_empty() && looks_like_html(&body));
-        let is_text = is_html
-            || lower.is_empty()
-            || lower.starts_with("text/")
-            || lower.contains("json")
-            || lower.contains("xml")
-            || lower.contains("javascript");
-        if !is_text {
-            return Ok(fail(format!(
-                "HTTP {status}: {final_url} returned `{content_type}` ({} bytes), which is not \
-                 text and cannot be shown.",
-                body.len()
-            ))
-            .with_details(details));
-        }
-        let raw = String::from_utf8_lossy(&body);
-        let text = if is_html {
-            extract_page_text(&raw, &final_url)
-        } else {
-            raw.into_owned()
+        let fetched = Fetched {
+            status,
+            final_url,
+            content_type,
+            location: None,
+            body,
+            body_truncated,
         };
-
-        if !status.is_success() {
-            let (snippet, _) = truncate_chars(text.trim(), 2000);
-            return Ok(
-                fail(format!("HTTP {status} from {final_url}.\n\n{snippet}")).with_details(details),
-            );
+        let reply = fetch_reply(&fetched, max_chars, args.offset);
+        let cut = reply.truncation.is_some() || fetched.body_truncated;
+        details["truncated"] = json!(cut);
+        if !reply.ok {
+            return Ok(fail(reply.text).with_details(details));
         }
-
-        let (mut text, cut) = truncate_chars(text.trim(), max_chars);
-        if cut || body_truncated {
+        let mut text = reply.text;
+        if let Some(info) = &reply.truncation {
             text.push_str(&format!(
-                "\n\n[Content truncated to {max_chars} characters.]"
+                "\n\n[Content truncated to {max_chars} characters. Fetch again with offset={} \
+                 for the next part ({} characters in all).]",
+                args.offset + info.shown_chars,
+                info.total_chars
+            ));
+        } else if fetched.body_truncated {
+            text.push_str(&format!(
+                "\n\n[Content truncated: the body was larger than {MAX_FETCH_BODY_BYTES} bytes.]"
             ));
         }
-        details["truncated"] = json!(cut || body_truncated);
         Ok(ToolOutput::text(format!(
-            "URL: {final_url}\nStatus: {}\nContent-Type: {content_type}\n\n{text}",
-            status.as_u16()
+            "Status: {}\nContent-Type: {}\n{text}",
+            fetched.status.as_u16(),
+            fetched.content_type
         ))
         .with_details(details))
     }
@@ -1203,6 +1196,104 @@ fn looks_like_html(body: &[u8]) -> bool {
     head.contains("<html") || head.contains("<!doctype html")
 }
 
+/// What a fetched body is: by its declared type, sniffed when undeclared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyKind {
+    Html,
+    Text,
+    Pdf,
+    Binary,
+}
+
+fn body_kind(content_type: &str, body: &[u8]) -> BodyKind {
+    let lower = content_type.to_ascii_lowercase();
+    if lower.contains("pdf") || (lower.is_empty() && body.starts_with(b"%PDF-")) {
+        BodyKind::Pdf
+    } else if lower.contains("html") || (lower.is_empty() && looks_like_html(body)) {
+        BodyKind::Html
+    } else if lower.starts_with("text/")
+        || lower.contains("json")
+        || lower.contains("xml")
+        || lower.contains("javascript")
+        || (lower.is_empty() && std::str::from_utf8(&body[..body.len().min(1024)]).is_ok())
+    {
+        BodyKind::Text
+    } else {
+        BodyKind::Binary
+    }
+}
+
+/// The model's view of one fetch, for both entry points: the page's text
+/// (from `offset`, cut at `max_chars`, with the cut as metadata), or an
+/// error that says why there is no text.
+struct FetchReply {
+    ok: bool,
+    text: String,
+    truncation: Option<crate::semantics::TruncationInfo>,
+}
+
+fn fetch_reply(fetched: &Fetched, max_chars: usize, offset: usize) -> FetchReply {
+    let url = fetched.final_url.as_str();
+    let status = fetched.status;
+    let error = |text: String| FetchReply {
+        ok: false,
+        text,
+        truncation: None,
+    };
+    if status.is_redirection() {
+        let target = fetched
+            .location
+            .as_deref()
+            .unwrap_or("(no Location header)");
+        return error(format!(
+            "HTTP {status}: {url} redirects to {target}, which was not followed. Fetch that URL \
+             explicitly if it is the page you want."
+        ));
+    }
+    let kind = body_kind(&fetched.content_type, &fetched.body);
+    let bytes = fetched.body.len();
+    let content_type = if fetched.content_type.is_empty() {
+        "an undeclared type"
+    } else {
+        fetched.content_type.as_str()
+    };
+    match kind {
+        BodyKind::Pdf if status.is_success() => {
+            return error(format!(
+                "{url} is a PDF document ({bytes} bytes, {content_type}). web_fetch does not \
+                 extract PDF text: download the file to the workspace and read it with read_file, \
+                 which says how to extract its text."
+            ));
+        }
+        BodyKind::Binary if status.is_success() => {
+            return error(format!(
+                "{url} returned binary content, {bytes} bytes, type {content_type}, which is not \
+                 text and cannot be shown."
+            ));
+        }
+        _ => {}
+    }
+    let raw = String::from_utf8_lossy(&fetched.body);
+    if !status.is_success() {
+        let text = match kind {
+            BodyKind::Html => extract_page_text(&raw, url),
+            BodyKind::Text => raw.into_owned(),
+            BodyKind::Pdf | BodyKind::Binary => String::new(),
+        };
+        let (snippet, _) = truncate_chars(text.trim(), 2000);
+        return error(format!("HTTP {status} from {url}.\n\n{snippet}"));
+    }
+    let (text, truncation) = match kind {
+        BodyKind::Html => build_fetch_reply_at(url, &raw, max_chars, offset),
+        _ => format_fetch_window(url, &raw, max_chars, offset),
+    };
+    FetchReply {
+        ok: true,
+        text,
+        truncation,
+    }
+}
+
 /// Extracted text shorter than this (on a large page) means extraction
 /// failed, not that the page is thin.
 const MIN_EXTRACTED_CHARS: usize = 200;
@@ -1212,10 +1303,20 @@ const MIN_HTML_FOR_EXTRACTION_CHECK: usize = 10_000;
 
 /// Full fetch-reply pipeline: strip non-visible blocks, extract readable
 /// text, detect failed extraction, format with truncation honesty.
+#[cfg(test)]
 fn build_fetch_reply(
     url: &str,
     html: &str,
     max_chars: usize,
+) -> (String, Option<crate::semantics::TruncationInfo>) {
+    build_fetch_reply_at(url, html, max_chars, 0)
+}
+
+fn build_fetch_reply_at(
+    url: &str,
+    html: &str,
+    max_chars: usize,
+    offset: usize,
 ) -> (String, Option<crate::semantics::TruncationInfo>) {
     let text = extract_page_text(html, url);
     let trimmed = text.trim();
@@ -1242,7 +1343,7 @@ fn build_fetch_reply(
             None,
         );
     }
-    format_fetch_result(url, &text, max_chars)
+    format_fetch_window(url, &text, max_chars, offset)
 }
 
 /// Extract readable page text: readability first, raw-HTML-to-markdown
@@ -1346,32 +1447,48 @@ fn find_ascii_ci(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 /// ignored and the model fabricates the omitted content (e.g. inventing the
 /// rest of a roster) — this is why the notice must reach the model through
 /// the loop's instructional rendering rather than raw tool output.
+#[cfg(test)]
 fn format_fetch_result(
     url: &str,
     text: &str,
     max_chars: usize,
 ) -> (String, Option<crate::semantics::TruncationInfo>) {
+    format_fetch_window(url, text, max_chars, 0)
+}
+
+/// `max_chars` of `text` starting at character `offset`. A cut is reported
+/// as metadata, with the offset that continues it.
+fn format_fetch_window(
+    url: &str,
+    text: &str,
+    max_chars: usize,
+    offset: usize,
+) -> (String, Option<crate::semantics::TruncationInfo>) {
+    let total_chars = text.chars().count();
     let mut result = format!("Content from {}:\n\n", url);
-    if text.len() > max_chars {
-        // Find a valid UTF-8 char boundary at or before max_chars
-        let mut end = max_chars;
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        result.push_str(&text[..end]);
+    if offset >= total_chars && offset > 0 {
+        result.push_str(&format!(
+            "[offset {offset} is past the end: the page text has {total_chars} characters.]"
+        ));
+        return (result, None);
+    }
+    let window: String = text.chars().skip(offset).take(max_chars).collect();
+    let shown_chars = window.chars().count();
+    result.push_str(&window);
+    if offset + shown_chars < total_chars {
         let truncation = crate::semantics::TruncationInfo {
-            shown_chars: text[..end].chars().count(),
-            total_chars: text.chars().count(),
-            remediation_hint: Some(
-                "If the answer may be in the omitted part, re-fetch with a larger max_chars \
-                 (up to 50000) or fetch a more specific page; if the full content is still \
-                 not visible, tell the user the page was longer than you could read."
-                    .to_string(),
-            ),
+            shown_chars,
+            total_chars,
+            remediation_hint: Some(format!(
+                "If the answer may be in the omitted part, fetch again with offset={} (or a \
+                 larger max_chars, up to 50000), or fetch a more specific page; if the full \
+                 content is still not visible, tell the user the page was longer than you \
+                 could read.",
+                offset + shown_chars
+            )),
         };
         (result, Some(truncation))
     } else {
-        result.push_str(text);
         (result, None)
     }
 }
@@ -1483,7 +1600,7 @@ mod tests {
             .unwrap();
         assert!(
             out.content
-                .contains("[Content truncated to 1000 characters.]")
+                .contains("[Content truncated to 1000 characters. Fetch again with offset=1000")
         );
         assert_eq!(out.details["truncated"], true);
 
@@ -1507,6 +1624,86 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error && out.content.contains("image/png"));
+    }
+
+    /// Both entry points build the same reply: a PDF and a PNG are
+    /// described, not decoded into junk text; a long page continues at
+    /// `offset`; a JavaScript-only page says extraction failed.
+    #[tokio::test]
+    async fn both_paths_describe_binary_and_continue_at_an_offset() {
+        let js_only = format!(
+            "<html><head><script>{}</script></head><body><div id=\"root\"></div></body></html>",
+            "z".repeat(20_000)
+        );
+        let base = serve(vec![
+            (
+                "/doc",
+                "200 OK",
+                "application/pdf",
+                "%PDF-1.7 synthetic".into(),
+            ),
+            ("/img", "200 OK", "image/png", "\u{1}PNG".into()),
+            (
+                "/long",
+                "200 OK",
+                "text/plain",
+                format!("{}{}", "a".repeat(1000), "b".repeat(500)),
+            ),
+            ("/spa", "200 OK", "text/html", js_only),
+        ])
+        .await;
+        let tool = WebFetch::new()
+            .without_proxy()
+            .allow_private_hosts()
+            .max_chars(1000);
+        let facts = crate::semantics::ToolCallContext::default();
+        let daemon = |args: Value| {
+            let tool = &tool;
+            let facts = &facts;
+            async move {
+                OutcomeTool::execute(tool, &args.to_string(), facts)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let pdf = daemon(json!({"url": format!("{base}/doc")})).await.output;
+        assert!(
+            pdf.contains("PDF document") && pdf.contains("read_file"),
+            "{pdf}"
+        );
+        assert!(!pdf.contains("%PDF"), "{pdf}");
+        let out = tool
+            .call(json!({"url": format!("{base}/doc")}), &ctx())
+            .await
+            .unwrap();
+        assert!(out.is_error && out.content.contains("PDF document"));
+
+        let png = daemon(json!({"url": format!("{base}/img")})).await.output;
+        assert!(
+            png.contains("binary content, 4 bytes, type image/png"),
+            "{png}"
+        );
+
+        let first = daemon(json!({"url": format!("{base}/long")})).await;
+        let info = first.metadata.truncation.expect("cut");
+        assert_eq!((info.shown_chars, info.total_chars), (1000, 1500));
+        assert!(info.remediation_hint.unwrap().contains("offset=1000"));
+        let rest = daemon(json!({"url": format!("{base}/long"), "offset": 1000})).await;
+        assert!(rest.output.ends_with(&"b".repeat(500)), "{}", rest.output);
+        assert!(!rest.output.contains('a'.to_string().repeat(2).as_str()));
+        assert!(rest.metadata.truncation.is_none());
+        let out = tool
+            .call(
+                json!({"url": format!("{base}/long"), "offset": 1000}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains(&"b".repeat(500)) && !out.content.contains("aa"));
+
+        let spa = daemon(json!({"url": format!("{base}/spa")})).await.output;
+        assert!(spa.contains("EXTRACTION FAILED"), "{spa}");
     }
 
     #[tokio::test]
