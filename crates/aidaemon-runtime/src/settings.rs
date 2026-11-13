@@ -856,3 +856,31 @@ impl ComputerUseConfig {
         std::time::Duration::from_secs(self.action_timeout_secs.clamp(1, 120))
     }
 }
+
+/// `[path_aliases]`: alias roots for "projects/..." paths.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct PathAliasConfig {
+    /// Optional alias roots for "projects/..." paths.
+    /// Example:
+    /// [path_aliases]
+    /// projects = ["~/projects"]
+    #[serde(default)]
+    pub projects: Vec<String>,
+}
+
+/// Iteration limit configuration for agent loops.
+/// Controls how iteration limits are enforced (or not enforced).
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum IterationLimitConfig {
+    /// No iteration limit - run until natural completion, token budget, or timeout.
+    /// This is the recommended default for complex tasks.
+    #[default]
+    Unlimited,
+    /// Soft limit with warnings but no forced termination.
+    /// Agent will be warned at `warn_at` iterations and continue until natural completion.
+    Soft { threshold: usize, warn_at: usize },
+    /// Legacy hard limit behavior (backward compatibility).
+    /// Agent will be forced to stop at `cap` iterations.
+    Hard { initial: usize, cap: usize },
+}

@@ -273,7 +273,7 @@ pub(crate) async fn init_heartbeat_coordinator(
                 let pool = history_projection_pool.clone();
                 async move {
                     let stats =
-                        crate::state::sqlite::history_search::repair_and_backfill(&pool, 4).await?;
+                        aidaemon_runtime::history::search::repair_and_backfill(&pool, 4).await?;
                     if stats.projected > 0
                         || stats.orphans_removed > 0
                         || stats.fts_rebuilt
@@ -295,7 +295,7 @@ pub(crate) async fn init_heartbeat_coordinator(
 
         // Retention cleanup (daily)
         let retention_pool = pool.clone();
-        let retention_config = config.state.retention.clone();
+        let retention_config = config.state.retention.policy();
         heartbeat.register_job(
             "retention_cleanup",
             Duration::from_secs(24 * 3600),
@@ -387,7 +387,7 @@ pub(crate) async fn init_heartbeat_coordinator(
                 Arc::new(crate::memory::people_intelligence::PeopleIntelligence::new(
                     state.clone(),
                     memory_store,
-                    config.people.clone(),
+                    config.people.intelligence(),
                 ));
             heartbeat.register_job(
                 "people_intelligence",

@@ -44,7 +44,8 @@ pub async fn build_stores(
             config.state.encryption_key.as_deref(),
             embedding_service.clone(),
         )
-        .await?,
+        .await?
+        .with_secret_store(crate::config::secret_store().clone()),
     );
     info!("State store initialized ({})", config.state.db_path);
     super::db_upkeep::record_started_version(&state.pool()).await;
@@ -96,11 +97,8 @@ pub async fn build_stores(
     // that migration off the channel-readiness critical path.
     let projection_state = state.clone();
     tokio::spawn(async move {
-        match crate::state::sqlite::history_search::repair_and_backfill(
-            &projection_state.pool(),
-            20,
-        )
-        .await
+        match aidaemon_runtime::history::search::repair_and_backfill(&projection_state.pool(), 20)
+            .await
         {
             Ok(stats)
                 if stats.projected > 0
@@ -123,8 +121,7 @@ pub async fn build_stores(
         // Continue large legacy backfills incrementally off the readiness
         // path. Each round is bounded and yields between batches.
         for _ in 0..20 {
-            match crate::state::sqlite::history_search::backfill(&projection_state.pool(), 20).await
-            {
+            match aidaemon_runtime::history::search::backfill(&projection_state.pool(), 20).await {
                 Ok((_, 0)) => break,
                 Ok((projected, pending)) => {
                     tracing::info!(projected, pending, "Continuing exact-history backfill");

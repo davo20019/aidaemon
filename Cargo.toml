@@ -101,7 +101,6 @@ dialoguer = "0.12"
 qrcode = { version = "0.14", default-features = false }
 shellexpand = "3"
 dirs = "7"
-fastembed = { version = "7", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
 tokio-util = "0.7.20"
 libc = "0.2"
 libsqlite3-sys = { version = "0.37", optional = true }
@@ -152,7 +151,7 @@ aidaemon-channel-telegram = { version = "=0.2.0", path = "crates/aidaemon-channe
 aidaemon-channel-slack = { version = "=0.2.0", path = "crates/aidaemon-channel-slack", optional = true, features = ["bot"] }
 aidaemon-channel-discord = { version = "=0.2.0", path = "crates/aidaemon-channel-discord", optional = true, features = ["bot"] }
 # Long-term memory: shared primitives today; the `sdk` backend with `sdk-memory`.
-aidaemon-memory = { version = "=0.2.0", path = "crates/aidaemon-memory" }
+aidaemon-memory = { version = "=0.2.0", path = "crates/aidaemon-memory", features = ["fastembed"] }
 aidaemon-events = { version = "=0.2.0", path = "crates/aidaemon-events" }
 aidaemon-work = { version = "=0.2.0", path = "crates/aidaemon-work", features = ["email-trigger"] }
 # Sub-agent composition and the specialist profiles child sessions carry.
@@ -173,7 +172,7 @@ discord = ["dep:aidaemon-channel-discord"]
 slack = ["dep:aidaemon-channel-slack"]
 execution-docker = ["aidaemon-tools/docker"]
 terminal-bridge = ["dep:aidaemon-terminal-bridge"]
-encryption = ["libsqlite3-sys/bundled-sqlcipher"]
+encryption = ["libsqlite3-sys/bundled-sqlcipher", "aidaemon-runtime/encryption"]
 computer_use = ["aidaemon-runtime/computer_use"]
 # Export runs to an OTLP backend when `[telemetry]` names one.
 otel = ["aidaemon-policies/otel", "dep:opentelemetry_sdk"]
@@ -207,6 +206,7 @@ aidaemon-work = { path = "crates/aidaemon-work", features = ["testing"] }
 aidaemon-tools = { path = "crates/aidaemon-tools", features = ["testing"] }
 aidaemon-decisions = { path = "crates/aidaemon-decisions", features = ["gemini", "testing"] }
 aidaemon-runtime = { path = "crates/aidaemon-runtime", features = ["testing"] }
+aidaemon-memory = { path = "crates/aidaemon-memory", features = ["fastembed", "testing"] }
 tempfile = "3"
 proptest = "1"
 assert_cmd = "2"

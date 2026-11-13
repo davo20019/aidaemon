@@ -6,10 +6,10 @@ mod config;
 mod context_budget;
 mod conversation;
 mod core;
+#[cfg(test)]
 use aidaemon_work::schedule as cron_utils;
 mod daemon;
 mod dashboard;
-mod db;
 #[allow(dead_code)]
 mod events;
 mod otel_export;
@@ -49,7 +49,6 @@ use aidaemon_channels::queue::telemetry as queue_telemetry;
 use aidaemon_work::reminders;
 mod router;
 mod runtime_ports;
-pub(crate) use aidaemon_events::session;
 mod single_instance;
 mod skills;
 mod startup;

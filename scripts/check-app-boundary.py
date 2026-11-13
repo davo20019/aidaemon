@@ -62,7 +62,6 @@ SHELL = {
 REEXPORTS = {
     "context_budget.rs",
     "conversation.rs",
-    "db",
     "execution",
     "events",
     "execution_policy.rs",
@@ -72,9 +71,11 @@ REEXPORTS = {
     "llm_runtime.rs",
     "llm_runtime",
     "mcp",
+    "memory",
     "oauth",
     "router.rs",
     "skills",
+    "state",
     "tools",
     "traits",
     "traits.rs",
@@ -83,10 +84,7 @@ REEXPORTS = {
 }
 
 # Behavior still in the app, and the plan step that moves it.
-PENDING = {
-    "state": "9.3/9.6: the SQLite store behind the facade traits",
-    "memory": "9.1/9.6: memory host adapters, procedures, task learning, retention",
-}
+PENDING: dict[str, str] = {}
 
 
 # The agent as the crates' host: the files that may hold non-test code.

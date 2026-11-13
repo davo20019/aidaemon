@@ -1,6 +1,7 @@
 //! Conversation helpers kept at their old path: event -> turn projection is
 //! `aidaemon_events::turn_from_event`, truncation `truncate_with_anchor`.
 
+#[allow(unused_imports)]
 pub use aidaemon_events::conversation::truncate_with_anchor;
 
 #[cfg(test)]

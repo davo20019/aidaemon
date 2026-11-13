@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::{Event, EventStore};
 use crate::harness_eval::recorder::{collect_run_result, HarnessEvalRunResult};
-use crate::state::sqlite::SqliteStateStore;
+use crate::state::SqliteStateStore;
 use crate::testing::{
     setup_test_agent, setup_test_agent_orchestrator, setup_test_agent_with_models, MockProvider,
 };

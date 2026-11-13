@@ -21,6 +21,9 @@ publish = false
 # Test-only helpers that dependents' test builds need, as `cfg(test)` cannot
 # reach across a crate boundary.
 testing = ["dep:tempfile", "aidaemon-core/testing", "aidaemon-events/testing", "aidaemon-decisions/testing"]
+# SQLCipher: `state::SqliteStateStore` applies a database's encryption key.
+# The host links SQLite with SQLCipher (`libsqlite3-sys/bundled-sqlcipher`).
+encryption = []
 # The `computer_use` tool (desktop apps through accessibility and screenshots).
 computer_use = []
 # Its macOS harness (accessibility, window capture, input).
@@ -36,6 +39,7 @@ aidaemon-events = { version = "0.2.0", path = "../aidaemon-events" }
 aidaemon-exposure = { version = "0.2.0", path = "../aidaemon-exposure" }
 aidaemon-mcp = { version = "0.2.0", path = "../aidaemon-mcp" }
 aidaemon-memory = { version = "0.2.0", path = "../aidaemon-memory" }
+aidaemon-nodes = { version = "0.2.0", path = "../aidaemon-nodes" }
 aidaemon-policies = { version = "0.2.0", path = "../aidaemon-policies" }
 aidaemon-skills = { version = "0.2.0", path = "../aidaemon-skills" }
 aidaemon-providers = { version = "0.2.0", path = "../aidaemon-providers", features = ["chatgpt-login"] }
@@ -82,6 +86,7 @@ aidaemon-events = { path = "../aidaemon-events", features = ["testing"] }
 aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
 aidaemon-channels = { path = "../aidaemon-channels", features = ["testing"] }
 aidaemon-work = { path = "../aidaemon-work", features = ["testing"] }
+aidaemon-memory = { path = "../aidaemon-memory", features = ["fastembed", "testing"] }
 axum = "0.8"
 proptest = "1"
 tempfile = "3"

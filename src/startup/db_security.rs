@@ -254,7 +254,7 @@ async fn verify_encrypted_database(
             aidaemon_memory::sqlite::rebuild_memory_fts_projections(&pool).await?;
         }
         if repairable.history {
-            crate::state::sqlite::history_search::reset_fts_projection(&pool).await?;
+            aidaemon_runtime::history::search::reset_fts_projection(&pool).await?;
         }
         issues = database_integrity_issues(&pool).await?;
         if issues.is_empty() {
