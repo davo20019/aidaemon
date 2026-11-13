@@ -343,6 +343,7 @@ impl TurnEngine<'_> {
             known_resources,
             // The spawn tool appends the child's own mission.
             card_title: None,
+            card_steps: Vec::new(),
             lineage: self
                 .inherited_authority()
                 .as_ref()

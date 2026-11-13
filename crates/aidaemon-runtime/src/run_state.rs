@@ -40,6 +40,10 @@ pub struct RunEvidence {
     /// Why a run failed or stopped, from its typed records; `None` for an
     /// error, which says why itself.
     pub failure: Option<RunFailure>,
+    /// What its run sent the owner when it ended: each declared
+    /// deliverable and what became of it. `None`: it ran outside a
+    /// request's delivery ledger, so nothing recorded what it sent.
+    pub delivered: Option<Vec<crate::coordination::RunDelivery>>,
 }
 
 /// Why a helper's run failed, decided from its typed records (its checklist
@@ -185,6 +189,8 @@ pub struct RunState {
     pub waited: Duration,
     /// Its latest step while it runs.
     pub step: Option<Step>,
+    /// The plan steps it was started for (`checklist_items`).
+    pub steps: Vec<usize>,
     pub evidence: RunEvidence,
     /// The chat card this run's line is drawn on after its turn: the card
     /// the turn that started it kept. A no-plan run's end edits exactly this
@@ -244,6 +250,7 @@ impl RunState {
                 RunPhase::Running => self.step.clone(),
                 _ => None,
             },
+            steps: self.steps.clone(),
             // The one measured line every surface shows for it
             // ([`RunTimes::line`]): the card, its result and the parent's
             // continuation all read the same labelled times. On the card
@@ -359,6 +366,7 @@ impl RunStates {
             work_began: None,
             waited: Duration::ZERO,
             step: None,
+            steps: Vec::new(),
             evidence: RunEvidence::default(),
             card: RunCard::default(),
         };
@@ -434,6 +442,13 @@ impl RunStates {
                 .filter_map(|member| entry.ended.remove(member))
                 .collect(),
         )
+    }
+
+    /// Run `id` was started for the plan steps `steps`.
+    pub fn link_steps(&self, id: &str, steps: &[usize]) {
+        if let Some(entry) = self.lock().get_mut(id) {
+            entry.state.steps = steps.to_vec();
+        }
     }
 
     /// The running run's latest step. Ignored once it ended.
@@ -768,6 +783,7 @@ mod tests {
             work_began: Some(requested + chrono::Duration::milliseconds(12_400)),
             waited: Duration::ZERO,
             step: None,
+            steps: Vec::new(),
             evidence: RunEvidence::default(),
             card: RunCard::default(),
         };

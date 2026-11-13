@@ -473,6 +473,12 @@ pub struct InheritedAuthority {
     /// shorten its mission instead.
     #[serde(default)]
     pub card_title: Option<String>,
+    /// The parent's plan steps (zero-based) this child was started to do,
+    /// as its spawn call named them (`checklist_items`): the typed link
+    /// between a step and each run started for it, so a later run for the
+    /// same step supersedes an earlier one that didn't finish.
+    #[serde(default)]
+    pub card_steps: Vec<usize>,
     /// The run that spawns this child, recorded on the child's task start so
     /// the parent can fold the child's results back into its own context.
     #[serde(default)]
@@ -973,6 +979,7 @@ mod tests {
             parent_run: None,
             known_resources: Default::default(),
             card_title: None,
+            card_steps: Vec::new(),
             lineage: Vec::new(),
             parent_task: None,
         }
@@ -1147,6 +1154,7 @@ mod tests {
             parent_run: None,
             known_resources: Default::default(),
             card_title: None,
+            card_steps: Vec::new(),
             lineage: Vec::new(),
             parent_task: None,
         };

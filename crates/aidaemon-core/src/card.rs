@@ -162,6 +162,10 @@ pub struct HelperView {
     pub background: bool,
     /// Its latest step while it runs.
     pub step: Option<Step>,
+    /// The plan steps (zero-based) it was started to do, as the spawn call
+    /// named them: the typed link a later run for the same step supersedes
+    /// it by ([`superseded_runs`]).
+    pub steps: Vec<usize>,
     /// Once it ended, how long it took and when, as the runtime measured it
     /// and already worded for the owner ("Took 21s (2:21:16 PM to 2:21:37 PM
     /// ET)."). Never worked out from anything a model wrote.
@@ -190,10 +194,100 @@ impl HelperView {
             phase: RunPhase::Running,
             background,
             step,
+            steps: Vec::new(),
             took: None,
             since_request: None,
         }
     }
+
+    /// The same record, started for the plan steps `steps`.
+    pub fn for_steps(mut self, steps: &[usize]) -> Self {
+        self.steps = steps.to_vec();
+        self
+    }
+}
+
+/// Which runs on a card a later run superseded: one that ended without
+/// succeeding, started for plan steps every one of which a later run on the
+/// card was also started for. Its step's outcome is the later run's, so it
+/// is history: it never counts as a failure in the card's header or total.
+/// `helpers` are in the order they started; the result is index for index.
+/// Linked only by the runs' typed plan steps, never by their names.
+pub fn superseded_runs(helpers: &[&HelperView]) -> Vec<Option<usize>> {
+    helpers
+        .iter()
+        .enumerate()
+        .map(|(index, helper)| {
+            if helper.steps.is_empty()
+                || !helper.phase.is_terminal()
+                || helper.phase == RunPhase::Succeeded
+            {
+                return None;
+            }
+            // The latest later run that took over all its steps.
+            helpers
+                .iter()
+                .enumerate()
+                .skip(index + 1)
+                .rfind(|(_, later)| helper.steps.iter().all(|step| later.steps.contains(step)))
+                .map(|(later, _)| later)
+        })
+        .collect()
+}
+
+/// A superseded run's one quiet line: its try, how it ended and what the
+/// run that took its step over did ("Drupal install: first try didn't
+/// finish; a second helper finished it").
+pub fn superseded_line(
+    earlier: &HelperView,
+    attempt: usize,
+    later: &HelperView,
+    later_attempt: usize,
+) -> String {
+    let ended = match earlier.phase {
+        RunPhase::Failed => "failed",
+        _ => "didn't finish",
+    };
+    let later_did = match later.phase {
+        RunPhase::Running => "is on it",
+        RunPhase::Succeeded => "finished it",
+        RunPhase::Stopped => "didn't finish it either",
+        RunPhase::Failed => "failed too",
+    };
+    format!(
+        "\u{21aa}\u{fe0f} {}: {} try {ended}; a {} helper {later_did}",
+        earlier.label.trim(),
+        ordinal(attempt),
+        ordinal(later_attempt),
+    )
+}
+
+/// "first", "second", … for a try's number (1-based).
+fn ordinal(n: usize) -> String {
+    match n {
+        1 => "first".to_string(),
+        2 => "second".to_string(),
+        3 => "third".to_string(),
+        4 => "fourth".to_string(),
+        5 => "fifth".to_string(),
+        n => format!("{n}th"),
+    }
+}
+
+/// Each run's try at its plan steps (1-based): one more than the runs
+/// before it that were started for any of the same steps. A run with no
+/// steps is its own first try.
+pub fn run_attempts(helpers: &[&HelperView]) -> Vec<usize> {
+    helpers
+        .iter()
+        .enumerate()
+        .map(|(index, helper)| {
+            1 + helpers[..index]
+                .iter()
+                .filter(|earlier| earlier.steps.iter().any(|step| helper.steps.contains(step)))
+                .count()
+        })
+        .collect()
 }
 
 /// A plan as the card shows it: its own rendering, how many steps it has

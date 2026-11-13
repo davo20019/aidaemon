@@ -1121,6 +1121,18 @@ impl BrowserTool {
         )
         .map_err(|e| format!("Screenshot captured but failed to save for vision context: {e}"))?;
 
+        // Every capture is noted with what it shows, so a later send_file of
+        // this saved path delivers this page's screenshot, never a file of
+        // its own beside it.
+        let kind = aidaemon_tools::semantics::DeliverableKind::Screenshot {
+            page: short_page_name(&display_url).to_string(),
+        };
+        if let Some(fence) = fence {
+            fence
+                .note_capture(&saved_attachment.local_path, &kind)
+                .await;
+        }
+
         // A capture is an observation; only the one the call declares the
         // owner's deliverable is sent. Every other capture (checking a page
         // that may have redirected or is not ready yet) is kept for the agent
@@ -1156,7 +1168,7 @@ impl BrowserTool {
         let delivery = screenshot_delivery_kind(png_bytes.len(), oversize_reason);
 
         // `as_file` selects the honest, mode-aware success string below.
-        let (kind, as_file) = match delivery {
+        let (media, as_file) = match delivery {
             ScreenshotDelivery::Photo => (MediaKind::Photo { data: png_bytes }, false),
             ScreenshotDelivery::Document => (
                 MediaKind::Document {
@@ -1174,12 +1186,47 @@ impl BrowserTool {
                 ));
             }
         };
+        let deliverable = aidaemon_tools::semantics::Deliverable {
+            kind: kind.clone(),
+            caption: caption.clone(),
+            send: screenshot_send(self.media_tx.clone(), session_id, &caption, media),
+        };
+
+        // A helper's declared screenshot is its run's deliverable: kept on
+        // its record and sent once, when the run ends, as the last capture
+        // of this page it declared (live 2026-11-13: a helper declared a
+        // WordPress homepage before its theme was on, then sent the styled
+        // one, and the owner got both).
+        let deliverable = match fence {
+            Some(fence) => match fence.declare_deliverable(deliverable).await {
+                aidaemon_tools::semantics::DeliveryPlan::Now(deliverable) => deliverable,
+                aidaemon_tools::semantics::DeliveryPlan::AtRunEnd { replaced } => {
+                    let replaced = if replaced {
+                        " It replaces the earlier screenshot of this page you declared."
+                    } else {
+                        ""
+                    };
+                    return Ok(DispatchResult {
+                        text: format!(
+                            "Screenshot captured and kept as your deliverable: {caption}. It is \
+                             sent to the owner once, when your run ends; a later deliver: true \
+                             capture of the same page replaces it.{replaced} Don't send it \
+                             with send_file.\nSaved to: {}",
+                            saved_attachment.local_path
+                        ),
+                        attachments: vec![saved_attachment],
+                        semantics: None,
+                    });
+                }
+            },
+            None => deliverable,
+        };
 
         // One request delivers a page's screenshot once: the first agent of
         // the request to send it owns that delivery (live 2026-11-13: a
         // helper sent the Drupal homepage, then the main agent sent it again).
         // A later capture is kept for looking at, not sent.
-        let subject = format!("screenshot:{}", short_page_name(&display_url));
+        let subject = kind.subject();
         if let Some(fence) = fence {
             if let Err(delivered) = fence.claim_delivery(&subject).await {
                 return Ok(DispatchResult {
@@ -1197,70 +1244,21 @@ impl BrowserTool {
                 });
             }
         }
-        let release = |reason: String| async move {
+        if let Err(reason) = (deliverable.send)().await {
             if let Some(fence) = fence {
                 fence.release_delivery(&subject).await;
             }
-            reason
-        };
-
-        // Honest delivery: ask the media listener to report the ACTUAL outcome.
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-        if let Err(e) = self
-            .media_tx
-            .send(MediaMessage {
-                session_id: session_id.to_string(),
-                caption: caption.clone(),
-                kind,
-                result_tx: Some(result_tx),
-            })
-            .await
-        {
-            return Err(release(format!("Failed to send screenshot to chat: {}", e)).await);
+            return Err(reason);
         }
-
-        // Wait (bounded) for the listener to confirm delivery, then report
-        // HONESTLY — never claim "sent" unless the channel actually accepted it.
-        let text = match tokio::time::timeout(Duration::from_secs(30), result_rx).await {
-            Ok(Ok(Ok(()))) => {
-                let base = if as_file {
-                    format!(
-                        "Screenshot captured and delivered to chat as a file (the full page was \
-                         too large for an inline image). {}",
-                        caption
-                    )
-                } else {
-                    format!("Screenshot captured and delivered to chat. {}", caption)
-                };
-                format!(
-                    "{base}\nSaved to: {}",
-                    saved_attachment.local_path
-                )
-            }
-            Ok(Ok(Err(reason))) => {
-                return Err(release(format!(
-                    "Screenshot captured but could NOT be delivered to chat: {}. The image was not sent.",
-                    reason
-                ))
-                .await)
-            }
-            Ok(Err(_)) => {
-                return Err(release(
-                    "Screenshot captured but delivery could not be confirmed (the delivery channel \
-                 was dropped). The image may not have been sent."
-                        .to_string(),
-                )
-                .await)
-            }
-            Err(_) => {
-                return Err(release(
-                    "Screenshot captured but delivery could not be confirmed within the timeout. \
-                 The image may not have been sent."
-                        .to_string(),
-                )
-                .await)
-            }
+        let base = if as_file {
+            format!(
+                "Screenshot captured and delivered to chat as a file (the full page was too \
+                 large for an inline image). {caption}"
+            )
+        } else {
+            format!("Screenshot captured and delivered to chat. {caption}")
         };
+        let text = format!("{base}\nSaved to: {}", saved_attachment.local_path);
 
         // Reaching here means the channel confirmed the image arrived, so the
         // receipt says so: a delivery of the saved capture. A checklist item
@@ -2422,7 +2420,7 @@ impl Tool for BrowserTool {
                     },
                     "deliver": {
                         "type": "boolean",
-                        "description": "For 'screenshot': true sends this capture to the owner now, as the deliverable their request asked for. Default false: the capture is saved and kept for you to look at, not sent. Leave it false for any capture that checks a page (it may have redirected or not be ready); set it only when you know the page is the one asked for, or send a kept capture later with send_file."
+                        "description": "For 'screenshot': true declares this capture the deliverable the owner's request asked for: it is sent now, or, in a helper's run, once when the run ends (the last such capture of each page). Default false: the capture is saved and kept for you to look at, not sent. Leave it false for any capture that checks a page (it may have redirected or not be ready); set it only when you know the page is the one asked for, or send a kept capture later with send_file."
                     },
                     "full_page": {
                         "type": "boolean",
@@ -2630,6 +2628,46 @@ fn browser_call_effects(arguments: &str) -> aidaemon_core::CallEffects {
 
 /// The receipt of a screenshot the chat confirmed receiving: the page was
 /// observed and its capture, saved at `local_path`, was delivered.
+/// The send of one screenshot: hand it to the media listener and wait
+/// (bounded) for the channel's own receipt, so "sent" is never claimed for
+/// an image the channel refused. Run now, or when a helper's run ends.
+fn screenshot_send(
+    media_tx: tokio::sync::mpsc::Sender<MediaMessage>,
+    session_id: &str,
+    caption: &str,
+    kind: MediaKind,
+) -> aidaemon_tools::semantics::DeliverySend {
+    let session_id = session_id.to_string();
+    let caption = caption.to_string();
+    Box::new(move || {
+        Box::pin(async move {
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+            media_tx
+                .send(MediaMessage {
+                    session_id,
+                    caption,
+                    kind,
+                    result_tx: Some(result_tx),
+                })
+                .await
+                .map_err(|e| format!("Failed to send screenshot to chat: {e}"))?;
+            match tokio::time::timeout(Duration::from_secs(30), result_rx).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(reason))) => Err(format!(
+                    "Screenshot captured but could NOT be delivered to chat: {reason}. The \
+                     image was not sent."
+                )),
+                Ok(Err(_)) => Err("Screenshot captured but delivery could not be confirmed \
+                     (the delivery channel was dropped). The image may not have been sent."
+                    .to_string()),
+                Err(_) => Err("Screenshot captured but delivery could not be confirmed \
+                     within the timeout. The image may not have been sent."
+                    .to_string()),
+            }
+        })
+    })
+}
+
 fn delivered_screenshot_semantics(local_path: &str) -> ToolCallSemantics {
     ToolCallSemantics::observation_and_mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY)
         .with_target_hint(ToolTargetHintKind::Path, local_path)
