@@ -4,13 +4,16 @@
 
 use std::collections::BTreeMap;
 
+use serde::Serialize;
+
 use aidaemon_client_protocol::{
     Approval, CommandResult, Event, HistoryMessage, ServerFrame, SessionSummary, Snapshot,
-    TaskState, TaskSummary, TurnState, TurnStatus,
+    TaskState, TaskSummary, TurnState, TurnStatus, ViewAction,
 };
 
 /// One line of a transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Line {
     User {
         text: String,
@@ -26,21 +29,23 @@ pub enum Line {
 }
 
 /// A turn running now: its streamed text and its latest status.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct LiveTurn {
     pub turn_id: String,
     pub streamed: String,
     pub status: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct SessionView {
     pub summary: Option<SessionSummary>,
     pub lines: Vec<Line>,
     pub live: Option<LiveTurn>,
 }
 
-#[derive(Debug, Default)]
+/// The client's view. Its JSON form (`serde_json::to_value`) is what the
+/// shared reducer fixtures compare, in Rust and in the web client.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct State {
     /// The last durable `seq` applied.
     pub last_seq: Option<u64>,
@@ -51,6 +56,17 @@ pub struct State {
     pub tasks: BTreeMap<String, TaskSummary>,
     /// The latest error or notice from the gateway, shown in the status bar.
     pub notice: Option<String>,
+    /// The latest view move the agent asked this client for, until the
+    /// client takes it ([`State::take_view_request`]). Never touches the
+    /// approvals, the work or the transcripts.
+    pub view_request: Option<ViewRequest>,
+}
+
+/// A view move the agent asked for, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ViewRequest {
+    pub action: ViewAction,
+    pub reason: String,
 }
 
 /// A turn status in a few words.
@@ -284,8 +300,21 @@ impl State {
                     self.tasks.remove(&task.id);
                 }
             }
+            // Kinds this client does not know are ignored.
+            Event::ViewAction {
+                action: ViewAction::Unknown,
+                ..
+            } => {}
+            Event::ViewAction { action, reason } => {
+                self.view_request = Some(ViewRequest { action, reason });
+            }
             Event::GoalUpdated { .. } | Event::Unknown => {}
         }
+    }
+
+    /// The view move asked for, once.
+    pub fn take_view_request(&mut self) -> Option<ViewRequest> {
+        self.view_request.take()
     }
 
     /// The oldest approval waiting, which the card shows.

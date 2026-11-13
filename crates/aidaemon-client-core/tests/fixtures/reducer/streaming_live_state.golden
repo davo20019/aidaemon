@@ -1,0 +1,76 @@
+{
+  "description": "Mid-turn: the streamed text and the latest status, as a client shows them.",
+  "frames": [
+    {
+      "at_ms": 1767225601000,
+      "event": {
+        "origin": "telegram",
+        "session_id": "app:s1",
+        "turn_id": "t1",
+        "type": "turn_started"
+      },
+      "seq": 1,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225600000,
+      "event": {
+        "status": {
+          "kind": "thinking"
+        },
+        "turn_id": "t1",
+        "type": "turn_status"
+      },
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225600000,
+      "event": {
+        "text": "Looking",
+        "turn_id": "t1",
+        "type": "turn_delta"
+      },
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225600000,
+      "event": {
+        "status": {
+          "description": "read the notes",
+          "kind": "plan_step",
+          "state": "started",
+          "step": 0,
+          "total": 3
+        },
+        "turn_id": "t1",
+        "type": "turn_status"
+      },
+      "session_id": "app:s1",
+      "type": "event"
+    }
+  ],
+  "state": {
+    "approvals": {},
+    "last_seq": 1,
+    "notice": null,
+    "order": [
+      "app:s1"
+    ],
+    "sessions": {
+      "app:s1": {
+        "lines": [],
+        "live": {
+          "status": "Step 1 of 3: read the notes",
+          "streamed": "Looking",
+          "turn_id": "t1"
+        },
+        "summary": null
+      }
+    },
+    "tasks": {},
+    "view_request": null
+  }
+}

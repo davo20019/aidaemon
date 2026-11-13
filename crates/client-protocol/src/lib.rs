@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -189,6 +189,11 @@ pub enum Capability {
     Attachments,
     /// Push notifications through a relay.
     Push,
+    /// The agent may move this connection's view (`view_action` events):
+    /// open a session, show an approval or a piece of work, focus a pane.
+    /// Sent only to the connection whose message started the turn, never
+    /// replayed, and never able to answer, pair, send or stop anything.
+    ViewActions,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -404,6 +409,18 @@ pub enum Event {
     GoalUpdated {
         goal: GoalSummary,
     },
+    /// Ephemeral, and only to the one connection that declared
+    /// `view_actions` and sent the turn's message: the agent asks this
+    /// client to move its view. The client shows a short note of what moved
+    /// and why. A view action only changes what is on screen; it never
+    /// answers an approval, pairs or revokes a device, sends a message or
+    /// stops work.
+    ViewAction {
+        action: ViewAction,
+        /// Why, in a few plain words, for the note the client shows.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -412,7 +429,10 @@ pub enum Event {
 impl Event {
     /// Whether the event is kept in the log and replayed on resume.
     pub fn is_durable(&self) -> bool {
-        !matches!(self, Event::TurnDelta { .. } | Event::TurnStatus { .. })
+        !matches!(
+            self,
+            Event::TurnDelta { .. } | Event::TurnStatus { .. } | Event::ViewAction { .. }
+        )
     }
 
     /// The event's `type` tag.
@@ -431,9 +451,47 @@ impl Event {
             Event::ApprovalResolved { .. } => "approval_resolved",
             Event::TaskUpdated { .. } => "task_updated",
             Event::GoalUpdated { .. } => "goal_updated",
+            Event::ViewAction { .. } => "view_action",
             Event::Unknown => "unknown",
         }
     }
+}
+
+/// Where the agent asks a client to take its view. Every variant only
+/// changes what is on screen: none carries a decision, a message or a
+/// device, so none can answer an approval or act for the owner. Kinds a
+/// client does not know read as `Unknown` and are ignored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ViewAction {
+    /// Open a session's transcript.
+    OpenSession { session_id: String },
+    /// Bring a waiting approval's card into view (not answer it).
+    ShowApproval { approval_id: String },
+    /// Show an entry of the running-work list.
+    ShowTask { task_id: String },
+    /// Move the keyboard to a pane.
+    FocusPane { pane: Pane },
+    /// Clear the composer's target, so the next message starts a session.
+    NewSession,
+    /// Show the paired devices.
+    ShowDevices,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// A part of a client's screen.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Pane {
+    Sessions,
+    Chat,
+    Approvals,
+    Tasks,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 /// How a turn ended.
@@ -1102,6 +1160,26 @@ mod tests {
         let v = ProtocolVersion { major: 1, minor: 7 };
         assert!(ProtocolVersion::CURRENT.compatible_with(v));
         assert!(!ProtocolVersion::CURRENT.compatible_with(ProtocolVersion { major: 2, minor: 0 }));
+    }
+
+    #[test]
+    fn view_actions_are_ephemeral_and_unknown_kinds_are_ignored() {
+        let event = Event::ViewAction {
+            action: ViewAction::NewSession,
+            reason: String::new(),
+        };
+        assert!(!event.is_durable());
+        let action: ViewAction =
+            serde_json::from_str(r#"{"kind":"open_the_pod_bay_doors"}"#).unwrap();
+        assert_eq!(action, ViewAction::Unknown);
+        let pane: ViewAction =
+            serde_json::from_str(r#"{"kind":"focus_pane","pane":"holodeck"}"#).unwrap();
+        assert_eq!(
+            pane,
+            ViewAction::FocusPane {
+                pane: Pane::Unknown
+            }
+        );
     }
 
     #[test]

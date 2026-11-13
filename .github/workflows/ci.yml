@@ -100,7 +100,7 @@ jobs:
           -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
           -p aidaemon-events -p aidaemon-work -p aidaemon-decisions -p aidaemon-runtime -p aidaemon-skills -p aidaemon-secrets -p aidaemon-nodes -p aidaemon-terminal-bridge -p aidaemon-client-protocol -p aidaemon-client-gateway
           -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
-          -p aidaemon-channel-discord -p aidaemon-parity-agent -p aidaemon-tui
+          -p aidaemon-channel-discord -p aidaemon-parity-agent -p aidaemon-tui -p aidaemon-client-core
           --all-targets --all-features -- -D warnings
 
   core-api:
@@ -352,7 +352,7 @@ jobs:
           -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
           -p aidaemon-events -p aidaemon-work -p aidaemon-decisions -p aidaemon-runtime -p aidaemon-skills -p aidaemon-secrets -p aidaemon-nodes -p aidaemon-terminal-bridge -p aidaemon-client-protocol -p aidaemon-client-gateway
           -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
-          -p aidaemon-channel-discord -p aidaemon-tui --all-features
+          -p aidaemon-channel-discord -p aidaemon-tui -p aidaemon-client-core --all-features
 
       # Each example runs against the scripted provider when no API key is
       # set (CI sets none), and against a live model when one is.
@@ -381,7 +381,7 @@ jobs:
           cargo test -q -p aidaemon-parity-agent
 
   web-client:
-    name: Web client (generated types and build are current)
+    name: Web client (generated types, build and reducer fixtures)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -395,7 +395,45 @@ jobs:
       - name: Types match the schema
         run: npm run gen && git diff --exit-code src/protocol.ts
       - name: The served build matches the source
-        run: npm run build && git diff --exit-code ../../crates/aidaemon-client-gateway/web
+        run: |
+          npm run build
+          git diff --exit-code ../../crates/aidaemon-client-gateway/web
+          test -z "$(git status --porcelain ../../crates/aidaemon-client-gateway/web)"
+      - name: The TypeScript reducer passes the shared reducer fixtures
+        run: npm run test:fixtures
+
+  # The desktop app (clients/desktop, its own Cargo workspace): build only,
+  # one job per OS. Signing and release bundles live in release.yml.
+  desktop:
+    name: Desktop app build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: clients/desktop
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev libssl-dev pkg-config
+      - run: npm install
+      - name: Bundle the web client
+        run: npm run build:web
+      - name: Build the shell (no bundle, no signing)
+        run: npm run tauri -- build --no-bundle --debug
+      - name: Shell unit tests
+        working-directory: clients/desktop/src-tauri
+        run: cargo test -q
 
   build-check:
     name: Build check (release)

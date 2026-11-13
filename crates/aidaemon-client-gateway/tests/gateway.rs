@@ -1150,5 +1150,359 @@ async fn the_web_client_is_served() {
         .to_str()
         .unwrap()
         .starts_with("text/javascript"));
-    assert!(script.text().await.unwrap().contains("/sessions/challenge"));
+    assert!(script.text().await.unwrap().contains("./ui.js"));
+    // Each module the page imports is served; nothing else is.
+    for (module, holds) in [
+        ("link.js", "/sessions/challenge"),
+        ("state.js", "approval_resolved"),
+        ("platform.js", "__TAURI__"),
+        ("ui.js", "resolve_approval"),
+    ] {
+        let response = f
+            .http()
+            .get(format!("http://{}/client/v1/app/{module}", f.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{module}");
+        assert!(response.text().await.unwrap().contains(holds), "{module}");
+    }
+    let missing = f
+        .http()
+        .get(format!("http://{}/client/v1/app/protocol.js", f.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+}
+
+/// The shared client core pairs a device with its own key, signs in with a
+/// signed challenge and holds a socket on the grant, against this router.
+#[tokio::test]
+async fn the_client_core_pairs_and_signs_in_with_a_device_key() {
+    use aidaemon_client_core::keystore::{KeyStore, MemoryKeyStore};
+    use aidaemon_client_core::link::{self, Auth, ClientIdentity, LinkConfig, Update};
+    use aidaemon_client_core::signin::{self, PairRequest};
+
+    let f = fixture(RiskLevel::Medium).await;
+    let offer: PairingOffer = f
+        .owner_post("/client/v1/pairing/offers", serde_json::json!({}))
+        .await;
+    let base = format!("http://{}", f.url);
+    let request = PairRequest {
+        gateway: base.clone(),
+        offer_id: offer.offer_id.clone(),
+        code: offer.code.clone(),
+        device_name: "Synthetic Desktop".into(),
+        device_kind: ClientKind::Desktop,
+        fingerprint: Some(offer.fingerprint.clone()),
+    };
+    let pairing = tokio::spawn(async move {
+        signin::pair(&reqwest::Client::new(), &request, Duration::from_millis(20)).await
+    });
+    // The owner confirms once the device has redeemed the offer.
+    let mut decided = false;
+    for _ in 0..200 {
+        let response = f
+            .http()
+            .post(format!(
+                "{base}/client/v1/pairing/offers/{}/decision",
+                offer.offer_id
+            ))
+            .bearer_auth(&f.token)
+            .json(&serde_json::json!({"approve": true}))
+            .send()
+            .await
+            .unwrap();
+        if response.status().is_success() {
+            decided = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(decided, "the offer was never redeemed");
+    let device = pairing.await.unwrap().unwrap();
+    assert_eq!(device.gateway, base);
+
+    // A direct sign-in gets a grant for this device.
+    let grant = signin::sign_in(&reqwest::Client::new(), &device)
+        .await
+        .unwrap();
+    assert_eq!(grant.device_id, device.device_id);
+
+    // The link signs in by itself and speaks the protocol on the grant.
+    let store = Arc::new(MemoryKeyStore::default());
+    store.save(&device).unwrap();
+    let (updates_tx, mut updates) = mpsc::unbounded_channel();
+    let commands = link::spawn(
+        LinkConfig {
+            url: format!("ws://{}/client/v1/ws", f.url),
+            auth: Auth::Device(store),
+            client: ClientIdentity {
+                kind: ClientKind::Desktop,
+                name: "synthetic-desktop".into(),
+                version: None,
+            },
+            device: None,
+            capabilities: Vec::new(),
+        },
+        updates_tx,
+    );
+    commands
+        .send(("core-1".into(), Command::GetGlance))
+        .unwrap();
+    let mut welcomed = false;
+    loop {
+        let update = tokio::time::timeout(Duration::from_secs(10), updates.recv())
+            .await
+            .expect("an update in time")
+            .expect("the link runs");
+        match update {
+            Update::Disconnected(disconnect) => panic!("dropped: {disconnect:?}"),
+            Update::Frame(ServerFrame::Welcome { .. }) => welcomed = true,
+            Update::Frame(ServerFrame::Ack { request_id, .. }) if request_id == "core-1" => break,
+            _ => {}
+        }
+    }
+    assert!(welcomed);
+}
+
+// ---------------------------------------------------------------------------
+// The agent-driven view
+// ---------------------------------------------------------------------------
+
+/// A socket with these capabilities, past its welcome.
+async fn socket_with(f: &Fixture, capabilities: Vec<Capability>) -> Socket {
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{}/client/v1/ws", f.url))
+        .await
+        .unwrap();
+    let hello = ClientFrame::Hello {
+        version: ProtocolVersion::CURRENT,
+        client: ClientInfo {
+            kind: ClientKind::Tui,
+            name: "test".into(),
+            version: None,
+            device: None,
+        },
+        capabilities,
+        resume_from: Some(0),
+        token: Some(f.token.clone()),
+    };
+    socket
+        .send(Message::text(serde_json::to_string(&hello).unwrap()))
+        .await
+        .unwrap();
+    let ServerFrame::Welcome {
+        server_capabilities,
+        ..
+    } = next(&mut socket).await
+    else {
+        panic!("welcome first");
+    };
+    assert!(server_capabilities.contains(&Capability::ViewActions));
+    socket
+}
+
+/// Send `frame` on `socket` and read until its ack; every frame before it.
+async fn command_on(socket: &mut Socket, frame: &ClientFrame) -> (CommandResult, Vec<ServerFrame>) {
+    socket
+        .send(Message::text(serde_json::to_string(frame).unwrap()))
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    loop {
+        match next(socket).await {
+            ServerFrame::Ack { result, .. } => return (result, seen),
+            other => seen.push(other),
+        }
+    }
+}
+
+/// Every view action the socket gets within `wait`.
+async fn view_actions_within(socket: &mut Socket, wait: Duration) -> Vec<ViewAction> {
+    let mut actions = Vec::new();
+    let until = tokio::time::Instant::now() + wait;
+    while let Ok(Some(Ok(message))) = tokio::time::timeout_at(until, socket.next()).await {
+        if let Message::Text(text) = message {
+            if let ServerFrame::Event {
+                event: Event::ViewAction { action, .. },
+                seq,
+                ..
+            } = serde_json::from_str(&text).unwrap()
+            {
+                assert_eq!(seq, None, "view actions are never logged");
+                actions.push(action);
+            }
+        }
+    }
+    actions
+}
+
+/// The view action goes to the connection that sent the turn's message and
+/// declared the capability; a client without it, or one that only watches,
+/// is never sent the event, and a message from a client that cannot be
+/// moved leaves the session without a target.
+#[tokio::test]
+async fn a_view_action_reaches_only_the_capable_sender() {
+    let f = fixture(RiskLevel::Medium).await;
+    let mut sender = socket_with(&f, vec![Capability::ViewActions]).await;
+    let mut plain = socket_with(&f, Vec::new()).await;
+    let mut watcher = socket_with(&f, vec![Capability::ViewActions]).await;
+    let (result, _) =
+        command_on(&mut sender, &command("v-1", send("Show me what's waiting"))).await;
+    let CommandResult::MessageAccepted { session_id, .. } = result else {
+        panic!("accepted");
+    };
+    assert!(f.gateway.views().can_show(&session_id));
+    f.gateway
+        .views()
+        .show(
+            &session_id,
+            ViewAction::OpenSession {
+                session_id: session_id.clone(),
+            },
+            "You asked to see it",
+        )
+        .unwrap();
+    assert_eq!(
+        view_actions_within(&mut sender, Duration::from_millis(500)).await,
+        vec![ViewAction::OpenSession {
+            session_id: session_id.clone()
+        }]
+    );
+    assert!(view_actions_within(&mut plain, Duration::from_millis(300))
+        .await
+        .is_empty());
+    assert!(
+        view_actions_within(&mut watcher, Duration::from_millis(300))
+            .await
+            .is_empty()
+    );
+    // Nothing of it reached the log, so no later replay can move a view.
+    let logged = f.gateway.bus().after(0, 500).await.unwrap();
+    assert!(!logged.iter().any(|frame| matches!(
+        frame,
+        ServerFrame::Event {
+            event: Event::ViewAction { .. },
+            ..
+        }
+    )));
+
+    // A message into the same session over HTTP (no capability) clears the
+    // target: the next turn cannot move anyone.
+    let ack = f
+        .post(
+            &[],
+            &command(
+                "v-2",
+                Command::SendMessage {
+                    session_id: Some(session_id.clone()),
+                    text: "Carry on".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+        )
+        .await;
+    assert!(matches!(ack, ServerFrame::Ack { .. }), "{ack:?}");
+    assert!(!f.gateway.views().can_show(&session_id));
+    assert_eq!(
+        f.gateway
+            .views()
+            .show(&session_id, ViewAction::NewSession, "again"),
+        Err(aidaemon_client_gateway::ViewError::NoClient)
+    );
+    // A session of another chat never has a target.
+    assert!(!f.gateway.views().can_show("telegram:synthetic-user-1"));
+}
+
+/// No view action can resolve an approval: with a card waiting, every kind
+/// of view action (pointing at that very card where it can) is delivered,
+/// and the card is still pending, no answer is logged and the turn that
+/// asked is still waiting for the owner.
+#[tokio::test]
+async fn no_view_action_can_resolve_an_approval() {
+    let f = fixture(RiskLevel::Medium).await;
+    let mut socket = socket_with(&f, vec![Capability::ViewActions]).await;
+    let (result, _) = command_on(&mut socket, &command("v-1", send("Please approve this"))).await;
+    let CommandResult::MessageAccepted { session_id, .. } = result else {
+        panic!("accepted");
+    };
+    let approval_id = loop {
+        if let ServerFrame::Event {
+            event: Event::ApprovalRequested { approval },
+            ..
+        } = next(&mut socket).await
+        {
+            break approval.id;
+        }
+    };
+    let every_action = [
+        ViewAction::OpenSession {
+            session_id: session_id.clone(),
+        },
+        ViewAction::ShowApproval {
+            approval_id: approval_id.clone(),
+        },
+        ViewAction::ShowTask {
+            task_id: "any".into(),
+        },
+        ViewAction::FocusPane {
+            pane: Pane::Approvals,
+        },
+        ViewAction::NewSession,
+        ViewAction::ShowDevices,
+        ViewAction::Unknown,
+    ];
+    // The list is every kind there is: adding one fails to compile here.
+    for action in &every_action {
+        match action {
+            ViewAction::OpenSession { .. }
+            | ViewAction::ShowApproval { .. }
+            | ViewAction::ShowTask { .. }
+            | ViewAction::FocusPane { .. }
+            | ViewAction::NewSession
+            | ViewAction::ShowDevices
+            | ViewAction::Unknown => {}
+        }
+    }
+    for action in &every_action {
+        f.gateway
+            .views()
+            .show(&session_id, action.clone(), "Look at this")
+            .unwrap();
+    }
+    let delivered = view_actions_within(&mut socket, Duration::from_millis(800)).await;
+    assert_eq!(delivered, every_action.to_vec());
+    let (_, snapshot) = f.gateway.snapshot().await;
+    assert!(
+        snapshot
+            .pending_approvals
+            .iter()
+            .any(|a| a.id == approval_id),
+        "the card is still waiting"
+    );
+    let logged = f.gateway.bus().after(0, 500).await.unwrap();
+    assert!(!logged.iter().any(|frame| matches!(
+        frame,
+        ServerFrame::Event {
+            event: Event::ApprovalResolved { .. } | Event::TurnCompleted { .. },
+            ..
+        }
+    )));
+    // Only the owner's own command answers it.
+    let (result, _) = command_on(
+        &mut socket,
+        &command(
+            "v-2",
+            Command::ResolveApproval {
+                approval_id: approval_id.clone(),
+                decision: ApprovalDecision::Deny,
+            },
+        ),
+    )
+    .await;
+    assert!(
+        matches!(result, CommandResult::ApprovalResolved { .. }),
+        "{result:?}"
+    );
 }

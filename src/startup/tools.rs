@@ -382,6 +382,7 @@ enum OptionalToolId {
     SendFile,
     CliAgents,
     HealthProbe,
+    ClientView,
     #[cfg(feature = "slack")]
     SlackChannelHistory,
 }
@@ -430,6 +431,10 @@ fn optional_enabled_files(config: &AppConfig) -> bool {
 
 fn optional_enabled_cli_agents(config: &AppConfig) -> bool {
     config.cli_agents.enabled
+}
+
+fn optional_enabled_client_gateway(config: &AppConfig) -> bool {
+    config.client_gateway.enabled
 }
 
 fn optional_enabled_always(_: &AppConfig) -> bool {
@@ -498,6 +503,11 @@ const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
         id: OptionalToolId::HealthProbe,
         name: "health_probe",
         enabled_if: optional_enabled_always,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::ClientView,
+        name: "client_view",
+        enabled_if: optional_enabled_client_gateway,
     },
     #[cfg(feature = "slack")]
     OptionalToolSpec {
@@ -890,6 +900,14 @@ pub async fn register_optional_tools(
                     continue;
                 };
                 tools.push(Arc::new(HealthProbeTool::new(store.clone())));
+            }
+            OptionalToolId::ClientView => {
+                if !config.tools.is_enabled("client_view") {
+                    continue;
+                }
+                tools.push(Arc::new(crate::tools::ClientViewTool::new(Arc::new(
+                    crate::startup::client_gateway::GatewayViews,
+                ))));
             }
             #[cfg(feature = "slack")]
             OptionalToolId::SlackChannelHistory => {

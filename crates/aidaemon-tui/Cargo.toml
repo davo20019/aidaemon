@@ -19,6 +19,7 @@ name = "aidaemon-tui"
 path = "src/main.rs"
 
 [dependencies]
+aidaemon-client-core = { version = "0.2.0", path = "../aidaemon-client-core" }
 aidaemon-client-protocol = { version = "0.2.0", path = "../client-protocol" }
 anyhow = "1"
 crossterm = { version = "0.28", features = ["event-stream"] }
@@ -26,8 +27,7 @@ futures = "0.3"
 ratatui = "0.29"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-tungstenite = "0.30"
-uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.30"

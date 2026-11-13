@@ -12,6 +12,9 @@ The protocol types (`src/protocol.ts`) are generated from `schemas/client-protoc
 npm install
 npm run gen     # regenerate src/protocol.ts from the schema
 npm run build   # type-check, compile and copy into the gateway crate
+npm run test:fixtures   # the shared reducer fixtures against src/state.ts
 ```
+
+`src/state.ts` is the event reducer, with no DOM. It is held to the Rust reducer in `aidaemon-client-core` by the fixtures in `crates/aidaemon-client-core/tests/fixtures/reducer/` (server frames in, the state they leave out); both suites run the same files in CI, and where the two disagree the Rust `State` is the reference.
 
 Run it against a daemon with `[client_gateway] enabled = true`, at `http://127.0.0.1:8788/client/v1/app`, or through your own HTTPS tunnel (set `public_url` so pairing links point there).

@@ -58,7 +58,7 @@ pub fn router(gateway: Arc<ClientGateway>) -> Router {
         .route("/client/v1/devices/{device_id}/revoke", post(revoke_device))
         .route("/client/v1/app", get(web_page))
         .route("/client/v1/app/", get(web_page))
-        .route("/client/v1/app/app.js", get(web_script))
+        .route("/client/v1/app/{module}", get(web_script))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .with_state(gateway)
 }
@@ -182,6 +182,7 @@ fn caller_of(
         kind,
         device,
         principal,
+        view_connection: None,
     }
 }
 
@@ -333,9 +334,15 @@ async fn revoke_device(
     reply(gateway.pairing.devices().await)
 }
 
-/// The web client: one page and its script, built from `clients/web`.
+/// The web client: one page and its modules, built from `clients/web`.
 const WEB_PAGE: &str = include_str!("../web/index.html");
-const WEB_SCRIPT: &str = include_str!("../web/app.js");
+const WEB_MODULES: &[(&str, &str)] = &[
+    ("app.js", include_str!("../web/app.js")),
+    ("link.js", include_str!("../web/link.js")),
+    ("platform.js", include_str!("../web/platform.js")),
+    ("state.js", include_str!("../web/state.js")),
+    ("ui.js", include_str!("../web/ui.js")),
+];
 
 async fn web_page() -> Response {
     (
@@ -351,13 +358,16 @@ async fn web_page() -> Response {
         .into_response()
 }
 
-async fn web_script() -> Response {
+async fn web_script(Path(module): Path<String>) -> Response {
+    let Some((_, script)) = WEB_MODULES.iter().find(|(name, _)| *name == module) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/javascript; charset=utf-8",
         )],
-        WEB_SCRIPT,
+        *script,
     )
         .into_response()
 }
@@ -555,12 +565,17 @@ async fn run_socket(
         .await;
     }
     let revoked = principal.revoked.clone();
-    let caller = caller_of(
+    let mut caller = caller_of(
         Some(client.kind),
         client.device.clone(),
         &capabilities,
         principal,
     );
+    // A socket that can be moved gets its own outbox for view actions.
+    let mut view = capabilities
+        .contains(&Capability::ViewActions)
+        .then(|| gateway.views.connect());
+    caller.view_connection = view.as_ref().map(|view| view.id);
 
     // Subscribe before reading the log, so nothing falls between them.
     let mut live = gateway.bus.subscribe();
@@ -569,7 +584,7 @@ async fn run_socket(
         &mut socket,
         &ServerFrame::Welcome {
             version: ProtocolVersion::CURRENT,
-            server_capabilities: vec![Capability::Compact],
+            server_capabilities: vec![Capability::Compact, Capability::ViewActions],
             owner: gateway.owner(),
             latest_seq: latest,
         },
@@ -628,6 +643,14 @@ async fn run_socket(
                         }).await?;
                     }
                 }
+            }
+            Some(frame) = async {
+                match view.as_mut() {
+                    Some(view) => view.outbox.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                send(&mut socket, &frame).await?;
             }
             Some(reply) = replies.recv() => {
                 if let Some(reply) = fit(&reply, caller.compact) {
