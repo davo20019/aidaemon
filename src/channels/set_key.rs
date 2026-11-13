@@ -345,13 +345,9 @@ pub(crate) async fn save_key(
     };
     let updated = with_api_key_value(&current, slot, stored)?;
     if updated != current {
-        crate::tools::config_manager::ConfigManagerTool::validate_config(&updated)
-            .map_err(anyhow::Error::msg)?;
-        if let Err(error) = crate::tools::config_manager::rotate_config_backups(config_path).await {
-            tracing::warn!(%error, "Failed to back up the config before saving a key");
-        }
-        tokio::fs::write(config_path, &updated).await?;
-        crate::tools::config_manager::set_owner_only_permissions(config_path);
+        crate::config::config_file(config_path)
+            .save(&updated)
+            .await?;
     }
     Ok(note)
 }

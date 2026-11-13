@@ -51,6 +51,7 @@ mod checklist;
 pub mod checkpoints;
 pub mod command_effects;
 pub mod command_risk;
+pub mod config_file;
 pub mod consequential;
 pub mod daemon_guard;
 pub mod duration_format;

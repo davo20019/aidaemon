@@ -95,6 +95,32 @@ pub fn delete_from_keychain(field_name: &str) -> anyhow::Result<()> {
     aidaemon_secrets::SecretStore::delete(secret_store().as_ref(), field_name)
 }
 
+/// The daemon's check of a whole config text before a tool writes it: TOML
+/// syntax, then `${ENV_VAR}` references expanded, then [`AppConfig`] and
+/// the checks startup makes (agent name, exposure). `"keychain"` sentinels
+/// are not resolved: the value may not be stored yet.
+pub fn check_config_text(content: &str) -> Result<(), String> {
+    let _doc: toml::Table = content
+        .parse()
+        .map_err(|e| format!("Invalid TOML syntax: {}", e))?;
+    let expanded = expand_env_vars(content).map_err(|e| format!("{}", e))?;
+    let config = toml::from_str::<AppConfig>(&expanded)
+        .map_err(|e| format!("Invalid config structure: {}", e))?;
+    config
+        .agent
+        .validated_name()
+        .map_err(|e| format!("Invalid agent configuration: {}", e))?;
+    config
+        .exposure
+        .validate(config.client_gateway.enabled, config.nodes.gateway.enabled)?;
+    Ok(())
+}
+
+/// The daemon's config file as the config-editing tools see it.
+pub fn config_file(path: impl Into<PathBuf>) -> aidaemon_tools::config_file::ConfigFile {
+    aidaemon_tools::config_file::ConfigFile::new(path, std::sync::Arc::new(check_config_text))
+}
+
 /// Where to export run traces. Nothing is exported unless an endpoint is
 /// set, and prompts and replies only with `capture_content`.
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -1896,7 +1922,7 @@ fn default_people_reconnect_reminder_days() -> u32 {
     30
 }
 
-pub use aidaemon_tools::http_request::{HttpAuthProfile, HttpAuthType};
+pub use aidaemon_tools::http_request::HttpAuthProfile;
 
 pub use aidaemon_runtime::settings::ContextWindowConfig;
 

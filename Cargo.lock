@@ -566,6 +566,7 @@ dependencies = [
  "aidaemon-memory",
  "aidaemon-policies",
  "aidaemon-providers",
+ "aidaemon-secrets",
  "aidaemon-skills",
  "aidaemon-store-sqlite",
  "aidaemon-tools",
@@ -764,6 +765,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]

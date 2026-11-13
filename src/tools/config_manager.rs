@@ -1,11 +1,9 @@
-use std::path::{Path, PathBuf};
-
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::warn;
 
-use crate::config::AppConfig;
+use aidaemon_tools::config_file::ConfigFile;
 
 mod config_path;
 use crate::traits::{
@@ -267,52 +265,12 @@ impl ResolvedProviderSelection {
 }
 
 pub struct ConfigManagerTool {
-    config_path: PathBuf,
-}
-
-/// Set file permissions to owner-only read/write (0600) on Unix.
-/// This is a best-effort operation — failures are logged but not fatal.
-#[cfg(unix)]
-pub(crate) fn set_owner_only_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        warn!(path = %path.display(), "Failed to set 0600 permissions: {}", e);
-    }
-}
-
-#[cfg(not(unix))]
-pub(crate) fn set_owner_only_permissions(_path: &Path) {
-    // No-op on non-Unix platforms
-}
-
-/// Rotate backups (3-deep ring) and create a new .bak from current config.
-/// Rotation: .bak.2 is deleted, .bak.1 → .bak.2, .bak → .bak.1, current → .bak
-pub(crate) async fn rotate_config_backups(config_path: &Path) -> anyhow::Result<()> {
-    let bak = config_path.with_extension("toml.bak");
-    let bak1 = config_path.with_extension("toml.bak.1");
-    let bak2 = config_path.with_extension("toml.bak.2");
-
-    // Rotate: .bak.1 → .bak.2
-    if bak1.exists() {
-        let _ = tokio::fs::rename(&bak1, &bak2).await;
-    }
-    // Rotate: .bak → .bak.1
-    if bak.exists() {
-        let _ = tokio::fs::rename(&bak, &bak1).await;
-    }
-    // Current → .bak
-    tokio::fs::copy(&config_path, &bak).await?;
-    // Restrict permissions on all backup files (contain secrets)
-    set_owner_only_permissions(&bak);
-    set_owner_only_permissions(&bak1);
-    set_owner_only_permissions(&bak2);
-    info!(backup = %bak.display(), "Config backup created (3-deep rotation)");
-    Ok(())
+    config: ConfigFile,
 }
 
 impl ConfigManagerTool {
-    pub fn new(config_path: PathBuf) -> Self {
-        Self { config_path }
+    pub fn new(config: ConfigFile) -> Self {
+        Self { config }
     }
 
     /// Check if a key path requires user approval to modify.
@@ -405,7 +363,7 @@ impl ConfigManagerTool {
                 Ok(Some(Self::set_summary(args)))
             }
             "enable_client_gateway" => {
-                let content = tokio::fs::read_to_string(&self.config_path).await?;
+                let content = self.config.read().await?;
                 let settings = Self::client_gateway_settings(&content);
                 Ok(Some(format!(
                     "Turn on the Client Gateway: local apps (terminal UI, web client) can chat, \
@@ -427,7 +385,7 @@ impl ConfigManagerTool {
                 else {
                     return Ok(None);
                 };
-                let content = tokio::fs::read_to_string(&self.config_path).await?;
+                let content = self.config.read().await?;
                 let doc: toml::Table = content.parse()?;
                 let next_index = match doc.get("provider") {
                     None => 0,
@@ -446,7 +404,7 @@ impl ConfigManagerTool {
                 let Some(index) = args.failover_index else {
                     return Ok(None);
                 };
-                let content = tokio::fs::read_to_string(&self.config_path).await?;
+                let content = self.config.read().await?;
                 let doc: toml::Table = content.parse()?;
                 let provider_table = doc
                     .get("provider")
@@ -554,7 +512,7 @@ impl ConfigManagerTool {
             return CallEffects::none();
         }
         let mut effects = CallEffects::unknown();
-        let config_key = std::path::absolute(&self.config_path)
+        let config_key = std::path::absolute(self.config.path())
             .ok()
             .and_then(|path| {
                 path.to_str()
@@ -567,20 +525,16 @@ impl ConfigManagerTool {
     }
 
     async fn create_backup(&self) -> anyhow::Result<()> {
-        rotate_config_backups(&self.config_path).await
+        self.config.backup().await
     }
 
     /// Restore from the first available backup in the chain.
     async fn restore_backup(&self) -> anyhow::Result<String> {
-        let candidates = [
-            self.config_path.with_extension("toml.bak"),
-            self.config_path.with_extension("toml.bak.1"),
-            self.config_path.with_extension("toml.bak.2"),
-        ];
+        let candidates = self.config.backups();
 
         for candidate in &candidates {
             if candidate.exists() {
-                tokio::fs::copy(candidate, &self.config_path).await?;
+                tokio::fs::copy(candidate, self.config.path()).await?;
                 warn!(source = %candidate.display(), "Config restored from backup");
                 return Ok(format!(
                     "Config restored from {}. Run /reload to apply.",
@@ -590,32 +544,6 @@ impl ConfigManagerTool {
         }
 
         anyhow::bail!("No backups found (checked .bak, .bak.1, .bak.2)")
-    }
-
-    /// Validate that a config string parses correctly as AppConfig.
-    /// Expands `${ENV_VAR}` references before structural validation but does
-    /// NOT resolve `"keychain"` sentinels (the value may not be stored yet).
-    pub(crate) fn validate_config(content: &str) -> Result<(), String> {
-        // First check it's valid TOML
-        let _doc: toml::Table = content
-            .parse()
-            .map_err(|e| format!("Invalid TOML syntax: {}", e))?;
-
-        // Expand env vars so "${VAR}" values don't break type validation
-        let expanded = crate::config::expand_env_vars(content).map_err(|e| format!("{}", e))?;
-
-        // Then check it deserializes into our AppConfig
-        let config = toml::from_str::<AppConfig>(&expanded)
-            .map_err(|e| format!("Invalid config structure: {}", e))?;
-        config
-            .agent
-            .validated_name()
-            .map_err(|e| format!("Invalid agent configuration: {}", e))?;
-        config
-            .exposure
-            .validate(config.client_gateway.enabled, config.nodes.gateway.enabled)?;
-
-        Ok(())
     }
 
     /// Why a change may not be written: it would add or change an
@@ -1236,7 +1164,7 @@ impl ConfigManagerTool {
     }
 
     async fn list_failover_providers(&self) -> anyhow::Result<String> {
-        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let content = self.config.read().await?;
         let doc: toml::Table = content.parse()?;
         let Some(provider_table) = doc.get("provider").and_then(toml::Value::as_table) else {
             return Ok("Config has no [provider] section.".to_string());
@@ -1273,7 +1201,7 @@ impl ConfigManagerTool {
             Err(message) => return Ok(message),
         };
 
-        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let content = self.config.read().await?;
         let mut doc: toml::Table = content.parse()?;
         let provider_table = doc
             .entry("provider")
@@ -1301,7 +1229,7 @@ impl ConfigManagerTool {
         Self::normalize_failover_array_mut(provider_table)?.push(toml::Value::Table(new_provider));
 
         let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
-        if let Err(e) = Self::validate_config(&new_content) {
+        if let Err(e) = self.config.validate(&new_content) {
             return Ok(format!(
                 "Refused to save failover provider: {}.\n\nThe config was NOT modified.",
                 e
@@ -1312,8 +1240,7 @@ impl ConfigManagerTool {
             warn!("Failed to create backup: {}", e);
         }
 
-        tokio::fs::write(&self.config_path, &new_content).await?;
-        set_owner_only_permissions(&self.config_path);
+        self.config.write_checked(&new_content).await?;
 
         let mut response = vec![
             format!(
@@ -1355,7 +1282,7 @@ impl ConfigManagerTool {
             );
         };
 
-        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let content = self.config.read().await?;
         let mut doc: toml::Table = content.parse()?;
         let provider_table = doc
             .get_mut("provider")
@@ -1421,7 +1348,7 @@ impl ConfigManagerTool {
         }
 
         let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
-        if let Err(e) = Self::validate_config(&new_content) {
+        if let Err(e) = self.config.validate(&new_content) {
             return Ok(format!(
                 "Refused to remove failover provider: {}.\n\nThe config was NOT modified.",
                 e
@@ -1432,8 +1359,7 @@ impl ConfigManagerTool {
             warn!("Failed to create backup: {}", e);
         }
 
-        tokio::fs::write(&self.config_path, &new_content).await?;
-        set_owner_only_permissions(&self.config_path);
+        self.config.write_checked(&new_content).await?;
 
         cleanup_keys.sort();
         cleanup_keys.dedup();
@@ -1469,7 +1395,7 @@ impl ConfigManagerTool {
 
         Self::require_kernel_approval(args)?;
 
-        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let content = self.config.read().await?;
         let mut doc: toml::Table = content.parse()?;
 
         let mut notes: Vec<String> = Vec::new();
@@ -1489,7 +1415,7 @@ impl ConfigManagerTool {
 
         let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
 
-        if let Err(e) = Self::validate_config(&new_content) {
+        if let Err(e) = self.config.validate(&new_content) {
             return Ok(format!(
                 "Refused to save provider switch: {}.\n\nThe config was NOT modified.",
                 e
@@ -1500,8 +1426,7 @@ impl ConfigManagerTool {
             warn!("Failed to create backup: {}", e);
         }
 
-        tokio::fs::write(&self.config_path, &new_content).await?;
-        set_owner_only_permissions(&self.config_path);
+        self.config.write_checked(&new_content).await?;
 
         let mut response = vec![
             format!("Switched provider to {}.", selection.preset.display_name),
@@ -1567,12 +1492,12 @@ impl ConfigManagerTool {
             .filter(|s| !s.is_empty())
             .unwrap_or("en");
 
-        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let content = self.config.read().await?;
         let mut doc: toml::Table = content.parse()?;
         crate::stt_setup::apply_stt_to_config_table(&mut doc, &probe, true, language)?;
 
         let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
-        if let Err(e) = Self::validate_config(&new_content) {
+        if let Err(e) = self.config.validate(&new_content) {
             return Ok(format!(
                 "Refused to enable STT: {}.\n\nThe config was NOT modified.",
                 e
@@ -1583,8 +1508,7 @@ impl ConfigManagerTool {
             warn!("Failed to create backup: {}", e);
         }
 
-        tokio::fs::write(&self.config_path, &new_content).await?;
-        set_owner_only_permissions(&self.config_path);
+        self.config.write_checked(&new_content).await?;
 
         Ok(format!(
             "Enabled Whisper STT fallback ([files.stt]).\n\n{}\n- language: `{language}`\n\nConfig validated and saved. Restart aidaemon (`/restart`) to apply — STT is loaded at startup.",
@@ -1607,7 +1531,7 @@ impl ConfigManagerTool {
     /// `aidaemon web` work with no flags. The token never enters the reply.
     async fn enable_client_gateway(&self, args: &ConfigArgs) -> anyhow::Result<ConfigReply> {
         Self::require_kernel_approval(args)?;
-        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let content = self.config.read().await?;
         let mut doc: toml::Table = content.parse()?;
         let already_on = Self::client_gateway_settings(&content).enabled;
         let table = doc
@@ -1622,7 +1546,7 @@ impl ConfigManagerTool {
         };
         table.insert("enabled".to_string(), toml::Value::Boolean(true));
         let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
-        if let Err(e) = Self::validate_config(&new_content) {
+        if let Err(e) = self.config.validate(&new_content) {
             return Ok(ConfigReply::refused(format!(
                 "Refused to enable the Client Gateway: {e}.\n\nThe config was NOT modified."
             )));
@@ -1631,8 +1555,7 @@ impl ConfigManagerTool {
             if let Err(e) = self.create_backup().await {
                 warn!("Failed to create backup: {}", e);
             }
-            tokio::fs::write(&self.config_path, &new_content).await?;
-            set_owner_only_permissions(&self.config_path);
+            self.config.write_checked(&new_content).await?;
         }
         let settings = Self::client_gateway_settings(&new_content);
         let token_path = match crate::startup::client_gateway::local_token(&settings) {
@@ -1732,7 +1655,7 @@ impl ConfigManagerTool {
                 )))
             }
         };
-        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let content = self.config.read().await?;
         let mut doc: toml::Table = content.parse()?;
         let value = toml::Value::try_from(&settings)?;
         let exposure = doc
@@ -1746,7 +1669,7 @@ impl ConfigManagerTool {
         };
         exposure.insert(service.key(), value);
         let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
-        if let Err(e) = Self::validate_config(&new_content) {
+        if let Err(e) = self.config.validate(&new_content) {
             let hint = match service {
                 aidaemon_exposure::ExposedService::ClientGateway
                     if e.contains("client_gateway.enabled") =>
@@ -1762,8 +1685,7 @@ impl ConfigManagerTool {
         if let Err(e) = self.create_backup().await {
             warn!("Failed to create backup: {}", e);
         }
-        tokio::fs::write(&self.config_path, &new_content).await?;
-        set_owner_only_permissions(&self.config_path);
+        self.config.write_checked(&new_content).await?;
         Ok(ConfigReply::done(format!(
             "Exposure saved: [exposure.{service}] adapter = \"{}\" ({}). Backup saved to \
              config.toml.bak.\n\nRestart aidaemon (`/restart`) to apply: the tunnel starts with \
@@ -1939,13 +1861,13 @@ impl ConfigManagerTool {
             "enable_client_gateway" => self.enable_client_gateway(&args).await,
             "enable_exposure" => self.enable_exposure(&args).await,
             "read" => {
-                let content = tokio::fs::read_to_string(&self.config_path).await?;
+                let content = self.config.read().await?;
                 let mut doc: toml::Value = toml::from_str(&content)?;
                 redact_secrets(&mut doc);
                 let redacted = toml::to_string_pretty(&doc)?;
                 Ok(ConfigReply::done(format!(
                     "Current config.toml at {} (secrets redacted):\n\n{}",
-                    self.config_path.display(),
+                    self.config.path().display(),
                     redacted
                 )))
             }
@@ -1977,7 +1899,7 @@ impl ConfigManagerTool {
                 "{path} = \"{REDACTED}\" (redacted for security)"
             )));
         }
-        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let content = self.config.read().await?;
         let doc: toml::Value = toml::from_str(&content)?;
         match path.lookup(&doc) {
             Some(value) => {
@@ -2018,7 +1940,7 @@ impl ConfigManagerTool {
             Self::require_kernel_approval(args)?;
         }
 
-        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let content = self.config.read().await?;
         let mut doc: toml_edit::DocumentMut = content.parse()?;
         let new_value = (!unset).then(|| config_path::parse_value(&args.value));
         let edited = match &new_value {
@@ -2032,7 +1954,7 @@ impl ConfigManagerTool {
         }
         let new_content = doc.to_string();
 
-        if let Err(e) = Self::validate_config(&new_content) {
+        if let Err(e) = self.config.validate(&new_content) {
             return Ok(ConfigReply::refused(format!(
                 "Refused to save: {}.\n\nThe config was NOT modified. Fix the value and try again.",
                 e
@@ -2042,7 +1964,7 @@ impl ConfigManagerTool {
             return Ok(ConfigReply::refused(refusal));
         }
         if let Some(value) = &new_value {
-            if !path.ends_in_index() && !Self::config_reads(&doc, &path, value) {
+            if !path.ends_in_index() && !self.config_reads(&doc, &path, value) {
                 return Ok(ConfigReply::refused(format!(
                     "Refused: aidaemon does not read a setting at `{path}`, so it would have no effect. \
                      The config was NOT modified. Check the key name with action 'read'."
@@ -2054,12 +1976,11 @@ impl ConfigManagerTool {
             warn!("Failed to create backup: {}", e);
             // Continue anyway — better to fix config than refuse
         }
-        tokio::fs::write(&self.config_path, &new_content).await?;
-        set_owner_only_permissions(&self.config_path);
+        self.config.write_checked(&new_content).await?;
 
         // What a reload will load: the file as it is on disk now.
-        let written = tokio::fs::read_to_string(&self.config_path).await?;
-        if let Err(e) = Self::validate_config(&written) {
+        let written = self.config.read().await?;
+        if let Err(e) = self.config.validate(&written) {
             return Ok(ConfigReply::refused(format!(
                 "config.toml was written but no longer loads ({e}). The change is not in effect; \
                  use action 'restore' to bring back the backup."
@@ -2105,6 +2026,7 @@ impl ConfigManagerTool {
     /// document with a value of the wrong shape there must fail to load. A
     /// key the config ignores loads either way.
     fn config_reads(
+        &self,
         doc: &toml_edit::DocumentMut,
         path: &ConfigPath,
         value: &toml_edit::Value,
@@ -2116,7 +2038,7 @@ impl ConfigManagerTool {
         {
             return true;
         }
-        Self::validate_config(&probe.to_string()).is_err()
+        self.config.validate(&probe.to_string()).is_err()
     }
 
     /// A change needs the owner when it names a security-sensitive key, or
@@ -2289,6 +2211,7 @@ fn redact_secrets(value: &mut toml::Value) {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::AppConfig;
     use crate::traits::ToolCalls as _;
     use std::fs;
     use std::path::PathBuf;
@@ -2320,7 +2243,9 @@ mod tests {
     }
 
     fn test_tool() -> ConfigManagerTool {
-        ConfigManagerTool::new(PathBuf::from("/tmp/nonexistent-config.toml"))
+        ConfigManagerTool::new(crate::config::config_file(PathBuf::from(
+            "/tmp/nonexistent-config.toml",
+        )))
     }
 
     fn write_temp_config(contents: &str) -> (TempDir, PathBuf) {
@@ -2333,7 +2258,7 @@ mod tests {
     /// The tool as the kernel runs it: test calls carry the kernel's
     /// approval (`test_args().kernel_approved`).
     fn approving_tool(config_path: PathBuf) -> ConfigManagerTool {
-        ConfigManagerTool::new(config_path)
+        ConfigManagerTool::new(crate::config::config_file(config_path))
     }
 
     const FAILOVER_CONFIG: &str = r#"
@@ -2355,7 +2280,7 @@ default = "claude-sonnet-4-20250514"
     #[tokio::test]
     async fn sensitive_changes_ask_with_the_old_wording_and_no_secret_in_the_subject() {
         let (_dir, path) = write_temp_config(FAILOVER_CONFIG);
-        let tool = ConfigManagerTool::new(path);
+        let tool = ConfigManagerTool::new(crate::config::config_file(path));
 
         let set = json!({"action": "set", "key": "provider.api_key", "value": "synthetic-secret"});
         let OwnerApprovalNeed::Ask(request) = tool.owner_approval(&set).await else {
@@ -2445,7 +2370,7 @@ fallback = ["old-a", "old-b"]
     #[tokio::test]
     async fn a_list_position_edits_that_fallback_entry_and_is_checked_on_disk() {
         let (_dir, path) = write_temp_config(TWO_FALLBACKS);
-        let tool = ConfigManagerTool::new(path.clone());
+        let tool = ConfigManagerTool::new(crate::config::config_file(path.clone()));
         for (key, value) in [
             ("provider.fallbacks[1].models.default", "new-model"),
             ("provider.fallbacks.1.models.smart", "\"new-smart\""),
@@ -2478,7 +2403,7 @@ fallback = ["old-a", "old-b"]
     #[tokio::test]
     async fn paths_the_config_does_not_have_or_read_are_refused_unchanged() {
         let (_dir, path) = write_temp_config(TWO_FALLBACKS);
-        let tool = ConfigManagerTool::new(path.clone());
+        let tool = ConfigManagerTool::new(crate::config::config_file(path.clone()));
         for (key, expect) in [
             ("provider.fallbacks[2].models.default", "has 2 entries"),
             (
@@ -2511,7 +2436,7 @@ fallback = ["old-a", "old-b"]
     #[tokio::test]
     async fn unset_removes_a_setting_and_read_is_a_typed_success() {
         let (_dir, path) = write_temp_config(TWO_FALLBACKS);
-        let tool = ConfigManagerTool::new(path.clone());
+        let tool = ConfigManagerTool::new(crate::config::config_file(path.clone()));
         let args =
             json!({"action": "unset", "key": "provider.fallbacks[1].models.fallback"}).to_string();
         let output = tool.call(&args).await.unwrap();
@@ -2544,7 +2469,7 @@ fallback = ["old-a", "old-b"]
     #[tokio::test]
     async fn sensitive_change_without_the_kernel_is_refused() {
         let (_dir, path) = write_temp_config(FAILOVER_CONFIG);
-        let tool = ConfigManagerTool::new(path.clone());
+        let tool = ConfigManagerTool::new(crate::config::config_file(path.clone()));
         let before = fs::read_to_string(&path).unwrap();
         let args = json!({"action": "set", "key": "provider.base_url", "value": "\"https://h.example.invalid/v1\""})
             .to_string();
@@ -2563,7 +2488,9 @@ fallback = ["old-a", "old-b"]
 
     #[test]
     fn changes_declare_the_config_path_and_reads_declare_nothing() {
-        let tool = ConfigManagerTool::new(PathBuf::from("/tmp/aidaemon-synthetic/config.toml"));
+        let tool = ConfigManagerTool::new(crate::config::config_file(PathBuf::from(
+            "/tmp/aidaemon-synthetic/config.toml",
+        )));
         let effects = tool.effects_for(r#"{"action":"set","key":"provider.kind","value":"x"}"#);
         assert_eq!(
             effects.keys,
@@ -2908,7 +2835,7 @@ token_file = "{}"
     async fn client_gateway_changes_ask_the_owner() {
         let tokens = tempfile::tempdir().unwrap();
         let (_dir, path) = write_temp_config(&gateway_config(tokens.path(), ""));
-        let tool = ConfigManagerTool::new(path);
+        let tool = ConfigManagerTool::new(crate::config::config_file(path));
         for call in [
             json!({"action": "set", "key": "client_gateway.enabled", "value": "true"}),
             json!({"action": "set", "key": "client_gateway.port", "value": "9000"}),

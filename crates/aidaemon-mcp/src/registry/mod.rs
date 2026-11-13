@@ -4,6 +4,8 @@
 //! `aidaemon-tools` tools.
 
 #[cfg(feature = "registry")]
+pub mod manage;
+#[cfg(feature = "registry")]
 mod proxied;
 #[cfg(feature = "registry")]
 mod render;

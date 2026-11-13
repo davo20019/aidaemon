@@ -405,8 +405,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[provider]\nkind = \"openai_compatible\"\n").unwrap();
-        let tool: Arc<dyn crate::traits::Tool> =
-            Arc::new(crate::tools::ConfigManagerTool::new(path));
+        let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::ConfigManagerTool::new(
+            crate::config::config_file(path),
+        ));
         for trusted in [false, true] {
             let rules = AppApprovalRules {
                 tools: ApprovalTools::new([tool.clone()]),
@@ -637,9 +638,10 @@ mod tests {
         use crate::traits::ToolSemantics;
         let dir = tempfile::TempDir::new().unwrap();
         let concrete = Arc::new(crate::tools::ManageHttpAuthTool::new(
-            synthetic_auth_config(&dir),
+            crate::config::config_file(synthetic_auth_config(&dir)),
             Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             Arc::new(SyntheticOAuthStore::default()),
+            crate::config::shared_secret_store(),
         ));
         let tool: Arc<dyn crate::traits::Tool> = concrete.clone();
         for trusted in [false, true] {
@@ -747,7 +749,7 @@ mod tests {
         let concrete = Arc::new(crate::tools::ManageOAuthTool::new(
             gateway,
             store as Arc<dyn crate::traits::OAuthStore>,
-            config,
+            crate::config::config_file(config),
         ));
         let tool: Arc<dyn crate::traits::Tool> = concrete.clone();
         for trusted in [false, true] {

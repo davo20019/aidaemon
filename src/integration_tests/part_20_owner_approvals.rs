@@ -468,7 +468,7 @@ async fn internal_state_tools_are_not_reasked_after_a_decline() {
     let config_path = config_dir.path().join("config.toml");
     std::fs::write(&config_path, "[provider]\nmodel = \"synthetic-model\"\n").unwrap();
     let config: Arc<dyn crate::traits::Tool> = Arc::new(OfferedConfigTool(
-        crate::tools::ConfigManagerTool::new(config_path.clone()),
+        crate::tools::ConfigManagerTool::new(crate::config::config_file(config_path.clone())),
     ));
     let (harness, approver) = approvals_harness_with(
         vec![
