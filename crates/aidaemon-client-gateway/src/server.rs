@@ -337,7 +337,10 @@ async fn revoke_device(
 const WEB_PAGE: &str = include_str!("../web/index.html");
 const WEB_MODULES: &[(&str, &str)] = &[
     ("app.js", include_str!("../web/app.js")),
+    ("link.js", include_str!("../web/link.js")),
+    ("platform.js", include_str!("../web/platform.js")),
     ("state.js", include_str!("../web/state.js")),
+    ("ui.js", include_str!("../web/ui.js")),
 ];
 
 async fn web_page() -> Response {

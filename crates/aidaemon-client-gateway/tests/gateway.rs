@@ -1149,7 +1149,30 @@ async fn the_web_client_is_served() {
         .to_str()
         .unwrap()
         .starts_with("text/javascript"));
-    assert!(script.text().await.unwrap().contains("/sessions/challenge"));
+    assert!(script.text().await.unwrap().contains("./ui.js"));
+    // Each module the page imports is served; nothing else is.
+    for (module, holds) in [
+        ("link.js", "/sessions/challenge"),
+        ("state.js", "approval_resolved"),
+        ("platform.js", "__TAURI__"),
+        ("ui.js", "resolve_approval"),
+    ] {
+        let response = f
+            .http()
+            .get(format!("http://{}/client/v1/app/{module}", f.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{module}");
+        assert!(response.text().await.unwrap().contains(holds), "{module}");
+    }
+    let missing = f
+        .http()
+        .get(format!("http://{}/client/v1/app/protocol.js", f.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
 }
 
 /// The shared client core pairs a device with its own key, signs in with a

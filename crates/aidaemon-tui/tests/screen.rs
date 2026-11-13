@@ -1,6 +1,10 @@
-//! The TUI's screen: approval cards from their typed facts, keys that
-//! answer them, and a typed message that starts a session and follows it.
+//! The TUI's screen: approval cards from their typed facts and keys that
+//! answer them only once armed, Esc stopping work, the palette switching
+//! sessions, and a status row that names the connection's state.
 
+use std::time::{Duration, Instant};
+
+use aidaemon_client_core::Update;
 use aidaemon_client_protocol::*;
 use aidaemon_tui::app::{Action, App, Focus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -48,7 +52,20 @@ fn approval() -> Approval {
     }
 }
 
-fn screen(app: &App) -> String {
+fn task() -> TaskSummary {
+    TaskSummary {
+        id: "b:telegram:synthetic-user-1#4".into(),
+        session_id: "telegram:synthetic-user-1".into(),
+        number: 4,
+        description: "Working on your message".into(),
+        state: TaskState::Running,
+        started_at_ms: 1,
+        finished_at_ms: None,
+        error: None,
+    }
+}
+
+pub fn screen(app: &App) -> String {
     let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
     terminal.draw(|frame| app.draw(frame)).unwrap();
     let buffer = terminal.backend().buffer().clone();
@@ -66,31 +83,27 @@ fn press(app: &mut App, code: KeyCode) -> Option<Action> {
     app.key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
+fn press_at(app: &mut App, code: KeyCode, at: Instant) -> Option<Action> {
+    app.key_at(KeyEvent::new(code, KeyModifiers::NONE), at)
+}
+
+fn type_text(app: &mut App, text: &str) {
+    for c in text.chars() {
+        press(app, KeyCode::Char(c));
+    }
+}
+
 #[test]
-fn the_card_shows_its_facts_and_keys_answer_it() {
+fn the_card_shows_its_facts_and_keys_answer_it_once_armed() {
     let mut app = App::default();
-    app.connected = true;
-    app.state.apply(event(
+    app.update(Update::Connected);
+    app.update(Update::Frame(event(
         1,
         Event::ApprovalRequested {
             approval: approval(),
         },
-    ));
-    app.state.apply(event(
-        2,
-        Event::TaskUpdated {
-            task: TaskSummary {
-                id: "b:telegram:synthetic-user-1#4".into(),
-                session_id: "telegram:synthetic-user-1".into(),
-                number: 4,
-                description: "Working on your message".into(),
-                state: TaskState::Running,
-                started_at_ms: 1,
-                finished_at_ms: None,
-                error: None,
-            },
-        },
-    ));
+    )));
+    app.update(Update::Frame(event(2, Event::TaskUpdated { task: task() })));
     let shown = screen(&app);
     for expected in [
         "delete the synthetic drafts",
@@ -101,16 +114,27 @@ fn the_card_shows_its_facts_and_keys_answer_it() {
         "[n] deny",
         "also in telegram",
         "#4 Working on your message",
+        "Connected",
+        "1 approval waiting",
     ] {
         assert!(shown.contains(expected), "missing {expected:?} in\n{shown}");
     }
 
-    // Tab reaches the card; `a` is not offered, `y` answers.
-    press(&mut app, KeyCode::Tab);
-    assert_eq!(app.focus, Focus::Approval);
-    assert_eq!(press(&mut app, KeyCode::Char('a')), None);
+    // A key pressed as the card appears is typed, not taken as an answer.
+    let shown_at = Instant::now();
+    app.observe_card(shown_at);
+    assert_eq!(press_at(&mut app, KeyCode::Char('y'), shown_at), None);
+    assert_eq!(app.input, "y");
+    // With text in the box, the card's keys are just letters.
+    let later = shown_at + Duration::from_secs(1);
+    assert_eq!(press_at(&mut app, KeyCode::Char('n'), later), None);
+    assert_eq!(app.input, "yn");
+    app.input.clear();
+    // Armed and with the box empty: `a` is not offered, `y` answers.
+    assert_eq!(press_at(&mut app, KeyCode::Char('a'), later), None);
+    app.input.clear();
     assert_eq!(
-        press(&mut app, KeyCode::Char('y')),
+        press_at(&mut app, KeyCode::Char('y'), later),
         Some(Action::Send(Command::ResolveApproval {
             approval_id: "a1".into(),
             decision: ApprovalDecision::ApproveOnce,
@@ -125,14 +149,21 @@ fn the_card_shows_its_facts_and_keys_answer_it() {
             task_id: "b:telegram:synthetic-user-1#4".into(),
         }))
     );
+    // Esc comes back to the message box.
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.focus, Focus::Chat);
 }
 
 #[test]
-fn typing_starts_a_session_then_follows_it() {
+fn typing_starts_a_session_follows_it_and_esc_stops_it() {
     let mut app = App::default();
-    for c in "Draft the report".chars() {
-        press(&mut app, KeyCode::Char(c));
-    }
+    let shown = screen(&app);
+    assert!(shown.contains("Connecting..."), "{shown}");
+    assert!(
+        shown.contains("Type a message to start your first session"),
+        "{shown}"
+    );
+    type_text(&mut app, "Draft the report");
     let Some(Action::Send(Command::SendMessage {
         session_id, text, ..
     })) = press(&mut app, KeyCode::Enter)
@@ -140,24 +171,91 @@ fn typing_starts_a_session_then_follows_it() {
         panic!("a message");
     };
     assert_eq!((session_id, text.as_str()), (None, "Draft the report"));
-    let ack = ServerFrame::Ack {
+    app.update(Update::Frame(ServerFrame::Ack {
         request_id: "r".into(),
         result: CommandResult::MessageAccepted {
             session_id: "app:new".into(),
             new_session: true,
         },
-    };
-    app.state.apply(ack.clone());
-    app.after_frame(&ack);
+    }));
     assert_eq!(app.selected.as_deref(), Some("app:new"));
-    // `/stop` stops the session's work.
-    for c in "/stop".chars() {
-        press(&mut app, KeyCode::Char(c));
+    // Nothing runs yet: Esc says so and sends nothing.
+    assert_eq!(press(&mut app, KeyCode::Esc), None);
+    app.update(Update::Frame(ServerFrame::Event {
+        seq: Some(1),
+        at_ms: 1,
+        session_id: Some("app:new".into()),
+        event: Event::TurnStarted {
+            turn_id: "t1".into(),
+            session_id: "app:new".into(),
+            origin: "app".into(),
+        },
+    }));
+    assert!(screen(&app).contains("Esc to stop"));
+    let stop = Some(Action::Send(Command::StopTurn {
+        session_id: "app:new".into(),
+    }));
+    assert_eq!(press(&mut app, KeyCode::Esc), stop);
+    // `/stop` does the same.
+    type_text(&mut app, "/stop");
+    assert_eq!(press(&mut app, KeyCode::Enter), stop);
+    // `/st` and Tab completes.
+    type_text(&mut app, "/st");
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.input, "/stop ");
+}
+
+fn session(id: &str, title: &str) -> SessionSummary {
+    SessionSummary {
+        id: id.into(),
+        channel: "app".into(),
+        title: Some(title.into()),
+        last_activity_ms: None,
+        writable: true,
     }
+}
+
+#[test]
+fn the_palette_switches_sessions_and_the_status_row_names_the_connection() {
+    let mut app = App::default();
+    app.update(Update::Connected);
+    app.update(Update::Frame(ServerFrame::Ack {
+        request_id: "r1".into(),
+        result: CommandResult::Sessions {
+            sessions: vec![
+                session("app:s1", "Synthetic report"),
+                session("app:s2", "Plan for Acme Corp"),
+            ],
+            next_cursor: None,
+        },
+    }));
+    app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    type_text(&mut app, "acme");
+    assert!(screen(&app).contains("Sessions and commands: acme"));
     assert_eq!(
         press(&mut app, KeyCode::Enter),
-        Some(Action::Send(Command::StopTurn {
-            session_id: "app:new".into()
+        Some(Action::Send(Command::GetHistory {
+            session_id: "app:s2".into(),
+            before: None,
+            limit: 100,
         }))
+    );
+    assert_eq!(app.selected.as_deref(), Some("app:s2"));
+    assert!(app.palette.is_none());
+    // Alt-Down moves to the next session in one key.
+    app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+    assert_eq!(app.selected.as_deref(), Some("app:s1"));
+
+    app.update(Update::Disconnected(aidaemon_client_core::Disconnect {
+        kind: aidaemon_client_core::DropKind::DaemonNotRunning,
+        reason: "nothing is listening".into(),
+        retry_in: Duration::from_secs(4),
+    }));
+    let shown = screen(&app);
+    assert!(shown.contains("Daemon not running"), "{shown}");
+    // Ctrl-C with an empty box quits.
+    assert_eq!(
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        Some(Action::Quit)
     );
 }
