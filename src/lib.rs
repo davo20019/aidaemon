@@ -91,9 +91,9 @@ use std::process::Stdio;
 const SUPPORTED_TERMINAL_AGENTS: &[&str] = &["codex", "claude", "gemini", "opencode"];
 const MAX_AGENT_LAUNCH_ARGS: usize = 24;
 const MAX_AGENT_LAUNCH_ARG_CHARS: usize = 256;
-pub(crate) const RUNTIME_CONFIG_PATH_ENV_KEY: &str = "AIDAEMON_RUNTIME_CONFIG_PATH";
-pub(crate) const RUNTIME_ENV_FILE_ENV_KEY: &str = "AIDAEMON_RUNTIME_ENV_FILE";
-pub(crate) const RUNTIME_WORKDIR_ENV_KEY: &str = "AIDAEMON_RUNTIME_WORKDIR";
+pub(crate) use aidaemon_tools::check_environment::{
+    RUNTIME_CONFIG_PATH_ENV_KEY, RUNTIME_ENV_FILE_ENV_KEY, RUNTIME_WORKDIR_ENV_KEY,
+};
 
 fn runtime_working_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))

@@ -18,10 +18,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::traits::{
-    Tool, ToolCallContext, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolRole,
-    ToolSemantics,
+use aidaemon_tools::semantics::{
+    ToolCallContext, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolRole, ToolSemantics,
 };
+use aidaemon_tools::OutcomeTool as Tool;
 
 /// Where view actions go: the running Client Gateway, or a test double.
 pub trait ClientViews: Send + Sync {
