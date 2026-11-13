@@ -12,7 +12,7 @@ use std::time::Duration;
 use aidaemon_tools::duration_format::{compact_chrono_duration, ZeroUnitStyle};
 use chrono::{DateTime, Utc};
 
-use crate::ports::{ChannelAgentRuntime, ChatWorkView, RunningItem};
+use crate::ports::{ChannelAgentRuntime, ChatWorkKind, ChatWorkView, RunningItem};
 use crate::tasks::{TaskRegistry, TaskStatus};
 
 /// How `/status`, `/tasks` and stop reports name a chat turn.
@@ -37,6 +37,8 @@ pub struct WorkEntry {
     /// What it is, in plain words.
     pub title: String,
     pub started_at: DateTime<Utc>,
+    /// What it is: `None` for a chat turn.
+    pub work: Option<ChatWorkKind>,
     /// The request that started it: entries sharing one are stopped together.
     group: String,
     target: Target,
@@ -65,6 +67,7 @@ impl WorkList {
                 number: entry.number,
                 title: entry.title.clone(),
                 elapsed: (now - entry.started_at).to_std().unwrap_or_default(),
+                work: entry.work,
             })
             .collect()
     }
@@ -95,6 +98,7 @@ impl WorkList {
                 number,
                 title: title.to_string(),
                 started_at,
+                work: Some(ChatWorkKind::SubAgent),
                 group: group.to_string(),
                 target: Target::Work(format!("test:{number}")),
             })
@@ -124,6 +128,7 @@ async fn build_list(registry: &TaskRegistry, session_id: &str, view: ChatWorkVie
             number: entry.id,
             title: TURN_LABEL.to_string(),
             started_at: entry.started_at,
+            work: None,
             group: view
                 .current_request
                 .clone()
@@ -138,6 +143,7 @@ async fn build_list(registry: &TaskRegistry, session_id: &str, view: ChatWorkVie
             number,
             title: item.title.clone(),
             started_at: item.started_at,
+            work: Some(item.kind),
             group: item
                 .request
                 .clone()

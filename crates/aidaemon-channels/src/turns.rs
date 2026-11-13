@@ -277,17 +277,14 @@ impl TurnRunner {
                 }
                 Some(MidRunReading {
                     intent: MidRunIntent::AboutRunningWork,
-                    answer,
                     ..
                 }) => {
-                    // Answered now; the run goes on undisturbed.
+                    // Answered now from the typed state, read afresh with
+                    // the clock `/tasks` uses; the run goes on undisturbed.
                     if registry.mark_seen(&session_id, &turn.text, dedup_key).await {
-                        let answer = match answer {
-                            Some(answer) => answer,
-                            None => crate::mid_run::running_work_reply(
-                                &self.running_work(&session_id).await,
-                            ),
-                        };
+                        let answer = crate::mid_run::running_work_reply(
+                            &self.running_work(&session_id).await,
+                        );
                         let _ = surface
                             .say(&crate::presentation::prepare_chat_message(&answer))
                             .await;
@@ -373,7 +370,9 @@ impl TurnRunner {
         tokio::spawn(async move { runner.run(surface, turn).await });
     }
 
-    /// The session's running work as its typed state shows it.
+    /// The session's running work as its typed state shows it: the running
+    /// list `/tasks` reads and the turn's live progress, timed at one
+    /// instant.
     async fn running_work(&self, session_id: &str) -> RunningWork {
         let listed = crate::stop::running_work(
             &self.deps.task_registry,
@@ -381,13 +380,18 @@ impl TurnRunner {
             session_id,
         )
         .await;
-        let mut work = self.running_turn(session_id).await;
-        work.running = listed.items(chrono::Utc::now());
+        let now = chrono::Utc::now();
+        let mut work = self.running_turn(session_id, now).await;
+        work.running = listed.items(now);
         work
     }
 
-    /// The session's running turn as its live state shows it.
-    async fn running_turn(&self, session_id: &str) -> RunningWork {
+    /// The session's running turn as its live state shows it at `now`.
+    async fn running_turn(
+        &self,
+        session_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> RunningWork {
         let running = self
             .deps
             .task_registry
@@ -398,9 +402,7 @@ impl TurnRunner {
         let (request, elapsed) = running.map_or_else(
             || (String::new(), Duration::ZERO),
             |entry| {
-                let elapsed = (chrono::Utc::now() - entry.started_at)
-                    .to_std()
-                    .unwrap_or_default();
+                let elapsed = (now - entry.started_at).to_std().unwrap_or_default();
                 (entry.description, elapsed)
             },
         );
@@ -1129,10 +1131,9 @@ mod tests {
                 .unwrap_or_default()
         };
 
-        // A question, with no drafted answer: the state itself is the reply.
+        // A question: the typed state itself is the reply.
         set(Some(MidRunReading {
             intent: MidRunIntent::AboutRunningWork,
-            answer: None,
             stop: Vec::new(),
         }));
         runner
@@ -1147,28 +1148,23 @@ mod tests {
             reply.contains("Latest step: installing the blog"),
             "{reply}"
         );
-        // A question with a drafted answer, worded differently.
-        set(Some(MidRunReading {
-            intent: MidRunIntent::AboutRunningWork,
-            answer: Some("The screenshots are not ready yet; they come when it finishes.".into()),
-            stop: Vec::new(),
-        }));
+        // Worded differently, it gets the same typed state.
         runner
             .submit(
                 surface.clone(),
                 owner_turn("Send me the screenshots now.", "m3"),
             )
             .await;
-        assert_eq!(
-            last(&surface),
-            "The screenshots are not ready yet; they come when it finishes."
+        let reply = last(&surface);
+        assert!(
+            reply.starts_with("Still working on \"Set up two demo sites\""),
+            "{reply}"
         );
         assert_eq!(registry.queue_len(session).await, 0);
 
         // Something else: queued for its own turn, not taken into the run.
         set(Some(MidRunReading {
             intent: MidRunIntent::Unrelated,
-            answer: None,
             stop: Vec::new(),
         }));
         runner
@@ -1195,7 +1191,6 @@ mod tests {
             (
                 Some(MidRunReading {
                     intent: MidRunIntent::ChangesWork,
-                    answer: None,
                     stop: Vec::new(),
                 }),
                 "m5",
@@ -1281,7 +1276,6 @@ mod tests {
         *agent.work.lock().unwrap() = two_counting_jobs();
         *agent.reading.lock().unwrap() = Some(MidRunReading {
             intent: MidRunIntent::StopsWork,
-            answer: None,
             stop: Vec::new(),
         });
         runner
