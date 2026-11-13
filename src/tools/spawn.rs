@@ -2012,6 +2012,75 @@ mod child_runtime_tests {
         assert!(runs.get("job-own-card").is_none());
     }
 
+    /// A run whose card can no longer be told (its chat's card history no
+    /// longer holds the card it began beside, as after a restart) never
+    /// draws itself over the card a later turn kept: that card shows that
+    /// turn's own runs (live 2026-11-13: a shell loop's card was overwritten
+    /// with a CLI agent's "Done 9m 40s" and stayed wrong).
+    #[tokio::test]
+    async fn a_run_with_an_unknown_card_leaves_a_later_turns_card_alone() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(pool).await.unwrap());
+        let chat = "telegram:synthetic-unknown-card-chat";
+        plans
+            .upsert_checklist(
+                chat,
+                Some("task-unknown"),
+                "track_requirements",
+                &[(
+                    "Install WordPress".into(),
+                    crate::plans::StepStatus::Pending,
+                )],
+            )
+            .await
+            .unwrap();
+        plans
+            .link_background_job(chat, Some("task-unknown"), &[0], "job-unknown")
+            .await
+            .unwrap()
+            .expect("the step waits on the run");
+        let hub = Arc::new(CardHub::default());
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        let weak = Arc::downgrade(&router);
+        let runs = Arc::new(aidaemon_runtime::run_state::RunStates::default());
+        runs.begin("job-unknown", chat, "Install WordPress", None);
+        // It began beside a card the hub no longer remembers; a later turn
+        // kept card-2 since.
+        runs.card_before("job-unknown", Some("forgotten-card".to_string()));
+        *hub.later_card.lock().unwrap() = Some("card-2".to_string());
+        runs.finish(
+            "job-unknown",
+            aidaemon_runtime::run_state::RunPhase::Failed,
+            aidaemon_runtime::run_state::RunMeasure {
+                ended_at: chrono::Utc::now(),
+                work_began: None,
+                waited: Duration::ZERO,
+            },
+            Default::default(),
+            aidaemon_runtime::run_state::RunReport {
+                text: "Blocked.".into(),
+                untrusted: false,
+            },
+        );
+        let shown = settle_background_steps(
+            &runs,
+            Some(&plans),
+            Some(&weak),
+            Some(chat),
+            chat,
+            "job-unknown",
+            crate::plans::JobEnd::Failed,
+        )
+        .await;
+        assert!(!shown, "no card shows it: its result says how it ended");
+        let edits = hub.edits.lock().unwrap().clone();
+        assert!(edits.is_empty(), "{edits:?}");
+    }
+
     /// A helper's steps reach the card its turn left after that turn ended,
     /// under its start line; while the turn runs, its live card shows them
     /// and the kept card is left alone (live 2026-11-13: the card said only
