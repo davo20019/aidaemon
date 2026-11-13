@@ -144,6 +144,9 @@ pub struct HelperProgress {
     /// says the running list's time instead when the helper is on it, the
     /// clock `/tasks` reads.
     pub running_for: std::time::Duration,
+    /// The running turn started it (an earlier turn's helper runs on in the
+    /// background).
+    pub this_turn: bool,
 }
 
 /// The running work as its typed live state shows it, for answering a

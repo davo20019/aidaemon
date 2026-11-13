@@ -11,6 +11,38 @@ use aidaemon_events::text::truncate_str;
 /// Maximum character length for the args portion of a terminal command summary.
 const COMMAND_TRUNCATE_CHARS: usize = 80;
 
+/// How a line of the daemon's own timing measurement begins (a helper's run,
+/// start, end and duration). The daemon writes these lines; the model never
+/// works them out. Every summary of an older result keeps them, so a later
+/// turn reports the measured times instead of guessing or calling them
+/// unmeasured (live 2026-11-13: "the tool results didn't include any
+/// durations" about installs the daemon had timed).
+pub const MEASURED_TIMING_MARK: &str = "\u{23f2} Measured: ";
+
+/// The daemon's timing lines in `text`, in order, each once.
+pub fn measured_timing_lines(text: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.starts_with(MEASURED_TIMING_MARK) && !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+/// `summary` followed by the timing lines of `text` it does not already
+/// carry.
+pub fn with_measured_timing(summary: String, text: &str) -> String {
+    let missing: Vec<&str> = measured_timing_lines(text)
+        .into_iter()
+        .filter(|line| !summary.contains(line))
+        .collect();
+    if missing.is_empty() {
+        return summary;
+    }
+    format!("{summary}\n{}", missing.join("\n"))
+}
+
 /// Generate a deterministic 1-line summary from a tool call and its result.
 ///
 /// Format: `"tool_name: [args_summary] -> [outcome]"`
@@ -31,11 +63,12 @@ pub fn summarize_tool_result(tool_name: &str, args_json: &str, result: &str) -> 
     let args_summary = extract_args_summary(tool_name, args_json);
     let outcome = extract_outcome(tool_name, result);
 
-    if args_summary.is_empty() {
+    let summary = if args_summary.is_empty() {
         format!("{}: -> {}", tool_name, outcome)
     } else {
         format!("{}: {} -> {}", tool_name, args_summary, outcome)
-    }
+    };
+    with_measured_timing(summary, result)
 }
 
 /// Extract a short args summary based on the tool type.
@@ -215,6 +248,31 @@ fn extract_write_outcome(result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An older helper result keeps the daemon's measured run when it is
+    /// cut to one line, so a later turn can still report it.
+    #[test]
+    fn a_summarized_result_keeps_the_measured_timing() {
+        let result = format!(
+            "{MEASURED_TIMING_MARK}Drupal install ran 8:10 PM ET to 8:12 PM ET, 2m 54s (174s).\n\n\
+             Installed Drupal 11 at ~/projects/claude-drupal-4.\n\n\
+             {MEASURED_TIMING_MARK}WordPress install ran 8:10 PM ET to 8:12 PM ET, 2m 33s (153s)."
+        );
+        let summary = summarize_tool_result(
+            "spawn_agent",
+            r#"{"mission": "Install Drupal and WordPress"}"#,
+            &result,
+        );
+        assert!(summary.starts_with("spawn_agent: Install Drupal and WordPress -> completed"));
+        assert!(summary.contains("Drupal install ran 8:10 PM ET to 8:12 PM ET, 2m 54s (174s)."));
+        assert!(summary.contains("WordPress install ran 8:10 PM ET to 8:12 PM ET, 2m 33s (153s)."));
+        assert!(!summary.contains("Installed Drupal 11"));
+        // A result without a measurement is unchanged.
+        assert_eq!(
+            summarize_tool_result("terminal", r#"{"command": "echo hello"}"#, "hello"),
+            "terminal: echo hello -> completed"
+        );
+    }
 
     #[test]
     fn test_terminal_with_exit_code() {

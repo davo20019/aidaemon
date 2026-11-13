@@ -1007,6 +1007,7 @@ impl Tool for WebFetch {
             .map_or_else(CallEffects::unknown, |key| CallEffects {
                 keys: vec![key],
                 complete: true,
+                understood: false,
             })
     }
 
@@ -1191,6 +1192,7 @@ impl crate::semantics::ToolSemantics for WebFetch {
                 aidaemon_core::CallEffects {
                     keys: vec![key],
                     complete: true,
+                    understood: false,
                 }
             })
     }

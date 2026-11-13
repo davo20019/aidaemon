@@ -423,12 +423,60 @@ fn declined_subject(ctx: &HookContext<'_>, request: &OwnerApprovalRequest) -> Op
     })
 }
 
+/// What the owner said no to, in a few plain words for the re-ask card: the
+/// declined step's own title when its call gave one, else what it would
+/// have changed. `None` when the record holds neither.
+fn declined_in_words(declined: &[aidaemon_core::EffectKey]) -> Option<String> {
+    const MAX_CHARS: usize = 80;
+    let titled = declined
+        .iter()
+        .filter(|key| key.class == EffectClass::Call)
+        .find_map(|key| {
+            let (_, arguments) = key.target.split_once(' ')?;
+            let arguments: Value = serde_json::from_str(arguments).ok()?;
+            let title = arguments.get("description")?.as_str()?;
+            let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!title.is_empty()).then(|| format!("\u{201c}{}\u{201d}", title.trim_end_matches('.')))
+        });
+    let what = titled.or_else(|| {
+        declined.iter().find_map(|key| {
+            let verb = match key.class {
+                EffectClass::Delete => "deleting",
+                EffectClass::Write => "changing",
+                EffectClass::Configuration => "changing the settings in",
+                EffectClass::Egress => "reaching",
+                _ => return None,
+            };
+            Some(format!("{verb} {}", key.target))
+        })
+    })?;
+    Some(if what.chars().count() > MAX_CHARS {
+        let cut: String = what.chars().take(MAX_CHARS - 1).collect();
+        format!("{}\u{2026}", cut.trim_end())
+    } else {
+        what
+    })
+}
+
 /// After a decline in this run, a call whose effects are not fully declared
 /// might be the declined action by another route: an egress or destructive
 /// one after any decline, and any non-read-only one (an opaque script that
 /// may write or delete the same path) after a declined Delete, Write,
-/// Configuration or Call.
+/// Configuration or Call. A call whose every part was read
+/// (`CallEffects::understood`) and that only writes named paths the owner
+/// did not decline is not such a route: a copy into the work area followed
+/// by `ls` and `date` runs unasked (live 2026-11-13).
 fn needs_reask(ctx: &HookContext<'_>, info: &ToolInfo) -> bool {
+    let plain_local_work = info.effects.understood
+        && !info.annotations.egress
+        && info
+            .effects
+            .keys
+            .iter()
+            .all(|key| key.class == EffectClass::Write && !ctx.declined.contains(key));
+    if plain_local_work {
+        return false;
+    }
     let declined_local = ctx.declined.iter().any(|key| {
         matches!(
             key.class,
@@ -500,7 +548,9 @@ impl Hook for ApprovalPolicy {
                 }
             }
             if let Some(card) = &mut request.card {
-                card.reason = Some(aidaemon_core::AskReason::AfterADecline);
+                card.reason = Some(aidaemon_core::AskReason::AfterADecline {
+                    declined: declined_in_words(ctx.declined),
+                });
             }
             return ToolDecision::Interrupt {
                 reason: format!(
@@ -694,6 +744,7 @@ mod rules_tests {
         CallEffects {
             keys,
             complete: true,
+            understood: false,
         }
     }
 
@@ -918,6 +969,72 @@ mod rules_tests {
         );
     }
 
+    /// Live 2026-11-13: after a decline, `cp inbox/x.png site/homepage.png;
+    /// ls -l ...; date +%s` got the re-ask card although every part of it
+    /// was read: a copy into the work area and two observations. A call the
+    /// tool read in full (`understood`) that only writes paths the owner did
+    /// not decline runs unasked; a write to the declined path, or a call not
+    /// read in full, is still asked about, and that card names what was
+    /// declined.
+    #[tokio::test]
+    async fn a_fully_read_copy_after_a_decline_is_not_reasked() {
+        let declined = [
+            EffectKey::named(
+                EffectClass::Call,
+                r#"terminal {"command":"rotate.sh","description":"Rotate the WordPress admin password"}"#,
+            ),
+            EffectKey::path(EffectClass::Write, "/w/site/wp-config.php").unwrap(),
+        ];
+        let shell = |keys: Vec<EffectKey>, understood: bool| ToolInfo {
+            annotations: ToolAnnotations::WRITE,
+            access: AccessManifest::default(),
+            effects: CallEffects {
+                keys,
+                complete: false,
+                understood,
+            },
+            outbound: Default::default(),
+        };
+        let copy = ToolCall::new(
+            "c2",
+            "terminal",
+            json!({"command": "cp /w/inbox/x.png /w/site/homepage.png; ls -l /w/site; date +%s"}),
+        );
+        let never = ApprovalPolicy::new(ApprovalMode::Never);
+        let homepage = EffectKey::path(EffectClass::Write, "/w/site/homepage.png").unwrap();
+        assert_eq!(
+            never
+                .before_tool(
+                    &hook_ctx(&declined),
+                    &copy,
+                    &shell(vec![homepage.clone()], true)
+                )
+                .await,
+            ToolDecision::Allow
+        );
+        // Not read in full: asked again, and the card says what was declined.
+        let asked = never
+            .before_tool(&hook_ctx(&declined), &copy, &shell(vec![homepage], false))
+            .await;
+        let card = owner_request(&asked).card.clone().expect("a typed card");
+        assert_eq!(
+            card.reason,
+            Some(aidaemon_core::AskReason::AfterADecline {
+                declined: Some("\u{201c}Rotate the WordPress admin password\u{201d}".into()),
+            })
+        );
+        // Read in full, but it writes the path the owner declined.
+        owner_request(
+            &never
+                .before_tool(
+                    &hook_ctx(&declined),
+                    &copy,
+                    &shell(vec![declined[1].clone()], true),
+                )
+                .await,
+        );
+    }
+
     /// Live 2026-11-12: the owner pressed Allow on the safety check's card
     /// and the same call was asked again at once by the re-ask after a
     /// decline. An Allow for that exact call answers the re-ask, once. The
@@ -933,7 +1050,14 @@ mod rules_tests {
             .before_tool(&hook_ctx(&declined), &post(), &opaque)
             .await;
         let card = owner_request(&reasked).card.clone().expect("a typed card");
-        assert_eq!(card.reason, Some(aidaemon_core::AskReason::AfterADecline));
+        assert!(
+            matches!(
+                card.reason,
+                Some(aidaemon_core::AskReason::AfterADecline { .. })
+            ),
+            "{:?}",
+            card.reason
+        );
         assert!(matches!(
             card.action,
             aidaemon_core::CardAction::Use { ref what, .. } if what == "use http request"

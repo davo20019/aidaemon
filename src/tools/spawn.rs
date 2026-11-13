@@ -19,6 +19,7 @@ use crate::traits::{
 };
 use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 use aidaemon_core::SourceTrust;
+use aidaemon_runtime::turn::sliding_window::MEASURED_TIMING_MARK;
 
 /// A tool that allows the LLM to spawn a sub-agent for a focused task.
 ///
@@ -298,6 +299,42 @@ fn format_background_completion(
     }
 }
 
+/// Each chat's background helpers still running, in the order they
+/// started: their job id and the name the card gives them. A plan card
+/// edited after its turn (a helper finished and settled its steps) keeps a
+/// start line for each one still running.
+static RUNNING_HELPERS: std::sync::LazyLock<std::sync::Mutex<RunningHelpers>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Per chat: each running helper's job id and card name.
+type RunningHelpers = std::collections::HashMap<String, Vec<(String, String)>>;
+
+fn note_running_helper(chat: &str, job_id: &str, label: &str) {
+    if let Ok(mut running) = RUNNING_HELPERS.lock() {
+        running
+            .entry(chat.to_string())
+            .or_default()
+            .push((job_id.to_string(), label.to_string()));
+    }
+}
+
+/// The job ended: its start line leaves the card. Returns the names of
+/// the chat's helpers still running.
+fn helper_ended(chat: &str, job_id: &str) -> Vec<String> {
+    let Ok(mut running) = RUNNING_HELPERS.lock() else {
+        return Vec::new();
+    };
+    let Some(helpers) = running.get_mut(chat) else {
+        return Vec::new();
+    };
+    helpers.retain(|(job, _)| job != job_id);
+    let left = helpers.iter().map(|(_, label)| label.clone()).collect();
+    if helpers.is_empty() {
+        running.remove(chat);
+    }
+    left
+}
+
 /// How much of a mission a background record keeps.
 const BACKGROUND_MISSION_CHARS: usize = 200;
 
@@ -466,32 +503,88 @@ fn batch_tasks(arguments: &str) -> anyhow::Result<Option<Vec<Value>>> {
     Ok(Some(merged))
 }
 
-/// When a child ran and how long it took, measured by the daemon: its start
-/// and finish in the owner's zone and 12-hour clock ("5:44 PM ET", as every
-/// owner-facing time reads), the elapsed time between them, and how much of
-/// it the child spent waiting for the owner to answer a card. A parent sees
-/// which of its children overlapped, and the times, durations and waits it
-/// reports are these measurements, never arithmetic on times the child
-/// printed (live 2026-11-12: "about 16 minutes (17:44 to 18:00)", and a
-/// "5-minute wait for approval" the model guessed).
-fn run_window(
+/// A child's run as the daemon measured it: when it was started and when it
+/// finished, when its own steps (its tool calls) ran, apart from its
+/// start-up and its report, and how long it waited for the owner's answer
+/// on a card, from its own clock.
+struct MeasuredRun {
     started: chrono::DateTime<chrono::Utc>,
     finished: chrono::DateTime<chrono::Utc>,
+    steps: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
     waited: Duration,
-) -> String {
-    let elapsed = (finished - started).max(chrono::Duration::zero());
-    format!(
-        "Sub-agent ran {} to {}: {} ({}s), measured by the daemon.{} Report these times, this \
-         duration and this wait as given (the owner's time zone, 12-hour clock); times in the \
-         sub-agent's own reply are its estimates.",
-        crate::cron_utils::owner_time(&started),
-        crate::cron_utils::owner_time(&finished),
-        aidaemon_tools::duration_format::compact_chrono_duration(
-            elapsed,
-            aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
+}
+
+impl MeasuredRun {
+    /// The run of a child whose clock is `clock`, started at `started` and
+    /// finished now.
+    fn ended_now(
+        started: chrono::DateTime<chrono::Utc>,
+        clock: &crate::tools::OwnerWaitClock,
+    ) -> Self {
+        Self {
+            started,
+            finished: chrono::Utc::now(),
+            steps: clock.steps(),
+            waited: clock.waited(),
+        }
+    }
+
+    fn total(&self) -> chrono::Duration {
+        (self.finished - self.started).max(chrono::Duration::zero())
+    }
+
+    /// Its steps' span, when it took any steps.
+    fn work(
+        &self,
+    ) -> Option<(
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        chrono::Duration,
+    )> {
+        let (first, last) = self.steps?;
+        Some((first, last, (last - first).max(chrono::Duration::zero())))
+    }
+}
+
+fn compact(duration: chrono::Duration) -> String {
+    aidaemon_tools::duration_format::compact_chrono_duration(
+        duration,
+        aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
+    )
+}
+
+/// When a child ran and how long it took, measured by the daemon, for the
+/// parent: one timing line naming the helper (start and finish in the
+/// owner's zone and 12-hour clock, "5:44 PM ET", the time in all, how long
+/// its own steps ran and its wait for the owner), then how to report it.
+/// The line keeps [`MEASURED_TIMING_MARK`], so a later turn still sees it
+/// when this result is cut to a summary. A parent sees which of its children
+/// overlapped, and the times, durations and waits it reports are these
+/// measurements, never arithmetic on times the child printed (live
+/// 2026-11-12: "about 16 minutes (17:44 to 18:00)", and a "5-minute wait for
+/// approval" the model guessed).
+fn run_window(name: &str, run: &MeasuredRun) -> String {
+    let total = run.total();
+    let work = match run.work() {
+        Some((first, last, ran)) => format!(
+            "; its steps ran {} ({}s), {} to {}",
+            compact(ran),
+            ran.num_seconds(),
+            crate::cron_utils::owner_time(&first),
+            crate::cron_utils::owner_time(&last),
         ),
-        elapsed.num_seconds(),
-        owner_wait_note(waited),
+        None => String::new(),
+    };
+    format!(
+        "{MEASURED_TIMING_MARK}{name} ran {} to {}, {} ({}s) in all{work}.{}\n\
+         These are the daemon's measurements: report these times, durations and this wait as \
+         given (the owner's time zone, 12-hour clock); times in the sub-agent's own reply are \
+         its estimates.",
+        crate::cron_utils::owner_time(&run.started),
+        crate::cron_utils::owner_time(&run.finished),
+        compact(total),
+        total.num_seconds(),
+        owner_wait_note(run.waited),
     )
 }
 
@@ -510,34 +603,39 @@ fn owner_wait_note(waited: Duration) -> String {
     )
 }
 
-/// A background child's measured run for the chat: how long it took and
-/// when, in the owner's zone, and how long it waited for the owner.
-fn background_timing(
-    started: chrono::DateTime<chrono::Utc>,
-    finished: chrono::DateTime<chrono::Utc>,
-    waited: Duration,
-) -> String {
-    let elapsed = (finished - started).max(chrono::Duration::zero());
-    let wait = if waited.as_secs() == 0 {
+/// A background child's measured run for the chat. The time it worked is
+/// its steps' span (live 2026-11-13: "Took 1m 18s" for a count that ran
+/// 62 s, the rest being its start-up and its report); the time since it
+/// started is said apart, labelled, when it differs.
+fn background_timing(run: &MeasuredRun) -> String {
+    let total = run.total();
+    let wait = if run.waited.as_secs() == 0 {
         String::new()
     } else {
         format!(
-            " It waited {} of that for your answer.",
+            " It waited {} for your answer.",
             aidaemon_tools::duration_format::compact_seconds(
-                i64::try_from(waited.as_secs()).unwrap_or(i64::MAX),
+                i64::try_from(run.waited.as_secs()).unwrap_or(i64::MAX),
                 aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
             )
         )
     };
-    format!(
-        "Took {} ({} to {}).{wait}",
-        aidaemon_tools::duration_format::compact_chrono_duration(
-            elapsed,
-            aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
+    let line = match run.work() {
+        Some((first, last, ran)) if compact(ran) != compact(total) => format!(
+            "Ran {} ({} to {}); {} in all since it started, with its start-up and report.",
+            compact(ran),
+            crate::cron_utils::owner_time(&first),
+            crate::cron_utils::owner_time(&last),
+            compact(total),
         ),
-        crate::cron_utils::owner_time(&started),
-        crate::cron_utils::owner_time(&finished),
-    )
+        _ => format!(
+            "Ran {} ({} to {}).",
+            compact(total),
+            crate::cron_utils::owner_time(&run.started),
+            crate::cron_utils::owner_time(&run.finished),
+        ),
+    };
+    format!("{MEASURED_TIMING_MARK}{line}{wait}")
 }
 
 /// One result for a batch call: each child's result under its mission, in
@@ -1183,6 +1281,14 @@ impl Tool for SpawnAgentTool {
             }
         }
         let plan_session = approval_session_id.clone();
+        let helper_label = crate::agent::helper_card_label(
+            args.title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .unwrap_or(args.mission.as_str()),
+        );
+        note_running_helper(&session_id, &background_id, &helper_label);
 
         tokio::spawn(async move {
             // This task owns `family_permit`, so the slot stays taken until
@@ -1374,7 +1480,7 @@ impl Tool for SpawnAgentTool {
                 // read this, not times the child wrote.
                 let message = format!(
                     "{message}\n\n{}",
-                    background_timing(started_utc, chrono::Utc::now(), waits.waited())
+                    background_timing(&MeasuredRun::ended_now(started_utc, &waits))
                 );
                 delivery.deliver(notification_type, &message, trust).await;
                 settle_background_steps(
@@ -1474,6 +1580,7 @@ pub(crate) async fn settle_background_steps(
     job_id: &str,
     succeeded: bool,
 ) {
+    let still_running = helper_ended(chat_session, job_id);
     let (Some(plans), Some(plan_session)) = (plan_store, plan_session) else {
         return;
     };
@@ -1495,7 +1602,12 @@ pub(crate) async fn settle_background_steps(
     let Some(hub) = hub.and_then(Weak::upgrade) else {
         return;
     };
-    update_checklist_card(hub.as_ref(), chat_session, &plan.render_compact_checklist()).await;
+    // Each helper still running keeps its start line under the plan.
+    let card = aidaemon_channels::live_status::with_helper_start_lines(
+        &plan.render_compact_checklist(),
+        still_running.iter().map(String::as_str),
+    );
+    update_checklist_card(hub.as_ref(), chat_session, &card).await;
 }
 
 /// Show `card` in the session's chat: edit the plan card the turn left (or
@@ -1665,6 +1777,14 @@ impl SpawnAgentTool {
         tree: Option<&crate::agent::authority::SpawnFamily>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let started = chrono::Utc::now();
+        // The name its timing line gives it: the title the owner sees on
+        // the card, else its mission.
+        let helper_name = crate::agent::helper_card_label(
+            parent_authority
+                .as_ref()
+                .and_then(|parent| parent.card_title.as_deref())
+                .unwrap_or(mission),
+        );
         // The child's own wait clock: its card waits, apart from its
         // siblings', still counting for the turn.
         let waits = crate::tools::OwnerWaitClock::current()
@@ -1690,7 +1810,7 @@ impl SpawnAgentTool {
             }),
         )
         .await;
-        let window = run_window(started, chrono::Utc::now(), waits.waited());
+        let window = run_window(&helper_name, &MeasuredRun::ended_now(started, &waits));
 
         match result {
             Ok(run) => {
@@ -2534,9 +2654,11 @@ mod child_runtime_tests {
             .await
             .unwrap();
         let first = outcome.output.lines().next().unwrap_or_default();
-        assert!(first.starts_with("Sub-agent ran "), "{first}");
+        assert!(
+            first.starts_with(&format!("{MEASURED_TIMING_MARK}Slow count ran ")),
+            "{first}"
+        );
         assert!(first.contains(" AM ") || first.contains(" PM "), "{first}");
-        assert!(first.contains("measured by the daemon"), "{first}");
     }
 
     /// One call with `tasks` starts its children together: they overlap,
@@ -2569,8 +2691,14 @@ mod child_runtime_tests {
         for mission in ["Count routes", "Count tests", "Count files"] {
             assert!(outcome.output.contains(mission), "{}", outcome.output);
         }
-        assert_eq!(outcome.output.matches("Sub-agent ran ").count(), 3);
-        assert_eq!(outcome.output.matches("measured by the daemon").count(), 3);
+        assert_eq!(outcome.output.matches(MEASURED_TIMING_MARK).count(), 3);
+        assert_eq!(
+            outcome
+                .output
+                .matches("These are the daemon's measurements")
+                .count(),
+            3
+        );
         assert_eq!(
             outcome.metadata.outcome_status,
             Some(crate::traits::ToolOutcomeStatus::Succeeded)
@@ -2895,7 +3023,7 @@ mod child_runtime_tests {
 
         // The measured run leads, then the child's own report.
         assert!(
-            outcome.output.starts_with("Sub-agent ran ")
+            outcome.output.starts_with(MEASURED_TIMING_MARK)
                 && outcome.output.contains("\n\nFinished."),
             "{}",
             outcome.output
@@ -3209,17 +3337,31 @@ mod child_runtime_tests {
         assert!(!entry.message.contains("never delivered"));
     }
 
-    /// A child's result carries its measured run: start and finish on this
-    /// machine's clock and the elapsed time, foreground and background.
+    /// A child's result carries its measured run: start and finish in the
+    /// owner's clock, the time in all, and how long its own steps ran,
+    /// foreground and background. The chat's footer gives the steps' time
+    /// as how long it ran and labels the time since it started (live
+    /// 2026-11-13: "Took 1m 18s" for a count that ran 62 s).
     #[test]
     fn a_childs_result_carries_its_measured_elapsed_time() {
         let started = chrono::Utc::now();
-        let finished = started + chrono::Duration::seconds(86);
-        let window = run_window(started, finished, Duration::ZERO);
+        let run = |steps: Option<(i64, i64)>, waited: u64| MeasuredRun {
+            started,
+            finished: started + chrono::Duration::seconds(78),
+            steps: steps.map(|(a, b)| {
+                (
+                    started + chrono::Duration::seconds(a),
+                    started + chrono::Duration::seconds(b),
+                )
+            }),
+            waited: Duration::from_secs(waited),
+        };
+        let window = run_window("Slow counter", &run(Some((7, 69)), 0));
         assert!(
-            window.contains(": 1m 26s (86s), measured by the daemon."),
+            window.starts_with(&format!("{MEASURED_TIMING_MARK}Slow counter ran ")),
             "{window}"
         );
+        assert!(window.contains(", 1m 18s (78s) in all; its steps ran 1m 2s (62s), "));
         // The owner's zone and 12-hour clock, never a 24-hour reading.
         let owner_start = crate::cron_utils::owner_time(&started);
         assert!(
@@ -3231,18 +3373,34 @@ mod child_runtime_tests {
             "{window}"
         );
         assert!(!window.contains("waited"), "{window}");
-        let timing = background_timing(started, finished, Duration::ZERO);
-        assert!(timing.starts_with("Took 1m 26s ("), "{timing}");
+
+        let footer = background_timing(&run(Some((7, 69)), 0));
+        assert!(
+            footer.starts_with(&format!("{MEASURED_TIMING_MARK}Ran 1m 2s (")),
+            "{footer}"
+        );
+        assert!(
+            footer.ends_with("; 1m 18s in all since it started, with its start-up and report."),
+            "{footer}"
+        );
+        // No steps: the one time it has.
+        let footer = background_timing(&run(None, 0));
+        assert!(
+            footer.starts_with(&format!("{MEASURED_TIMING_MARK}Ran 1m 18s (")),
+            "{footer}"
+        );
+        assert!(!footer.contains("in all"), "{footer}");
+
         // A wait for the owner is the child's measured wait, said as such.
-        let waited = run_window(started, finished, Duration::from_secs(300));
+        let waited = run_window("Slow counter", &run(Some((7, 69)), 300));
         assert!(
             waited.contains("Of that, it waited 5m for the owner's answer on an approval card."),
             "{waited}"
         );
-        let timing = background_timing(started, finished, Duration::from_secs(300));
+        let footer = background_timing(&run(Some((7, 69)), 20));
         assert!(
-            timing.ends_with("It waited 5m of that for your answer."),
-            "{timing}"
+            footer.ends_with(" It waited 20s for your answer."),
+            "{footer}"
         );
     }
 
@@ -3257,7 +3415,13 @@ mod child_runtime_tests {
             .await
             .unwrap();
         let entry = wait_for_notification(&store).await;
-        assert!(entry.message.contains("\n\nTook "), "{}", entry.message);
+        assert!(
+            entry
+                .message
+                .contains(&format!("\n\n{MEASURED_TIMING_MARK}Ran ")),
+            "{}",
+            entry.message
+        );
     }
 
     #[tokio::test]

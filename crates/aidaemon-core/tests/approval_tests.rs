@@ -111,6 +111,7 @@ impl Tool for Send {
         CallEffects {
             keys: vec![self.effect.clone()],
             complete: true,
+            understood: false,
         }
     }
     async fn call(
@@ -198,6 +199,7 @@ async fn owner_approval_deny_records_declined_effects() {
         CallEffects {
             keys: vec![egress_key()],
             complete: true,
+            understood: false,
         }
     );
 }
@@ -369,6 +371,7 @@ fn call_effects_constructors() {
         CallEffects {
             keys: Vec::new(),
             complete: false,
+            understood: false,
         }
     );
     assert_eq!(
@@ -376,6 +379,7 @@ fn call_effects_constructors() {
         CallEffects {
             keys: Vec::new(),
             complete: true,
+            understood: true,
         }
     );
 }
@@ -446,6 +450,7 @@ fn egress(target: &str) -> CallEffects {
     CallEffects {
         keys: vec![key(EffectClass::Egress, target)],
         complete: true,
+        understood: false,
     }
 }
 
@@ -766,6 +771,7 @@ async fn trailing_dot_host_is_the_same_declined_host() {
         CallEffects {
             keys: vec![EffectKey::egress("https", "H.example.invalid.", None)],
             complete: true,
+            understood: false,
         },
     );
     let out = a

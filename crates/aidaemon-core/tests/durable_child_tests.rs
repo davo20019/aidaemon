@@ -80,6 +80,7 @@ impl Tool for Counted {
             CallEffects {
                 keys: vec![egress()],
                 complete: true,
+                understood: false,
             }
         } else {
             CallEffects::none()

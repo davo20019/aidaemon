@@ -828,6 +828,7 @@ mod tests {
                 "repo.packagist.org:443",
             )],
             complete: false,
+            understood: false,
         };
         let messages = verifier_messages_with(
             "Install Drupal with ddev under ~/projects",

@@ -1030,6 +1030,31 @@ primary = "gpt-4o"
         )));
     }
 
+    /// Live 2026-11-13: a clear request for two fresh installs got "Did you
+    /// want a fresh pair of installs?" because earlier ones existed, and a
+    /// later turn gave install times it then retracted. The prompt says to
+    /// do a clear request the non-destructive way and say so, asking only
+    /// when existing work would change, and to state durations only from
+    /// measurements in the conversation.
+    #[test]
+    fn the_base_prompt_does_clear_requests_and_states_only_measured_durations() {
+        use crate::startup::prompt::MemoryPrompt;
+        let prompt =
+            build_base_system_prompt(&minimal_config(), &[], None, &MemoryPrompt::DaemonsOwn)
+                .unwrap();
+        assert!(prompt.contains(
+            "- **Do clear requests without asking.** When the request is clear and the way to do \
+             it without harming anything that exists is obvious"
+        ));
+        assert!(prompt
+            .contains("Ask first only when the choices would destroy or change existing work."));
+        assert!(prompt.contains(&format!(
+            "a result's line starting \"{}\" is the daemon's own measurement",
+            aidaemon_runtime::turn::sliding_window::MEASURED_TIMING_MARK.trim_end()
+        )));
+        assert!(prompt.contains("say it wasn't measured rather than giving or recalling a number"));
+    }
+
     #[test]
     fn base_prompt_uses_default_agent_identity() {
         let config = minimal_config();
