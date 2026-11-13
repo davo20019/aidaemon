@@ -4933,6 +4933,8 @@ fn a_guessed_scope_keeps_sensitive_paths_and_the_terminal_card() {
 
 /// A send the clean check refuses, in the owner's private chat, with the
 /// owner's card answered from `answer`, then one retry of the same send.
+/// Every card is answered: a card left waiting would hold the turn (the
+/// scripted approver has no expiry).
 async fn refused_send_put_to_owner(
     answer: crate::types::ApprovalResponse,
 ) -> (
@@ -4952,7 +4954,7 @@ async fn refused_send_put_to_owner(
         MockProvider::text_response("Finished."),
     ])
     .await;
-    let (broker, approver) = crate::testing::ScriptedApprover::start(vec![Some(answer), None]);
+    let (broker, approver) = crate::testing::ScriptedApprover::start(vec![Some(answer); 2]);
     harness.agent.owner_approvals().set_broker(broker);
     harness
         .agent
@@ -4982,7 +4984,9 @@ async fn the_owner_can_allow_a_call_the_check_refused() {
         card.reason,
         Some(aidaemon_core::AskReason::ReadOutsideContent { .. })
     ));
-    assert!(sent.load(Ordering::SeqCst) >= 1, "the owner allowed it");
+    // The owner allowed it, and the identical retry is replayed from the
+    // first send's result, never sent twice.
+    assert_eq!(sent.load(Ordering::SeqCst), 1, "the owner allowed it");
 }
 
 #[tokio::test]

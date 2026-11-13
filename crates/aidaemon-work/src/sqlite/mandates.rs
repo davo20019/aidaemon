@@ -8,8 +8,8 @@ use crate::traits::{
     MandateMutationQuotaState, MandateMutationReservation, MandateObjectiveMeasurement,
     MandateOperatingUpdates, MandateReconciliationReason, MandateReconciliationResolution,
     MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunProofCounts,
-    MandateStatus, MandateStore,
-    MandateSuspension, MandateSuspensionKind, MandateTerminationKind, MandateWakeSignal, Task,
+    MandateStatus, MandateStore, MandateSuspension, MandateSuspensionKind, MandateTerminationKind,
+    MandateWakeSignal, Task,
 };
 use sha2::{Digest, Sha256};
 

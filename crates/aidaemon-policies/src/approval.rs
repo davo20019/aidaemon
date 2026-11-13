@@ -381,7 +381,9 @@ fn call_card(tool_name: &str, arguments: &Value, info: &ToolInfo) -> aidaemon_co
         impact: info
             .annotations
             .destructive
-            .then(|| aidaemon_core::HighImpact::Deletes { targets: Vec::new() }),
+            .then(|| aidaemon_core::HighImpact::Deletes {
+                targets: Vec::new(),
+            }),
         ..aidaemon_core::ApprovalCard::new(action)
     }
 }

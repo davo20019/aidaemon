@@ -1335,7 +1335,9 @@ mod tests {
             Some("You asked for an install, not a cleanup."),
         );
         assert!(
-            request.summary.starts_with("Run a command on your computer?"),
+            request
+                .summary
+                .starts_with("Run a command on your computer?"),
             "{}",
             request.summary
         );

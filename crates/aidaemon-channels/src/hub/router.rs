@@ -489,8 +489,7 @@ impl ChannelHub {
                                     permission_mode: request.permission_mode,
                                     one_time_only,
                                 };
-                                match ch.request_approval_ask(&routed_session, &ask).await
-                                {
+                                match ch.request_approval_ask(&routed_session, &ask).await {
                                     Ok(resp) => Some(if one_time_only {
                                         // Enforce the one-shot boundary even if an
                                         // older or forged channel callback returns a
@@ -1230,7 +1229,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(channel.doc_count().await, 0, "the copy is already in the chat");
+        assert_eq!(
+            channel.doc_count().await,
+            0,
+            "the copy is already in the chat"
+        );
         hub.send_media_strict(
             "s1",
             &doc_msg("s1", &other.display().to_string(), "other.png"),

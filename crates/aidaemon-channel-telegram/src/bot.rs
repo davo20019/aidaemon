@@ -1942,7 +1942,11 @@ impl HubChannel for TelegramBot {
     ) -> anyhow::Result<ApprovalResponse> {
         info!(session_id, card = ask.card.is_some(), risk = %ask.risk_level, "Approval requested");
         self.prompts
-            .approval_ask(self.sdk_transport(), &self.conversation_for(session_id), ask)
+            .approval_ask(
+                self.sdk_transport(),
+                &self.conversation_for(session_id),
+                ask,
+            )
             .await
             .map_err(|e| anyhow::anyhow!("Telegram approval request failed: {e}"))
     }

@@ -161,7 +161,7 @@ async fn an_approval_card_is_answered_by_an_owner_press_and_shows_its_outcome() 
         .iter()
         .map(|b| b["text"]["text"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(labels, ["Allow Once", "Allow Always", "Deny"]);
+    assert_eq!(labels, ["Allow", "Always allow", "Deny"]);
     let press = |from: &str| {
         json!({
             "type": "interactive",
@@ -190,4 +190,78 @@ async fn an_approval_card_is_answered_by_an_owner_press_and_shows_its_outcome() 
         .as_str()
         .unwrap()
         .contains("Allowed this once"));
+}
+
+/// A typed card renders as Telegram's and Discord's do, in Slack's blocks: the
+/// plain headline and why the owner is asked in the main section, the exact
+/// command under them in a secondary context block, then the buttons.
+#[tokio::test]
+async fn a_typed_approval_card_puts_the_command_under_the_summary() {
+    let api = MockApi::start(respond).await;
+    let (channel, _harness) = channel(&api, MockProvider::new()).await;
+    let card = aidaemon_core::ApprovalCard {
+        asked_by: Some("Drupal install".to_string()),
+        action: aidaemon_core::CardAction::Command {
+            line: "ls -la claude-drupal && ddev describe <site>".to_string(),
+            title: None,
+            looks_inside: vec!["claude-drupal".to_string()],
+        },
+        reason: Some(aidaemon_core::AskReason::ReadOutsideContent {
+            check_says: Some("This isn't part of your request.".to_string()),
+        }),
+        impact: None,
+    };
+    let asking = channel.clone();
+    let asked = tokio::spawn(async move {
+        asking
+            .request_approval_ask(
+                "slack:D0SYNTH",
+                &aidaemon_channels::approval_render::ApprovalAsk {
+                    command: "summary a channel without cards would show",
+                    card: Some(&card),
+                    risk_level: RiskLevel::High,
+                    warnings: &[],
+                    permission_mode: PermissionMode::Default,
+                    one_time_only: true,
+                },
+            )
+            .await
+    });
+    let posted = api
+        .wait_for(|r| r.path == "/chat.postMessage" && r.json()["blocks"].is_array())
+        .await
+        .json();
+    asked.abort();
+    let blocks = posted["blocks"].as_array().unwrap();
+    assert_eq!(blocks.len(), 3, "{posted}");
+
+    assert_eq!(blocks[0]["type"], "section");
+    let summary = blocks[0]["text"]["text"].as_str().unwrap();
+    assert!(summary.starts_with(
+        "*Drupal install wants to look inside your claude-drupal folder.*\n\
+         It read content from outside, like a web page, so I'm checking with you"
+    ));
+    assert!(summary.contains("_Safety check: This isn't part of your request._"));
+    for gone in ["```", "ls -la", "summary a channel", "details"] {
+        assert!(!summary.contains(gone), "{gone}: {summary}");
+    }
+    assert_eq!(posted["text"], summary);
+
+    assert_eq!(blocks[1]["type"], "context");
+    assert_eq!(
+        blocks[1]["elements"][0],
+        json!({
+            "type": "mrkdwn",
+            "text": "```\nls -la claude-drupal &amp;&amp; ddev describe &lt;site&gt;\n```",
+        })
+    );
+
+    assert_eq!(blocks[2]["type"], "actions");
+    let labels: Vec<&str> = blocks[2]["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["text"]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(labels, ["Allow", "Deny"]);
 }

@@ -433,7 +433,10 @@ impl MandateObjectiveControl {
                 Self::SCHEMA_VERSION
             ));
         }
-        for (field, value, max) in [("metric_name", &self.metric_name, 128), ("unit", &self.unit, 64)] {
+        for (field, value, max) in [
+            ("metric_name", &self.metric_name, 128),
+            ("unit", &self.unit, 64),
+        ] {
             if !canonical_text_within(value, max) {
                 return Err(format!(
                     "{field} must be plain text of 1 to {max} characters with no surrounding spaces"

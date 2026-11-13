@@ -683,9 +683,7 @@ impl<'a> Driver<'a> {
                     Resolution::Deny { reason }
                     | Resolution::OwnerDeclined { reason, .. }
                     | Resolution::Unanswered { reason },
-                ) => {
-                    Verdict::Deny(reason)
-                }
+                ) => Verdict::Deny(reason),
                 None => self.decide(&mut call, &mut info, 0).await,
             };
             // A rewrite may introduce egress after reads were queued. Let

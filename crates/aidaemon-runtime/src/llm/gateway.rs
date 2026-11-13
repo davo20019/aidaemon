@@ -912,7 +912,12 @@ mod tests {
             gateway_with_targets(vec![capped, provider_answering(verdict)]).await;
         for _ in 0..3 {
             let answer = gateway
-                .ask(SideCall::UntrustedVerifier, &user("judge"), &Default::default(), None)
+                .ask(
+                    SideCall::UntrustedVerifier,
+                    &user("judge"),
+                    &Default::default(),
+                    None,
+                )
                 .await
                 .expect("the failover judges");
             assert!(answer.text.contains("consistent"));
