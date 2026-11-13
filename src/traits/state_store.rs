@@ -31,6 +31,7 @@ pub use aidaemon_skills::SkillsStore;
 pub trait StateStore:
     Send
     + Sync
+    + aidaemon_runtime::turn::compaction::CompactionStore
     + MessageStore
     + DialogueStateStore
     + super::HistorySearchStore

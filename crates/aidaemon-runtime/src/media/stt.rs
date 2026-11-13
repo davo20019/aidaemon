@@ -7,10 +7,10 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
-use crate::config::{AudioConfig, SttConfig};
-use crate::traits::MessageAttachment;
+use crate::settings::{AudioConfig, SttConfig};
+use aidaemon_events::conversation::MessageAttachment;
 
-use crate::agent::audio::encode_audio_attachment;
+use crate::media::audio::encode_audio_attachment;
 
 pub const TRANSCRIPTION_PREFIX: &str = "[Transcription of ";
 pub const STT_FAILED_SYSTEM_HINT: &str = "[SYSTEM] User attached audio saved to disk; local speech-to-text failed or is disabled — acknowledge receipt and ask them to type what they said.";
@@ -305,7 +305,7 @@ impl Drop for SttWorkDir {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AudioConfig;
+    use crate::settings::AudioConfig;
 
     fn stt_config() -> SttConfig {
         SttConfig {
@@ -335,7 +335,7 @@ mod tests {
             filename: "voice.ogg".to_string(),
             mime_type: mime.to_string(),
             size_bytes: 1024,
-            provenance: crate::traits::AttachmentProvenance::Inbound,
+            provenance: aidaemon_events::conversation::AttachmentProvenance::Inbound,
             source_tool: None,
             ..MessageAttachment::default()
         }
@@ -362,7 +362,7 @@ mod tests {
             filename: "voice.wav".to_string(),
             mime_type: "audio/wav".to_string(),
             size_bytes: 16,
-            provenance: crate::traits::AttachmentProvenance::Inbound,
+            provenance: aidaemon_events::conversation::AttachmentProvenance::Inbound,
             source_tool: None,
             ..MessageAttachment::default()
         }];

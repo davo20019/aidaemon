@@ -21,19 +21,4 @@ impl super::Agent {
         )
         .await
     }
-
-    /// The `[Handoff context]` section for this agent's turn.
-    pub(in crate::agent) async fn handoff_section(
-        &self,
-        session_id: &str,
-        projected_turn_ids: &[String],
-    ) -> Option<String> {
-        handoff_section(
-            &self.event_store,
-            self.inherited_authority.as_ref(),
-            session_id,
-            projected_turn_ids,
-        )
-        .await
-    }
 }

@@ -366,7 +366,7 @@ async fn build_isolated_mandate_bootstrap(
         durable_task_id: agent.task_id.clone(),
         completion_task_kind: "mandate_protocol".to_string(),
         followup_mode: None,
-        config: agent.harness_eval_config.clone(),
+        config: agent.runtime.harness_eval_config.clone(),
     });
     harness_eval.record_bootstrap(
         "isolated_mandate_continue",
@@ -557,8 +557,8 @@ pub(in crate::agent) async fn run_bootstrap(
         crate::agent::stt::maybe_enrich_user_text(
             ctx.user_text,
             ctx.attachments,
-            &agent.stt_config,
-            &agent.audio_config,
+            &agent.runtime.stt_config,
+            &agent.runtime.audio_config,
             &model_for_stt,
         )
         .await
@@ -621,6 +621,7 @@ pub(in crate::agent) async fn run_bootstrap(
     // turn-stamped.
     let user_msg_id = Uuid::new_v4().to_string();
     agent
+        .runtime
         .current_turn_ids
         .write()
         .await
@@ -903,7 +904,7 @@ pub(in crate::agent) async fn run_bootstrap(
         POLICY_METRICS
             .tool_exposure_after_sum
             .fetch_add(shadow_filtered.len() as u64, Ordering::Relaxed);
-        if agent.policy_config.policy_shadow_mode {
+        if agent.runtime.policy_config.policy_shadow_mode {
             info!(
                 session_id,
                 task_id = %task_id,
@@ -914,7 +915,7 @@ pub(in crate::agent) async fn run_bootstrap(
                 "Policy tool filter shadow comparison"
             );
         }
-        if agent.policy_config.tool_filter_enforce && !autonomous_bootstrap {
+        if agent.runtime.policy_config.tool_filter_enforce && !autonomous_bootstrap {
             tool_filter_stages.push(GateFilterStage::new(
                 "policy_filter",
                 tool_defs.len(),
@@ -950,7 +951,7 @@ pub(in crate::agent) async fn run_bootstrap(
         )
         .await;
     if routed {
-        if agent.policy_config.policy_shadow_mode {
+        if agent.runtime.policy_config.policy_shadow_mode {
             info!(
                 session_id,
                 task_id = %task_id,
@@ -980,7 +981,7 @@ pub(in crate::agent) async fn run_bootstrap(
                 | ChannelVisibility::PublicExternal
         );
 
-    let mut session_summary = if agent.context_window_config.enabled
+    let mut session_summary = if agent.runtime.context_window_config.enabled
         && agent.mandate_execution.is_none()
         && !non_owner_shared_context
     {
@@ -1262,7 +1263,7 @@ pub(in crate::agent) async fn run_bootstrap(
     // compacts at the normal threshold; the turn waits only when the history
     // nears this turn's model window (the background pass fell behind, or the
     // turn moved to a smaller-window model).
-    if agent.context_window_config.enabled
+    if agent.runtime.context_window_config.enabled
         && agent.mandate_execution.is_none()
         && user_role.can_persist_owner_memory()
         && !non_owner_shared_context
@@ -1273,9 +1274,11 @@ pub(in crate::agent) async fn run_bootstrap(
             .map(|router| router.select(crate::router::Tier::Fast).to_string())
             .unwrap_or_else(|| model.clone());
         let token_threshold = agent
+            .runtime
             .context_window_config
             .emergency_compaction_threshold_for(&model);
         let recent_tokens = agent
+            .runtime
             .context_window_config
             .summary_recent_tokens_for(&model);
         match tokio::time::timeout(
@@ -1305,7 +1308,7 @@ pub(in crate::agent) async fn run_bootstrap(
         }
     }
 
-    session_summary = if agent.context_window_config.enabled
+    session_summary = if agent.runtime.context_window_config.enabled
         && agent.mandate_execution.is_none()
         && !non_owner_shared_context
         && memory_recall_allowed
@@ -1351,7 +1354,7 @@ pub(in crate::agent) async fn run_bootstrap(
     //
     // Pillar A Task 7 (per-task core-cache hook): the per-session core cache lives
     // INSIDE `build_system_prompt_for_message` (it is `&self` on Agent and reads
-    // `self.core_prompts` directly — no signature change). On a cache HIT the
+    // `self.runtime.core_prompts` directly — no signature change). On a cache HIT the
     // returned `core_prompt_bytes` are reused verbatim with no re-render; on a
     // MISS a `Core prompt invalidated component=...` line is logged there. Option
     // (b) in the plan — chosen for the smaller diff since assemble + render already
@@ -1436,7 +1439,7 @@ pub(in crate::agent) async fn run_bootstrap(
         durable_task_id: agent.task_id.clone(),
         completion_task_kind: "conversational".to_string(),
         followup_mode: None,
-        config: agent.harness_eval_config.clone(),
+        config: agent.runtime.harness_eval_config.clone(),
     });
     harness_eval.record_bootstrap(
         "default_continue",

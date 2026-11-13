@@ -730,7 +730,8 @@ impl Agent {
                     .iter()
                     .filter(|a| a.provenance == AttachmentProvenance::ToolObservation)
                     .collect();
-                let (images, skipped) = sdk_images(&observed, &self.vision_config, scope.model);
+                let (images, skipped) =
+                    sdk_images(&observed, &self.runtime.vision_config, scope.model);
                 if skipped {
                     output.push_str(
                         "\n\n[SYSTEM] The image this tool observed could not be shown to you \

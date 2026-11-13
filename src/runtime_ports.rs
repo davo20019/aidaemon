@@ -41,23 +41,7 @@ pub(crate) struct ChildTimeLimit {
     pub limit: std::time::Duration,
 }
 
-/// What a stopped child had already done, from its own tool records.
-#[derive(Debug, Default)]
-pub(crate) struct ChildWorkReport {
-    /// Calls that finished and may have changed something.
-    pub changed: Vec<String>,
-    /// Calls still running when the child was stopped.
-    pub unfinished: Vec<String>,
-    /// The records could not be read in full (unreadable, or more than the
-    /// report reads), so the lists may be missing actions.
-    pub unknown: bool,
-}
-
-impl ChildWorkReport {
-    pub(crate) fn may_have_changed_something(&self) -> bool {
-        self.unknown || !self.changed.is_empty() || !self.unfinished.is_empty()
-    }
-}
+pub(crate) use aidaemon_runtime::spawn::ChildWorkReport;
 
 /// The child was stopped by the owner from the chat (`/cancel`, or a stop
 /// request read as one).

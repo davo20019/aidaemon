@@ -173,9 +173,7 @@ impl Agent {
     }
 
     pub(super) fn tool_name_from_definition(def: &Value) -> Option<&str> {
-        def.get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|n| n.as_str())
+        aidaemon_runtime::turn::helpers::tool_name_from_definition(def)
     }
 
     /// Session-static tool roster for the Pillar A core prompt: `(tool name,
@@ -265,19 +263,7 @@ impl Agent {
     /// Sort keys (name, serialized bytes) are computed ONCE per element so
     /// serialization cost is O(n), not O(n log n).
     pub(super) fn sort_tool_definitions_by_name(defs: &mut Vec<Value>) {
-        // Compute each element's sort key exactly once, then sort by key.
-        let mut keyed: Vec<(String, String, Value)> = defs
-            .drain(..)
-            .map(|d| {
-                let name = Self::tool_name_from_definition(&d)
-                    .unwrap_or("")
-                    .to_string();
-                let serialized = d.to_string();
-                (name, serialized, d)
-            })
-            .collect();
-        keyed.sort_by(|(an, as_, _), (bn, bs, _)| an.cmp(bn).then_with(|| as_.cmp(bs)));
-        defs.extend(keyed.into_iter().map(|(_, _, d)| d));
+        aidaemon_runtime::turn::helpers::sort_tool_definitions_by_name(defs);
     }
 
     pub(super) fn filter_tool_definitions_for_policy(

@@ -116,7 +116,7 @@ impl Agent {
             info!(session_id, skills = ?names, "Explicitly requested skills for message");
         }
 
-        if self.record_decision_points {
+        if self.runtime.record_decision_points {
             let final_skill_names: Vec<String> =
                 active_skills.iter().map(|s| s.name.clone()).collect();
             self.emit_decision_point(
@@ -221,7 +221,7 @@ impl Agent {
         // full agent (see core_prompt.rs tests). We hold the write lock across
         // the (cheap, sync) decision — this path runs once per task.
         let core_prompt_bytes = {
-            let mut cache = self.core_prompts.write().await;
+            let mut cache = self.runtime.core_prompts.write().await;
             let decision = core_prompt::core_cache_decision(cache.get(session_id), &core_inputs);
             if !decision.changed.is_empty() {
                 info!(
@@ -342,7 +342,7 @@ impl Agent {
         };
 
         if let Some(checkpoint) = resume_checkpoint {
-            if self.record_decision_points {
+            if self.runtime.record_decision_points {
                 self.emit_decision_point(
                     emitter,
                     task_id,
@@ -368,7 +368,7 @@ impl Agent {
             .map(|skill| skill.name.clone())
             .collect();
 
-        if self.record_decision_points {
+        if self.runtime.record_decision_points {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             core_prompt_bytes.hash(&mut hasher);
             tail.hash(&mut hasher);
@@ -594,7 +594,7 @@ impl Agent {
             channel_rules,
         );
         let core_prompt_bytes = {
-            let mut cache = self.core_prompts.write().await;
+            let mut cache = self.runtime.core_prompts.write().await;
             let decision = core_prompt::core_cache_decision(cache.get(session_id), &core_inputs);
             if !decision.changed.is_empty() {
                 info!(
@@ -616,7 +616,7 @@ impl Agent {
         let date_time_str = aidaemon_work::schedule::owner_date_time_long(&prompt_now);
         let tail = Self::build_context_tail(None, "", None, "", &date_time_str, None);
 
-        if self.record_decision_points {
+        if self.runtime.record_decision_points {
             let mut core_hasher = std::collections::hash_map::DefaultHasher::new();
             core_prompt_bytes.hash(&mut core_hasher);
             let core_hash = format!("{:016x}", core_hasher.finish());

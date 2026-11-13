@@ -15,5 +15,4 @@ pub(super) use super::completion_contract::{
     retain_structural_completion_contract, CompletionContract, CompletionProgress,
     CompletionTaskKind,
 };
-pub(super) use super::followup::FollowupMode;
 pub(super) use super::turn_context::TurnContext;

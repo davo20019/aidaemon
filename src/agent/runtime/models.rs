@@ -218,7 +218,7 @@ impl Agent {
     /// anchor so the next context build re-initializes past the new boundary.
     pub async fn clear_session_context(&self, session_id: &str) -> anyhow::Result<()> {
         self.state.clear_session_context(session_id).await?;
-        self.turn_anchors.write().await.remove(session_id);
+        self.runtime.turn_anchors.write().await.remove(session_id);
         Ok(())
     }
 

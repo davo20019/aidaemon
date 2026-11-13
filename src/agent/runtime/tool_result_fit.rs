@@ -112,10 +112,11 @@ impl Agent {
 
         // The cap is per-model so small-context models get tighter results
         // while big-context models keep more.
-        if !self.context_window_config.enabled {
+        if !self.runtime.context_window_config.enabled {
             return result_text;
         }
         let max_chars = self
+            .runtime
             .context_window_config
             .tool_result_chars_for(scope.model);
 
