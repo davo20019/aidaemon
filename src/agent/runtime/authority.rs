@@ -2,11 +2,9 @@
 
 pub(crate) use aidaemon_runtime::authority::*;
 
-/// Every `InheritedAuthority` a child agent was created with (test-only
-/// capture of the real spawn path).
+/// Every `InheritedAuthority` a child agent was created with.
 #[cfg(test)]
-pub(crate) static CREATED_CHILD_INHERITANCE: std::sync::Mutex<Vec<InheritedAuthority>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) use aidaemon_runtime::agent::testing::CREATED_CHILD_INHERITANCE;
 
 #[cfg(test)]
 mod tests {

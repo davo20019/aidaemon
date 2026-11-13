@@ -338,10 +338,13 @@ async fn install_active_test_mandate(
     );
     let calls = Arc::new(AtomicUsize::new(0));
     let saw_mandate_preapproval = Arc::new(AtomicBool::new(false));
-    harness.agent.tools.push(Arc::new(MandateMutationSpy {
-        calls: Arc::clone(&calls),
-        saw_mandate_preapproval: Arc::clone(&saw_mandate_preapproval),
-    }));
+    harness
+        .agent
+        .test_tools_mut()
+        .push(Arc::new(MandateMutationSpy {
+            calls: Arc::clone(&calls),
+            saw_mandate_preapproval: Arc::clone(&saw_mandate_preapproval),
+        }));
     (
         mandate,
         decision,
@@ -487,8 +490,10 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
     let mut harness = setup_test_agent(MockProvider::new())
         .await
         .expect("setup test harness");
-    harness.agent.tools.push(Arc::new(SlowTool));
-    harness.agent.limits.llm_call_timeout = Some(Duration::from_millis(30));
+    harness.agent.test_tools_mut().push(Arc::new(SlowTool));
+    harness
+        .agent
+        .set_test_llm_call_timeout(Some(Duration::from_millis(30)));
 
     let result = harness
         .agent
@@ -537,8 +542,13 @@ async fn execute_tool_watchdog_skips_cli_agent() {
     let mut harness = setup_test_agent(MockProvider::new())
         .await
         .expect("setup test harness");
-    harness.agent.tools.push(Arc::new(SlowCliAgentTool));
-    harness.agent.limits.llm_call_timeout = Some(Duration::from_millis(30));
+    harness
+        .agent
+        .test_tools_mut()
+        .push(Arc::new(SlowCliAgentTool));
+    harness
+        .agent
+        .set_test_llm_call_timeout(Some(Duration::from_millis(30)));
 
     let result = harness
         .agent
@@ -580,7 +590,9 @@ async fn execute_tool_watchdog_allows_fast_tool() {
         .expect("setup test harness");
     // system_info runs multiple subprocesses; allow a bit of slack to avoid
     // flakiness on slower/loaded machines.
-    harness.agent.limits.llm_call_timeout = Some(Duration::from_secs(5));
+    harness
+        .agent
+        .set_test_llm_call_timeout(Some(Duration::from_secs(5)));
 
     let result = harness
         .agent
@@ -623,7 +635,10 @@ async fn execute_tool_watchdog_hands_project_scope_and_causal_tool_call_id() {
     let mut harness = setup_test_agent(MockProvider::new())
         .await
         .expect("setup test harness");
-    harness.agent.tools.push(Arc::new(EchoSpawnAgentTool));
+    harness
+        .agent
+        .test_tools_mut()
+        .push(Arc::new(EchoSpawnAgentTool));
 
     let result = harness
         .agent
@@ -690,7 +705,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
     let arguments = r#"{"text":"useful update"}"#;
     let semantics = harness
         .agent
-        .tools
+        .tools()
         .iter()
         .find(|tool| tool.name() == "http_request")
         .unwrap()
@@ -928,7 +943,7 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
     let arguments = r#"{"text":"must require fresh deliberation"}"#;
     let semantics = harness
         .agent
-        .tools
+        .tools()
         .iter()
         .find(|tool| tool.name() == "http_request")
         .unwrap()

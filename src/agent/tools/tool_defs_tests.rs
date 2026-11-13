@@ -190,7 +190,7 @@ async fn tool_definitions_skip_unavailable_tools() {
     assert!(!caps.contains_key("cli_agent"));
     assert!(!harness
         .agent
-        .tools
+        .tools()
         .iter()
         .any(|tool| tool.name() == "cli_agent" && tool.is_available()));
 }

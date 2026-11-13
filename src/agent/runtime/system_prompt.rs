@@ -1,8 +1,6 @@
 //! The system prompt lives in `aidaemon-runtime`
 //! ([`aidaemon_runtime::prompt::system`]).
 
-#[cfg(test)]
-use super::*;
 #[allow(unused_imports)]
 pub(in crate::agent) use aidaemon_runtime::prompt::system::*;
 
@@ -55,67 +53,6 @@ pub(crate) fn build_available_specialists_block(
         "\nOmit the `specialist` argument to let the agent infer the right kind from the mission/task text.",
     );
     s
-}
-
-#[cfg(test)]
-impl Agent {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn build_system_prompt_for_message(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        task_id: &str,
-        session_id: &str,
-        user_text: &str,
-        user_role: UserRole,
-        channel_ctx: &ChannelContext,
-        tools_count: usize,
-        resume_checkpoint: Option<&ResumeCheckpoint>,
-        preserve_conversation_context: bool,
-        project_instruction_scope: Option<&str>,
-    ) -> anyhow::Result<(
-        String,
-        String,
-        String,
-        Vec<String>,
-        Option<aidaemon_runtime::turn::project_instructions::ProjectInstructionTracker>,
-    )> {
-        build_system_prompt_for_message(
-            self,
-            emitter,
-            task_id,
-            session_id,
-            user_text,
-            user_role,
-            channel_ctx,
-            tools_count,
-            resume_checkpoint,
-            preserve_conversation_context,
-            project_instruction_scope,
-        )
-        .await
-    }
-
-    pub(crate) fn core_behavioral_rules() -> String {
-        aidaemon_runtime::prompt::rules::core_behavioral_rules()
-    }
-
-    fn build_context_tail(
-        project_instructions_block: Option<&str>,
-        skills_content: &str,
-        sender_name: Option<&str>,
-        session_context_str: &str,
-        date_time_str: &str,
-        resume_section: Option<&str>,
-    ) -> String {
-        build_context_tail(
-            project_instructions_block,
-            skills_content,
-            sender_name,
-            session_context_str,
-            date_time_str,
-            resume_section,
-        )
-    }
 }
 
 #[cfg(test)]
@@ -334,9 +271,9 @@ mod tests {
             harness.agent.event_store().clone(),
             "new-task-session".to_string(),
         );
-        let (_, tail, continuation_tail, _, _) = harness
-            .agent
-            .build_system_prompt_for_message(
+        let (_, tail, continuation_tail, _, _) =
+            aidaemon_runtime::prompt::system::build_system_prompt_for_message(
+                &harness.agent,
                 &emitter,
                 "new-task",
                 "new-task-session",
@@ -372,8 +309,9 @@ mod tests {
         let mut harness = setup_test_agent(MockProvider::new())
             .await
             .expect("setup test harness");
-        harness.agent.system_prompt =
-            "PRIVATE CUSTOM PERSONA SENTINEL\nPRIVATE MCP SCHEMA SENTINEL".to_string();
+        harness.agent.set_test_system_prompt(
+            "PRIVATE CUSTOM PERSONA SENTINEL\nPRIVATE MCP SCHEMA SENTINEL".to_string(),
+        );
 
         let skill_dir = tempfile::tempdir().expect("skill tempdir");
         std::fs::write(
@@ -381,8 +319,9 @@ mod tests {
             "---\nname: private-skill\ndescription: PRIVATE SKILL DESCRIPTION SENTINEL\ntriggers: [private-skill]\n---\nPRIVATE SKILL BODY SENTINEL\n",
         )
         .expect("write custom skill");
-        harness.agent.skills_dir = skill_dir.path().to_path_buf();
-        harness.agent.skill_cache = crate::skills::SkillCache::new(skill_dir.path().to_path_buf());
+        harness
+            .agent
+            .set_test_skills_dir(skill_dir.path().to_path_buf());
 
         let specialist_dir = tempfile::tempdir().expect("specialist tempdir");
         std::fs::write(
@@ -390,9 +329,9 @@ mod tests {
             "---\nkind: code\ndescription: PRIVATE SPECIALIST DESCRIPTION SENTINEL\n---\nPRIVATE SPECIALIST BODY SENTINEL\n",
         )
         .expect("write custom specialist override");
-        harness.agent.specialists = std::sync::Arc::new(
+        harness.agent.set_test_specialists(std::sync::Arc::new(
             crate::agent::specialists::SpecialistRegistry::load(Some(specialist_dir.path())),
-        );
+        ));
 
         let project_dir = tempfile::tempdir().expect("project tempdir");
         std::fs::write(
@@ -496,9 +435,9 @@ mod tests {
             harness.agent.event_store().clone(),
             "mandate-session".to_string(),
         );
-        let (core, tail, continuation_tail, active_skills, project_tracker) = harness
-            .agent
-            .build_system_prompt_for_message(
+        let (core, tail, continuation_tail, active_skills, project_tracker) =
+            aidaemon_runtime::prompt::system::build_system_prompt_for_message(
+                &harness.agent,
                 &emitter,
                 "prompt-task",
                 "mandate-session",
@@ -627,22 +566,21 @@ mod tests {
             executor_continuation_tail,
             executor_skills,
             executor_tracker,
-        ) = harness
-            .agent
-            .build_system_prompt_for_message(
-                &emitter,
-                "executor-prompt-task",
-                "mandate-executor-session",
-                "$private-skill Execute the committed action",
-                UserRole::Owner,
-                &ChannelContext::internal(),
-                1,
-                None,
-                false,
-                project_dir.path().to_str(),
-            )
-            .await
-            .expect("build isolated mandate executor prompt");
+        ) = aidaemon_runtime::prompt::system::build_system_prompt_for_message(
+            &harness.agent,
+            &emitter,
+            "executor-prompt-task",
+            "mandate-executor-session",
+            "$private-skill Execute the committed action",
+            UserRole::Owner,
+            &ChannelContext::internal(),
+            1,
+            None,
+            false,
+            project_dir.path().to_str(),
+        )
+        .await
+        .expect("build isolated mandate executor prompt");
         let executor_prompt = format!("{executor_core}\n{executor_tail}");
         assert_eq!(executor_tail, executor_continuation_tail);
         assert!(executor_prompt.contains("role: executor"));
@@ -671,7 +609,6 @@ mod tests {
     // ---- Pillar A Task 5: context tail builder ----
 
     use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
-    use crate::agent::Agent;
 
     /// The tail starts with the marker and carries the volatile sections —
     /// here we assert the date/time block and the marker.
@@ -694,8 +631,14 @@ mod tests {
 
     #[test]
     fn context_tail_carries_all_volatile_sections_and_marker() {
-        let tail =
-            Agent::build_context_tail(None, "", None, "", "Monday, June 1, 2026 12:00 UTC", None);
+        let tail = aidaemon_runtime::prompt::system::build_context_tail(
+            None,
+            "",
+            None,
+            "",
+            "Monday, June 1, 2026 12:00 UTC",
+            None,
+        );
         assert!(tail.starts_with(TASK_CONTEXT_TAIL_MARKER));
         let needle = "[Current Date & Time]";
         assert!(tail.contains(needle), "missing {needle}");
@@ -709,7 +652,7 @@ mod tests {
 
         let checkpoint_section =
             "## Resume Checkpoint\nThe user explicitly asked to continue prior in-progress work.";
-        let tail = Agent::build_context_tail(
+        let tail = aidaemon_runtime::prompt::system::build_context_tail(
             None,
             "",
             None,
@@ -731,7 +674,7 @@ mod tests {
 
     #[test]
     fn core_behavioral_rules_contains_all_core_items() {
-        let core = Agent::core_behavioral_rules();
+        let core = aidaemon_runtime::prompt::rules::core_behavioral_rules();
         for needle in [
             "Never claim actions were performed unless confirmed by a tool result",
             "Quotation marks mean verbatim",
@@ -749,7 +692,7 @@ mod tests {
     #[test]
     fn root_rules_preserve_all_content_after_core_extraction() {
         // Core rules contain all core-tier content.
-        let core = Agent::core_behavioral_rules();
+        let core = aidaemon_runtime::prompt::rules::core_behavioral_rules();
         for needle in [
             "Never claim actions were performed unless confirmed by a tool result",
             "you have a tool for",
@@ -783,7 +726,7 @@ mod tests {
     #[test]
     fn context_tail_includes_scoped_project_instructions() {
         let instructions = "[Project Instructions — scoped workspace guidance]\nUse cargo fmt.";
-        let tail = Agent::build_context_tail(
+        let tail = aidaemon_runtime::prompt::system::build_context_tail(
             Some(instructions),
             "",
             None,

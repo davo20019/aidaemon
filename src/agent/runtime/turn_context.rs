@@ -43,7 +43,7 @@ mod tests {
         let task_id = "task-claimed-pre-dispatch";
         let session_id = "session-claimed-pre-dispatch";
         let emitter =
-            crate::events::EventEmitter::new(harness.agent.event_store.clone(), session_id)
+            crate::events::EventEmitter::new(harness.agent.event_store().clone(), session_id)
                 .with_task_id(task_id);
         let call = ToolCall {
             id: "call-claimed-pre-dispatch".to_string(),
@@ -90,7 +90,7 @@ mod tests {
 
         let events = harness
             .agent
-            .event_store
+            .event_store()
             .query_task_events_for_session(session_id, task_id)
             .await
             .expect("query events");
@@ -430,7 +430,9 @@ mod tests {
             .await
             .expect("test harness");
         let (_workspace, workspace_path) = synthetic_site_workspace();
-        harness.agent.inherited_project_scope = Some(workspace_path.clone());
+        harness
+            .agent
+            .set_test_inherited_project_scope(Some(workspace_path.clone()));
 
         for handoff in [
             "Create the post file in src/content/posts and run the build.",
@@ -483,7 +485,7 @@ mod tests {
 
         // Without an inherited workspace there is no binding and the explicit
         // path in the handoff scopes the turn as before.
-        harness.agent.inherited_project_scope = None;
+        harness.agent.set_test_inherited_project_scope(None);
         let unbound = harness
             .agent
             .build_turn_context_from_recent_history(
@@ -992,7 +994,7 @@ mod tests {
             .await
             .expect("test harness");
         let session_id = "ephemeral-history-result";
-        let emitter = EventEmitter::new(harness.agent.event_store.clone(), session_id);
+        let emitter = EventEmitter::new(harness.agent.event_store().clone(), session_id);
         let message = Message {
             content: Some("verbatim historical evidence".to_string()),
             tool_call_id: Some("call-1".to_string()),
@@ -1015,7 +1017,7 @@ mod tests {
 
         let events = harness
             .agent
-            .event_store
+            .event_store()
             .query_recent_events(session_id, 10)
             .await
             .unwrap();
@@ -1050,7 +1052,7 @@ mod tests {
         let artifact = temp.path().join("report.pdf");
         std::fs::write(&artifact, b"%PDF-1.7 resource test").expect("write artifact");
         let session_id = "resource-registration";
-        let emitter = EventEmitter::new(harness.agent.event_store.clone(), session_id);
+        let emitter = EventEmitter::new(harness.agent.event_store().clone(), session_id);
         let message = Message {
             content: Some("Rendered a PDF.".to_string()),
             tool_call_id: Some("browser-call".to_string()),
@@ -1082,7 +1084,7 @@ mod tests {
 
         let events = harness
             .agent
-            .event_store
+            .event_store()
             .query_events_by_types(session_id, &[EventType::ResourceRegistered], 10)
             .await
             .unwrap();
@@ -1097,7 +1099,7 @@ mod tests {
         );
         assert!(harness
             .agent
-            .event_store
+            .event_store()
             .get_resource(session_id, &registered.resource_id)
             .await
             .unwrap()

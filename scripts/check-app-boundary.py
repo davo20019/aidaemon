@@ -89,12 +89,9 @@ PENDING: dict[str, str] = {}
 
 # The agent as the crates' host: the files that may hold non-test code.
 AGENT_ADAPTERS = {
-    "mod.rs": "the Agent struct, its setters and its entry points (delegations)",
-    "construct.rs": "builds the Agent from the daemon's parts",
-    "turn_host.rs": "Agent as TurnHost and ChildAgent",
-    "runtime_ports.rs": "Agent as the channels' and tools' ports",
-    "runtime/spawn.rs": "create_child_agent: builds a child Agent",
-    "runtime/models.rs": "provider reload from the daemon config, session clears",
+    "construct.rs": "builds the Agent from its parts and the daemon's host ports",
+    "runtime_ports.rs": "Agent as the daemon's own chat glue's port (DaemonAgentRuntime)",
+    "runtime/models.rs": "provider reload: the daemon builds the backends from its config",
     "memory_plugin.rs": "the daemon memory as a MemoryPlugin",
     "memory_plugin/system_memory.rs": "SystemMemory over the daemon stores",
     "memory_plugin/recall.rs": "recall over the daemon stores",

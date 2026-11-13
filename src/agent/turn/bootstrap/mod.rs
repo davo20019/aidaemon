@@ -72,7 +72,7 @@ mod mandate_bootstrap_isolation_tests {
 
     async fn assert_durable_mandate_origin(agent: &Agent, session_id: &str) {
         let events = agent
-            .event_store
+            .event_store()
             .query_events_by_types(session_id, &[EventType::UserMessage], 10)
             .await
             .expect("query mandate user message");
@@ -126,8 +126,9 @@ mod mandate_bootstrap_isolation_tests {
             "---\nname: private-api-guide\ndescription: PRIVATE SKILL DESCRIPTION\ntriggers: stop, private-api-guide\nsource: docs\n---\nPRIVATE SKILL BODY\n",
         )
         .expect("write custom skill");
-        harness.agent.skills_dir = skill_dir.path().to_path_buf();
-        harness.agent.skill_cache = crate::skills::SkillCache::new(skill_dir.path().to_path_buf());
+        harness
+            .agent
+            .set_test_skills_dir(skill_dir.path().to_path_buf());
 
         let goal = crate::traits::Goal::new_continuous(
             "Mandate bootstrap controller",

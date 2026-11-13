@@ -1,5 +1,6 @@
 //! `report_blocker` lives in `aidaemon_runtime::tools::report_blocker`.
 
+#[cfg(test)]
 pub use aidaemon_runtime::tools::report_blocker::*;
 
 #[cfg(test)]

@@ -4,6 +4,7 @@ use super::outcome::*;
 use super::tool_calls::*;
 use super::*;
 use crate::events::TaskEndData;
+use aidaemon_runtime::host::{EngineContext as _, TurnHost as _};
 
 fn vision(max_image_bytes: u64) -> VisionConfig {
     VisionConfig {
@@ -107,7 +108,7 @@ async fn sdk_engine_runs_on_mock_provider() {
     assert_eq!(harness.provider.call_count().await, 2);
     let results = harness
         .agent
-        .event_store
+        .event_store()
         .task_event_count(
             "telegram:synthetic-user-1",
             &reply.task_id,
@@ -356,7 +357,7 @@ async fn task_events(
 ) -> Vec<crate::events::Event> {
     harness
         .agent
-        .event_store
+        .event_store()
         .query_task_events_for_session("telegram:synthetic-user-1", task_id)
         .await
         .unwrap()
@@ -403,7 +404,7 @@ async fn sdk_engine_emits_tool_call_before_result() {
     );
     let aggregate = harness
         .agent
-        .event_store
+        .event_store()
         .task_run_aggregate("telegram:synthetic-user-1", &reply.task_id)
         .await
         .unwrap();
@@ -480,7 +481,7 @@ async fn sdk_engine_track_requirements_declares_expectations() {
     assert_eq!(declared, 1);
     let aggregate = harness
         .agent
-        .event_store
+        .event_store()
         .task_run_aggregate("telegram:synthetic-user-1", &reply.task_id)
         .await
         .unwrap();
@@ -498,7 +499,7 @@ async fn sdk_engine_stops_when_cancelled() {
         .await
         .unwrap();
     let token = tokio_util::sync::CancellationToken::new();
-    harness.agent.cancel_token = Some(token.clone());
+    harness.agent.set_test_cancel_token(Some(token.clone()));
     token.cancel();
     let reply = harness
         .agent
@@ -1705,7 +1706,7 @@ async fn closeout_sees_only_offered_memory_tools() {
     )
     .await
     .unwrap();
-    let tools = &harness.agent.tools;
+    let tools = &harness.agent.tools();
     let owned = closeout_visible_tools(
         tools,
         &[],
@@ -3058,7 +3059,7 @@ async fn verifier_provider_error_denies_and_the_run_finishes() {
     // Side calls record under the gateway's `background:<purpose>` session.
     let failed_verifier_calls = harness
         .agent
-        .event_store
+        .event_store()
         .query_events_by_types(
             "background:untrusted_call_verifier",
             &[crate::events::EventType::LlmCall],
@@ -3683,7 +3684,9 @@ async fn goal_worker_reads_then_sends(
     harness.agent.set_test_task_lead_mode();
     harness.agent.set_test_inherited_authority(inherited);
     harness.agent.set_test_goal_id(Some(goal.id.clone()));
-    harness.agent.inherited_project_scope = Some(scope.to_string_lossy().into_owned());
+    harness
+        .agent
+        .set_test_inherited_project_scope(Some(scope.to_string_lossy().into_owned()));
     harness
         .agent
         .handle_inbound_message(owner_request(&mission))
@@ -3743,8 +3746,10 @@ async fn path_aliases_are_not_trusted_roots() {
     let mut harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
         .await
         .unwrap();
-    harness.agent.path_aliases.projects = vec!["/tmp/aidaemon-test/projects".to_string()];
-    let configured = harness.agent.sdk_engine.trusted_roots.clone();
+    harness
+        .agent
+        .set_test_project_roots(vec!["/tmp/aidaemon-test/projects".to_string()]);
+    let configured = harness.agent.engine_settings().trusted_roots.clone();
     let roots = super::turn_trust_roots(super::TrustRootSources {
         configured: &configured,
         ..Default::default()
@@ -3868,7 +3873,7 @@ async fn hook_order_is_pinned() {
             tools: Arc::default(),
             backend: crate::execution::active_execution_backend(),
             escalator: crate::agent::coordination::Escalator::new(
-                harness.agent.side_calls.clone(),
+                harness.agent.side_calls().clone(),
                 harness.state.clone(),
                 harness.state.clone(),
             ),

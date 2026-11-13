@@ -8,17 +8,17 @@ use async_trait::async_trait;
 
 #[cfg(test)]
 pub(crate) use aidaemon_runtime::spawn::ChildWorkReport;
-pub(crate) use aidaemon_runtime::spawn::{
-    ChildAgentRequest, ChildAgentRun, ChildAgentRuntime, ConversationRequest, ConversationRuntime,
-    SalvagedTaskOutcome,
-};
+#[cfg(test)]
+pub(crate) use aidaemon_runtime::spawn::{ChildAgentRequest, ChildAgentRun, SalvagedTaskOutcome};
+pub(crate) use aidaemon_runtime::spawn::{ChildAgentRuntime, ConversationRuntime};
 #[cfg(test)]
 pub(crate) use aidaemon_runtime::spawn::{ChildTimeLimit, ChildTimedOut};
 
+#[cfg(test)]
 pub(crate) use aidaemon_channels::ports::{
-    AgentIngress, AgentResponseEnvelope, AssistantNoteSink, ChannelAgentRuntime,
-    InboundMessageRequest, InboundMessageTiming, OutboundRouter,
+    AgentIngress, InboundMessageRequest, InboundMessageTiming,
 };
+pub(crate) use aidaemon_channels::ports::{ChannelAgentRuntime, OutboundRouter};
 
 /// The daemon's additions to [`ChannelAgentRuntime`]: what its own chat
 /// glue (Slack project grants, `/reload`) needs from the agent.

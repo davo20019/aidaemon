@@ -277,10 +277,12 @@ pub struct MemoryConfig {
     pub backend: MemoryBackend,
     /// SQLite file for the `sdk` backend.
     #[serde(default = "default_sdk_memory_path")]
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub path: String,
     /// Let a replacing memory system learn from the retained conversations.
     /// It reads them once, in the background, and costs model calls.
     #[serde(default)]
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub learn_from_history: bool,
 }
 
@@ -416,6 +418,7 @@ pub struct ProviderConfig {
     /// stream that dies after partial text is recovered via the
     /// truncation-recovery path instead of failing the whole call.
     #[serde(default)]
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub streaming: bool,
     /// Models whose final (no-tool-call) answers are re-issued through a
     /// tool-less, schema-constrained `{reasoning, response}` second pass
@@ -533,6 +536,7 @@ pub struct SlotRoutingConfig {
     pub interactive_slot: u32,
     /// Slot used for all background/non-interactive calls. Default `1`.
     #[serde(default = "default_background_slot")]
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub background_slot: u32,
 }
 
@@ -1429,26 +1433,26 @@ impl BrowserConfig {
     }
 
     /// Resolved navigation/DOM-ready timeout (see [`aidaemon_tool_browser::BrowserSettings::nav_timeout`]).
-    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
+    #[allow(dead_code)] // the browser tool reads its own settings
     pub fn nav_timeout(&self) -> std::time::Duration {
         self.settings().nav_timeout()
     }
 
     /// Resolved default `wait`-action element-poll timeout.
-    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
+    #[allow(dead_code)] // the browser tool reads its own settings
     pub fn element_timeout(&self) -> std::time::Duration {
         self.settings().element_timeout()
     }
 
     /// Resolved overall per-action ceiling.
-    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
+    #[allow(dead_code)] // the browser tool reads its own settings
     pub fn action_timeout(&self) -> std::time::Duration {
         self.settings().action_timeout()
     }
 
     /// The effective session-isolation mode, refusing configurations that
     /// would falsely claim per-session cookie isolation.
-    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
+    #[allow(dead_code)] // the browser tool reads its own settings
     pub fn resolve_session_isolation(&self) -> Result<SessionIsolation, String> {
         self.settings().resolve_session_isolation()
     }
@@ -1741,10 +1745,13 @@ pub struct PeopleConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_people_auto_extract")]
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub auto_extract: bool,
     #[serde(default = "default_people_auto_extract_categories")]
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub auto_extract_categories: Vec<String>,
     #[serde(default = "default_people_restricted_categories")]
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub restricted_categories: Vec<String>,
     #[serde(default = "default_people_fact_retention_days")]
     pub fact_retention_days: u32,

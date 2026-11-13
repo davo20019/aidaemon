@@ -349,7 +349,7 @@ mod tests {
     async fn set_current_turn(harness: &crate::testing::TestHarness, session: &str, turn_id: &str) {
         harness
             .agent
-            .runtime
+            .turn_runtime()
             .current_turn_ids
             .write()
             .await
@@ -971,7 +971,7 @@ mod tests {
             .expect("test harness");
         harness
             .agent
-            .runtime
+            .test_runtime_mut()
             .context_window_config
             .model_budgets
             .insert("gemma-4-26b".to_string(), 16_384);
@@ -1094,7 +1094,7 @@ mod tests {
             .expect("test harness");
         harness
             .agent
-            .runtime
+            .test_runtime_mut()
             .context_window_config
             .model_budgets
             .insert("gemma-4-26b".to_string(), 16_384);
@@ -1740,7 +1740,13 @@ mod tests {
         );
 
         // After a restart the in-memory anchor is gone; the dialogue survives.
-        harness.agent.runtime.turn_anchors.write().await.clear();
+        harness
+            .agent
+            .turn_runtime()
+            .turn_anchors
+            .write()
+            .await
+            .clear();
         let after_restart =
             build_payload_with_continuity(&harness, session, "How old are they?", 1, false).await;
         assert!(serde_json::to_string(&after_restart)
@@ -1844,7 +1850,7 @@ mod tests {
 
         let floor = harness
             .agent
-            .runtime
+            .turn_runtime()
             .turn_anchors
             .read()
             .await
@@ -1861,7 +1867,13 @@ mod tests {
 
         // Simulate a daemon restart. The in-memory anchor disappears, while
         // the typed new-task floor must remain authoritative in SQLite.
-        harness.agent.runtime.turn_anchors.write().await.clear();
+        harness
+            .agent
+            .turn_runtime()
+            .turn_anchors
+            .write()
+            .await
+            .clear();
 
         seed_turn(
             &store,
@@ -2173,7 +2185,11 @@ mod tests {
     async fn eviction_advances_anchor_and_evicts_whole_turns() {
         let mut harness = setup_test_agent(MockProvider::new()).await.unwrap();
         // Tiny model budget so archived_budget is small but positive.
-        harness.agent.runtime.context_window_config.default_budget = 5900;
+        harness
+            .agent
+            .test_runtime_mut()
+            .context_window_config
+            .default_budget = 5900;
         let store = seed_store(&harness).await;
         // Several archived turns with sizeable content so they exceed the budget.
         let big = "lots of detail ".repeat(20);
@@ -2203,7 +2219,7 @@ mod tests {
 
         let anchor_before = harness
             .agent
-            .runtime
+            .turn_runtime()
             .turn_anchors
             .read()
             .await
@@ -2212,7 +2228,7 @@ mod tests {
         let messages = build_payload(&harness, "s5", "current request", 1).await;
         let anchor_after = harness
             .agent
-            .runtime
+            .turn_runtime()
             .turn_anchors
             .read()
             .await
@@ -2427,7 +2443,11 @@ mod tests {
     #[tokio::test]
     async fn render_cache_prunes_evicted_turns() {
         let mut harness = setup_test_agent(MockProvider::new()).await.unwrap();
-        harness.agent.runtime.context_window_config.default_budget = 5900;
+        harness
+            .agent
+            .test_runtime_mut()
+            .context_window_config
+            .default_budget = 5900;
         let store = seed_store(&harness).await;
         let big = "detail ".repeat(20);
         for i in 1..=4 {
@@ -2455,7 +2475,7 @@ mod tests {
         set_current_turn(&harness, "s9", "tcur").await;
 
         let _ = build_payload(&harness, "s9", "current request", 1).await;
-        let cache = harness.agent.runtime.turn_renders.read().await;
+        let cache = harness.agent.turn_runtime().turn_renders.read().await;
         let session_cache = cache.get("s9");
         // The oldest evicted turn ids must NOT remain cached (no unbounded growth).
         if let Some(sc) = session_cache {
@@ -2467,7 +2487,7 @@ mod tests {
         // Anchor advanced past t1.
         let anchor = harness
             .agent
-            .runtime
+            .turn_runtime()
             .turn_anchors
             .read()
             .await
@@ -2523,7 +2543,7 @@ mod tests {
         // Every emitted historical marker belongs to a turn whose turn_seq >= anchor.
         let anchor = harness
             .agent
-            .runtime
+            .turn_runtime()
             .turn_anchors
             .read()
             .await

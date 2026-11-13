@@ -1,11 +1,13 @@
 //! What one request's tree of sub-agents knows about each other lives in
 //! `aidaemon-runtime`; the old paths stay.
 
+#[cfg(test)]
 pub(crate) use aidaemon_runtime::coordination::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aidaemon_runtime::host::TurnHost as _;
     use aidaemon_tools::semantics::FileFence;
 
     async fn fence(
@@ -23,7 +25,7 @@ mod tests {
                 call_id: call.to_string(),
                 backend: crate::execution::active_execution_backend(),
                 escalator: Escalator::new(
-                    harness.agent.side_calls.clone(),
+                    harness.agent.side_calls().clone(),
                     harness.state.clone(),
                     harness.state.clone(),
                 ),

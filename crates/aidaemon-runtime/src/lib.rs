@@ -46,6 +46,7 @@
 //! - [`spawn_tool`]: the `spawn_agent` tool.
 //! - [`untrusted`]: the untrusted-content rule's taint facts and verifier.
 
+pub mod agent;
 pub mod approvals;
 pub mod authority;
 pub mod background_run;

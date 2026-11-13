@@ -1,154 +1,52 @@
+#[cfg(test)]
 use super::*;
+#[cfg(test)]
 pub(crate) use aidaemon_runtime::spawn::*;
 
-// impl-Agent justification: the host side of making a child (its own tools,
-// MCP registry and agent struct); deciding and running the child is the
-// engine's (`aidaemon_runtime::engine::turn_engine::spawn`).
-impl Agent {
-    /// Build a child of this agent from `spec` (the host side of
-    /// [`aidaemon_runtime::host::TurnHost::create_child`]).
-    pub(in crate::agent) async fn create_child_agent(&self, spec: ChildSpec) -> Arc<Agent> {
-        let ChildSpec {
-            mut tools,
-            model,
-            system_prompt,
-            depth: child_depth,
-            role,
-            task_id,
-            goal_id,
-            mandate_execution,
-            cancel_token,
-            root_tools,
-            add_spawn_tool,
-            inherited_project_scope,
-            approval_session_id,
-            max_iterations_override,
-            timeout_secs_override,
-            inherited_authority,
-            child_progress,
-        } = spec;
-        let hub = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
-            Ok(guard) => guard.clone(),
-            Err(_) => {
-                warn!("Timed out acquiring hub lock while spawning child agent");
-                None
-            }
-        };
-
-        let spawn_tool = if add_spawn_tool {
-            Some(Arc::new(crate::tools::spawn::SpawnAgentTool::for_child(
-                self.limits.max_response_chars,
-                self.limits.timeout_secs,
-                self.state.clone(),
-                hub.clone(),
-            )))
-        } else {
-            None
-        };
-
-        if let Some(ref spawn_tool) = spawn_tool {
-            tools.push(spawn_tool.clone());
-        }
-        // A plain child in a tree can hand the coordinator a decision.
-        if inherited_authority
-            .spawn_family
-            .as_ref()
-            .is_some_and(|family| family.coordinates())
-        {
-            tools.push(Arc::new(crate::tools::EscalateToParentTool));
-        }
-
-        let effective_max_iterations =
-            max_iterations_override.unwrap_or(self.limits.max_iterations);
-        let effective_timeout_secs = timeout_secs_override.unwrap_or(self.limits.timeout_secs);
-        let child_mcp_registry = match mandate_execution.as_ref() {
-            Some(_) => self
-                .mcp_registry
-                .as_ref()
-                .map(|registry| registry.scoped_to_mandate()),
-            None => self.mcp_registry.clone(),
-        };
-        let child_specialists = if mandate_execution.is_some() {
-            Arc::new(crate::agent::specialists::SpecialistRegistry::load(None))
-        } else {
-            self.specialists.clone()
-        };
-        #[allow(unused_mut)]
-        let mut child = Agent::with_depth(
-            self.llm_runtime.clone(),
-            self.side_calls.clone(),
-            self.state.clone(),
-            self.memory_store.clone(),
-            self.event_store.clone(),
-            tools,
-            model,
-            system_prompt,
-            self.config_path.clone(),
-            self.daemon_paths.clone(),
-            self.execution_backend.clone(),
-            self.skills_dir.clone(),
-            child_depth,
-            self.limits.max_depth,
-            self.limits.iteration_config.clone(),
-            effective_max_iterations,
-            self.limits.max_iterations_cap,
-            self.limits.max_response_chars,
-            effective_timeout_secs,
-            self.limits.max_facts,
-            self.limits.task_token_budget,
-            self.limits.llm_call_timeout,
-            child_mcp_registry,
-            role,
-            task_id,
-            goal_id,
-            mandate_execution,
-            cancel_token,
-            self.goal_token_registry.clone(),
-            hub,
-            self.schedule_approved_sessions.clone(),
-            self.billing_failed_models.clone(),
-            self.runtime.record_decision_points,
-            self.runtime.context_window_config.clone(),
-            self.runtime.policy_config.clone(),
-            self.path_aliases.clone(),
-            self.inbox_dir.clone(),
-            inherited_project_scope,
-            approval_session_id,
-            root_tools,
-            child_specialists,
-            self.runtime.vision_config.clone(),
-            self.runtime.audio_config.clone(),
-            self.runtime.stt_config.clone(),
-            self.runtime.harness_eval_config.clone(),
-        );
-        #[cfg(test)]
-        crate::agent::authority::CREATED_CHILD_INHERITANCE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(inherited_authority.clone());
-        child.inherited_authority = Some(inherited_authority);
-        child.child_progress = child_progress;
-        child.running_children = self.running_children.clone();
-        child.sdk_engine = self.sdk_engine.clone();
-        child.run_store = self.run_store.clone();
-        child.owner_approvals = self.owner_approvals.clone();
-        child.memory = self.memory.clone();
-        child.transcript_writes = self.transcript_writes.clone();
-        let child = Arc::new(child);
-
-        if let Some(spawn_tool) = spawn_tool {
-            let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = child.clone();
-            spawn_tool.set_agent(Arc::downgrade(&runtime));
-        }
-
-        child
-    }
-
-    /// Spawn a child and return its reply (tests' shorthand for
-    /// [`TurnEngine::spawn_child`](aidaemon_runtime::engine::turn_engine::TurnEngine::spawn_child)).
-    #[cfg(test)]
+/// Tests' shorthands for
+/// [`TurnEngine::spawn_child`](aidaemon_runtime::engine::turn_engine::TurnEngine::spawn_child).
+#[cfg(test)]
+pub(crate) trait SpawnChildForTest {
+    /// Spawn a child and return its reply.
     #[allow(clippy::too_many_arguments)]
-    pub async fn spawn_child(
+    async fn spawn_child(
+        &self,
+        mission: &str,
+        task: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        channel_ctx: ChannelContext,
+        user_role: UserRole,
+        child_role: Option<AgentRole>,
+        goal_id: Option<&str>,
+        task_id: Option<&str>,
+        inherited_project_scope: Option<&str>,
+        arg_specialist: Option<&str>,
+    ) -> anyhow::Result<String>;
+
+    /// Spawn a child and return how it ended.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_child_with_outcome(
+        &self,
+        mission: &str,
+        task: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        channel_ctx: ChannelContext,
+        user_role: UserRole,
+        child_role: Option<AgentRole>,
+        goal_id: Option<&str>,
+        task_id: Option<&str>,
+        inherited_project_scope: Option<&str>,
+        arg_specialist: Option<&str>,
+        approval_session_id: Option<&str>,
+        parent_authority: Option<crate::agent::authority::InheritedAuthority>,
+        time_limit: Option<ChildTimeLimit>,
+        model_tier: Option<crate::router::Tier>,
+    ) -> anyhow::Result<SpawnChildResult>;
+}
+
+#[cfg(test)]
+impl SpawnChildForTest for Agent {
+    async fn spawn_child(
         &self,
         mission: &str,
         task: &str,
@@ -181,11 +79,7 @@ impl Agent {
         .map(|result| result.response)
     }
 
-    /// Spawn a child and return how it ended (tests' shorthand for
-    /// [`TurnEngine::spawn_child`](aidaemon_runtime::engine::turn_engine::TurnEngine::spawn_child)).
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn spawn_child_with_outcome(
+    async fn spawn_child_with_outcome(
         &self,
         mission: &str,
         task: &str,
@@ -303,7 +197,9 @@ mod tests {
             "specialist:code:1",
             "a root agent answers to its own session"
         );
-        harness.agent.approval_session_id = Some("telegram:synthetic-user-1".to_string());
+        harness
+            .agent
+            .set_test_approval_session_id(Some("telegram:synthetic-user-1".to_string()));
         assert_eq!(
             harness
                 .agent

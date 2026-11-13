@@ -1,3 +1,6 @@
+use crate::agent::SpawnChildForTest as _;
+use crate::runtime_ports::DaemonAgentRuntime as _;
+
 include!("integration_tests/part_00.rs");
 include!("integration_tests/part_01.rs");
 include!("integration_tests/part_02.rs");

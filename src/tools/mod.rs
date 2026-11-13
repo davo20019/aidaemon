@@ -39,7 +39,6 @@ mod web_search;
 #[cfg(feature = "browser")]
 pub use aidaemon_tool_browser::BrowserTool;
 pub use approval::ApprovalBroker;
-pub(crate) use approval::ProgressClock;
 #[cfg(feature = "slack")]
 #[cfg(feature = "slack")]
 pub use channel_history::ReadChannelHistoryTool;
@@ -54,6 +53,7 @@ pub use aidaemon_tools::http_request;
 pub use aidaemon_tools::system::SystemInfoTool;
 pub use aidaemon_work::health::HealthProbeTool;
 pub use diagnose::DiagnoseTool;
+#[cfg(test)]
 pub use escalate::EscalateToParentTool;
 pub use goal_trace::GoalTraceTool;
 pub use http_request::HttpRequestTool;
@@ -81,13 +81,13 @@ pub mod manage_mcp;
 
 pub use aidaemon_runtime::tools::manage_cli_agents::ManageCliAgentsTool;
 pub mod manage_goal_tasks;
+#[cfg(test)]
 pub use manage_goal_tasks::ManageGoalTasksTool;
 pub mod report_blocker;
 pub use aidaemon_client_gateway::client_view::ClientViewTool;
 pub use aidaemon_skills::tools::{ManageSkillsTool, SkillResourcesTool, UseSkillTool};
 pub use aidaemon_tools::command_risk;
 pub use manage_mcp::ManageMcpTool;
-pub use report_blocker::ReportBlockerTool;
 
 // Deterministic tools
 pub(crate) use aidaemon_tools::fs_utils;

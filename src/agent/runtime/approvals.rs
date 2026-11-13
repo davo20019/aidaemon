@@ -1,5 +1,6 @@
 //! Owner approvals live in `aidaemon-runtime`; the old paths stay.
 
+#[cfg(test)]
 pub(crate) use aidaemon_runtime::approvals::*;
 
 #[cfg(test)]

@@ -161,6 +161,7 @@ mod tests {
     use crate::testing::{MockProvider, TestHarness};
     use crate::traits::store_prelude::*;
     use crate::types::{ChannelContext, ChannelVisibility, FactPrivacy, UserRole};
+    use aidaemon_runtime::host::TurnHost as _;
     use serde_json::Value;
 
     const SESSION: &str = "telegram:synthetic-user-1";
@@ -359,7 +360,7 @@ mod tests {
         assert_eq!(harness.provider.call_count().await, 3);
         let retrievals = harness
             .agent
-            .event_store
+            .event_store()
             .query_task_events(&reply.task_id)
             .await
             .unwrap()
@@ -401,8 +402,8 @@ mod tests {
             state,
             harness.state.memory_stores(),
             harness.agent.event_store().clone(),
-            harness.agent.llm_runtime.clone(),
-            harness.agent.side_calls.clone(),
+            harness.agent.llm_runtime().clone(),
+            harness.agent.side_calls().clone(),
             crate::config::ContextWindowConfig::default(),
             10,
             false,
@@ -460,8 +461,8 @@ mod tests {
             state,
             harness.state.memory_stores(),
             harness.agent.event_store().clone(),
-            harness.agent.llm_runtime.clone(),
-            harness.agent.side_calls.clone(),
+            harness.agent.llm_runtime().clone(),
+            harness.agent.side_calls().clone(),
             crate::config::ContextWindowConfig::default(),
             10,
             false,

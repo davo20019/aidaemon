@@ -1,5 +1,6 @@
 //! `manage_goal_tasks` lives in `aidaemon_work::tools::manage_goal_tasks`; the tests here run it against the daemon's assembled state store.
 
+#[cfg(test)]
 pub use aidaemon_work::tools::manage_goal_tasks::*;
 
 #[cfg(test)]

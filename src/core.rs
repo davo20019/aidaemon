@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use tracing::info;
 
-use crate::agent::Agent;
 use crate::channels::{ChannelHub, SessionMap};
 use crate::config::{AppConfig, AudioConfig, SttConfig, VisionConfig};
 use crate::llm_runtime::SharedLlmRuntime;
@@ -228,8 +227,8 @@ pub async fn run(
     let sdk_engine = crate::startup::engine::settings_from_config(&config, &*execution_backend);
 
     #[allow(unused_mut)]
-    let mut agent = Agent::new(crate::agent::AgentConstruction {
-        dependencies: crate::agent::AgentRuntimeDependencies {
+    let mut agent = crate::agent::new_agent(crate::agent::AgentParts {
+        dependencies: crate::agent::AgentDependencies {
             memory_store: memory_store.clone(),
             llm_runtime: llm_runtime.clone(),
             side_calls: side_calls.clone(),

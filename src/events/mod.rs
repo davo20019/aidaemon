@@ -26,9 +26,6 @@ pub use aidaemon_events::payloads::*;
 pub(crate) use aidaemon_events::run_aggregate::RunAggregate;
 #[cfg(test)]
 pub(crate) use aidaemon_events::run_aggregate::{RunObligationState, RunTerminalDecision};
-#[cfg(test)]
-pub(crate) use aidaemon_events::store::GeneratedResponseRef;
-pub(crate) use aidaemon_events::store::{capture_generated_responses, CapturedGeneratedResponse};
 #[allow(unused_imports)]
 pub use aidaemon_events::store::{
     ContinuationToolEvidence, EventEmitter, EventHost, EventStore, LlmStats,

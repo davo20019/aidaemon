@@ -5,6 +5,7 @@
 //! agent as its `TurnHost`; `crate::startup::engine` reads its settings from
 //! the daemon's config. What stays here is the engine tests' support.
 
+#[cfg(test)]
 pub(crate) use aidaemon_runtime::engine::settings::SdkEngineSettings;
 
 /// What the engine tests reach through `super::*`.

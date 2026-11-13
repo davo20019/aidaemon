@@ -37,7 +37,7 @@ aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
 aidaemon-decisions = { version = "0.2.0", path = "../aidaemon-decisions", features = ["gemini"] }
 aidaemon-events = { version = "0.2.0", path = "../aidaemon-events" }
 aidaemon-exposure = { version = "0.2.0", path = "../aidaemon-exposure" }
-aidaemon-mcp = { version = "0.2.0", path = "../aidaemon-mcp" }
+aidaemon-mcp = { version = "0.2.0", path = "../aidaemon-mcp", features = ["registry"] }
 aidaemon-memory = { version = "0.2.0", path = "../aidaemon-memory" }
 aidaemon-nodes = { version = "0.2.0", path = "../aidaemon-nodes" }
 aidaemon-policies = { version = "0.2.0", path = "../aidaemon-policies" }

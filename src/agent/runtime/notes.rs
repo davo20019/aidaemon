@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::agent::TurnNotes;
+    use aidaemon_runtime::host::TurnHost as _;
 
     #[tokio::test]
     async fn delivered_mandate_ask_persists_typed_owner_input_context() {
@@ -140,7 +141,7 @@ mod tests {
         assert!(
             harness
                 .agent
-                .runtime
+                .turn_runtime()
                 .current_turn_ids
                 .read()
                 .await

@@ -404,6 +404,7 @@ pub(super) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aidaemon_runtime::host::TurnHost as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn turn(mandate: bool) -> MemoryTurn {
@@ -645,7 +646,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            harness.agent.memory.owned_daemon_tools(),
+            harness.agent.memory_plugin().owned_daemon_tools(),
             [
                 "remember_fact",
                 "manage_memories",

@@ -15,5 +15,6 @@ pub use aidaemon_tools::semantics::PermissionMode;
 #[cfg(test)]
 pub use aidaemon_tools::semantics::RiskLevel;
 pub use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse, UserRole};
+#[cfg(test)]
 pub use aidaemon_tools::status::StatusUpdate;
 pub use aidaemon_tools::TerminalConfinement;

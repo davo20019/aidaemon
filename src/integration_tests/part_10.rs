@@ -659,9 +659,7 @@ async fn test_compaction_fires_on_window_overflow() {
     let provider = MockProvider::with_responses(responses)
         .with_relationship_assessments(relationships);
     let mut harness = setup_test_agent(provider).await.unwrap();
-    harness
-        .agent
-        .set_context_compaction_tokens_for_test(512, 256);
+    crate::agent::set_context_compaction_tokens_for_test(&mut harness.agent, 512, 256);
 
     // Cross the focused test watermark with ordinary-sized synthetic messages.
     // Production compacts at 60% of the model's window; compaction is intentionally no

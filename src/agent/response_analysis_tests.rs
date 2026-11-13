@@ -233,7 +233,7 @@ fn test_classify_stall_detects_deferred_no_tool_loop() {
         task_outcome: None,
     };
 
-    let (label, suggestion) = Agent::classify_stall(&learning_ctx);
+    let (label, suggestion) = crate::agent::graceful::classify_stall(&learning_ctx);
     assert_eq!(label, "Deferred No-Tool Loop");
     assert!(suggestion.contains("Automatic tool and model recovery"));
     assert!(!suggestion.contains('?'));

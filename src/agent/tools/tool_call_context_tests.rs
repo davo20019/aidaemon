@@ -190,7 +190,7 @@ async fn dispatch_hostile(
     ctx: &ToolExecCtx<'_>,
 ) -> (Value, crate::traits::ToolCallContext) {
     let seen: Seen = Arc::default();
-    harness.agent.tools.insert(
+    harness.agent.test_tools_mut().insert(
         0,
         Arc::new(RecordingTool {
             name: tool,
@@ -203,7 +203,7 @@ async fn dispatch_hostile(
         .await
         .unwrap_or_else(|error| panic!("{tool} dispatch failed: {error}"));
     assert_eq!(output, "recorded");
-    harness.agent.tools.remove(0);
+    harness.agent.test_tools_mut().remove(0);
     let mut seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1, "{tool} was called once");
     seen.pop().unwrap()
@@ -211,10 +211,12 @@ async fn dispatch_hostile(
 
 async fn owner_harness() -> crate::testing::TestHarness {
     let mut harness = setup_test_agent(MockProvider::new()).await.unwrap();
-    harness.agent.goal_id = Some("goal-real".to_string());
     harness
         .agent
-        .runtime
+        .set_test_goal_id(Some("goal-real".to_string()));
+    harness
+        .agent
+        .turn_runtime()
         .current_turn_ids
         .write()
         .await
@@ -377,8 +379,8 @@ async fn model_supplied_underscore_keys_have_no_effect() {
     #[cfg(feature = "computer_use")]
     {
         let (_, computer) = dispatch_hostile(&mut harness, "computer_use", json!({}), &ctx).await;
-        let runtime = harness.agent.llm_runtime.snapshot();
-        let live_model = harness.agent.model.read().await.clone();
+        let runtime = harness.agent.llm_runtime().snapshot();
+        let live_model = harness.agent.model_lock().read().await.clone();
         assert_eq!(computer.model.as_deref(), Some(live_model.as_str()));
         assert_eq!(
             computer.provider_kind,
@@ -461,7 +463,7 @@ async fn workspace_root_and_mandate_fence_are_dispatcher_facts() {
         &attempt,
     );
     for tool in ["manage_goal_tasks", "manage_mandates"] {
-        harness.agent.tools.push(Arc::new(RecordingTool {
+        harness.agent.test_tools_mut().push(Arc::new(RecordingTool {
             name: tool,
             seen: Arc::default(),
         }));
@@ -557,19 +559,16 @@ async fn fact_reading_tools_receive_call_context() {
     let state: Arc<dyn crate::traits::StateStore> = harness.state.clone();
     harness
         .agent
-        .tools
+        .test_tools_mut()
         .push(Arc::new(crate::tools::ManageMemoriesTool::new(
             state.clone(),
             harness.state.memory_stores(),
         )));
+    let events = harness.agent.event_store().clone();
     harness
         .agent
-        .tools
-        .push(Arc::new(crate::tools::DiagnoseTool::new(
-            harness.agent.event_store.clone(),
-            20,
-            false,
-        )));
+        .test_tools_mut()
+        .push(Arc::new(crate::tools::DiagnoseTool::new(events, 20, false)));
 
     let calls = [
         (

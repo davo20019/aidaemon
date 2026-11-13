@@ -1,22 +1,15 @@
-//! The daemon's agent as the turn runtime's host.
+//! The agent as the turn engine's host.
 
 use aidaemon_events::stores::{DialogueStateStore, MessageStore};
-use aidaemon_runtime::host::{
+use aidaemon_events::EventStore;
+use aidaemon_tools::ExecutionBackend;
+
+use super::Agent;
+use crate::host::{
     DecisionRecorder, EngineContext, EngineHostOps, TurnHost, TurnLimits, TurnServices, TurnStores,
     TurnWorkspace,
 };
-use aidaemon_runtime::turn_runtime::TurnRuntime;
-
-use super::Agent;
-use crate::events::EventStore;
-use crate::execution::ExecutionBackend;
-
-impl Agent {
-    /// The turn engine on this agent.
-    pub(crate) fn engine(&self) -> aidaemon_runtime::engine::turn_engine::TurnEngine<'_> {
-        aidaemon_runtime::engine::turn_engine::TurnEngine::new(self)
-    }
-}
+use crate::turn_runtime::TurnRuntime;
 
 impl TurnStores for Agent {
     fn dialogue_states(&self) -> &dyn DialogueStateStore {
@@ -82,10 +75,10 @@ impl TurnWorkspace for Agent {
 impl DecisionRecorder for Agent {
     async fn record_decision_point(
         &self,
-        emitter: &crate::events::EventEmitter,
+        emitter: &aidaemon_events::EventEmitter,
         task_id: &str,
         iteration: usize,
-        decision_type: crate::events::DecisionType,
+        decision_type: aidaemon_events::DecisionType,
         summary: String,
         metadata: serde_json::Value,
     ) {
@@ -103,13 +96,11 @@ impl DecisionRecorder for Agent {
 }
 
 impl EngineContext for Agent {
-    fn daemon_paths(&self) -> &crate::tools::DaemonPaths {
+    fn daemon_paths(&self) -> &aidaemon_tools::path_class::DaemonPaths {
         &self.daemon_paths
     }
 
-    fn engine_settings(
-        &self,
-    ) -> &std::sync::Arc<aidaemon_runtime::engine::settings::SdkEngineSettings> {
+    fn engine_settings(&self) -> &std::sync::Arc<crate::engine::settings::SdkEngineSettings> {
         &self.sdk_engine
     }
 
@@ -121,11 +112,11 @@ impl EngineContext for Agent {
         self.approval_session_id.as_deref()
     }
 
-    fn owner_approvals(&self) -> &std::sync::Arc<aidaemon_runtime::approvals::OwnerApprovals> {
+    fn owner_approvals(&self) -> &std::sync::Arc<crate::approvals::OwnerApprovals> {
         &self.owner_approvals
     }
 
-    fn child_progress(&self) -> Option<&crate::tools::ProgressClock> {
+    fn child_progress(&self) -> Option<&aidaemon_channels::owner_wait::ProgressClock> {
         self.child_progress.as_ref()
     }
 
@@ -133,33 +124,36 @@ impl EngineContext for Agent {
         &self.read_untrusted
     }
 
-    fn running_children(&self) -> &std::sync::Arc<aidaemon_runtime::spawn::RunningChildren> {
+    fn running_children(&self) -> &std::sync::Arc<crate::spawn::RunningChildren> {
         &self.running_children
     }
 
     fn file_policy(&self) -> std::sync::Arc<dyn aidaemon_tools::FilePolicy> {
-        crate::tools::daemon_file_policy(self.daemon_paths.clone())
+        self.file_policy.clone()
     }
 }
 
 #[async_trait::async_trait]
 impl TurnServices for Agent {
-    fn task_registry(&self) -> Option<&std::sync::Arc<crate::tasks::TaskRegistry>> {
+    fn task_registry(&self) -> Option<&std::sync::Arc<aidaemon_channels::tasks::TaskRegistry>> {
         self.task_registry.get()
     }
 
-    async fn plan_store(&self) -> Option<std::sync::Arc<crate::plans::PlanStore>> {
+    async fn plan_store(&self) -> Option<std::sync::Arc<aidaemon_work::plans::PlanStore>> {
         self.plan_store.read().await.clone()
     }
 
-    async fn mcp_tool(&self, name: &str) -> Option<std::sync::Arc<dyn crate::traits::Tool>> {
+    async fn mcp_tool(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<dyn aidaemon_tools::OutcomeTool>> {
         self.mcp_registry.as_ref()?.find_tool(name).await
     }
 
     async fn mcp_tools_matching(
         &self,
         user_message: &str,
-    ) -> Vec<std::sync::Arc<dyn crate::traits::Tool>> {
+    ) -> Vec<std::sync::Arc<dyn aidaemon_tools::OutcomeTool>> {
         match self.mcp_registry.as_ref() {
             Some(registry) => registry.match_tools(user_message).await,
             None => Vec::new(),
@@ -178,9 +172,7 @@ impl TurnServices for Agent {
             .collect()
     }
 
-    fn transcript_writes(
-        &self,
-    ) -> std::sync::Arc<dyn aidaemon_runtime::turn::memory_writer::MemoryWrites> {
+    fn transcript_writes(&self) -> std::sync::Arc<dyn crate::turn::memory_writer::MemoryWrites> {
         self.transcript_writes.clone()
     }
 
@@ -207,20 +199,17 @@ impl TurnServices for Agent {
 #[async_trait::async_trait]
 impl EngineHostOps for Agent {
     fn trace_sink(&self) -> Option<std::sync::Arc<dyn aidaemon_core::EventSink>> {
-        crate::otel_export::sink()
+        self.trace.as_ref()?.sink()
     }
 
     fn observe_sent(&self, run: aidaemon_core::RunId, messages: &[serde_json::Value]) {
-        crate::otel_export::observe_sent(run, messages);
+        if let Some(trace) = self.trace.as_ref() {
+            trace.observe_sent(run, messages);
+        }
     }
 
-    fn computer_use(&self) -> Option<std::sync::Arc<dyn aidaemon_runtime::host::ComputerUseState>> {
-        #[cfg(feature = "computer_use")]
-        {
-            Some(std::sync::Arc::new(super::computer_use::ComputerUsePins))
-        }
-        #[cfg(not(feature = "computer_use"))]
-        None
+    fn computer_use(&self) -> Option<std::sync::Arc<dyn crate::host::ComputerUseState>> {
+        self.computer_use.clone()
     }
 }
 
@@ -234,7 +223,7 @@ impl TurnHost for Agent {
         self.depth > 0 || self.mandate_execution.is_some()
     }
 
-    fn mandate_execution(&self) -> Option<&aidaemon_runtime::turn_runtime::MandateExecutionFence> {
+    fn mandate_execution(&self) -> Option<&crate::turn_runtime::MandateExecutionFence> {
         self.mandate_execution.as_ref()
     }
 
@@ -251,22 +240,22 @@ impl TurnHost for Agent {
     }
 
     fn bundled_specialist_kinds(&self) -> Vec<(String, String)> {
-        super::specialists::SpecialistRegistry::load(None)
+        crate::specialists::SpecialistRegistry::load(None)
             .llm_visible_kinds()
             .into_iter()
             .map(|(name, description)| (name.to_string(), description))
             .collect()
     }
 
-    fn memory_plugin(&self) -> &dyn aidaemon_runtime::turn::memory::MemoryPlugin {
+    fn memory_plugin(&self) -> &dyn crate::turn::memory::MemoryPlugin {
         &*self.memory
     }
 
-    fn execution_backend_handle(&self) -> crate::execution::SharedExecutionBackend {
+    fn execution_backend_handle(&self) -> aidaemon_tools::backend::SharedExecutionBackend {
         self.execution_backend.clone()
     }
 
-    fn role(&self) -> crate::traits::AgentRole {
+    fn role(&self) -> aidaemon_events::traits::AgentRole {
         Agent::role(self)
     }
 
@@ -282,7 +271,7 @@ impl TurnHost for Agent {
         self.inbox_dir.as_deref()
     }
 
-    fn inherited_authority(&self) -> Option<&aidaemon_runtime::authority::InheritedAuthority> {
+    fn inherited_authority(&self) -> Option<&crate::authority::InheritedAuthority> {
         self.inherited_authority.as_ref()
     }
 
@@ -322,18 +311,18 @@ impl TurnHost for Agent {
         goal_id: &str,
         status: &aidaemon_work::goal_tokens::GoalRunBudgetStatus,
     ) {
-        super::goal_dispatch::persist_scheduled_run_state(&self.state, goal_id, None, status).await;
+        crate::goal_dispatch::persist_scheduled_run_state(&self.state, goal_id, None, status).await;
     }
 
     fn task_id(&self) -> Option<&str> {
         self.task_id.as_deref()
     }
 
-    fn llm_runtime(&self) -> &crate::llm_runtime::SharedLlmRuntime {
+    fn llm_runtime(&self) -> &crate::llm::SharedLlmRuntime {
         &self.llm_runtime
     }
 
-    fn side_calls(&self) -> &crate::llm_runtime::gateway::SideCallGateway {
+    fn side_calls(&self) -> &crate::llm::gateway::SideCallGateway {
         &self.side_calls
     }
 
@@ -357,35 +346,33 @@ impl TurnHost for Agent {
     }
 
     async fn stamp_lastgood(&self) {
-        Agent::stamp_lastgood(self).await;
+        self.stamp_lastgood_config().await;
     }
 
     fn message_log(&self) -> std::sync::Arc<dyn MessageStore> {
         self.state.clone()
     }
 
-    fn compaction_store(
-        &self,
-    ) -> std::sync::Arc<dyn aidaemon_runtime::turn::compaction::CompactionStore> {
+    fn compaction_store(&self) -> std::sync::Arc<dyn crate::turn::compaction::CompactionStore> {
         self.state.clone()
     }
 
-    fn skills(&self) -> &crate::skills::SkillCache {
+    fn skills(&self) -> &aidaemon_skills::SkillCache {
         &self.skill_cache
     }
 
     async fn create_child(
         &self,
-        spec: aidaemon_runtime::spawn::ChildSpec,
-    ) -> std::sync::Arc<dyn aidaemon_runtime::spawn::ChildAgent> {
+        spec: crate::spawn::ChildSpec,
+    ) -> std::sync::Arc<dyn crate::spawn::ChildAgent> {
         self.create_child_agent(spec).await
     }
 
-    fn root_tools(&self) -> Option<&[std::sync::Arc<dyn crate::traits::Tool>]> {
+    fn root_tools(&self) -> Option<&[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>]> {
         self.root_tools.as_deref()
     }
 
-    fn specialists(&self) -> &std::sync::Arc<aidaemon_runtime::specialists::SpecialistRegistry> {
+    fn specialists(&self) -> &std::sync::Arc<crate::specialists::SpecialistRegistry> {
         &self.specialists
     }
 
@@ -393,47 +380,50 @@ impl TurnHost for Agent {
         &self,
         goal_id: &str,
         goal_run_id: Option<String>,
-    ) -> std::sync::Arc<dyn crate::traits::Tool> {
+    ) -> std::sync::Arc<dyn aidaemon_tools::OutcomeTool> {
         std::sync::Arc::new(
-            crate::tools::ManageGoalTasksTool::new(goal_id.to_string(), self.state.clone())
-                .with_goal_run_id(goal_run_id),
+            aidaemon_work::tools::manage_goal_tasks::ManageGoalTasksTool::new(
+                goal_id.to_string(),
+                self.state.clone(),
+            )
+            .with_goal_run_id(goal_run_id),
         )
     }
 
     fn report_blocker_tool(
         &self,
         task_id: &str,
-        attempt: crate::traits::TaskAttempt,
+        attempt: aidaemon_work::traits::TaskAttempt,
         mandate: bool,
-    ) -> std::sync::Arc<dyn crate::traits::Tool> {
-        std::sync::Arc::new(crate::tools::ReportBlockerTool::for_attempt(
-            task_id.to_string(),
-            self.state.clone(),
-            attempt,
-            mandate,
-        ))
+    ) -> std::sync::Arc<dyn aidaemon_tools::OutcomeTool> {
+        std::sync::Arc::new(
+            crate::tools::report_blocker::ReportBlockerTool::for_attempt(
+                task_id.to_string(),
+                self.state.clone(),
+                attempt,
+                mandate,
+            ),
+        )
     }
 
-    fn tools(&self) -> &[std::sync::Arc<dyn crate::traits::Tool>] {
+    fn tools(&self) -> &[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>] {
         &self.tools
     }
 
-    fn execution_budget_override(
-        &self,
-    ) -> Option<aidaemon_runtime::turn::execution_state::ExecutionBudget> {
+    fn execution_budget_override(&self) -> Option<crate::turn::execution_state::ExecutionBudget> {
         self.execution_budget_override.clone()
     }
 }
 
 #[async_trait::async_trait]
-impl aidaemon_runtime::spawn::ChildAgent for Agent {
+impl crate::spawn::ChildAgent for Agent {
     async fn handle_message(
         &self,
         session_id: &str,
         user_text: &str,
-        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        user_role: crate::types::UserRole,
-        channel_ctx: crate::types::ChannelContext,
+        status_tx: Option<tokio::sync::mpsc::Sender<aidaemon_tools::status::StatusUpdate>>,
+        user_role: aidaemon_tools::semantics::UserRole,
+        channel_ctx: aidaemon_channels::context::ChannelContext,
         heartbeat: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     ) -> anyhow::Result<String> {
         Agent::handle_message(

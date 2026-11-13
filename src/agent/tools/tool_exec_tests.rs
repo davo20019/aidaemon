@@ -8,9 +8,18 @@ pub(super) use aidaemon_runtime::engine::dispatcher::{
 };
 pub(super) use aidaemon_runtime::engine::tool_exec::{ToolExecCtx, UnknownToolError};
 
-impl Agent {
-    /// One tool call through the dispatcher's watchdog, its output only.
-    pub(super) async fn execute_tool_with_watchdog(
+/// One tool call through the dispatcher's watchdog, its output only.
+pub(super) trait WatchdogOutput {
+    async fn execute_tool_with_watchdog(
+        &self,
+        name: &str,
+        arguments: &str,
+        ctx: &ToolExecCtx<'_>,
+    ) -> anyhow::Result<String>;
+}
+
+impl WatchdogOutput for Agent {
+    async fn execute_tool_with_watchdog(
         &self,
         name: &str,
         arguments: &str,

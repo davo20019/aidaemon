@@ -6,20 +6,18 @@ pub(in crate::agent) use aidaemon_runtime::turn::task_end::emit_decision_point_e
 #[cfg(test)]
 use aidaemon_runtime::turn::task_end::task_end_decision_and_outcome;
 
+/// Test-only wrapper around `post_task::classify_stall`.
+///
+/// Production flow should call the `post_task` function with the real
+/// `tool_failure_count` map so lockout classification remains available.
 #[cfg(test)]
-impl Agent {
-    /// Test-only wrapper around `post_task::classify_stall`.
-    ///
-    /// Production flow should call the `post_task` function with the real
-    /// `tool_failure_count` map so lockout classification remains available.
-    pub(super) fn classify_stall(learning_ctx: &LearningContext) -> (&'static str, &'static str) {
-        let empty_tool_failure_count: HashMap<String, usize> = HashMap::new();
-        post_task::classify_stall(
-            learning_ctx,
-            DEFERRED_NO_TOOL_ERROR_MARKER,
-            &empty_tool_failure_count,
-        )
-    }
+pub(super) fn classify_stall(learning_ctx: &LearningContext) -> (&'static str, &'static str) {
+    let empty_tool_failure_count: HashMap<String, usize> = HashMap::new();
+    post_task::classify_stall(
+        learning_ctx,
+        DEFERRED_NO_TOOL_ERROR_MARKER,
+        &empty_tool_failure_count,
+    )
 }
 
 #[cfg(test)]

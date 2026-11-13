@@ -5,6 +5,7 @@ pub(in crate::agent) use aidaemon_runtime::engine::mandate_run::*;
 mod tests {
     use super::*;
     use crate::traits::store_prelude::*;
+    use aidaemon_runtime::host::TurnHost as _;
 
     async fn install_due_mandate_root(
         harness: &mut crate::testing::TestHarness,
@@ -117,7 +118,7 @@ mod tests {
         assert!(fallback.is_runtime_fallback());
         let attempt = harness
             .agent
-            .mandate_execution
+            .mandate_execution()
             .as_ref()
             .expect("mandate fence")
             .root_task_attempt_id

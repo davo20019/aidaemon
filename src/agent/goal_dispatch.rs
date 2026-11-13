@@ -1,5 +1,6 @@
 //! Goal and task dispatch helpers live in `aidaemon_runtime::goal_dispatch`.
 
+#[cfg(test)]
 pub use aidaemon_runtime::goal_dispatch::*;
 
 #[cfg(test)]

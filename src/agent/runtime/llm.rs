@@ -5,6 +5,7 @@
 pub(in crate::agent) use aidaemon_runtime::llm::turn_calls::*;
 #[cfg(test)]
 mod tests {
+    use aidaemon_runtime::host::TurnHost as _;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -88,7 +89,7 @@ mod tests {
             .expect("build test harness");
         let (gateway, events) =
             crate::llm_runtime::gateway::test_support::gateway_with(provider).await;
-        harness.agent.side_calls = gateway;
+        harness.agent.set_test_side_calls(gateway);
         (harness, events)
     }
 
@@ -164,7 +165,7 @@ mod tests {
             MockProvider::text_response("Answered by the failover provider"),
         )]));
         let hanging: crate::llm_runtime::ModelBackend = Arc::new(Hanging);
-        harness.agent.llm_runtime.swap(
+        harness.agent.llm_runtime().swap(
             hanging.clone(),
             None,
             crate::config::ProviderKind::OpenaiCompatible,
@@ -180,7 +181,7 @@ mod tests {
 
         // No other model on the hanging provider: the chain is the primary,
         // then the failover provider.
-        *harness.agent.fallback_model.write().await = "primary-model".to_string();
+        *harness.agent.fallback_model_lock().write().await = "primary-model".to_string();
 
         let mut telemetry = super::LlmCallTelemetry::default();
         let started = std::time::Instant::now();
@@ -228,7 +229,7 @@ mod tests {
             MockProvider::text_response("Recovered via failover provider"),
         )]));
 
-        harness.agent.llm_runtime.swap(
+        harness.agent.llm_runtime().swap(
             primary_provider.clone() as crate::llm_runtime::ModelBackend,
             None,
             crate::config::ProviderKind::OpenaiCompatible,
@@ -307,7 +308,7 @@ mod tests {
             fallback_models: vec!["plan-model-small".into(), "plan-model-mini".into()],
             ..Default::default()
         });
-        harness.agent.llm_runtime.swap(
+        harness.agent.llm_runtime().swap(
             primary.clone(),
             Some(router.clone()),
             crate::config::ProviderKind::OpenaiChatgpt,
@@ -365,7 +366,7 @@ mod tests {
         let broke = Arc::new(ScriptedProvider::with_results(vec![Err(
             ProviderError::from_status(402, "insufficient credits").into(),
         )]));
-        harness.agent.llm_runtime.swap(
+        harness.agent.llm_runtime().swap(
             primary.clone(),
             None,
             crate::config::ProviderKind::OpenaiChatgpt,
@@ -556,7 +557,7 @@ mod tests {
         let alternate = Arc::new(ScriptedProvider::with_results(vec![Ok(
             MockProvider::text_response("fallback must not run"),
         )]));
-        harness.agent.llm_runtime.swap(
+        harness.agent.llm_runtime().swap(
             primary.clone() as crate::llm_runtime::ModelBackend,
             None,
             crate::config::ProviderKind::OpenaiCompatible,
@@ -571,7 +572,7 @@ mod tests {
         );
         harness
             .agent
-            .billing_failed_models
+            .billing_failed_models()
             .write()
             .await
             .insert("primary-model".to_string(), Instant::now());
@@ -619,7 +620,7 @@ mod tests {
             let alternate = Arc::new(ScriptedProvider::with_results(vec![Ok(
                 MockProvider::text_response("from the fallback"),
             )]));
-            harness.agent.llm_runtime.swap(
+            harness.agent.llm_runtime().swap(
                 primary.clone() as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
@@ -702,7 +703,7 @@ mod tests {
         let later = soon + std::time::Duration::from_secs(600);
         let primary = used_up(later);
         let alternate = used_up(soon);
-        harness.agent.llm_runtime.swap(
+        harness.agent.llm_runtime().swap(
             primary.clone() as crate::llm_runtime::ModelBackend,
             None,
             crate::config::ProviderKind::OpenaiCompatible,
@@ -719,17 +720,20 @@ mod tests {
             model: model.into(),
             ..Default::default()
         };
-        assert_eq!(harness.agent.llm_runtime.snapshot().next_answer_at(), None);
+        assert_eq!(
+            harness.agent.llm_runtime().snapshot().next_answer_at(),
+            None
+        );
         let _ = primary.complete(&request("primary-model")).await;
         assert_eq!(
-            harness.agent.llm_runtime.snapshot().next_answer_at(),
+            harness.agent.llm_runtime().snapshot().next_answer_at(),
             None,
             "the alternate can"
         );
         let _ = alternate.complete(&request("secondary-model")).await;
         let at = harness
             .agent
-            .llm_runtime
+            .llm_runtime()
             .snapshot()
             .next_answer_at()
             .expect("nobody can");

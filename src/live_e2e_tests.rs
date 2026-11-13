@@ -110,8 +110,8 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
         model.clone(),
     );
 
-    let agent = Agent::new(crate::agent::AgentConstruction {
-        dependencies: crate::agent::AgentRuntimeDependencies {
+    let agent = crate::agent::new_agent(crate::agent::AgentParts {
+        dependencies: crate::agent::AgentDependencies {
             memory_store: state.memory_stores(),
             side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
                 llm_runtime.clone(),
@@ -297,8 +297,8 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
         model.clone(),
     );
 
-    let agent = Agent::new(crate::agent::AgentConstruction {
-        dependencies: crate::agent::AgentRuntimeDependencies {
+    let agent = crate::agent::new_agent(crate::agent::AgentParts {
+        dependencies: crate::agent::AgentDependencies {
             memory_store: state.memory_stores(),
             side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
                 llm_runtime.clone(),

@@ -25,9 +25,6 @@ pub(in crate::agent) struct IntentGateDecision {
 }
 
 #[cfg(test)]
-pub(in crate::agent) use aidaemon_runtime::turn::resume::ResumeCheckpoint;
-
-#[cfg(test)]
 pub(in crate::agent) fn user_text_references_filesystem_path(user_text: &str) -> bool {
     let user_text = crate::channels::attachments::user_authored_text(user_text);
     if user_text.trim().is_empty() {

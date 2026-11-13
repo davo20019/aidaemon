@@ -889,8 +889,8 @@ async fn setup_test_agent_internal(
     );
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
-    let mut agent = Agent::new(crate::agent::AgentConstruction {
-        dependencies: crate::agent::AgentRuntimeDependencies {
+    let mut agent = crate::agent::new_agent(crate::agent::AgentParts {
+        dependencies: crate::agent::AgentDependencies {
             memory_store: state.memory_stores(),
             side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
                 llm_runtime.clone(),
@@ -1047,8 +1047,8 @@ pub async fn setup_test_agent_with_models_and_policy(
     );
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
-    let agent = Agent::new(crate::agent::AgentConstruction {
-        dependencies: crate::agent::AgentRuntimeDependencies {
+    let agent = crate::agent::new_agent(crate::agent::AgentParts {
+        dependencies: crate::agent::AgentDependencies {
             memory_store: state.memory_stores(),
             side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
                 llm_runtime.clone(),
@@ -1153,8 +1153,8 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
     );
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
-    let agent = Agent::new(crate::agent::AgentConstruction {
-        dependencies: crate::agent::AgentRuntimeDependencies {
+    let agent = crate::agent::new_agent(crate::agent::AgentParts {
+        dependencies: crate::agent::AgentDependencies {
             memory_store: state.memory_stores(),
             side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
                 llm_runtime.clone(),
@@ -1459,8 +1459,8 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
     );
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
-    let mut agent = Agent::new(crate::agent::AgentConstruction {
-        dependencies: crate::agent::AgentRuntimeDependencies {
+    let mut agent = crate::agent::new_agent(crate::agent::AgentParts {
+        dependencies: crate::agent::AgentDependencies {
             memory_store: state.memory_stores(),
             side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
                 llm_runtime.clone(),
@@ -1624,8 +1624,8 @@ pub async fn setup_live_agent(
         provider_kind,
         models_config.primary.clone(),
     );
-    let agent = Agent::new(crate::agent::AgentConstruction {
-        dependencies: crate::agent::AgentRuntimeDependencies {
+    let agent = crate::agent::new_agent(crate::agent::AgentParts {
+        dependencies: crate::agent::AgentDependencies {
             memory_store: state.memory_stores(),
             side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
                 llm_runtime.clone(),

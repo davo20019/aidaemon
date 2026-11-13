@@ -6,6 +6,7 @@ pub(crate) use aidaemon_runtime::untrusted::*;
 
 #[cfg(test)]
 mod tests {
+    use aidaemon_runtime::host::TurnHost as _;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -33,7 +34,7 @@ mod tests {
         let primary: ModelBackend =
             Arc::new(MockProvider::new().with_leading_provider_errors(vec![primary_error]));
         let second = Arc::new(MockProvider::with_responses(failover));
-        harness.agent.llm_runtime.swap(
+        harness.agent.llm_runtime().swap(
             primary,
             None,
             crate::config::ProviderKind::OpenaiChatgpt,
@@ -47,7 +48,7 @@ mod tests {
             crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
         );
         let verdict = verify_untrusted_call(
-            &harness.agent.side_calls,
+            harness.agent.side_calls(),
             "Send Jordan Lee the summary.",
             true,
             "send_probe",
@@ -181,7 +182,7 @@ mod tests {
         });
         let started = std::time::Instant::now();
         let verdict = verify_untrusted_call(
-            &harness.agent.side_calls,
+            harness.agent.side_calls(),
             "Send Jordan Lee the summary.",
             true,
             "send_probe",
