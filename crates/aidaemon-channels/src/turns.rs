@@ -1451,6 +1451,7 @@ mod tests {
             sessions: Arc::new(NoSessions),
             task_registry: registry.clone(),
             watchdog_stale_threshold_secs: 0,
+            watch: TurnWatch::default(),
         });
         let session = "test:mid-run";
         // The turn that started the helper has ended; the helper reports on.

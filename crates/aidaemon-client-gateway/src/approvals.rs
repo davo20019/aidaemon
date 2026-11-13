@@ -242,7 +242,7 @@ fn card_of(card: &aidaemon_core::ApprovalCard) -> wire::ApprovalCard {
             AskReason::ReadOutsideContent { check_says } => wire::AskReason::ReadOutsideContent {
                 check_says: check_says.clone(),
             },
-            AskReason::AfterADecline => wire::AskReason::AfterADecline,
+            AskReason::AfterADecline { .. } => wire::AskReason::AfterADecline,
             _ => wire::AskReason::Unknown,
         }),
         impact: card.impact.as_ref().map(|impact| match impact {
