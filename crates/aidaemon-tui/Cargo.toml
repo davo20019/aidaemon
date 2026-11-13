@@ -1,0 +1,33 @@
+[package]
+name = "aidaemon-tui"
+description = "A terminal client for the AIdaemon Client Gateway: sessions, chat, approval cards and running work over the client protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["agent", "tui", "terminal", "client"]
+categories = ["command-line-utilities"]
+exclude = ["tests/"]
+publish = false
+
+[[bin]]
+name = "aidaemon-tui"
+path = "src/main.rs"
+
+[dependencies]
+aidaemon-client-protocol = { version = "0.2.0", path = "../client-protocol" }
+anyhow = "1"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
+ratatui = "0.29"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = "0.30"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
