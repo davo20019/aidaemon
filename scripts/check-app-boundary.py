@@ -258,7 +258,14 @@ def main() -> int:
     src = root / "src"
     errors: list[str] = []
 
-    present = {p.name for p in src.iterdir() if not p.name.startswith(".")}
+    # Only entries that hold Rust code count; empty or data-only folders
+    # (e.g. one a local run left behind) are not modules.
+    present = {
+        p.name
+        for p in src.iterdir()
+        if not p.name.startswith(".")
+        and (p.suffix == ".rs" or (p.is_dir() and any(p.rglob("*.rs"))))
+    }
     for name in sorted(present):
         if name not in SHELL and name not in PENDING and name not in REEXPORTS:
             errors.append(
