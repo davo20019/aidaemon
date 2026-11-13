@@ -186,6 +186,7 @@ impl Updater {
         let send_result = self
             .approval_tx
             .send(ApprovalRequest {
+                card: None,
                 command: description,
                 session_id,
                 risk_level: RiskLevel::High,

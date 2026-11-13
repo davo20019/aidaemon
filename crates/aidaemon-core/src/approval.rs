@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 /// Prefix of the reason recorded when the owner declines an approval.
 pub const OWNER_DECLINED: &str = "[OWNER DECLINED]";
 
+/// Prefix of the reason for a call whose owner card got no answer (it
+/// expired, could not be delivered, or the turn was cancelled). Not a
+/// refusal: nothing is remembered as declined.
+pub const OWNER_UNANSWERED: &str = "[NO ANSWER]";
+
 /// Prefix of the reason an outbound secret scan (the
 /// [`crate::Safeguard::Egress`] hook) gives when it refuses a call.
 pub const EGRESS_BLOCKED: &str = "[EGRESS BLOCKED]";
@@ -223,6 +228,107 @@ pub struct OwnerApprovalRequest {
     pub risk: ApprovalRisk,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// What the card says, as typed facts each channel renders. Plain
+    /// words only, never authority: grants match `subject`. `None` shows
+    /// `summary` and `warnings` as they are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<Box<ApprovalCard>>,
+}
+
+/// An approval card's content as facts, so every channel says the same
+/// thing in its own formatting: who asks, what will happen, why the owner
+/// is asked, and the one high-impact effect worth a warning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalCard {
+    /// The helper asking ("Drupal install"); `None` for the assistant
+    /// itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked_by: Option<String>,
+    pub action: CardAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<AskReason>,
+    /// The effect that earns a warning. `None` for ordinary work, which
+    /// gets no warning however the request's risk is rated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact: Option<HighImpact>,
+}
+
+impl ApprovalCard {
+    pub fn new(action: CardAction) -> Self {
+        Self {
+            asked_by: None,
+            action,
+            reason: None,
+            impact: None,
+        }
+    }
+}
+
+/// What allowing the call does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+#[non_exhaustive]
+pub enum CardAction {
+    /// Run a command on the owner's computer.
+    Command {
+        /// The exact line that runs (secrets hidden); shown collapsed,
+        /// never as the headline.
+        line: String,
+        /// The few plain words the call gave for itself (`description`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// The folders a read-only command only looks inside, by name.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        looks_inside: Vec<String>,
+    },
+    /// Let the browser open a site on this computer.
+    OpenLocalSite {
+        site: String,
+        /// How long a one-time allowance lasts.
+        once_minutes: u64,
+    },
+    /// Use a tool; `what` completes "wants to …".
+    Use {
+        what: String,
+        /// The call's arguments as they would run, shown collapsed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+}
+
+/// Why the owner is asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+#[non_exhaustive]
+pub enum AskReason {
+    /// The work read content from outside, and the clean check could not
+    /// confirm this step fits the request.
+    ReadOutsideContent {
+        /// The check's one sentence, addressed to the owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        check_says: Option<String>,
+    },
+    /// The owner said no to a step earlier in this run, and what this call
+    /// does cannot be fully told, so it is not run unasked.
+    AfterADecline,
+}
+
+/// An effect that deserves a warning on the card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+#[non_exhaustive]
+pub enum HighImpact {
+    /// Deletes files: the targets when they can be read.
+    Deletes {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        targets: Vec<String>,
+    },
+    /// Sends or posts something to another service.
+    Sends,
+    /// Spends money.
+    Spends,
+    /// Writes outside the work area.
+    WritesOutsideWorkArea,
 }
 
 /// Who an interruption is waiting for.

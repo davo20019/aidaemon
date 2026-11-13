@@ -203,7 +203,7 @@ async fn an_approval_is_asked_with_buttons_and_answered_by_a_press() {
         .iter()
         .map(|b| b["text"].as_str().unwrap())
         .collect();
-    assert_eq!(labels, ["Allow Once", "Allow Always", "Deny"]);
+    assert_eq!(labels, ["Allow", "Always allow", "Deny"]);
     mock.updates.lock().unwrap().push_back(json!({
         "update_id": 2,
         "callback_query": {

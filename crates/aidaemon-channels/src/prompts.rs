@@ -18,6 +18,12 @@ use aidaemon_tools::semantics::{ApprovalResponse, GoalConfirmationStyle};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const GOAL_TIMEOUT: Duration = Duration::from_secs(1800);
+/// How long before an approval card expires the owner is reminded of it
+/// (at most a fifth of its wait).
+const APPROVAL_REMINDER_BEFORE: Duration = Duration::from_secs(60);
+/// The reminder sent while an approval card still waits.
+const APPROVAL_REMINDER: &str = "⏳ Still waiting for your answer on the card above. It \
+expires in about a minute; then that step is skipped, not refused.";
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -112,17 +118,40 @@ impl Prompts {
         permission_mode: PermissionMode,
         one_time_only: bool,
     ) -> anyhow::Result<ApprovalResponse> {
+        self.approval_ask(
+            channel,
+            conversation,
+            &approval_render::ApprovalAsk {
+                command,
+                card: None,
+                risk_level,
+                warnings,
+                permission_mode,
+                one_time_only,
+            },
+        )
+        .await
+    }
+
+    /// Ask for `ask`, rendered from its typed card when it has one; waits up
+    /// to five minutes. A timeout, a failed send or a closed prompt is an
+    /// error (and declines).
+    pub async fn approval_ask(
+        &self,
+        channel: Arc<dyn Channel>,
+        conversation: &Conversation,
+        ask: &approval_render::ApprovalAsk<'_>,
+    ) -> anyhow::Result<ApprovalResponse> {
         let session_button =
-            approval_render::approval_use_session_button(permission_mode, risk_level);
-        let choices = approval_choices(session_button, one_time_only);
-        let text = approval_render::build_approval_message_markdown(
-            command,
-            risk_level,
-            warnings,
-            session_button,
-            one_time_only,
+            approval_render::approval_use_session_button(ask.permission_mode, ask.risk_level);
+        let choices = approval_choices(session_button, ask.one_time_only);
+        let text = approval_render::build_approval_ask_markdown(ask);
+        info!(
+            risk = %ask.risk_level,
+            mode = %ask.permission_mode,
+            card = ask.card.is_some(),
+            "Asking for an approval"
         );
-        info!(risk = %risk_level, mode = %permission_mode, "Asking for an approval");
         self.ask(
             channel,
             conversation,
@@ -215,7 +244,29 @@ impl Prompts {
                 anyhow::bail!("the prompt could not be delivered: {error}");
             }
         }
-        let outcome = tokio::time::timeout(timeout, answered).await;
+        let mut answered = answered;
+        // An approval card nobody has answered gets one reminder shortly
+        // before it expires: a helper working in the background may have
+        // asked while the owner looked elsewhere.
+        let remind_at = matches!(kind, Kind::Approval)
+            .then(|| timeout.checked_sub(APPROVAL_REMINDER_BEFORE.min(timeout / 5)))
+            .flatten()
+            .filter(|at| !at.is_zero());
+        let outcome = match remind_at {
+            Some(at) => match tokio::time::timeout(at, &mut answered).await {
+                Ok(answer) => Ok(answer),
+                Err(_) => {
+                    if let Err(error) = channel
+                        .send(conversation, &OutboundMessage::text(APPROVAL_REMINDER))
+                        .await
+                    {
+                        warn!(%error, prompt = %id, "Failed to remind about a waiting card");
+                    }
+                    tokio::time::timeout(timeout - at, &mut answered).await
+                }
+            },
+            None => tokio::time::timeout(timeout, &mut answered).await,
+        };
         // An answer already took the prompt out of the book and replaced its
         // message; anything else leaves it to `unanswered`, which expires it.
         unanswered.done = matches!(outcome, Ok(Ok(_)));
@@ -265,15 +316,16 @@ impl Prompts {
     }
 }
 
-/// Allow once, then (unless the grant is one-time only) for the session or
-/// always, then deny.
+/// Allow (this once), then (unless the grant is one-time only) until a
+/// restart or always, then deny. The labels say what each grant lasts, so
+/// the card needs no footer explaining them.
 fn approval_choices(session_button: bool, one_time_only: bool) -> Vec<ApprovalChoice> {
-    let mut choices = vec![choice("once", "Allow Once")];
+    let mut choices = vec![choice("once", "Allow")];
     if !one_time_only {
         choices.push(if session_button {
-            choice("session", "Allow Session")
+            choice("session", "Allow until restart")
         } else {
-            choice("always", "Allow Always")
+            choice("always", "Always allow")
         });
     }
     choices.push(choice("deny", "Deny"));
@@ -392,6 +444,36 @@ mod tests {
         }
     }
 
+    /// A waiting approval card gets one reminder before it expires.
+    #[tokio::test]
+    async fn a_waiting_approval_card_is_reminded_once_before_it_expires() {
+        use crate::testing::{direct, TestChannel};
+        let channel = Arc::new(
+            TestChannel::new("synthetic")
+                .with_buttons(true)
+                .with_edits(true),
+        );
+        let prompts = Prompts::default();
+        let conversation = direct("synthetic-user-1");
+        let pages = ["Your assistant wants to run a command on your computer.".to_string()];
+        let ask = prompts.ask(
+            channel.clone(),
+            &conversation,
+            Kind::Approval,
+            &pages,
+            approval_choices(false, true),
+            Duration::from_millis(300),
+        );
+        assert!(ask.await.is_err(), "nobody answered");
+        let reminders: Vec<String> = channel
+            .sent()
+            .into_iter()
+            .map(|sent| sent.message.text)
+            .filter(|text| text.contains("Still waiting"))
+            .collect();
+        assert_eq!(reminders.len(), 1, "{reminders:?}");
+    }
+
     fn labels(choices: Vec<ApprovalChoice>) -> Vec<String> {
         choices.into_iter().map(|c| c.label).collect()
     }
@@ -400,14 +482,14 @@ mod tests {
     fn approval_buttons_follow_the_grant_offered() {
         assert_eq!(
             labels(approval_choices(false, false)),
-            ["Allow Once", "Allow Always", "Deny"]
+            ["Allow", "Always allow", "Deny"]
         );
         assert_eq!(
             labels(approval_choices(true, false)),
-            ["Allow Once", "Allow Session", "Deny"]
+            ["Allow", "Allow until restart", "Deny"]
         );
         // A one-time grant offers nothing that persists.
-        assert_eq!(labels(approval_choices(true, true)), ["Allow Once", "Deny"]);
+        assert_eq!(labels(approval_choices(true, true)), ["Allow", "Deny"]);
     }
 
     #[test]

@@ -481,16 +481,15 @@ impl ChannelHub {
                             ApprovalKind::Command | ApprovalKind::CommandOnce => {
                                 let one_time_only =
                                     matches!(request.kind, ApprovalKind::CommandOnce);
-                                match ch
-                                    .request_approval(
-                                        &routed_session,
-                                        &request.command,
-                                        request.risk_level,
-                                        &request.warnings,
-                                        request.permission_mode,
-                                        one_time_only,
-                                    )
-                                    .await
+                                let ask = crate::approval_render::ApprovalAsk {
+                                    command: &request.command,
+                                    card: request.card.as_deref(),
+                                    risk_level: request.risk_level,
+                                    warnings: &request.warnings,
+                                    permission_mode: request.permission_mode,
+                                    one_time_only,
+                                };
+                                match ch.request_approval_ask(&routed_session, &ask).await
                                 {
                                     Ok(resp) => Some(if one_time_only {
                                         // Enforce the one-shot boundary even if an
@@ -1302,6 +1301,7 @@ mod tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         approval_tx
             .send(ApprovalRequest {
+                card: None,
                 command: "Navigate to public site".to_string(),
                 session_id: "specialist:browser:child".to_string(),
                 risk_level: RiskLevel::Medium,
@@ -1322,6 +1322,7 @@ mod tests {
         let (unrouted_tx, unrouted_rx) = tokio::sync::oneshot::channel();
         approval_tx
             .send(ApprovalRequest {
+                card: None,
                 command: "Navigate to public site".to_string(),
                 session_id: "specialist:browser:child".to_string(),
                 risk_level: RiskLevel::Medium,

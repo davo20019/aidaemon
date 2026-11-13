@@ -411,6 +411,7 @@ impl ManageOAuthTool {
 
     fn bind_request(service: &str, plan: &BindPlan) -> aidaemon_core::OwnerApprovalRequest {
         aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!(
                 "Verify and bind OAuth service '{}' from account '{}' to '{}'",
@@ -441,6 +442,7 @@ impl ManageOAuthTool {
 
     fn remove_request(service: &str) -> aidaemon_core::OwnerApprovalRequest {
         aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!("Disconnect OAuth service '{}'", service),
             subject: json!({"action": "remove", "service": service, "confirm_disconnect": true})
@@ -461,6 +463,7 @@ impl ManageOAuthTool {
         plan: &RegisterPlan,
     ) -> aidaemon_core::OwnerApprovalRequest {
         aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!(
                 "Register custom OAuth provider '{}' (authorize={}, token={})",
@@ -487,6 +490,7 @@ impl ManageOAuthTool {
 
     fn remove_provider_request(service: &str) -> aidaemon_core::OwnerApprovalRequest {
         aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!(
                 "Remove custom OAuth provider '{}' and delete its client credentials",

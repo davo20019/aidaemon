@@ -601,6 +601,7 @@ impl ToolSemantics for NodeRestartTool {
             return OwnerApprovalNeed::NotNeeded;
         };
         OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: vec![aidaemon_core::EffectKey::named(
                 aidaemon_core::EffectClass::Process,
                 RESTART_EFFECT_KEY,

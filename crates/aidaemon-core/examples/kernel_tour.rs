@@ -30,6 +30,7 @@ impl Hook for AskBeforeDestructive {
             ToolDecision::Interrupt {
                 reason: format!("`{}` is destructive; needs approval", call.name),
                 kind: InterruptKind::OwnerApproval(OwnerApprovalRequest {
+                    card: None,
                     effects: Vec::new(),
                     summary: format!("Run `{}`?", call.name),
                     subject: format!("{} {}", call.name, call.arguments),

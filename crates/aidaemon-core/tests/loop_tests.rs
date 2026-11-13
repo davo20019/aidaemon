@@ -2253,6 +2253,7 @@ async fn rewrite_after_approval_requires_a_new_judgment() {
             ToolDecision::Interrupt {
                 reason: "approve exact arguments".into(),
                 kind: InterruptKind::OwnerApproval(aidaemon_core::OwnerApprovalRequest {
+                    card: None,
                     effects: vec![],
                     summary: "synthetic operation".into(),
                     subject: call.arguments.to_string(),

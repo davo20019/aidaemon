@@ -515,8 +515,12 @@ async fn internal_state_tools_are_not_reasked_after_a_decline() {
         .contains("synthetic-model"));
 }
 
+/// A card nobody answered is not a refusal (live 2026-11-12: an expired
+/// card led the bot to tell the owner "you declined"): the call is not run,
+/// the model is told there was no answer, and nothing is remembered as
+/// declined, so the next step is asked about on its own.
 #[tokio::test]
-async fn approval_timeout_is_a_decline() {
+async fn approval_timeout_is_no_answer_not_a_decline() {
     let (harness, approver) = approvals_harness(
         vec![
             http_call("POST", "https://h.example.invalid/x", Some("report")),
@@ -529,14 +533,17 @@ async fn approval_timeout_is_a_decline() {
     .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
 
-    assert_eq!(approver.card_count(), 1);
+    assert_eq!(approver.card_count(), 2, "each step gets its own card");
     let results = tool_results(&harness).await;
-    assert!(results[0].contains("[OWNER DECLINED]"), "{results:?}");
+    for result in &results[..2] {
+        assert!(result.contains(aidaemon_core::OWNER_UNANSWERED), "{results:?}");
+        assert!(!result.contains("[OWNER DECLINED]"), "{results:?}");
+        assert!(result.contains("did not refuse"), "{results:?}");
+    }
     assert!(
         results[0].contains("no answer from the owner"),
         "{results:?}"
     );
-    assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
     // The card held past the timeout approves nothing.
     let held = approver
         .held
@@ -601,7 +608,10 @@ async fn stale_card_after_restart_approves_nothing() {
     restart.await.unwrap();
 
     let results = tool_results(&harness).await;
-    assert!(results[0].contains("[OWNER DECLINED]"), "{results:?}");
+    assert!(
+        results[0].contains(aidaemon_core::OWNER_UNANSWERED),
+        "{results:?}"
+    );
     assert!(
         results[0].contains("no answer from the owner"),
         "{results:?}"

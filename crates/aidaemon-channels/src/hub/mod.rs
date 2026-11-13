@@ -52,6 +52,8 @@ pub struct ApprovalRequest {
     pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
     /// What kind of approval this is (command vs goal confirmation).
     pub kind: ApprovalKind,
+    /// The card's typed facts, when the asker gave them.
+    pub card: Option<Box<aidaemon_core::ApprovalCard>>,
 }
 
 /// Capabilities that vary by channel (Telegram, WhatsApp, SMS, Web, etc.).
@@ -140,6 +142,26 @@ pub trait HubChannel: Send + Sync {
         permission_mode: PermissionMode,
         one_time_only: bool,
     ) -> anyhow::Result<ApprovalResponse>;
+
+    /// Request approval for `ask`, rendered from its typed card. Channels
+    /// that render cards override this; the default asks with the request's
+    /// summary and warnings through [`HubChannel::request_approval`].
+    async fn request_approval_ask(
+        &self,
+        session_id: &str,
+        ask: &crate::approval_render::ApprovalAsk<'_>,
+    ) -> anyhow::Result<ApprovalResponse> {
+        let warnings = crate::approval_render::card_as_warnings(ask);
+        self.request_approval(
+            session_id,
+            ask.command,
+            ask.risk_level,
+            &warnings,
+            ask.permission_mode,
+            ask.one_time_only,
+        )
+        .await
+    }
 
     /// Request user confirmation for a scheduled goal. Blocks until the user
     /// responds. Returns `true` for confirm, `false` for cancel.

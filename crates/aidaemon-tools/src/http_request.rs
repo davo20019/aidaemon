@@ -1562,6 +1562,7 @@ impl HttpRequestTool {
         let local_site = Self::local_site_needing_owner(&url);
         if matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") && body.is_none() && !overrides {
             return local_site.map(|site| aidaemon_core::OwnerApprovalRequest {
+                card: None,
                 effects: Vec::new(),
                 summary: format!(
                     "Let http_request reach {site}, a site on this computer? Approve only if \
@@ -1599,6 +1600,7 @@ impl HttpRequestTool {
             warnings.push("Write operation: may modify remote data".to_string());
         }
         Some(aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary,
             subject,

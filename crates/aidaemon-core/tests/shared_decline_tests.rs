@@ -74,6 +74,7 @@ impl Hook for AskOwner {
             ToolDecision::Interrupt {
                 reason: "the owner must confirm this send".to_string(),
                 kind: InterruptKind::OwnerApproval(OwnerApprovalRequest {
+                    card: None,
                     effects: tool.effects.keys.clone(),
                     summary: "Send the weekly report for Alice Rivera".to_string(),
                     subject: format!("send via {}", call.name),

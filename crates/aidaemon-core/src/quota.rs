@@ -204,6 +204,20 @@ mod tests {
         }
     }
 
+    /// Behind an `Arc<dyn Provider>` (how every backend is held) the guard
+    /// still says when a used-up model can answer again.
+    #[tokio::test]
+    async fn a_shared_guard_reports_its_cooldown() {
+        let reset = SystemTime::now() + Duration::from_secs(3600);
+        let shared: Arc<dyn Provider> = Arc::new(QuotaGuard::new(ScriptedProvider::with_results(
+            vec![Err(capped(Some(reset), false))],
+        )));
+        assert_eq!(shared.unavailable_until("model-a"), None);
+        let _ = shared.complete(&request("model-a")).await;
+        let until = shared.unavailable_until("model-b").expect("known out");
+        assert!(until > SystemTime::now() + Duration::from_secs(3500));
+    }
+
     /// A plan cap on the first model blocks the account's other models
     /// without sending them, until the stated reset.
     #[tokio::test]

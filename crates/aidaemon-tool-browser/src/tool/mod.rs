@@ -224,6 +224,12 @@ enum GateDecision {
 fn local_site_request(key: &str) -> aidaemon_core::OwnerApprovalRequest {
     let minutes = LOCAL_SITE_ONCE.as_secs() / 60;
     aidaemon_core::OwnerApprovalRequest {
+        card: Some(Box::new(aidaemon_core::ApprovalCard::new(
+            aidaemon_core::CardAction::OpenLocalSite {
+                site: key.to_string(),
+                once_minutes: minutes,
+            },
+        ))),
         effects: Vec::new(),
         summary: format!(
             "Let the browser open {key}, a site on this computer? Approve only if you \
@@ -807,6 +813,7 @@ impl BrowserTool {
         let subject = format!("{summary} [call {}]", &digest[..16]);
         BrowserApproval::Ask {
             request: aidaemon_core::OwnerApprovalRequest {
+                card: None,
                 effects: Vec::new(),
                 summary,
                 subject,

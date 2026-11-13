@@ -11,7 +11,9 @@ use futures::{FutureExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentInner, Resolution};
-use crate::approval::{EffectClass, EffectKey, InterruptKind, SharedDeclines, OWNER_DECLINED};
+use crate::approval::{
+    EffectClass, EffectKey, InterruptKind, SharedDeclines, OWNER_DECLINED, OWNER_UNANSWERED,
+};
 use crate::authority::Authority;
 use crate::error::CoreError;
 use crate::event::Event;
@@ -130,6 +132,14 @@ impl<'a> Driver<'a> {
         interruption: &Interruption,
         resolution: Option<Resolution>,
     ) -> Option<Resolution> {
+        if let Some(Resolution::Unanswered { reason }) = &resolution {
+            let reason = if reason.starts_with(OWNER_UNANSWERED) {
+                reason.clone()
+            } else {
+                format!("{OWNER_UNANSWERED} {reason}")
+            };
+            return Some(Resolution::Deny { reason });
+        }
         let (request, reason) = match (&interruption.kind, &resolution) {
             (_, Some(Resolution::OwnerDeclined { request, reason }))
             | (InterruptKind::OwnerApproval(request), Some(Resolution::Deny { reason })) => {
@@ -669,7 +679,11 @@ impl<'a> Driver<'a> {
                     self.decide(&mut call, &mut info, resume_after.map_or(0, |i| i + 1))
                         .await
                 }
-                Some(Resolution::Deny { reason } | Resolution::OwnerDeclined { reason, .. }) => {
+                Some(
+                    Resolution::Deny { reason }
+                    | Resolution::OwnerDeclined { reason, .. }
+                    | Resolution::Unanswered { reason },
+                ) => {
                     Verdict::Deny(reason)
                 }
                 None => self.decide(&mut call, &mut info, 0).await,

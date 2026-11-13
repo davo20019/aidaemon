@@ -19,11 +19,27 @@ use crate::approval::ApprovalGrants;
 #[derive(Debug, Default)]
 pub struct SessionGrants {
     granted: Mutex<HashSet<(Option<EffectKey>, String)>>,
+    /// Exact calls (by subject) the owner allowed once on another card,
+    /// each good for one later check of that same call.
+    once: Mutex<HashSet<String>>,
 }
 
 impl SessionGrants {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The owner allowed the exact call `subject` once on another card (the
+    /// safety check's): a later approval rule asking about that same call
+    /// takes it as answered, once.
+    pub fn allow_call_once(&self, subject: &str) {
+        if subject.trim().is_empty() {
+            return;
+        }
+        self.once
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(subject.to_string());
     }
 
     /// Remember that the owner approved `request`.
@@ -51,6 +67,13 @@ impl ApprovalGrants for SessionGrants {
         let granted = self.granted.lock().unwrap_or_else(|e| e.into_inner());
         keys(request).iter().all(|key| granted.contains(key))
     }
+
+    async fn take_call_allowed_once(&self, subject: &str) -> bool {
+        self.once
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(subject)
+    }
 }
 
 #[cfg(test)]
@@ -61,6 +84,7 @@ mod tests {
 
     fn req(subject: &str, effects: Vec<EffectKey>) -> OwnerApprovalRequest {
         OwnerApprovalRequest {
+            card: None,
             effects,
             summary: format!("Run {subject} for Jordan Lee"),
             subject: subject.to_string(),

@@ -35,6 +35,7 @@ impl ManageCliAgentsTool {
             return OwnerApprovalNeed::NotNeeded;
         };
         OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!(
                 "Add CLI agent '{}' ({} {})\n\

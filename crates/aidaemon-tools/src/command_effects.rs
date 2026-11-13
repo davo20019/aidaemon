@@ -728,6 +728,80 @@ pub fn reaches_only_this_computer(command: &str) -> bool {
     })
 }
 
+/// Whether every command only reads or reports on this computer and
+/// writes nothing: observations, `cd`, a local `ddev` project's own query,
+/// and `curl` reads of sites on this computer that save nothing (no output,
+/// header, cookie or trace file). Checking the dev site the work set up is
+/// a read, like listing its folder. Fail closed like the other shapes:
+/// `wget` saves by default, and redirects into files, deletes and writes to
+/// a site are excluded.
+pub fn only_reads_this_computer(command: &str) -> bool {
+    if command_effects(command).deletes
+        || scan(command).writes_file
+        || sends_remote_write(command)
+    {
+        return false;
+    }
+    every_segment(command, &|program, args| match program {
+        "cd" => true,
+        "ddev" => ddev_query_ok(args),
+        "curl" => !curl_saves_files(args) && reads_only_local_sites(program, args),
+        _ => OBSERVATION_PROGRAMS.contains(&program) && observation_args_ok(program, args),
+    })
+}
+
+/// Whether a `curl` call saves something to a file: an output, header,
+/// cookie or trace file. Output sent to `/dev/null` saves nothing.
+fn curl_saves_files(args: &[String]) -> bool {
+    const LONG: &[&str] = &[
+        "--output",
+        "--remote-name",
+        "--remote-name-all",
+        "--dump-header",
+        "--cookie-jar",
+        "--trace",
+        "--trace-ascii",
+        "--stderr",
+        "--libcurl",
+        "--etag-save",
+        "--hsts",
+        "--alt-svc",
+        "--create-dirs",
+        "--output-dir",
+    ];
+    let to_null = |value: Option<&String>| value.is_some_and(|value| value == "/dev/null");
+    args.iter().enumerate().any(|(index, arg)| {
+        let next = args.get(index + 1);
+        if arg == "--output" || arg == "-o" {
+            return !to_null(next);
+        }
+        if let Some(value) = arg.strip_prefix("--output=") {
+            return value != "/dev/null";
+        }
+        if LONG
+            .iter()
+            .any(|option| arg == *option || arg.starts_with(&format!("{option}=")))
+        {
+            return true;
+        }
+        if short_cluster_has(arg, &['O', 'D', 'c']) {
+            return true;
+        }
+        // `-so FILE`: the cluster's last letter takes the next word; an
+        // `o` inside a cluster takes the rest of it.
+        if arg.starts_with('-') && !arg.starts_with("--") {
+            if let Some(at) = arg.find('o') {
+                return if at + 1 == arg.len() {
+                    !to_null(next)
+                } else {
+                    &arg[at + 1..] != "/dev/null"
+                };
+            }
+        }
+        false
+    })
+}
+
 /// What a command runs, in a word or two for the owner: "a shell loop" for
 /// a `for`/`while`/`until` loop, else its first program's name ("ddev"),
 /// "a command" when neither can be read. Never the raw line.
@@ -764,6 +838,114 @@ pub fn program_label(command: &str) -> String {
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         })
         .map_or_else(|| "a command".to_string(), str::to_string)
+}
+
+/// The approval card for running `line`, from its structure: the folders
+/// it only looks inside, and the one effect worth a warning (deleting,
+/// with the targets when they can be read, or sending a write to a
+/// service). `title` is the call's own few words for itself.
+pub fn command_card(line: &str, title: Option<String>) -> aidaemon_core::ApprovalCard {
+    let effects = command_effects(line);
+    let impact = if effects.deletes {
+        Some(aidaemon_core::HighImpact::Deletes {
+            targets: effects.delete_targets.unwrap_or_default(),
+        })
+    } else if sends_remote_write(line) {
+        Some(aidaemon_core::HighImpact::Sends)
+    } else {
+        None
+    };
+    aidaemon_core::ApprovalCard {
+        impact,
+        ..aidaemon_core::ApprovalCard::new(aidaemon_core::CardAction::Command {
+            line: line.to_string(),
+            title,
+            looks_inside: looked_inside(line),
+        })
+    }
+}
+
+/// Programs that list or describe folders, whose operands name the folders
+/// they look inside.
+const FOLDER_LISTERS: &[&str] = &["ls", "tree", "du", "find", "stat"];
+
+/// The folders a read-only command looks inside, by name, for the owner's
+/// card ("look inside your claude-drupal and claude-wordpress folders").
+/// Empty unless every command only reads or reports on this computer
+/// (observations, `cd`, a local `ddev` project's own query) and writes no
+/// file. Each listing command's operand (`ls`, `tree`, `du`, `find`,
+/// `stat`, a loop's words bound) counts once, by its first component when
+/// relative and its last when absolute; `.`, `..`, home and anything still
+/// holding a variable or a glob are left out.
+pub fn looked_inside(command: &str) -> Vec<String> {
+    if command_effects(command).deletes || scan(command).writes_file {
+        return Vec::new();
+    }
+    let folders = std::cell::RefCell::new(Vec::<String>::new());
+    let reads_only = every_segment(command, &|program, args| {
+        let ok = match program {
+            "cd" => true,
+            "ddev" => ddev_query_ok(args),
+            _ => OBSERVATION_PROGRAMS.contains(&program) && observation_args_ok(program, args),
+        };
+        if ok && FOLDER_LISTERS.contains(&program) {
+            let mut folders = folders.borrow_mut();
+            for operand in lister_operands(program, args) {
+                if let Some(name) = folder_name(operand) {
+                    if !folders.contains(&name) {
+                        folders.push(name);
+                    }
+                }
+            }
+        }
+        ok
+    });
+    if reads_only {
+        folders.into_inner()
+    } else {
+        Vec::new()
+    }
+}
+
+/// A listing command's path operands: its non-option arguments (`find`:
+/// those before its expression), skipping the values of `tree`'s `-L`,
+/// `-I` and `-P` and `du`'s `-d`.
+fn lister_operands<'a>(program: &str, args: &'a [String]) -> Vec<&'a str> {
+    let mut operands = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if program == "find" && (arg.starts_with('-') || matches!(arg.as_str(), "(" | "!")) {
+            break;
+        }
+        if matches!(
+            (program, arg.as_str()),
+            ("tree", "-L" | "-I" | "-P") | ("du", "-d")
+        ) {
+            iter.next();
+            continue;
+        }
+        if !arg.starts_with('-') {
+            operands.push(arg.as_str());
+        }
+    }
+    operands
+}
+
+/// A folder's name as the owner knows it, from an operand.
+fn folder_name(operand: &str) -> Option<String> {
+    let path = operand.trim_end_matches('/');
+    if path.is_empty()
+        || path.starts_with('~')
+        || path.chars().any(|c| matches!(c, '$' | '*' | '?' | '[' | '{'))
+    {
+        return None;
+    }
+    let name = if path.starts_with('/') {
+        path.rsplit('/').next()?
+    } else {
+        path.split('/').find(|part| !part.is_empty() && *part != ".")?
+    };
+    (!matches!(name, "" | "." | "..")).then(|| name.to_string())
 }
 
 /// `ddev` subcommands whose output is ddev's own report of a local project,
@@ -848,45 +1030,317 @@ fn reads_only_local_sites(program: &str, args: &[String]) -> bool {
 /// Whether `command` is one or more simple commands, each passing `ok` on
 /// its program's bare name and its arguments: no syntax that hides a
 /// command, no input redirects, no variable assignments, programs named
-/// bare or from a system bin directory.
+/// bare or from a system bin directory. Lists, pipes, `( ... )` subshells
+/// and `for` loops over literal words are read structurally
+/// ([`simple_commands`]), so every command they run is checked.
 fn every_segment(command: &str, ok: &dyn Fn(&str, &[String]) -> bool) -> bool {
     if command.contains("/dev/tcp/") || command.contains("/dev/udp/") || command.contains("$'") {
         return false;
     }
-    let mut any = false;
     // A script's lines are commands like `;`-separated ones.
-    for line in command.replace("\\\n", " ").split('\n') {
-        let scanned = scan(line);
-        // Local work never reads stdin from a file: an interpreter fed a
-        // file this way runs code no argument names.
-        if scanned.unsafe_syntax || !scanned.input_targets.is_empty() {
-            return false;
-        }
-        for segment in &scanned.segments {
-            if segment.trim().is_empty() {
-                continue;
-            }
-            let Ok(tokens) = shell_words::split(segment) else {
-                return false;
-            };
-            let tokens = strip_redirections(tokens);
+    let scanned = scan(&command.replace("\\\n", " "));
+    // Local work never reads stdin from a file: an interpreter fed a file
+    // this way runs code no argument names.
+    if scanned.hidden_syntax || !scanned.input_targets.is_empty() {
+        return false;
+    }
+    let Some(commands) = simple_commands(&scanned) else {
+        return false;
+    };
+    !commands.is_empty()
+        && commands.iter().all(|tokens| {
             let Some(program) = tokens.first() else {
                 return false;
             };
-            if is_env_assignment(program) {
-                return false;
+            !is_env_assignment(program)
+                && program_path_ok(program)
+                && ok(basename(program), &tokens[1..])
+        })
+}
+
+/// A program named bare or from a system bin directory.
+fn program_path_ok(program: &str) -> bool {
+    !program.contains('/')
+        || program
+            .rsplit_once('/')
+            .is_some_and(|(dir, _)| SYSTEM_BIN_DIRS.contains(&dir))
+}
+
+/// One command of a compound command line, as the shell groups it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellCommand {
+    /// A program and its arguments, redirections removed.
+    Simple(Vec<String>),
+    /// `( list )`: a list run in a subshell.
+    Subshell(Vec<ShellCommand>),
+    /// `for VAR in WORDS; do LIST; done`.
+    For {
+        var: String,
+        words: Vec<String>,
+        body: Vec<ShellCommand>,
+    },
+}
+
+/// The pieces a scanned line is parsed from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Piece {
+    /// One segment's words, redirections removed.
+    Words(Vec<String>),
+    Open,
+    Close,
+    /// `;`, `|`, `&` or a newline (`&&` and `||` are two of them).
+    Separator(char),
+}
+
+/// Where a list being parsed ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListEnd {
+    Input,
+    Subshell,
+    Loop,
+}
+
+/// Reserved words that start or continue syntax this parser does not
+/// model; a list using one is not understood.
+const UNMODELLED_KEYWORDS: &[&str] = &[
+    "if", "then", "elif", "else", "fi", "while", "until", "case", "esac", "select", "function",
+    "{", "}", "!", "[[", "]]", "do", "in", "coproc",
+];
+
+struct ShellParser {
+    pieces: Vec<Piece>,
+    pos: usize,
+}
+
+impl ShellParser {
+    fn list(&mut self, end: ListEnd) -> Option<Vec<ShellCommand>> {
+        let mut commands = Vec::new();
+        // A command just ended: only a separator or the list's end may follow.
+        let mut ended = false;
+        loop {
+            let Some(piece) = self.pieces.get(self.pos).cloned() else {
+                return (end == ListEnd::Input).then_some(commands);
+            };
+            match piece {
+                Piece::Separator(_) => {
+                    ended = false;
+                    self.pos += 1;
+                }
+                Piece::Close => {
+                    if end != ListEnd::Subshell {
+                        return None;
+                    }
+                    self.pos += 1;
+                    return Some(commands);
+                }
+                _ if ended => return None,
+                Piece::Open => {
+                    self.pos += 1;
+                    let inner = self.list(ListEnd::Subshell)?;
+                    // Redirections after the closing parenthesis apply to
+                    // the whole subshell; the scan has vetted them.
+                    if matches!(self.pieces.get(self.pos), Some(Piece::Words(words)) if words.is_empty())
+                    {
+                        self.pos += 1;
+                    }
+                    commands.push(ShellCommand::Subshell(inner));
+                    ended = true;
+                }
+                Piece::Words(words) => {
+                    let first = words.first()?.as_str();
+                    if first == "done" {
+                        if end != ListEnd::Loop || words.len() != 1 {
+                            return None;
+                        }
+                        self.pos += 1;
+                        return Some(commands);
+                    }
+                    if first == "for" {
+                        commands.push(self.for_loop(&words)?);
+                    } else if UNMODELLED_KEYWORDS.contains(&first) || first.contains('$') {
+                        // A program named by a variable is whatever the
+                        // variable holds, which the other readings of the
+                        // command (deletes, network) never see.
+                        return None;
+                    } else {
+                        self.pos += 1;
+                        commands.push(ShellCommand::Simple(words));
+                    }
+                    ended = true;
+                }
             }
-            let path_ok = !program.contains('/')
-                || program
-                    .rsplit_once('/')
-                    .is_some_and(|(dir, _)| SYSTEM_BIN_DIRS.contains(&dir));
-            if !path_ok || !ok(basename(program), &tokens[1..]) {
-                return false;
-            }
-            any = true;
         }
     }
-    any
+
+    /// `for VAR in WORDS` `;`/newline `do LIST` `done`, starting at its
+    /// header.
+    fn for_loop(&mut self, header: &[String]) -> Option<ShellCommand> {
+        let var = header.get(1)?;
+        let valid_name = var
+            .chars()
+            .next()
+            .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            && var.chars().all(|c| c == '_' || c.is_ascii_alphanumeric());
+        if !valid_name || header.get(2).map(String::as_str) != Some("in") {
+            return None;
+        }
+        let words = header[3..].to_vec();
+        self.pos += 1;
+        let mut separated = false;
+        while let Some(Piece::Separator(sep)) = self.pieces.get(self.pos) {
+            if !matches!(sep, ';' | '\n') {
+                return None;
+            }
+            separated = true;
+            self.pos += 1;
+        }
+        let Some(Piece::Words(opening)) = self.pieces.get(self.pos).cloned() else {
+            return None;
+        };
+        if !separated || opening.first().map(String::as_str) != Some("do") {
+            return None;
+        }
+        if opening.len() == 1 {
+            self.pos += 1;
+        } else {
+            self.pieces[self.pos] = Piece::Words(opening[1..].to_vec());
+        }
+        let body = self.list(ListEnd::Loop)?;
+        Some(ShellCommand::For {
+            var: var.clone(),
+            words,
+            body,
+        })
+    }
+}
+
+/// The compound structure of a scanned command: lists (`;`, `&&`, `||`,
+/// `&`, newlines), pipes, `( ... )` subshells and `for` loops. `None` when
+/// any part is not understood (hidden syntax is the caller's to reject).
+fn parse_shell(scanned: &Scan) -> Option<Vec<ShellCommand>> {
+    let mut pieces = Vec::new();
+    for (index, segment) in scanned.segments.iter().enumerate() {
+        if !segment.trim().is_empty() {
+            let words = strip_redirections(shell_words::split(segment).ok()?);
+            pieces.push(Piece::Words(words));
+        }
+        if let Some(&separator) = scanned.separators.get(index) {
+            pieces.push(match separator {
+                '(' => Piece::Open,
+                ')' => Piece::Close,
+                other => Piece::Separator(other),
+            });
+        }
+    }
+    // A segment of only redirections may follow a subshell, nothing else.
+    for (index, piece) in pieces.iter().enumerate() {
+        if matches!(piece, Piece::Words(words) if words.is_empty())
+            && !matches!(index.checked_sub(1).map(|i| &pieces[i]), Some(Piece::Close))
+        {
+            return None;
+        }
+    }
+    ShellParser { pieces, pos: 0 }.list(ListEnd::Input)
+}
+
+/// `token` with `$var` and `${var}` replaced by `value`.
+fn substitute_var(token: &str, var: &str, value: &str) -> String {
+    let braced = format!("${{{var}}}");
+    let bare = format!("${var}");
+    let mut out = String::with_capacity(token.len());
+    let mut rest = token;
+    while let Some(index) = rest.find('$') {
+        out.push_str(&rest[..index]);
+        let tail = &rest[index..];
+        if let Some(after) = tail.strip_prefix(&braced) {
+            out.push_str(value);
+            rest = after;
+        } else if let Some(after) = tail
+            .strip_prefix(&bare)
+            .filter(|after| !after.starts_with(|c: char| c == '_' || c.is_ascii_alphanumeric()))
+        {
+            out.push_str(value);
+            rest = after;
+        } else {
+            out.push('$');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `commands` with the loop variable `var` bound to `value`.
+fn bind_var(commands: &[ShellCommand], var: &str, value: &str) -> Vec<ShellCommand> {
+    commands
+        .iter()
+        .map(|command| match command {
+            ShellCommand::Simple(tokens) => ShellCommand::Simple(
+                tokens
+                    .iter()
+                    .map(|token| substitute_var(token, var, value))
+                    .collect(),
+            ),
+            ShellCommand::Subshell(inner) => ShellCommand::Subshell(bind_var(inner, var, value)),
+            ShellCommand::For {
+                var: inner_var,
+                words,
+                body,
+            } => ShellCommand::For {
+                var: inner_var.clone(),
+                words: words
+                    .iter()
+                    .map(|word| substitute_var(word, var, value))
+                    .collect(),
+                // An inner loop over the same name shadows it.
+                body: if inner_var == var {
+                    body.clone()
+                } else {
+                    bind_var(body, var, value)
+                },
+            },
+        })
+        .collect()
+}
+
+/// Every simple command `commands` runs, a loop's body once per word with
+/// its variable bound. `None` when a loop word is not one plain operand: a
+/// variable or whitespace could split it into other arguments, and a word
+/// starting with `-` would land as an option the readings of the raw text
+/// (deletes, network) cannot see.
+fn flatten_commands(commands: &[ShellCommand], out: &mut Vec<Vec<String>>) -> Option<()> {
+    for command in commands {
+        match command {
+            ShellCommand::Simple(tokens) => out.push(tokens.clone()),
+            ShellCommand::Subshell(inner) => flatten_commands(inner, out)?,
+            ShellCommand::For { var, words, body } => {
+                if words.is_empty() {
+                    flatten_commands(body, out)?;
+                }
+                for word in words {
+                    if word.is_empty()
+                        || word.starts_with('-')
+                        || word
+                            .chars()
+                            .any(|c| c.is_whitespace() || matches!(c, '$' | '`' | '"' | '\''))
+                    {
+                        return None;
+                    }
+                    flatten_commands(&bind_var(body, var, word), out)?;
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// The simple commands a scanned command line runs, redirections removed,
+/// through lists, pipes, subshells and `for` loops (each body once per
+/// word). `None` when its structure is not understood.
+fn simple_commands(scanned: &Scan) -> Option<Vec<Vec<String>>> {
+    let mut out = Vec::new();
+    flatten_commands(&parse_shell(scanned)?, &mut out)?;
+    Some(out)
 }
 
 /// Options through which a local-work program runs code given inline (or
@@ -974,6 +1428,11 @@ struct Scan {
     /// input redirects other than `/dev/null`, heredocs, substitutions,
     /// process substitution, comments, newlines, unclosed quotes.
     unsafe_syntax: bool,
+    /// Unsafe syntax other than the structure a compound command is built
+    /// from (newlines and `(`/`)` subshells): substitutions, heredocs,
+    /// comments, process substitution, descriptor-numbered input, a newline
+    /// inside single quotes, unclosed quotes.
+    hidden_syntax: bool,
     /// Output redirected into a file (not `/dev/null` or a descriptor).
     writes_file: bool,
     /// Targets of plain input redirects (`< file`, `<file`, `0< file`),
@@ -1004,6 +1463,7 @@ fn scan(command: &str) -> Scan {
     let mut segments = Vec::new();
     let mut cur = String::new();
     let mut unsafe_syntax = false;
+    let mut hidden_syntax = false;
     let mut writes_file = false;
     let mut input_targets = Vec::new();
     let mut output_targets = Vec::new();
@@ -1013,6 +1473,7 @@ fn scan(command: &str) -> Scan {
     while i < chars.len() {
         let c = chars[i];
         if in_single {
+            hidden_syntax |= c == '\n';
             in_single = c != '\'';
             cur.push(c);
             i += 1;
@@ -1044,15 +1505,18 @@ fn scan(command: &str) -> Scan {
             // Substitutions expand inside double quotes too.
             '`' => {
                 unsafe_syntax = true;
+                hidden_syntax = true;
                 cur.push(c);
             }
             '$' if next == Some('(') || (next == Some('\'') && !in_double) => {
                 unsafe_syntax = true;
+                hidden_syntax = true;
                 cur.push(c);
             }
             _ if in_double => cur.push(c),
             '#' if cur.chars().last().is_none_or(|p| p.is_whitespace()) => {
                 unsafe_syntax = true;
+                hidden_syntax = true;
                 cur.push(c);
             }
             ';' | '(' | ')' => {
@@ -1082,6 +1546,7 @@ fn scan(command: &str) -> Scan {
                     || target.is_empty()
                 {
                     unsafe_syntax = true;
+                    hidden_syntax = true;
                 } else if target != "/dev/null" {
                     input_targets.push(target);
                 }
@@ -1107,6 +1572,7 @@ fn scan(command: &str) -> Scan {
                 }
                 if next == Some('(') {
                     unsafe_syntax = true;
+                    hidden_syntax = true;
                 } else if !dup {
                     let target = redirect_target(&chars, j);
                     if target != "/dev/null" {
@@ -1126,11 +1592,13 @@ fn scan(command: &str) -> Scan {
     }
     if in_single || in_double {
         unsafe_syntax = true;
+        hidden_syntax = true;
     }
     segments.push(cur);
     Scan {
         segments,
         unsafe_syntax,
+        hidden_syntax,
         writes_file,
         input_targets,
         output_targets,
@@ -1184,51 +1652,41 @@ pub fn is_observation_reading_input(command: &str) -> bool {
 fn is_observation(command: &str, allow_input_redirects: bool) -> bool {
     let scanned = scan(command);
     if (!allow_input_redirects && !scanned.input_targets.is_empty())
-        || scanned.unsafe_syntax
+        || scanned.hidden_syntax
+        || scanned.separators.contains(&'\n')
         || scanned.writes_file
         || command.contains("/dev/tcp/")
         || command.contains("/dev/udp/")
     {
         return false;
     }
-    let mut any = false;
-    for segment in &scanned.segments {
-        if segment.trim().is_empty() {
-            continue;
-        }
-        let Ok(tokens) = shell_words::split(segment) else {
-            return false;
-        };
-        let tokens = strip_redirections(tokens);
-        let Some(first) = tokens.first() else {
-            return false;
-        };
-        if is_env_assignment(first) {
-            return false;
-        }
-        // `command ls` is the one wrapper that stays an observation.
-        let tokens = if first == "command" {
-            &tokens[1..]
-        } else {
-            &tokens[..]
-        };
-        let Some(program) = tokens.first() else {
-            return false;
-        };
-        let name = basename(program);
-        let path_ok = !program.contains('/')
-            || program
-                .rsplit_once('/')
-                .is_some_and(|(dir, _)| SYSTEM_BIN_DIRS.contains(&dir));
-        if !path_ok
-            || !OBSERVATION_PROGRAMS.contains(&name)
-            || !observation_args_ok(name, &tokens[1..])
-        {
-            return false;
-        }
-        any = true;
+    let Some(commands) = simple_commands(&scanned) else {
+        return false;
+    };
+    !commands.is_empty() && commands.iter().all(|tokens| observing_command(tokens))
+}
+
+/// One simple command that only reads or prints.
+fn observing_command(tokens: &[String]) -> bool {
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    if is_env_assignment(first) {
+        return false;
     }
-    any
+    // `command ls` is the one wrapper that stays an observation.
+    let tokens = if first == "command" {
+        &tokens[1..]
+    } else {
+        tokens
+    };
+    let Some(program) = tokens.first() else {
+        return false;
+    };
+    let name = basename(program);
+    program_path_ok(program)
+        && OBSERVATION_PROGRAMS.contains(&name)
+        && observation_args_ok(name, &tokens[1..])
 }
 
 /// `tree` is observation-only with only these read-only flags; `-o FILE` and
@@ -3382,6 +3840,142 @@ mod tests {
     /// A local project's own status queries (a project report, read-only
     /// WP-CLI and drush queries) are local work; starting, installing,
     /// running code and arbitrary commands in its containers are not.
+    /// The inspection a helper ran before installing (live 2026-11-12): a
+    /// `for` loop over two folders, a `( ... )` subshell, `2>&1`, pipes
+    /// into `head` and the loop variable. Every command it runs reads or
+    /// reports a local project, so it is local work that reaches nothing
+    /// beyond this computer; the same loop deleting, or writing a file,
+    /// is not read-only.
+    const INSPECT_SITES: &str = "cd /Users/davidloor/projects && for d in claude-drupal \
+        claude-wordpress; do echo \"== $d\"; ls -la $d | head -30; ls $d/.ddev 2>&1 | head; \
+        (cd $d && ddev describe 2>&1 | head -25); done";
+
+    #[test]
+    fn a_read_only_loop_with_a_subshell_is_local_work() {
+        let effects = command_effects(INSPECT_SITES);
+        assert!(effects.local_work_only, "{INSPECT_SITES}");
+        assert!(!effects.deletes);
+        assert!(reaches_only_this_computer(INSPECT_SITES));
+        assert!(!fetches_network(INSPECT_SITES));
+        // Observations alone, in the same shapes, are read-only.
+        for read in [
+            "for d in a b; do echo \"== $d\"; ls -la $d | head -30; done",
+            "(ls -la /tmp && pwd) 2>&1 | head",
+            "for d in a b; do for f in x y; do cat ${d}/$f; done; done",
+            "for f in *.log; do tail -5 $f; done",
+        ] {
+            assert!(command_effects(read).observation_only, "{read}");
+        }
+
+        let deleting = INSPECT_SITES.replace("ls -la $d | head -30", "rm -rf $d");
+        let effects = command_effects(&deleting);
+        assert!(effects.deletes && effects.delete_targets.is_none(), "{deleting}");
+        assert!(!effects.observation_only);
+        assert!(!reaches_only_this_computer(&deleting));
+        let writing = INSPECT_SITES.replace("ls -la $d | head -30", "ls -la $d > notes.txt");
+        // A file it writes stays on this computer, but it is not a read.
+        assert!(!command_effects(&writing).observation_only, "{writing}");
+
+        for not_understood in [
+            // A loop word that splits, or a variable, could become any flag.
+            "for x in \"-o out\"; do sort $x f; done",
+            "for x in $FLAGS; do sort $x f; done",
+            "for x in -o; do sort $x out f; done",
+            "for x in -delete; do find . $x; done",
+            // The loop variable is the program.
+            "for p in ls rm; do $p x; done",
+            "for p in rm; do (cd /tmp && $p -rf x); done",
+            "for p in ls; do $p x; done; rm y",
+            "for d in a; do ls $d",
+            "for d in a; ls $d; done",
+            "for d; do ls $d; done",
+            "for ((i=0;i<3;i++)); do ls; done",
+            "while true; do ls; done",
+            "if true; then ls; fi",
+            "ls (cd x)",
+            "(ls) ls",
+            "(ls",
+            "ls)",
+            "f() (ls); f",
+            "(echo $(rm x))",
+        ] {
+            let effects = command_effects(not_understood);
+            assert!(!effects.observation_only, "{not_understood}");
+            assert!(!effects.local_work_only, "{not_understood}");
+        }
+    }
+
+    /// The card names the folders a read-only command looks inside; a
+    /// command that also deletes, writes or runs anything else names none.
+    #[test]
+    fn the_folders_a_read_only_command_looks_inside_are_named() {
+        assert_eq!(
+            looked_inside(INSPECT_SITES),
+            ["claude-drupal", "claude-wordpress"]
+        );
+        assert_eq!(looked_inside("ls -la /srv/www/shop/ && du -sh logs/2026"), ["shop", "logs"]);
+        assert_eq!(looked_inside("tree -L 2 src && find app -name '*.php'"), ["src", "app"]);
+        assert!(looked_inside("ls ~ . .. $HOME *.txt").is_empty());
+        assert!(looked_inside("cat notes.txt").is_empty());
+        for not_only_looking in [
+            INSPECT_SITES.replace("ls -la $d | head -30", "rm -rf $d"),
+            INSPECT_SITES.replace("ls -la $d | head -30", "ls -la $d > notes.txt"),
+            "ls site && curl -s http://localhost:5173/".to_string(),
+            "ls site && cargo build".to_string(),
+        ] {
+            assert!(looked_inside(&not_only_looking).is_empty(), "{not_only_looking}");
+        }
+    }
+
+    #[test]
+    fn a_command_card_carries_its_typed_effects() {
+        use aidaemon_core::{CardAction, HighImpact};
+        let card = command_card(INSPECT_SITES, Some("check the site folders".to_string()));
+        assert_eq!(card.impact, None);
+        assert!(matches!(
+            &card.action,
+            CardAction::Command { looks_inside, title: Some(_), line }
+                if looks_inside.len() == 2 && line == INSPECT_SITES
+        ));
+        assert_eq!(
+            command_card("rm -rf build dist", None).impact,
+            Some(HighImpact::Deletes {
+                targets: vec!["build".to_string(), "dist".to_string()]
+            })
+        );
+        assert_eq!(
+            command_card("curl -X POST https://example.invalid/hook", None).impact,
+            Some(HighImpact::Sends)
+        );
+    }
+
+    /// Checking a dev site this work set up is a read; saving its page,
+    /// writing to it or reaching anything else is not.
+    #[test]
+    fn a_local_site_check_only_reads_this_computer() {
+        for read in [
+            "curl -s -o /dev/null -w '%{http_code}' https://shop-synthetic.localhost/",
+            "curl -sI https://127.0.0.1:8443/ | head -5",
+            "cd /tmp/site && ddev describe && curl -s http://localhost:5173/ | grep -c title",
+            INSPECT_SITES,
+        ] {
+            assert!(only_reads_this_computer(read), "{read}");
+        }
+        for not_a_read in [
+            "curl -s -o page.html https://shop-synthetic.localhost/",
+            "curl -sSo page.html http://localhost:5173/",
+            "curl -s -c jar http://localhost:5173/",
+            "curl -s https://example.invalid/",
+            "curl -s -X POST http://localhost:5173/x",
+            "curl -s http://localhost:5173/ > page.html",
+            "wget http://localhost:5173/",
+            "ddev start",
+            "cargo build",
+        ] {
+            assert!(!only_reads_this_computer(not_a_read), "{not_a_read}");
+        }
+    }
+
     #[test]
     fn ddev_status_queries_are_local_work() {
         for query in [

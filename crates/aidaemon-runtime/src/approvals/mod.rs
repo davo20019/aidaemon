@@ -447,6 +447,7 @@ impl AppApprovalRules {
         folders.sort();
         folders.dedup();
         Some(sdk::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!(
                 "Write {}? This task looks like it is about {}, and this is outside it.",
@@ -679,6 +680,7 @@ impl OwnerApprovals {
                 permission_mode,
                 response_tx,
                 kind,
+                card: request.card.clone(),
             })
             .await;
         let wait = if matches!(
@@ -740,9 +742,12 @@ fn asked_by<'r>(
         .filter(|mission| !mission.is_empty());
     match mission {
         Some(mission) => {
-            let mut card = request.clone();
-            card.summary = sub_agent_card_summary(mission, &request.summary);
-            std::borrow::Cow::Owned(card)
+            let mut shown = request.clone();
+            shown.summary = sub_agent_card_summary(mission, &request.summary);
+            if let Some(card) = &mut shown.card {
+                card.asked_by = Some(sub_agent_name(mission));
+            }
+            std::borrow::Cow::Owned(shown)
         }
         None => std::borrow::Cow::Borrowed(request),
     }
@@ -755,9 +760,15 @@ const CARD_MISSION_CHARS: usize = 40;
 /// install asks:"): the title its parent gave it, else its mission's first
 /// line cut at a whole word.
 fn sub_agent_card_summary(mission: &str, summary: &str) -> String {
+    format!("{} asks:\n{summary}", sub_agent_name(mission))
+}
+
+/// A sub-agent's short name: the title its parent gave it, else its
+/// mission's first line cut at a whole word.
+fn sub_agent_name(mission: &str) -> String {
     let line = mission.lines().next().unwrap_or_default().trim();
     let line = line.trim_end_matches('.');
-    let shown = if line.chars().count() <= CARD_MISSION_CHARS {
+    if line.chars().count() <= CARD_MISSION_CHARS {
         line.to_string()
     } else {
         let head: String = line.chars().take(CARD_MISSION_CHARS - 1).collect();
@@ -765,8 +776,7 @@ fn sub_agent_card_summary(mission: &str, summary: &str) -> String {
             .rfind(char::is_whitespace)
             .map_or(head.as_str(), |at| &head[..at]);
         format!("{}…", kept.trim_end())
-    };
-    format!("{shown} asks:\n{summary}")
+    }
 }
 
 /// The card's risk level for a kernel request.
@@ -911,8 +921,8 @@ impl OwnerApprovalResolver<'_> {
             Some(RUN_ABANDONED),
         )
         .await;
-        sdk::Resolution::Deny {
-            reason: RUN_ABANDONED.to_string(),
+        sdk::Resolution::Unanswered {
+            reason: unanswered_reason(tool, RUN_ABANDONED),
         }
     }
 
@@ -937,9 +947,11 @@ impl OwnerApprovalResolver<'_> {
     }
 
     /// Put a call the clean check would not pass to the owner, for this one
-    /// call only. The owner's Deny binds the run like any other decline. A
-    /// card nobody answered leaves the check's own refusal standing: no owner
-    /// declined anything.
+    /// call only. The owner's Deny binds the run like any other decline; a
+    /// card nobody answered leaves the check's own refusal standing, which
+    /// is not a decline either.
+    /// An Allow covers this exact call through the later approval rules
+    /// too (`SessionGrants::allow_call_once`), so one answer is enough.
     async fn ask_about_refused_call(
         &self,
         state: &sdk::RunState,
@@ -952,7 +964,12 @@ impl OwnerApprovalResolver<'_> {
             .tool(&call.name)
             .map(|tool| tool.call_effects(&call.arguments.to_string()).keys)
             .unwrap_or_default();
-        let request = refused_call_request(&call.name, &call.arguments, effects, &verdict.reason);
+        let request = refused_call_request(
+            &call.name,
+            &call.arguments,
+            effects,
+            verdict.owner_reason.as_deref(),
+        );
         // The kernel only stops a retry by its effects; one declared by
         // subject alone must not bring the same card back.
         let declined = sdk::EffectKey::named(sdk::EffectClass::Call, &request.subject);
@@ -967,8 +984,14 @@ impl OwnerApprovalResolver<'_> {
             sdk::Resolution::Deny { reason } if reason == DECLINED_BY_OWNER => {
                 sdk::Resolution::OwnerDeclined { request, reason }
             }
-            sdk::Resolution::Deny { .. } => {
+            sdk::Resolution::Deny { .. } | sdk::Resolution::Unanswered { .. } => {
                 crate::untrusted::verdict_resolution(&call.name, verdict)
+            }
+            sdk::Resolution::Approve => {
+                self.approvals
+                    .grants_for(&self.grant_session)
+                    .allow_call_once(&request.subject);
+                sdk::Resolution::Approve
             }
             other => other,
         }
@@ -1024,10 +1047,27 @@ impl OwnerApprovalResolver<'_> {
                 }
                 self.record("owner_approval_declined", tool, request, Some(&reason))
                     .await;
-                sdk::Resolution::Deny { reason }
+                if reason == DECLINED_BY_OWNER {
+                    sdk::Resolution::Deny { reason }
+                } else {
+                    sdk::Resolution::Unanswered {
+                        reason: unanswered_reason(tool, &reason),
+                    }
+                }
             }
         }
     }
+}
+
+/// What the model is told about a card nobody answered: not run, and not
+/// refused either, so it neither claims the owner said no nor tries the
+/// step another way.
+fn unanswered_reason(tool: &str, why: &str) -> String {
+    format!(
+        "`{tool}` was not run: the owner's approval card got no answer ({why}). The owner did \
+         not refuse it. If the step is still needed, tell the owner it is waiting for their OK \
+         and ask again; do not describe it as declined."
+    )
 }
 
 /// Settles a run the daemon left unfinished, ahead of the owner's new message.
@@ -1129,26 +1169,59 @@ fn refused_check_may_ask_owner(rules: &AppApprovalRules, origin_trusted: bool) -
 
 /// How much of a call a card shows, head and tail around a marked cut.
 const REFUSED_CALL_SHOWN_CHARS: usize = 1500;
-const REFUSED_CALL_REASON_CHARS: usize = 400;
+/// How much of a call's own title a card shows.
+const CALL_TITLE_CHARS: usize = 80;
 
-/// The card for a call the clean check would not pass. It says in plain
-/// words what allowing it does and that the step waits meanwhile; the exact
-/// command the owner would be allowing (not the model's account of it) is
-/// under its details, never the headline.
+/// The card for a call the clean check would not pass. Its typed card says
+/// in plain words what allowing it does (who asks is added by
+/// [`asked_by`]), why the owner is asked with the check's own sentence to
+/// them, and a warning only for an effect worth one; the exact command the
+/// owner would be allowing (not the model's account of it) sits collapsed
+/// underneath, never as the headline. `summary` stays a plain sentence for
+/// records and channels without cards.
 fn refused_call_request(
     tool: &str,
     arguments: &Value,
     effects: Vec<sdk::EffectKey>,
-    check_reason: &str,
+    owner_reason: Option<&str>,
 ) -> sdk::OwnerApprovalRequest {
     let command = ["command", "script"]
         .iter()
         .find_map(|key| arguments.get(key).and_then(Value::as_str));
-    let shown = command.map_or_else(|| arguments.to_string(), str::to_string);
     // The owner decides on the call as it would run: secrets stay hidden,
     // the paths it touches stay readable.
-    let shown = aidaemon_tools::sanitize::redact_secrets_only(&shown);
-    let shown = crate::untrusted::cap_strings(&Value::from(shown), REFUSED_CALL_SHOWN_CHARS);
+    let mut card = match command {
+        Some(command) => {
+            let title = arguments
+                .get("description")
+                .and_then(Value::as_str)
+                .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|title| !title.is_empty())
+                .map(|title| {
+                    aidaemon_events::text::truncate_str(
+                        &aidaemon_tools::sanitize::redact_secrets_only(&title),
+                        CALL_TITLE_CHARS,
+                    )
+                    .to_string()
+                });
+            aidaemon_tools::command_effects::command_card(
+                &aidaemon_tools::sanitize::redact_secrets_only(command),
+                title,
+            )
+        }
+        None => {
+            let shown = aidaemon_tools::sanitize::redact_secrets_only(&arguments.to_string());
+            let shown =
+                crate::untrusted::cap_strings(&Value::from(shown), REFUSED_CALL_SHOWN_CHARS);
+            sdk::ApprovalCard::new(sdk::CardAction::Use {
+                what: format!("use {}", tool.replace('_', " ")),
+                detail: shown.as_str().map(str::to_string),
+            })
+        }
+    };
+    card.reason = Some(sdk::AskReason::ReadOutsideContent {
+        check_says: owner_reason.map(str::to_string),
+    });
     let action = if command.is_some() {
         "Run a command on your computer?".to_string()
     } else {
@@ -1161,14 +1234,14 @@ fn refused_call_request(
              confirm this step fits your request. This step is paused until you answer."
         ),
         subject: format!("{tool} {arguments}"),
-        risk: sdk::ApprovalRisk::High,
-        warnings: vec![
-            format!("Details: {}", shown.as_str().unwrap_or_default()),
-            format!(
-                "Why the check stopped it: {}",
-                aidaemon_events::text::truncate_str(check_reason, REFUSED_CALL_REASON_CHARS)
-            ),
-        ],
+        // Only an effect worth a warning rates it high.
+        risk: if card.impact.is_some() {
+            sdk::ApprovalRisk::High
+        } else {
+            sdk::ApprovalRisk::Medium
+        },
+        warnings: Vec::new(),
+        card: Some(Box::new(card)),
     }
 }
 
@@ -1248,12 +1321,19 @@ mod tests {
     }
 
     /// The card says in plain words what allowing does and what waits; the
-    /// command is under its details, never the headline.
+    /// command is the card's collapsed detail, never the headline. Its
+    /// typed facts name the effect worth a warning and carry the check's
+    /// sentence to the owner.
     #[test]
     fn a_refused_call_card_says_what_happens_and_shows_the_command_under_details() {
-        let arguments =
-            json!({"action": "run", "command": "rm -rf synthetic-dir", "network": true});
-        let request = refused_call_request("terminal", &arguments, Vec::new(), "not requested");
+        let arguments = json!({"action": "run", "command": "rm -rf synthetic-dir",
+            "network": true, "description": "  clear the   old build "});
+        let request = refused_call_request(
+            "terminal",
+            &arguments,
+            Vec::new(),
+            Some("You asked for an install, not a cleanup."),
+        );
         assert!(
             request.summary.starts_with("Run a command on your computer?"),
             "{}",
@@ -1263,25 +1343,70 @@ mod tests {
         assert!(!request.summary.contains("rm -rf"));
         assert!(!request.summary.contains("terminal"));
         assert_eq!(request.subject, format!("terminal {arguments}"));
-        assert_eq!(request.warnings[0], "Details: rm -rf synthetic-dir");
-        assert!(request.warnings[1].contains("not requested"));
-        let other = refused_call_request("http_request", &json!({"url": "x"}), Vec::new(), "r");
+        assert!(request.warnings.is_empty());
+        assert_eq!(request.risk, sdk::ApprovalRisk::High);
+        let card = request.card.expect("typed card");
+        assert_eq!(
+            card.action,
+            sdk::CardAction::Command {
+                line: "rm -rf synthetic-dir".to_string(),
+                title: Some("clear the old build".to_string()),
+                looks_inside: Vec::new(),
+            }
+        );
+        assert_eq!(
+            card.impact,
+            Some(sdk::HighImpact::Deletes {
+                targets: vec!["synthetic-dir".to_string()]
+            })
+        );
+        assert_eq!(
+            card.reason,
+            Some(sdk::AskReason::ReadOutsideContent {
+                check_says: Some("You asked for an install, not a cleanup.".to_string())
+            })
+        );
+
+        let other = refused_call_request("http_request", &json!({"url": "x"}), Vec::new(), None);
         assert!(other.summary.starts_with("Let me use http request?"));
+        assert!(matches!(
+            other.card.unwrap().action,
+            sdk::CardAction::Use { ref what, .. } if what == "use http request"
+        ));
     }
 
-    /// The end of a long command is kept: that is where a payload hides.
+    /// The live card (2026-11-12): a read-only look inside two folders is
+    /// no high-risk card, and names the folders; a sub-agent's card names it.
     #[test]
-    fn a_refused_call_card_keeps_both_ends_of_a_long_command() {
-        let command = format!("start {} rm-tail", "x".repeat(5000));
-        let request = refused_call_request(
-            "terminal",
-            &json!({"command": command}),
-            Vec::new(),
-            "not requested",
-        );
-        assert!(request.warnings[0].contains("start"));
-        assert!(request.warnings[0].contains("rm-tail"));
-        assert!(request.warnings[0].contains("chars cut"));
+    fn a_refused_read_only_look_is_not_rated_high_and_names_its_folders() {
+        let command = "cd /Users/davidloor/projects && for d in claude-drupal claude-wordpress; \
+            do echo \"== $d\"; ls -la $d | head -30; ls $d/.ddev 2>&1 | head; \
+            (cd $d && ddev describe 2>&1 | head -25); done";
+        let request =
+            refused_call_request("terminal", &json!({"command": command}), Vec::new(), None);
+        assert_eq!(request.risk, sdk::ApprovalRisk::Medium);
+        let shown = asked_by(Some("Drupal install"), &request);
+        let card = shown.card.as_ref().expect("typed card");
+        assert_eq!(card.asked_by.as_deref(), Some("Drupal install"));
+        assert_eq!(card.impact, None);
+        assert!(matches!(
+            &card.action,
+            sdk::CardAction::Command { looks_inside, .. }
+                if looks_inside == &["claude-drupal", "claude-wordpress"]
+        ));
+    }
+
+    /// Secrets in a command stay hidden on the card.
+    #[test]
+    fn a_refused_call_card_hides_secrets() {
+        let command = "curl -H 'Authorization: Bearer sk-synthetic0123456789abcdef0123' x";
+        let request =
+            refused_call_request("terminal", &json!({"command": command}), Vec::new(), None);
+        let card = request.card.unwrap();
+        let sdk::CardAction::Command { line, .. } = card.action else {
+            panic!("a command card");
+        };
+        assert!(!line.contains("sk-synthetic0123456789abcdef0123"), "{line}");
     }
 
     fn hook_ctx() -> sdk::HookContext<'static> {
@@ -1499,6 +1624,7 @@ mod tests {
         use aidaemon_policies::ApprovalGrants;
         let approvals = OwnerApprovals::default();
         let request = sdk::OwnerApprovalRequest {
+            card: None,
             effects: vec![sdk::EffectKey::egress("https", "h.example.invalid", None)],
             summary: "POST https://h.example.invalid/x".to_string(),
             subject: "POST https://h.example.invalid/x".to_string(),
@@ -1525,6 +1651,7 @@ mod tests {
         use aidaemon_policies::ApprovalGrants;
         let approvals = OwnerApprovals::default();
         let request = sdk::OwnerApprovalRequest {
+            card: None,
             effects: vec![sdk::EffectKey::egress("https", "h.example.invalid", None)],
             summary: "POST https://h.example.invalid/x".to_string(),
             subject: "POST https://h.example.invalid/x".to_string(),

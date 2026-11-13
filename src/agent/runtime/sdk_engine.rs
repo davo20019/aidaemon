@@ -1410,6 +1410,8 @@ impl Agent {
                 origin_request,
                 origin_trusted,
                 cancel: cancel.clone(),
+                // The request's project folder.
+                working_area: scope.project_scope.as_deref(),
             },
             owner: super::approvals::OwnerApprovalResolver {
                 decisions: self,

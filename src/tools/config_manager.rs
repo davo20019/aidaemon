@@ -509,6 +509,7 @@ impl ConfigManagerTool {
             ),
         };
         OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary,
             subject: Self::approval_subject(&args),

@@ -244,6 +244,7 @@ impl ManageMandatesTool {
             .unwrap_or_default();
         let strategy_sha256 = self.judged_strategy_hash(&args);
         OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: card.summary,
             subject: json!({

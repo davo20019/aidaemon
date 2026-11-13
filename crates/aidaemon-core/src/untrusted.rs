@@ -429,6 +429,7 @@ mod tests {
         let key = crate::EffectKey::named(crate::EffectClass::Call, "send");
         let r = Fixed(Resolution::OwnerDeclined {
             request: crate::OwnerApprovalRequest {
+                card: None,
                 effects: vec![key.clone()],
                 summary: "send".into(),
                 subject: "send".into(),
@@ -448,6 +449,28 @@ mod tests {
             .as_deref()
             .is_some_and(|reason| reason.starts_with(crate::OWNER_DECLINED)));
         assert_eq!(out.state.declined, vec![key]);
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+    }
+
+    /// A card nobody answered refuses the call without binding the run:
+    /// nothing is remembered as declined, and the model is told there was
+    /// no answer, never that the owner refused.
+    #[tokio::test]
+    async fn an_unanswered_card_refuses_without_a_decline() {
+        let (a, sent) = setup(UntrustedMode::Enforce, egress_script());
+        let r = Fixed(Resolution::Unanswered {
+            reason: "the card got no answer".into(),
+        });
+        let out = a
+            .run_resolving(RunState::new("a", "s", "go"), CancellationToken::new(), &r)
+            .await
+            .unwrap();
+        let send = &out.receipts()[1];
+        assert_eq!(send.status, ReceiptStatus::Denied);
+        let reason = send.reason.as_deref().unwrap_or_default();
+        assert!(reason.starts_with(crate::OWNER_UNANSWERED), "{reason}");
+        assert!(!reason.contains(crate::OWNER_DECLINED), "{reason}");
+        assert!(out.state.declined.is_empty());
         assert_eq!(sent.load(Ordering::SeqCst), 0);
     }
 

@@ -1935,6 +1935,18 @@ impl HubChannel for TelegramBot {
             .map_err(|e| anyhow::anyhow!("Telegram approval request failed: {e}"))
     }
 
+    async fn request_approval_ask(
+        &self,
+        session_id: &str,
+        ask: &aidaemon_channels::approval_render::ApprovalAsk<'_>,
+    ) -> anyhow::Result<ApprovalResponse> {
+        info!(session_id, card = ask.card.is_some(), risk = %ask.risk_level, "Approval requested");
+        self.prompts
+            .approval_ask(self.sdk_transport(), &self.conversation_for(session_id), ask)
+            .await
+            .map_err(|e| anyhow::anyhow!("Telegram approval request failed: {e}"))
+    }
+
     async fn request_goal_confirmation(
         &self,
         session_id: &str,

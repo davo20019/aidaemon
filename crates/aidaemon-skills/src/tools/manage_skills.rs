@@ -3243,6 +3243,7 @@ impl ManageSkillsTool {
             _ => return None,
         };
         Some(aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary,
             // The exact arguments the owner approves; a changed argument is a new card.

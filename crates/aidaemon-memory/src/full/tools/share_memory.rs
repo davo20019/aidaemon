@@ -33,6 +33,7 @@ impl ShareMemoryTool {
     /// all channels always asks; the subject is the exact arguments approved.
     fn approval_for(args: &ShareArgs, fact: &Fact) -> OwnerApprovalNeed {
         OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!(
                 "Share memory globally: [{}] {} = \"{}\"",
@@ -151,6 +152,7 @@ impl aidaemon_tools::semantics::ToolSemantics for ShareMemoryTool {
             // The lookup failed: ask with what the call names rather than
             // waving it through (the run reads the store again).
             Err(_) => OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+                card: None,
                 effects: Vec::new(),
                 summary: format!("Share memory globally: [{}] {}", args.category, args.key),
                 subject: json!({"category": args.category, "key": args.key}).to_string(),

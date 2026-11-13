@@ -58,6 +58,12 @@ pub trait ApprovalRules: Send + Sync {
 #[async_trait]
 pub trait ApprovalGrants: Send + Sync {
     async fn covers(&self, request: &OwnerApprovalRequest) -> bool;
+
+    /// Whether the owner just allowed this exact call (by subject) once on
+    /// another card; consumes that allowance. Default: never.
+    async fn take_call_allowed_once(&self, _subject: &str) -> bool {
+        false
+    }
 }
 
 /// Approval policy. Declares [`Safeguard::Approval`].
@@ -339,6 +345,7 @@ fn call_request(
         format!("{tool_name} {arguments}")
     };
     OwnerApprovalRequest {
+        card: Some(Box::new(call_card(tool_name, arguments, info))),
         effects: info.effects.keys.clone(),
         summary: format!("Run {subject}: {why}"),
         subject,
@@ -348,6 +355,34 @@ fn call_request(
             ApprovalRisk::High
         },
         warnings: Vec::new(),
+    }
+}
+
+/// The card for a call the policy asks about, from the call's own fields
+/// and its annotations: a command line (with its own title) shown collapsed
+/// under a plain sentence, else the tool's name with its arguments
+/// collapsed. Never the raw JSON as the headline.
+fn call_card(tool_name: &str, arguments: &Value, info: &ToolInfo) -> aidaemon_core::ApprovalCard {
+    let text = |key: &str| arguments.get(key).and_then(Value::as_str);
+    let action = match text("command").or_else(|| text("script")) {
+        Some(line) => aidaemon_core::CardAction::Command {
+            line: line.to_string(),
+            title: text("description")
+                .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|title| !title.is_empty()),
+            looks_inside: Vec::new(),
+        },
+        None => aidaemon_core::CardAction::Use {
+            what: format!("use {}", tool_name.replace('_', " ")),
+            detail: (!arguments.is_null()).then(|| arguments.to_string()),
+        },
+    };
+    aidaemon_core::ApprovalCard {
+        impact: info
+            .annotations
+            .destructive
+            .then(|| aidaemon_core::HighImpact::Deletes { targets: Vec::new() }),
+        ..aidaemon_core::ApprovalCard::new(action)
     }
 }
 
@@ -454,6 +489,16 @@ impl Hook for ApprovalPolicy {
             request.summary = format!("Run {}", request.subject);
             if let Some(refusal) = declined_subject(ctx, &request) {
                 return refusal;
+            }
+            // The owner already allowed this exact call on the safety
+            // check's card: one answer covers it.
+            if let Some(grants) = &self.grants {
+                if grants.take_call_allowed_once(&request.subject).await {
+                    return decision;
+                }
+            }
+            if let Some(card) = &mut request.card {
+                card.reason = Some(aidaemon_core::AskReason::AfterADecline);
             }
             return ToolDecision::Interrupt {
                 reason: format!(
@@ -660,6 +705,7 @@ mod rules_tests {
 
     fn request() -> OwnerApprovalRequest {
         OwnerApprovalRequest {
+            card: None,
             // The policy replaces these with the call's declared effects.
             effects: Vec::new(),
             summary: "Post a report for Alice Rivera to h.example.invalid".to_string(),
@@ -867,6 +913,43 @@ mod rules_tests {
                 .before_tool(&hook_ctx(&declined), &post(), &local)
                 .await,
             ToolDecision::Allow
+        );
+    }
+
+    /// Live 2026-11-12: the owner pressed Allow on the safety check's card
+    /// and the same call was asked again at once by the re-ask after a
+    /// decline. An Allow for that exact call answers the re-ask, once. The
+    /// re-ask's card is typed: a plain sentence and why, never raw JSON.
+    #[tokio::test]
+    async fn an_allow_on_the_checks_card_answers_the_reask_once() {
+        let declined = [egress_key()];
+        let opaque = send_info(CallEffects::unknown());
+        let grants = Arc::new(SessionGrants::new());
+        let never = ApprovalPolicy::new(ApprovalMode::Never).with_grants(grants.clone());
+
+        let reasked = never
+            .before_tool(&hook_ctx(&declined), &post(), &opaque)
+            .await;
+        let card = owner_request(&reasked).card.clone().expect("a typed card");
+        assert_eq!(card.reason, Some(aidaemon_core::AskReason::AfterADecline));
+        assert!(matches!(
+            card.action,
+            aidaemon_core::CardAction::Use { ref what, .. } if what == "use http request"
+        ));
+
+        let subject = owner_request(&reasked).subject.clone();
+        grants.allow_call_once(&subject);
+        assert_eq!(
+            never
+                .before_tool(&hook_ctx(&declined), &post(), &opaque)
+                .await,
+            ToolDecision::Allow
+        );
+        // Once only.
+        owner_request(
+            &never
+                .before_tool(&hook_ctx(&declined), &post(), &opaque)
+                .await,
         );
     }
 

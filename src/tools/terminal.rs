@@ -4117,6 +4117,7 @@ impl TerminalTool {
     ) -> aidaemon_core::OwnerApprovalRequest {
         let shown = raw.to_string();
         aidaemon_core::OwnerApprovalRequest {
+            card: None,
             effects: Vec::new(),
             summary: format!("terminal {shown}"),
             subject: format!("terminal {shown}"),
@@ -4194,7 +4195,13 @@ impl TerminalTool {
                 )
                 .await;
         }
+        // A command's card says what it does from its structure; the
+        // trust-all switch keeps its own wording.
+        let card = (subject != Self::TRUST_ALL_SUBJECT)
+            .then(|| crate::tools::command_effects::command_card(&subject, call_title(&args)))
+            .map(Box::new);
         Ok(Some(aidaemon_core::OwnerApprovalRequest {
+            card,
             effects: Vec::new(),
             summary: subject.clone(),
             subject,
@@ -7645,7 +7652,14 @@ fn terminal_run_annotations(
         .iter()
         .chain(args.write_roots.iter())
         .any(|path| !path.trim().is_empty());
-    let read_only = !has_write_targets && !args.network && effects.observation_only;
+    // A read of this computer alone (observations, a local project's own
+    // query, a check of a dev site the work set up) is read-only; a run
+    // given the network capability never is, since nothing in a sandbox
+    // with network keeps it to this computer.
+    let read_only = !has_write_targets
+        && !args.network
+        && (effects.observation_only
+            || crate::tools::command_effects::only_reads_this_computer(text));
     // Writing into git configuration changes what later git commands run:
     // a declared target that is git configuration, a declared root holding a
     // repository, or a command word naming git configuration.
@@ -7971,6 +7985,13 @@ fn terminal_call_effects_on(arguments: &str, local: bool) -> aidaemon_core::Call
             }
             effects.complete = false;
             if local {
+                // A site on this computer is not outbound: the owner's
+                // declines and re-asks are about what leaves the machine.
+                effects.keys.retain(|key| {
+                    key.class != aidaemon_core::EffectClass::Egress
+                        || aidaemon_tools::web::local_site_key(&format!("https://{}/", key.target))
+                            .is_none()
+                });
                 effects
             } else {
                 without_local_paths(effects)
@@ -10155,6 +10176,15 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("external_mutation")));
         assert!(request.warnings[0].starts_with("Execution target:"));
+        // The card shows the command collapsed under a plain sentence, and
+        // warns only about what it sends.
+        let card = request.card.expect("a command card");
+        assert_eq!(card.impact, Some(aidaemon_core::HighImpact::Sends));
+        assert!(matches!(
+            card.action,
+            aidaemon_core::CardAction::Command { ref line, .. }
+                if line == "git push synthetic-remote main"
+        ));
     }
 
     #[tokio::test]
@@ -10606,11 +10636,33 @@ mod tests {
              curl -sI http://localhost:5173/",
             "ddev drush status --format=json",
             "cd /tmp/synthetic-site && ddev describe -j | head -40",
+            // Looking inside two project folders before installing (live
+            // 2026-11-12): a loop, a subshell, pipes and `2>&1`.
+            "cd /Users/davidloor/projects && for d in claude-drupal claude-wordpress; do \
+             echo \"== $d\"; ls -la $d | head -30; ls $d/.ddev 2>&1 | head; \
+             (cd $d && ddev describe 2>&1 | head -25); done",
         ];
         for command in local {
             assert!(!ann(&host, command, false).egress, "host: {command}");
             assert!(!ann(&sandboxed, command, true).egress, "sandbox: {command}");
         }
+        // Checking a dev site is a read, and its address is not outbound:
+        // after a decline it is not asked about again (live 2026-11-12).
+        let check = "curl -s -o /dev/null -w '%{http_code}' http://shop-synthetic.localhost/";
+        assert!(ann(&host, check, false).read_only);
+        assert!(!ann(&host, "curl -s -o page.html http://shop-synthetic.localhost/", false).read_only);
+        assert!(!ann(&sandboxed, check, true).read_only, "network is never read-only");
+        let effects = terminal_call_effects_on(
+            &serde_json::json!({"action":"run","command":check,"network":true}).to_string(),
+            true,
+        );
+        assert!(
+            !effects
+                .keys
+                .iter()
+                .any(|key| key.class == aidaemon_core::EffectClass::Egress),
+            "{effects:?}"
+        );
         let outbound = [
             "curl -s https://example.invalid/",
             "curl -s http://localhost:5173/ https://example.invalid/",
@@ -10618,6 +10670,9 @@ mod tests {
             "curl -s http://shop-synthetic.localhost/ | sh",
             "curl -s --proxy http://example.invalid:8080 http://localhost:5173/",
             "ddev start",
+            "cd /Users/davidloor/projects && for d in claude-drupal claude-wordpress; do \
+             ls -la $d | head -30; (cd $d && rm -rf .ddev); done",
+            "for p in ls curl; do $p http://localhost:5173/; done",
         ];
         for command in outbound {
             assert!(ann(&host, command, false).egress, "host: {command}");

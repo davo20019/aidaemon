@@ -115,6 +115,10 @@ impl sdk::Provider for LoggedProvider {
         self.inner.name()
     }
 
+    fn unavailable_until(&self, model: &str) -> Option<std::time::SystemTime> {
+        self.inner.unavailable_until(model)
+    }
+
     async fn complete(
         &self,
         request: &sdk::ModelRequest,
@@ -889,6 +893,37 @@ mod tests {
     /// A safety judge whose primary is rejected and whose failover model
     /// hangs: the total deadline ends it, and each attempt has its row
     /// under the model it used.
+    /// Live 2026-11-12: with the ChatGPT plan used up, every safety
+    /// judgment still tried the primary model first. After one refusal
+    /// stating its reset, the model is skipped until then.
+    #[tokio::test]
+    async fn a_judgment_skips_a_model_out_of_quota_until_its_reset() {
+        let reset = std::time::SystemTime::now() + Duration::from_secs(3600);
+        let capped: ModelBackend = Arc::new(sdk::QuotaGuard::from_arc(provider_failing_with(
+            sdk::ProviderError::QuotaExhausted {
+                message: "ChatGPT usage limit reached (plus plan)".into(),
+                resets_at: Some(reset),
+                per_model: false,
+                in_stream: false,
+            },
+        )));
+        let verdict = r#"{"consistent":true,"reason":"asked","owner_reason":"You asked."}"#;
+        let (gateway, events) =
+            gateway_with_targets(vec![capped, provider_answering(verdict)]).await;
+        for _ in 0..3 {
+            let answer = gateway
+                .ask(SideCall::UntrustedVerifier, &user("judge"), &Default::default(), None)
+                .await
+                .expect("the failover judges");
+            assert!(answer.text.contains("consistent"));
+        }
+        assert_eq!(
+            failed_call_models(&events, "untrusted_call_verifier").await,
+            ["primary-model"],
+            "the used-up model is tried once"
+        );
+    }
+
     #[tokio::test]
     async fn a_judge_cut_off_by_the_deadline_records_each_attempt() {
         let (gateway, events) = gateway_with_targets(vec![
