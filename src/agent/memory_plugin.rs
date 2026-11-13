@@ -50,9 +50,12 @@ pub(crate) use writer::{DaemonMemoryWriter, MemoryWrites, WriterSettings};
 pub(crate) use aidaemon_runtime::turn::memory::MANAGE_MEMORIES_GOAL_ACTIONS;
 #[cfg(test)]
 pub(crate) use aidaemon_runtime::turn::memory::{check_goal_action, memory_parts};
+#[cfg(test)]
 pub(crate) use aidaemon_runtime::turn::memory::{
-    daemon_tool_offer, goal_actions_view, DaemonToolOffer, MemoryParts, MemoryPlugin, MemoryTurn,
-    DAEMON_MEMORY_TOOLS,
+    daemon_tool_offer, goal_actions_view, DaemonToolOffer,
+};
+pub(crate) use aidaemon_runtime::turn::memory::{
+    MemoryParts, MemoryPlugin, MemoryTurn, DAEMON_MEMORY_TOOLS,
 };
 
 /// The memory system this daemon runs with.
@@ -287,7 +290,7 @@ impl MemoryWrites for DaemonMemoryInner {
     }
 
     fn learn(&self, learning: crate::agent::post_task::LearningContext) {
-        crate::agent::post_turn::spawn_learning(self.store.clone(), learning);
+        aidaemon_runtime::turn::post_task::spawn_learning(self.store.clone(), learning);
     }
 
     fn learn_from_task(
@@ -650,6 +653,7 @@ mod tests {
                 "share_memory"
             ]
         );
+        use aidaemon_runtime::engine::tool_roster::ToolRoster as _;
         let roster = |agent: &crate::agent::Agent| {
             agent
                 .session_static_tool_roster(UserRole::Owner, &ChannelContext::private("telegram"))

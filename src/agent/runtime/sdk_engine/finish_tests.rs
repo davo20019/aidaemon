@@ -844,6 +844,7 @@ impl crate::traits::ToolSemantics for ChatJob {
 #[tokio::test]
 async fn the_chat_work_lists_a_tools_background_command_and_stops_it() {
     use aidaemon_channels::ports::ChatWorkKind;
+    use aidaemon_runtime::engine::chat_work::ChatWorkControl as _;
     let harness = root(
         MockProvider::new(),
         vec![Arc::new(ChatJob {

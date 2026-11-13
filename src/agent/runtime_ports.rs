@@ -286,7 +286,10 @@ impl ChannelAgentRuntime for Agent {
     }
 
     async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String> {
-        Agent::cancel_active_finite_work_for_session(self, session_id).await
+        aidaemon_runtime::engine::chat_work::ChatWorkControl::cancel_active_finite_work_for_session(
+            self, session_id,
+        )
+        .await
     }
 
     async fn running_children(
@@ -297,19 +300,23 @@ impl ChannelAgentRuntime for Agent {
     }
 
     async fn chat_work(&self, session_id: &str) -> aidaemon_channels::ports::ChatWorkView {
-        Agent::chat_work(self, session_id).await
+        aidaemon_runtime::engine::chat_work::ChatWorkControl::chat_work(self, session_id).await
     }
 
     async fn stop_chat_work(&self, session_id: &str, key: &str) -> bool {
-        Agent::stop_chat_work(self, session_id, key).await
+        aidaemon_runtime::engine::chat_work::ChatWorkControl::stop_chat_work(self, session_id, key)
+            .await
     }
 
     async fn cancel_finite_goals_for_session(&self, session_id: &str) -> Vec<String> {
-        Agent::cancel_session_finite_goals(self, session_id).await
+        aidaemon_runtime::engine::chat_work::ChatWorkControl::cancel_session_finite_goals(
+            self, session_id,
+        )
+        .await
     }
 
     async fn current_model(&self) -> String {
-        Agent::current_model(self).await
+        self.engine().current_model().await
     }
 
     async fn context_debug_settings(
@@ -321,7 +328,7 @@ impl ChannelAgentRuntime for Agent {
     }
 
     async fn set_model(&self, model: String) {
-        Agent::set_model(self, model).await;
+        self.engine().set_model(model).await;
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
@@ -329,7 +336,7 @@ impl ChannelAgentRuntime for Agent {
     }
 
     async fn clear_model_override(&self) {
-        Agent::clear_model_override(self).await;
+        self.engine().clear_model_override().await;
     }
 
     async fn clear_session_context(&self, session_id: &str) -> anyhow::Result<()> {

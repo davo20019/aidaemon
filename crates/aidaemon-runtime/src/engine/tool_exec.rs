@@ -1,5 +1,6 @@
-//! Running one tool call on the host: what the turn hands its host's tool
-//! execution ([`crate::host::TurnHost::execute_tool_with_watchdog_outcome`]).
+//! What one tool call runs with: the context the turn hands the dispatcher
+//! ([`crate::engine::dispatcher::ToolDispatch`]) and the refusal of an
+//! unknown tool.
 
 use std::sync::Arc;
 

@@ -13,8 +13,8 @@
 //! - [`TurnServices`]: the registries and per-run handles a turn uses (the
 //!   task registry, plans, MCP tools, transcript writes, cancellation, the
 //!   interactive slot and the turn's limits).
-//! - [`EngineHostOps`]: what only the host can do for the engine (queue a
-//!   request for provider recovery).
+//! - [`EngineHostOps`]: what only the host can do for the engine (trace
+//!   export, computer use).
 //! - [`TurnHost`]: all of the above plus the agent's turn runtime and who
 //!   the agent is; the turn's handlers in this crate run on it.
 
@@ -128,6 +128,13 @@ pub trait TurnServices: Send + Sync {
     /// The available MCP tool named `name`, if a connected server offers it.
     async fn mcp_tool(&self, name: &str)
         -> Option<std::sync::Arc<dyn aidaemon_tools::OutcomeTool>>;
+    /// The MCP tools `user_message` calls for (their servers' triggers).
+    async fn mcp_tools_matching(
+        &self,
+        user_message: &str,
+    ) -> Vec<std::sync::Arc<dyn aidaemon_tools::OutcomeTool>>;
+    /// The names of every tool the MCP servers serve.
+    async fn mcp_tool_names(&self) -> Vec<String>;
     /// Where a turn's memory side effects go (extraction, summaries,
     /// learning).
     fn transcript_writes(&self) -> std::sync::Arc<dyn crate::turn::memory_writer::MemoryWrites>;
@@ -142,18 +149,6 @@ pub trait TurnServices: Send + Sync {
 /// What only the host can do for the turn engine.
 #[async_trait::async_trait]
 pub trait EngineHostOps: Send + Sync {
-    /// Queue (or re-queue) a request whose provider failed before any tool
-    /// work committed, to run again once the provider recovers. Returns the
-    /// attempt number that will run next, or `None` when the request is not
-    /// deferrable or has exhausted its cap.
-    async fn defer_request_for_provider_recovery(
-        &self,
-        session_id: &str,
-        user_text: &str,
-        user_role: aidaemon_tools::semantics::UserRole,
-        channel_ctx: &aidaemon_channels::context::ChannelContext,
-        error: &anyhow::Error,
-    ) -> Option<u16>;
     /// Where kernel runs are traced (an OTLP export), if anywhere.
     fn trace_sink(&self) -> Option<std::sync::Arc<dyn aidaemon_core::EventSink>>;
     /// Report the messages actually sent for a model call of `run` to the
@@ -196,15 +191,6 @@ pub trait TurnHost:
     }
     /// The configured persona: the base of the system prompt.
     fn persona(&self) -> &str;
-    /// The session-static tool roster the core prompt names: `(name,
-    /// serialized schema)`, sorted by name.
-    fn session_static_tool_roster(
-        &self,
-        user_role: aidaemon_tools::semantics::UserRole,
-        channel_ctx: &aidaemon_channels::context::ChannelContext,
-    ) -> Vec<(String, String)>;
-    /// Whether a tool named `name` is registered.
-    fn has_registered_tool(&self, name: &str) -> bool;
     /// The specialists a parent may name, with their descriptions.
     fn specialist_kinds(&self) -> Vec<(String, String)>;
     /// The bundled specialists only (no user overrides), for a mandate
@@ -282,58 +268,6 @@ pub trait TurnHost:
     fn compaction_store(&self) -> std::sync::Arc<dyn crate::turn::compaction::CompactionStore>;
     /// The skill library.
     fn skills(&self) -> &aidaemon_skills::SkillCache;
-    /// Every registered tool's definition and capabilities.
-    fn registered_tool_definitions_with_capabilities(
-        &self,
-    ) -> (
-        Vec<serde_json::Value>,
-        std::collections::HashMap<String, aidaemon_tools::semantics::ToolCapabilities>,
-    );
-    /// Drop from `defs` and `capabilities` the tools not offered on a turn
-    /// of `session_id` (each tool's `ToolSemantics::offered_in_session`).
-    /// The default keeps everything.
-    fn retain_offered_in_session(
-        &self,
-        _defs: &mut Vec<serde_json::Value>,
-        _capabilities: &mut std::collections::HashMap<
-            String,
-            aidaemon_tools::semantics::ToolCapabilities,
-        >,
-        _session_id: &str,
-    ) {
-    }
-    /// The tools offered for `user_message`: the registered ones plus the MCP
-    /// tools it calls for.
-    async fn tool_definitions_with_capabilities(
-        &self,
-        user_message: &str,
-    ) -> (
-        Vec<serde_json::Value>,
-        std::collections::HashMap<String, aidaemon_tools::semantics::ToolCapabilities>,
-    );
-    /// `defs` narrowed to what `policy` allows at `risk_score`.
-    fn filter_tool_definitions_for_policy(
-        &self,
-        defs: &[serde_json::Value],
-        capabilities: &std::collections::HashMap<
-            String,
-            aidaemon_tools::semantics::ToolCapabilities,
-        >,
-        policy: &crate::policy::execution::ExecutionPolicy,
-        risk_score: f32,
-        widen: bool,
-    ) -> Vec<serde_json::Value>;
-    /// Run one tool call with the host's tool execution (its watchdog,
-    /// mandate validation and workspace scoping).
-    async fn execute_tool_with_watchdog_outcome(
-        &self,
-        name: &str,
-        arguments: &str,
-        ctx: &crate::engine::tool_exec::ToolExecCtx<'_>,
-    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome>;
-    /// Cancel the finite work the session started (background task leads
-    /// and executors); what was cancelled.
-    async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String>;
     /// Build a child of this agent: a fresh agent sharing this one's model
     /// runtime, stores, hub, approvals and sub-agent registry.
     async fn create_child(

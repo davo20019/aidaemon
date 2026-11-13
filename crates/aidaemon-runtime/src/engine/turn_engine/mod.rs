@@ -12,6 +12,7 @@
 //! finished run into the checklist's final shape, and `events` records the
 //! turn's task end and decision points.
 
+use crate::engine::deferral::DeferredRetries as _;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -59,9 +60,11 @@ use crate::turn::turn_context::TurnHistory;
 use aidaemon_channels::owner_wait::ProgressClock;
 
 pub mod compaction;
+pub mod entry;
 mod events;
 pub mod main_loop;
 pub mod model_call;
+pub mod model_pin;
 pub mod outcome;
 pub mod spawn;
 pub mod stop;

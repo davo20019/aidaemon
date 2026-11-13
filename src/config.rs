@@ -2007,6 +2007,22 @@ pub struct DiagnosticsHarnessEvalConfig {
     pub warn_routing_below: f32,
 }
 
+impl From<&DiagnosticsHarnessEvalConfig> for aidaemon_runtime::eval::HarnessEvalConfig {
+    fn from(cfg: &DiagnosticsHarnessEvalConfig) -> Self {
+        Self {
+            enabled: cfg.enabled,
+            weight_routing: cfg.weight_routing,
+            weight_progress: cfg.weight_progress,
+            weight_quality: cfg.weight_quality,
+            weight_cost: cfg.weight_cost,
+            cost_tier_cheap: cfg.cost_tier_cheap,
+            cost_tier_balanced: cfg.cost_tier_balanced,
+            cost_tier_strong: cfg.cost_tier_strong,
+            cost_tier_unknown: cfg.cost_tier_unknown,
+        }
+    }
+}
+
 impl Default for DiagnosticsHarnessEvalConfig {
     fn default() -> Self {
         Self {

@@ -24,41 +24,6 @@ fn attachment(file: &tempfile::NamedTempFile, mime: &str) -> MessageAttachment {
     }
 }
 
-fn engine_config(provider_kind: &str, engine: &str) -> AppConfig {
-    toml::from_str(&format!(
-        "[provider]\nkind = \"{provider_kind}\"\napi_key = \"test-key\"\n\n\
-         [provider.models]\ndefault = \"model-a\"\n\n[agent.engine]\n{engine}"
-    ))
-    .expect("parse app config")
-}
-
-#[test]
-fn legacy_engine_model_pin_is_dropped_for_a_non_anthropic_provider() {
-    let config = engine_config(
-        "openai_chatgpt",
-        "model = \"claude-haiku-5-5\"\napi_key = \"sk-ant-test\"",
-    );
-    let settings = settings_from_config(&config, &*crate::execution::active_execution_backend());
-    assert_eq!(settings.model_override, None);
-}
-
-#[test]
-fn legacy_engine_model_pin_is_kept_for_an_anthropic_provider() {
-    let config = engine_config(
-        "anthropic",
-        "model = \"claude-haiku-5-5\"\napi_key = \"sk-ant-test\"",
-    );
-    let settings = settings_from_config(&config, &*crate::execution::active_execution_backend());
-    assert_eq!(settings.model_override.as_deref(), Some("claude-haiku-5-5"));
-}
-
-#[test]
-fn engine_model_pin_without_api_key_is_honored() {
-    let config = engine_config("openai_chatgpt", "model = \"gpt-6-luna\"");
-    let settings = settings_from_config(&config, &*crate::execution::active_execution_backend());
-    assert_eq!(settings.model_override.as_deref(), Some("gpt-6-luna"));
-}
-
 #[test]
 fn image_attachments_are_encoded_for_a_vision_model() {
     use std::io::Write;
@@ -186,13 +151,17 @@ async fn recorded_models(harness: &crate::testing::TestHarness) -> Vec<String> {
 async fn sdk_engine_follows_daemon_model_selection() {
     use crate::runtime_ports::AgentIngress;
     let harness = models_harness().await;
-    harness.agent.set_model("pinned-model".to_string()).await;
+    harness
+        .agent
+        .engine()
+        .set_model("pinned-model".to_string())
+        .await;
     harness
         .agent
         .handle_inbound_message(owner_request("hello"))
         .await
         .unwrap();
-    harness.agent.clear_model_override().await;
+    harness.agent.engine().clear_model_override().await;
     harness
         .agent
         .handle_inbound_message(owner_request("hello again"))
@@ -306,7 +275,7 @@ async fn a_capped_plan_queues_the_request_until_the_reset() {
         "{}",
         reply.text
     );
-    let queued: Vec<crate::agent::deferred_retry::DeferredRequest> = serde_json::from_str(
+    let queued: Vec<aidaemon_runtime::engine::deferral::DeferredRequest> = serde_json::from_str(
         &harness
             .state
             .get_setting("deferred_provider_retries")
@@ -3524,6 +3493,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
             trust_roots: None,
             lone_root_call: false,
         };
+        use aidaemon_runtime::engine::dispatcher::ToolDispatch as _;
         harness
             .agent
             .execute_tool_with_watchdog_outcome(tool, &spoof, &ctx)
@@ -4461,7 +4431,10 @@ fn no_name_keyed_dispatch_remains() {
             include_str!("../../../../crates/aidaemon-runtime/src/engine/turn_engine/mod.rs"),
         ),
         ("approvals.rs", include_str!("../approvals.rs")),
-        ("tool_defs.rs", include_str!("../../tools/tool_defs.rs")),
+        (
+            "tool_roster.rs",
+            include_str!("../../../../crates/aidaemon-runtime/src/engine/tool_roster.rs"),
+        ),
     ];
     let names = [
         "send_file",

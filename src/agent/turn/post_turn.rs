@@ -1,18 +1,7 @@
 #![allow(clippy::items_after_test_module)]
 
+#[cfg(test)]
 use super::*;
-
-/// Learn from a finished task in the background.
-pub(in crate::agent) fn spawn_learning(
-    store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
-    learning_ctx: LearningContext,
-) {
-    tokio::spawn(async move {
-        if let Err(e) = post_task::process_learning(&store, learning_ctx).await {
-            warn!("Learning failed: {}", e);
-        }
-    });
-}
 
 /// Whether ordinary conversational memory maintenance may run after a
 /// completed turn: the full memory system's plan

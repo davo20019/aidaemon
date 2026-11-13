@@ -226,7 +226,7 @@ pub async fn run(
         specialists_dir.as_deref(),
     ));
 
-    let sdk_engine = crate::agent::sdk_engine::settings_from_config(&config, &*execution_backend);
+    let sdk_engine = crate::startup::engine::settings_from_config(&config, &*execution_backend);
 
     #[allow(unused_mut)]
     let mut agent = Agent::new(crate::agent::AgentConstruction {

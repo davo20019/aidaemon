@@ -68,6 +68,18 @@ pub async fn process_learning(
     aidaemon_memory::full::writer::learn_from_run(state.as_ref(), ctx.into_run_learning()).await
 }
 
+/// Learn from a finished task in the background.
+pub fn spawn_learning(
+    store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
+    learning_ctx: LearningContext,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = process_learning(&store, learning_ctx).await {
+            tracing::warn!("Learning failed: {}", e);
+        }
+    });
+}
+
 /// Classify the stall cause from recent errors for actionable guidance.
 pub fn classify_stall(
     learning_ctx: &LearningContext,

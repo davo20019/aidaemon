@@ -1,3 +1,5 @@
+use crate::engine::chat_work::ChatWorkControl as _;
+use crate::engine::dispatcher::ToolDispatch as _;
 use std::time::Instant;
 
 use aidaemon_channels::context::ChannelContext;

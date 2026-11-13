@@ -187,6 +187,55 @@ pub trait WorkScope: TurnHost {
         Ok(())
     }
 
+    /// Refuse an executor spawn for `task_id` unless the task exists, belongs
+    /// to `expected_goal_id` (when given) and is claimed: no executor for an
+    /// unclaimed, stale, running or finished task.
+    async fn validate_executor_task_for_spawn(
+        &self,
+        task_id: &str,
+        expected_goal_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let Some(task) = self.tasks().get_task(task_id).await? else {
+            anyhow::bail!(
+                "Task '{}' was not found. Use manage_goal_tasks(list_tasks) and pass a valid task_id.",
+                task_id
+            );
+        };
+
+        if let Some(goal_id) = expected_goal_id {
+            if task.goal_id != goal_id {
+                anyhow::bail!(
+                    "Task '{}' belongs to goal '{}', not '{}'.",
+                    task_id,
+                    task.goal_id,
+                    goal_id
+                );
+            }
+        }
+
+        match task.status.as_str() {
+            "claimed" => Ok(()),
+            "pending" => anyhow::bail!(
+                "Task '{}' is still pending. Claim it first with manage_goal_tasks(action='claim_task').",
+                task_id
+            ),
+            "running" => anyhow::bail!(
+                "Task '{}' is already running. Do not spawn another executor for the same task.",
+                task_id
+            ),
+            "completed" | "failed" | "blocked" | "cancelled" => anyhow::bail!(
+                "Task '{}' is '{}' and should not be executed again without an explicit retry/reset.",
+                task_id,
+                task.status
+            ),
+            other => anyhow::bail!(
+                "Task '{}' has unsupported status '{}' for executor spawn (expected 'claimed').",
+                task_id,
+                other
+            ),
+        }
+    }
+
     /// The chat whose `/readonly` narrows this turn while it runs: a child
     /// answers to the chat that started the work, a root turn to its own.
     fn mode_session_for(&self, session_id: &str) -> String {

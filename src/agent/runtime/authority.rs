@@ -139,6 +139,7 @@ mod tests {
             trust_roots: None,
             lone_root_call: false,
         };
+        use aidaemon_runtime::engine::dispatcher::ToolDispatch as _;
         let error = harness
             .agent
             .execute_tool_with_watchdog_outcome(

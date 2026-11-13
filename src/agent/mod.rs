@@ -1,12 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use chrono::Utc;
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+#[cfg(test)]
+use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
@@ -20,17 +25,21 @@ use crate::events::{
 };
 #[cfg(test)]
 use crate::events::{DecisionPointData, DecisionType, EventType};
-use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
+#[cfg(test)]
+use crate::execution_policy::{ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
-use crate::llm_runtime::side_calls::SideCall;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
 use crate::runtime_ports::OutboundRouter;
 use crate::skills;
 #[cfg(test)]
 use crate::traits::Message;
-use crate::traits::{AgentRole, StateStore, Tool, ToolCapabilities};
-use crate::types::{ChannelContext, ChannelVisibility, UserRole};
+#[cfg(test)]
+use crate::traits::ToolCapabilities;
+use crate::traits::{AgentRole, StateStore, Tool};
+#[cfg(test)]
+use crate::types::ChannelVisibility;
+use crate::types::{ChannelContext, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
 #[cfg(test)]
 use crate::events::ToolCallInfo;
@@ -42,6 +51,7 @@ pub use crate::types::StatusUpdate;
 #[cfg(test)]
 use crate::traits::Task;
 
+#[cfg(test)]
 const DEFERRED_NO_TOOL_ERROR_MARKER: &str = "deferred-action no-tool loop";
 #[path = "response_analysis.rs"]
 mod response_analysis;
@@ -86,15 +96,11 @@ mod execution_state;
 #[cfg(test)]
 pub(crate) use execution_state::ExecutionBudget;
 pub(crate) use execution_state::TargetScope;
-/// Tool-failure classification lives in `aidaemon-runtime`.
-mod loop_utils {
-    pub(in crate::agent) use aidaemon_runtime::turn::loop_utils::*;
-}
-use loop_utils::is_trigger_session;
 /// The post-run learning context lives in `aidaemon-runtime`.
 mod post_task {
     pub(crate) use aidaemon_runtime::turn::post_task::*;
 }
+#[cfg(test)]
 use post_task::LearningContext;
 
 #[cfg(feature = "computer_use")]
@@ -119,8 +125,6 @@ pub(crate) mod coordination;
 mod core_prompt {
     pub(crate) use aidaemon_runtime::prompt::core::*;
 }
-#[path = "runtime/deferred_retry.rs"]
-mod deferred_retry;
 /// Dialogue state lives in `aidaemon-runtime`.
 mod dialogue_state {
     #[cfg(test)]
@@ -192,7 +196,6 @@ mod runtime_ports;
 #[path = "runtime/spawn.rs"]
 mod spawn;
 mod turn_host;
-pub(crate) use aidaemon_runtime::engine::work_scope::WorkScope;
 /// Session notes and parent-visible deliveries, on any TurnHost.
 pub(crate) use aidaemon_runtime::turn::notes::TurnNotes;
 /// The speech-to-text fallback lives in `aidaemon-runtime`.
@@ -207,9 +210,14 @@ mod system_directives {
 }
 #[path = "runtime/system_prompt.rs"]
 mod system_prompt;
-#[path = "tools/tool_defs.rs"]
-mod tool_defs;
-#[path = "tools/tool_exec.rs"]
+/// Tool dispatch and the tool roster live in `aidaemon-runtime`
+/// (`engine::dispatcher`, `engine::tool_roster`); their tests run here, on
+/// the daemon's harness.
+#[cfg(test)]
+#[path = "tools/tool_defs_tests.rs"]
+mod tool_defs_tests;
+#[cfg(test)]
+#[path = "tools/tool_exec_tests.rs"]
 mod tool_exec;
 #[path = "turn/tool_execution/mod.rs"]
 mod tool_execution;
@@ -228,7 +236,6 @@ pub use policy_metrics::{
 // in-tree consumer (the legacy definition carried `#[allow(dead_code)]`).
 #[allow(unused_imports)]
 pub use policy_metrics::PolicyAutotuneSnapshot;
-pub(in crate::agent) use policy_metrics::POLICY_METRICS;
 
 // Free-function helpers (status, resume, project-scope cues, untrusted-reference
 // filtering, intent-gate merge). Implementation lives in `agent_helpers.rs`.
@@ -427,9 +434,6 @@ pub(crate) use goal_dispatch::{
     build_goal_task_results_summary, SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS,
     SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
 };
-pub(in crate::agent) use goal_dispatch::{
-    clear_scheduled_run_state, goal_has_scheduled_provenance, task_has_scheduled_provenance,
-};
 #[cfg(test)]
 pub(in crate::agent) use goal_dispatch::{parse_wait_task_seconds, user_facing_task_description};
 
@@ -580,45 +584,12 @@ impl Agent {
         task_id: &str,
         expected_goal_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let Some(task) = self.state.get_task(task_id).await? else {
-            anyhow::bail!(
-                "Task '{}' was not found. Use manage_goal_tasks(list_tasks) and pass a valid task_id.",
-                task_id
-            );
-        };
-
-        if let Some(goal_id) = expected_goal_id {
-            if task.goal_id != goal_id {
-                anyhow::bail!(
-                    "Task '{}' belongs to goal '{}', not '{}'.",
-                    task_id,
-                    task.goal_id,
-                    goal_id
-                );
-            }
-        }
-
-        match task.status.as_str() {
-            "claimed" => Ok(()),
-            "pending" => anyhow::bail!(
-                "Task '{}' is still pending. Claim it first with manage_goal_tasks(action='claim_task').",
-                task_id
-            ),
-            "running" => anyhow::bail!(
-                "Task '{}' is already running. Do not spawn another executor for the same task.",
-                task_id
-            ),
-            "completed" | "failed" | "blocked" | "cancelled" => anyhow::bail!(
-                "Task '{}' is '{}' and should not be executed again without an explicit retry/reset.",
-                task_id,
-                task.status
-            ),
-            other => anyhow::bail!(
-                "Task '{}' has unsupported status '{}' for executor spawn (expected 'claimed').",
-                task_id,
-                other
-            ),
-        }
+        aidaemon_runtime::engine::work_scope::WorkScope::validate_executor_task_for_spawn(
+            self,
+            task_id,
+            expected_goal_id,
+        )
+        .await
     }
 
     /// Maximum agentic loop iterations per invocation.
@@ -657,39 +628,9 @@ impl Agent {
     /// Returns `None` on any failure or empty reply so the caller can fall back
     /// to delivering the raw result — the answer is never lost.
     pub async fn interpret_background_result(&self, command: &str, output: &str) -> Option<String> {
-        let system = "You translate the result of a shell command into ONE short, \
-            plain-language sentence for a non-technical user. Say what the result \
-            represents and flag any obvious caveat (for example, a raw text-match \
-            count is not the same as a count of files). Never suggest running \
-            anything, never use code formatting, and reply with the sentence only.";
-        let user = format!(
-            "Command that was run:\n{command}\n\nIts output:\n{output}\n\n\
-             In one sentence, tell the user what this result means."
-        );
-        let messages = vec![
-            json!({"role": "system", "content": system}),
-            json!({"role": "user", "content": user}),
-        ];
-
-        match self
-            .side_calls
-            .ask(
-                SideCall::BackgroundInterpretation,
-                &messages,
-                &Default::default(),
-                None,
-            )
+        self.engine()
+            .interpret_background_result(command, output)
             .await
-        {
-            Ok(answer) => {
-                let trimmed = answer.text.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_string())
-            }
-            Err(e) => {
-                warn!(error = %e, "Background-result interpretation LLM call failed");
-                None
-            }
-        }
     }
 
     pub async fn handle_message(
@@ -749,96 +690,18 @@ impl Agent {
         heartbeat: Option<Arc<AtomicU64>>,
         ingress_timing: Option<crate::runtime_ports::InboundMessageTiming>,
     ) -> anyhow::Result<String> {
-        let scheduled_goal_to_clear = if let Some(goal_id) = self.goal_id.as_deref() {
-            let is_scheduled_goal =
-                goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref()).await;
-            let is_root_scheduled_run = if self.task_id.is_none() {
-                is_scheduled_goal
-            } else {
-                task_has_scheduled_provenance(&self.state, self.task_id.as_deref()).await
-            };
-            // Background scheduled cycles are owned by background_task_lead,
-            // which must keep one shared budget alive across planning and all
-            // executor siblings. Direct/resume runs without a background task
-            // identity still own their cleanup here.
-            if agent_return_owns_scheduled_run_cleanup(
-                self.depth,
-                self.task_id.is_some(),
-                is_root_scheduled_run,
-            ) {
-                Some(goal_id.to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let backend = self.execution_backend.clone();
-        let mut execution_user_text = user_text.to_string();
-        if backend.kind() != crate::execution::BackendKind::Local {
-            for attachment in attachments {
-                let safe_name: String = attachment
-                    .filename
-                    .chars()
-                    .map(|character| {
-                        if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
-                        {
-                            character
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                let destination = backend
-                    .workspace_root()
-                    .join(".aidaemon")
-                    .join("inbox")
-                    .join(format!("{}-{}", uuid::Uuid::new_v4(), safe_name));
-                let imported = backend
-                    .import_local_file(std::path::Path::new(&attachment.local_path), &destination)
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "Failed to import attachment {:?} into the {} execution workspace: {}",
-                            attachment.filename,
-                            backend.kind().as_str(),
-                            error
-                        )
-                    })?;
-                execution_user_text =
-                    execution_user_text.replace(&attachment.local_path, imported.as_str());
-            }
-        }
-
-        let reply = self
-            .engine()
-            .handle_message_impl(
+        self.engine()
+            .handle_inbound(
                 session_id,
-                &execution_user_text,
+                user_text,
                 attachments,
                 status_tx,
                 user_role,
                 channel_ctx,
                 heartbeat,
                 ingress_timing,
-                false,
-                None,
-                None,
-                None,
             )
-            .await;
-
-        if let Some(goal_id) = scheduled_goal_to_clear.as_deref() {
-            if let Some(registry) = self.goal_token_registry.as_ref() {
-                registry.clear_run_budget(goal_id).await;
-            }
-            clear_scheduled_run_state(&self.state, goal_id).await;
-        }
-
-        // The loop's response-finalization phase is the sole owner of all
-        // user-facing transforms and persists that exact finalized text.
-        reply
+            .await
     }
 
     /// Re-enter an unfinished conversation with runtime-produced evidence.
@@ -864,239 +727,6 @@ impl Agent {
                 request.parent_result_id.as_deref(),
             )
             .await
-    }
-
-    /// Cancel all active/pending goals for a session.
-    ///
-    /// This is used by channels to implement fast-path `cancel`/`stop` handling
-    /// without needing an LLM call. It cancels the goal token (cascading to task
-    /// leads/executors), updates goal/task DB state, and removes any schedules.
-    /// Cancel the finite work a session started (task leads and their
-    /// executors). Recurring goals and tracked personal goals in the same
-    /// session are kept: a "stop" or a correction in chat must not end
-    /// them; that takes an explicit cancel of that goal.
-    pub(crate) async fn cancel_active_finite_work_for_session(
-        &self,
-        session_id: &str,
-    ) -> Vec<String> {
-        let mut cancelled = self.cancel_session_finite_goals(session_id).await;
-        cancelled.extend(self.cancel_session_background_spawns(session_id).await);
-        cancelled
-    }
-
-    /// Stop the session's background sub-agents; returns what was stopped.
-    async fn cancel_session_background_spawns(&self, session_id: &str) -> Vec<String> {
-        let Some(registry) = self.goal_token_registry.as_ref() else {
-            return Vec::new();
-        };
-        let spawns = self
-            .state
-            .background_spawns_for_session(session_id)
-            .await
-            .unwrap_or_default();
-        let mut cancelled = Vec::new();
-        for spawn in spawns {
-            if registry.cancel(&spawn.id).await {
-                let mission: String = spawn.mission.chars().take(80).collect();
-                cancelled.push(format!("background task: {mission}"));
-            }
-        }
-        cancelled
-    }
-
-    /// Everything running for the chat besides its turns, from typed
-    /// state: its sub-agents (the running-children registry) and its
-    /// background commands (each tool's process table).
-    pub(crate) async fn chat_work(
-        &self,
-        session_id: &str,
-    ) -> aidaemon_channels::ports::ChatWorkView {
-        use aidaemon_channels::ports::{ChatWork, ChatWorkKind, ChatWorkView};
-        let mut items: Vec<ChatWork> = self
-            .running_children
-            .listed(session_id)
-            .into_iter()
-            .map(|child| ChatWork {
-                key: child.key,
-                kind: ChatWorkKind::SubAgent,
-                title: format!("Sub-agent: {}", child.child.label),
-                started_at: child.child.started_at,
-                request: child.request,
-                step: child.step,
-            })
-            .collect();
-        for (index, tool) in self.tools.iter().enumerate() {
-            for job in tool.background_jobs(session_id).await {
-                items.push(ChatWork {
-                    key: format!("job:{index}:{}", job.key),
-                    kind: ChatWorkKind::BackgroundJob,
-                    title: job.title,
-                    started_at: job.started_at,
-                    request: job.task_id,
-                    step: None,
-                });
-            }
-        }
-        items.sort_by_key(|item| item.started_at);
-        ChatWorkView {
-            current_request: self.running_children.current_request(session_id),
-            items,
-        }
-    }
-
-    /// Stop the chat's work `key` and read it back: a sub-agent is stopped
-    /// with the commands it left running, and counts as stopped once it is
-    /// no longer listed and none of those commands runs; a command once its
-    /// process is gone.
-    pub(crate) async fn stop_chat_work(&self, session_id: &str, key: &str) -> bool {
-        const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
-        const POLL: std::time::Duration = std::time::Duration::from_millis(100);
-        if let Some(job) = key.strip_prefix("job:") {
-            let Some((index, job_key)) = job.split_once(':') else {
-                return false;
-            };
-            let Some(tool) = index.parse::<usize>().ok().and_then(|i| self.tools.get(i)) else {
-                return false;
-            };
-            if !tool
-                .background_jobs(session_id)
-                .await
-                .iter()
-                .any(|listed| listed.key == job_key)
-            {
-                // Not running for this chat (it ended, or it is not its).
-                return true;
-            }
-            return tool.stop_background_job(job_key).await;
-        }
-        let Some(child_session) = self.running_children.stop(key) else {
-            return true;
-        };
-        let deadline = tokio::time::Instant::now() + SETTLE;
-        while self.running_children.is_listed(key) && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(POLL).await;
-        }
-        // A stopped child's run is dropped before its own end could stop
-        // the commands it started: stop them here.
-        let mut jobs_stopped = true;
-        for tool in &self.tools {
-            for job in tool.background_jobs(&child_session).await {
-                jobs_stopped &= tool.stop_background_job(&job.key).await;
-            }
-        }
-        !self.running_children.is_listed(key) && jobs_stopped
-    }
-
-    pub(crate) async fn cancel_session_finite_goals(&self, session_id: &str) -> Vec<String> {
-        let goals = self
-            .state
-            .get_goals_for_session(session_id)
-            .await
-            .unwrap_or_default();
-        let mut active: Vec<&crate::traits::Goal> = Vec::new();
-        for goal in goals
-            .iter()
-            .filter(|goal| session_goal_is_finite_work(goal))
-        {
-            // A scheduled one-shot (a reminder) is future work the owner
-            // asked for, not work in flight: a stop or /clear ends it only
-            // while its run is executing.
-            let scheduled = self
-                .state
-                .get_schedules_for_goal(&goal.id)
-                .await
-                .map(|schedules| !schedules.is_empty())
-                .unwrap_or(false);
-            let running = self
-                .goal_token_registry
-                .as_ref()
-                .is_some_and(|registry| registry.is_run_active(&goal.id));
-            if scheduled && !running {
-                continue;
-            }
-            active.push(goal);
-        }
-        if active.is_empty() {
-            return Vec::new();
-        }
-
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut cancelled = Vec::new();
-        for goal in active {
-            if let Some(ref registry) = self.goal_token_registry {
-                registry.cancel(&goal.id).await;
-                registry.clear_run_budget(&goal.id).await;
-            }
-            clear_scheduled_run_state(&self.state, &goal.id).await;
-
-            let mut updated = goal.clone();
-            updated.status = "cancelled".to_string();
-            updated.updated_at = now.clone();
-            updated.completed_at = Some(now.clone());
-            let _ = self.state.update_goal(&updated).await;
-
-            // Best-effort cleanup: cancelled goals should not retain schedules.
-            if let Ok(schedules) = self.state.get_schedules_for_goal(&updated.id).await {
-                for s in &schedules {
-                    let _ = self.state.delete_goal_schedule(&s.id).await;
-                }
-            }
-
-            // Cancel all remaining tasks for this goal.
-            if let Ok(tasks) = self.state.get_tasks_for_goal(&updated.id).await {
-                for task in tasks {
-                    if task.status != "completed"
-                        && task.status != "failed"
-                        && task.status != "cancelled"
-                    {
-                        let mut t = task.clone();
-                        t.status = "cancelled".to_string();
-                        t.completed_at = Some(now.clone());
-                        let _ = self.state.update_task(&t).await;
-                    }
-                }
-            }
-
-            cancelled.push(updated.description.chars().take(100).collect());
-        }
-
-        cancelled
-    }
-}
-
-/// An active goal that a session's stop or correction cancels: finite
-/// orchestration work, never a recurring or personal goal.
-fn session_goal_is_finite_work(goal: &crate::traits::Goal) -> bool {
-    matches!(
-        goal.status.as_str(),
-        "active" | "pending" | "pending_confirmation"
-    ) && goal.domain == "orchestration"
-        && goal.goal_type == "finite"
-}
-
-fn agent_return_owns_scheduled_run_cleanup(
-    depth: usize,
-    has_task_id: bool,
-    is_root_scheduled_run: bool,
-) -> bool {
-    is_root_scheduled_run && (depth == 0 || !has_task_id)
-}
-
-#[cfg(test)]
-mod session_goal_cancellation_tests {
-    use crate::traits::Goal;
-
-    use super::session_goal_is_finite_work;
-
-    #[test]
-    fn stop_cancels_finite_work_but_keeps_recurring_and_personal_goals() {
-        let finite = Goal::new_finite("Answer the current question", "session-1");
-        let recurring = Goal::new_continuous("Publish a daily blog post", "session-1", None, None);
-        let personal = Goal::new_personal("Keep writing", "session-1");
-
-        assert!(session_goal_is_finite_work(&finite));
-        assert!(!session_goal_is_finite_work(&recurring));
-        assert!(!session_goal_is_finite_work(&personal));
     }
 }
 

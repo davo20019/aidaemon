@@ -1506,7 +1506,7 @@ async fn test_reload_provider_switches_backend_and_models_endpoint() {
 
     let before_models = harness.agent.list_models().await.unwrap();
     assert_eq!(before_models, vec!["mock-model".to_string()]);
-    assert_eq!(harness.agent.current_model().await, "mock-model");
+    assert_eq!(harness.agent.engine().current_model().await, "mock-model");
 
     let anthropic = test_reload_config(
         "anthropic",
@@ -1529,7 +1529,7 @@ async fn test_reload_provider_switches_backend_and_models_endpoint() {
         status
     );
     assert_eq!(
-        harness.agent.current_model().await,
+        harness.agent.engine().current_model().await,
         "claude-3-haiku-20240307"
     );
 
@@ -1550,8 +1550,8 @@ async fn test_reload_provider_switches_backend_and_models_endpoint() {
 async fn test_reload_provider_resets_manual_model_and_supports_second_reload() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 
-    harness.agent.set_model("manual-override".to_string()).await;
-    assert_eq!(harness.agent.current_model().await, "manual-override");
+    harness.agent.engine().set_model("manual-override".to_string()).await;
+    assert_eq!(harness.agent.engine().current_model().await, "manual-override");
 
     let anthropic = test_reload_config(
         "anthropic",
@@ -1569,7 +1569,7 @@ async fn test_reload_provider_resets_manual_model_and_supports_second_reload() {
         status_1
     );
     assert_eq!(
-        harness.agent.current_model().await,
+        harness.agent.engine().current_model().await,
         "claude-3-opus-20240229"
     );
 
@@ -1592,7 +1592,7 @@ async fn test_reload_provider_resets_manual_model_and_supports_second_reload() {
         "unexpected second reload status: {}",
         status_2
     );
-    assert_eq!(harness.agent.current_model().await, "openai/gpt-4o-mini");
+    assert_eq!(harness.agent.engine().current_model().await, "openai/gpt-4o-mini");
 }
 
 #[tokio::test]
@@ -1606,9 +1606,10 @@ async fn test_no_router_auto_mode_uses_runtime_primary_over_stale_model_field() 
     // Create a stale local model field, then disable override.
     harness
         .agent
+        .engine()
         .set_model("manual-stale-model".to_string())
         .await;
-    harness.agent.clear_model_override().await;
+    harness.agent.engine().clear_model_override().await;
 
     let response = harness
         .agent

@@ -69,6 +69,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Agent behavior lives in crates; src/ holds wiring and the product
+      # shell. Fails on a new src/ module or logic landing in src/agent.
+      - name: App boundary
+        run: python3 scripts/check-app-boundary.py
+
       # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
       - name: Install Rust
         run: rustup toolchain install && rustc --version
