@@ -7,8 +7,10 @@
 //! - [`TurnWorkspace`]: where the turn's file work happens (the execution
 //!   backend and the configured project roots).
 //! - [`DecisionRecorder`]: where the turn's decision points go.
+//! - [`TurnHost`]: all of the above plus the agent's turn runtime and who
+//!   the agent is; the turn's handlers in this crate run on it.
 
-use aidaemon_events::stores::DialogueStateStore;
+use aidaemon_events::stores::{DialogueStateStore, MessageStore};
 use aidaemon_events::EventStore;
 use aidaemon_tools::ExecutionBackend;
 
@@ -17,6 +19,10 @@ use aidaemon_tools::ExecutionBackend;
 pub trait TurnStores: Send + Sync {
     /// Per-session dialogue state (open request, open question, last turns).
     fn dialogue_states(&self) -> &dyn DialogueStateStore;
+    /// The conversation's messages and its durable context boundary.
+    fn messages(&self) -> &dyn MessageStore;
+    /// Goals (a goal's bound workspace scopes its tasks' turns).
+    fn goals(&self) -> &dyn aidaemon_work::stores::GoalStore;
     /// The event log.
     fn events(&self) -> &EventStore;
 }
@@ -43,4 +49,31 @@ pub trait DecisionRecorder: Send + Sync {
         summary: String,
         metadata: serde_json::Value,
     );
+}
+
+/// The host a turn runs on: its stores, workspace and decision record, the
+/// agent's [`TurnRuntime`] and where the agent stands in its tree.
+pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
+    /// The agent's turn settings and caches.
+    fn turn_runtime(&self) -> &crate::turn_runtime::TurnRuntime;
+    /// Whether this agent works for another (a spawned child, or a mandate's
+    /// worker): its transcript is an authority envelope, not a conversation
+    /// with the user.
+    fn is_worker(&self) -> bool;
+    /// Whether this agent is a mandate's worker (bound to one decision
+    /// cycle's run).
+    fn works_for_mandate(&self) -> bool;
+    /// What a spawned child inherited from the turn that spawned it; `None`
+    /// for a root agent.
+    fn inherited_authority(&self) -> Option<&crate::authority::InheritedAuthority>;
+    /// The agent's role in its tree.
+    fn role(&self) -> aidaemon_events::traits::AgentRole;
+    /// The goal a task lead works for.
+    fn goal_id(&self) -> Option<&str>;
+    /// The project scope a spawned child was handed.
+    fn inherited_project_scope(&self) -> Option<&str>;
+    /// Where received attachments are saved: daemon storage, never a project.
+    fn inbox_dir(&self) -> Option<&std::path::Path>;
+    /// The agent's tools (their task-end hooks run when a task ends).
+    fn tools(&self) -> &[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>];
 }

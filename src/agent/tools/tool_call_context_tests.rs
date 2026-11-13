@@ -213,6 +213,7 @@ async fn owner_harness() -> crate::testing::TestHarness {
     harness.agent.goal_id = Some("goal-real".to_string());
     harness
         .agent
+        .runtime
         .current_turn_ids
         .write()
         .await

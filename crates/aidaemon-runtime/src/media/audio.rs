@@ -6,10 +6,10 @@ use base64::Engine;
 use serde_json::{json, Value};
 use tracing::warn;
 
-use crate::config::AudioConfig;
-use crate::traits::MessageAttachment;
+use crate::settings::AudioConfig;
+use aidaemon_events::conversation::MessageAttachment;
 
-use crate::agent::turn_render::RenderMode;
+use crate::turn::turn_render::RenderMode;
 
 pub const AUDIO_SKIPPED_SYSTEM_HINT: &str = "[SYSTEM] User attached audio saved to disk; native audio input is disabled, unsupported for this model, or the file could not be read — acknowledge receipt and ask them to describe it or switch to an audio-capable model.";
 

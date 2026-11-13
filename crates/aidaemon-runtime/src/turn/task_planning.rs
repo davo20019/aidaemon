@@ -1,17 +1,21 @@
-use crate::llm_runtime::gateway::SideCallGateway;
-use crate::llm_runtime::side_calls::SideCall;
-use crate::utils::truncate_str;
+use crate::llm::gateway::SideCallGateway;
+use crate::llm::side_calls::SideCall;
 use aidaemon_core as sdk;
+use aidaemon_events::text::truncate_str;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::warn;
+
+/// The memory policy event's reason for a turn the user opted out of
+/// learning.
+pub const OPTED_OUT_REASON: &str = "learning_opted_out";
 
 /// Build bounded relationship-assessment context. This is not provider
 /// transcript carryover: stable message IDs let the router identify one
 /// exact antecedent, while fresh tasks still discard all archived prose after
 /// the relationship is finalized.
-pub(crate) fn relationship_conversation_context(
-    _followup_mode: Option<crate::agent::FollowupMode>,
+pub fn relationship_conversation_context(
+    _followup_mode: Option<crate::turn::followup::FollowupMode>,
     session_summary: Option<&str>,
     recent_messages: &[serde_json::Value],
 ) -> Option<String> {
@@ -46,7 +50,7 @@ pub(crate) fn relationship_conversation_context(
 /// The relationship router's typed dialogue edge: how this turn relates to
 /// persisted dialogue state. It never authorizes actions or decides completion.
 #[derive(Debug, Clone)]
-pub(crate) struct PlannedTaskShape {
+pub struct PlannedTaskShape {
     /// `low`, `medium`, or `high`.
     pub confidence: Option<String>,
     /// Relationship of this turn to persisted dialogue state.
@@ -74,7 +78,7 @@ fn confidence_is_sufficient(value: Option<&str>) -> bool {
     )
 }
 
-pub(crate) fn planned_task_relationship_is_complete(shape: &PlannedTaskShape) -> bool {
+pub fn planned_task_relationship_is_complete(shape: &PlannedTaskShape) -> bool {
     let relationship = shape
         .request_relationship
         .as_deref()
@@ -98,13 +102,13 @@ pub(crate) fn planned_task_relationship_is_complete(shape: &PlannedTaskShape) ->
 }
 
 /// Automatic-memory policy for one task (`aidaemon_memory::policy`).
-pub(crate) use aidaemon_memory::policy::MemoryPipelinePolicy;
+pub use aidaemon_memory::policy::MemoryPipelinePolicy;
 
 /// Compile the task-local automatic-memory policy from typed lifecycle state:
 /// whether the contract forbids user memory (inherited from a request that
 /// said so) and whether a person wrote the turn.
-pub(crate) fn compile_memory_pipeline_policy(
-    current_contract: &crate::agent::CompletionContract,
+pub fn compile_memory_pipeline_policy(
+    current_contract: &crate::turn::completion_contract::CompletionContract,
     user_authored_turn: bool,
 ) -> MemoryPipelinePolicy {
     MemoryPipelinePolicy::compile(
@@ -115,7 +119,7 @@ pub(crate) fn compile_memory_pipeline_policy(
         },
         current_contract
             .forbidden_tool_scopes
-            .contains(&crate::traits::ToolSemanticScope::UserMemory),
+            .contains(&aidaemon_events::traits::ToolSemanticScope::UserMemory),
     )
 }
 
@@ -124,26 +128,26 @@ pub(crate) fn compile_memory_pipeline_policy(
 /// policy says: the reason is what keeps the turn out of history search, so
 /// it must not depend on the turn's memory being allowed otherwise. Recall
 /// still follows the policy (opting out is about learning, not reading).
-pub(crate) fn memory_policy_compiled_data(
+pub fn memory_policy_compiled_data(
     task_id: &str,
     turn_id: &str,
     policy: &MemoryPipelinePolicy,
     learning_opted_out: bool,
-) -> crate::events::MemoryPolicyCompiledData {
+) -> aidaemon_events::MemoryPolicyCompiledData {
     let persistence_allowed = policy.allows_memory() && !learning_opted_out;
-    crate::events::MemoryPolicyCompiledData {
+    aidaemon_events::MemoryPolicyCompiledData {
         task_id: task_id.to_string(),
         turn_id: Some(turn_id.to_string()),
         // `access` excludes the turn from every automatic memory pipeline
         // (`memory_suppressed_turn_ids`), so it tracks persistence, not
         // recall.
         access: if persistence_allowed {
-            crate::events::MemoryPipelineAccess::Allowed
+            aidaemon_events::MemoryPipelineAccess::Allowed
         } else {
-            crate::events::MemoryPipelineAccess::Suppressed
+            aidaemon_events::MemoryPipelineAccess::Suppressed
         },
         reason_code: if learning_opted_out {
-            crate::agent::memory_plugin::OPTED_OUT_REASON.to_string()
+            OPTED_OUT_REASON.to_string()
         } else {
             policy.reason_code().to_string()
         },
@@ -177,7 +181,7 @@ fn typed_object_response_format(name: &str) -> sdk::ResponseFormat {
 /// bounds every attempt by the spec's total deadline and records each one.
 /// Any failure, an unreadable reply or an invalid edge returns `None`: the
 /// turn is then treated as a new request.
-pub(crate) async fn generate_task_relationship(
+pub async fn generate_task_relationship(
     side_calls: &SideCallGateway,
     user_text: &str,
     conversation_context: &str,
@@ -223,7 +227,7 @@ pub(crate) async fn generate_task_relationship(
             return None;
         }
     };
-    let Some(json) = crate::utils::extract_json_object(&response.text) else {
+    let Some(json) = crate::turn::helpers::extract_json_object(&response.text) else {
         warn!("Task relationship router reply held no JSON object");
         return None;
     };
@@ -265,7 +269,7 @@ pub(crate) async fn generate_task_relationship(
 /// relate to; its options carry the antecedent, one `continuation_<n>`
 /// option per earlier user message the conversation context names, so the
 /// class and the antecedent come back as one answer.
-pub(crate) struct TurnDigestRequest {
+pub struct TurnDigestRequest {
     pub request: aidaemon_decisions::DecisionRequest,
     /// `continuation_<n>` option -> user message id.
     pub antecedents: std::collections::BTreeMap<String, String>,
@@ -304,7 +308,7 @@ const TIERS: [(&str, &str); 3] = [
 /// Earlier user message ids named in the relationship context, in order,
 /// without repeats. Reads the context's own row formats (`[message_id=X] U:`
 /// and owed `USER message_id="X"` rows); it never reads message wording.
-pub(crate) fn relationship_candidate_ids(conversation_context: &str) -> Vec<String> {
+pub fn relationship_candidate_ids(conversation_context: &str) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for line in conversation_context.lines() {
         let line = line.trim_start();
@@ -329,11 +333,11 @@ pub(crate) fn relationship_candidate_ids(conversation_context: &str) -> Vec<Stri
 
 /// Builds the turn digest. `conversation_context` is the router's context
 /// when the relationship should be asked, `None` otherwise.
-pub(crate) fn turn_digest_request(
+pub fn turn_digest_request(
     user_text: &str,
     conversation_context: Option<&str>,
 ) -> TurnDigestRequest {
-    use crate::llm_runtime::decisions::digest_keys;
+    use crate::llm::decisions::digest_keys;
     use aidaemon_decisions::{DecisionRequest, Question};
 
     let mut antecedents = std::collections::BTreeMap::new();
@@ -395,11 +399,11 @@ pub(crate) fn turn_digest_request(
 
 /// The relationship edge the digest decided, when its answer may be acted
 /// on. Shaped like the router's answer, so the rest of the turn is the same.
-pub(crate) fn digest_relationship(
-    outcome: &crate::llm_runtime::decisions::DecisionOutcome,
+pub fn digest_relationship(
+    outcome: &crate::llm::decisions::DecisionOutcome,
     antecedents: &std::collections::BTreeMap<String, String>,
 ) -> Option<PlannedTaskShape> {
-    let answer = outcome.acted(crate::llm_runtime::decisions::digest_keys::RELATIONSHIP)?;
+    let answer = outcome.acted(crate::llm::decisions::digest_keys::RELATIONSHIP)?;
     let chosen = answer.chosen()?;
     let (relationship, antecedent) = match antecedents.get(chosen) {
         Some(id) => ("continuation", Some(id.clone())),
@@ -422,9 +426,9 @@ pub(crate) fn digest_relationship(
 }
 
 /// Whether the digest flags the message as identity-critical.
-pub(crate) fn digest_identity(outcome: &crate::llm_runtime::decisions::DecisionOutcome) -> bool {
+pub fn digest_identity(outcome: &crate::llm::decisions::DecisionOutcome) -> bool {
     outcome
-        .acted(crate::llm_runtime::decisions::digest_keys::IDENTITY)
+        .acted(crate::llm::decisions::digest_keys::IDENTITY)
         .and_then(aidaemon_decisions::Answer::p_yes)
         .is_some_and(|p| p >= 0.5)
 }
@@ -434,17 +438,14 @@ pub(crate) fn digest_identity(outcome: &crate::llm_runtime::decisions::DecisionO
 /// and exact emergency control commands bypass it.
 #[cfg(test)]
 fn should_skip_planning(
-    _task_kind: &crate::agent::CompletionTaskKind,
+    _task_kind: &crate::turn::completion_contract::CompletionTaskKind,
     user_text: &str,
     is_acknowledgment: bool,
 ) -> bool {
     planning_skip_reason(user_text, is_acknowledgment).is_some()
 }
 
-pub(crate) fn planning_skip_reason(
-    user_text: &str,
-    is_acknowledgment: bool,
-) -> Option<&'static str> {
+pub fn planning_skip_reason(user_text: &str, is_acknowledgment: bool) -> Option<&'static str> {
     if is_acknowledgment {
         return Some("acknowledgment");
     }
@@ -470,7 +471,7 @@ pub(crate) fn planning_skip_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_runtime::gateway::test_support::*;
+    use crate::llm::gateway::test_support::*;
     use std::sync::Arc;
 
     /// An opted-out turn's one policy event carries the opt-out's reason
@@ -479,7 +480,7 @@ mod tests {
     #[test]
     fn an_opted_out_turn_records_the_opt_out_whatever_its_policy() {
         use aidaemon_memory::policy::TurnAuthor;
-        let opted_out = crate::agent::memory_plugin::OPTED_OUT_REASON;
+        let opted_out = OPTED_OUT_REASON;
         for (author, forbidden) in [
             (TurnAuthor::Person, false),
             (TurnAuthor::Person, true),
@@ -488,7 +489,10 @@ mod tests {
             let policy = MemoryPipelinePolicy::compile(author, forbidden);
             let data = memory_policy_compiled_data("task-1", "turn-1", &policy, true);
             assert_eq!(data.reason_code, opted_out, "{policy:?}");
-            assert_eq!(data.access, crate::events::MemoryPipelineAccess::Suppressed);
+            assert_eq!(
+                data.access,
+                aidaemon_events::MemoryPipelineAccess::Suppressed
+            );
             assert!(data.persistence_suppressed);
             assert_eq!(data.retrieval_suppressed, !policy.allows_recall());
 
@@ -500,7 +504,7 @@ mod tests {
 
     #[test]
     fn conversational_turn_reaches_the_relationship_router() {
-        use crate::agent::CompletionTaskKind;
+        use crate::turn::completion_contract::CompletionTaskKind;
         assert!(!should_skip_planning(
             &CompletionTaskKind::Conversational,
             "hello there how are you doing today",
@@ -510,7 +514,7 @@ mod tests {
 
     #[test]
     fn short_turn_reaches_the_relationship_router() {
-        use crate::agent::CompletionTaskKind;
+        use crate::turn::completion_contract::CompletionTaskKind;
         assert!(!should_skip_planning(
             &CompletionTaskKind::Find,
             "hi",
@@ -520,7 +524,7 @@ mod tests {
 
     #[test]
     fn direct_recall_question_reaches_the_relationship_router() {
-        use crate::agent::CompletionTaskKind;
+        use crate::turn::completion_contract::CompletionTaskKind;
         assert_eq!(planning_skip_reason("What's my dad's name?", false), None);
         assert!(!should_skip_planning(
             &CompletionTaskKind::Answer,
@@ -538,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_should_skip_control_commands() {
-        use crate::agent::CompletionTaskKind;
+        use crate::turn::completion_contract::CompletionTaskKind;
         assert!(should_skip_planning(
             &CompletionTaskKind::Conversational,
             "cancel",
@@ -568,7 +572,7 @@ mod tests {
 
     #[test]
     fn timed_request_reaches_the_relationship_router() {
-        use crate::agent::CompletionTaskKind;
+        use crate::turn::completion_contract::CompletionTaskKind;
         assert_eq!(
             planning_skip_reason("Check deployment tomorrow at 9am", false),
             None
@@ -588,7 +592,7 @@ mod tests {
 
     #[test]
     fn test_should_skip_acknowledgment() {
-        use crate::agent::CompletionTaskKind;
+        use crate::turn::completion_contract::CompletionTaskKind;
         assert!(should_skip_planning(
             &CompletionTaskKind::Change,
             "ok thanks that looks good",
@@ -598,7 +602,7 @@ mod tests {
 
     #[test]
     fn test_should_not_skip_investigative_question() {
-        use crate::agent::CompletionTaskKind;
+        use crate::turn::completion_contract::CompletionTaskKind;
         assert!(!should_skip_planning(
             &CompletionTaskKind::Find,
             "Can you figure out how the Twitter scheduled task got removed?",
@@ -608,7 +612,7 @@ mod tests {
 
     #[test]
     fn test_should_not_skip_change_task() {
-        use crate::agent::CompletionTaskKind;
+        use crate::turn::completion_contract::CompletionTaskKind;
         assert!(!should_skip_planning(
             &CompletionTaskKind::Change,
             "Create a website about zeigarnik effect and deploy to cloudflare",
@@ -725,8 +729,8 @@ mod tests {
 
     #[test]
     fn memory_policy_is_compiled_once_from_typed_task_capabilities() {
-        let user_memory = crate::traits::ToolSemanticScope::UserMemory;
-        let current_contract = crate::agent::CompletionContract::default();
+        let user_memory = aidaemon_events::traits::ToolSemanticScope::UserMemory;
+        let current_contract = crate::turn::completion_contract::CompletionContract::default();
         let person = compile_memory_pipeline_policy(&current_contract, true);
         assert_eq!(
             person,
@@ -760,8 +764,8 @@ mod digest_tests {
     use aidaemon_decisions::{Answer, ConfidenceSource, DecisionResponse, QuestionKind};
 
     use super::*;
-    use crate::llm_runtime::decide::gated_for_tests;
-    use crate::llm_runtime::decisions::{digest_keys, Decision};
+    use crate::llm::decide::gated_for_tests;
+    use crate::llm::decisions::{digest_keys, Decision};
 
     const CONTEXT: &str = "[Session Summary] synthetic summary\n\
         - [message_id=msg-1] U: book a table for Alice Rivera\n\
@@ -771,11 +775,7 @@ mod digest_tests {
         USER message_id=\"msg-0\" (unfinished request): \"deploy the docs\"\n\
         USER message_id=\"msg-1\" (unfinished request): \"book a table\"";
 
-    fn outcome(
-        key: &str,
-        answer: Answer,
-        acting: bool,
-    ) -> crate::llm_runtime::decisions::DecisionOutcome {
+    fn outcome(key: &str, answer: Answer, acting: bool) -> crate::llm::decisions::DecisionOutcome {
         let mut answers = BTreeMap::new();
         answers.insert(key.to_string(), answer);
         gated_for_tests(

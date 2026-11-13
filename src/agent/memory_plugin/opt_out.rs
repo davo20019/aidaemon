@@ -30,7 +30,7 @@ use crate::events::{EventEmitter, EventType, MemoryPipelineAccess, MemoryPolicyC
 pub(crate) use aidaemon_policies::SKIP_LEARNING_TOOL;
 
 /// The policy event's reason for an opted-out turn.
-pub(crate) const OPTED_OUT_REASON: &str = "learning_opted_out";
+pub(crate) use aidaemon_runtime::turn::task_planning::OPTED_OUT_REASON;
 
 /// Mark the turn's events so no automatic memory pipeline learns from them.
 pub(crate) async fn mark_turn_opted_out(

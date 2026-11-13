@@ -130,6 +130,7 @@ impl Agent {
     /// not write the note.
     pub(crate) async fn tainted_note_turn(&self, session_id: &str) -> anyhow::Result<String> {
         let turn_id = self
+            .runtime
             .current_turn_ids
             .read()
             .await

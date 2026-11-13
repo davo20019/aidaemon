@@ -2,12 +2,12 @@
 
 use serde_json::{json, Value};
 
-use crate::config::{AudioConfig, VisionConfig};
-use crate::traits::MessageAttachment;
+use crate::settings::{AudioConfig, VisionConfig};
+use aidaemon_events::conversation::MessageAttachment;
 
-use crate::agent::audio::build_audio_blocks;
-use crate::agent::turn_render::RenderMode;
-use crate::agent::vision::build_image_blocks;
+use crate::media::audio::build_audio_blocks;
+use crate::media::vision::build_image_blocks;
+use crate::turn::turn_render::RenderMode;
 
 /// Result of building wire-format user content for a message with attachments.
 pub struct AttachmentBuildResult {

@@ -1,6 +1,9 @@
 mod run;
 mod shortcuts;
-pub(crate) mod task_planning;
+/// Task planning and the turn digest live in `aidaemon-runtime`.
+pub(crate) mod task_planning {
+    pub(crate) use aidaemon_runtime::turn::task_planning::*;
+}
 mod types;
 
 pub(in crate::agent) use run::run_bootstrap;

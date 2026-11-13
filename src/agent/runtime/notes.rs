@@ -56,6 +56,7 @@ impl Agent {
         let turn_id = match turn_id {
             Some(turn_id) => turn_id.to_string(),
             None => self
+                .runtime
                 .current_turn_ids
                 .read()
                 .await
@@ -248,6 +249,7 @@ mod tests {
         assert!(
             harness
                 .agent
+                .runtime
                 .current_turn_ids
                 .read()
                 .await

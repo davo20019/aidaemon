@@ -22,8 +22,10 @@ pub use aidaemon_events::model_call_telemetry::{
     record_model_call_telemetry, ModelCallTelemetryInput,
 };
 pub use aidaemon_events::payloads::*;
+#[cfg(test)]
+pub(crate) use aidaemon_events::run_aggregate::RunAggregate;
 pub(crate) use aidaemon_events::run_aggregate::{
-    CloseoutDecision, RunAggregate, RunObligationClass, RunObligationState, RunTerminalDecision,
+    CloseoutDecision, RunObligationClass, RunObligationState, RunTerminalDecision,
     OWNER_APPROVAL_DECLINED,
 };
 #[cfg(test)]

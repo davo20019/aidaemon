@@ -1,5 +1,5 @@
-use crate::events::TaskOutcome;
-use crate::execution_policy::ModelProfile;
+use crate::policy::execution::ModelProfile;
+use aidaemon_events::TaskOutcome;
 
 use super::accumulator::{ContractSnapshot, CostSnapshot, ProgressSnapshot, RoutingSnapshot};
 
@@ -256,7 +256,7 @@ pub fn weighted_tokens_from_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::TaskOutcome;
+    use aidaemon_events::TaskOutcome;
 
     fn default_routing() -> RoutingSnapshot {
         RoutingSnapshot {

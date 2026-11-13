@@ -11,13 +11,11 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::config::{
-    AudioConfig, IterationLimitConfig, PathAliasConfig, PolicyConfig, SttConfig, VisionConfig,
-};
+use crate::config::{IterationLimitConfig, PathAliasConfig};
 use crate::events::{
     AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
     SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData, TaskStatus,
-    ThinkingStartData, ToolCallInfo, ToolResultData,
+    ThinkingStartData, ToolResultData,
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
@@ -30,10 +28,14 @@ use crate::runtime_ports::OutboundRouter;
 use crate::skills;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{
-    AgentRole, ChatOptions, Message, StateStore, Tool, ToolCall, ToolCapabilities, ToolRole,
+    AgentRole, ChatOptions, Message, StateStore, Tool, ToolCapabilities, ToolRole,
 };
 use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
+#[cfg(test)]
+use crate::events::ToolCallInfo;
+#[cfg(test)]
+use crate::traits::ToolCall;
 pub use crate::types::StatusUpdate;
 // `Task` is consumed only by in-tree `#[cfg(test)]` modules that import the
 // agent namespace via `use super::*` (e.g. `runtime/goal_failure_tests.rs`).
@@ -47,15 +49,6 @@ const DEFERRED_NO_TOOL_ERROR_MARKER: &str = "deferred-action no-tool loop";
 /// Set high enough to allow complex multi-step investigations from mobile,
 /// and to leave room for follow-up work after cli_agent returns.
 use aidaemon_runtime::turn::loop_utils::MAX_CONSECUTIVE_SAME_TOOL;
-/// The adjacent prior assistant answer is recent transcript, not generic
-/// archive. Keep ordinary answers verbatim up to roughly 3k tokens; only
-/// genuinely oversized answers use deterministic head/tail compaction.
-const MAX_ADJACENT_ASSISTANT_CONTENT_CHARS: usize = 12_000;
-/// Higher cap for archived assistant messages that end in a clarifying
-/// question/menu: the options ARE the actionable state the next user turn
-/// refers to ("Yes do 1, 2"), so they must survive archival. Content over the
-/// cap keeps the question head and the option tail and elides the middle.
-const MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS: usize = 2000;
 #[path = "response_analysis.rs"]
 mod response_analysis;
 #[cfg(test)]
@@ -113,7 +106,7 @@ mod recall_guardrails {
 }
 #[path = "policy/trust_tier.rs"]
 pub(crate) mod trust_tier;
-use loop_utils::{fixup_message_ordering, is_trigger_session};
+use loop_utils::is_trigger_session;
 /// The post-run learning context lives in `aidaemon-runtime`.
 mod post_task {
     pub(crate) use aidaemon_runtime::turn::post_task::*;
@@ -192,14 +185,13 @@ mod turn_context;
 #[path = "runtime/untrusted.rs"]
 pub(crate) mod untrusted;
 pub(in crate::agent) use completion_contract::persistable_completion_contract;
+#[cfg(test)]
+pub(in crate::agent) use followup::FollowupMode;
 pub(in crate::agent) use history::retain_structural_completion_contract;
 pub(in crate::agent) use history::CompletionContract;
 pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;
-pub(in crate::agent) use history::FollowupMode;
 pub(in crate::agent) use history::TurnContext;
-pub(crate) mod attachment_content;
-pub(crate) mod audio;
 pub(in crate::agent) mod eval;
 /// Evidence routing lives in `aidaemon-runtime`.
 mod inquiry {
@@ -222,16 +214,17 @@ mod prefix_fingerprint {
 #[path = "runtime/resume.rs"]
 mod resume;
 mod runtime_ports;
-mod turn_host;
-/// Tool-result summaries live in `aidaemon-runtime`.
-mod sliding_window {
-    pub(in crate::agent) use aidaemon_runtime::turn::sliding_window::*;
-}
 #[path = "runtime/spawn.rs"]
 mod spawn;
+mod turn_host;
 /// What the owner reads for a helper on cards, status lines and timing.
-pub(crate) use spawn::child_status_label as helper_card_label;
-pub(crate) mod stt;
+pub(crate) use aidaemon_runtime::spawn::child_status_label as helper_card_label;
+/// The session history appends and turn-context assembly, on any TurnHost.
+pub(in crate::agent) use aidaemon_runtime::turn::turn_context::TurnHistory;
+/// The speech-to-text fallback lives in `aidaemon-runtime`.
+pub(crate) mod stt {
+    pub(crate) use aidaemon_runtime::media::stt::*;
+}
 /// System directives live in `aidaemon-runtime`.
 mod system_directives {
     pub(in crate::agent) use aidaemon_runtime::turn::system_directives::*;
@@ -248,24 +241,19 @@ mod tool_execution;
 mod tool_result_notices {
     pub(in crate::agent) use aidaemon_runtime::turn::tool_result_notices::*;
 }
-/// Whole-turn eviction lives in `aidaemon-runtime`.
-pub(crate) mod turn_eviction {
-    pub(crate) use aidaemon_runtime::turn::turn_eviction::*;
+/// Image attachments live in `aidaemon-runtime`.
+pub(crate) mod vision {
+    pub(crate) use aidaemon_runtime::media::vision::*;
 }
-#[path = "turn/turn_render.rs"]
-pub(crate) mod turn_render;
-#[path = "turn/turn_render_cache.rs"]
-pub(crate) mod turn_render_cache;
-pub(crate) mod vision;
 
 pub(in crate::agent) use eval::{HarnessEvalAccumulator, HarnessEvalConfig, HarnessEvalSeed};
 use system_prompt::format_goal_context;
 pub(in crate::agent) use tool_result_notices::ToolResultNotice;
 
-// Policy runtime metrics and bounded autotuning.
-// Implementation lives in `policy_metrics.rs` (Phase 5 decoupling).
-#[path = "policy_metrics.rs"]
-mod policy_metrics;
+/// Policy runtime metrics and bounded autotuning live in `aidaemon-runtime`.
+mod policy_metrics {
+    pub use aidaemon_runtime::policy::metrics::*;
+}
 pub use policy_metrics::{
     apply_bounded_autotune_from_failure_ratio, init_policy_tunables_once, policy_autotune_snapshot,
     policy_metrics_boot_id, policy_metrics_snapshot,
@@ -301,27 +289,6 @@ pub(in crate::agent) use agent_helpers::{
 /// `message_build` to emit an explicit boundary-movement event.
 type WindowBoundaryMemory = Arc<tokio::sync::RwLock<HashMap<String, (usize, Option<String>)>>>;
 
-/// Pillar A per-session core-prompt cache: `session_id` → last rendered
-/// [`core_prompt::CachedCore`]. On a HIT (aggregate hash unchanged) the cached
-/// bytes are reused verbatim with no re-render; on a MISS the changed
-/// component(s) are logged (`Core prompt invalidated component=...`) and the
-/// entry is replaced. In-memory, lost on restart.
-type CorePromptCache = Arc<tokio::sync::RwLock<HashMap<String, core_prompt::CachedCore>>>;
-
-/// Pillar B per-session/per-turn render cache: `session_id` → (`turn_id` →
-/// [`turn_render_cache::CachedRender`]). Reuses rendered turn bytes verbatim
-/// when `content_fp` + `renderer_version` + `mode` all match; on a miss the
-/// turn is re-rendered and the entry replaced. In-memory, lost on restart.
-type TurnRenderCache =
-    Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, turn_render_cache::CachedRender>>>>;
-
-/// Pillar B per-session in-memory anchor: `session_id` → anchor `turn_seq`. The
-/// archived region carried into each payload starts at this turn; eviction
-/// advances it. In-memory, lost on restart (one re-prefill per restart is
-/// accepted). Consumed by the message-build integration in Task 7; unused until
-/// then.
-type TurnAnchorMemory = Arc<tokio::sync::RwLock<HashMap<String, i64>>>;
-
 /// Immutable execution identity for one worker inside one autonomous mandate
 /// decision cycle. The lease token is Rust-side control state and must never be
 /// serialized, logged, or exposed to the model.
@@ -341,6 +308,9 @@ pub(crate) struct MandateExecutionFence {
 
 pub struct Agent {
     llm_runtime: SharedLlmRuntime,
+    /// The turn runtime's settings and caches (context window, policy,
+    /// media, prompt and render caches, turn ids).
+    runtime: aidaemon_runtime::turn_runtime::TurnRuntime,
     /// The gateway for model calls made outside the agent loop.
     side_calls: crate::llm_runtime::gateway::SideCallGateway,
     state: Arc<dyn StateStore>,
@@ -417,10 +387,6 @@ pub struct Agent {
     /// the same sender sends while it runs into the run (mid-turn steering).
     /// Set after channel startup via `set_task_registry()`.
     task_registry: std::sync::OnceLock<Arc<crate::tasks::TaskRegistry>>,
-    /// Context window management configuration.
-    context_window_config: crate::config::ContextWindowConfig,
-    /// Policy rollout and enforcement configuration.
-    policy_config: PolicyConfig,
     /// Configured path alias roots (for example, `projects/...`).
     path_aliases: PathAliasConfig,
     /// Where received attachments are saved: daemon storage, never a project.
@@ -442,14 +408,6 @@ pub struct Agent {
     /// Executor children so they can access Action tools that were filtered
     /// out of the TaskLead's own `tools` vec.
     root_tools: Option<Vec<Arc<dyn Tool>>>,
-    /// Emit structured decision points into the event store for self-diagnostics.
-    record_decision_points: bool,
-    /// Per-session conversation turn IDs. Populated at the start of each
-    /// `handle_message_impl` and read by `append_message_canonical` so every
-    /// message written during a turn is stamped with the same `turn_id`.
-    /// `message_build` uses this stamp to find the current-task
-    /// boundary without inferring from message content.
-    current_turn_ids: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     /// Some turn of this agent read (or started with) untrusted content.
     /// Kept in memory so a taint that could not be recorded still counts
     /// when a parent reads this child's result.
@@ -471,36 +429,12 @@ pub struct Agent {
     /// Loaded once at agent construction and shared with every child agent
     /// spawned from this hierarchy.
     pub(crate) specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
-    /// Pillar A per-session core-prompt cache (Task 7). Keyed by `session_id`;
-    /// reuses rendered core bytes verbatim across tasks when the session-static
-    /// inputs are unchanged, and logs the changed component on invalidation.
-    core_prompts: CorePromptCache,
-    /// Pillar B per-session/per-turn render cache (Task 5). Keyed by
-    /// `session_id` then `turn_id`; reuses rendered turn bytes verbatim across
-    /// builds when `content_fp` + `renderer_version` + `mode` are unchanged.
-    /// Consumed by the message-build integration (Pillar B Task 7).
-    turn_renders: TurnRenderCache,
-    /// Pillar B per-session anchor tracker (Task 6). Keyed by `session_id`;
-    /// maps to the anchor `turn_seq` of the oldest archived turn carried into
-    /// the payload. Eviction advances it. Consumed by the message-build
-    /// integration (Pillar B Task 7).
-    turn_anchors: TurnAnchorMemory,
     /// llama.cpp interactive KV-cache slot for the main generation loop.
     /// `Some(interactive_slot)` only when slot routing is enabled on the primary
     /// provider; `None` otherwise (and for all sub-agents). When set, it is
     /// applied to the main-loop `ChatOptions.id_slot` so the interactive
     /// conversation pins a dedicated slot that background tasks cannot evict.
     interactive_slot: Option<u32>,
-    /// Vision/image encoding settings for multimodal LLM requests.
-    vision_config: VisionConfig,
-    /// Native audio input settings for multimodal LLM requests.
-    audio_config: AudioConfig,
-    /// Local Whisper STT fallback when native audio is skipped.
-    stt_config: SttConfig,
-    /// Per-task harness effectiveness accumulator (cleared after TaskEnd).
-    harness_eval: Arc<RwLock<Option<HarnessEvalAccumulator>>>,
-    /// Harness eval scoring configuration.
-    harness_eval_config: HarnessEvalConfig,
 }
 
 pub(in crate::agent) use system_directives::SystemDirective;
@@ -710,12 +644,20 @@ impl Agent {
         model: &str,
     ) -> (bool, usize, usize, usize, Option<i64>) {
         (
-            self.context_window_config.enabled,
-            crate::context_budget::model_context_budget(model, &self.context_window_config),
-            self.context_window_config
+            self.runtime.context_window_config.enabled,
+            crate::context_budget::model_context_budget(model, &self.runtime.context_window_config),
+            self.runtime
+                .context_window_config
                 .summarize_token_threshold_for(model),
-            self.context_window_config.summary_recent_tokens_for(model),
-            self.turn_anchors.read().await.get(session_id).copied(),
+            self.runtime
+                .context_window_config
+                .summary_recent_tokens_for(model),
+            self.runtime
+                .turn_anchors
+                .read()
+                .await
+                .get(session_id)
+                .copied(),
         )
     }
 
@@ -727,8 +669,8 @@ impl Agent {
         token_threshold: usize,
         recent_tokens: usize,
     ) {
-        self.context_window_config.summarize_token_threshold = token_threshold;
-        self.context_window_config.summary_recent_tokens = recent_tokens;
+        self.runtime.context_window_config.summarize_token_threshold = token_threshold;
+        self.runtime.context_window_config.summary_recent_tokens = recent_tokens;
         // The turn's post-reply compaction reads the writer's own copy.
         self.transcript_writes = memory_plugin::DaemonMemory::new(
             self.state.clone(),
@@ -736,7 +678,7 @@ impl Agent {
             self.event_store.clone(),
             self.llm_runtime.clone(),
             self.side_calls.clone(),
-            self.context_window_config.clone(),
+            self.runtime.context_window_config.clone(),
             0,
             false,
             "",
@@ -751,28 +693,19 @@ impl Agent {
         &self.event_store
     }
 
-    pub(crate) fn render_options(&self, model: &str) -> turn_render::RenderOptions {
-        turn_render::RenderOptions {
-            vision: self.vision_config.clone(),
-            audio: self.audio_config.clone(),
-            stt: self.stt_config.clone(),
-            model: model.to_string(),
-        }
-    }
-
     pub(in crate::agent) async fn install_harness_eval(&self, accumulator: HarnessEvalAccumulator) {
-        *self.harness_eval.write().await = Some(accumulator);
+        self.runtime.install_harness_eval(accumulator).await;
     }
 
     pub(in crate::agent) async fn with_harness_eval<R>(
         &self,
         f: impl FnOnce(&mut HarnessEvalAccumulator) -> R,
     ) -> Option<R> {
-        self.harness_eval.write().await.as_mut().map(f)
+        self.runtime.with_harness_eval(f).await
     }
 
     pub(in crate::agent) fn harness_eval_enabled(&self) -> bool {
-        self.harness_eval_config.enabled
+        self.runtime.harness_eval_enabled()
     }
 
     /// Maximum recursion depth allowed.

@@ -41,10 +41,6 @@ mod mandates {
 }
 mod mcp;
 mod memory;
-/// Chat content helpers live in `aidaemon-runtime`.
-mod message_content {
-    pub(crate) use aidaemon_runtime::message_content::*;
-}
 pub mod nodes;
 mod oauth;
 #[allow(unused_imports)]

@@ -211,7 +211,7 @@ impl Agent {
             &request.model,
             0,
             &tools,
-            &self.context_window_config,
+            &self.runtime.context_window_config,
         );
         // Hook notes (recalled memory) ride in the wire prefix; the rest of
         // the kernel transcript after the starting prefix is this run's.
