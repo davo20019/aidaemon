@@ -1,64 +1,22 @@
 //! Skills live in `aidaemon_skills`. The daemon keeps its old paths to them
-//! and the model it gives skill promotion.
+//! (skill promotion writes through the side-call gateway, its
+//! `PromotionModel`).
 
 pub use aidaemon_skills::*;
 
-/// Skill promotion, with the daemon's side-call gateway as its model.
+/// Skill promotion; the side-call gateway is its model.
 pub mod promotion {
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    use serde_json::Value;
-
     pub use aidaemon_skills::promotion::*;
-
-    use crate::llm_runtime::gateway::SideCallGateway;
-    use crate::llm_runtime::side_calls::SideCall;
-    use crate::traits::StateStore;
-
-    /// Skill drafts are written through the `skill_promotion` side call.
-    struct SideCallPromotion(SideCallGateway);
-
-    #[async_trait::async_trait]
-    impl PromotionModel for SideCallPromotion {
-        async fn write_skill(&self, messages: &[Value]) -> anyhow::Result<String> {
-            // Background work does not need the strongest model: the spec runs
-            // on the cheap model.
-            Ok(self
-                .0
-                .ask(
-                    SideCall::SkillPromotion,
-                    messages,
-                    &Default::default(),
-                    None,
-                )
-                .await?
-                .text)
-        }
-    }
-
-    /// The daemon's promoter: drafts in its state store, written through
-    /// its side-call gateway.
-    pub fn promoter(
-        state: Arc<dyn StateStore>,
-        side_calls: SideCallGateway,
-        skills_dir: PathBuf,
-        evidence_gate_enforce: bool,
-    ) -> SkillPromoter {
-        SkillPromoter::new(
-            state,
-            Arc::new(SideCallPromotion(side_calls)),
-            skills_dir,
-            evidence_gate_enforce,
-        )
-    }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::sync::Arc;
+
         use crate::llm_runtime::gateway::test_support::{
             failed_calls, gateway_with, ok_calls, provider_answering, provider_failing,
         };
+        use crate::llm_runtime::gateway::SideCallGateway;
         use crate::traits::store_prelude::*;
         use crate::traits::Procedure;
 
@@ -74,7 +32,11 @@ pub mod promotion {
         async fn promoter_with(
             gateway: SideCallGateway,
             successes: i32,
-        ) -> (SkillPromoter, Arc<dyn StateStore>, tempfile::TempDir) {
+        ) -> (
+            SkillPromoter,
+            Arc<dyn crate::traits::StateStore>,
+            tempfile::TempDir,
+        ) {
             let file = tempfile::NamedTempFile::new().unwrap();
             let path = file.path().to_str().unwrap().to_string();
             // The store keeps the file open; the file outlives the test.
@@ -101,11 +63,11 @@ pub mod promotion {
                 })
                 .await
                 .unwrap();
-            let state: Arc<dyn StateStore> = Arc::new(store);
+            let state: Arc<dyn crate::traits::StateStore> = Arc::new(store);
             let skills_dir = tempfile::tempdir().unwrap();
-            let promoter = promoter(
+            let promoter = SkillPromoter::new(
                 state.clone(),
-                gateway,
+                Arc::new(gateway),
                 skills_dir.path().to_path_buf(),
                 false,
             );

@@ -38,7 +38,7 @@ mod tool_facts {
 mod writer;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use opt_out::{
-    mark_turn_opted_out, set_next_message_private, take_next_message_private, OPTED_OUT_REASON,
+    mark_turn_opted_out, set_next_message_private, take_next_message_private,
 };
 pub(crate) use recall::DaemonRecall;
 pub(crate) use system_memory::SystemMemory;

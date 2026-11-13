@@ -356,9 +356,9 @@ pub(crate) async fn init_heartbeat_coordinator(
 
         // Skill promotion (every 12 hours)
         if let Some(sd) = skills_dir {
-            let promoter = Arc::new(crate::skills::promotion::promoter(
+            let promoter = Arc::new(crate::skills::promotion::SkillPromoter::new(
                 state.clone(),
-                side_calls.clone(),
+                Arc::new(side_calls.clone()),
                 sd,
                 config.policy.learning_evidence_gate_enforce,
             ));
@@ -553,7 +553,8 @@ pub(crate) fn start_heartbeat_coordinator(
     heartbeat_opt.map(|mut heartbeat| {
         let outbound: Arc<dyn crate::runtime_ports::OutboundRouter> = hub.clone();
         heartbeat.set_hub(Arc::downgrade(&outbound));
-        heartbeat.set_agent(Arc::downgrade(agent));
+        let agent: std::sync::Weak<crate::agent::Agent> = Arc::downgrade(agent);
+        heartbeat.set_agent(agent);
         info!("Heartbeat coordinator starting with hub and agent references");
         heartbeat.start(shutdown)
     })
@@ -654,7 +655,7 @@ pub(crate) async fn init_health_probe_manager(
 
     let health_manager = Arc::new(HealthProbeManager::new(
         store.clone(),
-        Arc::new(crate::health::HubAlerts(hub)),
+        hub,
         config.health.tick_interval_secs,
     ));
     health_manager

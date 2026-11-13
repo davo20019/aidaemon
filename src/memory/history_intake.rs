@@ -20,9 +20,9 @@ use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 use tracing::info;
 
-use super::history_source::EventHistory;
 use crate::traits::{SettingsStore, StateStore};
 use crate::types::ChannelVisibility;
+use aidaemon_runtime::history::EventHistory;
 
 const BATCH: i64 = 200;
 const INTERVAL: Duration = Duration::from_secs(60);

@@ -1955,7 +1955,10 @@ async fn mcp_add_decline_is_kernel_owned_and_retries_do_not_prompt() {
     let backing = setup_test_agent(MockProvider::with_responses(vec![]))
         .await
         .unwrap();
-    let registry = crate::mcp::McpRegistry::new(backing.state.clone());
+    let registry = crate::mcp::McpRegistry::new(
+        backing.state.clone(),
+        crate::config::secret_store().clone(),
+    );
     let tool: Arc<dyn crate::traits::Tool> = Arc::new(OfferedManageMcpTool(
         crate::tools::ManageMcpTool::new(registry.clone()),
     ));

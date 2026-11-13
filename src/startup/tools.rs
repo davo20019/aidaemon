@@ -1087,7 +1087,7 @@ async fn register_runtime_tool_by_id(
                 .callback_url
                 .clone()
                 .unwrap_or_else(|| format!("http://localhost:{}", config.daemon.health_port));
-            let gateway = crate::oauth::daemon_gateway(
+            let gateway = crate::startup::oauth::daemon_gateway(
                 state.clone() as Arc<dyn crate::traits::OAuthGatewayStore>,
                 http_profiles,
                 callback_url,
@@ -1423,8 +1423,10 @@ mod tests {
         )
         .await?;
 
-        let mcp_registry =
-            McpRegistry::new(state.clone() as Arc<dyn crate::traits::McpRegistryStore>);
+        let mcp_registry = McpRegistry::new(
+            state.clone() as Arc<dyn crate::traits::McpRegistryStore>,
+            crate::config::secret_store().clone(),
+        );
         let http_profiles: crate::oauth::SharedHttpProfiles =
             Arc::new(tokio::sync::RwLock::new(config.http_auth.clone()));
         let _runtime = register_runtime_tools(

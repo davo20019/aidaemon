@@ -13,12 +13,12 @@ use sqlx::{Row, SqlitePool};
 use tracing::info;
 
 use super::embeddings::EmbeddingService;
-use super::history_source::EventHistory;
 use crate::events::Consolidator;
 use crate::llm_runtime::gateway::SideCallGateway;
 use crate::llm_runtime::side_calls::SideCall;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::traits::StateStore;
+use aidaemon_runtime::history::EventHistory;
 
 /// The daemon's side of the memory jobs.
 pub(crate) struct DaemonJobsHost {

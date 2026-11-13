@@ -28,6 +28,7 @@ aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels" }
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
 aidaemon-decisions = { version = "0.2.0", path = "../aidaemon-decisions", features = ["gemini"] }
 aidaemon-events = { version = "0.2.0", path = "../aidaemon-events" }
+aidaemon-mcp = { version = "0.2.0", path = "../aidaemon-mcp" }
 aidaemon-memory = { version = "0.2.0", path = "../aidaemon-memory" }
 aidaemon-policies = { version = "0.2.0", path = "../aidaemon-policies" }
 aidaemon-skills = { version = "0.2.0", path = "../aidaemon-skills" }

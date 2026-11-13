@@ -8,27 +8,28 @@ use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
 use tracing::warn;
 
-use crate::traits::StateStore;
-use crate::types::{ChannelVisibility, UserRole};
+use crate::stores::StateStore;
+use aidaemon_core::ChannelVisibility;
+use aidaemon_tools::semantics::UserRole;
 
 /// Reads the event log for memory consolidation.
 #[derive(Clone)]
-pub(crate) struct EventHistory {
+pub struct EventHistory {
     pool: SqlitePool,
     /// Where consolidation cursors are kept (settings).
     state: Option<Arc<dyn StateStore>>,
 }
 
 impl EventHistory {
-    pub(crate) fn new(pool: SqlitePool, state: Option<Arc<dyn StateStore>>) -> Self {
+    pub fn new(pool: SqlitePool, state: Option<Arc<dyn StateStore>>) -> Self {
         Self { pool, state }
     }
 
-    pub(crate) fn pool(&self) -> &SqlitePool {
+    pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
-    pub(crate) async fn session_visibility_from_events(
+    pub async fn session_visibility_from_events(
         &self,
         session_id: &str,
     ) -> Option<ChannelVisibility> {
@@ -63,7 +64,7 @@ impl EventHistory {
         Some(ChannelVisibility::from_str_lossy(vis))
     }
 
-    pub(crate) fn parse_event_user_role(data: &serde_json::Value) -> Option<UserRole> {
+    pub fn parse_event_user_role(data: &serde_json::Value) -> Option<UserRole> {
         match data.get("user_role").and_then(|v| v.as_str()) {
             Some("owner") => Some(UserRole::Owner),
             Some("guest") => Some(UserRole::Guest),
@@ -72,17 +73,14 @@ impl EventHistory {
         }
     }
 
-    pub(crate) async fn session_is_memory_isolated(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<bool> {
-        if crate::events::is_memory_isolated_worker_session(session_id) {
+    pub async fn session_is_memory_isolated(&self, session_id: &str) -> anyhow::Result<bool> {
+        if aidaemon_events::is_memory_isolated_worker_session(session_id) {
             return Ok(true);
         }
-        crate::events::session_has_mandate_execution_provenance(&self.pool, session_id).await
+        aidaemon_events::session_has_mandate_execution_provenance(&self.pool, session_id).await
     }
 
-    pub(crate) async fn fact_consolidation_batch_is_owner_only(
+    pub async fn fact_consolidation_batch_is_owner_only(
         &self,
         session_id: &str,
         cutoff: &str,
@@ -130,7 +128,7 @@ impl EventHistory {
     /// Whether every user message after `last_episode` (the session's
     /// latest episode; `None`: the whole session) came from the owner, and
     /// there was at least one.
-    pub(crate) async fn session_since_last_episode_is_owner_only(
+    pub async fn session_since_last_episode_is_owner_only(
         &self,
         session_id: &str,
         last_episode: Option<&aidaemon_memory::records::EpisodeBound>,
@@ -193,11 +191,11 @@ impl EventHistory {
         Ok(saw_owner_message)
     }
 
-    pub(crate) fn fact_consolidation_cursor_key(session_id: &str) -> String {
+    pub fn fact_consolidation_cursor_key(session_id: &str) -> String {
         format!("memory_fact_consolidation_cursor:{}", session_id)
     }
 
-    pub(crate) async fn get_fact_consolidation_cursor(&self, session_id: &str) -> i64 {
+    pub async fn get_fact_consolidation_cursor(&self, session_id: &str) -> i64 {
         let Some(state) = &self.state else {
             return 0;
         };
@@ -208,7 +206,7 @@ impl EventHistory {
         }
     }
 
-    pub(crate) async fn set_fact_consolidation_cursor(
+    pub async fn set_fact_consolidation_cursor(
         &self,
         session_id: &str,
         event_id: i64,
@@ -220,7 +218,7 @@ impl EventHistory {
         state.set_setting(&key, &event_id.to_string()).await
     }
 
-    pub(crate) async fn list_candidate_sessions_for_fact_consolidation(
+    pub async fn list_candidate_sessions_for_fact_consolidation(
         &self,
         cutoff: &str,
     ) -> anyhow::Result<Vec<String>> {
@@ -238,7 +236,7 @@ impl EventHistory {
         self.exclude_memory_isolated_sessions(rows).await
     }
 
-    pub(crate) async fn exclude_memory_isolated_sessions(
+    pub async fn exclude_memory_isolated_sessions(
         &self,
         candidates: Vec<String>,
     ) -> anyhow::Result<Vec<String>> {
@@ -251,7 +249,7 @@ impl EventHistory {
         Ok(eligible)
     }
 
-    pub(crate) async fn memory_suppressed_tasks_for_session(
+    pub async fn memory_suppressed_tasks_for_session(
         &self,
         session_id: &str,
     ) -> anyhow::Result<std::collections::HashSet<String>> {
@@ -269,7 +267,7 @@ impl EventHistory {
         .collect())
     }
 
-    pub(crate) async fn all_memory_suppressed_tasks(
+    pub async fn all_memory_suppressed_tasks(
         &self,
     ) -> anyhow::Result<std::collections::HashSet<String>> {
         Ok(sqlx::query_scalar(
@@ -284,13 +282,13 @@ impl EventHistory {
         .collect())
     }
 
-    pub(crate) async fn fetch_fact_consolidation_messages(
+    pub async fn fetch_fact_consolidation_messages(
         &self,
         session_id: &str,
         cutoff: &str,
         after_event_id: i64,
         limit: usize,
-    ) -> anyhow::Result<Vec<crate::events::ConversationTurn>> {
+    ) -> anyhow::Result<Vec<aidaemon_events::conversation_turn::ConversationTurn>> {
         let suppressed_tasks = self.memory_suppressed_tasks_for_session(session_id).await?;
         let rows = sqlx::query(
             r#"
@@ -341,9 +339,13 @@ impl EventHistory {
                 }
             };
 
-            if let Some(turn) =
-                crate::events::turn_from_event(event_id, session_id, &event_type, &data, created_at)
-            {
+            if let Some(turn) = aidaemon_events::conversation_turn::turn_from_event(
+                event_id,
+                session_id,
+                &event_type,
+                &data,
+                created_at,
+            ) {
                 out.push(turn);
             }
         }
@@ -415,9 +417,15 @@ impl aidaemon_memory::history::ConversationSource for EventHistory {
             .map(|turn| HistoryTurn {
                 id: turn.event_id,
                 role: match turn.role {
-                    crate::events::ConversationTurnRole::User => TurnRole::User,
-                    crate::events::ConversationTurnRole::Assistant => TurnRole::Assistant,
-                    crate::events::ConversationTurnRole::Tool => TurnRole::Tool,
+                    aidaemon_events::conversation_turn::ConversationTurnRole::User => {
+                        TurnRole::User
+                    }
+                    aidaemon_events::conversation_turn::ConversationTurnRole::Assistant => {
+                        TurnRole::Assistant
+                    }
+                    aidaemon_events::conversation_turn::ConversationTurnRole::Tool => {
+                        TurnRole::Tool
+                    }
                 },
                 content: turn.content,
                 created_at: turn.created_at,
@@ -430,7 +438,7 @@ impl aidaemon_memory::history::ConversationSource for EventHistory {
     }
 
     fn channel_id(&self, session_id: &str) -> Option<String> {
-        crate::memory::derive_channel_id_from_session(session_id)
+        aidaemon_events::session::derive_channel_id_from_session(session_id)
     }
 }
 
@@ -450,7 +458,7 @@ impl EventHistory {
     /// The user message event `event_id`, if memory may learn from it: its
     /// task's memory policy allowed access and never suppressed it (a message
     /// outside any task is always learnable).
-    pub(crate) async fn learnable_user_message(
+    pub async fn learnable_user_message(
         &self,
         event_id: i64,
     ) -> anyhow::Result<Option<aidaemon_memory::history::LoggedMessage>> {

@@ -979,7 +979,7 @@ fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
             None => anyhow::bail!("Usage: aidaemon auth logout openai"),
         },
         "status" => {
-            match crate::oauth::chatgpt_codex::load_credentials() {
+            match crate::providers::chatgpt_login::load_credentials() {
                 Some(creds) => {
                     let state = if creds.needs_refresh(chrono::Utc::now()) {
                         "refresh due"
@@ -1035,7 +1035,7 @@ fn auth_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 }
 
 fn run_chatgpt_login(paste: bool) -> anyhow::Result<()> {
-    use crate::oauth::chatgpt_codex::{self, CallbackMode};
+    use crate::providers::chatgpt_login::{self as chatgpt_codex, CallbackMode};
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -1077,14 +1077,14 @@ fn run_chatgpt_login(paste: bool) -> anyhow::Result<()> {
 }
 
 fn run_chatgpt_logout() -> anyhow::Result<()> {
-    if !crate::oauth::chatgpt_codex::is_connected() {
+    if !crate::providers::chatgpt_login::is_connected() {
         println!("No ChatGPT subscription is connected.");
         return Ok(());
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    auth_runtime()?.block_on(crate::oauth::chatgpt_codex::logout(&client))?;
+    auth_runtime()?.block_on(crate::providers::chatgpt_login::logout(&client))?;
     println!("Disconnected the ChatGPT subscription.");
     Ok(())
 }

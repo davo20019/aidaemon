@@ -1,9 +1,9 @@
 // The memory jobs over the daemon's store and event log.
 
 use super::*;
-use crate::memory::activity_log::uncaptured_sessions_sql;
 use crate::traits::Message;
 use aidaemon_memory::full::MemoryJobs;
+use aidaemon_runtime::history::uncaptured_sessions_sql;
 use sqlx::SqlitePool;
 
 use crate::config::ProviderKind;

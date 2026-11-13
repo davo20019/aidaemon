@@ -62,10 +62,10 @@ impl Agent {
             max_iterations_override.unwrap_or(self.limits.max_iterations);
         let effective_timeout_secs = timeout_secs_override.unwrap_or(self.limits.timeout_secs);
         let child_mcp_registry = match mandate_execution.as_ref() {
-            Some(fence) => self
+            Some(_) => self
                 .mcp_registry
                 .as_ref()
-                .map(|registry| registry.scoped_to_mandate(&fence.authority)),
+                .map(|registry| registry.scoped_to_mandate()),
             None => self.mcp_registry.clone(),
         };
         let child_specialists = if mandate_execution.is_some() {

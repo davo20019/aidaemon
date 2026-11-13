@@ -9,15 +9,15 @@ use aidaemon_memory::records::EpisodeBound;
 use chrono::{DateTime, Utc};
 use sqlx::Row;
 
-use super::history_source::EventHistory;
-use crate::traits::{Message, MessageAnnotation};
-use crate::types::UserRole;
+use super::source::EventHistory;
+use aidaemon_events::conversation::{Message, MessageAnnotation};
+use aidaemon_tools::semantics::UserRole;
 
 impl EventHistory {
     /// Fetch messages after the last stable canonical event bound. Legacy
     /// episodes without bounds fall back to end_time.
     /// If no episode exists, returns all session messages up to `limit`.
-    pub(crate) async fn session_messages_after(
+    pub async fn session_messages_after(
         &self,
         session_id: &str,
         last_episode: Option<&EpisodeBound>,
@@ -91,7 +91,7 @@ impl EventHistory {
                 Err(_) => continue,
             };
 
-            if let Some(turn) = crate::events::turn_from_event(
+            if let Some(turn) = aidaemon_events::conversation_turn::turn_from_event(
                 event_id,
                 &row_session_id,
                 &event_type,
@@ -115,7 +115,7 @@ impl EventHistory {
     }
 
     /// Fetch messages from all sessions since a given time.
-    pub(crate) async fn fetch_messages_since(
+    pub async fn fetch_messages_since(
         &self,
         since: &str,
         limit: usize,
@@ -167,7 +167,7 @@ impl EventHistory {
                 Err(_) => continue,
             };
 
-            if let Some(turn) = crate::events::turn_from_event(
+            if let Some(turn) = aidaemon_events::conversation_turn::turn_from_event(
                 event_id,
                 &session_id,
                 &event_type,
@@ -190,7 +190,7 @@ impl EventHistory {
         Ok(messages)
     }
 
-    pub(crate) async fn fetch_owner_user_messages_since(
+    pub async fn fetch_owner_user_messages_since(
         &self,
         since: &str,
         limit: usize,
@@ -246,7 +246,7 @@ impl EventHistory {
                 continue;
             }
 
-            if let Some(turn) = crate::events::turn_from_event(
+            if let Some(turn) = aidaemon_events::conversation_turn::turn_from_event(
                 event_id,
                 &session_id,
                 &event_type,
@@ -279,7 +279,7 @@ impl EventHistory {
 /// a lookup table for it), and sessions with one are driven from the list into
 /// `idx_events_session_time`. A `LEFT JOIN` against `json_each` re-read the
 /// whole list for every event row, which grew with every session and episode.
-pub(crate) fn uncaptured_sessions_sql(filter: &str, having: &str) -> String {
+pub fn uncaptured_sessions_sql(filter: &str, having: &str) -> String {
     format!(
         "SELECT ev.session_id
          FROM events ev

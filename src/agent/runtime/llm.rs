@@ -719,15 +719,20 @@ mod tests {
             model: model.into(),
             ..Default::default()
         };
-        assert_eq!(harness.agent.next_model_answer_at(), None);
+        assert_eq!(harness.agent.llm_runtime.snapshot().next_answer_at(), None);
         let _ = primary.complete(&request("primary-model")).await;
         assert_eq!(
-            harness.agent.next_model_answer_at(),
+            harness.agent.llm_runtime.snapshot().next_answer_at(),
             None,
             "the alternate can"
         );
         let _ = alternate.complete(&request("secondary-model")).await;
-        let at = harness.agent.next_model_answer_at().expect("nobody can");
+        let at = harness
+            .agent
+            .llm_runtime
+            .snapshot()
+            .next_answer_at()
+            .expect("nobody can");
         assert!(at <= soon && at > soon - std::time::Duration::from_secs(5));
     }
 }

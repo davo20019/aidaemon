@@ -12,7 +12,6 @@ use serde_json::{json, Value};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
 
-use super::{ConsolidationResult, Consolidator};
 use crate::config::ProviderKind;
 use crate::events::{
     DecisionPointData, DecisionType, DiagnosticSeverity, Event, EventStore, EventType, TaskEndData,
@@ -22,6 +21,7 @@ use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::embeddings::EmbeddingService;
 use crate::plans::{PlanStatus, PlanStore, StepStatus, TaskPlan};
 use crate::testing::MockProvider;
+use aidaemon_runtime::consolidation::{ConsolidationResult, Consolidator};
 
 const GOLDEN: &str = include_str!("testdata/consolidation.golden");
 
@@ -843,7 +843,9 @@ async fn run(setup: Setup) -> Snapshot {
         memory,
         runtime,
         side_calls,
-        setup.with_models.then(|| embeddings.clone()),
+        setup
+            .with_models
+            .then(|| embeddings.clone() as Arc<dyn aidaemon_memory::Embedder>),
     )
     .with_learning_evidence_gate(setup.evidence_gate);
 

@@ -496,6 +496,23 @@ impl sdk::Provider for SideCallProvider {
     }
 }
 
+/// Skill promotion writes its skill through the gateway's skill-promotion
+/// side call.
+#[async_trait::async_trait]
+impl aidaemon_skills::promotion::PromotionModel for SideCallGateway {
+    async fn write_skill(&self, messages: &[serde_json::Value]) -> anyhow::Result<String> {
+        Ok(self
+            .ask(
+                crate::llm::side_calls::SideCall::SkillPromotion,
+                messages,
+                &Default::default(),
+                None,
+            )
+            .await?
+            .text)
+    }
+}
+
 #[cfg(any(test, feature = "testing"))]
 pub mod test_support {
     //! Gateways over scripted providers, and counts of the rows they write.
