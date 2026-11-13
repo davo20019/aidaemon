@@ -127,6 +127,14 @@ name = "channel_bot"
 required-features = ["macros", "testing", "channels"]
 
 [[example]]
+name = "scheduled_worker"
+required-features = ["testing"]
+
+[[example]]
+name = "own_channel"
+required-features = ["macros", "testing", "channels"]
+
+[[example]]
 name = "sse_server"
 required-features = ["macros", "testing"]
 
