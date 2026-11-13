@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 async fn setup_test_store() -> (SqliteStateStore, tempfile::NamedTempFile) {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let store = SqliteStateStore::new(
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let store = SqliteStateStore::for_tests(
         db_file.path().to_str().unwrap(),
         100,
         None,
@@ -25,8 +25,8 @@ async fn setup_test_store() -> (SqliteStateStore, tempfile::NamedTempFile) {
 
 async fn setup_test_store_with_cap(cap: usize) -> (SqliteStateStore, tempfile::NamedTempFile) {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let store = SqliteStateStore::new(
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let store = SqliteStateStore::for_tests(
         db_file.path().to_str().unwrap(),
         cap,
         None,
@@ -549,8 +549,8 @@ async fn test_open_store_migrates_legacy_messages_to_events() {
 
     pool.close().await;
 
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let store = SqliteStateStore::new(
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let store = SqliteStateStore::for_tests(
         db_file.path().to_str().unwrap(),
         100,
         None,
@@ -652,8 +652,8 @@ async fn test_open_store_migration_skips_preexisting_event_rows() {
 
     pool.close().await;
 
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let store = SqliteStateStore::new(
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let store = SqliteStateStore::for_tests(
         db_file.path().to_str().unwrap(),
         100,
         None,
@@ -3862,8 +3862,8 @@ async fn test_migrate_legacy_scheduled_tasks_to_goals_and_schedules() {
 
     pool.close().await;
 
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let store = SqliteStateStore::new(db_path, 100, None, embedding_service)
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let store = SqliteStateStore::for_tests(db_path, 100, None, embedding_service)
         .await
         .unwrap();
 
@@ -4162,8 +4162,8 @@ async fn test_migrate_v3_tables_renamed_and_schedule_migrated() {
 
     pool.close().await;
 
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let store = SqliteStateStore::new(db_path, 100, None, embedding_service)
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let store = SqliteStateStore::for_tests(db_path, 100, None, embedding_service)
         .await
         .unwrap();
 
@@ -4212,8 +4212,8 @@ async fn test_migrate_v3_tables_renamed_and_schedule_migrated() {
 
     // Idempotency: re-opening should not duplicate migrated schedules.
     drop(store);
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let store2 = SqliteStateStore::new(db_path, 100, None, embedding_service)
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let store2 = SqliteStateStore::for_tests(db_path, 100, None, embedding_service)
         .await
         .unwrap();
     let schedules2 = store2.get_schedules_for_goal("g-v3-1").await.unwrap();
@@ -4602,8 +4602,8 @@ async fn reopening_store_prunes_legacy_prompt_snapshots() {
     }
     drop(store);
 
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let reopened = SqliteStateStore::new(
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let reopened = SqliteStateStore::for_tests(
         db_file.path().to_str().unwrap(),
         100,
         None,
@@ -4638,8 +4638,8 @@ async fn reopening_store_allows_existing_multiple_episodes_per_session() {
     }
     drop(store);
 
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let reopened = SqliteStateStore::new(
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let reopened = SqliteStateStore::for_tests(
         db_file.path().to_str().unwrap(),
         100,
         None,
@@ -4697,8 +4697,8 @@ async fn reopening_store_reclassifies_inferred_goal_mentions_as_non_executable()
     .unwrap();
     drop(store);
 
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let reopened = SqliteStateStore::new(
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let reopened = SqliteStateStore::for_tests(
         db_file.path().to_str().unwrap(),
         100,
         None,
@@ -4765,8 +4765,8 @@ async fn reopening_store_closes_inactive_legacy_continuous_runs() {
         .unwrap();
     drop(store);
 
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let reopened = SqliteStateStore::new(
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let reopened = SqliteStateStore::for_tests(
         db_file.path().to_str().unwrap(),
         100,
         None,

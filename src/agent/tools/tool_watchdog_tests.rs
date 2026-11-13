@@ -90,6 +90,8 @@ impl crate::traits::ToolSemantics for SlowCliAgentTool {
 
 struct EchoSpawnAgentTool;
 
+/// Stands in for `http_request`, a tool a mandate may delegate, and records
+/// each mutation it is allowed to make.
 struct MandateMutationSpy {
     calls: Arc<AtomicUsize>,
     saw_mandate_preapproval: Arc<AtomicBool>,
@@ -105,7 +107,7 @@ struct MandateTestFence {
 #[async_trait::async_trait]
 impl Tool for MandateMutationSpy {
     fn name(&self) -> &str {
-        "mandate_mutation_spy"
+        "http_request"
     }
 
     fn description(&self) -> &str {
@@ -182,7 +184,7 @@ async fn install_active_test_mandate(
     let goal = Goal::new_continuous("Synthetic mandate", "owner-session", None, None);
     let authority = MandateAuthority {
         allow_observations: true,
-        allowed_tools: vec!["mandate_mutation_spy".to_string()],
+        allowed_tools: vec!["http_request".to_string()],
         allowed_mutation_effects: vec!["remote_mutation".to_string()],
         allowed_target_prefixes: vec!["https://api.x.com/2/".to_string()],
         operation_scopes: Vec::new(),
@@ -370,7 +372,7 @@ fn test_mandate_grant(
     match crate::mandates::authority::authorize_mandate_action(
         mandate,
         decision,
-        "mandate_mutation_spy",
+        "http_request",
         arguments,
         &semantics,
         &chrono::Utc::now(),
@@ -396,7 +398,7 @@ fn test_mandate_reservation(
         task_id: fence.worker_task_id.clone(),
         task_attempt_id: fence.worker_attempt.id.clone(),
         tool_call_id: format!("watchdog-mandate-call-{sequence}"),
-        tool_name: "mandate_mutation_spy".to_string(),
+        tool_name: "http_request".to_string(),
         mutation_effects: vec!["remote_mutation".to_string()],
         targets: vec![crate::traits::MandateMutationTarget {
             kind: "url".to_string(),
@@ -690,7 +692,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
         .agent
         .tools
         .iter()
-        .find(|tool| tool.name() == "mandate_mutation_spy")
+        .find(|tool| tool.name() == "http_request")
         .unwrap()
         .call_semantics(arguments);
 
@@ -730,7 +732,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
 
     let missing = harness
         .agent
-        .execute_tool_with_watchdog("mandate_mutation_spy", arguments, &base_ctx(None))
+        .execute_tool_with_watchdog("http_request", arguments, &base_ctx(None))
         .await
         .unwrap_err();
     assert!(missing
@@ -742,7 +744,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
     let mut grant = match crate::mandates::authority::authorize_mandate_action(
         &mandate,
         &decision,
-        "mandate_mutation_spy",
+        "http_request",
         arguments,
         &semantics,
         &chrono::Utc::now(),
@@ -758,7 +760,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
     let changed = harness
         .agent
         .execute_tool_with_watchdog(
-            "mandate_mutation_spy",
+            "http_request",
             r#"{"text":"different update"}"#,
             &base_ctx(Some(&grant)),
         )
@@ -770,7 +772,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
 
     let result = harness
         .agent
-        .execute_tool_with_watchdog("mandate_mutation_spy", arguments, &base_ctx(Some(&grant)))
+        .execute_tool_with_watchdog("http_request", arguments, &base_ctx(Some(&grant)))
         .await
         .unwrap();
     assert_eq!(result, "mutated");
@@ -782,7 +784,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
 
     let replay = harness
         .agent
-        .execute_tool_with_watchdog("mandate_mutation_spy", arguments, &base_ctx(Some(&grant)))
+        .execute_tool_with_watchdog("http_request", arguments, &base_ctx(Some(&grant)))
         .await
         .unwrap_err();
     assert!(
@@ -802,7 +804,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
     harness.state.update_mandate(&revised).await.unwrap();
     let revoked = harness
         .agent
-        .execute_tool_with_watchdog("mandate_mutation_spy", arguments, &base_ctx(Some(&grant)))
+        .execute_tool_with_watchdog("http_request", arguments, &base_ctx(Some(&grant)))
         .await
         .unwrap_err();
     assert!(
@@ -845,11 +847,7 @@ async fn mandate_task_lead_mutation_is_denied_without_burning_quota() {
 
     let error = harness
         .agent
-        .execute_tool_with_watchdog(
-            "mandate_mutation_spy",
-            arguments,
-            &mandate_tool_ctx(Some(&grant)),
-        )
+        .execute_tool_with_watchdog("http_request", arguments, &mandate_tool_ctx(Some(&grant)))
         .await
         .unwrap_err();
     assert!(
@@ -932,13 +930,13 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
         .agent
         .tools
         .iter()
-        .find(|tool| tool.name() == "mandate_mutation_spy")
+        .find(|tool| tool.name() == "http_request")
         .unwrap()
         .call_semantics(arguments);
     let mut grant = match crate::mandates::authority::authorize_mandate_action(
         &mandate,
         &decision,
-        "mandate_mutation_spy",
+        "http_request",
         arguments,
         &semantics,
         &chrono::Utc::now(),
@@ -978,7 +976,7 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
     let blocked = harness
         .agent
         .execute_tool_with_watchdog(
-            "mandate_mutation_spy",
+            "http_request",
             arguments,
             &ToolExecCtx {
                 file_fence: None,
@@ -1032,11 +1030,7 @@ async fn mandate_dispatch_rejects_a_blocked_run_even_with_a_live_attempt_and_gra
 
     let error = harness
         .agent
-        .execute_tool_with_watchdog(
-            "mandate_mutation_spy",
-            arguments,
-            &mandate_tool_ctx(Some(&grant)),
-        )
+        .execute_tool_with_watchdog("http_request", arguments, &mandate_tool_ctx(Some(&grant)))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("stale, blocked"));
@@ -1074,11 +1068,7 @@ async fn stale_mandate_child_cannot_rebind_to_the_next_goal_run() {
 
     let error = harness
         .agent
-        .execute_tool_with_watchdog(
-            "mandate_mutation_spy",
-            arguments,
-            &mandate_tool_ctx(Some(&grant)),
-        )
+        .execute_tool_with_watchdog("http_request", arguments, &mandate_tool_ctx(Some(&grant)))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("stale, blocked"));
@@ -1118,11 +1108,7 @@ async fn mandate_dispatch_rejects_a_lost_root_task_attempt() {
 
     let error = harness
         .agent
-        .execute_tool_with_watchdog(
-            "mandate_mutation_spy",
-            arguments,
-            &mandate_tool_ctx(Some(&grant)),
-        )
+        .execute_tool_with_watchdog("http_request", arguments, &mandate_tool_ctx(Some(&grant)))
         .await
         .unwrap_err();
     assert!(

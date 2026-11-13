@@ -7,7 +7,7 @@ use crate::events::EventStore;
 use crate::health::HealthProbeStore;
 use crate::memory::embeddings::EmbeddingService;
 use crate::plans::PlanStore;
-use crate::state::SqliteStateStore;
+use crate::state::{SqliteStateStore, StoreOptions};
 use crate::traits::StateStore;
 use sqlx::SqlitePool;
 
@@ -26,26 +26,41 @@ pub struct StoreBundle {
     pub health_store: Option<Arc<HealthProbeStore>>,
 }
 
+/// The embedder every daemon process uses: the real models, loaded on
+/// first use. Tests build their own (`EmbeddingService::deterministic`).
+pub fn daemon_embeddings() -> anyhow::Result<EmbeddingService> {
+    EmbeddingService::fastembed().map_err(|e| anyhow::anyhow!("Failed to init embeddings: {}", e))
+}
+
+/// Opens the daemon's state database as every daemon process does: in WAL
+/// mode ([`StoreOptions::DAEMON`]).
+pub async fn open_daemon_state(
+    config: &AppConfig,
+    embeddings: Arc<EmbeddingService>,
+) -> anyhow::Result<SqliteStateStore> {
+    SqliteStateStore::open(
+        &config.state.db_path,
+        config.state.working_memory_cap,
+        config.state.encryption_key.as_deref(),
+        embeddings,
+        StoreOptions::DAEMON,
+    )
+    .await
+}
+
 pub async fn build_stores(
     config: &AppConfig,
     paths: crate::execution::LexicalPaths,
 ) -> anyhow::Result<StoreBundle> {
-    let embedding_service = Arc::new(
-        EmbeddingService::new().map_err(|e| anyhow::anyhow!("Failed to init embeddings: {}", e))?,
-    );
+    let embedding_service = Arc::new(daemon_embeddings()?);
     info!("Embedding service initialized (AllMiniLML6V2)");
 
-    // Before the migrations in `SqliteStateStore::new` change the schema.
+    // Before the migrations in `open_daemon_state` change the schema.
     super::db_upkeep::snapshot_before_upgrade(&config.state).await;
     let state = Arc::new(
-        SqliteStateStore::new(
-            &config.state.db_path,
-            config.state.working_memory_cap,
-            config.state.encryption_key.as_deref(),
-            embedding_service.clone(),
-        )
-        .await?
-        .with_secret_store(crate::config::secret_store().clone()),
+        open_daemon_state(config, embedding_service.clone())
+            .await?
+            .with_secret_store(crate::config::secret_store().clone()),
     );
     info!("State store initialized ({})", config.state.db_path);
     super::db_upkeep::record_started_version(&state.pool()).await;
@@ -203,4 +218,31 @@ pub async fn build_stores(
         plan_store,
         health_store,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::embeddings::EmbedderKind;
+
+    /// What a test build sees here is what the shipped daemon gets: the
+    /// journal and the models come from these functions, not from a cargo
+    /// feature a test build turns on.
+    #[tokio::test]
+    async fn the_daemon_store_journals_in_wal_with_the_real_models() {
+        let embeddings = daemon_embeddings().unwrap();
+        assert_eq!(embeddings.kind(), EmbedderKind::FastEmbed);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: AppConfig = toml::from_str("[provider]\napi_key = \"test-key\"\n").unwrap();
+        config.state.db_path = dir.path().join("state.db").display().to_string();
+        let state = open_daemon_state(&config, Arc::new(embeddings))
+            .await
+            .unwrap();
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&state.pool())
+            .await
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
 }

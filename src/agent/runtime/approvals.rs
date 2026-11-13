@@ -1164,11 +1164,11 @@ mod tests {
         let path = db.path().to_str().unwrap().to_string();
         std::mem::forget(db);
         Arc::new(
-            crate::state::SqliteStateStore::new(
+            crate::state::SqliteStateStore::for_tests(
                 &path,
                 100,
                 None,
-                Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap()),
+                Arc::new(crate::memory::embeddings::EmbeddingService::deterministic()),
             )
             .await
             .unwrap(),

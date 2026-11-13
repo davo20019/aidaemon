@@ -206,7 +206,7 @@ aidaemon-work = { path = "crates/aidaemon-work", features = ["testing"] }
 aidaemon-tools = { path = "crates/aidaemon-tools", features = ["testing"] }
 aidaemon-decisions = { path = "crates/aidaemon-decisions", features = ["gemini", "testing"] }
 aidaemon-runtime = { path = "crates/aidaemon-runtime", features = ["testing"] }
-aidaemon-memory = { path = "crates/aidaemon-memory", features = ["fastembed", "testing"] }
+aidaemon-memory = { path = "crates/aidaemon-memory", features = ["fastembed"] }
 tempfile = "3"
 proptest = "1"
 assert_cmd = "2"

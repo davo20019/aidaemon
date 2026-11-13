@@ -80,8 +80,8 @@ pub mod conformance;
 pub mod consolidation;
 mod embed;
 pub mod embedding_index;
-/// The daemon's local embedder and reranker (fastembed); deterministic,
-/// offline vectors under the `testing` feature.
+/// The daemon's local embedder and reranker (fastembed), or deterministic
+/// offline vectors: the caller picks one by constructor.
 #[cfg(feature = "fastembed")]
 pub mod embeddings;
 pub mod episodes;

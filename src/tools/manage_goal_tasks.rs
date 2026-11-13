@@ -20,9 +20,9 @@ mod tests {
     async fn setup_test_state() -> (Arc<dyn StateStore>, String) {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().to_str().unwrap().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service = Arc::new(EmbeddingService::deterministic());
         let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+            SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)
                 .await
                 .unwrap(),
         );

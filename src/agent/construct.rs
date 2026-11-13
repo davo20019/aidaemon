@@ -271,7 +271,6 @@ impl Agent {
             inherited_authority: None,
             root_tools: None, // Root agent — its own tools ARE the root tools
             read_untrusted: Arc::default(),
-            #[cfg(test)]
             execution_budget_override: None,
             specialists,
             interactive_slot,
@@ -535,7 +534,6 @@ impl Agent {
             inherited_authority: None,
             root_tools,
             read_untrusted: Arc::default(),
-            #[cfg(test)]
             execution_budget_override: None,
             specialists,
             // Sub-agents never pin the interactive slot — only the root agent's

@@ -616,7 +616,7 @@ pub async fn run_memory_export(
         .await?;
     let files = aidaemon_memory::sqlite::SqliteMemory::new(
         pool,
-        Arc::new(crate::memory::embeddings::EmbeddingService::new()?),
+        Arc::new(crate::startup::stores::daemon_embeddings()?),
     )
     .export_readable()
     .await?;
@@ -674,9 +674,9 @@ mod tests {
     async fn setup_state() -> Arc<SqliteStateStore> {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().to_str().unwrap().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service = Arc::new(EmbeddingService::deterministic());
         let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+            SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)
                 .await
                 .unwrap(),
         );
@@ -980,11 +980,11 @@ primary = "gpt-4o"
 
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("state.db");
-        let state = crate::state::SqliteStateStore::new(
+        let state = crate::state::SqliteStateStore::for_tests(
             db.to_str().unwrap(),
             100,
             None,
-            Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap()),
+            Arc::new(crate::memory::embeddings::EmbeddingService::deterministic()),
         )
         .await
         .unwrap();

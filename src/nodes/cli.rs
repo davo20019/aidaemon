@@ -2,9 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::config::AppConfig;
-use crate::memory::embeddings::EmbeddingService;
 use crate::nodes::domain::{NodeAction, CHILD_COMPANION_POLICY};
-use crate::state::SqliteStateStore;
 use anyhow::Context;
 use sqlx::SqlitePool;
 
@@ -25,17 +23,8 @@ pub fn handle_node_command(args: &[String], config_path: &Path) -> anyhow::Resul
         let resolved =
             crate::startup::db_security::resolve_db_path(config_path, &config.state.db_path);
         config.state.db_path = resolved.to_string_lossy().into_owned();
-        let embeddings =
-            Arc::new(EmbeddingService::new().map_err(|error| {
-                anyhow::anyhow!("Failed to initialize database support: {error}")
-            })?);
-        let state = SqliteStateStore::new(
-            &config.state.db_path,
-            config.state.working_memory_cap,
-            config.state.encryption_key.as_deref(),
-            embeddings,
-        )
-        .await?;
+        let embeddings = Arc::new(crate::startup::stores::daemon_embeddings()?);
+        let state = crate::startup::stores::open_daemon_state(&config, embeddings).await?;
         let store = Arc::new(super::store::NodeStore::new(
             state.pool(),
             super::auth::load_or_create_instance_key()?,

@@ -825,6 +825,7 @@ pub async fn register_optional_tools(
                     std::path::PathBuf::from(&inbox_dir),
                     media_tx.clone(),
                     Some(event_store.clone()),
+                    crate::tools::computer_use::Desktop::Real,
                 )));
             }
             OptionalToolId::SendFile => {
@@ -1381,8 +1382,9 @@ mod tests {
 
         let db_file = NamedTempFile::new()?;
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new()?);
-        let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+        let embedding_service = Arc::new(EmbeddingService::deterministic());
+        let state =
+            Arc::new(SqliteStateStore::for_tests(&db_path, 100, None, embedding_service).await?);
         let event_store = Arc::new(EventStore::new(state.pool()).await?);
         let config_file = NamedTempFile::new()?;
 
@@ -1724,9 +1726,9 @@ mod tests {
         config.provider.models.apply_defaults(&config.provider.kind);
 
         let db_file = NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service = Arc::new(EmbeddingService::deterministic());
         let state = Arc::new(
-            SqliteStateStore::new(
+            SqliteStateStore::for_tests(
                 &db_file.path().display().to_string(),
                 100,
                 None,

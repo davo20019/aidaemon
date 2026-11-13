@@ -835,10 +835,11 @@ async fn setup_test_agent_internal(
     let skills_dir = tempfile::TempDir::new()?;
 
     // Embedding service (downloads ~25MB model on first run, cached afterwards)
-    let embedding_service = Arc::new(EmbeddingService::new()?);
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
 
     // State store
-    let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+    let state =
+        Arc::new(SqliteStateStore::for_tests(&db_path, 100, None, embedding_service).await?);
 
     // Event store (reuse the same pool/options as the state store)
     let event_store = Arc::new(EventStore::new(state.pool()).await?);
@@ -1012,8 +1013,9 @@ pub async fn setup_test_agent_with_models_and_policy(
     let db_file = tempfile::NamedTempFile::new()?;
     let db_path = db_file.path().to_str().unwrap().to_string();
     let skills_dir = tempfile::TempDir::new()?;
-    let embedding_service = Arc::new(EmbeddingService::new()?);
-    let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let state =
+        Arc::new(SqliteStateStore::for_tests(&db_path, 100, None, embedding_service).await?);
 
     let event_store = Arc::new(EventStore::new(state.pool()).await?);
 
@@ -1117,8 +1119,9 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
     let db_file = tempfile::NamedTempFile::new()?;
     let db_path = db_file.path().to_str().unwrap().to_string();
     let skills_dir = tempfile::TempDir::new()?;
-    let embedding_service = Arc::new(EmbeddingService::new()?);
-    let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let state =
+        Arc::new(SqliteStateStore::for_tests(&db_path, 100, None, embedding_service).await?);
 
     let event_store = Arc::new(EventStore::new(state.pool()).await?);
 
@@ -1399,10 +1402,11 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
     let skills_dir = tempfile::TempDir::new()?;
 
     // Embedding service
-    let embedding_service = Arc::new(EmbeddingService::new()?);
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
 
     // State store
-    let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+    let state =
+        Arc::new(SqliteStateStore::for_tests(&db_path, 100, None, embedding_service).await?);
 
     // Reuse the state store pool for all DB-backed components so tests match production.
     let pool = state.pool();
@@ -1568,8 +1572,9 @@ pub async fn setup_live_agent(
     let db_file = tempfile::NamedTempFile::new()?;
     let db_path = db_file.path().to_str().unwrap().to_string();
     let skills_dir = tempfile::TempDir::new()?;
-    let embedding_service = Arc::new(EmbeddingService::new()?);
-    let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let state =
+        Arc::new(SqliteStateStore::for_tests(&db_path, 100, None, embedding_service).await?);
     let pool = state.pool();
     let event_store = Arc::new(EventStore::new(pool.clone()).await?);
 

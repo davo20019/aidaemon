@@ -418,8 +418,9 @@ impl TurnHost for Agent {
         &self.tools
     }
 
-    #[cfg(test)]
-    fn execution_budget_override(&self) -> Option<super::ExecutionBudget> {
+    fn execution_budget_override(
+        &self,
+    ) -> Option<aidaemon_runtime::turn::execution_state::ExecutionBudget> {
         self.execution_budget_override.clone()
     }
 }

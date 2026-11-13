@@ -19,11 +19,11 @@ mod tests {
     async fn mandate_test_state() -> (Arc<dyn SchedulerStore>, tempfile::NamedTempFile) {
         let database = tempfile::NamedTempFile::new().unwrap();
         let store: Arc<dyn StateStore> = Arc::new(
-            SqliteStateStore::new(
+            SqliteStateStore::for_tests(
                 database.path().to_str().unwrap(),
                 100,
                 None,
-                Arc::new(EmbeddingService::new().unwrap()),
+                Arc::new(EmbeddingService::deterministic()),
             )
             .await
             .unwrap(),

@@ -22,9 +22,9 @@ async fn setup_consolidator_test() -> (
 ) {
     let db_file = tempfile::NamedTempFile::new().expect("temp db file");
     let db_path = db_file.path().to_str().expect("db path");
-    let embedding_service = Arc::new(EmbeddingService::new().expect("embedding service"));
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state = Arc::new(
-        SqliteStateStore::new(db_path, 100, None, embedding_service)
+        SqliteStateStore::for_tests(db_path, 100, None, embedding_service)
             .await
             .expect("state store"),
     );
@@ -148,9 +148,9 @@ async fn append_old_procedure_trace(
 async fn retiring_old_events_marks_them_without_learning() {
     let db_file = tempfile::NamedTempFile::new().expect("temp db file");
     let db_path = db_file.path().to_str().expect("db path");
-    let embedding_service = Arc::new(EmbeddingService::new().expect("embedding service"));
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state = Arc::new(
-        SqliteStateStore::new(db_path, 100, None, embedding_service)
+        SqliteStateStore::for_tests(db_path, 100, None, embedding_service)
             .await
             .expect("state store"),
     );
@@ -200,9 +200,9 @@ async fn retiring_old_events_marks_them_without_learning() {
 async fn pruner_marks_mandate_and_internal_sessions_without_learning() {
     let db_file = tempfile::NamedTempFile::new().expect("temp db file");
     let db_path = db_file.path().to_str().expect("db path");
-    let embedding_service = Arc::new(EmbeddingService::new().expect("embedding service"));
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state = Arc::new(
-        SqliteStateStore::new(db_path, 100, None, embedding_service)
+        SqliteStateStore::for_tests(db_path, 100, None, embedding_service)
             .await
             .expect("state store"),
     );

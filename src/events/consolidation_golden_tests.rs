@@ -813,7 +813,7 @@ async fn run(setup: Setup) -> Snapshot {
         .expect("memory tables");
     let event_store = Arc::new(EventStore::new(pool.clone()).await.expect("event store"));
     let plan_store = Arc::new(PlanStore::new(pool.clone()).await.expect("plan store"));
-    let embeddings = Arc::new(EmbeddingService::new().expect("embedding service"));
+    let embeddings = Arc::new(EmbeddingService::deterministic());
     let memory: Arc<dyn aidaemon_memory::stores::MemoryStores> = Arc::new(
         crate::memory::sqlite_memory(pool.clone(), embeddings.clone()),
     );

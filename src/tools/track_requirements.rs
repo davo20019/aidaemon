@@ -115,11 +115,11 @@ mod tests {
         let (tool, _plan_store) = test_tool().await;
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let state: Arc<dyn crate::traits::StateStore> = Arc::new(
-            crate::state::SqliteStateStore::new(
+            crate::state::SqliteStateStore::for_tests(
                 &db_file.path().display().to_string(),
                 100,
                 None,
-                Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap()),
+                Arc::new(crate::memory::embeddings::EmbeddingService::deterministic()),
             )
             .await
             .unwrap(),

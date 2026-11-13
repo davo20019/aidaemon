@@ -15,9 +15,9 @@ mod tests {
         let db = tempfile::NamedTempFile::new().unwrap();
         let path = db.path().to_str().unwrap().to_string();
         std::mem::forget(db);
-        let embeddings = Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap());
+        let embeddings = Arc::new(crate::memory::embeddings::EmbeddingService::deterministic());
         Arc::new(
-            crate::state::SqliteStateStore::new(&path, 100, None, embeddings)
+            crate::state::SqliteStateStore::for_tests(&path, 100, None, embeddings)
                 .await
                 .unwrap(),
         )

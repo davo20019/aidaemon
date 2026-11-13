@@ -1167,9 +1167,7 @@ impl MandateAuthority {
                         .to_string(),
                 );
             }
-            if !(Self::DELEGABLE_DATA_TOOLS.contains(&trimmed)
-                || (cfg!(any(test, feature = "testing")) && trimmed == "mandate_mutation_spy"))
-            {
+            if !Self::DELEGABLE_DATA_TOOLS.contains(&trimmed) {
                 return Err(format!(
                     "{trimmed} is not a directly governed v1 mandate data tool"
                 ));

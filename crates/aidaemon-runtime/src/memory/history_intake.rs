@@ -256,11 +256,16 @@ mod tests {
         HistoryIntake,
     ) {
         let db = tempfile::NamedTempFile::new().unwrap();
-        let embeddings = Arc::new(aidaemon_memory::embeddings::EmbeddingService::new().unwrap());
+        let embeddings = Arc::new(aidaemon_memory::embeddings::EmbeddingService::deterministic());
         let state = Arc::new(
-            crate::state::SqliteStateStore::new(db.path().to_str().unwrap(), 100, None, embeddings)
-                .await
-                .unwrap(),
+            crate::state::SqliteStateStore::for_tests(
+                db.path().to_str().unwrap(),
+                100,
+                None,
+                embeddings,
+            )
+            .await
+            .unwrap(),
         );
         let system = Arc::new(Recording::default());
         let intake = HistoryIntake::new(system.clone(), state.pool(), state.clone(), "test");

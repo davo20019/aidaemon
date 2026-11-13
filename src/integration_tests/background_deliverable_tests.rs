@@ -105,9 +105,9 @@ async fn make_terminal_with_hub(
     let db_path = db_file.path().display().to_string();
     // Keep the temp DB file alive for the test duration.
     std::mem::forget(db_file);
-    let embedding_service = Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(crate::memory::embeddings::EmbeddingService::deterministic());
     let state = Arc::new(
-        SqliteStateStore::new(&db_path, 100, None, embedding_service)
+        SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)
             .await
             .unwrap(),
     );

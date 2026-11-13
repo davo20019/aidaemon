@@ -16,10 +16,9 @@ mod tests {
     use aidaemon_core::Authority;
 
     async fn temp_store(path: &std::path::Path) -> crate::state::SqliteStateStore {
-        let embedding = std::sync::Arc::new(
-            crate::memory::embeddings::EmbeddingService::new().expect("embedding service"),
-        );
-        crate::state::SqliteStateStore::new(path.to_str().unwrap(), 100, None, embedding)
+        let embedding =
+            std::sync::Arc::new(crate::memory::embeddings::EmbeddingService::deterministic());
+        crate::state::SqliteStateStore::for_tests(path.to_str().unwrap(), 100, None, embedding)
             .await
             .unwrap()
     }

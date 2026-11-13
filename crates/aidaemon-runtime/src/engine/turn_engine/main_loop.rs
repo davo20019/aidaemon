@@ -899,7 +899,6 @@ impl TurnEngine<'_> {
 
         let (execution_budget_tier, execution_budget_route, execution_budget) =
             select_initial_execution_budget(self.depth(), self.role());
-        #[cfg(any(test, feature = "testing"))]
         let execution_budget = self
             .execution_budget_override()
             .unwrap_or(execution_budget);

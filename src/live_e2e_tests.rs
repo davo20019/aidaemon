@@ -72,8 +72,9 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     let db_path = db_file.path().to_str().unwrap().to_string();
     let skills_dir = tempfile::TempDir::new()?;
 
-    let embedding_service = Arc::new(EmbeddingService::new()?);
-    let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let state =
+        Arc::new(SqliteStateStore::for_tests(&db_path, 100, None, embedding_service).await?);
 
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
     let event_store = Arc::new(EventStore::new(pool.clone()).await?);
@@ -259,8 +260,9 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
     let db_path = db_file.path().to_str().unwrap().to_string();
     let skills_dir = tempfile::TempDir::new()?;
 
-    let embedding_service = Arc::new(EmbeddingService::new()?);
-    let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let state =
+        Arc::new(SqliteStateStore::for_tests(&db_path, 100, None, embedding_service).await?);
 
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
     let event_store = Arc::new(EventStore::new(pool.clone()).await?);

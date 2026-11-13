@@ -297,8 +297,8 @@ pub trait TurnHost:
         attempt: aidaemon_work::traits::TaskAttempt,
         mandate: bool,
     ) -> std::sync::Arc<dyn aidaemon_tools::OutcomeTool>;
-    /// The execution budget a test pins for this agent's turns.
-    #[cfg(any(test, feature = "testing"))]
+    /// The execution budget pinned for this agent's turns, if any (tests
+    /// pin one; the daemon never does).
     fn execution_budget_override(&self) -> Option<crate::turn::execution_state::ExecutionBudget> {
         None
     }

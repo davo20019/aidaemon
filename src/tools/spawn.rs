@@ -416,9 +416,9 @@ mod tests {
     async fn background_notification_reaches_the_queue() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service = Arc::new(EmbeddingService::deterministic());
         let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+            SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)
                 .await
                 .unwrap(),
         );
@@ -726,9 +726,9 @@ mod child_runtime_tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
         std::mem::forget(db_file);
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service = Arc::new(EmbeddingService::deterministic());
         Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+            SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)
                 .await
                 .unwrap(),
         )

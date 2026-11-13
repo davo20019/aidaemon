@@ -13,11 +13,16 @@ mod tests {
         use crate::traits::OwnerApprovalNeed;
         let db = tempfile::NamedTempFile::new().unwrap();
         let embeddings =
-            std::sync::Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap());
+            std::sync::Arc::new(crate::memory::embeddings::EmbeddingService::deterministic());
         let state = std::sync::Arc::new(
-            crate::state::SqliteStateStore::new(db.path().to_str().unwrap(), 100, None, embeddings)
-                .await
-                .unwrap(),
+            crate::state::SqliteStateStore::for_tests(
+                db.path().to_str().unwrap(),
+                100,
+                None,
+                embeddings,
+            )
+            .await
+            .unwrap(),
         );
         let registry = crate::testing::fake_mcp_registry(state).await;
         let tool = ManageMcpTool::new(registry);

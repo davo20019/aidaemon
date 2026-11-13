@@ -716,8 +716,8 @@ mod tests {
     async fn derived_memory_does_not_outlive_deleted_source_fact() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("retention-memory.db");
-        let embeddings = Arc::new(EmbeddingService::new().unwrap());
-        let store = SqliteStateStore::new(path.to_str().unwrap(), 20, None, embeddings)
+        let embeddings = Arc::new(EmbeddingService::deterministic());
+        let store = SqliteStateStore::for_tests(path.to_str().unwrap(), 20, None, embeddings)
             .await
             .unwrap();
         let pool = store.pool();
@@ -758,8 +758,8 @@ mod tests {
     async fn derived_cleanup_preserves_structured_entities_with_aliases() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("retention-structured-memory.db");
-        let embeddings = Arc::new(EmbeddingService::new().unwrap());
-        let store = SqliteStateStore::new(path.to_str().unwrap(), 20, None, embeddings)
+        let embeddings = Arc::new(EmbeddingService::deterministic());
+        let store = SqliteStateStore::for_tests(path.to_str().unwrap(), 20, None, embeddings)
             .await
             .unwrap();
         let pool = store.pool();

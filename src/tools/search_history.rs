@@ -21,9 +21,9 @@ mod tests {
     async fn tool() -> (SearchHistoryTool, Arc<EventStore>, tempfile::NamedTempFile) {
         let db = tempfile::NamedTempFile::new().unwrap();
         let path = db.path().to_path_buf();
-        let embedding = Arc::new(EmbeddingService::new().unwrap());
+        let embedding = Arc::new(EmbeddingService::deterministic());
         let state = Arc::new(
-            SqliteStateStore::new(path.to_str().unwrap(), 50, None, embedding)
+            SqliteStateStore::for_tests(path.to_str().unwrap(), 50, None, embedding)
                 .await
                 .unwrap(),
         );

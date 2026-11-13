@@ -115,10 +115,55 @@ impl std::ops::Deref for SqliteStateStore {
     }
 }
 
+/// How the store's database journals writes. Chosen by whoever opens the
+/// store, never by a cargo feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Journal {
+    /// Write-ahead log: concurrent readers beside a writer, and the daemon's
+    /// crash behaviour. Every daemon store uses it.
+    Wal,
+    /// Rollback journal. For throwaway test databases: WAL sidecars outlive
+    /// an already-unlinked temp file until every pooled connection closes,
+    /// which across thousands of tests fills the disk.
+    Delete,
+}
+
+impl Journal {
+    fn mode_name(self) -> &'static str {
+        match self {
+            Journal::Wal => "wal",
+            Journal::Delete => "delete",
+        }
+    }
+
+    fn pragma(self) -> &'static str {
+        match self {
+            Journal::Wal => "PRAGMA journal_mode = WAL",
+            Journal::Delete => "PRAGMA journal_mode = DELETE",
+        }
+    }
+}
+
+/// What a caller decides when it opens a [`SqliteStateStore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreOptions {
+    pub journal: Journal,
+}
+
+impl StoreOptions {
+    /// The daemon's own database.
+    pub const DAEMON: Self = Self {
+        journal: Journal::Wal,
+    };
+    /// A throwaway database a test opens and drops.
+    pub const SCRATCH: Self = Self {
+        journal: Journal::Delete,
+    };
+}
+
 impl SqliteStateStore {
-    /// Opens (or creates) the database at `db_path` and brings its schema
-    /// up to date. `embeddings` embeds and reranks long-term memory.
-    pub async fn new<E>(
+    /// A throwaway store for tests: rollback journal ([`StoreOptions::SCRATCH`]).
+    pub async fn for_tests<E>(
         db_path: &str,
         cap: usize,
         encryption_key: Option<&str>,
@@ -127,16 +172,31 @@ impl SqliteStateStore {
     where
         E: aidaemon_memory::Embedder + aidaemon_memory::sqlite::Reranker + 'static,
     {
-        // Unit tests create thousands of NamedTempFile-backed databases. WAL
-        // sidecars outlive the already-unlinked main file until every pooled
-        // connection closes and can consume tens of gigabytes in one suite.
-        // Delete journaling keeps test databases self-contained; production
-        // retains WAL concurrency and crash behavior.
-        let (journal_mode_name, journal_mode_pragma) = if cfg!(any(test, feature = "testing")) {
-            ("delete", "PRAGMA journal_mode = DELETE")
-        } else {
-            ("wal", "PRAGMA journal_mode = WAL")
-        };
+        Self::open(
+            db_path,
+            cap,
+            encryption_key,
+            embeddings,
+            StoreOptions::SCRATCH,
+        )
+        .await
+    }
+
+    /// Opens (or creates) the database at `db_path` and brings its schema
+    /// up to date. `embeddings` embeds and reranks long-term memory;
+    /// `options` says how the database journals.
+    pub async fn open<E>(
+        db_path: &str,
+        cap: usize,
+        encryption_key: Option<&str>,
+        embeddings: Arc<E>,
+        options: StoreOptions,
+    ) -> anyhow::Result<Self>
+    where
+        E: aidaemon_memory::Embedder + aidaemon_memory::sqlite::Reranker + 'static,
+    {
+        let journal_mode_name = options.journal.mode_name();
+        let journal_mode_pragma = options.journal.pragma();
         // Only the `encryption` feature adds to these.
         #[cfg_attr(not(feature = "encryption"), allow(unused_mut))]
         let mut opts = SqliteConnectOptions::new()
@@ -401,8 +461,8 @@ mod turn_id_hydration_tests {
         let db_path = dir.path().join("turn_id_hydration.db");
         let db_path = db_path.to_str().unwrap();
         let embedding_service =
-            Arc::new(aidaemon_memory::embeddings::EmbeddingService::new().unwrap());
-        let store = SqliteStateStore::new(db_path, 50, None, embedding_service)
+            Arc::new(aidaemon_memory::embeddings::EmbeddingService::deterministic());
+        let store = SqliteStateStore::for_tests(db_path, 50, None, embedding_service)
             .await
             .unwrap();
 
@@ -441,8 +501,8 @@ mod turn_id_hydration_tests {
         let db_path = dir.path().join("clear_ctx.db");
         let db_path = db_path.to_str().unwrap();
         let embedding_service =
-            Arc::new(aidaemon_memory::embeddings::EmbeddingService::new().unwrap());
-        let store = SqliteStateStore::new(db_path, 50, None, embedding_service)
+            Arc::new(aidaemon_memory::embeddings::EmbeddingService::deterministic());
+        let store = SqliteStateStore::for_tests(db_path, 50, None, embedding_service)
             .await
             .unwrap();
         let events = event_store(store.pool()).await;
@@ -478,8 +538,8 @@ mod turn_id_hydration_tests {
         let db_path = dir.path().join("advance_ctx.db");
         let db_path = db_path.to_str().unwrap();
         let embedding_service =
-            Arc::new(aidaemon_memory::embeddings::EmbeddingService::new().unwrap());
-        let store = SqliteStateStore::new(db_path, 50, None, embedding_service)
+            Arc::new(aidaemon_memory::embeddings::EmbeddingService::deterministic());
+        let store = SqliteStateStore::for_tests(db_path, 50, None, embedding_service)
             .await
             .unwrap();
         let events = event_store(store.pool()).await;
@@ -576,8 +636,8 @@ mod turn_id_hydration_tests {
         let db_path = dir.path().join("wipe.db");
         let db_path = db_path.to_str().unwrap();
         let embedding_service =
-            Arc::new(aidaemon_memory::embeddings::EmbeddingService::new().unwrap());
-        let store = SqliteStateStore::new(db_path, 50, None, embedding_service)
+            Arc::new(aidaemon_memory::embeddings::EmbeddingService::deterministic());
+        let store = SqliteStateStore::for_tests(db_path, 50, None, embedding_service)
             .await
             .unwrap();
         let events = event_store(store.pool()).await;

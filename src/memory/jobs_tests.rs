@@ -39,9 +39,9 @@ async fn setup_memory_manager_with_responses(
     tempfile::NamedTempFile,
 ) {
     let db_file = tempfile::NamedTempFile::new().expect("temp db file");
-    let embedding_service = Arc::new(EmbeddingService::new().expect("embedding service"));
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let store = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().expect("db path"),
             100,
             None,
@@ -345,9 +345,9 @@ async fn mandate_sessions_are_excluded_from_long_episode_candidates() {
 #[tokio::test]
 async fn test_consolidation_skips_public_external_sessions() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let store = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -440,9 +440,9 @@ async fn test_consolidation_skips_public_external_sessions() {
 #[tokio::test]
 async fn test_consolidation_skips_non_owner_sessions() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let store = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -545,9 +545,9 @@ async fn test_consolidation_skips_non_owner_sessions() {
 #[tokio::test]
 async fn test_fetch_owner_user_messages_since_filters_non_owner_messages() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let store = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -629,9 +629,9 @@ async fn test_fetch_owner_user_messages_since_filters_non_owner_messages() {
 #[tokio::test]
 async fn test_fetch_session_messages_since_last_episode_supports_legacy_annotations() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let store = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,

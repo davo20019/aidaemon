@@ -41,8 +41,8 @@ pub mod promotion {
             let path = file.path().to_str().unwrap().to_string();
             // The store keeps the file open; the file outlives the test.
             std::mem::forget(file);
-            let embeddings = Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap());
-            let store = crate::state::SqliteStateStore::new(&path, 100, None, embeddings)
+            let embeddings = Arc::new(crate::memory::embeddings::EmbeddingService::deterministic());
+            let store = crate::state::SqliteStateStore::for_tests(&path, 100, None, embeddings)
                 .await
                 .unwrap();
             store

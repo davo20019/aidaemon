@@ -1,11 +1,7 @@
-#[cfg(not(any(test, feature = "testing")))]
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
-#[cfg(not(any(test, feature = "testing")))]
 use std::sync::{Arc, Mutex};
-#[cfg(not(any(test, feature = "testing")))]
 use tokio::sync::OnceCell;
-#[cfg(not(any(test, feature = "testing")))]
 use tokio::task;
 use tracing::info;
 
@@ -19,7 +15,6 @@ pub const EMBEDDING_MODEL_ID: &str = "fastembed/all-MiniLM-L6-v2";
 /// model in a `std::sync::Mutex` so blocking-thread callers can take it,
 /// embed, and release. Calls serialize, but embedding itself is CPU-bound
 /// and short, so this is acceptable for our usage pattern.
-#[cfg(not(any(test, feature = "testing")))]
 type SharedModel = Arc<Mutex<TextEmbedding>>;
 
 /// Cross-encoder reranker for the explicit memory-search path. A multilingual
@@ -27,38 +22,73 @@ type SharedModel = Arc<Mutex<TextEmbedding>>;
 /// reranking is actually used) since it is a sizeable extra download.
 const RERANKER_MODEL: RerankerModel = RerankerModel::JINARerankerV2BaseMultilingual;
 
+/// Which models a service runs. Chosen by the caller's constructor, never by
+/// a cargo feature: a test build and the shipped daemon differ only in what
+/// their code asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedderKind {
+    /// AllMiniLM-L6-v2 embeddings and the cross-encoder reranker.
+    FastEmbed,
+    /// Hashed lexical vectors, offline, with no reranker (searches keep
+    /// bi-encoder order). For tests: nothing is downloaded or loaded.
+    Deterministic,
+}
+
+#[derive(Clone)]
+enum Backend {
+    FastEmbed {
+        model: Arc<OnceCell<SharedModel>>,
+        /// Loaded in the background on first use and kept even when the
+        /// search that started the load stops waiting; one rerank runs at a
+        /// time, and a rerank whose search gave up never holds later
+        /// searches in a queue.
+        reranker: BackgroundModel<TextRerank>,
+    },
+    Deterministic,
+}
+
 #[derive(Clone)]
 pub struct EmbeddingService {
-    #[cfg(not(any(test, feature = "testing")))]
-    model: Arc<OnceCell<SharedModel>>,
-    /// Loaded in the background on first use and kept even when the search
-    /// that started the load stops waiting; one rerank runs at a time, and a
-    /// rerank whose search gave up never holds later searches in a queue.
-    reranker: BackgroundModel<TextRerank>,
+    backend: Backend,
 }
 
 impl EmbeddingService {
-    /// Creates the service without loading the model.
-    /// The model is loaded lazily on the first embedding request.
-    pub fn new() -> anyhow::Result<Self> {
+    /// The daemon's real models: AllMiniLM-L6-v2 embeddings and the
+    /// multilingual reranker. Neither is loaded until first used.
+    pub fn fastembed() -> anyhow::Result<Self> {
         Ok(Self {
-            #[cfg(not(any(test, feature = "testing")))]
-            model: Arc::new(OnceCell::new()),
-            reranker: BackgroundModel::new("reranker", || {
-                let options =
-                    RerankInitOptions::new(RERANKER_MODEL).with_show_download_progress(true);
-                let model = TextRerank::try_new(options)?;
-                info!("Reranker model loaded ({:?})", RERANKER_MODEL);
-                Ok(model)
-            }),
+            backend: Backend::FastEmbed {
+                model: Arc::new(OnceCell::new()),
+                reranker: BackgroundModel::new("reranker", || {
+                    let options =
+                        RerankInitOptions::new(RERANKER_MODEL).with_show_download_progress(true);
+                    let model = TextRerank::try_new(options)?;
+                    info!("Reranker model loaded ({:?})", RERANKER_MODEL);
+                    Ok(model)
+                }),
+            },
         })
     }
 
+    /// Deterministic offline vectors and no reranker: nothing is downloaded
+    /// or loaded, and the same text always gets the same vector.
+    pub fn deterministic() -> Self {
+        Self {
+            backend: Backend::Deterministic,
+        }
+    }
+
+    /// Which models this service runs.
+    pub fn kind(&self) -> EmbedderKind {
+        match self.backend {
+            Backend::FastEmbed { .. } => EmbedderKind::FastEmbed,
+            Backend::Deterministic => EmbedderKind::Deterministic,
+        }
+    }
+
     /// Returns the model, initializing it on first call.
-    #[cfg(not(any(test, feature = "testing")))]
-    async fn get_model(&self) -> anyhow::Result<SharedModel> {
-        let model = self
-            .model
+    async fn get_model(model: &OnceCell<SharedModel>) -> anyhow::Result<SharedModel> {
+        let model = model
             .get_or_try_init(|| async {
                 task::spawn_blocking(|| {
                     let mut options = TextInitOptions::default();
@@ -76,52 +106,39 @@ impl EmbeddingService {
 
     /// Compute embedding for a single string.
     /// Runs on a blocking thread to avoid blocking the async runtime.
-    #[allow(dead_code)]
     pub async fn embed(&self, text: String) -> anyhow::Result<Vec<f32>> {
-        #[cfg(any(test, feature = "testing"))]
-        return Ok(deterministic_test_embedding(&text));
-
-        #[cfg(not(any(test, feature = "testing")))]
-        {
-            let model = self.get_model().await?;
-            task::spawn_blocking(move || {
-                let mut guard = model
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("embedding model mutex poisoned: {e}"))?;
-                let embeddings = guard.embed(vec![text], None)?;
-                Ok(embeddings[0].clone())
-            })
+        self.embed_batch(vec![text])
             .await?
-        }
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("the embedding model returned no vector"))
     }
 
     /// Compute embeddings for multiple strings.
-    #[allow(dead_code)]
     pub async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-        #[cfg(any(test, feature = "testing"))]
-        return Ok(texts
-            .iter()
-            .map(|text| deterministic_test_embedding(text))
-            .collect());
-
-        #[cfg(not(any(test, feature = "testing")))]
-        {
-            let model = self.get_model().await?;
-            task::spawn_blocking(move || {
-                let mut guard = model
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("embedding model mutex poisoned: {e}"))?;
-                Ok(guard.embed(texts, None)?)
-            })
-            .await?
-        }
+        let model = match &self.backend {
+            Backend::Deterministic => {
+                return Ok(texts
+                    .iter()
+                    .map(|text| deterministic_embedding(text))
+                    .collect());
+            }
+            Backend::FastEmbed { model, .. } => Self::get_model(model).await?,
+        };
+        task::spawn_blocking(move || {
+            let mut guard = model
+                .lock()
+                .map_err(|e| anyhow::anyhow!("embedding model mutex poisoned: {e}"))?;
+            Ok(guard.embed(texts, None)?)
+        })
+        .await?
     }
 
     /// Cross-encoder rerank: score each document against the query and return
     /// `(original_index, score)` pairs sorted by descending relevance. The
     /// indices map back into the input `documents` vec. Runs on a blocking
-    /// thread. Errors (including "busy with a rerank whose search gave up")
-    /// propagate so callers can fall back to bi-encoder order.
+    /// thread. Errors (including "busy with a rerank whose search gave up",
+    /// and a deterministic service, which has no reranker) propagate so
+    /// callers can fall back to bi-encoder order.
     pub async fn rerank(
         &self,
         query: String,
@@ -130,14 +147,11 @@ impl EmbeddingService {
         if documents.is_empty() {
             return Ok(vec![]);
         }
-        // Never download/load the heavyweight reranker during unit tests: callers
-        // treat this error as "rerank unavailable" and fall back to bi-encoder
-        // order, so test behavior stays deterministic and offline. The reranker
-        // is exercised by live/ignored tests and in production builds.
-        if cfg!(any(test, feature = "testing")) {
-            anyhow::bail!("reranker disabled in test builds");
-        }
-        self.reranker
+        let reranker = match &self.backend {
+            Backend::FastEmbed { reranker, .. } => reranker,
+            Backend::Deterministic => anyhow::bail!("a deterministic embedder has no reranker"),
+        };
+        reranker
             .run(move |model| {
                 let results = model.rerank(query, documents, false, None)?;
                 let mut ranked: Vec<(usize, f32)> =
@@ -193,8 +207,7 @@ impl crate::sqlite::Reranker for EmbeddingService {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-fn deterministic_test_embedding(text: &str) -> Vec<f32> {
+fn deterministic_embedding(text: &str) -> Vec<f32> {
     use std::hash::{Hash, Hasher};
 
     const DIMENSIONS: usize = 384;

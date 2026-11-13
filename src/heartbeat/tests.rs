@@ -257,11 +257,11 @@ async fn queued_notices_reach_owner_history_and_timeouts_stay_answerable() {
 async fn due_mandate_creates_a_distinct_run_without_a_goal_schedule() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
-            Arc::new(EmbeddingService::new().unwrap()),
+            Arc::new(EmbeddingService::deterministic()),
         )
         .await
         .unwrap(),
@@ -323,11 +323,11 @@ async fn due_mandate_creates_a_distinct_run_without_a_goal_schedule() {
 async fn mandate_budget_deferral_waits_for_the_next_utc_reset() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
-            Arc::new(EmbeddingService::new().unwrap()),
+            Arc::new(EmbeddingService::deterministic()),
         )
         .await
         .unwrap(),
@@ -371,11 +371,11 @@ async fn mandate_budget_deferral_waits_for_the_next_utc_reset() {
 async fn open_mandate_run_prevents_a_duplicate_review_after_lease_release() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
-            Arc::new(EmbeddingService::new().unwrap()),
+            Arc::new(EmbeddingService::deterministic()),
         )
         .await
         .unwrap(),
@@ -420,11 +420,11 @@ async fn open_mandate_run_prevents_a_duplicate_review_after_lease_release() {
 async fn generic_orphan_dispatch_leaves_non_root_mandate_tasks_untouched() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
-            Arc::new(EmbeddingService::new().unwrap()),
+            Arc::new(EmbeddingService::deterministic()),
         )
         .await
         .unwrap(),
@@ -619,9 +619,9 @@ async fn test_state_store() -> Arc<dyn StateStore> {
     // database — surfacing as "no such table" under parallel test load on
     // CI. keep() leaks the file, which is fine for short-lived test runs.
     let (_db_file, db_path) = tempfile::NamedTempFile::new().unwrap().keep().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     Arc::new(
-        SqliteStateStore::new(db_path.to_str().unwrap(), 100, None, embedding_service)
+        SqliteStateStore::for_tests(db_path.to_str().unwrap(), 100, None, embedding_service)
             .await
             .unwrap(),
     )
@@ -665,9 +665,9 @@ async fn test_heartbeat_job_fires() {
 
     let (wake_tx, wake_rx) = mpsc::channel::<()>(1);
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -715,9 +715,9 @@ async fn reminder_test_setup() -> (
 ) {
     let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -892,9 +892,9 @@ async fn test_non_reminder_schedule_creates_pending_task() {
 async fn test_heartbeat_telemetry_tracks_failures_and_recovery() {
     let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -971,9 +971,9 @@ async fn test_heartbeat_telemetry_tracks_failures_and_recovery() {
 #[tokio::test]
 async fn test_due_one_shot_schedule_creates_task_and_deletes_schedule() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -1188,9 +1188,9 @@ async fn test_idle_continuous_goal_alerts_only_once() {
 #[tokio::test]
 async fn test_coalesce_policy_one_shot_backs_off_when_open_task_exists() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -1509,9 +1509,9 @@ async fn scheduled_lifecycle_reconciles_before_the_next_fire_is_due() {
 #[tokio::test]
 async fn escalated_goal_gets_one_automatic_recovery_run_whose_root_survives_dispatch() {
     let (_db_file, db_path) = tempfile::NamedTempFile::new().unwrap().keep().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let sqlite = Arc::new(
-        SqliteStateStore::new(db_path.to_str().unwrap(), 100, None, embedding_service)
+        SqliteStateStore::for_tests(db_path.to_str().unwrap(), 100, None, embedding_service)
             .await
             .unwrap(),
     );
@@ -1802,9 +1802,9 @@ async fn test_provider_overload_blocker_does_not_coalesce_next_schedule_fire() {
 #[tokio::test]
 async fn test_pending_task_with_interrupted_dependency_does_not_block_next_schedule_fire() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -1905,9 +1905,9 @@ async fn test_pending_task_with_interrupted_dependency_does_not_block_next_sched
 #[tokio::test]
 async fn test_multiple_due_schedules_always_fire_enqueues_multiple_tasks() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -1964,9 +1964,9 @@ async fn test_multiple_due_schedules_always_fire_enqueues_multiple_tasks() {
 #[tokio::test]
 async fn test_daily_budget_reset() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let sqlite_state = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -2007,9 +2007,9 @@ async fn test_daily_budget_reset() {
 #[tokio::test]
 async fn test_daily_budget_reset_preserves_same_day_usage() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let sqlite_state = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -2040,9 +2040,9 @@ async fn test_daily_budget_reset_preserves_same_day_usage() {
 #[tokio::test]
 async fn test_dispatch_no_agent_reverts_claim() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -2364,9 +2364,9 @@ async fn closed_scheduled_run_children_are_neither_retried_nor_dispatched() {
 #[tokio::test]
 async fn test_dispatch_skips_redispatch_after_mutating_success_this_cycle() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -2522,9 +2522,9 @@ async fn test_dispatch_skips_redispatch_after_mutating_success_this_cycle() {
 #[tokio::test]
 async fn test_manual_run_is_not_suppressed_by_prior_run_mutating_success() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -2672,9 +2672,9 @@ async fn test_manual_run_is_not_suppressed_by_prior_run_mutating_success() {
 #[tokio::test]
 async fn test_dispatch_still_redispatches_without_prior_mutating_success() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,
@@ -2798,9 +2798,9 @@ fn task_escalations_wait_for_same_turn_state_reconciliation() {
 #[tokio::test]
 async fn test_stale_pending_confirmation_cleanup() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(
+        SqliteStateStore::for_tests(
             db_file.path().to_str().unwrap(),
             100,
             None,

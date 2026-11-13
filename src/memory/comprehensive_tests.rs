@@ -26,8 +26,8 @@ use std::sync::Arc;
 
 async fn setup_test_store() -> (SqliteStateStore, tempfile::NamedTempFile) {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let store = SqliteStateStore::new(
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let store = SqliteStateStore::for_tests(
         db_file.path().to_str().unwrap(),
         100,
         None,

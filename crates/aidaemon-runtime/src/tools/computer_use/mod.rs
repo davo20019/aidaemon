@@ -25,11 +25,6 @@ pub mod capability;
 pub mod harness;
 #[cfg(all(target_os = "macos", feature = "computer_use-macos"))]
 pub mod macos;
-#[cfg(any(
-    test,
-    feature = "testing",
-    not(all(target_os = "macos", feature = "computer_use-macos"))
-))]
 mod mock;
 pub mod pin_registry;
 mod policy;
@@ -197,6 +192,30 @@ for repeats), e.g. click element_title=\"Like\". Do NOT write/edit files, run te
 saved results, or describe the action in a comment: only a computer_use call changes anything on \
 screen.";
 
+/// Which desktop a [`ComputerUseTool`] drives. The caller picks it; no
+/// cargo feature swaps one for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Desktop {
+    /// The real desktop where this build can drive one (macOS with the
+    /// `computer_use-macos` feature); a scripted one elsewhere.
+    Real,
+    /// A scripted Calculator that never touches the screen, for tests.
+    Scripted,
+}
+
+impl Desktop {
+    /// The harness this choice drives.
+    pub fn harness(self, config: &ComputerUseConfig) -> Arc<dyn ComputerHarness> {
+        match self {
+            #[cfg(all(target_os = "macos", feature = "computer_use-macos"))]
+            Desktop::Real => Arc::new(macos::MacOsHarness::new(config.clone())),
+            #[cfg(not(all(target_os = "macos", feature = "computer_use-macos")))]
+            Desktop::Real => Arc::new(mock::MockHarness::new(config.clone())),
+            Desktop::Scripted => Arc::new(mock::MockHarness::new(config.clone())),
+        }
+    }
+}
+
 impl ComputerUseTool {
     pub fn new(
         config: ComputerUseConfig,
@@ -204,21 +223,9 @@ impl ComputerUseTool {
         inbox_dir: PathBuf,
         media_tx: mpsc::Sender<MediaMessage>,
         events: Option<Arc<EventStore>>,
+        desktop: Desktop,
     ) -> Self {
-        // Tests, here and in a host's test build (`testing`), never drive
-        // the real desktop.
-        #[cfg(all(
-            not(any(test, feature = "testing")),
-            target_os = "macos",
-            feature = "computer_use-macos"
-        ))]
-        let harness: Arc<dyn ComputerHarness> = Arc::new(macos::MacOsHarness::new(config.clone()));
-        #[cfg(any(
-            test,
-            feature = "testing",
-            not(all(target_os = "macos", feature = "computer_use-macos"))
-        ))]
-        let harness: Arc<dyn ComputerHarness> = Arc::new(mock::MockHarness::new(config.clone()));
+        let harness = desktop.harness(&config);
 
         Self {
             config,
@@ -1806,6 +1813,7 @@ pub async fn test_tool(config: ComputerUseConfig, inbox: PathBuf) -> ComputerUse
         inbox,
         media_tx,
         None,
+        Desktop::Scripted,
     );
     tool.approval_state
         .approve_all_for_test("telegram:1", "com.apple.calculator")

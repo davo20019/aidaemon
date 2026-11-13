@@ -12,8 +12,8 @@ use std::sync::Arc;
 async fn test_store() -> (tempfile::TempDir, SqliteStateStore) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("memory.db");
-    let service = Arc::new(EmbeddingService::new().unwrap());
-    let store = SqliteStateStore::new(path.to_str().unwrap(), 20, None, service)
+    let service = Arc::new(EmbeddingService::deterministic());
+    let store = SqliteStateStore::for_tests(path.to_str().unwrap(), 20, None, service)
         .await
         .unwrap();
     (dir, store)

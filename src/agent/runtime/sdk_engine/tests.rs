@@ -3555,9 +3555,9 @@ async fn bind_workspace_after_untrusted_content_is_verified() {
     use crate::runtime_ports::AgentIngress;
     use crate::testing::MockProvider;
     let db = tempfile::tempdir().unwrap();
-    let embedding = Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap());
+    let embedding = Arc::new(crate::memory::embeddings::EmbeddingService::deterministic());
     let goal_store: Arc<dyn crate::traits::StateStore> = Arc::new(
-        crate::state::SqliteStateStore::new(
+        crate::state::SqliteStateStore::for_tests(
             db.path().join("goals.db").to_str().unwrap(),
             100,
             None,

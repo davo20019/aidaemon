@@ -6,8 +6,8 @@ use std::sync::Arc;
 async fn store() -> (tempfile::TempDir, SqliteStateStore) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("structured-memory.db");
-    let embeddings = Arc::new(EmbeddingService::new().unwrap());
-    let store = SqliteStateStore::new(path.to_str().unwrap(), 20, None, embeddings)
+    let embeddings = Arc::new(EmbeddingService::deterministic());
+    let store = SqliteStateStore::for_tests(path.to_str().unwrap(), 20, None, embeddings)
         .await
         .unwrap();
     (dir, store)
@@ -819,11 +819,12 @@ async fn blank_validity_bounds_mean_no_bound() {
 async fn startup_repairs_blank_bounds_and_their_duplicates() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("repair.db");
-    let embeddings = Arc::new(EmbeddingService::new().unwrap());
+    let embeddings = Arc::new(EmbeddingService::deterministic());
     {
-        let store = SqliteStateStore::new(path.to_str().unwrap(), 20, None, embeddings.clone())
-            .await
-            .unwrap();
+        let store =
+            SqliteStateStore::for_tests(path.to_str().unwrap(), 20, None, embeddings.clone())
+                .await
+                .unwrap();
         write(&store, &owner("residence", "Springfield")).await;
         // What older builds wrote: the same fact twice with blank bounds.
         for _ in 0..2 {
@@ -841,7 +842,7 @@ async fn startup_repairs_blank_bounds_and_their_duplicates() {
         }
         assert_eq!(canonical(&store).await, vec!["residence=Springfield"]);
     }
-    let store = SqliteStateStore::new(path.to_str().unwrap(), 20, None, embeddings)
+    let store = SqliteStateStore::for_tests(path.to_str().unwrap(), 20, None, embeddings)
         .await
         .unwrap();
     let mut rows = canonical(&store).await;

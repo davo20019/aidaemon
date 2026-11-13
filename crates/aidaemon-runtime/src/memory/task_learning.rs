@@ -145,9 +145,9 @@ mod tests {
         let path = file.path().to_str().unwrap().to_string();
         // The store keeps the file open; the file outlives the test.
         std::mem::forget(file);
-        let embeddings = Arc::new(aidaemon_memory::embeddings::EmbeddingService::new().unwrap());
+        let embeddings = Arc::new(aidaemon_memory::embeddings::EmbeddingService::deterministic());
         let state = Arc::new(
-            SqliteStateStore::new(&path, 100, None, embeddings)
+            SqliteStateStore::for_tests(&path, 100, None, embeddings)
                 .await
                 .unwrap(),
         );

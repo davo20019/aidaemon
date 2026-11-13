@@ -364,11 +364,10 @@ pub struct Agent {
     /// Kept in memory so a taint that could not be recorded still counts
     /// when a parent reads this child's result.
     read_untrusted: Arc<std::sync::atomic::AtomicBool>,
-    /// Test-only override for the execution budget selected at the start of
-    /// the agent loop. When `Some`, `select_initial_execution_budget` is
-    /// bypassed and this budget is used instead.
-    #[cfg(test)]
-    execution_budget_override: Option<ExecutionBudget>,
+    /// An execution budget pinned for this agent's turns (tests pin one;
+    /// the daemon never does). When `Some`, `select_initial_execution_budget`
+    /// is bypassed and this budget is used instead.
+    execution_budget_override: Option<aidaemon_runtime::turn::execution_state::ExecutionBudget>,
     /// Per-process specialist registry (bundled + user-override `.md` files).
     /// Loaded once at agent construction and shared with every child agent
     /// spawned from this hierarchy.

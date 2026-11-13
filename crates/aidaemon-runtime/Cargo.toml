@@ -86,7 +86,7 @@ aidaemon-events = { path = "../aidaemon-events", features = ["testing"] }
 aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
 aidaemon-channels = { path = "../aidaemon-channels", features = ["testing"] }
 aidaemon-work = { path = "../aidaemon-work", features = ["testing"] }
-aidaemon-memory = { path = "../aidaemon-memory", features = ["fastembed", "testing"] }
+aidaemon-memory = { path = "../aidaemon-memory", features = ["fastembed"] }
 axum = "0.8"
 proptest = "1"
 tempfile = "3"
