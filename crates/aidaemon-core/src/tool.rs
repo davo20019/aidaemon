@@ -438,10 +438,13 @@ pub trait Tool: Send + Sync {
         Outbound::Nothing
     }
 
-    /// Deterministic argument checks run before any policy or I/O. The
-    /// default checks the schema's `required` keys; override to add more.
+    /// Deterministic argument checks, run before any policy or I/O. The
+    /// kernel checks the arguments against the declared schema
+    /// ([`check_arguments`]: required keys, types, enums, nested objects
+    /// and array items) before calling this, whatever a tool does here, so
+    /// an override only adds checks. The default is that schema check.
     fn validate(&self, arguments: &Value) -> Result<(), String> {
-        check_required(&self.spec().parameters, arguments)
+        check_arguments(&self.spec().parameters, arguments)
     }
 
     /// How long this tool may run, overriding `Limits::tool_timeout`. Tools
@@ -520,29 +523,157 @@ pub trait Tool: Send + Sync {
 
 /// Minimal schema check: the arguments must be an object containing every
 /// `required` key. Full JSON Schema validation is left to tools that need it.
-pub(crate) fn check_required(schema: &Value, arguments: &Value) -> Result<(), String> {
-    let wants_object = schema.get("type").and_then(Value::as_str) == Some("object");
-    if !wants_object {
-        return Ok(());
+/// Drop every top-level argument key starting with `_`. Those keys are the
+/// dispatcher's (an application passes its own facts to a tool through
+/// [`ToolContext`], never through arguments), so a model that sends one is
+/// impersonating it. The kernel applies this to every call a model
+/// proposes before anything reads it, and the daemon's dispatcher uses the
+/// same function.
+pub fn strip_reserved_arguments(map: &mut serde_json::Map<String, Value>) {
+    map.retain(|key, _| !key.starts_with('_'));
+}
+
+/// Check `arguments` against a tool's declared JSON schema: an object when
+/// the schema says `"type": "object"`, every `required` key present and not
+/// null, and each present value of the declared `type` (`string`,
+/// `integer` (a whole number), `number`, `boolean`, `array`, `object`,
+/// `null`, or a list of these), within its `enum`, with nested objects and
+/// array items checked the same way. A `null` for a key that is not
+/// required counts as absent. Keywords beyond these are not enforced.
+pub fn check_arguments(schema: &Value, arguments: &Value) -> Result<(), String> {
+    check_value(schema, arguments, "arguments", true)
+}
+
+/// [`check_arguments`] without `required` keys (at any depth): what the
+/// kernel enforces for every call whatever the tool's own
+/// [`Tool::validate`] says. Which keys a call may leave out is the tool's
+/// contract (a dispatcher may fill defaults); what a present value is, is
+/// not.
+pub fn check_argument_types(schema: &Value, arguments: &Value) -> Result<(), String> {
+    check_value(schema, arguments, "arguments", false)
+}
+
+fn check_value(schema: &Value, value: &Value, at: &str, required_keys: bool) -> Result<(), String> {
+    if let Some(types) = schema.get("type") {
+        let allowed: Vec<&str> = match types {
+            Value::String(one) => vec![one.as_str()],
+            Value::Array(many) => many.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        if !allowed.is_empty() && !allowed.iter().any(|t| is_type(value, t)) {
+            return Err(if at == "arguments" && allowed == ["object"] {
+                "arguments must be a JSON object".to_string()
+            } else {
+                format!(
+                    "`{at}` must be {}, not {}",
+                    allowed.join(" or "),
+                    kind(value)
+                )
+            });
+        }
     }
-    let Some(object) = arguments.as_object() else {
-        return Err("arguments must be a JSON object".to_string());
-    };
-    let missing: Vec<&str> = schema
-        .get("required")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter(|key| !object.contains_key(*key))
-        .collect();
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "missing required argument(s): {}",
-            missing.join(", ")
-        ))
+    if let Some(options) = schema.get("enum").and_then(Value::as_array) {
+        if !options.contains(value) {
+            let listed: Vec<String> = options.iter().map(Value::to_string).collect();
+            return Err(format!("`{at}` must be one of {}", listed.join(", ")));
+        }
+    }
+    if let Value::Object(object) = value {
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let missing: Vec<&str> = required
+            .iter()
+            .filter(|_| required_keys)
+            .copied()
+            .filter(|key| object.get(*key).is_none_or(Value::is_null))
+            .filter(|key| {
+                // A required key whose own schema allows null may be null.
+                !object.contains_key(*key)
+                    || !schema
+                        .get("properties")
+                        .and_then(|p| p.get(*key))
+                        .is_some_and(allows_null)
+            })
+            .collect();
+        if !missing.is_empty() {
+            let prefix = if at == "arguments" {
+                String::new()
+            } else {
+                format!("`{at}`: ")
+            };
+            return Err(format!(
+                "{prefix}missing required argument(s): {}",
+                missing.join(", ")
+            ));
+        }
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (key, property) in properties {
+                let Some(item) = object.get(key) else {
+                    continue;
+                };
+                if item.is_null() && !required.contains(&key.as_str()) {
+                    continue;
+                }
+                let path = if at == "arguments" {
+                    key.clone()
+                } else {
+                    format!("{at}.{key}")
+                };
+                check_value(property, item, &path, required_keys)?;
+            }
+        }
+    }
+    if let (Value::Array(items), Some(item_schema)) = (value, schema.get("items")) {
+        if item_schema.is_object() {
+            for (index, item) in items.iter().enumerate() {
+                check_value(item_schema, item, &format!("{at}[{index}]"), required_keys)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn allows_null(schema: &Value) -> bool {
+    match schema.get("type") {
+        Some(Value::String(t)) => t == "null",
+        Some(Value::Array(ts)) => ts.iter().any(|t| t == "null"),
+        _ => true,
+    }
+}
+
+fn is_type(value: &Value, wanted: &str) -> bool {
+    match wanted {
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => {
+            value.is_i64()
+                || value.is_u64()
+                || value
+                    .as_f64()
+                    .is_some_and(|n| n.fract() == 0.0 && n.is_finite())
+        }
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => value.is_null(),
+        // An unknown type name is not ours to enforce.
+        _ => true,
+    }
+}
+
+fn kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 
@@ -638,10 +769,10 @@ mod tests {
     #[test]
     fn required_keys_are_checked() {
         let schema = json!({"type": "object", "required": ["path", "text"]});
-        assert!(check_required(&schema, &json!({"path": "a", "text": "b"})).is_ok());
-        let err = check_required(&schema, &json!({"path": "a"})).unwrap_err();
+        assert!(check_arguments(&schema, &json!({"path": "a", "text": "b"})).is_ok());
+        let err = check_arguments(&schema, &json!({"path": "a"})).unwrap_err();
         assert!(err.contains("text"), "{err}");
-        assert!(check_required(&schema, &json!("not an object")).is_err());
+        assert!(check_arguments(&schema, &json!("not an object")).is_err());
     }
 
     #[test]

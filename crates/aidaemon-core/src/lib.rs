@@ -90,8 +90,9 @@ pub use state::{Interruption, Pending, RunId, RunState, RUN_STATE_SCHEMA};
 pub use store::{MemoryStore, RunStore, StoreError};
 pub use stuck::{StuckConfig, StuckSignal};
 pub use tool::{
-    AccessManifest, Extensions, Finish, FnTool, Outbound, SameToolStreak, SourceTrust, Tool,
-    ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput, ToolResult,
+    check_argument_types, check_arguments, strip_reserved_arguments, AccessManifest, Extensions,
+    Finish, FnTool, Outbound, SameToolStreak, SourceTrust, Tool, ToolAnnotations, ToolContext,
+    ToolError, ToolInfo, ToolOutput, ToolResult,
 };
 
 pub use untrusted::{

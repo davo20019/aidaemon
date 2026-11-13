@@ -576,7 +576,8 @@ pub fn strip_model_arguments(
     map: &mut serde_json::Map<String, Value>,
     tool: Option<&dyn aidaemon_tools::OutcomeTool>,
 ) {
-    map.retain(|k, _| !k.starts_with('_'));
+    // The kernel's own rule, so the daemon and the SDK strip alike.
+    aidaemon_core::strip_reserved_arguments(map);
     if let Some(tool) = tool {
         drop_unset_optional_arguments(map, &tool.schema());
     }

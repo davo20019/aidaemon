@@ -374,6 +374,11 @@ impl<'a> Driver<'a> {
                     if call.id.trim().is_empty() {
                         call.id = format!("call_{turn}_{i}");
                     }
+                    // `_` keys are the dispatcher's; the model cannot send
+                    // them. Dropped before anything records or judges it.
+                    if let Some(map) = call.arguments.as_object_mut() {
+                        crate::tool::strip_reserved_arguments(map);
+                    }
                     call
                 })
                 .collect();
@@ -628,7 +633,7 @@ impl<'a> Driver<'a> {
                 track(self.record(receipt, output).await?, &mut nudge, &mut stop);
                 continue;
             };
-            if let Err(reason) = tool.validate(&call.arguments) {
+            if let Err(reason) = self.check_call(tool.as_ref(), &call) {
                 if let Some(end) = self
                     .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
                     .await?
@@ -1058,7 +1063,7 @@ impl<'a> Driver<'a> {
                     }
                     call.arguments = arguments;
                     if let Some(tool) = self.agent.tools.get(&call.name) {
-                        if let Err(reason) = tool.validate(&call.arguments) {
+                        if let Err(reason) = self.check_call(tool.as_ref(), call) {
                             return Verdict::Deny(format!(
                                 "a hook rewrote the arguments into an invalid call: {reason}"
                             ));
@@ -1546,6 +1551,17 @@ impl<'a> Driver<'a> {
     }
 
     /// The names of the installed hooks, in order.
+    /// The deterministic checks every call passes before a hook sees it:
+    /// the types the schema declares (from the specs computed at build), then
+    /// the tool's own `validate` (by default the full schema, required keys
+    /// included).
+    fn check_call(&self, tool: &dyn crate::Tool, call: &ToolCall) -> Result<(), String> {
+        if let Some(spec) = self.agent.specs.iter().find(|s| s.name == call.name) {
+            crate::tool::check_argument_types(&spec.parameters, &call.arguments)?;
+        }
+        tool.validate(&call.arguments)
+    }
+
     fn scrubber(&self) -> crate::redaction::Scrubber<'_> {
         crate::redaction::Scrubber {
             hooks: &self.agent.hooks,
