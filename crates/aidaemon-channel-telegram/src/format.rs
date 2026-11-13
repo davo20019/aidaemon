@@ -65,11 +65,15 @@ pub(crate) fn render_html(md: &str) -> String {
                 i += 1; // closing fence
             }
             // Content a card shows collapsed (`approval_render::COLLAPSED_FENCE`):
-            // an expandable quote, plain text, no code styling.
+            // an expandable quote, plain text, no code styling, never inside
+            // `<pre>`. Telegram shows an expandable quote's first three
+            // lines even collapsed, so a short command stood in full on the
+            // card (live 2026-11-13); its text is a spoiler as well, hidden
+            // until tapped whatever its length.
             if lang == aidaemon_channels::approval_render::COLLAPSED_FENCE {
-                out.push_str("<blockquote expandable>");
+                out.push_str("<blockquote expandable><tg-spoiler>");
                 out.push_str(&html_escape(&code));
-                out.push_str("</blockquote>\n");
+                out.push_str("</tg-spoiler></blockquote>\n");
                 continue;
             }
             if lang.is_empty() {
@@ -809,5 +813,40 @@ mod bot_format_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "bot"))]
+mod card_tests {
+    use super::*;
+
+    /// The approval card exactly as Telegram receives it (live 2026-11-13:
+    /// the command stood in full on the card): the command in an
+    /// expandable quote, hidden as a spoiler until tapped, never in `<pre>`.
+    #[test]
+    fn an_approval_cards_command_is_sent_collapsed_and_hidden() {
+        let card = aidaemon_core::ApprovalCard {
+            asked_by: Some("Drupal install".into()),
+            ..aidaemon_core::ApprovalCard::new(aidaemon_core::CardAction::Command {
+                line: "ddev drush site:install standard -y > /dev/null 2>&1".into(),
+                title: Some("install the site".into()),
+                looks_inside: Vec::new(),
+            })
+        };
+        let markdown = aidaemon_channels::approval_render::build_card_markdown(
+            &card,
+            aidaemon_tools::command_risk::RiskLevel::Medium,
+            &[],
+        );
+        let html = render_html(&aidaemon_channels::latex::strip_latex_keeping_code(
+            &markdown,
+        ));
+        assert_eq!(
+            html,
+            "<b>Drupal install wants to run a command on your computer: install the site.</b>\n\n\
+             <blockquote expandable><tg-spoiler>ddev drush site:install standard -y &gt; \
+             /dev/null 2&gt;&amp;1</tg-spoiler></blockquote>"
+        );
+        assert!(!html.contains("<pre>"));
     }
 }
