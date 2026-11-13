@@ -1298,3 +1298,82 @@ async fn only_a_child_that_reached_its_run_counts_toward_the_requests_total() {
 
     assert!(family.try_admit().is_err(), "the child that ran kept it");
 }
+
+/// What a chat receives once a background helper with `script` as its
+/// model ends, waiting at most a few seconds and sending nothing in.
+async fn background_finish_reaches_chat(script: Vec<crate::traits::ProviderResponse>) -> Vec<String> {
+    let session = "telegram:synthetic-chat-1";
+    let harness = crate::testing::setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(script),
+        vec![],
+        None,
+    )
+    .await
+    .unwrap();
+    let channel = Arc::new(crate::testing::TestChannel::new());
+    let session_map: crate::channels::SessionMap = Arc::new(tokio::sync::RwLock::new(
+        std::collections::HashMap::from([(session.to_string(), "test".to_string())]),
+    ));
+    let hub = Arc::new(crate::channels::ChannelHub::new(
+        vec![channel.clone() as Arc<dyn crate::traits::HubChannel>],
+        session_map,
+    ));
+    let outbound: Arc<dyn crate::runtime_ports::OutboundRouter> = hub.clone();
+    let (agent, files) = harness.into_agent();
+    let agent = Arc::new(agent);
+    let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
+    let spawn_tool = crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 30)
+        .with_state(files.state.clone() as Arc<dyn crate::traits::StateStore>);
+    spawn_tool.set_hub(Arc::downgrade(&outbound));
+    let started = crate::testing::call_with_facts(
+        &spawn_tool,
+        &json!({
+            "title": "Slow count",
+            "task": "Count to 3.",
+            "background": true,
+        })
+        .to_string(),
+        crate::testing::call_facts(session),
+    )
+    .await
+    .unwrap();
+    assert!(started.contains("Started in the background"), "{started}");
+    for _ in 0..200 {
+        let sent = channel.messages_for(session).await;
+        if sent.iter().any(|text| text.contains("in the background: Slow count")) {
+            return sent;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    channel.messages_for(session).await
+}
+
+/// A background helper's result reaches its chat the moment it ends, with
+/// nothing sent in meanwhile (live 2026-11-13: a finished count's result
+/// was looked for until the owner's next message): after a plain final
+/// reply, and after a final reply the engine rejected and retried once.
+#[tokio::test]
+async fn a_background_helpers_result_reaches_the_chat_when_it_ends() {
+    let plain = background_finish_reaches_chat(vec![MockProvider::text_response(
+        "Done. I counted to 3.",
+    )])
+    .await;
+    assert!(
+        plain.iter().any(|text| text.contains("in the background: Slow count")),
+        "{plain:?}"
+    );
+
+    let checklist = r#"{"items":[
+        {"text":"Count to 3","status":"in_progress","mutation_effects":["process_state"]}
+    ]}"#;
+    let retried = background_finish_reaches_chat(vec![
+        MockProvider::tool_call_response("track_requirements", checklist),
+        MockProvider::text_response("Done. I counted to 3."),
+        MockProvider::text_response("Done. I counted to 3."),
+    ])
+    .await;
+    assert!(
+        retried.iter().any(|text| text.contains("in the background: Slow count")),
+        "{retried:?}"
+    );
+}

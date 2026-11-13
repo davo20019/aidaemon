@@ -5257,7 +5257,7 @@ async fn a_ticked_step_is_confirmed_only_by_the_runs_receipts() {
     let card = plan.render_compact_checklist();
     assert!(card.contains("✅ read the first file"), "{card}");
     assert!(
-        card.contains("☑️ read the second file (said done; nothing confirmed it)"),
+        card.contains("☑️ read the second file (no tool confirmed it)"),
         "{card}"
     );
 }

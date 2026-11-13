@@ -379,10 +379,10 @@ impl PlanStore {
         &self,
         session_id: &str,
         job_id: &str,
-        succeeded: bool,
+        end: super::JobEnd,
     ) -> anyhow::Result<Option<TaskPlan>> {
         for mut plan in self.get_recent_for_session(session_id, 5).await? {
-            if plan.settle_background_job(job_id, succeeded) {
+            if plan.settle_background_job(job_id, end) {
                 self.update(&plan).await?;
                 return Ok(Some(plan));
             }
@@ -827,7 +827,7 @@ mod tests {
         let card = plan.render_compact_checklist();
         assert!(card.starts_with("⚙️ Working · step 3 of 3"), "{card}");
         assert!(
-            card.contains("☑️ Check the second site (said done; nothing confirmed it)"),
+            card.contains("☑️ Check the second site (no tool confirmed it)"),
             "{card}"
         );
         assert!(!card.contains("✅"), "{card}");
@@ -848,13 +848,13 @@ mod tests {
             .unwrap()
             .unwrap();
         let plan = store
-            .settle_background_job("s1", "job-1", true)
+            .settle_background_job("s1", "job-1", crate::plans::JobEnd::Succeeded)
             .await
             .unwrap()
             .unwrap();
         let card = plan.render_compact_checklist();
         assert!(
-            card.starts_with("☑️ Finished · 2 of 3 confirmed, 1 said done"),
+            card.starts_with("☑️ Finished · 3 of 3 done, 1 not confirmed by a tool"),
             "{card}"
         );
         assert!(card.contains("✅ Report both"), "{card}");
@@ -886,7 +886,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let plan = store
-            .settle_background_job("s1", "job-1", true)
+            .settle_background_job("s1", "job-1", crate::plans::JobEnd::Succeeded)
             .await
             .unwrap()
             .unwrap();
@@ -1174,7 +1174,7 @@ mod tests {
         assert_eq!(plan.steps[1].background_jobs, vec!["job-a".to_string()]);
 
         let plan = store
-            .settle_background_job("s", "job-a", true)
+            .settle_background_job("s", "job-a", crate::plans::JobEnd::Succeeded)
             .await
             .unwrap()
             .expect("settled");
