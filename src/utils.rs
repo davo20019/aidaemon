@@ -6,15 +6,7 @@ pub use aidaemon_tools::text::{
 
 pub use aidaemon_events::text::{truncate_str, truncate_with_note};
 
-/// Render the model-facing truncation notice from structured metadata.
-/// Exactly one call site in the agent loop renders this; tools must not
-/// embed it in their returned output.
-pub fn render_truncation_notice(info: &crate::traits::TruncationInfo) -> String {
-    match info.remediation_hint.as_deref() {
-        Some(hint) => truncation_notice_with_hint(info.shown_chars, info.total_chars, hint),
-        None => truncation_notice(info.shown_chars, info.total_chars),
-    }
-}
+pub use aidaemon_runtime::turn::helpers::render_truncation_notice;
 
 /// Losslessly compact a pretty-printed JSON block embedded in tool-result
 /// text (headers/prefix + JSON body + suffix). Pretty-printed JSON costs
