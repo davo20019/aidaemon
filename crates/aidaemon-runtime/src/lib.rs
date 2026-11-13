@@ -11,6 +11,10 @@
 //! - [`engine`]: the boundary between a turn's kernel run and its host:
 //!   the host calls, the forwarding hooks and the host provider.
 //! - [`eval`]: the per-task harness effectiveness evaluation.
+//! - [`background_task_lead`]: a goal's task lead run in the background,
+//!   its executors, recovery and result delivery.
+//! - [`goal_dispatch`]: wait prefixes, scheduled-run provenance and state,
+//!   and the user-facing goal and task result summaries.
 //! - [`chat_bridge`]: calling an SDK provider with chat-completions JSON,
 //!   and the classified provider errors recovery decisions read.
 //! - [`prompt`]: the system prompt's cacheable core, its fixed rule blocks
@@ -45,11 +49,13 @@
 pub mod approvals;
 pub mod authority;
 pub mod background_run;
+pub mod background_task_lead;
 pub mod chat_bridge;
 pub mod context_budget;
 pub mod coordination;
 pub mod engine;
 pub mod eval;
+pub mod goal_dispatch;
 pub mod host;
 pub mod known_resources;
 pub mod llm;

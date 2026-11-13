@@ -27,9 +27,7 @@ use std::sync::Arc;
 pub use aidaemon_channels::hub::{ChannelHub, SessionMap};
 #[cfg(feature = "discord")]
 pub use discord::{spawn_discord_channel, DiscordChannel};
-pub(crate) use presentation::{
-    present_notification, present_scheduled_run_notification, ScheduledRunProgress,
-};
+pub(crate) use presentation::present_notification;
 #[cfg(feature = "slack")]
 pub use slack::{spawn_slack_channel, SlackChannel};
 pub(crate) use telegram::{new_telegram_bot, TelegramBot};

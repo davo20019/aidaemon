@@ -146,10 +146,6 @@ mod notes;
 mod parent_delivery;
 #[path = "turn/post_turn.rs"]
 mod post_turn;
-/// Project scopes live in `aidaemon-runtime`.
-mod project_scope {
-    pub(in crate::agent) use aidaemon_runtime::turn::project_scope::*;
-}
 #[path = "runtime/sdk_engine.rs"]
 pub(crate) mod sdk_engine;
 #[path = "runtime/sdk_provider.rs"]
@@ -422,22 +418,22 @@ impl AgentLimits {
     }
 }
 
-// Goal/task dispatch helpers. Implementation lives in `goal_dispatch.rs`.
+// Goal/task dispatch helpers live in `aidaemon_runtime::goal_dispatch`.
 #[path = "goal_dispatch.rs"]
 mod goal_dispatch;
-pub use goal_dispatch::is_group_session;
-pub(in crate::agent) use goal_dispatch::{
-    auto_dispatch_scheduled_run_extension_budget, clear_scheduled_run_state,
-    effective_goal_daily_budget, goal_has_scheduled_provenance, parse_goal_leading_wait,
-    parse_wait_task_seconds, persist_scheduled_run_state, strip_leading_wait,
-    task_has_scheduled_provenance, truncate_goal_result_text, user_facing_task_description,
-};
+#[cfg(test)]
+pub(crate) use goal_dispatch::{build_goal_failure_summary, extract_file_paths_from_text};
 pub(crate) use goal_dispatch::{
-    build_goal_failure_summary, build_goal_task_results_summary, extract_file_paths_from_text,
-    SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS, SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
+    build_goal_task_results_summary, SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS,
+    SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
 };
+pub(in crate::agent) use goal_dispatch::{
+    clear_scheduled_run_state, goal_has_scheduled_provenance, task_has_scheduled_provenance,
+};
+#[cfg(test)]
+pub(in crate::agent) use goal_dispatch::{parse_wait_task_seconds, user_facing_task_description};
 
-// Background task-lead spawner. Implementation lives in `background_task_lead.rs`.
+// A goal's background task lead lives in `aidaemon_runtime::background_task_lead`.
 #[path = "background_task_lead.rs"]
 mod background_task_lead;
 pub use background_task_lead::spawn_background_task_lead;
