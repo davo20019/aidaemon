@@ -58,6 +58,36 @@ pub(crate) struct SpawnChildResult {
     /// `Untrusted` when the child's run read (or started with) untrusted
     /// content: its result carries that taint back to the parent.
     pub trust: aidaemon_core::SourceTrust,
+    /// See [`crate::runtime_ports::ChildAgentRun::reported_done`].
+    pub reported_done: bool,
+}
+
+/// Whether a child's partial outcome is only for want of receipts: it
+/// ended its run normally with its own typed verdict `done`, nothing it
+/// started still runs, the owner declined nothing, and it set none of its
+/// listed steps aside (failed, skipped or deferred); only some steps were
+/// never matched by a receipt. The owner is then told it finished.
+fn reported_done_unconfirmed(
+    outcome: TaskOutcome,
+    end: &TaskEndData,
+    aggregate: &crate::events::RunAggregate,
+) -> bool {
+    use crate::events::RunObligationState;
+    outcome == TaskOutcome::Partial
+        && end.status == crate::events::TaskStatus::Completed
+        && aggregate.executor_claimed_outcome == Some(crate::events::ExecutorClaimedOutcome::Done)
+        && !aggregate.has_background_in_flight()
+        && !aggregate.owner_declined()
+        && aggregate
+            .obligations
+            .iter()
+            .filter(|(id, _)| id.contains("/obligation:checklist:"))
+            .all(|(_, obligation)| {
+                matches!(
+                    obligation.state,
+                    RunObligationState::Satisfied | RunObligationState::Pending
+                )
+            })
 }
 
 #[derive(Debug)]
@@ -134,13 +164,20 @@ struct ListedChild {
     request: Option<String>,
     /// Stops the child when the owner asks.
     stop: tokio_util::sync::CancellationToken,
+    /// Its latest step, as its progress line says it.
+    step: ChildStep,
 }
+
+/// A running child's latest step, written by its status channel.
+pub(crate) type ChildStep = Arc<std::sync::Mutex<Option<String>>>;
 
 /// A listed child, as the chat's running work shows it.
 pub(crate) struct ListedChildView {
     pub key: String,
     pub child: aidaemon_channels::ports::RunningChild,
     pub request: Option<String>,
+    /// Its latest step, as `/tasks` and the status reply give it.
+    pub step: Option<String>,
 }
 
 /// A chat's running turn, recorded while it runs.
@@ -169,12 +206,18 @@ pub(crate) struct RunningChildEntry {
     registry: Arc<RunningChildren>,
     id: u64,
     stop: tokio_util::sync::CancellationToken,
+    step: ChildStep,
 }
 
 impl RunningChildEntry {
     /// Cancelled when the owner stops this child.
     pub(crate) fn stopped(&self) -> tokio_util::sync::CancellationToken {
         self.stop.clone()
+    }
+
+    /// Where the child's status channel writes its latest step.
+    pub(crate) fn step(&self) -> ChildStep {
+        self.step.clone()
     }
 }
 
@@ -194,6 +237,7 @@ impl RunningChildren {
             .get(session_id)
             .cloned();
         let stop = tokio_util::sync::CancellationToken::new();
+        let step = ChildStep::default();
         self.entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -206,11 +250,13 @@ impl RunningChildren {
                 child_session: child_session.to_string(),
                 request,
                 stop: stop.clone(),
+                step: step.clone(),
             });
         RunningChildEntry {
             registry: self.clone(),
             id,
             stop,
+            step,
         }
     }
 
@@ -303,6 +349,11 @@ impl RunningChildren {
                         started_at: child.started_at,
                     },
                     request: child.request.clone(),
+                    step: child
+                        .step
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
                 }
             })
             .collect()
@@ -393,6 +444,7 @@ const MAX_REPORT_TOOL_RECORDS: usize = 5_000;
 fn child_status_sender(
     parent: Option<mpsc::Sender<StatusUpdate>>,
     mission: &str,
+    step: Option<ChildStep>,
 ) -> Option<mpsc::Sender<StatusUpdate>> {
     let parent = parent?;
     let label = child_status_label(mission);
@@ -439,6 +491,22 @@ fn child_status_sender(
                 },
                 other => other,
             };
+            // Its own latest step, for `/tasks`.
+            if let (
+                Some(slot),
+                StatusUpdate::SubAgentProgress {
+                    label: of,
+                    progress,
+                },
+            ) = (step.as_ref(), &update)
+            {
+                if *of == label {
+                    *slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(progress.clone());
+                }
+            }
             if parent.send(update).await.is_err() {
                 break;
             }
@@ -3181,7 +3249,11 @@ impl Agent {
         let session_for_task = child_session.clone();
         let task_for_task = task.to_string();
         let parent_status_tx = status_tx.clone();
-        let status_tx = child_status_sender(status_tx, &card_name);
+        let status_tx = child_status_sender(
+            status_tx,
+            &card_name,
+            listed.as_ref().map(RunningChildEntry::step),
+        );
         // Setup is done: from here the child counts toward its request's
         // total even if it then fails.
         crate::agent::authority::mark_child_began();
@@ -3327,18 +3399,32 @@ impl Agent {
 
         let child_end_record =
             latest_child_task_end(&self.event_store, &child_session_for_events).await;
+        let unlanded_write = outcome_coordination
+            .as_ref()
+            .is_some_and(|tree| tree.has_unlanded_write(&child_session_for_events));
         let child_outcome = settle_coordinated_outcome(
             resolve_child_outcome(result.is_ok(), &child_end_record),
-            outcome_coordination
-                .as_ref()
-                .is_some_and(|tree| tree.has_unlanded_write(&child_session_for_events)),
+            unlanded_write,
         );
+        let reported_done = match child_end_record.as_ref() {
+            Ok(Some(end)) if result.is_ok() && !unlanded_write => self
+                .event_store
+                .task_run_aggregate(&child_session_for_events, &end.task_id)
+                .await
+                .is_ok_and(|aggregate| reported_done_unconfirmed(child_outcome, end, &aggregate)),
+            _ => false,
+        };
         // The child's progress line on the parent's card ends with how the
         // child ended, not with the last step it reported.
         if let Some(tx) = &parent_status_tx {
+            let ended = if reported_done {
+                TaskOutcome::Succeeded
+            } else {
+                child_outcome
+            };
             let _ = tx.try_send(StatusUpdate::SubAgentProgress {
                 label: child_status_label(&card_name),
-                progress: child_end_progress(child_outcome).to_string(),
+                progress: child_end_progress(ended).to_string(),
             });
         }
         let child_task_end = match child_end_record {
@@ -3481,6 +3567,7 @@ impl Agent {
             response,
             outcome: child_outcome,
             trust,
+            reported_done,
         })
     }
 
@@ -3786,7 +3873,7 @@ mod tests {
         assert_eq!(crate::tools::terminal::latest_output_line(b"\n \n"), None);
 
         let (parent_tx, mut parent_rx) = mpsc::channel(4);
-        let counter = child_status_sender(Some(parent_tx), "Slow counter").unwrap();
+        let counter = child_status_sender(Some(parent_tx), "Slow counter", None).unwrap();
         counter
             .send(StatusUpdate::CommandOutput {
                 name: "terminal".into(),
@@ -3814,11 +3901,15 @@ mod tests {
         let wordpress = child_status_sender(
             Some(parent_tx.clone()),
             "Build the WordPress demo site for Acme Corp",
+            None,
         )
         .unwrap();
-        let drupal =
-            child_status_sender(Some(parent_tx), "Build the Drupal demo site for Acme Corp")
-                .unwrap();
+        let drupal = child_status_sender(
+            Some(parent_tx),
+            "Build the Drupal demo site for Acme Corp",
+            None,
+        )
+        .unwrap();
         wordpress
             .send(StatusUpdate::Checklist {
                 text: rendered_checklist(5, 5),

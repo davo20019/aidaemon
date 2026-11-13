@@ -430,7 +430,8 @@ impl Tool for TrackRequirementsTool {
          tried one and it did not work, or 'deferred' if you will not do one: the run may then \
          end, but a failed, deferred or removed item is reported as not done, never as done. \
          Write each item as the person you are helping reads it, speaking to them ('your \
-         calendar'). \
+         calendar'), and name the folder or file an item creates ('Install WordPress in \
+         ~/projects/site-6'), so they see where the work goes before it is done. \
          Mark 'background' an item a background job you launch will do and report on (give that \
          launch the item's index in its checklist_items): the card shows it running, and only the \
          job's end marks it done or failed. \

@@ -1566,6 +1566,31 @@ mod tests {
         assert!(agent.work.lock().unwrap().is_empty());
     }
 
+    /// `/tasks` gives each helper's latest step beside its title, as the
+    /// status reply does (live 2026-11-13: "#2 Sub-agent: WordPress Install
+    /// (29s so far)" with nothing about what it was doing).
+    #[tokio::test]
+    async fn tasks_lists_a_helpers_latest_step() {
+        let mut work = two_counting_jobs();
+        work[0].step = Some("running a command: 14".into());
+        let agent = ScriptedAgent {
+            release: tokio::sync::Notify::new(),
+            reading: std::sync::Mutex::new(None),
+            work: std::sync::Mutex::new(work),
+        };
+        let registry = TaskRegistry::new(10);
+        let running = crate::stop::running_work(&registry, &agent, "s1").await;
+        let tasks = crate::slash::render_tasks(&running, &[], chrono::Utc::now(), None);
+        assert!(
+            tasks.contains("Sub-agent: Counting agent A – running a command: 14 ("),
+            "{tasks}"
+        );
+        assert!(
+            tasks.contains("Background command: count to 300 ("),
+            "{tasks}"
+        );
+    }
+
     fn two_counting_jobs() -> Vec<crate::ports::ChatWork> {
         let now = chrono::Utc::now();
         vec![
@@ -1575,6 +1600,7 @@ mod tests {
                 title: "Sub-agent: Counting agent A".into(),
                 started_at: now - chrono::Duration::seconds(60),
                 request: Some("req-1".into()),
+                step: None,
             },
             crate::ports::ChatWork {
                 key: "job:0:4242".into(),
@@ -1582,6 +1608,7 @@ mod tests {
                 title: "Background command: count to 300".into(),
                 started_at: now - chrono::Duration::seconds(50),
                 request: Some("req-1".into()),
+                step: None,
             },
         ]
     }

@@ -214,6 +214,8 @@ pub struct ChatWork {
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// The request (turn) that started it, when known; opaque.
     pub request: Option<String>,
+    /// Its latest step, as its own progress said it (a sub-agent's).
+    pub step: Option<String>,
 }
 
 /// Everything running for a chat besides its turns.

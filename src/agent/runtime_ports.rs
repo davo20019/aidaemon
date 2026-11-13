@@ -80,6 +80,7 @@ impl ChildAgentRuntime for Agent {
             response: result.response,
             outcome: result.outcome,
             trust: result.trust,
+            reported_done: result.reported_done,
         })
     }
 
