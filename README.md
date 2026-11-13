@@ -267,6 +267,22 @@ message you send while the task is still running joins that task, and the
 Deny still holds. Once the task has finished, your next message starts a new
 task, so you can change your mind and ask again.
 
+### Reaching the gateways from your other devices
+
+The Client Gateway (`/client/v1`, for `aidaemon tui`, `aidaemon web` and paired phones) and the Node Gateway (`/node/v1`) only listen on loopback. To reach them from elsewhere, let the daemon run the tunnel itself: it starts with the daemon, stops with it, restarts with backoff when it drops, and feeds its address into pairing links and Node heartbeats. The tunnel only moves bytes; devices still pair with their own keys.
+
+```toml
+[exposure.client_gateway]
+adapter = "tailscale"        # private to your tailnet; mode = "funnel" makes it public
+
+[exposure.node_gateway]
+adapter = "cloudflare"       # a named tunnel on your own hostname
+hostname = "nodes.example.com"
+tunnel = "my-tunnel"         # created with `cloudflared tunnel create`
+```
+
+Adapters: `tailscale` (`serve` or `funnel`), `cloudflare` (`named`, or `quick` for a throwaway `trycloudflare.com` address, Client Gateway only), `manual` (`url` of a reverse proxy you run) and `command` (any program that prints `{"url": "https://..."}` on its first line and keeps running; argv only, `{port}`, `{addr}` and `{service}` are filled in). The Node Gateway needs an address that survives restarts, so it refuses `quick` and a `command` without `stable = true`. `cloudflared` or `tailscale` must be on `PATH` (or set `binary`). Changes apply after a restart; `/exposure` shows each tunnel's state, address and last failure. The agent can set this up for you (`manage_config enable_exposure`, with your approval), except `command`, which only you can write.
+
 ### Customize your agent
 
 The setup wizard asks what your agent should be called, what role it should serve, and how it should communicate. It writes those choices to an editable `persona.md` next to `config.toml`.
