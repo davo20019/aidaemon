@@ -2202,7 +2202,8 @@ async fn answer_group(route: &ResultRoute, ends: Vec<crate::run_state::GroupEnd>
 /// The continuation a turn's group of runs gets once the last of them
 /// ended: each run's name, how it ended and its one time set from its
 /// record ([`crate::run_state::RunTimes::line`], the line its card shows),
-/// then its report with every duration in it left out. The parent answers
+/// then its report (told never to state a time: the record is the only
+/// source of one). The parent answers
 /// the owner's request once from this, and the record's labelled times are
 /// the only durations it sees (live 2026-11-13: the answer said "its agent
 /// took 3m 55s" and "stopped after 2m", work-start figures, under a card
@@ -2235,8 +2236,7 @@ pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usi
             out.push_str(&line);
             out.push('\n');
         }
-        let text = without_durations(end.report.text.trim());
-        let (report, _) = bounded_child_response(&text, max_report_chars);
+        let (report, _) = bounded_child_response(end.report.text.trim(), max_report_chars);
         let report = if end.report.untrusted {
             aidaemon_tools::sanitize::wrap_untrusted_output("spawn_agent", report)
         } else {
@@ -2266,25 +2266,6 @@ pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usi
          to re-check this work.",
     );
     out
-}
-
-/// `text` with every stated duration ("3m 55s", "about 2 minutes", "40
-/// sec") replaced by a mark that a time was left out: a helper's report is
-/// never a source of times, the run record is (it is told so, and a
-/// report that says one anyway must not reach the answer as a figure).
-pub fn without_durations(text: &str) -> String {
-    use regex::Regex;
-    use std::sync::LazyLock as Lazy;
-    // A number, then a unit of time; runs of them ("1h 2m 3s") are one
-    // duration.
-    static DURATION: Lazy<Regex> = Lazy::new(|| {
-        let one = r"\d+(?:[.,]\d+)?\s*-?\s*(?:milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b";
-        Regex::new(&format!(r"(?i)\b{one}(?:\s*(?:and\s+)?{one})*"))
-            .expect("valid duration pattern")
-    });
-    DURATION
-        .replace_all(text, "[a time, left out]")
-        .into_owned()
 }
 
 /// What the runtime measured of a background run as it ends: now, its
@@ -2944,8 +2925,8 @@ mod group_tests {
     /// "stopped after 2m" under a card that said "Done 5m 54s after your
     /// request". The continuation carries each run's one time set, every
     /// figure labelled ("took" for its own work, "after your request" from
-    /// the request), and nothing else that looks like a duration: a
-    /// report's own times are left out.
+    /// the request), and the record's figures appear only on its labelled
+    /// lines.
     #[test]
     fn the_group_followup_has_only_the_records_labelled_times() {
         use chrono::TimeZone;
@@ -2979,7 +2960,7 @@ mod group_tests {
         let ends = vec![
             end(
                 run("d", "Install Drupal demo site", RunPhase::Stopped, 117, 237),
-                "DDEV could not start: low Docker disk space. It ran for about 2 minutes.",
+                "DDEV could not start: low Docker disk space.",
             ),
             end(
                 run(
@@ -2989,7 +2970,7 @@ mod group_tests {
                     119,
                     354,
                 ),
-                "WordPress is up at https://wp.ddev.site (took 3m 55s, 1h 2m 3s in all).",
+                "WordPress is up at https://wp.ddev.site.",
             ),
         ];
         let followup = group_followup(&ends, 8_000);
@@ -3026,34 +3007,18 @@ mod group_tests {
             followup.contains("The last of them ended 5m 54s after your request ("),
             "{followup}"
         );
-        // Every duration in it is on a record's line; the reports' own
-        // times are gone, their words kept.
-        for line in followup.lines() {
-            if line.starts_with("Times: ") || line.starts_with("The last of them ended ") {
-                continue;
+        // The record's figures appear only on its labelled lines.
+        for figure in ["3m 55s", "5m 54s", "1m 59s"] {
+            for line in followup.lines().filter(|line| line.contains(figure)) {
+                assert!(
+                    line.starts_with("Times: ") || line.starts_with("The last of them ended "),
+                    "{figure} outside the record's lines: {line}"
+                );
             }
-            assert_eq!(
-                without_durations(line),
-                line,
-                "a duration outside the record: {line}"
-            );
         }
         assert!(followup.contains("DDEV could not start: low Docker disk space."));
         assert!(followup.contains("WordPress is up at https://wp.ddev.site"));
-        assert!(!followup.contains("3m 55s, 1h"), "{followup}");
-        assert!(!followup.contains("about 2 minutes"), "{followup}");
-    }
-
-    #[test]
-    fn durations_are_left_out_of_a_report_and_other_numbers_kept() {
-        assert_eq!(
-            without_durations("Took 3m 55s; PHP 8.3 on port 8080, 2 sites, about 40 sec."),
-            "Took [a time, left out]; PHP 8.3 on port 8080, 2 sites, about [a time, left out]."
-        );
-        assert_eq!(
-            without_durations("1 hour and 5 minutes"),
-            "[a time, left out]"
-        );
+        assert!(followup.contains("quote one of these figures with its own words"));
     }
 
     /// A run alone in its group, or in none, is its own answer; a group's
