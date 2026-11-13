@@ -12,10 +12,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::{IterationLimitConfig, PathAliasConfig};
+#[cfg(test)]
+use crate::events::{AssistantResponseData, TaskEndData, ThinkingStartData, ToolResultData};
 use crate::events::{
-    AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
-    SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData, TaskStatus,
-    ThinkingStartData, ToolResultData,
+    DecisionPointData, DecisionType, EventStore, EventType, SubAgentCompleteData,
+    SubAgentSpawnData, TaskStartData, TaskStatus,
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
@@ -86,7 +87,7 @@ mod execution_state;
 pub(crate) use execution_state::ExecutionBudget;
 pub(crate) use execution_state::TargetScope;
 pub(in crate::agent) use execution_state::{
-    select_initial_execution_budget, ExecutionPersistence, ExecutionState, StepExecutionOutcome,
+    select_initial_execution_budget, ExecutionPersistence, ExecutionState,
 };
 /// Tool-failure classification lives in `aidaemon-runtime`.
 mod loop_utils {
@@ -268,8 +269,7 @@ pub use agent_helpers::touch_heartbeat;
 pub(in crate::agent) use agent_helpers::IntentGateDecision;
 pub(in crate::agent) use agent_helpers::{
     filter_tool_defs_for_untrusted_external_reference, is_resume_request,
-    is_untrusted_external_reference_blocked_tool, truncate_for_resume, ResumeCheckpoint,
-    ResumeExecutionSnapshot,
+    is_untrusted_external_reference_blocked_tool, ResumeCheckpoint, ResumeExecutionSnapshot,
 };
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::{

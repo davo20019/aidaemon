@@ -22,6 +22,7 @@ pub mod project_dir;
 pub mod project_instructions;
 pub mod project_scope;
 pub mod reply_checks;
+pub mod resume;
 pub mod sliding_window;
 pub mod system_directives;
 pub mod task_end;

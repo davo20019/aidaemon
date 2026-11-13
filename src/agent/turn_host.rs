@@ -24,6 +24,10 @@ impl TurnStores for Agent {
     fn events(&self) -> &EventStore {
         &self.event_store
     }
+
+    fn event_log(&self) -> std::sync::Arc<EventStore> {
+        self.event_store.clone()
+    }
 }
 
 impl TurnWorkspace for Agent {

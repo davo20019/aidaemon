@@ -25,6 +25,8 @@ pub trait TurnStores: Send + Sync {
     fn goals(&self) -> &dyn aidaemon_work::stores::GoalStore;
     /// The event log.
     fn events(&self) -> &EventStore;
+    /// A shared handle to the event log, for emitters and spawned work.
+    fn event_log(&self) -> std::sync::Arc<EventStore>;
 }
 
 /// Where the turn's file work happens.

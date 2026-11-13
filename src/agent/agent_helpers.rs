@@ -9,7 +9,6 @@ use serde_json::Value;
 
 #[cfg(test)]
 use super::contains_keyword_as_words;
-use super::execution_state::StepExecutionOutcome;
 
 pub use aidaemon_runtime::turn::helpers::touch_heartbeat;
 
@@ -25,148 +24,9 @@ pub(in crate::agent) struct IntentGateDecision {
     pub(in crate::agent) needs_tools: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
-pub(in crate::agent) struct ResumeCheckpoint {
-    pub(in crate::agent) task_id: String,
-    pub(in crate::agent) description: String,
-    pub(in crate::agent) original_user_message: Option<String>,
-    pub(in crate::agent) elapsed_secs: u64,
-    pub(in crate::agent) last_iteration: u32,
-    pub(in crate::agent) tool_results_count: u32,
-    pub(in crate::agent) pending_tool_call_ids: Vec<String>,
-    pub(in crate::agent) last_assistant_summary: Option<String>,
-    pub(in crate::agent) last_tool_summary: Option<String>,
-    pub(in crate::agent) last_error: Option<String>,
-    pub(in crate::agent) execution_snapshot: Option<ResumeExecutionSnapshot>,
-    /// The interrupted task's ORIGINAL turn_id (from its TaskStart event).
-    /// Recovery TaskEnd MUST use this, never the new resume turn. None for
-    /// legacy tasks whose TaskStart predates turn_id persistence.
-    pub(in crate::agent) turn_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub(in crate::agent) struct ResumeExecutionSnapshot {
-    pub(in crate::agent) execution_id: String,
-    pub(in crate::agent) current_step_id: Option<String>,
-    pub(in crate::agent) current_tool: Option<String>,
-    pub(in crate::agent) current_target: Option<String>,
-    pub(in crate::agent) last_outcome: Option<StepExecutionOutcome>,
-    pub(in crate::agent) background_handoff_active: bool,
-    pub(in crate::agent) idempotency_key: Option<String>,
-}
-
-impl ResumeCheckpoint {
-    pub(in crate::agent) fn render_prompt_section(&self) -> String {
-        let mut lines = vec![
-            "## Resume Checkpoint".to_string(),
-            "The user explicitly asked to continue prior in-progress work. Resume from this checkpoint and avoid restarting completed steps."
-                .to_string(),
-            format!("- Previous task_id: {}", self.task_id),
-            format!("- Original task: {}", self.description),
-            format!("- Elapsed before interruption: {}s", self.elapsed_secs),
-            format!("- Last completed iteration: {}", self.last_iteration),
-            format!("- Completed tool results: {}", self.tool_results_count),
-            format!(
-                "- Pending unresolved tool calls: {}",
-                self.pending_tool_call_ids.len()
-            ),
-        ];
-
-        if !self.pending_tool_call_ids.is_empty() {
-            let pending = self
-                .pending_tool_call_ids
-                .iter()
-                .take(3)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            lines.push(format!("- Pending tool call IDs: {}", pending));
-        }
-        if let Some(msg) = &self.original_user_message {
-            lines.push(format!(
-                "- Original user request: {}",
-                truncate_for_resume(msg, 180)
-            ));
-        }
-        if let Some(summary) = &self.last_assistant_summary {
-            lines.push(format!("- Last assistant output: {}", summary));
-        }
-        if let Some(summary) = &self.last_tool_summary {
-            lines.push(format!("- Last tool result: {}", summary));
-        }
-        if let Some(err) = &self.last_error {
-            lines.push(format!("- Last error: {}", err));
-        }
-        if let Some(snapshot) = &self.execution_snapshot {
-            lines.push(format!("- Execution id: {}", snapshot.execution_id));
-            if let Some(step_id) = &snapshot.current_step_id {
-                lines.push(format!("- Last execution step: {}", step_id));
-            }
-            if let Some(tool) = &snapshot.current_tool {
-                lines.push(format!("- Last execution tool: {}", tool));
-            }
-            if let Some(target) = &snapshot.current_target {
-                lines.push(format!("- Last execution target: {}", target));
-            }
-            if let Some(outcome) = snapshot.last_outcome {
-                lines.push(format!("- Last execution outcome: {:?}", outcome));
-            }
-            if snapshot.background_handoff_active {
-                lines.push("- Background execution was active before interruption.".to_string());
-            }
-            if let Some(key) = &snapshot.idempotency_key {
-                lines.push(format!(
-                    "- Replay/idempotency key: {}",
-                    truncate_for_resume(key, 120)
-                ));
-            }
-        }
-        lines.push(
-            "Resume from the next concrete step immediately. Re-run tools only if needed to verify or recover."
-                .to_string(),
-        );
-        lines.join("\n")
-    }
-}
-
-pub(in crate::agent) use aidaemon_runtime::turn::helpers::truncate_for_resume;
-
-fn normalize_for_resume_intent(text: &str) -> String {
-    text.split_whitespace()
-        .map(|part| part.trim_matches(|c: char| c.is_ascii_punctuation()))
-        .filter(|part| !part.is_empty())
-        .map(|part| part.to_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub(in crate::agent) fn is_resume_request(text: &str) -> bool {
-    let normalized = normalize_for_resume_intent(text);
-    if normalized.is_empty() {
-        return false;
-    }
-
-    const EXACT: &[&str] = &[
-        "continue",
-        "resume",
-        "keep going",
-        "go on",
-        "carry on",
-        "next phase",
-        "next step",
-    ];
-    if EXACT.contains(&normalized.as_str()) {
-        return true;
-    }
-
-    normalized.starts_with("continue ")
-        || normalized.starts_with("resume ")
-        || normalized.starts_with("keep going ")
-        || normalized.starts_with("go on ")
-        || normalized.starts_with("carry on ")
-        || normalized.starts_with("next phase ")
-        || normalized.starts_with("next step ")
-}
+pub(in crate::agent) use aidaemon_runtime::turn::resume::{
+    is_resume_request, ResumeCheckpoint, ResumeExecutionSnapshot,
+};
 
 #[cfg(test)]
 pub(in crate::agent) fn user_text_references_filesystem_path(user_text: &str) -> bool {

@@ -8,10 +8,6 @@ use aidaemon_runtime::turn::task_end::task_end_decision_and_outcome;
 
 // impl-Agent justification: graceful shutdown, budget progress, and task-end hooks over state/event_store.
 impl Agent {
-    pub(super) async fn run_task_end_tool_hooks(&self, task_id: &str, session_id: &str) {
-        task_end::run_task_end_tool_hooks(self, task_id, session_id).await;
-    }
-
     /// Test-only wrapper around `post_task::classify_stall`.
     ///
     /// Production flow should call the `post_task` function with the real
