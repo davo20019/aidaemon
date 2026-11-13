@@ -206,25 +206,6 @@ impl TurnServices for Agent {
 
 #[async_trait::async_trait]
 impl EngineHostOps for Agent {
-    async fn defer_request_for_provider_recovery(
-        &self,
-        session_id: &str,
-        user_text: &str,
-        user_role: crate::types::UserRole,
-        channel_ctx: &crate::types::ChannelContext,
-        error: &anyhow::Error,
-    ) -> Option<u16> {
-        Agent::defer_request_for_provider_recovery(
-            self,
-            session_id,
-            user_text,
-            user_role,
-            channel_ctx,
-            error,
-        )
-        .await
-    }
-
     fn trace_sink(&self) -> Option<std::sync::Arc<dyn aidaemon_core::EventSink>> {
         crate::otel_export::sink()
     }
@@ -391,10 +372,6 @@ impl TurnHost for Agent {
 
     fn skills(&self) -> &crate::skills::SkillCache {
         &self.skill_cache
-    }
-
-    async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String> {
-        Agent::cancel_active_finite_work_for_session(self, session_id).await
     }
 
     async fn create_child(

@@ -1,3 +1,4 @@
+#[cfg(test)]
 use super::*;
 #[cfg(test)]
 use aidaemon_runtime::turn::budget;
@@ -5,13 +6,12 @@ pub(in crate::agent) use aidaemon_runtime::turn::task_end::emit_decision_point_e
 #[cfg(test)]
 use aidaemon_runtime::turn::task_end::task_end_decision_and_outcome;
 
-// impl-Agent justification: graceful shutdown, budget progress, and task-end hooks over state/event_store.
+#[cfg(test)]
 impl Agent {
     /// Test-only wrapper around `post_task::classify_stall`.
     ///
     /// Production flow should call the `post_task` function with the real
     /// `tool_failure_count` map so lockout classification remains available.
-    #[allow(dead_code)] // Used in tests; production path delegates through post_task.
     pub(super) fn classify_stall(learning_ctx: &LearningContext) -> (&'static str, &'static str) {
         let empty_tool_failure_count: HashMap<String, usize> = HashMap::new();
         post_task::classify_stall(

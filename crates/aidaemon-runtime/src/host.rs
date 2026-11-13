@@ -13,8 +13,8 @@
 //! - [`TurnServices`]: the registries and per-run handles a turn uses (the
 //!   task registry, plans, MCP tools, transcript writes, cancellation, the
 //!   interactive slot and the turn's limits).
-//! - [`EngineHostOps`]: what only the host can do for the engine (queue a
-//!   request for provider recovery).
+//! - [`EngineHostOps`]: what only the host can do for the engine (trace
+//!   export, computer use).
 //! - [`TurnHost`]: all of the above plus the agent's turn runtime and who
 //!   the agent is; the turn's handlers in this crate run on it.
 
@@ -149,18 +149,6 @@ pub trait TurnServices: Send + Sync {
 /// What only the host can do for the turn engine.
 #[async_trait::async_trait]
 pub trait EngineHostOps: Send + Sync {
-    /// Queue (or re-queue) a request whose provider failed before any tool
-    /// work committed, to run again once the provider recovers. Returns the
-    /// attempt number that will run next, or `None` when the request is not
-    /// deferrable or has exhausted its cap.
-    async fn defer_request_for_provider_recovery(
-        &self,
-        session_id: &str,
-        user_text: &str,
-        user_role: aidaemon_tools::semantics::UserRole,
-        channel_ctx: &aidaemon_channels::context::ChannelContext,
-        error: &anyhow::Error,
-    ) -> Option<u16>;
     /// Where kernel runs are traced (an OTLP export), if anywhere.
     fn trace_sink(&self) -> Option<std::sync::Arc<dyn aidaemon_core::EventSink>>;
     /// Report the messages actually sent for a model call of `run` to the
@@ -280,9 +268,6 @@ pub trait TurnHost:
     fn compaction_store(&self) -> std::sync::Arc<dyn crate::turn::compaction::CompactionStore>;
     /// The skill library.
     fn skills(&self) -> &aidaemon_skills::SkillCache;
-    /// Cancel the finite work the session started (background task leads
-    /// and executors); what was cancelled.
-    async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String>;
     /// Build a child of this agent: a fresh agent sharing this one's model
     /// runtime, stores, hub, approvals and sub-agent registry.
     async fn create_child(

@@ -12,6 +12,7 @@
 //! finished run into the checklist's final shape, and `events` records the
 //! turn's task end and decision points.
 
+use crate::engine::deferral::DeferredRetries as _;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

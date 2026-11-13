@@ -1,4 +1,5 @@
 use crate::traits::AgentRole;
+use aidaemon_runtime::engine::chat_work::ChatWorkControl as _;
 
 fn extract_tool_names(defs: &[serde_json::Value]) -> Vec<String> {
     defs.iter()

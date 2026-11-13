@@ -117,7 +117,7 @@ impl TaskLeadHost for DaemonTaskLeads {
 
     async fn retry_deferred_provider_requests(&self) -> usize {
         match self.agent.upgrade() {
-            Some(agent) => agent.retry_deferred_provider_requests().await,
+            Some(agent) => agent.engine().retry_deferred_provider_requests().await,
             None => 0,
         }
     }

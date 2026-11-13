@@ -290,7 +290,7 @@ impl MemoryWrites for DaemonMemoryInner {
     }
 
     fn learn(&self, learning: crate::agent::post_task::LearningContext) {
-        crate::agent::post_turn::spawn_learning(self.store.clone(), learning);
+        aidaemon_runtime::turn::post_task::spawn_learning(self.store.clone(), learning);
     }
 
     fn learn_from_task(

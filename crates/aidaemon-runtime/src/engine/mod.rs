@@ -10,6 +10,7 @@ use std::time::Duration;
 
 pub mod budgets;
 pub mod calls;
+pub mod chat_work;
 pub mod compaction;
 pub mod deferral;
 pub mod dispatcher;

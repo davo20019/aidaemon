@@ -24,41 +24,6 @@ fn attachment(file: &tempfile::NamedTempFile, mime: &str) -> MessageAttachment {
     }
 }
 
-fn engine_config(provider_kind: &str, engine: &str) -> AppConfig {
-    toml::from_str(&format!(
-        "[provider]\nkind = \"{provider_kind}\"\napi_key = \"test-key\"\n\n\
-         [provider.models]\ndefault = \"model-a\"\n\n[agent.engine]\n{engine}"
-    ))
-    .expect("parse app config")
-}
-
-#[test]
-fn legacy_engine_model_pin_is_dropped_for_a_non_anthropic_provider() {
-    let config = engine_config(
-        "openai_chatgpt",
-        "model = \"claude-haiku-5-5\"\napi_key = \"sk-ant-test\"",
-    );
-    let settings = settings_from_config(&config, &*crate::execution::active_execution_backend());
-    assert_eq!(settings.model_override, None);
-}
-
-#[test]
-fn legacy_engine_model_pin_is_kept_for_an_anthropic_provider() {
-    let config = engine_config(
-        "anthropic",
-        "model = \"claude-haiku-5-5\"\napi_key = \"sk-ant-test\"",
-    );
-    let settings = settings_from_config(&config, &*crate::execution::active_execution_backend());
-    assert_eq!(settings.model_override.as_deref(), Some("claude-haiku-5-5"));
-}
-
-#[test]
-fn engine_model_pin_without_api_key_is_honored() {
-    let config = engine_config("openai_chatgpt", "model = \"gpt-6-luna\"");
-    let settings = settings_from_config(&config, &*crate::execution::active_execution_backend());
-    assert_eq!(settings.model_override.as_deref(), Some("gpt-6-luna"));
-}
-
 #[test]
 fn image_attachments_are_encoded_for_a_vision_model() {
     use std::io::Write;
@@ -306,7 +271,7 @@ async fn a_capped_plan_queues_the_request_until_the_reset() {
         "{}",
         reply.text
     );
-    let queued: Vec<crate::agent::deferred_retry::DeferredRequest> = serde_json::from_str(
+    let queued: Vec<aidaemon_runtime::engine::deferral::DeferredRequest> = serde_json::from_str(
         &harness
             .state
             .get_setting("deferred_provider_retries")
