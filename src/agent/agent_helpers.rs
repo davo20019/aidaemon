@@ -5,8 +5,6 @@
 //! filesystem-reference cue detection, untrusted-external-reference tool
 //! filtering, and the intent-gate decision merge.
 
-use serde_json::Value;
-
 #[cfg(test)]
 use super::contains_keyword_as_words;
 
@@ -24,9 +22,7 @@ pub(in crate::agent) struct IntentGateDecision {
     pub(in crate::agent) needs_tools: Option<bool>,
 }
 
-pub(in crate::agent) use aidaemon_runtime::turn::resume::{
-    is_resume_request, ResumeCheckpoint, ResumeExecutionSnapshot,
-};
+pub(in crate::agent) use aidaemon_runtime::turn::resume::ResumeCheckpoint;
 
 #[cfg(test)]
 pub(in crate::agent) fn user_text_references_filesystem_path(user_text: &str) -> bool {
@@ -96,35 +92,7 @@ pub(in crate::agent) fn user_explicitly_requests_local_file_inspection(user_text
     mentions_local_subject && mentions_inspection_verb
 }
 
-pub(in crate::agent) fn is_untrusted_external_reference_blocked_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "read_file"
-            | "search_files"
-            | "project_inspect"
-            | "check_environment"
-            | "web_fetch"
-            | "web_search"
-            | "browser"
-            | "send_file"
-            | "skill_resources"
-    )
-}
-
-pub(in crate::agent) fn filter_tool_defs_for_untrusted_external_reference(
-    defs: &[Value],
-) -> Vec<Value> {
-    defs.iter()
-        .filter(|def| {
-            let name = def
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str());
-            !name.is_some_and(is_untrusted_external_reference_blocked_tool)
-        })
-        .cloned()
-        .collect()
-}
+pub(in crate::agent) use aidaemon_runtime::turn::helpers::is_untrusted_external_reference_blocked_tool;
 
 #[cfg(test)]
 mod tests {

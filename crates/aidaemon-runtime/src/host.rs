@@ -21,6 +21,8 @@ pub trait TurnStores: Send + Sync {
     fn dialogue_states(&self) -> &dyn DialogueStateStore;
     /// The conversation's messages and its durable context boundary.
     fn messages(&self) -> &dyn MessageStore;
+    /// The conversation's cumulative summaries.
+    fn summaries(&self) -> &dyn aidaemon_events::stores::ConversationSummaryStore;
     /// Goals (a goal's bound workspace scopes its tasks' turns).
     fn goals(&self) -> &dyn aidaemon_work::stores::GoalStore;
     /// The event log.
@@ -96,6 +98,95 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
         goal_id: &str,
         status: &aidaemon_work::goal_tokens::GoalRunBudgetStatus,
     );
+    /// The durable task this agent was started for (executors and run-bound
+    /// task leads).
+    fn task_id(&self) -> Option<&str>;
+    /// The model runtime (primary, router, failover chain).
+    fn llm_runtime(&self) -> &crate::llm::SharedLlmRuntime;
+    /// The door for model calls made outside the agent loop.
+    fn side_calls(&self) -> &crate::llm::gateway::SideCallGateway;
+    /// The model this agent runs on.
+    fn model_lock(&self) -> &tokio::sync::RwLock<String>;
+    /// Whether the owner pinned the model (`/model`), so routing leaves it.
+    async fn model_override_active(&self, session_id: &str) -> bool;
+    /// The model for this turn and whether routing chose it.
+    async fn select_turn_model(
+        &self,
+        snapshot: &crate::llm::LlmRuntimeSnapshot,
+        router: Option<&aidaemon_providers::routing::Router>,
+        profile: crate::policy::execution::ModelProfile,
+        session_id: &str,
+    ) -> (String, bool);
+    /// A shared handle to the message store, for spawned work.
+    fn message_log(&self) -> std::sync::Arc<dyn MessageStore>;
+    /// A shared handle to what conversation compaction reads and writes.
+    fn compaction_store(&self) -> std::sync::Arc<dyn crate::turn::compaction::CompactionStore>;
+    /// The skill library.
+    fn skills(&self) -> &aidaemon_skills::SkillCache;
+    /// Every registered tool's definition and capabilities.
+    fn registered_tool_definitions_with_capabilities(
+        &self,
+    ) -> (
+        Vec<serde_json::Value>,
+        std::collections::HashMap<String, aidaemon_tools::semantics::ToolCapabilities>,
+    );
+    /// The tools offered for `user_message`: the registered ones plus the MCP
+    /// tools it calls for.
+    async fn tool_definitions_with_capabilities(
+        &self,
+        user_message: &str,
+    ) -> (
+        Vec<serde_json::Value>,
+        std::collections::HashMap<String, aidaemon_tools::semantics::ToolCapabilities>,
+    );
+    /// `defs` narrowed to what `policy` allows at `risk_score`.
+    fn filter_tool_definitions_for_policy(
+        &self,
+        defs: &[serde_json::Value],
+        capabilities: &std::collections::HashMap<
+            String,
+            aidaemon_tools::semantics::ToolCapabilities,
+        >,
+        policy: &crate::policy::execution::ExecutionPolicy,
+        risk_score: f32,
+        widen: bool,
+    ) -> Vec<serde_json::Value>;
+    /// The system prompt for a message: the core prompt, the fresh-task and
+    /// continuation context tails, the skills it activated, and the project
+    /// instruction tracker for its scope.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_system_prompt_for_message(
+        &self,
+        emitter: &aidaemon_events::EventEmitter,
+        task_id: &str,
+        session_id: &str,
+        user_text: &str,
+        user_role: aidaemon_tools::semantics::UserRole,
+        channel_ctx: &aidaemon_channels::context::ChannelContext,
+        tools_count: usize,
+        resume_checkpoint: Option<&crate::turn::resume::ResumeCheckpoint>,
+        preserve_conversation_context: bool,
+        project_instruction_scope: Option<&str>,
+    ) -> anyhow::Result<(
+        String,
+        String,
+        String,
+        Vec<String>,
+        Option<crate::turn::project_instructions::ProjectInstructionTracker>,
+    )>;
+    /// Stop the CLI agents running for the session (a stop command); the
+    /// tool's reply.
+    async fn cancel_cli_agents(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<aidaemon_tools::status::StatusUpdate>>,
+        channel_ctx: &aidaemon_channels::context::ChannelContext,
+        user_role: aidaemon_tools::semantics::UserRole,
+    ) -> anyhow::Result<String>;
+    /// Cancel the finite work the session started (background task leads
+    /// and executors); what was cancelled.
+    async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String>;
     /// The agent's tools (their task-end hooks run when a task ends).
     fn tools(&self) -> &[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>];
 }

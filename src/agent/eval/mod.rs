@@ -1,7 +1,7 @@
 //! Per-task harness effectiveness evaluation lives in `aidaemon-runtime`;
 //! the daemon maps its `[diagnostics.harness_eval]` settings onto it.
 
-pub use aidaemon_runtime::eval::{HarnessEvalAccumulator, HarnessEvalConfig, HarnessEvalSeed};
+pub use aidaemon_runtime::eval::{HarnessEvalAccumulator, HarnessEvalConfig};
 
 impl From<&crate::config::DiagnosticsHarnessEvalConfig> for HarnessEvalConfig {
     fn from(cfg: &crate::config::DiagnosticsHarnessEvalConfig) -> Self {

@@ -22,37 +22,6 @@ impl Agent {
         )
     }
 
-    /// Emit TaskEnd after recording an exact bootstrap protocol direct-return.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn emit_direct_return_task_end(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        task_id: &str,
-        status: TaskStatus,
-        outcome: crate::events::TaskOutcome,
-        task_start: Instant,
-        iteration: usize,
-        tool_calls_count: usize,
-        error: Option<String>,
-        summary: Option<String>,
-        direct_return_succeeded: bool,
-    ) {
-        task_end::emit_direct_return_task_end(
-            self,
-            emitter,
-            task_id,
-            status,
-            outcome,
-            task_start,
-            iteration,
-            tool_calls_count,
-            error,
-            summary,
-            direct_return_succeeded,
-        )
-        .await;
-    }
-
     /// Emit a TaskEnd event. Called from every exit path in the agent loop.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn emit_task_end(

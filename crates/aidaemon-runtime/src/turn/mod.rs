@@ -5,6 +5,7 @@
 //! output, structural reply checks, the post-run learning context and the
 //! project instructions found for a turn's scope.
 
+pub mod bootstrap;
 pub mod budget;
 pub mod closeout;
 pub mod compaction;

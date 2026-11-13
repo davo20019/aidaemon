@@ -13,10 +13,12 @@ use uuid::Uuid;
 
 use crate::config::{IterationLimitConfig, PathAliasConfig};
 #[cfg(test)]
-use crate::events::{AssistantResponseData, TaskEndData, ThinkingStartData, ToolResultData};
+use crate::events::{
+    AssistantResponseData, TaskEndData, TaskStartData, ThinkingStartData, ToolResultData,
+};
 use crate::events::{
     DecisionPointData, DecisionType, EventStore, EventType, SubAgentCompleteData,
-    SubAgentSpawnData, TaskStartData, TaskStatus,
+    SubAgentSpawnData, TaskStatus,
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
@@ -66,12 +68,12 @@ use intent_routing::infer_intent_gate;
 #[allow(unused_imports)]
 pub(crate) use intent_routing::contains_keyword_as_words as keyword_match;
 /// Policy signals live in `aidaemon-runtime`.
+#[cfg(test)]
 mod policy_signals {
     pub(super) use aidaemon_runtime::policy::signals::*;
 }
 #[cfg(test)]
 use policy_signals::is_short_user_correction;
-use policy_signals::{build_policy_bundle, detect_explicit_outcome_signal};
 /// Validation state lives in `aidaemon-runtime`.
 mod validation_state {
     pub(crate) use aidaemon_runtime::turn::validation_state::*;
@@ -177,13 +179,12 @@ mod tool_result_fit;
 mod turn_context;
 #[path = "runtime/untrusted.rs"]
 pub(crate) mod untrusted;
-pub(in crate::agent) use completion_contract::persistable_completion_contract;
+#[cfg(test)]
+pub(in crate::agent) use completion_contract::CompletionTaskKind;
 #[cfg(test)]
 pub(in crate::agent) use followup::FollowupMode;
-pub(in crate::agent) use history::retain_structural_completion_contract;
 pub(in crate::agent) use history::CompletionContract;
 pub(in crate::agent) use history::CompletionProgress;
-pub(in crate::agent) use history::CompletionTaskKind;
 pub(in crate::agent) use history::TurnContext;
 pub(in crate::agent) mod eval;
 /// Evidence routing lives in `aidaemon-runtime`.
@@ -215,6 +216,7 @@ pub(crate) use aidaemon_runtime::spawn::child_status_label as helper_card_label;
 /// The session history appends and turn-context assembly, on any TurnHost.
 pub(in crate::agent) use aidaemon_runtime::turn::turn_context::TurnHistory;
 /// The speech-to-text fallback lives in `aidaemon-runtime`.
+#[cfg(test)]
 pub(crate) mod stt {
     pub(crate) use aidaemon_runtime::media::stt::*;
 }
@@ -239,7 +241,7 @@ pub(crate) mod vision {
     pub(crate) use aidaemon_runtime::media::vision::*;
 }
 
-pub(in crate::agent) use eval::{HarnessEvalAccumulator, HarnessEvalConfig, HarnessEvalSeed};
+pub(in crate::agent) use eval::{HarnessEvalAccumulator, HarnessEvalConfig};
 use system_prompt::format_goal_context;
 pub(in crate::agent) use tool_result_notices::ToolResultNotice;
 
@@ -268,8 +270,7 @@ pub use agent_helpers::touch_heartbeat;
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::IntentGateDecision;
 pub(in crate::agent) use agent_helpers::{
-    filter_tool_defs_for_untrusted_external_reference, is_resume_request,
-    is_untrusted_external_reference_blocked_tool, ResumeCheckpoint, ResumeExecutionSnapshot,
+    is_untrusted_external_reference_blocked_tool, ResumeCheckpoint,
 };
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::{

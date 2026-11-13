@@ -17,6 +17,10 @@ impl TurnStores for Agent {
         &*self.state
     }
 
+    fn summaries(&self) -> &dyn aidaemon_events::stores::ConversationSummaryStore {
+        &*self.state
+    }
+
     fn goals(&self) -> &dyn aidaemon_work::stores::GoalStore {
         &*self.state
     }
@@ -126,6 +130,162 @@ impl TurnHost for Agent {
         status: &aidaemon_work::goal_tokens::GoalRunBudgetStatus,
     ) {
         super::goal_dispatch::persist_scheduled_run_state(&self.state, goal_id, None, status).await;
+    }
+
+    fn task_id(&self) -> Option<&str> {
+        self.task_id.as_deref()
+    }
+
+    fn llm_runtime(&self) -> &crate::llm_runtime::SharedLlmRuntime {
+        &self.llm_runtime
+    }
+
+    fn side_calls(&self) -> &crate::llm_runtime::gateway::SideCallGateway {
+        &self.side_calls
+    }
+
+    fn model_lock(&self) -> &tokio::sync::RwLock<String> {
+        &self.model
+    }
+
+    async fn model_override_active(&self, session_id: &str) -> bool {
+        Agent::model_override_active(self, session_id).await
+    }
+
+    async fn select_turn_model(
+        &self,
+        snapshot: &crate::llm_runtime::LlmRuntimeSnapshot,
+        router: Option<&crate::router::Router>,
+        profile: crate::execution_policy::ModelProfile,
+        session_id: &str,
+    ) -> (String, bool) {
+        Agent::select_turn_model(self, snapshot, router, profile, session_id).await
+    }
+
+    fn message_log(&self) -> std::sync::Arc<dyn MessageStore> {
+        self.state.clone()
+    }
+
+    fn compaction_store(
+        &self,
+    ) -> std::sync::Arc<dyn aidaemon_runtime::turn::compaction::CompactionStore> {
+        self.state.clone()
+    }
+
+    fn skills(&self) -> &crate::skills::SkillCache {
+        &self.skill_cache
+    }
+
+    fn registered_tool_definitions_with_capabilities(
+        &self,
+    ) -> (
+        Vec<serde_json::Value>,
+        std::collections::HashMap<String, crate::traits::ToolCapabilities>,
+    ) {
+        Agent::registered_tool_definitions_with_capabilities(self)
+    }
+
+    async fn tool_definitions_with_capabilities(
+        &self,
+        user_message: &str,
+    ) -> (
+        Vec<serde_json::Value>,
+        std::collections::HashMap<String, crate::traits::ToolCapabilities>,
+    ) {
+        Agent::tool_definitions_with_capabilities(self, user_message).await
+    }
+
+    fn filter_tool_definitions_for_policy(
+        &self,
+        defs: &[serde_json::Value],
+        capabilities: &std::collections::HashMap<String, crate::traits::ToolCapabilities>,
+        policy: &crate::execution_policy::ExecutionPolicy,
+        risk_score: f32,
+        widen: bool,
+    ) -> Vec<serde_json::Value> {
+        Agent::filter_tool_definitions_for_policy(
+            self,
+            defs,
+            capabilities,
+            policy,
+            risk_score,
+            widen,
+        )
+    }
+
+    async fn build_system_prompt_for_message(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        task_id: &str,
+        session_id: &str,
+        user_text: &str,
+        user_role: crate::types::UserRole,
+        channel_ctx: &crate::types::ChannelContext,
+        tools_count: usize,
+        resume_checkpoint: Option<&super::ResumeCheckpoint>,
+        preserve_conversation_context: bool,
+        project_instruction_scope: Option<&str>,
+    ) -> anyhow::Result<(
+        String,
+        String,
+        String,
+        Vec<String>,
+        Option<crate::project_instructions::ProjectInstructionTracker>,
+    )> {
+        Agent::build_system_prompt_for_message(
+            self,
+            emitter,
+            task_id,
+            session_id,
+            user_text,
+            user_role,
+            channel_ctx,
+            tools_count,
+            resume_checkpoint,
+            preserve_conversation_context,
+            project_instruction_scope,
+        )
+        .await
+    }
+
+    async fn cancel_cli_agents(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        channel_ctx: &crate::types::ChannelContext,
+        user_role: crate::types::UserRole,
+    ) -> anyhow::Result<String> {
+        self.execute_tool_with_watchdog(
+            "cli_agent",
+            r#"{"action": "cancel_all"}"#,
+            &super::tool_exec::ToolExecCtx {
+                file_fence: None,
+                mcp_tool: None,
+                owner_approval_by_kernel: false,
+                session_id,
+                task_id: Some(task_id),
+                status_tx,
+                channel_visibility: channel_ctx.visibility,
+                channel_id: channel_ctx.channel_id.as_deref(),
+                project_scope: None,
+                trusted: channel_ctx.trusted,
+                user_role,
+                workspace_grant: channel_ctx.active_workspace_grant(user_role),
+                mandate_authority: None,
+                tool_call_id: None,
+                mutation_forbidden: false,
+                scope_escalation: None,
+                turn_authority: None,
+                trust_roots: None,
+                lone_root_call: false,
+            },
+        )
+        .await
+    }
+
+    async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String> {
+        Agent::cancel_active_finite_work_for_session(self, session_id).await
     }
 
     fn tools(&self) -> &[std::sync::Arc<dyn crate::traits::Tool>] {

@@ -1,20 +1,32 @@
-use crate::agent::*;
-use crate::execution_policy::PolicyBundle;
-use crate::traits::ConversationSummary;
+use std::collections::HashMap;
 
-pub(in crate::agent) enum BootstrapOutcome {
+use aidaemon_channels::context::ChannelContext;
+use aidaemon_providers::routing::Router;
+use aidaemon_tools::semantics::{ToolCapabilities, UserRole};
+use aidaemon_tools::status::StatusUpdate;
+use serde_json::Value;
+use tokio::sync::mpsc;
+
+use crate::eval::HarnessEvalAccumulator;
+use crate::policy::execution::PolicyBundle;
+use crate::turn::post_task::LearningContext;
+use crate::turn::resume::ResumeExecutionSnapshot;
+use crate::turn::turn_context::TurnContext;
+use aidaemon_events::traits::ConversationSummary;
+
+pub enum BootstrapOutcome {
     Return(anyhow::Result<String>),
     Continue(Box<BootstrapData>),
 }
 
-pub(in crate::agent) struct BootstrapCtx<'a> {
+pub struct BootstrapCtx<'a> {
     pub session_id: &'a str,
     pub user_text: &'a str,
-    pub attachments: &'a [crate::traits::MessageAttachment],
+    pub attachments: &'a [aidaemon_events::traits::MessageAttachment],
     pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
     pub user_role: UserRole,
     pub channel_ctx: &'a ChannelContext,
-    pub ingress_timing: Option<&'a crate::runtime_ports::InboundMessageTiming>,
+    pub ingress_timing: Option<&'a aidaemon_channels::ports::InboundMessageTiming>,
     /// True for runtime-generated background-result continuations. These turns
     /// carry evidence for the existing request, not fresh user intent.
     pub internal_continuation: bool,
@@ -23,18 +35,18 @@ pub(in crate::agent) struct BootstrapCtx<'a> {
     pub parent_task_id: Option<&'a str>,
 }
 
-pub(in crate::agent) struct BootstrapData {
+pub struct BootstrapData {
     /// Canonical user message persisted for this turn. This is normally the
     /// user's exact text; when STT fallback runs it also contains the appended
     /// transcription. Downstream phases must use this value rather than the
     /// pre-bootstrap input so prompt assembly matches durable history.
     pub user_text: String,
     pub task_id: String,
-    pub memory_pipeline_policy: super::task_planning::MemoryPipelinePolicy,
+    pub memory_pipeline_policy: crate::turn::task_planning::MemoryPipelinePolicy,
     /// Durable execution identity recovered from an interrupted run. The new
     /// turn reuses it so operation-derived idempotency keys remain stable.
     pub resume_execution_snapshot: Option<ResumeExecutionSnapshot>,
-    pub emitter: crate::events::EventEmitter,
+    pub emitter: aidaemon_events::EventEmitter,
     pub learning_ctx: LearningContext,
     /// Whether the turn may be learned from (`/private` opts it out).
     pub learning: aidaemon_policies::TurnLearning,
@@ -53,7 +65,8 @@ pub(in crate::agent) struct BootstrapData {
     /// Authorized, task-local instruction hierarchy state. `None` for turns
     /// without a single trusted project scope; otherwise used to discover
     /// deeper instruction files before the first tool action in that subtree.
-    pub project_instruction_tracker: Option<crate::project_instructions::ProjectInstructionTracker>,
+    pub project_instruction_tracker:
+        Option<crate::turn::project_instructions::ProjectInstructionTracker>,
     /// Pillar A: message-zero bytes (the session-static CORE prompt). Cacheable
     /// prefix; rendered once per task by `render_core_prompt`.
     pub core_prompt_bytes: String,
