@@ -28,6 +28,8 @@
 //! - [`coordination`]: what one request's tree of sub-agents knows about each
 //!   other, and the hook that judges their file writes.
 //! - [`known_resources`]: the context that crosses a handoff.
+//! - [`spawn`]: the running sub-agents registry, a child's progress and
+//!   end as its parent sees them, and the plain child's prompt.
 //! - [`untrusted`]: the untrusted-content rule's taint facts and verifier.
 
 pub mod approvals;
@@ -45,5 +47,6 @@ pub mod mid_run;
 pub mod policy;
 pub mod prompt;
 pub mod settings;
+pub mod spawn;
 pub mod turn;
 pub mod untrusted;

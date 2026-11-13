@@ -230,7 +230,7 @@ mod sliding_window {
 #[path = "runtime/spawn.rs"]
 mod spawn;
 /// What the owner reads for a helper on cards, status lines and timing.
-pub(crate) use spawn::child_status_label as helper_card_label;
+pub(crate) use aidaemon_runtime::spawn::child_status_label as helper_card_label;
 pub(crate) mod stt;
 /// System directives live in `aidaemon-runtime`.
 mod system_directives {

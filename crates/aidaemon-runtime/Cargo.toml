@@ -23,6 +23,7 @@ publish = false
 testing = ["dep:tempfile", "aidaemon-core/testing", "aidaemon-events/testing", "aidaemon-decisions/testing"]
 
 [dependencies]
+aidaemon-agents = { version = "0.2.0", path = "../aidaemon-agents" }
 aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels" }
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
 aidaemon-decisions = { version = "0.2.0", path = "../aidaemon-decisions", features = ["gemini"] }

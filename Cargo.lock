@@ -514,6 +514,7 @@ dependencies = [
 name = "aidaemon-runtime"
 version = "0.2.0"
 dependencies = [
+ "aidaemon-agents",
  "aidaemon-channels",
  "aidaemon-core",
  "aidaemon-decisions",
