@@ -6,10 +6,10 @@ use base64::Engine;
 use serde_json::{json, Value};
 use tracing::warn;
 
-use crate::config::VisionConfig;
-use crate::traits::{AttachmentProvenance, MessageAttachment};
+use crate::settings::VisionConfig;
+use aidaemon_events::conversation::{AttachmentProvenance, MessageAttachment};
 
-use crate::agent::turn_render::RenderMode;
+use crate::turn::turn_render::RenderMode;
 
 pub const VISION_SKIPPED_SYSTEM_HINT: &str = "[SYSTEM] User attached image(s) saved to disk; vision is disabled, unsupported, or the file could not be read — acknowledge receipt and explain you cannot view the image directly.";
 
@@ -201,7 +201,7 @@ pub fn format_tool_observation_label(tool_name: &str, result_hint: &str) -> Stri
     }
 }
 
-pub(crate) use crate::message_content::user_message_content_matches;
+pub use crate::message_content::user_message_content_matches;
 
 #[cfg(test)]
 mod tests {
@@ -272,7 +272,7 @@ mod tests {
         let result = build_image_blocks(
             &attachments,
             RenderMode::Archived {
-                terminal_state: crate::events::TerminalState::Completed,
+                terminal_state: aidaemon_events::TerminalState::Completed,
             },
             &vision_config(),
         );

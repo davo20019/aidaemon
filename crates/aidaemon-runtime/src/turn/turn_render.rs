@@ -11,23 +11,32 @@
 //! tool results summarized; identity-critical verbatim; terminal-state
 //! placeholder when no substantive assistant remains).
 
-use super::recall_guardrails::text_relates_to_critical_identity;
-use super::sliding_window::summarize_tool_result;
-// `Message`, `ToolCall`, `json` and `Value` live in the `agent` module scope.
-use super::*;
-use crate::config::{AudioConfig, SttConfig, VisionConfig};
-use crate::events::TerminalState;
-use crate::traits::AttachmentProvenance;
+use crate::policy::recall_guardrails::text_relates_to_critical_identity;
+use crate::settings::{AudioConfig, SttConfig, VisionConfig};
+use crate::turn::sliding_window::summarize_tool_result;
+use aidaemon_events::conversation::AttachmentProvenance;
+use aidaemon_events::conversation::{Message, ToolCall};
+use aidaemon_events::TerminalState;
+use serde_json::{json, Value};
 
 /// Bump when the rendering ALGORITHM changes; invalidates all cached renders.
 /// v6: a structurally referenced parent turn retains bounded receipt-bearing
 /// tool evidence; ordinary archived turns remain aggressively compact.
-pub(crate) const RENDERER_VERSION: u32 = 6;
+pub const RENDERER_VERSION: u32 = 6;
 const MAX_ADJACENT_TOOL_RESULT_CHARS: usize = 4_000;
-pub(crate) const SOURCE_MESSAGE_IDS_KEY: &str = "_aidaemon_source_message_ids";
-pub(crate) const SOURCE_TURN_IDS_KEY: &str = "_aidaemon_source_turn_ids";
+/// The adjacent prior assistant answer is recent transcript, not generic
+/// archive. Keep ordinary answers verbatim up to roughly 3k tokens; only
+/// genuinely oversized answers use deterministic head/tail compaction.
+pub const MAX_ADJACENT_ASSISTANT_CONTENT_CHARS: usize = 12_000;
+/// Higher cap for archived assistant messages that end in a clarifying
+/// question/menu: the options ARE the actionable state the next user turn
+/// refers to ("Yes do 1, 2"), so they must survive archival. Content over the
+/// cap keeps the question head and the option tail and elides the middle.
+pub const MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS: usize = 2000;
+pub const SOURCE_MESSAGE_IDS_KEY: &str = "_aidaemon_source_message_ids";
+pub const SOURCE_TURN_IDS_KEY: &str = "_aidaemon_source_turn_ids";
 
-pub(crate) fn attach_source_provenance(value: &mut Value, messages: &[&Message]) {
+pub fn attach_source_provenance(value: &mut Value, messages: &[&Message]) {
     let Some(object) = value.as_object_mut() else {
         return;
     };
@@ -57,7 +66,7 @@ fn push_with_source(out: &mut Vec<Value>, mut value: Value, message: &Message) {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RenderOptions {
+pub struct RenderOptions {
     pub vision: VisionConfig,
     pub audio: AudioConfig,
     pub stt: SttConfig,
@@ -78,22 +87,22 @@ impl Default for RenderOptions {
                 ],
                 model_patterns: vec!["gpt-4o".to_string()],
             },
-            audio: AudioConfig::from_files(&crate::config::FilesConfig::default()),
-            stt: SttConfig::from_files(&crate::config::FilesConfig::default()),
+            audio: AudioConfig::from_files(&crate::settings::FilesConfig::default()),
+            stt: SttConfig::from_files(&crate::settings::FilesConfig::default()),
             model: String::new(),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RenderMode {
+pub enum RenderMode {
     Current,
     Archived { terminal_state: TerminalState },
     Adjacent { terminal_state: TerminalState },
 }
 
 /// Pure entry point. Dispatches to the per-mode renderer.
-pub(crate) fn render_turn(
+pub fn render_turn(
     turn_messages: &[Message],
     mode: RenderMode,
     _version: u32,
@@ -116,7 +125,7 @@ pub(crate) fn render_turn(
 /// (excludes from winning-assistant selection, uses the terminal placeholder)
 /// call this so the lists cannot drift. This is the list previously inlined in
 /// `message_build.rs`'s `&Message → Value` conversion.
-pub(crate) fn is_failure_boilerplate(content: &str) -> bool {
+pub fn is_failure_boilerplate(content: &str) -> bool {
     let t = content.trim_start();
     t.starts_with("I wasn't able to process that request.")
         || t.starts_with("I wasn't able to complete this task.")
@@ -250,9 +259,9 @@ fn append_tool_observation_messages(
     }
     let tool_name = m.tool_name.as_deref().unwrap_or("tool");
     let hint = m.content.as_deref().unwrap_or("");
-    let label = crate::agent::vision::format_tool_observation_label(tool_name, hint);
+    let label = crate::media::vision::format_tool_observation_label(tool_name, hint);
     let content = if encode_image {
-        let built = crate::agent::vision::build_tool_observation_content(
+        let built = crate::media::vision::build_tool_observation_content(
             &label,
             &m.attachments,
             &options.vision,
@@ -343,7 +352,7 @@ fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Val
 
         let content = if m.role == "user" && !m.attachments.is_empty() {
             let text = m.content.as_deref().unwrap_or("");
-            let built = crate::agent::attachment_content::build_attachment_content(
+            let built = crate::media::attachment_content::build_attachment_content(
                 text,
                 &m.attachments,
                 RenderMode::Current,
@@ -354,9 +363,9 @@ fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Val
             if built.vision_skipped {
                 vision_skipped = true;
             }
-            if built.audio_skipped && !crate::agent::stt::content_has_transcription(text) {
+            if built.audio_skipped && !crate::media::stt::content_has_transcription(text) {
                 if options.stt.enabled
-                    && crate::agent::stt::should_run_stt_fallback(
+                    && crate::media::stt::should_run_stt_fallback(
                         &options.stt,
                         &options.audio,
                         &options.model,
@@ -410,7 +419,7 @@ fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Val
             0,
             json!({
                 "role": "system",
-                "content": crate::agent::vision::VISION_SKIPPED_SYSTEM_HINT,
+                "content": crate::media::vision::VISION_SKIPPED_SYSTEM_HINT,
             }),
         );
     }
@@ -419,7 +428,7 @@ fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Val
             0,
             json!({
                 "role": "system",
-                "content": crate::agent::stt::STT_FAILED_SYSTEM_HINT,
+                "content": crate::media::stt::STT_FAILED_SYSTEM_HINT,
             }),
         );
     } else if audio_skipped {
@@ -427,7 +436,7 @@ fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Val
             0,
             json!({
                 "role": "system",
-                "content": crate::agent::audio::AUDIO_SKIPPED_SYSTEM_HINT,
+                "content": crate::media::audio::AUDIO_SKIPPED_SYSTEM_HINT,
             }),
         );
     }
@@ -494,7 +503,7 @@ fn render_archived(
         .iter()
         .filter(|m| m.role == "assistant")
         .filter_map(|m| m.content.as_deref())
-        .flat_map(super::sliding_window::measured_timing_lines)
+        .flat_map(crate::turn::sliding_window::measured_timing_lines)
         .fold(String::new(), |mut all, line| {
             if !all.contains(line) {
                 all.push_str(line);
@@ -517,7 +526,7 @@ fn render_archived(
         if m.role == "user"
             && (m
                 .annotations
-                .contains(&crate::traits::MessageAnnotation::IdentityCritical)
+                .contains(&aidaemon_events::conversation::MessageAnnotation::IdentityCritical)
                 || m.content
                     .as_deref()
                     .is_some_and(text_relates_to_critical_identity))
@@ -569,7 +578,7 @@ fn render_archived(
                             }
                         })
                         .map(|shown| {
-                            super::sliding_window::with_measured_timing(shown, &turn_timing)
+                            crate::turn::sliding_window::with_measured_timing(shown, &turn_timing)
                         })
                         .unwrap_or_default();
                     let mut obj = json!({
@@ -633,7 +642,7 @@ fn render_archived(
             0,
             json!({
                 "role": "system",
-                "content": crate::agent::vision::VISION_SKIPPED_SYSTEM_HINT,
+                "content": crate::media::vision::VISION_SKIPPED_SYSTEM_HINT,
             }),
         );
     }
@@ -1119,7 +1128,7 @@ mod tests {
 
     #[test]
     fn current_mode_encodes_image_attachments_as_multimodal_array() {
-        use crate::traits::MessageAttachment;
+        use aidaemon_events::conversation::MessageAttachment;
         use std::io::Write;
         use tempfile::NamedTempFile;
 
@@ -1159,7 +1168,7 @@ mod tests {
 
     #[test]
     fn current_mode_emits_synthetic_user_observation_after_tool_screenshot() {
-        use crate::traits::{AttachmentProvenance, MessageAttachment};
+        use aidaemon_events::conversation::{AttachmentProvenance, MessageAttachment};
         use std::io::Write;
         use tempfile::NamedTempFile;
 
@@ -1216,8 +1225,8 @@ mod tests {
 
     #[test]
     fn current_mode_keeps_only_latest_tool_observation_image() {
-        use crate::agent::vision::VISION_SKIPPED_SYSTEM_HINT;
-        use crate::traits::{AttachmentProvenance, MessageAttachment};
+        use crate::media::vision::VISION_SKIPPED_SYSTEM_HINT;
+        use aidaemon_events::conversation::{AttachmentProvenance, MessageAttachment};
         use std::io::Write;
         use tempfile::NamedTempFile;
 
@@ -1310,7 +1319,7 @@ mod tests {
             content: Some(
                 "[File received: photo.png (1 KB, image/png)\nSaved to: /tmp/x.png]".to_string(),
             ),
-            attachments: vec![crate::traits::MessageAttachment {
+            attachments: vec![aidaemon_events::conversation::MessageAttachment {
                 local_path: "/tmp/x.png".to_string(),
                 filename: "photo.png".to_string(),
                 mime_type: "image/png".to_string(),

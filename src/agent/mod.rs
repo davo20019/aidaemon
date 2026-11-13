@@ -47,15 +47,6 @@ const DEFERRED_NO_TOOL_ERROR_MARKER: &str = "deferred-action no-tool loop";
 /// Set high enough to allow complex multi-step investigations from mobile,
 /// and to leave room for follow-up work after cli_agent returns.
 use aidaemon_runtime::turn::loop_utils::MAX_CONSECUTIVE_SAME_TOOL;
-/// The adjacent prior assistant answer is recent transcript, not generic
-/// archive. Keep ordinary answers verbatim up to roughly 3k tokens; only
-/// genuinely oversized answers use deterministic head/tail compaction.
-const MAX_ADJACENT_ASSISTANT_CONTENT_CHARS: usize = 12_000;
-/// Higher cap for archived assistant messages that end in a clarifying
-/// question/menu: the options ARE the actionable state the next user turn
-/// refers to ("Yes do 1, 2"), so they must survive archival. Content over the
-/// cap keeps the question head and the option tail and elides the middle.
-const MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS: usize = 2000;
 #[path = "response_analysis.rs"]
 mod response_analysis;
 #[cfg(test)]
@@ -198,8 +189,10 @@ pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;
 pub(in crate::agent) use history::FollowupMode;
 pub(in crate::agent) use history::TurnContext;
-pub(crate) mod attachment_content;
-pub(crate) mod audio;
+/// Received images and audio as content blocks live in `aidaemon-runtime`.
+pub(crate) mod attachment_content {
+    pub(crate) use aidaemon_runtime::media::attachment_content::*;
+}
 pub(in crate::agent) mod eval;
 /// Evidence routing lives in `aidaemon-runtime`.
 mod inquiry {
@@ -222,16 +215,15 @@ mod prefix_fingerprint {
 #[path = "runtime/resume.rs"]
 mod resume;
 mod runtime_ports;
-mod turn_host;
-/// Tool-result summaries live in `aidaemon-runtime`.
-mod sliding_window {
-    pub(in crate::agent) use aidaemon_runtime::turn::sliding_window::*;
-}
 #[path = "runtime/spawn.rs"]
 mod spawn;
+mod turn_host;
 /// What the owner reads for a helper on cards, status lines and timing.
 pub(crate) use aidaemon_runtime::spawn::child_status_label as helper_card_label;
-pub(crate) mod stt;
+/// The speech-to-text fallback lives in `aidaemon-runtime`.
+pub(crate) mod stt {
+    pub(crate) use aidaemon_runtime::media::stt::*;
+}
 /// System directives live in `aidaemon-runtime`.
 mod system_directives {
     pub(in crate::agent) use aidaemon_runtime::turn::system_directives::*;
@@ -252,20 +244,25 @@ mod tool_result_notices {
 pub(crate) mod turn_eviction {
     pub(crate) use aidaemon_runtime::turn::turn_eviction::*;
 }
-#[path = "turn/turn_render.rs"]
-pub(crate) mod turn_render;
+/// Per-turn rendering lives in `aidaemon-runtime`.
+pub(crate) mod turn_render {
+    pub(crate) use aidaemon_runtime::turn::turn_render::*;
+}
 #[path = "turn/turn_render_cache.rs"]
 pub(crate) mod turn_render_cache;
-pub(crate) mod vision;
+/// Image attachments live in `aidaemon-runtime`.
+pub(crate) mod vision {
+    pub(crate) use aidaemon_runtime::media::vision::*;
+}
 
 pub(in crate::agent) use eval::{HarnessEvalAccumulator, HarnessEvalConfig, HarnessEvalSeed};
 use system_prompt::format_goal_context;
 pub(in crate::agent) use tool_result_notices::ToolResultNotice;
 
-// Policy runtime metrics and bounded autotuning.
-// Implementation lives in `policy_metrics.rs` (Phase 5 decoupling).
-#[path = "policy_metrics.rs"]
-mod policy_metrics;
+/// Policy runtime metrics and bounded autotuning live in `aidaemon-runtime`.
+mod policy_metrics {
+    pub use aidaemon_runtime::policy::metrics::*;
+}
 pub use policy_metrics::{
     apply_bounded_autotune_from_failure_ratio, init_policy_tunables_once, policy_autotune_snapshot,
     policy_metrics_boot_id, policy_metrics_snapshot,

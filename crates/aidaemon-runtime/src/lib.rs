@@ -17,6 +17,8 @@
 //! - [`policy`]: execution policies, turn signals, recall guardrails and
 //!   model trust tiers.
 //! - [`markers`]: marker constants shared by prompts and sanitizers.
+//! - [`media`]: received images and audio as content blocks, and the
+//!   speech-to-text fallback.
 //! - [`message_content`]: chat content helpers.
 //! - [`context_budget`]: token estimates and context-window budgets.
 //! - [`turn`]: system directives, tool-result notices and task outcomes.
@@ -42,6 +44,7 @@ pub mod host;
 pub mod known_resources;
 pub mod llm;
 pub mod markers;
+pub mod media;
 pub mod message_content;
 pub mod mid_run;
 pub mod policy;
