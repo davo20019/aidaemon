@@ -1,0 +1,135 @@
+{
+  "description": "Session lists and history fill transcripts (history first); replies and errors become the notice.",
+  "frames": [
+    {
+      "at_ms": 1767225601000,
+      "event": {
+        "session_id": "app:s1",
+        "text": "live line",
+        "type": "assistant_message"
+      },
+      "seq": 1,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "request_id": "r1",
+      "result": {
+        "sessions": [
+          {
+            "channel": "app",
+            "id": "app:s1",
+            "title": "Synthetic report",
+            "writable": true
+          },
+          {
+            "channel": "slack",
+            "id": "slack:synthetic-team-1",
+            "writable": false
+          }
+        ],
+        "type": "sessions"
+      },
+      "type": "ack"
+    },
+    {
+      "request_id": "r2",
+      "result": {
+        "messages": [
+          {
+            "at_ms": 1,
+            "id": "m1",
+            "role": "user",
+            "text": "older question"
+          },
+          {
+            "at_ms": 2,
+            "id": "m2",
+            "role": "assistant",
+            "text": "older answer"
+          }
+        ],
+        "session_id": "app:s1",
+        "type": "history"
+      },
+      "type": "ack"
+    },
+    {
+      "request_id": "r3",
+      "result": {
+        "report": "Nothing is running in this chat right now.",
+        "type": "stopped"
+      },
+      "type": "ack"
+    },
+    {
+      "error": {
+        "code": "forbidden",
+        "message": "This device may not Chat",
+        "retryable": false
+      },
+      "request_id": "r4",
+      "type": "error"
+    },
+    {
+      "at_ms": 1767225602000,
+      "event": {
+        "message": "Finish the sign-in in your browser.",
+        "turn_id": "t2",
+        "type": "user_action_required"
+      },
+      "seq": 2,
+      "session_id": "app:s1",
+      "type": "event"
+    }
+  ],
+  "state": {
+    "approvals": {},
+    "last_seq": 2,
+    "notice": "This device may not Chat",
+    "order": [
+      "slack:synthetic-team-1",
+      "app:s1"
+    ],
+    "sessions": {
+      "app:s1": {
+        "lines": [
+          {
+            "kind": "user",
+            "origin": "",
+            "text": "older question"
+          },
+          {
+            "kind": "assistant",
+            "text": "older answer"
+          },
+          {
+            "kind": "assistant",
+            "text": "live line"
+          },
+          {
+            "kind": "note",
+            "text": "Finish the sign-in in your browser."
+          }
+        ],
+        "live": null,
+        "summary": {
+          "channel": "app",
+          "id": "app:s1",
+          "title": "Synthetic report",
+          "writable": true
+        }
+      },
+      "slack:synthetic-team-1": {
+        "lines": [],
+        "live": null,
+        "summary": {
+          "channel": "slack",
+          "id": "slack:synthetic-team-1",
+          "writable": false
+        }
+      }
+    },
+    "tasks": {}
+  }
+}

@@ -1,0 +1,210 @@
+{
+  "description": "A snapshot sets sessions, approvals and work; later events add to it in order.",
+  "frames": [
+    {
+      "latest_seq": 4,
+      "owner": {
+        "name": "Alice Rivera"
+      },
+      "type": "welcome",
+      "version": {
+        "major": 1,
+        "minor": 0
+      }
+    },
+    {
+      "seq": 4,
+      "state": {
+        "pending_approvals": [
+          {
+            "card": {
+              "action": {
+                "kind": "command",
+                "line": "rm -r /tmp/synthetic-drafts"
+              },
+              "impact": {
+                "kind": "deletes",
+                "targets": [
+                  "/tmp/synthetic-drafts"
+                ]
+              },
+              "reason": {
+                "kind": "after_a_decline"
+              }
+            },
+            "channel": "telegram",
+            "detail": "rm -r /tmp/synthetic-drafts",
+            "id": "a1",
+            "kind": "command",
+            "options": [
+              "approve_once",
+              "approve_session",
+              "deny"
+            ],
+            "requested_at_ms": 1767225601000,
+            "risk": "high",
+            "session_id": "telegram:synthetic-user-1",
+            "summary": "Your assistant wants to delete the synthetic drafts"
+          }
+        ],
+        "running_tasks": [
+          {
+            "description": "Working on your message",
+            "id": "b1:app:s1#4",
+            "number": 4,
+            "session_id": "app:s1",
+            "started_at_ms": 1767225602000,
+            "state": "running"
+          }
+        ],
+        "sessions": [
+          {
+            "channel": "telegram",
+            "id": "telegram:synthetic-user-1",
+            "last_activity_ms": 5,
+            "writable": false
+          },
+          {
+            "channel": "app",
+            "id": "app:s1",
+            "title": "Synthetic report",
+            "writable": true
+          }
+        ]
+      },
+      "type": "snapshot"
+    },
+    {
+      "at_ms": 1767225605000,
+      "event": {
+        "origin": "app",
+        "session_id": "app:s2",
+        "text": "Plan the week for Acme Corp",
+        "type": "user_message"
+      },
+      "seq": 5,
+      "session_id": "app:s2",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225606000,
+      "event": {
+        "session": {
+          "channel": "app",
+          "id": "app:s2",
+          "title": "Plan the week",
+          "writable": true
+        },
+        "type": "session_created"
+      },
+      "seq": 6,
+      "session_id": "app:s2",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225607000,
+      "event": {
+        "session_id": "app:s1",
+        "text": "The report is queued.",
+        "type": "assistant_message"
+      },
+      "seq": 7,
+      "session_id": "app:s1",
+      "type": "event"
+    }
+  ],
+  "state": {
+    "approvals": {
+      "a1": {
+        "card": {
+          "action": {
+            "kind": "command",
+            "line": "rm -r /tmp/synthetic-drafts"
+          },
+          "impact": {
+            "kind": "deletes",
+            "targets": [
+              "/tmp/synthetic-drafts"
+            ]
+          },
+          "reason": {
+            "kind": "after_a_decline"
+          }
+        },
+        "channel": "telegram",
+        "detail": "rm -r /tmp/synthetic-drafts",
+        "id": "a1",
+        "kind": "command",
+        "options": [
+          "approve_once",
+          "approve_session",
+          "deny"
+        ],
+        "requested_at_ms": 1767225601000,
+        "risk": "high",
+        "session_id": "telegram:synthetic-user-1",
+        "summary": "Your assistant wants to delete the synthetic drafts"
+      }
+    },
+    "last_seq": 7,
+    "notice": null,
+    "order": [
+      "app:s2",
+      "telegram:synthetic-user-1",
+      "app:s1"
+    ],
+    "sessions": {
+      "app:s1": {
+        "lines": [
+          {
+            "kind": "assistant",
+            "text": "The report is queued."
+          }
+        ],
+        "live": null,
+        "summary": {
+          "channel": "app",
+          "id": "app:s1",
+          "title": "Synthetic report",
+          "writable": true
+        }
+      },
+      "app:s2": {
+        "lines": [
+          {
+            "kind": "user",
+            "origin": "app",
+            "text": "Plan the week for Acme Corp"
+          }
+        ],
+        "live": null,
+        "summary": {
+          "channel": "app",
+          "id": "app:s2",
+          "title": "Plan the week",
+          "writable": true
+        }
+      },
+      "telegram:synthetic-user-1": {
+        "lines": [],
+        "live": null,
+        "summary": {
+          "channel": "telegram",
+          "id": "telegram:synthetic-user-1",
+          "last_activity_ms": 5,
+          "writable": false
+        }
+      }
+    },
+    "tasks": {
+      "b1:app:s1#4": {
+        "description": "Working on your message",
+        "id": "b1:app:s1#4",
+        "number": 4,
+        "session_id": "app:s1",
+        "started_at_ms": 1767225602000,
+        "state": "running"
+      }
+    }
+  }
+}

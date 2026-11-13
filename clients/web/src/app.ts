@@ -12,11 +12,9 @@ import type {
   ClientFrame,
   Command,
   Enrollment,
-  Event,
   ServerFrame,
-  SessionSummary,
-  TaskSummary,
 } from "./protocol";
+import { apply as reduce, newState, nextApproval, running, title as titleOf } from "./state.js";
 
 const API = "/client/v1";
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -99,137 +97,21 @@ async function pair(offerId: string, code: string, name: string, fingerprint?: s
 
 // --- State -------------------------------------------------------------------
 
-type Line = { who: string; text: string; note?: boolean };
-interface SessionView {
-  summary?: SessionSummary;
-  lines: Line[];
-  live?: { turnId: string; text: string; status: string };
-}
-
-const sessions = new Map<string, SessionView>();
-const approvals = new Map<string, Approval>();
-const tasks = new Map<string, TaskSummary>();
+const state = newState();
+state.last_seq = Number(localStorage.getItem(SEQ_KEY) ?? "") || null;
 let selected: string | null = null;
 let awaitingNew = false;
-let lastSeq: number | null = Number(localStorage.getItem(SEQ_KEY) ?? "") || null;
-
-const view = (id: string) => {
-  let v = sessions.get(id);
-  if (!v) sessions.set(id, (v = { lines: [] }));
-  return v;
-};
-
-function liveOf(turnId: string) {
-  for (const v of sessions.values()) if (v.live?.turnId === turnId) return v;
-  return undefined;
-}
-
-function statusText(event: Extract<Event, { type: "turn_status" }>): string {
-  const s = event.status;
-  switch (s.kind) {
-    case "thinking": return "Thinking…";
-    case "tool_started": return `${s.name}${s.summary ? `: ${s.summary}` : ""}…`;
-    case "tool_progress": return `${s.name}: ${s.chunk.slice(0, 80)}`;
-    case "tool_completed": return `✓ ${s.name} ${s.summary ?? ""}`;
-    case "plan_step": return `Step ${s.step + 1} of ${s.total}: ${s.description}`;
-    case "checklist": return "Updated the plan";
-    case "note": return s.text;
-  }
-  return "Working…";
-}
-
-function applyEvent(sessionId: string | undefined, event: Event) {
-  switch (event.type) {
-    case "session_created":
-    case "session_updated":
-      view(event.session.id).summary = event.session;
-      break;
-    case "user_message":
-      view(event.session_id).lines.push({ who: event.origin === "app" ? "You" : `You (${event.origin})`, text: event.text });
-      break;
-    case "assistant_message":
-      view(event.session_id).lines.push({ who: "Assistant", text: event.text });
-      break;
-    case "turn_started":
-      view(event.session_id).live = { turnId: event.turn_id, text: "", status: "Working…" };
-      break;
-    case "turn_delta": {
-      const v = liveOf(event.turn_id);
-      if (v?.live) v.live.text += event.text;
-      break;
-    }
-    case "turn_status": {
-      const v = liveOf(event.turn_id);
-      if (v?.live) v.live.status = statusText(event);
-      break;
-    }
-    case "user_action_required":
-      if (sessionId) view(sessionId).lines.push({ who: "Action needed", text: event.message, note: true });
-      break;
-    case "turn_completed": {
-      const v = liveOf(event.turn_id) ?? (sessionId ? view(sessionId) : undefined);
-      if (!v) break;
-      v.live = undefined;
-      if (event.text) v.lines.push({ who: "Assistant", text: event.text });
-      if (event.state === "cancelled") v.lines.push({ who: "", text: "Stopped.", note: true });
-      if (event.state === "failed") v.lines.push({ who: "", text: `Failed: ${event.error ?? ""}`, note: true });
-      break;
-    }
-    case "approval_requested":
-      approvals.set(event.approval.id, event.approval);
-      break;
-    case "approval_resolved":
-      approvals.delete(event.approval_id);
-      break;
-    case "task_updated":
-      if (event.task.state === "running" || event.task.state === "cancelling") tasks.set(event.task.id, event.task);
-      else tasks.delete(event.task.id);
-      break;
-  }
-}
 
 function apply(frame: ServerFrame) {
-  switch (frame.type) {
-    case "snapshot":
-      approvals.clear();
-      tasks.clear();
-      for (const s of frame.state.sessions) view(s.id).summary = s;
-      for (const a of frame.state.pending_approvals) approvals.set(a.id, a);
-      for (const t of frame.state.running_tasks) tasks.set(t.id, t);
-      setSeq(frame.seq);
-      break;
-    case "event":
-      if (frame.seq != null) {
-        if (lastSeq != null && frame.seq <= lastSeq) return;
-        setSeq(frame.seq);
-      }
-      applyEvent(frame.session_id ?? undefined, frame.event);
-      break;
-    case "ack": {
-      const r = frame.result;
-      if (r.type === "message_accepted" && r.new_session && awaitingNew) {
-        awaitingNew = false;
-        selected = r.session_id;
-      } else if (r.type === "sessions") {
-        for (const s of r.sessions) view(s.id).summary = s;
-      } else if (r.type === "history") {
-        const v = view(r.session_id);
-        v.lines = r.messages.map((m) => ({ who: m.role === "user" ? "You" : "Assistant", text: m.text })).concat(v.lines);
-      } else if (r.type === "stopped" || r.type === "reply") {
-        status(r.type === "stopped" ? r.report : r.text);
-      }
-      break;
-    }
-    case "error":
-      status(frame.error.message);
-      break;
+  const notice = state.notice;
+  reduce(state, frame);
+  if (frame.type === "ack" && frame.result.type === "message_accepted" && frame.result.new_session && awaitingNew) {
+    awaitingNew = false;
+    selected = frame.result.session_id;
   }
+  if (state.last_seq != null) localStorage.setItem(SEQ_KEY, String(state.last_seq));
+  if (state.notice && state.notice !== notice) status(state.notice);
   render();
-}
-
-function setSeq(seq: number) {
-  lastSeq = seq;
-  localStorage.setItem(SEQ_KEY, String(seq));
 }
 
 // --- Connection --------------------------------------------------------------
@@ -270,7 +152,7 @@ async function connect() {
       type: "hello",
       version: { major: 1, minor: 0 },
       client: { kind: "web", name: "aidaemon-web" },
-      resume_from: lastSeq ?? undefined,
+      resume_from: state.last_seq ?? undefined,
       token: grant!.access_token,
     };
     ws.send(JSON.stringify(hello));
@@ -309,10 +191,7 @@ function el(tag: string, props: Record<string, string> = {}, ...children: (Node 
   return node;
 }
 
-function title(id: string) {
-  const s = sessions.get(id)?.summary;
-  return s?.title ?? (s ? `${id.slice(0, 22)} (${s.channel})` : id.slice(0, 22));
-}
+const title = (id: string) => titleOf(state, id);
 
 function card(a: Approval): HTMLElement {
   const box = el("div", { class: `card ${a.risk}` }, el("strong", {}, a.summary));
@@ -341,8 +220,8 @@ function card(a: Approval): HTMLElement {
 
 function render() {
   const list = $("sessionlist");
-  list.replaceChildren(...[...sessions.keys()].map((id) => {
-    const b = el("button", { class: id === selected ? "on" : "" }, `${sessions.get(id)?.live ? "● " : ""}${title(id)}`);
+  list.replaceChildren(...state.order.map((id) => {
+    const b = el("button", { class: id === selected ? "on" : "" }, `${state.sessions[id]?.live ? "● " : ""}${title(id)}`);
     b.onclick = () => {
       selected = id;
       if (!fetched.has(id)) {
@@ -353,15 +232,20 @@ function render() {
     };
     return b;
   }));
-  $("cards").replaceChildren(...[...approvals.values()].sort((a, b) => a.requested_at_ms - b.requested_at_ms).map(card));
+  const first = nextApproval(state);
+  $("cards").replaceChildren(...(first ? [card(first)] : []));
   const log = $("log");
-  const v = selected ? sessions.get(selected) : undefined;
-  const lines = (v?.lines ?? []).map((l) => el("p", { class: l.note ? "msg live" : "msg" }, el("b", {}, l.who), l.text));
-  if (v?.live) lines.push(el("p", { class: "msg live" }, v.live.text, v.live.text ? "\n" : "", v.live.status));
+  const v = selected ? state.sessions[selected] : undefined;
+  const lines = (v?.lines ?? []).map((l) => {
+    const who = l.kind === "user" ? (l.origin && l.origin !== "app" ? `You (${l.origin})` : "You")
+      : l.kind === "assistant" ? "Assistant" : "";
+    return el("p", { class: l.kind === "note" ? "msg live" : "msg" }, el("b", {}, who), l.text);
+  });
+  if (v?.live) lines.push(el("p", { class: "msg live" }, v.live.streamed, v.live.streamed ? "\n" : "", v.live.status ?? "Working..."));
   if (!v) lines.push(el("p", { class: "msg live" }, "Type a message to start a new session."));
   log.replaceChildren(...lines);
   log.scrollTop = log.scrollHeight;
-  $("tasklist").replaceChildren(...[...tasks.values()].map((t) => {
+  $("tasklist").replaceChildren(...running(state).map((t) => {
     const cancel = el("button", {}, "Cancel");
     cancel.onclick = () => send({ type: "cancel_task", task_id: t.id });
     return el("div", { class: "task" }, `#${t.number} ${t.description}`, el("br"), el("small", {}, title(t.session_id)), el("br"), cancel);
@@ -409,7 +293,7 @@ $("send").onsubmit = (e) => {
     const [name, ...args] = text.slice(1).split(" ");
     send({ type: "run_slash", session_id: selected, command: name, args: args.join(" ") });
   } else {
-    const writable = !selected || sessions.get(selected)?.summary?.writable !== false;
+    const writable = !selected || state.sessions[selected]?.summary?.writable !== false;
     if (!writable) return status("That session belongs to another chat: reply there, or start a new session.");
     awaitingNew = !selected;
     send({ type: "send_message", session_id: selected ?? undefined, text });

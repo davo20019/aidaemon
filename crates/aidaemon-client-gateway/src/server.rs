@@ -58,7 +58,7 @@ pub fn router(gateway: Arc<ClientGateway>) -> Router {
         .route("/client/v1/devices/{device_id}/revoke", post(revoke_device))
         .route("/client/v1/app", get(web_page))
         .route("/client/v1/app/", get(web_page))
-        .route("/client/v1/app/app.js", get(web_script))
+        .route("/client/v1/app/{module}", get(web_script))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .with_state(gateway)
 }
@@ -333,9 +333,12 @@ async fn revoke_device(
     reply(gateway.pairing.devices().await)
 }
 
-/// The web client: one page and its script, built from `clients/web`.
+/// The web client: one page and its modules, built from `clients/web`.
 const WEB_PAGE: &str = include_str!("../web/index.html");
-const WEB_SCRIPT: &str = include_str!("../web/app.js");
+const WEB_MODULES: &[(&str, &str)] = &[
+    ("app.js", include_str!("../web/app.js")),
+    ("state.js", include_str!("../web/state.js")),
+];
 
 async fn web_page() -> Response {
     (
@@ -351,13 +354,16 @@ async fn web_page() -> Response {
         .into_response()
 }
 
-async fn web_script() -> Response {
+async fn web_script(Path(module): Path<String>) -> Response {
+    let Some((_, script)) = WEB_MODULES.iter().find(|(name, _)| *name == module) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/javascript; charset=utf-8",
         )],
-        WEB_SCRIPT,
+        *script,
     )
         .into_response()
 }
