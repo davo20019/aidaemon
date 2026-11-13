@@ -650,7 +650,19 @@ impl BackgroundDelivery<'_> {
             None => Ok(false),
         };
         let delivered = match direct {
-            Ok(sent) => sent,
+            Ok(sent) => {
+                // The chat's record of the push: the daemon's log showed
+                // nothing for a finished helper whose result had in fact
+                // been sent (live 2026-11-13).
+                if sent {
+                    info!(
+                        session_id = %self.session_id,
+                        notification_type = %notification_type,
+                        "Delivered a background helper's result to its chat"
+                    );
+                }
+                sent
+            }
             Err(e) => {
                 warn!(
                     session_id = %self.session_id,
