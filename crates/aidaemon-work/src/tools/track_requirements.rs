@@ -545,7 +545,7 @@ impl TrackRequirementsTool {
             return Ok("track_requirements: no items provided.".to_string());
         }
 
-        let mut plan = match self
+        let plan = match self
             .plan_store
             .upsert_checklist_graph(
                 &session_id,
@@ -571,44 +571,50 @@ impl TrackRequirementsTool {
             .and_then(Value::as_str)
             .and_then(aidaemon_events::ExecutorClaimedOutcome::from_protocol_name)
             .is_some_and(|outcome| outcome != aidaemon_events::ExecutorClaimedOutcome::Done);
-        if claimed_short && plan.status == PlanStatus::Completed {
-            plan.status = PlanStatus::PartiallyCompleted;
-            if let Err(e) = self
-                .plan_store
-                .set_status(&plan.id, PlanStatus::PartiallyCompleted)
-                .await
-            {
-                tracing::warn!(error = %e, "track_requirements: failed to record the partial verdict");
-            }
-        }
 
         // Background sub-agents of this chat still running: the steps left
         // open wait on them (typed: their running records), so the card says
         // the work continues in the background, not that it stopped short.
-        if let Some(state) = self.state.as_ref() {
-            let running: Vec<String> = state
+        let running: Vec<String> = match self.state.as_ref() {
+            Some(state) => state
                 .background_spawns_for_session(&session_id)
                 .await
                 .unwrap_or_default()
                 .into_iter()
                 .map(|spawn| spawn.id)
-                .collect();
-            if plan.wait_on_background_jobs(&running) {
-                if let Err(e) = self.plan_store.update(&plan).await {
-                    tracing::warn!(error = %e, "track_requirements: failed to record waiting steps");
-                }
-            }
-        }
+                .collect(),
+            None => Vec::new(),
+        };
 
         // A turn that cannot make changes did what it was allowed to: steps
         // it left undone were held back, not failed, and the card says so.
-        if facts.mutation_forbidden
-            && plan.hold_back_unfinished_steps(crate::plans::NotDoneReason::ChangesOff)
+        let changes_off = facts.mutation_forbidden;
+
+        // One write under the plan lock, on the plan as stored now.
+        let plan = match self
+            .plan_store
+            .modify(&plan.id, |plan| {
+                let mut changed = false;
+                if claimed_short && plan.status == PlanStatus::Completed {
+                    plan.status = PlanStatus::PartiallyCompleted;
+                    changed = true;
+                }
+                changed |= plan.wait_on_background_jobs(&running);
+                if changes_off {
+                    changed |=
+                        plan.hold_back_unfinished_steps(crate::plans::NotDoneReason::ChangesOff);
+                }
+                changed
+            })
+            .await
         {
-            if let Err(e) = self.plan_store.update(&plan).await {
-                tracing::warn!(error = %e, "track_requirements: failed to record held-back steps");
+            Ok(Some(stored)) => stored,
+            Ok(None) => plan,
+            Err(e) => {
+                tracing::warn!(error = %e, "track_requirements: failed to record the checklist's verdict");
+                plan
             }
-        }
+        };
 
         // What the model reads. The owner's card is drawn by the agent loop
         // from the stored plan (StatusUpdate::Checklist), never from this
