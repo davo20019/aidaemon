@@ -63,6 +63,7 @@ mod events;
 pub mod main_loop;
 pub mod model_call;
 pub mod outcome;
+pub mod spawn;
 pub mod stop;
 pub mod tool_calls;
 pub mod turn_hooks;

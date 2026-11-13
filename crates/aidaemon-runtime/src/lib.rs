@@ -11,6 +11,10 @@
 //! - [`engine`]: the boundary between a turn's kernel run and its host:
 //!   the host calls, the forwarding hooks and the host provider.
 //! - [`eval`]: the per-task harness effectiveness evaluation.
+//! - [`background_task_lead`]: a goal's task lead run in the background,
+//!   its executors, recovery and result delivery.
+//! - [`goal_dispatch`]: wait prefixes, scheduled-run provenance and state,
+//!   and the user-facing goal and task result summaries.
 //! - [`chat_bridge`]: calling an SDK provider with chat-completions JSON,
 //!   and the classified provider errors recovery decisions read.
 //! - [`prompt`]: the system prompt's cacheable core, its fixed rule blocks
@@ -37,17 +41,21 @@
 //! - [`spawn`]: the running sub-agents registry, a child's progress and
 //!   end as its parent sees them, and the plain child's prompt.
 //! - [`turn_runtime`]: one agent's turn settings and caches.
+//! - [`specialists`]: the specialist registry (bundled and owner-overridden
+//!   expert profiles a child is made from).
 //! - [`spawn_tool`]: the `spawn_agent` tool.
 //! - [`untrusted`]: the untrusted-content rule's taint facts and verifier.
 
 pub mod approvals;
 pub mod authority;
 pub mod background_run;
+pub mod background_task_lead;
 pub mod chat_bridge;
 pub mod context_budget;
 pub mod coordination;
 pub mod engine;
 pub mod eval;
+pub mod goal_dispatch;
 pub mod host;
 pub mod known_resources;
 pub mod llm;
@@ -61,6 +69,7 @@ pub mod run_state;
 pub mod settings;
 pub mod spawn;
 pub mod spawn_tool;
+pub mod specialists;
 pub mod turn;
 pub mod turn_runtime;
 pub mod untrusted;

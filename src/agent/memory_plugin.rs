@@ -289,6 +289,27 @@ impl MemoryWrites for DaemonMemoryInner {
     fn learn(&self, learning: crate::agent::post_task::LearningContext) {
         crate::agent::post_turn::spawn_learning(self.store.clone(), learning);
     }
+
+    fn learn_from_task(
+        &self,
+        task: crate::traits::Task,
+        model: String,
+        taint: crate::memory::task_learning::RunTaint,
+    ) {
+        let state = self.state.clone();
+        let store = self.store.clone();
+        let side_calls = self.side_calls.clone();
+        tokio::spawn(async move {
+            let task_id = task.id.clone();
+            if let Err(error) = crate::memory::task_learning::extract_task_knowledge(
+                state, store, side_calls, model, task, taint,
+            )
+            .await
+            {
+                tracing::warn!(task_id = %task_id, %error, "Task knowledge extraction failed");
+            }
+        });
+    }
 }
 
 /// The router's fast tier, else the turn's model.

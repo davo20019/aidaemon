@@ -3701,6 +3701,7 @@ async fn goal_worker_reads_then_sends(
     harness.state.create_goal(&goal).await.unwrap();
     let inherited = harness
         .agent
+        .engine()
         .authority_for_child(
             UserRole::Owner,
             &ChannelContext::private("telegram"),
@@ -3771,7 +3772,7 @@ async fn path_aliases_are_not_trusted_roots() {
         .await
         .unwrap();
     harness.agent.path_aliases.projects = vec!["/tmp/aidaemon-test/projects".to_string()];
-    let configured = harness.agent.configured_trust_roots();
+    let configured = harness.agent.sdk_engine.trusted_roots.clone();
     let roots = super::turn_trust_roots(super::TrustRootSources {
         configured: &configured,
         ..Default::default()
@@ -3780,6 +3781,7 @@ async fn path_aliases_are_not_trusted_roots() {
     assert_eq!(read_trust(&roots, file), Untrusted);
     let dispatched = harness
         .agent
+        .engine()
         .authority_for_child(UserRole::Owner, &ChannelContext::private("telegram"), None)
         .await;
     assert_eq!(read_trust(&dispatched.trusted_roots, file), Untrusted);

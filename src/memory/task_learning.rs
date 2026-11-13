@@ -13,12 +13,7 @@ use crate::traits::{StateStore, Task};
 /// Maximum size of activity log text sent to the extraction prompt.
 const MAX_ACTIVITY_LOG_CHARS: usize = 4096;
 
-/// Whether the run a task finished in read untrusted content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunTaint {
-    Clean,
-    Tainted,
-}
+pub use aidaemon_runtime::turn::memory_writer::RunTaint;
 
 /// Extract durable knowledge from a completed task's activity log.
 ///

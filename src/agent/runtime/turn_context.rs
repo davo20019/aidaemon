@@ -3,13 +3,13 @@
 //! gets them as a [`aidaemon_runtime::host::TurnHost`].
 
 #[cfg(test)]
-use super::project_scope::drop_inbox_scopes;
-#[cfg(test)]
 use super::*;
 #[cfg(test)]
 use super::{completion_contract, followup};
 #[cfg(test)]
 use crate::traits::ToolCallSemantics;
+#[cfg(test)]
+use aidaemon_runtime::turn::project_scope::drop_inbox_scopes;
 #[allow(unused_imports)]
 pub(in crate::agent) use aidaemon_runtime::turn::turn_context::*;
 

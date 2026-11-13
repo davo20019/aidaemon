@@ -450,8 +450,8 @@ impl TaskPlan {
     /// The turn handed its work to background jobs `job_ids` without naming
     /// the steps they do (`checklist_items`): every step still open (or
     /// already waiting on an earlier job) waits on them, so the card reads "continuing in the background", never
-    /// "stopped short", while they run. Their end does not complete such a
-    /// step ([`PlanStep::waits_on_jobs`]). Returns whether anything changed.
+    /// "stopped short", while they run. Their typed ends settle such a step
+    /// ([`PlanStep::waits_on_jobs`]). Returns whether anything changed.
     pub fn wait_on_background_jobs(&mut self, job_ids: &[String]) -> bool {
         if job_ids.is_empty() {
             return false;
@@ -490,10 +490,11 @@ impl TaskPlan {
     /// Record the end of background job `job_id`, as its run record says.
     /// A step handed to it is completed once every job on it succeeded,
     /// failed only when one failed (a typed failure), and not done when one
-    /// stopped before finishing. A step that only waited on the job (nothing
-    /// handed it the step) is never done or failed by the job's end: once no
-    /// job is left on it, it is not done. The plan resolves once nothing is
-    /// left to run. Returns whether any step changed.
+    /// stopped before finishing. A step that only waited on the job settles
+    /// from the typed ends of the jobs it waited on: done once every one
+    /// succeeded, not done (with the plain reason) as soon as one failed or
+    /// stopped. The plan resolves once nothing is left to run. Returns
+    /// whether any step changed.
     pub fn settle_background_job(&mut self, job_id: &str, end: JobEnd) -> bool {
         let now = Utc::now();
         let mut changed = false;
@@ -506,10 +507,27 @@ impl TaskPlan {
             changed = true;
             step.background_jobs.retain(|job| job != job_id);
             if step.waits_on_jobs {
-                if step.background_jobs.is_empty() {
-                    step.waits_on_jobs = false;
-                    step.status = StepStatus::Deferred;
-                    step.completed_at = Some(now);
+                // Live 2026-11-13: a step that only waited on a background
+                // job read "(not done)" after the job succeeded. Its runs'
+                // typed ends are what settle it.
+                let not_done = match end {
+                    JobEnd::Succeeded if step.background_jobs.is_empty() => None,
+                    JobEnd::Succeeded => continue,
+                    JobEnd::Stopped => Some(NotDoneReason::HelperStopped),
+                    JobEnd::Failed => Some(NotDoneReason::WaitedOnFailed),
+                };
+                step.waits_on_jobs = false;
+                step.background_jobs.clear();
+                step.completed_at = Some(now);
+                match not_done {
+                    None => {
+                        step.status = StepStatus::Completed;
+                        step.evidence = StepEvidence::Settled;
+                    }
+                    Some(reason) => {
+                        step.status = StepStatus::Deferred;
+                        step.not_done = Some(reason);
+                    }
                 }
                 continue;
             }
@@ -875,8 +893,8 @@ pub struct PlanStep {
 
     /// The step was left open while the turn's background jobs ran, not
     /// handed to them by a launch's `checklist_items`: it reads as running
-    /// while they do, and their end returns it to not done (failed if one
-    /// failed), since no job was given it. Only an update closes it.
+    /// while they do and settles from their typed ends: done once every one
+    /// succeeded, not done (with the reason) once one failed or stopped.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waits_on_jobs: bool,
 
@@ -1061,6 +1079,8 @@ pub enum NotDoneReason {
     HelperStopped,
     /// Its turn ended and nothing was left working on it.
     LeftOpen,
+    /// A background job it waited on failed (its run record says so).
+    WaitedOnFailed,
 }
 
 impl NotDoneReason {
@@ -1069,6 +1089,7 @@ impl NotDoneReason {
             Self::ChangesOff => "read-only is on",
             Self::HelperStopped => "its helper stopped before it finished",
             Self::LeftOpen => "nothing was left working on it",
+            Self::WaitedOnFailed => "the work it waited on failed",
         }
     }
 }
@@ -1391,9 +1412,9 @@ mod tests {
 
     /// A turn that hands work to background jobs without linking its open
     /// steps never reads "stopped short" or "not done" while they run, and
-    /// their end does not claim the steps were done.
+    /// once every job succeeded the steps waiting on them are done.
     #[test]
-    fn open_steps_wait_on_the_turns_background_jobs_without_being_claimed() {
+    fn open_steps_wait_on_the_turns_background_jobs_and_settle_from_their_ends() {
         let mut plan = TaskPlan::new(
             "synthetic-session",
             "synthetic-task",
@@ -1430,9 +1451,37 @@ mod tests {
             .render_compact_checklist()
             .starts_with("⏳ Continuing in the background"));
         assert!(plan.settle_background_job("job-b", JobEnd::Succeeded));
-        assert_eq!(plan.steps[1].status, StepStatus::Deferred);
-        assert_eq!(plan.steps[2].status, StepStatus::Deferred);
-        assert_ne!(plan.status, PlanStatus::Completed);
+        assert_eq!(plan.steps[1].status, StepStatus::Completed);
+        assert_eq!(plan.steps[2].status, StepStatus::Completed);
+        assert_eq!(plan.status, PlanStatus::Completed);
+        let card = plan.render_compact_checklist();
+        assert!(!card.contains("not done"), "{card}");
+        assert!(is_completed_checklist(&card), "{card}");
+    }
+
+    /// A step waiting on runs is not done, with the plain reason, as soon as
+    /// one of them failed; a later success of another run does not undo it.
+    #[test]
+    fn a_step_waiting_on_a_failed_run_is_not_done_with_the_reason() {
+        let mut plan = TaskPlan::new(
+            "synthetic-session",
+            "synthetic-task",
+            "description",
+            vec!["wait for the build".into()],
+            "track_requirements",
+        );
+        let jobs = vec!["job-a".to_string(), "job-b".to_string()];
+        assert!(plan.wait_on_background_jobs(&jobs));
+        assert!(plan.settle_background_job("job-a", JobEnd::Failed));
+        assert_eq!(plan.steps[0].status, StepStatus::Deferred);
+        assert_eq!(plan.steps[0].not_done, Some(NotDoneReason::WaitedOnFailed));
+        assert!(!plan.settle_background_job("job-b", JobEnd::Succeeded));
+        assert!(plan.is_finished());
+        let card = plan.render_compact_checklist();
+        assert!(
+            card.contains("wait for the build (not done: the work it waited on failed)"),
+            "{card}"
+        );
     }
 
     #[test]

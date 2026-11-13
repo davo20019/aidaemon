@@ -1306,9 +1306,11 @@ async fn background_detach_delivers_neutral_handoff_not_giveup_summary() {
         !lower.contains("results were not provided") && !lower.contains("activity summary"),
         "the model's give-up summary must not be the final answer; got: {reply}"
     );
-    assert!(
-        lower.contains("background") && lower.contains("running in the background"),
-        "the final answer must be the neutral background handoff; got: {reply}"
+    // The handoff's reply is the launch's own first line; the run's card
+    // carries the rest.
+    assert_eq!(
+        reply, "Background job started.",
+        "the final answer must be the launch's own handoff line"
     );
 }
 

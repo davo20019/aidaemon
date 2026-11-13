@@ -810,7 +810,8 @@ pub fn plain_child_prompt(
          You are a sub-agent (depth {child_depth}/{max_depth}) spawned to accomplish a specific mission.\n\
          **Mission:** {mission}\n\n\
          Focus exclusively on this mission. Be concise. Return your findings/results \
-         directly — they will be consumed by the parent agent.{depth_note}"
+         directly — they will be consumed by the parent agent. {own_duration}{depth_note}",
+        own_duration = crate::specialists::compose::OWN_DURATION_RULE,
     );
     if let Some(specialist_prompt) = specialist_prompt {
         prompt.push_str("\n\n## Specialist Profile\n");
@@ -1016,12 +1017,44 @@ pub struct ChildAgentRequest {
     pub project_scope: Option<String>,
     pub specialist: Option<String>,
     pub approval_session_id: Option<String>,
+    /// The durable task attempt a task lead or executor was already claimed
+    /// with; `None` lets the spawn find or claim its task's attempt.
+    pub bound_task_attempt: Option<aidaemon_work::traits::TaskAttempt>,
     /// The spawning turn's actual authority, taint and root request
     /// (dispatcher-injected; `None` falls back to re-resolution).
     pub parent_authority: Option<crate::authority::InheritedAuthority>,
     /// `None` leaves the child unlimited.
     pub time_limit: Option<ChildTimeLimit>,
     pub model_tier: Option<aidaemon_providers::routing::Tier>,
+}
+
+impl ChildAgentRequest {
+    /// A request for a child doing `task` within `mission`, with nothing
+    /// else set.
+    pub fn new(
+        mission: impl Into<String>,
+        task: impl Into<String>,
+        channel_ctx: ChannelContext,
+        user_role: UserRole,
+    ) -> Self {
+        Self {
+            mission: mission.into(),
+            task: task.into(),
+            status_tx: None,
+            channel_ctx,
+            user_role,
+            child_role: None,
+            goal_id: None,
+            task_id: None,
+            project_scope: None,
+            specialist: None,
+            approval_session_id: None,
+            bound_task_attempt: None,
+            parent_authority: None,
+            time_limit: None,
+            model_tier: None,
+        }
+    }
 }
 
 /// Child-delegation capability required by `spawn_agent`.
@@ -1358,5 +1391,423 @@ mod tests {
             "Install a fresh Drupal site with demo content in exactly…"
         );
         assert_eq!(child_status_label("Count to 30"), "Count to 30");
+    }
+
+    use aidaemon_core::card::ActivityKind;
+
+    fn rendered_checklist(done: usize, total: usize) -> String {
+        let steps = (0..total).map(|i| format!("synthetic step {i}")).collect();
+        let mut plan = aidaemon_work::plans::TaskPlan::new(
+            "synthetic-session",
+            "synthetic-task",
+            "description",
+            steps,
+            "track_requirements",
+        );
+        for step in plan.steps.iter_mut().take(done) {
+            step.status = aidaemon_work::plans::StepStatus::Completed;
+        }
+        if done == total {
+            plan.status = aidaemon_work::plans::PlanStatus::Completed;
+        } else {
+            plan.current_step = done;
+        }
+        plan.render_compact_checklist()
+    }
+
+    /// Two parallel children each declare a checklist. Neither reaches the
+    /// parent's card (which would replace the parent's plan); each step
+    /// becomes its own child's record with a typed kind, a step handed to
+    /// the background included, and a tool ending is not a step.
+    #[tokio::test]
+    async fn a_childs_checklist_never_replaces_the_parents_plan() {
+        let (parent_tx, mut parent_rx) = mpsc::channel(16);
+        let wordpress = child_status_sender(
+            Some(parent_tx.clone()),
+            "Build the WordPress demo site for Acme Corp",
+            false,
+            None,
+        )
+        .unwrap();
+        let drupal = child_status_sender(
+            Some(parent_tx),
+            "Build the Drupal demo site for Acme Corp",
+            false,
+            None,
+        )
+        .unwrap();
+        wordpress
+            .send(StatusUpdate::Checklist(aidaemon_core::card::PlanCard {
+                text: rendered_checklist(5, 5),
+                steps: 5,
+            }))
+            .await
+            .unwrap();
+        drupal
+            .send(StatusUpdate::Checklist(aidaemon_core::card::PlanCard {
+                text: rendered_checklist(1, 4),
+                steps: 4,
+            }))
+            .await
+            .unwrap();
+        drupal
+            .send(StatusUpdate::ToolStart {
+                name: "running the site installer".into(),
+                summary: String::new(),
+                kind: ActivityKind::Run,
+            })
+            .await
+            .unwrap();
+        drupal
+            .send(StatusUpdate::ToolComplete {
+                name: "running the site installer".into(),
+                summary: "done".into(),
+            })
+            .await
+            .unwrap();
+        drupal
+            .send(StatusUpdate::StepHandedOff {
+                kind: ActivityKind::Run,
+            })
+            .await
+            .unwrap();
+        drop((wordpress, drupal));
+
+        let mut lines = Vec::new();
+        while let Some(update) = parent_rx.recv().await {
+            match update {
+                StatusUpdate::Checklist(_) => panic!("child checklist reached the parent card"),
+                StatusUpdate::Helper(view) => {
+                    assert!(!view.background);
+                    lines.push(format!(
+                        "{}: {}",
+                        view.label,
+                        view.step.map(|step| step.words()).unwrap_or_default()
+                    ));
+                }
+                other => panic!("unexpected update {other:?}"),
+            }
+        }
+        assert_eq!(
+            lines,
+            vec![
+                "Build the Drupal demo site for Acme Corp: Running a command".to_string(),
+                "Build the Drupal demo site for Acme Corp: Running a command · goes on in the \
+                 background"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn running_siblings_with_one_title_are_told_apart_by_their_task() {
+        let registry = Arc::new(RunningChildren::default());
+        let mission = "Run one shell command and report its exact output.";
+        let _alpha = registry.enter(
+            "chat-1",
+            mission,
+            "Run this exact shell command: sleep 120 && echo alpha-test . Report the output.",
+            "child-alpha",
+            None,
+        );
+        let _beta = registry.enter(
+            "chat-1",
+            mission,
+            "Run this exact shell command: sleep 120 && echo beta-test . Report the output.",
+            "child-beta",
+            None,
+        );
+        let _other_chat = registry.enter("chat-2", mission, "Run: date", "child-other", None);
+        let labels: Vec<String> = registry
+            .for_session("chat-1")
+            .into_iter()
+            .map(|child| child.label)
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                format!("{mission} (…echo alpha-test . Report the…)"),
+                format!("{mission} (…echo beta-test . Report the…)"),
+            ]
+        );
+        let alone = registry.for_session("chat-2");
+        assert_eq!(alone[0].label, mission);
+        drop(_beta);
+        assert_eq!(registry.for_session("chat-1")[0].label, mission);
+    }
+
+    /// A child is listed under the chat turn that started it, and a stop
+    /// from the chat reaches it by its key.
+    #[test]
+    fn a_listed_child_carries_its_request_and_can_be_stopped() {
+        let registry = Arc::new(RunningChildren::default());
+        let turn = registry.begin_request("chat-1", "task-a");
+        let child = registry.enter("chat-1", "Counting agent A", "count", "child-a", None);
+        drop(turn);
+        let later = registry.enter("chat-1", "Counting agent B", "count", "child-b", None);
+        let listed = registry.listed("chat-1");
+        assert_eq!(listed[0].request.as_deref(), Some("task-a"));
+        assert_eq!(listed[1].request, None);
+        assert_eq!(registry.current_request("chat-1"), None);
+        let stop = child.stopped();
+        assert_eq!(registry.stop(&listed[0].key).as_deref(), Some("child-a"));
+        assert!(stop.is_cancelled());
+        assert!(registry.is_listed(&listed[0].key));
+        drop(child);
+        assert!(!registry.is_listed(&listed[0].key));
+        assert!(registry.stop(&listed[0].key).is_none());
+        drop(later);
+    }
+
+    #[test]
+    fn a_child_status_label_fits_a_phone() {
+        assert_eq!(child_status_label("  \n"), "Sub-agent");
+        let long = "x".repeat(200);
+        let label = child_status_label(&long);
+        assert_eq!(label.chars().count(), 60);
+        assert!(label.ends_with('…'));
+    }
+
+    async fn synthetic_event_store() -> aidaemon_events::EventStore {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let path = db_file.into_temp_path().keep().expect("keep temp db path");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .expect("connect sqlite");
+        aidaemon_events::EventStore::on_paths(
+            pool,
+            aidaemon_tools::LexicalPaths::daemon_host(),
+            Arc::new(aidaemon_events::NoEventHost),
+        )
+        .await
+        .expect("init event store")
+    }
+
+    async fn record_tool_call(
+        store: &aidaemon_events::EventStore,
+        session: &str,
+        id: &str,
+        name: &str,
+        finished: bool,
+    ) {
+        store
+            .append(aidaemon_events::Event::new(
+                session,
+                EventType::ToolCall,
+                serde_json::json!({ "tool_call_id": id, "name": name, "arguments": {} }),
+            ))
+            .await
+            .expect("append tool call");
+        if finished {
+            store
+                .append(aidaemon_events::Event::new(
+                    session,
+                    EventType::ToolResult,
+                    serde_json::json!({
+                        "tool_call_id": id,
+                        "name": name,
+                        "result": "ok",
+                        "success": true,
+                        "duration_ms": 1,
+                    }),
+                ))
+                .await
+                .expect("append tool result");
+        }
+    }
+
+    /// An early change stays in the report however many read-only calls
+    /// follow it.
+    #[tokio::test]
+    async fn a_stopped_childs_report_covers_its_whole_run() {
+        let store = synthetic_event_store().await;
+        let session = "specialist:executor:synthetic-1";
+        let read_only: std::collections::HashSet<String> =
+            ["read_file".to_string()].into_iter().collect();
+        record_tool_call(&store, session, "call-write", "write_file", true).await;
+        for n in 0..300 {
+            record_tool_call(
+                &store,
+                session,
+                &format!("call-read-{n}"),
+                "read_file",
+                true,
+            )
+            .await;
+        }
+        let report = child_work_report(&store, session, &read_only).await;
+        assert!(report.may_have_changed_something());
+        assert_eq!(report.changed.len(), 1);
+        assert!(!report.unknown);
+    }
+
+    /// A report that cannot show it saw the run from its first record does
+    /// not claim the child only read.
+    #[tokio::test]
+    async fn a_report_that_cannot_see_the_whole_run_is_unknown() {
+        let store = synthetic_event_store().await;
+        let session = "specialist:executor:synthetic-2";
+        let read_only: std::collections::HashSet<String> =
+            ["read_file".to_string()].into_iter().collect();
+        for n in 0..6 {
+            record_tool_call(
+                &store,
+                session,
+                &format!("call-read-{n}"),
+                "read_file",
+                true,
+            )
+            .await;
+        }
+        let report = child_work_report_within(&store, session, &read_only, 10).await;
+        assert!(report.unknown);
+        assert!(report.may_have_changed_something());
+        let report = child_work_report_within(&store, session, &read_only, 13).await;
+        assert!(!report.unknown);
+        assert!(!report.may_have_changed_something());
+    }
+
+    /// A child's end record is found however many records follow it.
+    #[tokio::test]
+    async fn a_childs_end_record_is_found_behind_later_records() {
+        let store = synthetic_event_store().await;
+        let session = "specialist:executor:synthetic-3";
+        store
+            .append(aidaemon_events::Event::new(
+                session,
+                EventType::TaskEnd,
+                serde_json::json!({
+                    "task_id": "task-synthetic-3",
+                    "status": "completed",
+                    "outcome": "succeeded",
+                }),
+            ))
+            .await
+            .expect("append task end");
+        for n in 0..40 {
+            record_tool_call(
+                &store,
+                session,
+                &format!("call-late-{n}"),
+                "read_file",
+                false,
+            )
+            .await;
+        }
+        let record = latest_child_task_end(&store, session).await;
+        assert_eq!(resolve_child_outcome(true, &record), TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn a_child_with_a_refused_write_it_never_made_is_incomplete() {
+        assert_eq!(
+            settle_coordinated_outcome(TaskOutcome::Succeeded, true),
+            TaskOutcome::Partial
+        );
+        assert_eq!(
+            settle_coordinated_outcome(TaskOutcome::Succeeded, false),
+            TaskOutcome::Succeeded
+        );
+        assert_eq!(
+            settle_coordinated_outcome(TaskOutcome::Failed, true),
+            TaskOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn a_reply_with_no_readable_end_record_is_not_a_success() {
+        let unreadable: anyhow::Result<Option<TaskEndData>> =
+            Err(anyhow::anyhow!("database is locked"));
+        assert_eq!(
+            resolve_child_outcome(true, &unreadable),
+            TaskOutcome::Partial
+        );
+        assert_eq!(resolve_child_outcome(true, &Ok(None)), TaskOutcome::Partial);
+        assert_eq!(resolve_child_outcome(false, &Ok(None)), TaskOutcome::Failed);
+    }
+
+    /// The child's prompt says what `child_can_spawn` decided: a specialist
+    /// its caller made a coordinator is not told it cannot delegate.
+    #[test]
+    fn the_child_prompt_follows_the_spawn_decision() {
+        let coordinator = plain_child_prompt("P", 1, 3, "Coordinate", Some("profile"), true);
+        assert!(!coordinator.contains("CANNOT spawn"));
+        let leaf = plain_child_prompt("P", 1, 3, "Count", Some("profile"), false);
+        assert!(leaf.contains("CANNOT spawn"));
+        let deepest = plain_child_prompt("P", 3, 3, "Count", None, false);
+        assert!(deepest.contains("maximum sub-agent depth"));
+    }
+
+    #[test]
+    fn a_named_specialist_is_a_leaf_and_a_plain_child_is_not() {
+        assert!(child_can_spawn(1, 3, AgentRole::Orchestrator, false, false));
+        assert!(!child_can_spawn(1, 3, AgentRole::Orchestrator, true, false));
+        assert!(!child_can_spawn(
+            3,
+            3,
+            AgentRole::Orchestrator,
+            false,
+            false
+        ));
+        assert!(!child_can_spawn(1, 3, AgentRole::Executor, false, false));
+        // A caller that grants `spawn_agent` asked for a coordinator, within
+        // the depth limit and never for an executor.
+        assert!(child_can_spawn(1, 3, AgentRole::Orchestrator, true, true));
+        assert!(!child_can_spawn(3, 3, AgentRole::Orchestrator, true, true));
+        assert!(!child_can_spawn(1, 3, AgentRole::Executor, true, true));
+    }
+
+    #[test]
+    fn task_lead_cannot_be_named_on_a_plain_spawn() {
+        assert_eq!(named_specialist(Some("task_lead")), None);
+        assert_eq!(named_specialist(Some("not-a-kind")), None);
+        assert_eq!(named_specialist(None), None);
+        assert_eq!(
+            named_specialist(Some("review")),
+            Some(SpecialistKind::Review)
+        );
+    }
+
+    /// A child that saw untrusted content but could not record it, or
+    /// whose record cannot be read, returns an untrusted result.
+    #[test]
+    fn a_childs_unrecorded_or_unreadable_taint_fails_closed() {
+        use aidaemon_core::SourceTrust::{Trusted, Untrusted};
+        assert_eq!(child_result_trust(false, &Ok(Vec::new())), Trusted);
+        assert_eq!(child_result_trust(true, &Ok(Vec::new())), Untrusted);
+        assert_eq!(
+            child_result_trust(false, &Ok(vec!["turn-a".to_string()])),
+            Untrusted
+        );
+        assert_eq!(
+            child_result_trust(false, &Err(anyhow::anyhow!("unreadable"))),
+            Untrusted
+        );
+    }
+
+    #[test]
+    fn sqlite_busy_retry_classifier_is_narrow() {
+        assert!(is_sqlite_busy(&anyhow::anyhow!(
+            "error returned from database: (code: 5) database is locked"
+        )));
+        assert!(is_sqlite_busy(&anyhow::anyhow!("SQLITE_BUSY")));
+        for code in [261, 517, 773] {
+            assert!(is_sqlite_busy(&anyhow::anyhow!(
+                "error returned from database: (code: {code}) database is locked"
+            )));
+        }
+        assert!(!is_sqlite_busy(&anyhow::anyhow!(
+            "error returned from database: (code: 516) unrelated failure"
+        )));
+        assert!(!is_sqlite_busy(&anyhow::anyhow!("executor lease was lost")));
+    }
+
+    /// A helper never states its own run's duration: the owner reads only
+    /// the run record's measured times, under its result.
+    #[test]
+    fn a_helper_is_told_its_run_time_is_the_daemons() {
+        let rule = crate::specialists::compose::OWN_DURATION_RULE;
+        assert!(plain_child_prompt("P", 1, 3, "Count", None, false).contains(rule));
+        assert!(plain_child_prompt("P", 1, 3, "Coordinate", Some("profile"), true).contains(rule));
     }
 }

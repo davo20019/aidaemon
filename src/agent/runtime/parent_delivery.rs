@@ -1,6 +1,7 @@
 //! Parent-visible deliveries live in `aidaemon-runtime`
 //! ([`aidaemon_runtime::turn::notes`]).
 
+#[cfg(test)]
 pub(crate) use aidaemon_runtime::turn::notes::ParentDeliveryKind;
 
 #[cfg(test)]

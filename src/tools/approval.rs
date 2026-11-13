@@ -3,7 +3,9 @@
 
 pub use aidaemon_runtime::approvals::broker::ApprovalBroker;
 
-pub(crate) use aidaemon_channels::owner_wait::{OwnerWaitClock, ProgressClock};
+#[cfg(test)]
+use aidaemon_channels::owner_wait::OwnerWaitClock;
+pub(crate) use aidaemon_channels::owner_wait::ProgressClock;
 
 #[cfg(test)]
 mod tests {

@@ -110,6 +110,12 @@ pub struct TurnLimits {
     pub task_token_budget: Option<u64>,
     /// How many sub-agents one request's tree may run.
     pub spawn_family: crate::authority::SpawnFamilyLimits,
+    /// How deep a tree of sub-agents may grow (0 is the root agent).
+    pub max_depth: usize,
+    /// The most iterations a specialist may declare for a child.
+    pub max_iterations_cap: usize,
+    /// The longest timeout, in seconds, a specialist may declare for a child.
+    pub timeout_cap_secs: u64,
 }
 
 /// The registries and per-run handles a turn uses.
@@ -336,6 +342,27 @@ pub trait TurnHost:
     ) -> std::sync::Arc<dyn crate::spawn::ChildAgent>;
     /// The agent's tools (their task-end hooks run when a task ends).
     fn tools(&self) -> &[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>];
+    /// The root agent's full tool list, handed down so a task lead's
+    /// executors get the working tools it lacks; `None` when the agent's own
+    /// tools are the full list.
+    fn root_tools(&self) -> Option<&[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>]>;
+    /// The specialist registry this agent's children are made from.
+    fn specialists(&self) -> &std::sync::Arc<crate::specialists::SpecialistRegistry>;
+    /// The task board tool of a task lead for `goal_id`, bound to the goal
+    /// run `goal_run_id` when there is one.
+    fn goal_tasks_tool(
+        &self,
+        goal_id: &str,
+        goal_run_id: Option<String>,
+    ) -> std::sync::Arc<dyn aidaemon_tools::OutcomeTool>;
+    /// The tool an executor of the claimed `attempt` of `task_id` reports a
+    /// blocker with (`mandate`: the attempt works for a mandate).
+    fn report_blocker_tool(
+        &self,
+        task_id: &str,
+        attempt: aidaemon_work::traits::TaskAttempt,
+        mandate: bool,
+    ) -> std::sync::Arc<dyn aidaemon_tools::OutcomeTool>;
     /// The execution budget a test pins for this agent's turns.
     #[cfg(any(test, feature = "testing"))]
     fn execution_budget_override(&self) -> Option<crate::turn::execution_state::ExecutionBudget> {
