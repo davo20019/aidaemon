@@ -114,3 +114,84 @@ async fn the_first_reply_to_a_request_is_kept() {
     assert_eq!(log.forget_replies_before(11).await.unwrap(), 1);
     assert_eq!(log.remembered_reply(OWNER, "r1").await.unwrap(), None);
 }
+
+fn offer(id: &str, expires_at_ms: u64) -> aidaemon_store_sqlite::PairingRow {
+    aidaemon_store_sqlite::PairingRow {
+        offer_id: id.into(),
+        code_hash: "hash".into(),
+        origin_session: Some("telegram:synthetic-user-1".into()),
+        created_at_ms: 1,
+        expires_at_ms,
+        attempts: 0,
+        status: "open".into(),
+        device_name: None,
+        device_kind: None,
+        public_key: None,
+        scopes: None,
+        device_id: None,
+    }
+}
+
+#[tokio::test]
+async fn an_offer_pairs_one_device_and_wrong_codes_close_it() {
+    let log = log().await;
+    log.create_offer(&offer("o1", 100)).await.unwrap();
+    let redeem = |code: &'static str, now| {
+        let log = log.clone();
+        async move {
+            log.redeem_offer("o1", code, now, 3, "Pixel", "web", "pk", "observe")
+                .await
+                .unwrap()
+        }
+    };
+    assert!(!redeem("hash", 100).await, "expired");
+    assert!(redeem("hash", 50).await);
+    assert!(!redeem("hash", 50).await, "single use");
+    let row = log.offer("o1").await.unwrap().unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.device_name.as_deref(), Some("Pixel"));
+    assert!(log
+        .decide_offer("o1", "approved", Some("d1"))
+        .await
+        .unwrap());
+    assert!(!log.decide_offer("o1", "denied", None).await.unwrap());
+
+    log.create_offer(&offer("o2", 100)).await.unwrap();
+    for _ in 0..3 {
+        assert!(!log
+            .redeem_offer("o2", "wrong", 5, 3, "x", "web", "pk", "observe")
+            .await
+            .unwrap());
+    }
+    assert_eq!(log.offer("o2").await.unwrap().unwrap().status, "expired");
+    assert!(!log
+        .redeem_offer("o2", "hash", 5, 3, "x", "web", "pk", "observe")
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn devices_are_listed_and_revoked_once() {
+    let log = log().await;
+    log.add_device(&aidaemon_store_sqlite::DeviceRow {
+        device_id: "d1".into(),
+        name: "Synthetic Phone".into(),
+        kind: "web".into(),
+        public_key: "pk".into(),
+        scopes: "observe,chat,approve".into(),
+        risk_ceiling: None,
+        created_at_ms: 1,
+        last_seen_ms: None,
+        revoked_at_ms: None,
+    })
+    .await
+    .unwrap();
+    log.touch_device("d1", 7).await.unwrap();
+    assert_eq!(
+        log.device("d1").await.unwrap().unwrap().last_seen_ms,
+        Some(7)
+    );
+    assert!(log.revoke_device("d1", 9).await.unwrap());
+    assert!(!log.revoke_device("d1", 10).await.unwrap());
+    assert_eq!(log.devices().await.unwrap()[0].revoked_at_ms, Some(9));
+}

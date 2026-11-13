@@ -406,8 +406,14 @@ pub async fn run(
     )
     .await?;
     crate::startup::nodes::start(&config, pool.clone(), agent.clone(), hub.clone()).await?;
-    crate::startup::client_gateway::start(&config, pool.clone(), &channel_deps, hub.clone())
-        .await?;
+    crate::startup::client_gateway::start(
+        &config,
+        pool.clone(),
+        &channel_deps,
+        hub.clone(),
+        approval_tx.clone(),
+    )
+    .await?;
     // Give the agent its plan_store handle so the completion phase can read the
     // active checklist for soft verification + recap (deferred to avoid touching
     // the large Agent::new signature and all subagent spawn call sites).

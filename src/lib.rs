@@ -227,6 +227,7 @@ pub fn run() -> anyhow::Result<()> {
                 println!(
                     "  client-token          Mint the local Client Gateway token (revokes the old)"
                 );
+                println!("  pair                  Pair a phone or browser with the Client Gateway");
                 println!("  keychain set <key>    Store a secret in the OS keychain");
                 println!("  keychain get <key>    Retrieve a secret from the OS keychain");
                 println!("  keychain delete <key> Remove a secret from the OS keychain");
@@ -296,6 +297,9 @@ pub fn run() -> anyhow::Result<()> {
             }
             "client-token" => {
                 return handle_client_token_command(&args[2..], config_path.as_path());
+            }
+            "pair" => {
+                return handle_pair_command(&args[2..], config_path.as_path());
             }
             other => {
                 if let Some(agent) = normalize_terminal_agent_name(other) {
@@ -723,13 +727,7 @@ fn handle_client_token_command(args: &[String], config_path: &Path) -> anyhow::R
         None => {
             // Read only the gateway's table: loading the whole config would
             // resolve secrets from the keychain.
-            let settings = std::fs::read_to_string(config_path)
-                .ok()
-                .and_then(|text| text.parse::<toml::Table>().ok())
-                .and_then(|table| table.get("client_gateway").cloned())
-                .and_then(|value| value.try_into().ok())
-                .unwrap_or_default();
-            crate::startup::client_gateway::token_file(&settings)
+            crate::startup::client_gateway::token_file(&client_gateway_settings(config_path))
         }
     };
     let token = aidaemon_client_gateway::token::mint(&path)?;
@@ -740,6 +738,143 @@ fn handle_client_token_command(args: &[String], config_path: &Path) -> anyhow::R
         path.display()
     );
     Ok(())
+}
+
+/// The `[client_gateway]` table of the config file, read without resolving
+/// the rest (which would touch the keychain).
+fn client_gateway_settings(config_path: &Path) -> aidaemon_client_gateway::ClientGatewayConfig {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("client_gateway").cloned())
+        .and_then(|value| value.try_into().ok())
+        .unwrap_or_default()
+}
+
+/// `aidaemon pair [--token-file FILE]`: make a pairing offer on the running
+/// daemon's Client Gateway, show its code and a QR code of the web client's
+/// link, and confirm the device here when it redeems the offer. Uses the
+/// owner's local token (`AIDAEMON_CLIENT_TOKEN`, or `--token-file`).
+fn handle_pair_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
+    use aidaemon_client_protocol::{Enrollment, EnrollmentState, PairingDecision, PairingOffer};
+    let mut token = std::env::var("AIDAEMON_CLIENT_TOKEN").ok();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--token-file" => {
+                let Some(path) = args.get(i + 1) else {
+                    anyhow::bail!("Missing value for --token-file");
+                };
+                token = Some(std::fs::read_to_string(path)?.trim().to_string());
+                i += 2;
+            }
+            "-h" | "--help" => {
+                println!("Usage: aidaemon pair [--token-file FILE]");
+                println!();
+                println!("Pair a phone or browser with the Client Gateway. Needs the daemon");
+                println!("running with [client_gateway] enabled, and the local token from");
+                println!("`aidaemon client-token` (AIDAEMON_CLIENT_TOKEN or --token-file).");
+                return Ok(());
+            }
+            other => anyhow::bail!("Unknown pair option: {other}"),
+        }
+    }
+    let Some(token) = token.filter(|t| !t.trim().is_empty()) else {
+        anyhow::bail!(
+            "Give the local token: AIDAEMON_CLIENT_TOKEN=... or --token-file (mint one with \
+             `aidaemon client-token`)"
+        );
+    };
+    let settings = client_gateway_settings(config_path);
+    let address = settings.bind_addr()?;
+    let base = format!("http://{address}");
+    let http = reqwest::blocking::Client::new();
+    let response = http
+        .post(format!("{base}/client/v1/pairing/offers"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({}))
+        .send()
+        .map_err(|error| anyhow::anyhow!("Is the daemon running with the gateway on? {error}"))?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "The gateway refused the offer ({}): check the token",
+        response.status()
+    );
+    let offer: PairingOffer = response.json()?;
+    let link = format!(
+        "{}/client/v1/app#offer={}&code={}&fp={}",
+        settings.public_url(),
+        offer.offer_id,
+        offer.code,
+        offer.fingerprint
+    );
+    if let Ok(code) = qrcode::QrCode::new(link.as_bytes()) {
+        println!(
+            "{}",
+            code.render::<qrcode::render::unicode::Dense1x2>()
+                .quiet_zone(true)
+                .build()
+        );
+    }
+    println!("Open {link}");
+    println!(
+        "or enter the code {} on the device (valid 10 minutes).",
+        offer.code
+    );
+    println!("Daemon fingerprint: {}", offer.fingerprint);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let enrollment: Enrollment = http
+            .get(format!(
+                "{base}/client/v1/pairing/offers/{}",
+                offer.offer_id
+            ))
+            .bearer_auth(&token)
+            .send()?
+            .json()?;
+        match enrollment.state {
+            EnrollmentState::Open => continue,
+            EnrollmentState::Pending => {
+                let scopes: Vec<String> = enrollment
+                    .scopes
+                    .iter()
+                    .map(|s| format!("{s:?}").to_lowercase())
+                    .collect();
+                let approve = dialoguer::Confirm::new()
+                    .with_prompt(format!(
+                        "Pair “{}” ({:?}) with access to: {}?",
+                        enrollment.device_name.unwrap_or_default(),
+                        enrollment
+                            .device_kind
+                            .unwrap_or(aidaemon_client_protocol::ClientKind::Unknown),
+                        scopes.join(", ")
+                    ))
+                    .default(false)
+                    .interact()?;
+                let settled: Enrollment = http
+                    .post(format!(
+                        "{base}/client/v1/pairing/offers/{}/decision",
+                        offer.offer_id
+                    ))
+                    .bearer_auth(&token)
+                    .json(&PairingDecision { approve })
+                    .send()?
+                    .json()?;
+                match settled.device_id {
+                    Some(device_id) => println!("Paired: {device_id}"),
+                    None => println!("Not paired."),
+                }
+                return Ok(());
+            }
+            EnrollmentState::Expired => {
+                anyhow::bail!("The offer expired; run `aidaemon pair` again")
+            }
+            other => {
+                println!("Pairing ended: {other:?}");
+                return Ok(());
+            }
+        }
+    }
 }
 
 /// `aidaemon auth …` — manage subscription-based model logins.

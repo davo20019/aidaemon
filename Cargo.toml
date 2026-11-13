@@ -92,6 +92,8 @@ strum = { version = "0.28", features = ["derive"] }
 futures = "0.3"
 axum = "0.8"
 dialoguer = "0.12"
+# The pairing code as a QR code in the terminal (`aidaemon pair`).
+qrcode = { version = "0.14", default-features = false }
 shellexpand = "3"
 dirs = "7"
 fastembed = { version = "7", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
@@ -206,8 +208,9 @@ serial_test = "4"
 # `test-util` enables tokio's pausable fake clock (`#[tokio::test(start_paused = true)]`,
 # `tokio::time::advance`) used by the deterministic bounded-wait browser tests.
 tokio = { version = "1", features = ["test-util"] }
-# A real WebSocket client for the Client Gateway's tests.
+# A real WebSocket client for the Client Gateway's tests, and a device key.
 tokio-tungstenite = "0.30"
+p256 = { version = "0.14", features = ["ecdsa"] }
 
 # libsqlite3-sys is never named in code: the `encryption` feature turns on its
 # bundled SQLCipher build under sqlx.

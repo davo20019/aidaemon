@@ -457,6 +457,133 @@ fn the_http_events_page_matches_its_fixture() {
     );
 }
 
+fn http_samples() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "http_offer_request",
+            serde_json::to_value(OfferRequest {
+                confirm_in_session: Some("telegram:synthetic-user-1".into()),
+            })
+            .unwrap(),
+        ),
+        (
+            "http_pairing_offer",
+            serde_json::to_value(PairingOffer {
+                offer_id: "of-1".into(),
+                code: "K7Q2-9FZD".into(),
+                expires_at_ms: 1_767_226_200_000,
+                link: "aidaemon-pair:?gateway=http%3A%2F%2F127.0.0.1%3A8788&offer=of-1&code=K7Q2-9FZD&fp=3b1f".into(),
+                fingerprint: "3b1f".into(),
+            })
+            .unwrap(),
+        ),
+        (
+            "http_redeem_request",
+            serde_json::to_value(RedeemRequest {
+                offer_id: "of-1".into(),
+                code: "K7Q2-9FZD".into(),
+                device_name: "Synthetic Phone".into(),
+                device_kind: ClientKind::Web,
+                public_key: "BOr9...".into(),
+                scopes: vec![Scope::Observe, Scope::Approve],
+            })
+            .unwrap(),
+        ),
+        (
+            "http_enrollment",
+            serde_json::to_value(Enrollment {
+                offer_id: "of-1".into(),
+                state: EnrollmentState::Approved,
+                device_id: Some("dv-1".into()),
+                device_name: Some("Synthetic Phone".into()),
+                device_kind: Some(ClientKind::Web),
+                scopes: ALL_SCOPES.to_vec(),
+                fingerprint: "3b1f".into(),
+            })
+            .unwrap(),
+        ),
+        (
+            "http_pairing_decision",
+            serde_json::to_value(PairingDecision { approve: true }).unwrap(),
+        ),
+        (
+            "http_challenge_request",
+            serde_json::to_value(ChallengeRequest {
+                device_id: "dv-1".into(),
+            })
+            .unwrap(),
+        ),
+        (
+            "http_challenge",
+            serde_json::to_value(Challenge {
+                challenge_id: "ch-1".into(),
+                nonce: "n0nce".into(),
+                expires_at_ms: 1_767_225_660_000,
+            })
+            .unwrap(),
+        ),
+        (
+            "http_session_request",
+            serde_json::to_value(SessionRequest {
+                challenge_id: "ch-1".into(),
+                signature: "c2ln...".into(),
+            })
+            .unwrap(),
+        ),
+        (
+            "http_access_grant",
+            serde_json::to_value(AccessGrant {
+                access_token: "acs_synthetic".into(),
+                expires_at_ms: 1_767_226_500_000,
+                device_id: "dv-1".into(),
+                scopes: ALL_SCOPES.to_vec(),
+                risk_ceiling: Some(Risk::Medium),
+            })
+            .unwrap(),
+        ),
+        (
+            "http_devices",
+            serde_json::to_value(vec![DeviceInfo {
+                device_id: "dv-1".into(),
+                name: "Synthetic Phone".into(),
+                kind: ClientKind::Web,
+                scopes: ALL_SCOPES.to_vec(),
+                risk_ceiling: None,
+                created_at_ms: 1_767_225_600_000,
+                last_seen_ms: Some(1_767_225_700_000),
+                revoked: false,
+            }])
+            .unwrap(),
+        ),
+    ]
+}
+
+fn roundtrip_http(name: &str, text: &str) -> Value {
+    fn again<T: serde::de::DeserializeOwned + serde::Serialize>(text: &str) -> Value {
+        serde_json::to_value(serde_json::from_str::<T>(text).unwrap()).unwrap()
+    }
+    match name {
+        "http_offer_request" => again::<OfferRequest>(text),
+        "http_pairing_offer" => again::<PairingOffer>(text),
+        "http_redeem_request" => again::<RedeemRequest>(text),
+        "http_enrollment" => again::<Enrollment>(text),
+        "http_pairing_decision" => again::<PairingDecision>(text),
+        "http_challenge_request" => again::<ChallengeRequest>(text),
+        "http_challenge" => again::<Challenge>(text),
+        "http_session_request" => again::<SessionRequest>(text),
+        "http_access_grant" => again::<AccessGrant>(text),
+        "http_devices" => again::<Vec<DeviceInfo>>(text),
+        other => panic!("no type for {other}"),
+    }
+}
+
+#[test]
+fn every_pairing_type_matches_its_fixture() {
+    for (name, value) in http_samples() {
+        check(name, value, |text| roundtrip_http(name, text));
+    }
+}
+
 /// Every fixture on disk belongs to a sample, so a renamed variant cannot
 /// leave a stale file behind.
 #[test]
@@ -464,6 +591,7 @@ fn no_fixture_is_orphaned() {
     let mut known: Vec<String> = client_samples().iter().map(client_name).collect();
     known.extend(server_samples().iter().map(server_name));
     known.push("http_events_page".into());
+    known.extend(http_samples().into_iter().map(|(name, _)| name.to_string()));
     for entry in std::fs::read_dir(fixtures()).unwrap() {
         let name = entry.unwrap().file_name().to_string_lossy().into_owned();
         let stem = name.trim_end_matches(".golden");

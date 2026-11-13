@@ -1,5 +1,45 @@
 {
   "$defs": {
+    "AccessGrant": {
+      "description": "A short-lived access token for one device.",
+      "properties": {
+        "access_token": {
+          "type": "string"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "expires_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "risk_ceiling": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Risk"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The highest risk this device may approve; `None`: no limit."
+        },
+        "scopes": {
+          "items": {
+            "$ref": "#/$defs/Scope"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "access_token",
+        "expires_at_ms",
+        "device_id",
+        "scopes"
+      ],
+      "type": "object"
+    },
     "Approval": {
       "description": "A question the owner must answer before work goes on. Pending until\nexactly one of: answered, expired (nobody answered in time: the call is\nnot run, and it is not a refusal) or withdrawn (its turn stopped, or the\ndaemon restarted).",
       "properties": {
@@ -147,10 +187,6 @@
     "ApprovalKind": {
       "oneOf": [
         {
-          "enum": [],
-          "type": "string"
-        },
-        {
           "const": "command",
           "description": "Allow a call (a command, a request, a tool use).",
           "type": "string"
@@ -261,10 +297,6 @@
       "description": "An optional feature, named instead of a version bump. A client lists the\nones it wants in `hello`; the server lists the ones it offers in\n`welcome`, and only those it offers apply.",
       "oneOf": [
         {
-          "enum": [],
-          "type": "string"
-        },
-        {
           "const": "compact",
           "description": "Short frames: an approval's summary without its detail or card, no\n`turn_delta` or `turn_status`. The default for a watch.",
           "type": "string"
@@ -370,6 +402,39 @@
           "type": "object"
         }
       ]
+    },
+    "Challenge": {
+      "properties": {
+        "challenge_id": {
+          "type": "string"
+        },
+        "expires_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "nonce": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "challenge_id",
+        "nonce",
+        "expires_at_ms"
+      ],
+      "type": "object"
+    },
+    "ChallengeRequest": {
+      "description": "`POST /client/v1/sessions/challenge`.",
+      "properties": {
+        "device_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "device_id"
+      ],
+      "type": "object"
     },
     "ClientFrame": {
       "description": "A frame from a client to the daemon.",
@@ -889,6 +954,132 @@
         }
       ]
     },
+    "DeviceInfo": {
+      "description": "A paired device (owner only: `GET /client/v1/devices`).",
+      "properties": {
+        "created_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ClientKind"
+        },
+        "last_seen_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "revoked": {
+          "default": false,
+          "type": "boolean"
+        },
+        "risk_ceiling": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Risk"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scopes": {
+          "items": {
+            "$ref": "#/$defs/Scope"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "device_id",
+        "name",
+        "kind",
+        "scopes",
+        "created_at_ms"
+      ],
+      "type": "object"
+    },
+    "Enrollment": {
+      "description": "Where a pairing stands (`GET /client/v1/enrollments/{offer_id}`, and\nthe owner's `GET /client/v1/pairing/offers/{offer_id}`).",
+      "properties": {
+        "device_id": {
+          "description": "Once approved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "device_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "device_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "offer_id": {
+          "type": "string"
+        },
+        "scopes": {
+          "items": {
+            "$ref": "#/$defs/Scope"
+          },
+          "type": "array"
+        },
+        "state": {
+          "$ref": "#/$defs/EnrollmentState"
+        }
+      },
+      "required": [
+        "offer_id",
+        "state",
+        "fingerprint"
+      ],
+      "type": "object"
+    },
+    "EnrollmentState": {
+      "oneOf": [
+        {
+          "enum": [
+            "approved",
+            "denied",
+            "expired"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "open",
+          "description": "Not redeemed yet.",
+          "type": "string"
+        },
+        {
+          "const": "pending",
+          "description": "Redeemed; waiting for the owner.",
+          "type": "string"
+        }
+      ]
+    },
     "ErrorCode": {
       "description": "The closed set of error codes.",
       "oneOf": [
@@ -1397,6 +1588,19 @@
       ],
       "type": "object"
     },
+    "OfferRequest": {
+      "description": "The owner's offer to pair a device (owner only:\n`POST /client/v1/pairing/offers`).",
+      "properties": {
+        "confirm_in_session": {
+          "description": "The chat where the owner confirms the device; `None` to confirm\nwith `POST /client/v1/pairing/offers/{id}/decision`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "OwnerInfo": {
       "description": "The daemon's owner, as the gateway knows them.",
       "properties": {
@@ -1407,6 +1611,51 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "PairingDecision": {
+      "description": "The owner's answer to a pending pairing made without a chat.",
+      "properties": {
+        "approve": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "approve"
+      ],
+      "type": "object"
+    },
+    "PairingOffer": {
+      "description": "A single-use pairing offer.",
+      "properties": {
+        "code": {
+          "description": "What the owner types on the device (\"K7Q2-9FZD\").",
+          "type": "string"
+        },
+        "expires_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fingerprint": {
+          "description": "Identifies this daemon; the device checks the redeem reply matches.",
+          "type": "string"
+        },
+        "link": {
+          "description": "The same as a link, for a QR code:\n`aidaemon-pair:?gateway=<url>&offer=<id>&code=<code>&fp=<fingerprint>`.",
+          "type": "string"
+        },
+        "offer_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "offer_id",
+        "code",
+        "expires_at_ms",
+        "link",
+        "fingerprint"
+      ],
       "type": "object"
     },
     "ProtocolError": {
@@ -1451,6 +1700,43 @@
       ],
       "type": "object"
     },
+    "RedeemRequest": {
+      "description": "`POST /client/v1/enrollments/redeem`.",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "device_kind": {
+          "$ref": "#/$defs/ClientKind"
+        },
+        "device_name": {
+          "description": "The device as the owner will see it (\"Pixel 9\").",
+          "type": "string"
+        },
+        "offer_id": {
+          "type": "string"
+        },
+        "public_key": {
+          "description": "The device's P-256 public key, SEC1 uncompressed, base64url.",
+          "type": "string"
+        },
+        "scopes": {
+          "description": "The scopes asked for; empty: all of them.",
+          "items": {
+            "$ref": "#/$defs/Scope"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "offer_id",
+        "code",
+        "device_name",
+        "device_kind",
+        "public_key"
+      ],
+      "type": "object"
+    },
     "ResolvedBy": {
       "description": "Who answered an approval.",
       "properties": {
@@ -1480,6 +1766,26 @@
         "critical"
       ],
       "type": "string"
+    },
+    "Scope": {
+      "description": "What a device's token may do.",
+      "oneOf": [
+        {
+          "const": "observe",
+          "description": "Read sessions, history, events, tasks and approvals.",
+          "type": "string"
+        },
+        {
+          "const": "chat",
+          "description": "Send messages, stop and cancel work, run commands.",
+          "type": "string"
+        },
+        {
+          "const": "approve",
+          "description": "Answer approvals (within the device's risk ceiling).",
+          "type": "string"
+        }
+      ]
     },
     "ServerFrame": {
       "description": "A frame from the daemon to a client.",
@@ -1634,6 +1940,23 @@
           "type": "object"
         }
       ]
+    },
+    "SessionRequest": {
+      "description": "`POST /client/v1/sessions`.",
+      "properties": {
+        "challenge_id": {
+          "type": "string"
+        },
+        "signature": {
+          "description": "The signature as `r || s` (64 bytes), base64url.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "challenge_id",
+        "signature"
+      ],
+      "type": "object"
     },
     "SessionSummary": {
       "properties": {

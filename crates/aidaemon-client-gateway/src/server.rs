@@ -2,15 +2,19 @@
 //! mode for clients that cannot hold a socket (watches, scripts):
 //! `POST /client/v1/commands` and the long-poll `GET /client/v1/events`.
 
+// Handlers return a refusal as the response itself (`Result<_, Response>`).
+#![allow(clippy::result_large_err)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use aidaemon_client_protocol::{
-    Capability, ClientFrame, ClientKind, ErrorCode, Event, EventsPage, ProtocolError,
-    ProtocolVersion, ServerFrame,
+    Capability, ChallengeRequest, ClientFrame, ClientKind, ErrorCode, Event, EventsPage,
+    OfferRequest, PairingDecision, ProtocolError, ProtocolVersion, RedeemRequest, Scope,
+    ServerFrame, SessionRequest,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -19,6 +23,7 @@ use serde::Deserialize;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info};
 
+use crate::pairing::Principal;
 use crate::{Caller, ClientGateway};
 
 /// The largest frame or request body accepted.
@@ -39,6 +44,21 @@ pub fn router(gateway: Arc<ClientGateway>) -> Router {
         .route("/client/v1/ws", get(websocket))
         .route("/client/v1/commands", post(http_command))
         .route("/client/v1/events", get(http_events))
+        .route("/client/v1/pairing/offers", post(create_offer))
+        .route("/client/v1/pairing/offers/{offer_id}", get(offer_status))
+        .route(
+            "/client/v1/pairing/offers/{offer_id}/decision",
+            post(decide_offer),
+        )
+        .route("/client/v1/enrollments/redeem", post(redeem))
+        .route("/client/v1/enrollments/{offer_id}", get(enrollment))
+        .route("/client/v1/sessions/challenge", post(challenge))
+        .route("/client/v1/sessions", post(open_session))
+        .route("/client/v1/devices", get(devices))
+        .route("/client/v1/devices/{device_id}/revoke", post(revoke_device))
+        .route("/client/v1/app", get(web_page))
+        .route("/client/v1/app/", get(web_page))
+        .route("/client/v1/app/app.js", get(web_script))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .with_state(gateway)
 }
@@ -61,8 +81,14 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .map(str::trim)
 }
 
-fn authorized(gateway: &ClientGateway, token: Option<&str>) -> bool {
-    token.is_some_and(|token| crate::token::verify(&gateway.token_file, token))
+fn principal(gateway: &ClientGateway, token: Option<&str>) -> Option<Principal> {
+    gateway.principal(token?)
+}
+
+/// The caller with this token, or the response refusing it.
+fn authenticate(gateway: &ClientGateway, headers: &HeaderMap) -> Result<Principal, Response> {
+    principal(gateway, bearer(headers))
+        .ok_or_else(|| error_response(ErrorCode::Unauthorized, "A valid client token is required"))
 }
 
 fn status_of(code: ErrorCode) -> StatusCode {
@@ -122,7 +148,7 @@ fn fit(frame: &ServerFrame, compact: bool) -> Option<ServerFrame> {
 /// The caller an HTTP request names: `X-Aidaemon-Client` (its kind),
 /// `X-Aidaemon-Device` and `X-Aidaemon-Capabilities` (comma-separated).
 /// A watch is compact unless it says otherwise.
-fn http_caller(headers: &HeaderMap) -> Caller {
+fn http_caller(headers: &HeaderMap, principal: Principal) -> Caller {
     let header = |name: &str| {
         headers
             .get(name)
@@ -142,19 +168,198 @@ fn http_caller(headers: &HeaderMap) -> Caller {
                 .collect()
         })
         .unwrap_or_default();
-    caller_of(kind, header("x-aidaemon-device"), &capabilities)
+    caller_of(kind, header("x-aidaemon-device"), &capabilities, principal)
 }
 
 fn caller_of(
     kind: Option<ClientKind>,
     device: Option<String>,
     capabilities: &[Capability],
+    principal: Principal,
 ) -> Caller {
     Caller {
         compact: capabilities.contains(&Capability::Compact) || kind == Some(ClientKind::Watch),
         kind,
         device,
+        principal,
     }
+}
+
+fn refusal(error: ProtocolError) -> Response {
+    (
+        status_of(error.code),
+        Json(ServerFrame::Error {
+            request_id: None,
+            error,
+        }),
+    )
+        .into_response()
+}
+
+fn reply<T: serde::Serialize>(result: Result<T, ProtocolError>) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => refusal(error),
+    }
+}
+
+/// Only the owner's local token may pair and revoke devices.
+fn owner_only(gateway: &ClientGateway, headers: &HeaderMap) -> Result<(), Response> {
+    let principal = authenticate(gateway, headers)?;
+    if principal.is_owner() {
+        Ok(())
+    } else {
+        Err(error_response(
+            ErrorCode::Forbidden,
+            "Only the owner's local token may manage devices",
+        ))
+    }
+}
+
+fn body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Response> {
+    serde_json::from_slice(bytes)
+        .map_err(|error| error_response(ErrorCode::Invalid, &error.to_string()))
+}
+
+async fn create_offer(
+    State(gateway): State<Arc<ClientGateway>>,
+    headers: HeaderMap,
+    bytes: axum::body::Bytes,
+) -> Response {
+    if let Err(refused) = owner_only(&gateway, &headers) {
+        return refused;
+    }
+    let request: OfferRequest = if bytes.is_empty() {
+        OfferRequest::default()
+    } else {
+        match body(&bytes) {
+            Ok(request) => request,
+            Err(refused) => return refused,
+        }
+    };
+    reply(gateway.pairing.offer(request.confirm_in_session).await)
+}
+
+async fn offer_status(
+    State(gateway): State<Arc<ClientGateway>>,
+    headers: HeaderMap,
+    Path(offer_id): Path<String>,
+) -> Response {
+    if let Err(refused) = owner_only(&gateway, &headers) {
+        return refused;
+    }
+    reply(gateway.pairing.enrollment(&offer_id).await)
+}
+
+async fn decide_offer(
+    State(gateway): State<Arc<ClientGateway>>,
+    headers: HeaderMap,
+    Path(offer_id): Path<String>,
+    bytes: axum::body::Bytes,
+) -> Response {
+    if let Err(refused) = owner_only(&gateway, &headers) {
+        return refused;
+    }
+    let decision: PairingDecision = match body(&bytes) {
+        Ok(decision) => decision,
+        Err(refused) => return refused,
+    };
+    reply(gateway.pairing.decide(&offer_id, decision.approve).await)
+}
+
+async fn redeem(State(gateway): State<Arc<ClientGateway>>, bytes: axum::body::Bytes) -> Response {
+    let request: RedeemRequest = match body(&bytes) {
+        Ok(request) => request,
+        Err(refused) => return refused,
+    };
+    match gateway.pairing.redeem(request).await {
+        Ok(enrollment) => (StatusCode::ACCEPTED, Json(enrollment)).into_response(),
+        Err(error) => refusal(error),
+    }
+}
+
+async fn enrollment(
+    State(gateway): State<Arc<ClientGateway>>,
+    Path(offer_id): Path<String>,
+) -> Response {
+    reply(gateway.pairing.enrollment(&offer_id).await)
+}
+
+async fn challenge(
+    State(gateway): State<Arc<ClientGateway>>,
+    bytes: axum::body::Bytes,
+) -> Response {
+    let request: ChallengeRequest = match body(&bytes) {
+        Ok(request) => request,
+        Err(refused) => return refused,
+    };
+    reply(gateway.pairing.challenge(&request.device_id).await)
+}
+
+async fn open_session(
+    State(gateway): State<Arc<ClientGateway>>,
+    bytes: axum::body::Bytes,
+) -> Response {
+    let request: SessionRequest = match body(&bytes) {
+        Ok(request) => request,
+        Err(refused) => return refused,
+    };
+    reply(
+        gateway
+            .pairing
+            .open_session(&request.challenge_id, &request.signature)
+            .await,
+    )
+}
+
+async fn devices(State(gateway): State<Arc<ClientGateway>>, headers: HeaderMap) -> Response {
+    if let Err(refused) = owner_only(&gateway, &headers) {
+        return refused;
+    }
+    reply(gateway.pairing.devices().await)
+}
+
+async fn revoke_device(
+    State(gateway): State<Arc<ClientGateway>>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Response {
+    if let Err(refused) = owner_only(&gateway, &headers) {
+        return refused;
+    }
+    if let Err(error) = gateway.pairing.revoke(&device_id).await {
+        return refusal(error);
+    }
+    reply(gateway.pairing.devices().await)
+}
+
+/// The web client: one page and its script, built from `clients/web`.
+const WEB_PAGE: &str = include_str!("../web/index.html");
+const WEB_SCRIPT: &str = include_str!("../web/app.js");
+
+async fn web_page() -> Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "default-src 'self'; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline'",
+            ),
+        ],
+        WEB_PAGE,
+    )
+        .into_response()
+}
+
+async fn web_script() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/javascript; charset=utf-8",
+        )],
+        WEB_SCRIPT,
+    )
+        .into_response()
 }
 
 async fn http_command(
@@ -162,9 +367,10 @@ async fn http_command(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if !authorized(&gateway, bearer(&headers)) {
-        return error_response(ErrorCode::Unauthorized, "A valid client token is required");
-    }
+    let principal = match authenticate(&gateway, &headers) {
+        Ok(principal) => principal,
+        Err(refused) => return refused,
+    };
     let frame: ClientFrame = match serde_json::from_slice(&body) {
         Ok(frame) => frame,
         Err(error) => return error_response(ErrorCode::Invalid, &error.to_string()),
@@ -176,7 +382,7 @@ async fn http_command(
     else {
         return error_response(ErrorCode::Invalid, "Send a command frame");
     };
-    let caller = http_caller(&headers);
+    let caller = http_caller(&headers, principal);
     let reply = gateway.command(&request_id, command, &caller).await;
     let reply = fit(&reply, caller.compact).unwrap_or(reply);
     Json(reply).into_response()
@@ -202,10 +408,14 @@ async fn http_events(
     headers: HeaderMap,
     Query(query): Query<EventsQuery>,
 ) -> Response {
-    if !authorized(&gateway, bearer(&headers)) {
-        return error_response(ErrorCode::Unauthorized, "A valid client token is required");
+    let principal = match authenticate(&gateway, &headers) {
+        Ok(principal) => principal,
+        Err(refused) => return refused,
+    };
+    if !principal.may(Scope::Observe) {
+        return error_response(ErrorCode::Forbidden, "This device may not read events");
     }
-    let caller = http_caller(&headers);
+    let caller = http_caller(&headers, principal);
     let limit = query.limit.clamp(1, REPLAY_PAGE);
     let since = match query.since {
         Some(since) if gateway.bus.can_resume(since).await => since,
@@ -261,15 +471,19 @@ async fn websocket(
 ) -> Response {
     // A token in the header is checked now; without one, `hello` must
     // carry it.
-    let header_token = bearer(&headers).map(str::to_string);
-    if header_token.is_some() && !authorized(&gateway, header_token.as_deref()) {
-        return error_response(ErrorCode::Unauthorized, "A valid client token is required");
-    }
-    let authorized_by_header = header_token.is_some();
+    let by_header = match bearer(&headers) {
+        Some(token) => match principal(&gateway, Some(token)) {
+            Some(principal) => Some(principal),
+            None => {
+                return error_response(ErrorCode::Unauthorized, "A valid client token is required")
+            }
+        },
+        None => None,
+    };
     upgrade
         .max_message_size(MAX_BODY)
         .on_upgrade(move |socket| async move {
-            if let Err(error) = run_socket(gateway, socket, authorized_by_header).await {
+            if let Err(error) = run_socket(gateway, socket, by_header).await {
                 debug!(%error, "Client socket closed");
             }
         })
@@ -297,7 +511,7 @@ async fn refuse(socket: &mut WebSocket, code: ErrorCode, message: &str) -> anyho
 async fn run_socket(
     gateway: Arc<ClientGateway>,
     mut socket: WebSocket,
-    authorized_by_header: bool,
+    by_header: Option<Principal>,
 ) -> anyhow::Result<()> {
     let hello = match tokio::time::timeout(HELLO_WITHIN, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str::<ClientFrame>(&text).ok(),
@@ -313,11 +527,19 @@ async fn run_socket(
     else {
         return refuse(&mut socket, ErrorCode::Invalid, "Say hello first").await;
     };
-    if !authorized_by_header && !authorized(&gateway, token.as_deref()) {
+    let Some(principal) = by_header.or_else(|| principal(&gateway, token.as_deref())) else {
         return refuse(
             &mut socket,
             ErrorCode::Unauthorized,
             "A valid client token is required",
+        )
+        .await;
+    };
+    if !principal.may(Scope::Observe) {
+        return refuse(
+            &mut socket,
+            ErrorCode::Forbidden,
+            "This device may not read events",
         )
         .await;
     }
@@ -332,7 +554,13 @@ async fn run_socket(
         )
         .await;
     }
-    let caller = caller_of(Some(client.kind), client.device.clone(), &capabilities);
+    let revoked = principal.revoked.clone();
+    let caller = caller_of(
+        Some(client.kind),
+        client.device.clone(),
+        &capabilities,
+        principal,
+    );
 
     // Subscribe before reading the log, so nothing falls between them.
     let mut live = gateway.bus.subscribe();
@@ -432,6 +660,14 @@ async fn run_socket(
                 let _ = socket.send(Message::Close(None)).await;
                 return Ok(());
             }
+            _ = revoked.cancelled() => {
+                send(&mut socket, &ServerFrame::Error {
+                    request_id: None,
+                    error: ProtocolError::new(ErrorCode::Unauthorized, "This device was revoked"),
+                }).await?;
+                let _ = socket.send(Message::Close(None)).await;
+                return Ok(());
+            }
         }
     }
 }
@@ -522,13 +758,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-aidaemon-client", "watch".parse().unwrap());
         headers.insert("x-aidaemon-device", "Synthetic Watch".parse().unwrap());
-        let caller = http_caller(&headers);
+        let caller = http_caller(&headers, Principal::owner());
         assert!(caller.compact);
         assert_eq!(caller.kind, Some(ClientKind::Watch));
         assert_eq!(caller.device.as_deref(), Some("Synthetic Watch"));
         let mut headers = HeaderMap::new();
         headers.insert("x-aidaemon-capabilities", "compact, goals".parse().unwrap());
-        assert!(http_caller(&headers).compact);
-        assert!(!http_caller(&HeaderMap::new()).compact);
+        assert!(http_caller(&headers, Principal::owner()).compact);
+        assert!(!http_caller(&HeaderMap::new(), Principal::owner()).compact);
     }
 }

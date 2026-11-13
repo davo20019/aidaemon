@@ -31,6 +31,10 @@ pub struct ClientGatewayConfig {
     /// The highest risk a watch may approve; above it a watch may only deny.
     #[serde(default = "default_watch_risk_ceiling")]
     pub watch_risk_ceiling: Risk,
+    /// The address paired devices reach the gateway at (an owner tunnel's
+    /// HTTPS URL), put in pairing links. Empty: the loopback address.
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 fn default_bind() -> String {
@@ -59,11 +63,23 @@ impl Default for ClientGatewayConfig {
             retention_days: default_retention_days(),
             max_events: default_max_events(),
             watch_risk_ceiling: default_watch_risk_ceiling(),
+            public_url: None,
         }
     }
 }
 
 impl ClientGatewayConfig {
+    /// Where devices reach the gateway: `public_url`, else the bind address.
+    pub fn public_url(&self) -> String {
+        match self.public_url.as_deref().map(str::trim) {
+            Some(url) if !url.is_empty() => url.trim_end_matches('/').to_string(),
+            _ => match self.bind.parse::<IpAddr>() {
+                Ok(IpAddr::V6(ip)) => format!("http://[{ip}]:{}", self.port),
+                _ => format!("http://{}:{}", self.bind, self.port),
+            },
+        }
+    }
+
     /// The address to bind, refused unless it is loopback: this gateway
     /// does not serve TLS, and a client token can approve a shell command.
     pub fn bind_addr(&self) -> anyhow::Result<std::net::SocketAddr> {

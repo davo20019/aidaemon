@@ -49,7 +49,7 @@ mod migrations;
 #[cfg(feature = "channels")]
 pub use approvals::SqliteApprovalStore;
 #[cfg(feature = "client-events")]
-pub use client_events::{ClientEventRow, SqliteClientEventLog};
+pub use client_events::{ClientEventRow, DeviceRow, PairingRow, SqliteClientEventLog};
 
 use std::path::Path;
 use std::str::FromStr;

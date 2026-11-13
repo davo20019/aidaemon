@@ -1,0 +1,13 @@
+{
+  "device_id": "dv-1",
+  "device_kind": "web",
+  "device_name": "Synthetic Phone",
+  "fingerprint": "3b1f",
+  "offer_id": "of-1",
+  "scopes": [
+    "observe",
+    "chat",
+    "approve"
+  ],
+  "state": "approved"
+}

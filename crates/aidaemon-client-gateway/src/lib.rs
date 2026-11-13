@@ -27,6 +27,7 @@ mod approvals;
 mod bus;
 mod config;
 mod observer;
+pub mod pairing;
 mod server;
 pub mod token;
 
@@ -40,8 +41,8 @@ use aidaemon_channels::stop::{self, StopRequest};
 use aidaemon_channels::turns::{Turn, TurnDeps, TurnRunner};
 use aidaemon_client_protocol::{
     ApprovalDecision, ClientKind, Command, CommandResult, ErrorCode, Event, Glance, HistoryMessage,
-    LastReply, OwnerInfo, ProtocolError, Risk, ServerFrame, SessionSummary, Snapshot, TaskState,
-    TaskSummary,
+    LastReply, OwnerInfo, ProtocolError, Risk, Scope, ServerFrame, SessionSummary, Snapshot,
+    TaskState, TaskSummary,
 };
 use aidaemon_store_sqlite::SqliteClientEventLog;
 use aidaemon_tools::semantics::UserRole;
@@ -53,6 +54,7 @@ pub use approvals::Approvals;
 pub use bus::{EventBus, OWNER};
 pub use config::ClientGatewayConfig;
 pub use observer::{AppChannel, AppSurface, GatewayObserver, Ids};
+pub use pairing::{Pairing, Principal};
 pub use server::{router, serve};
 
 /// The hub channel and turn platform name of the app.
@@ -103,14 +105,32 @@ pub struct GatewayDeps {
     pub config: ClientGatewayConfig,
     /// The local token's hash.
     pub token_file: PathBuf,
+    /// Where pairing confirmations go: the hub's approval queue (the same
+    /// one the agent's cards use). `None`: pairings are confirmed only
+    /// through the owner's decision call.
+    pub approvals: Option<mpsc::Sender<aidaemon_channels::hub::ApprovalRequest>>,
 }
 
 /// Who sent a command.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Caller {
     pub kind: Option<ClientKind>,
     pub device: Option<String>,
     pub compact: bool,
+    /// The token's owner: the local owner or a paired device.
+    pub principal: Principal,
+}
+
+impl Caller {
+    /// The owner at the machine, with nothing else known.
+    pub fn owner() -> Self {
+        Self {
+            kind: None,
+            device: None,
+            compact: false,
+            principal: Principal::owner(),
+        }
+    }
 }
 
 /// The running gateway.
@@ -125,6 +145,7 @@ pub struct ClientGateway {
     active: Arc<Mutex<HashSet<String>>>,
     pub(crate) config: ClientGatewayConfig,
     pub(crate) token_file: PathBuf,
+    pub(crate) pairing: Arc<Pairing>,
     /// Requests being handled now, so a retry waits for the first answer.
     in_flight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -178,7 +199,14 @@ impl ClientGateway {
             }) as Arc<dyn HubChannel>)
             .await;
 
+        let pairing = Arc::new(Pairing::new(
+            bus.log().clone(),
+            deps.approvals,
+            deps.config.public_url(),
+            deps.config.watch_risk_ceiling,
+        ));
         let gateway = Arc::new(Self {
+            pairing,
             bus,
             publisher,
             approvals,
@@ -232,6 +260,24 @@ impl ClientGateway {
 
     pub fn owner(&self) -> OwnerInfo {
         self.host.owner()
+    }
+
+    pub fn pairing(&self) -> &Arc<Pairing> {
+        &self.pairing
+    }
+
+    /// Where devices reach the gateway.
+    pub fn public_url(&self) -> String {
+        self.config.public_url()
+    }
+
+    /// Who `token` belongs to: the owner's local token, or a paired
+    /// device's live access token.
+    pub fn principal(&self, token: &str) -> Option<Principal> {
+        if crate::token::verify(&self.token_file, token) {
+            return Some(Principal::owner());
+        }
+        self.pairing.principal(token)
     }
 
     /// Answer `command` once per `request_id`: a retry gets the first reply.
@@ -314,6 +360,27 @@ impl ClientGateway {
         command: Command,
         caller: &Caller,
     ) -> Result<CommandResult, ProtocolError> {
+        let needs = match &command {
+            Command::SendMessage { .. }
+            | Command::StopTurn { .. }
+            | Command::CancelTask { .. }
+            | Command::ClearSession { .. }
+            | Command::RunSlash { .. } => Some(Scope::Chat),
+            Command::ResolveApproval { .. } => Some(Scope::Approve),
+            Command::ListSessions { .. }
+            | Command::GetHistory { .. }
+            | Command::GetGlance
+            | Command::GetSnapshot => Some(Scope::Observe),
+            Command::Unknown => None,
+        };
+        if let Some(scope) = needs {
+            if !caller.principal.may(scope) {
+                return Err(ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    format!("This device may not {scope:?}"),
+                ));
+            }
+        }
         match command {
             Command::SendMessage {
                 session_id,
@@ -353,9 +420,17 @@ impl ClientGateway {
                 approval_id,
                 decision,
             } => {
-                let ceiling = (caller.kind == Some(ClientKind::Watch))
+                let watch = (caller.kind == Some(ClientKind::Watch))
                     .then_some(self.config.watch_risk_ceiling);
-                self.resolve_approval(&approval_id, decision, caller.device.clone(), ceiling)
+                let ceiling = match (watch, caller.principal.ceiling) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                let device = caller
+                    .device
+                    .clone()
+                    .or_else(|| caller.principal.device_name.clone());
+                self.resolve_approval(&approval_id, decision, device, ceiling)
             }
             Command::ListSessions { cursor, limit } => self.list_sessions(cursor, limit).await,
             Command::GetHistory {

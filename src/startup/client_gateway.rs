@@ -80,17 +80,33 @@ impl ClientHost for DaemonClientHost {
     }
 }
 
+/// The running gateway, for the chat's device commands; unset while it is
+/// off.
+static GATEWAY: std::sync::OnceLock<Arc<ClientGateway>> = std::sync::OnceLock::new();
+
+pub(crate) fn running() -> Option<Arc<ClientGateway>> {
+    GATEWAY.get().cloned()
+}
+
 /// Start the gateway when it is enabled: it sees every chat's turns and
-/// approval cards from now on, and serves on its loopback port.
+/// approval cards from now on, and serves on its loopback port. Pairing
+/// confirmations go out on `approvals`, as the agent's cards do.
 pub async fn start(
     config: &AppConfig,
     pool: sqlx::SqlitePool,
     deps: &ChannelRuntimeDeps,
     hub: Arc<ChannelHub>,
+    approvals: crate::tools::ApprovalBroker,
 ) -> anyhow::Result<()> {
     if !config.client_gateway.enabled {
         return Ok(());
     }
+    let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        while let Some(request) = confirm_rx.recv().await {
+            let _ = approvals.send(request).await;
+        }
+    });
     let log = aidaemon_store_sqlite::SqliteClientEventLog::open(pool)
         .await
         .map_err(|error| anyhow::anyhow!("client event log: {error}"))?;
@@ -111,12 +127,111 @@ pub async fn start(
         log,
         config: config.client_gateway.clone(),
         token_file: token_file(&config.client_gateway),
+        approvals: Some(confirm_tx),
     })
     .await?;
+    let _ = GATEWAY.set(gateway.clone());
     tokio::spawn(async move {
         if let Err(error) = aidaemon_client_gateway::serve(gateway).await {
             tracing::error!(%error, "Client Gateway stopped");
         }
     });
     Ok(())
+}
+
+/// `/pair_device`, `/devices` and `/revoke_device <id>`: the owner's devices
+/// for the Client Gateway, from any chat.
+pub(crate) struct DeviceCommands;
+
+const GATEWAY_OFF: &str = "The Client Gateway is off. Set `[client_gateway] enabled = true` in \
+config.toml and restart to pair apps.";
+
+#[async_trait]
+impl aidaemon_channels::slash::SlashCommand for DeviceCommands {
+    fn handles(&self, cmd: &str) -> bool {
+        matches!(cmd, "/pair_device" | "/devices" | "/revoke_device")
+    }
+
+    async fn run(
+        &self,
+        cmd: &str,
+        args: &str,
+        call: &aidaemon_channels::slash::SlashCall<'_>,
+    ) -> String {
+        if call.user_role != UserRole::Owner {
+            return "Only the owner can manage paired devices.".to_string();
+        }
+        let Some(gateway) = running() else {
+            return GATEWAY_OFF.to_string();
+        };
+        let pairing = gateway.pairing();
+        match cmd {
+            "/pair_device" => match pairing.offer(Some(call.session_id.to_string())).await {
+                Ok(offer) => format!(
+                    "To pair a device, open {} on it and enter the code **{}** \
+                     (valid 10 minutes). I'll ask you here before it can do anything.\n\n\
+                     Daemon fingerprint: `{}`",
+                    web_link(&gateway, &offer),
+                    offer.code,
+                    offer.fingerprint
+                ),
+                Err(error) => format!("Could not start pairing: {}", error.message),
+            },
+            "/devices" => match pairing.devices().await {
+                Ok(devices) if devices.iter().all(|d| d.revoked) => {
+                    "No paired devices. Send /pair_device to pair one.".to_string()
+                }
+                Ok(devices) => devices_text(&devices),
+                Err(error) => format!("Could not list devices: {}", error.message),
+            },
+            _ => {
+                let id = args.trim();
+                if id.is_empty() {
+                    return "Usage: /revoke_device <device id> (see /devices)".to_string();
+                }
+                match pairing.revoke(id).await {
+                    Ok(true) => format!("Revoked `{id}`: its sessions are closed."),
+                    Ok(false) => format!("No active device `{id}`."),
+                    Err(error) => format!("Could not revoke: {}", error.message),
+                }
+            }
+        }
+    }
+}
+
+/// The web client's address with the offer filled in.
+pub(crate) fn web_link(
+    gateway: &ClientGateway,
+    offer: &aidaemon_client_protocol::PairingOffer,
+) -> String {
+    format!(
+        "{}/client/v1/app#offer={}&code={}&fp={}",
+        gateway.public_url(),
+        offer.offer_id,
+        offer.code,
+        offer.fingerprint
+    )
+}
+
+fn devices_text(devices: &[aidaemon_client_protocol::DeviceInfo]) -> String {
+    let mut text = "Paired devices:".to_string();
+    for device in devices.iter().filter(|d| !d.revoked) {
+        let scopes: Vec<String> = device
+            .scopes
+            .iter()
+            .map(|s| format!("{s:?}").to_lowercase())
+            .collect();
+        text.push_str(&format!(
+            "\n• {} ({:?}) `{}`: {}",
+            device.name,
+            device.kind,
+            device.device_id,
+            scopes.join(", ")
+        ));
+        if let Some(ceiling) = device.risk_ceiling {
+            text.push_str(&format!(", approves up to {ceiling:?} risk"));
+        }
+    }
+    text.push_str("\n\nRevoke one with /revoke_device <id>.");
+    text
 }

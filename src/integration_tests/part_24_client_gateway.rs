@@ -39,6 +39,8 @@ mod client_gateway {
         token: String,
         posted: Arc<std::sync::atomic::AtomicUsize>,
         pool: sqlx::SqlitePool,
+        hub: Arc<crate::channels::ChannelHub>,
+        turns: aidaemon_channels::turns::TurnDeps,
         _dir: tempfile::TempDir,
         _files: crate::testing::HarnessFiles,
     }
@@ -66,7 +68,7 @@ mod client_gateway {
         harness
             .agent
             .owner_approvals()
-            .set_broker(crate::tools::ApprovalBroker::new(approval_tx));
+            .set_broker(crate::tools::ApprovalBroker::new(approval_tx.clone()));
         tokio::spawn(hub.clone().approval_listener(approval_rx));
 
         let (agent, files) = harness.into_agent();
@@ -76,17 +78,18 @@ mod client_gateway {
         let dir = tempfile::tempdir().unwrap();
         let token_file = dir.path().join("client-token.sha256");
         let token = aidaemon_client_gateway::token::mint(&token_file).unwrap();
+        let turns = aidaemon_channels::turns::TurnDeps {
+            agent,
+            session_map,
+            sessions: state.clone(),
+            task_registry: Arc::new(crate::tasks::TaskRegistry::new(50)),
+            watchdog_stale_threshold_secs: 0,
+            watch: Default::default(),
+        };
         let gateway =
             aidaemon_client_gateway::ClientGateway::start(aidaemon_client_gateway::GatewayDeps {
-                turns: aidaemon_channels::turns::TurnDeps {
-                    agent,
-                    session_map,
-                    sessions: state.clone(),
-                    task_registry: Arc::new(crate::tasks::TaskRegistry::new(50)),
-                    watchdog_stale_threshold_secs: 0,
-                    watch: Default::default(),
-                },
-                hub,
+                turns: turns.clone(),
+                hub: hub.clone(),
                 host: Arc::new(NoHost),
                 log: aidaemon_store_sqlite::SqliteClientEventLog::open(pool.clone())
                     .await
@@ -96,6 +99,7 @@ mod client_gateway {
                     ..Default::default()
                 },
                 token_file,
+                approvals: Some(approval_tx),
             })
             .await
             .unwrap();
@@ -108,6 +112,8 @@ mod client_gateway {
             token,
             posted,
             pool,
+            hub,
+            turns,
             _dir: dir,
             _files: files,
         }
@@ -394,6 +400,264 @@ mod client_gateway {
                 resolved_by: Some(ResolvedBy { channel, device: Some(device) }),
                 ..
             } if channel == "app" && device == "Synthetic Laptop"
+        )));
+    }
+
+    /// The owner's Telegram chat: confirms pairings, and leaves every other
+    /// card open (so the paired browser has to answer it).
+    struct Telegram {
+        cards: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::traits::HubChannel for Telegram {
+        fn name(&self) -> String {
+            "telegram".into()
+        }
+        fn capabilities(&self) -> aidaemon_channels::hub::ChannelCapabilities {
+            aidaemon_channels::hub::ChannelCapabilities {
+                markdown: true,
+                inline_buttons: true,
+                media: true,
+                max_message_len: 4096,
+            }
+        }
+        async fn send_text(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_media(
+            &self,
+            _: &str,
+            _: &aidaemon_channels::hub::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_approval(
+            &self,
+            _: &str,
+            command: &str,
+            _: crate::types::RiskLevel,
+            _: &[String],
+            _: crate::types::PermissionMode,
+            _: bool,
+        ) -> anyhow::Result<crate::types::ApprovalResponse> {
+            self.cards.lock().unwrap().push(command.to_string());
+            if command.starts_with("Pair a new device") {
+                return Ok(crate::types::ApprovalResponse::AllowOnce);
+            }
+            std::future::pending().await
+        }
+    }
+
+    /// Shows a Telegram turn's output nowhere.
+    struct TelegramSurface;
+
+    #[async_trait::async_trait]
+    impl aidaemon_channels::turns::TurnSurface for TelegramSurface {
+        fn platform(&self) -> &'static str {
+            "telegram"
+        }
+        async fn say(&self, _: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn show_working(
+            &self,
+            _: tokio_util::sync::CancellationToken,
+            _: Arc<std::sync::atomic::AtomicU64>,
+            _: u64,
+        ) {
+        }
+    }
+
+    async fn http_json<T: serde::de::DeserializeOwned>(
+        response: reqwest::Response,
+    ) -> T {
+        assert!(response.status().is_success(), "{}", response.status());
+        response.json().await.unwrap()
+    }
+
+    /// Phase 4 is done when a paired browser can approve a command that a
+    /// Telegram-started turn requested: pair from the Telegram chat
+    /// (confirmed there), sign in with the device key, and answer the turn's
+    /// card over the socket.
+    #[tokio::test]
+    async fn a_paired_browser_approves_a_telegram_started_turn() {
+        use base64::Engine;
+        use p256::ecdsa::signature::Signer;
+        use p256::elliptic_curve::Generate;
+        const TELEGRAM_SESSION: &str = "telegram:synthetic-user-1";
+        let daemon = daemon().await;
+        let telegram = Arc::new(Telegram {
+            cards: std::sync::Mutex::default(),
+        });
+        daemon.hub.register_channel(telegram.clone()).await;
+        let runner = aidaemon_channels::turns::TurnRunner::new(daemon.turns.clone());
+        runner.register_session(TELEGRAM_SESSION, "telegram").await;
+        let http = reqwest::Client::new();
+        let base = format!("http://{}", daemon.url);
+
+        // The owner sends /pair_device in Telegram (the offer is confirmed
+        // there); the browser redeems it with its own key.
+        let offer: PairingOffer = http_json(
+            http.post(format!("{base}/client/v1/pairing/offers"))
+                .bearer_auth(&daemon.token)
+                .json(&OfferRequest {
+                    confirm_in_session: Some(TELEGRAM_SESSION.into()),
+                })
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        let key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let redeemed: Enrollment = http_json(
+            http.post(format!("{base}/client/v1/enrollments/redeem"))
+                .json(&RedeemRequest {
+                    offer_id: offer.offer_id.clone(),
+                    code: offer.code.clone(),
+                    device_name: "Synthetic Phone".into(),
+                    device_kind: ClientKind::Web,
+                    public_key: b64.encode(key.verifying_key().to_sec1_point(false).as_bytes()),
+                    scopes: Vec::new(),
+                })
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(redeemed.fingerprint, offer.fingerprint);
+        let mut device_id = None;
+        for _ in 0..500 {
+            let enrollment: Enrollment = http_json(
+                http.get(format!("{base}/client/v1/enrollments/{}", offer.offer_id))
+                    .send()
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if enrollment.state == EnrollmentState::Approved {
+                device_id = enrollment.device_id;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let device_id = device_id.expect("the owner confirmed in Telegram");
+        assert!(telegram.cards.lock().unwrap()[0].contains("Synthetic Phone"));
+
+        // Sign in: a challenge signed with the device key.
+        let challenge: Challenge = http_json(
+            http.post(format!("{base}/client/v1/sessions/challenge"))
+                .json(&ChallengeRequest {
+                    device_id: device_id.clone(),
+                })
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        let signature: p256::ecdsa::Signature =
+            key.sign(challenge_message(&challenge.challenge_id, &challenge.nonce).as_bytes());
+        let grant: AccessGrant = http_json(
+            http.post(format!("{base}/client/v1/sessions"))
+                .json(&SessionRequest {
+                    challenge_id: challenge.challenge_id,
+                    signature: b64.encode(signature.to_bytes()),
+                })
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        // The browser's socket: the token in `hello`, as a browser sends it.
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{}/client/v1/ws", daemon.url))
+                .await
+                .unwrap();
+        let hello = ClientFrame::Hello {
+            version: ProtocolVersion::CURRENT,
+            client: ClientInfo {
+                kind: ClientKind::Web,
+                name: "aidaemon-web".into(),
+                version: None,
+                device: None,
+            },
+            capabilities: Vec::new(),
+            resume_from: None,
+            token: Some(grant.access_token),
+        };
+        socket
+            .send(Message::text(serde_json::to_string(&hello).unwrap()))
+            .await
+            .unwrap();
+        let mut applied = Applied::default();
+        until(&mut socket, &mut applied, |f| {
+            matches!(f, ServerFrame::Snapshot { .. })
+        })
+        .await;
+
+        // A turn started from Telegram asks to POST; the card is in
+        // Telegram and in the browser.
+        runner
+            .submit(
+                Arc::new(TelegramSurface),
+                aidaemon_channels::turns::Turn {
+                    session_id: TELEGRAM_SESSION.into(),
+                    text: "Post the synthetic report for Alice Rivera".into(),
+                    attachments: Vec::new(),
+                    user_role: super::UserRole::Owner,
+                    channel_ctx: super::ChannelContext::private("telegram"),
+                    dedup_key: Some("tg-1".into()),
+                    ingress_timing: None,
+                },
+            )
+            .await;
+        let asked = until(&mut socket, &mut applied, |f| {
+            is_event(f, "approval_requested")
+        })
+        .await;
+        let ServerFrame::Event {
+            event: Event::ApprovalRequested { approval },
+            ..
+        } = asked
+        else {
+            unreachable!()
+        };
+        assert_eq!(approval.session_id, TELEGRAM_SESSION);
+        assert_eq!(approval.channel.as_deref(), Some("telegram"));
+        assert!(applied.events.iter().any(
+            |e| matches!(e, Event::TurnStarted { origin, .. } if origin == "telegram")
+        ));
+        command(
+            &mut socket,
+            "approve-from-phone",
+            Command::ResolveApproval {
+                approval_id: approval.id.clone(),
+                decision: ApprovalDecision::ApproveOnce,
+            },
+        )
+        .await;
+        let completed = until(&mut socket, &mut applied, |f| {
+            is_event(f, "turn_completed")
+        })
+        .await;
+        let ServerFrame::Event {
+            event: Event::TurnCompleted { text, .. },
+            ..
+        } = completed
+        else {
+            unreachable!()
+        };
+        assert!(text.contains("Posted the synthetic report"), "{text}");
+        assert_eq!(daemon.posted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(applied.events.iter().any(|e| matches!(
+            e,
+            Event::ApprovalResolved {
+                outcome: ApprovalOutcome::ApprovedOnce,
+                resolved_by: Some(ResolvedBy { channel, device: Some(device) }),
+                ..
+            } if channel == "app" && device == "Synthetic Phone"
         )));
     }
 }

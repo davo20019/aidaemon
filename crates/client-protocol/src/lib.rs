@@ -847,18 +847,193 @@ pub struct EventsPage {
 }
 
 // ---------------------------------------------------------------------------
+// Pairing and device sessions (HTTP)
+// ---------------------------------------------------------------------------
+//
+// A device pairs once: the owner makes an offer (`/pair_device` in a chat,
+// or `aidaemon pair`), which shows a code and a link (as a QR code); the
+// device redeems it with its public key (`POST /client/v1/enrollments/redeem`)
+// and the owner confirms on a chat they already use (or in the terminal
+// that made the offer). Each connection then proves the key: the device
+// asks for a challenge (`POST /client/v1/sessions/challenge`), signs
+// [`challenge_message`] and trades the signature for a short-lived access
+// token (`POST /client/v1/sessions`), used as `Authorization: Bearer` or in
+// `hello.token`.
+
+/// What a device's token may do.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// Read sessions, history, events, tasks and approvals.
+    Observe,
+    /// Send messages, stop and cancel work, run commands.
+    Chat,
+    /// Answer approvals (within the device's risk ceiling).
+    Approve,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// Every scope: what a phone or computer gets by default.
+pub const ALL_SCOPES: [Scope; 3] = [Scope::Observe, Scope::Chat, Scope::Approve];
+
+/// The owner's offer to pair a device (owner only:
+/// `POST /client/v1/pairing/offers`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct OfferRequest {
+    /// The chat where the owner confirms the device; `None` to confirm
+    /// with `POST /client/v1/pairing/offers/{id}/decision`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_in_session: Option<String>,
+}
+
+/// A single-use pairing offer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct PairingOffer {
+    pub offer_id: String,
+    /// What the owner types on the device ("K7Q2-9FZD").
+    pub code: String,
+    pub expires_at_ms: u64,
+    /// The same as a link, for a QR code:
+    /// `aidaemon-pair:?gateway=<url>&offer=<id>&code=<code>&fp=<fingerprint>`.
+    pub link: String,
+    /// Identifies this daemon; the device checks the redeem reply matches.
+    pub fingerprint: String,
+}
+
+/// `POST /client/v1/enrollments/redeem`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RedeemRequest {
+    pub offer_id: String,
+    pub code: String,
+    /// The device as the owner will see it ("Pixel 9").
+    pub device_name: String,
+    pub device_kind: ClientKind,
+    /// The device's P-256 public key, SEC1 uncompressed, base64url.
+    pub public_key: String,
+    /// The scopes asked for; empty: all of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<Scope>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrollmentState {
+    /// Not redeemed yet.
+    Open,
+    /// Redeemed; waiting for the owner.
+    Pending,
+    Approved,
+    Denied,
+    Expired,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// Where a pairing stands (`GET /client/v1/enrollments/{offer_id}`, and
+/// the owner's `GET /client/v1/pairing/offers/{offer_id}`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct Enrollment {
+    pub offer_id: String,
+    pub state: EnrollmentState,
+    /// Once approved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_kind: Option<ClientKind>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<Scope>,
+    pub fingerprint: String,
+}
+
+/// The owner's answer to a pending pairing made without a chat.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct PairingDecision {
+    pub approve: bool,
+}
+
+/// `POST /client/v1/sessions/challenge`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ChallengeRequest {
+    pub device_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct Challenge {
+    pub challenge_id: String,
+    pub nonce: String,
+    pub expires_at_ms: u64,
+}
+
+/// The exact bytes a device signs (ECDSA P-256, SHA-256) for a challenge.
+pub fn challenge_message(challenge_id: &str, nonce: &str) -> String {
+    format!("aidaemon-client-v1:{challenge_id}:{nonce}")
+}
+
+/// `POST /client/v1/sessions`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct SessionRequest {
+    pub challenge_id: String,
+    /// The signature as `r || s` (64 bytes), base64url.
+    pub signature: String,
+}
+
+/// A short-lived access token for one device.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct AccessGrant {
+    pub access_token: String,
+    pub expires_at_ms: u64,
+    pub device_id: String,
+    pub scopes: Vec<Scope>,
+    /// The highest risk this device may approve; `None`: no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_ceiling: Option<Risk>,
+}
+
+/// A paired device (owner only: `GET /client/v1/devices`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct DeviceInfo {
+    pub device_id: String,
+    pub name: String,
+    pub kind: ClientKind,
+    pub scopes: Vec<Scope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_ceiling: Option<Risk>,
+    pub created_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<u64>,
+    #[serde(default)]
+    pub revoked: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
 
 /// The protocol's JSON Schema (draft 2020-12): a frame is a
 /// [`ClientFrame`] or a [`ServerFrame`]; every type is under `$defs`,
-/// including the HTTP mode's [`EventsPage`].
+/// including the HTTP mode's [`EventsPage`] and the pairing types.
 pub fn schema() -> serde_json::Value {
     let mut generator = schemars::generate::SchemaSettings::draft2020_12().into_generator();
     let client = generator.subschema_for::<ClientFrame>();
     let server = generator.subschema_for::<ServerFrame>();
     let _ = generator.subschema_for::<EventsPage>();
-    let defs = generator.take_definitions(true);
+    let _ = generator.subschema_for::<OfferRequest>();
+    let _ = generator.subschema_for::<PairingOffer>();
+    let _ = generator.subschema_for::<RedeemRequest>();
+    let _ = generator.subschema_for::<Enrollment>();
+    let _ = generator.subschema_for::<PairingDecision>();
+    let _ = generator.subschema_for::<ChallengeRequest>();
+    let _ = generator.subschema_for::<Challenge>();
+    let _ = generator.subschema_for::<SessionRequest>();
+    let _ = generator.subschema_for::<AccessGrant>();
+    let _ = generator.subschema_for::<Vec<DeviceInfo>>();
+    let mut defs = serde_json::Value::Object(generator.take_definitions(true));
+    drop_empty_alternatives(&mut defs);
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://aidaemon.ai/schemas/client-protocol/v1.schema.json",
@@ -866,6 +1041,29 @@ pub fn schema() -> serde_json::Value {
         "oneOf": [client, server],
         "$defs": defs,
     })
+}
+
+/// Remove the `{"enum": []}` alternatives schemars leaves where a skipped
+/// variant (`Unknown`) was: they match nothing, and code generators choke
+/// on them.
+fn drop_empty_alternatives(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in ["oneOf", "anyOf"] {
+                if let Some(serde_json::Value::Array(items)) = map.get_mut(key) {
+                    items.retain(|item| {
+                        !item
+                            .get("enum")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(Vec::is_empty)
+                    });
+                }
+            }
+            map.values_mut().for_each(drop_empty_alternatives);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(drop_empty_alternatives),
+        _ => {}
+    }
 }
 
 /// [`schema`] as the checked-in file holds it: pretty, with a final newline.

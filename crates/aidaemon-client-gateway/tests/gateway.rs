@@ -214,6 +214,7 @@ async fn fixture(risk: RiskLevel) -> Fixture {
         .unwrap();
     let log = SqliteClientEventLog::open(pool).await.unwrap();
     let (approvals_tx, approvals_rx) = mpsc::channel(16);
+    let approvals_for_pairing = approvals_tx.clone();
     let agent = Arc::new(ScriptedAgent {
         approvals: approvals_tx,
         risk,
@@ -243,6 +244,7 @@ async fn fixture(risk: RiskLevel) -> Fixture {
             ..ClientGatewayConfig::default()
         },
         token_file,
+        approvals: Some(approvals_for_pairing),
     })
     .await
     .unwrap();
@@ -822,4 +824,330 @@ impl aidaemon_channels::turns::TurnSurface for Quiet {
         _: u64,
     ) {
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pairing
+// ---------------------------------------------------------------------------
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use p256::ecdsa::signature::Signer;
+use p256::ecdsa::{Signature, SigningKey};
+use p256::elliptic_curve::Generate;
+
+/// A device: its key, and what it was given.
+struct Device {
+    key: SigningKey,
+    device_id: String,
+}
+
+impl Fixture {
+    fn http(&self) -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    async fn owner_post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> T {
+        let response = self
+            .http()
+            .post(format!("http://{}{path}", self.url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{path}: {}",
+            response.status()
+        );
+        response.json().await.unwrap()
+    }
+
+    async fn redeem(
+        &self,
+        offer: &PairingOffer,
+        key: &SigningKey,
+        scopes: Vec<Scope>,
+    ) -> reqwest::Response {
+        self.http()
+            .post(format!("http://{}/client/v1/enrollments/redeem", self.url))
+            .json(&RedeemRequest {
+                offer_id: offer.offer_id.clone(),
+                code: offer.code.to_lowercase(),
+                device_name: "Synthetic Phone".into(),
+                device_kind: ClientKind::Web,
+                public_key: URL_SAFE_NO_PAD
+                    .encode(key.verifying_key().to_sec1_point(false).as_bytes()),
+                scopes,
+            })
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Pair a device, confirmed by the owner's decision call.
+    async fn pair(&self, scopes: Vec<Scope>) -> Device {
+        let offer: PairingOffer = self
+            .owner_post("/client/v1/pairing/offers", serde_json::json!({}))
+            .await;
+        let key = SigningKey::generate_from_rng(&mut rand::rng());
+        assert_eq!(self.redeem(&offer, &key, scopes).await.status(), 202);
+        let enrollment: Enrollment = self
+            .owner_post(
+                &format!("/client/v1/pairing/offers/{}/decision", offer.offer_id),
+                serde_json::json!({"approve": true}),
+            )
+            .await;
+        assert_eq!(enrollment.state, EnrollmentState::Approved);
+        Device {
+            key,
+            device_id: enrollment.device_id.unwrap(),
+        }
+    }
+
+    async fn sign_in(&self, device: &Device) -> reqwest::Response {
+        let response = self
+            .http()
+            .post(format!("http://{}/client/v1/sessions/challenge", self.url))
+            .json(&ChallengeRequest {
+                device_id: device.device_id.clone(),
+            })
+            .send()
+            .await
+            .unwrap();
+        if !response.status().is_success() {
+            return response;
+        }
+        let challenge: Challenge = response.json().await.unwrap();
+        let signature: Signature = device
+            .key
+            .sign(challenge_message(&challenge.challenge_id, &challenge.nonce).as_bytes());
+        self.http()
+            .post(format!("http://{}/client/v1/sessions", self.url))
+            .json(&SessionRequest {
+                challenge_id: challenge.challenge_id,
+                signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            })
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn post_as(&self, token: &str, frame: &ClientFrame) -> ServerFrame {
+        self.http()
+            .post(format!("http://{}/client/v1/commands", self.url))
+            .bearer_auth(token)
+            .json(frame)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_device_pairs_signs_in_and_is_held_to_its_scopes() {
+    let f = fixture(RiskLevel::Medium).await;
+    // A wrong code does not redeem.
+    let offer: PairingOffer = f
+        .owner_post("/client/v1/pairing/offers", serde_json::json!({}))
+        .await;
+    assert!(offer.link.starts_with("aidaemon-pair:?gateway="));
+    let mut wrong = offer.clone();
+    wrong.code = "AAAA-AAAA".into();
+    let key = SigningKey::generate_from_rng(&mut rand::rng());
+    assert_eq!(f.redeem(&wrong, &key, Vec::new()).await.status(), 401);
+
+    // A screen that may only watch.
+    let kiosk = f.pair(vec![Scope::Observe]).await;
+    let grant: AccessGrant = f.sign_in(&kiosk).await.json().await.unwrap();
+    assert_eq!(grant.scopes, vec![Scope::Observe]);
+    let refused = f
+        .post_as(&grant.access_token, &command("k-1", send("hi")))
+        .await;
+    assert!(
+        matches!(&refused, ServerFrame::Error { error, .. } if error.code == ErrorCode::Forbidden),
+        "{refused:?}"
+    );
+    let glance = f
+        .post_as(&grant.access_token, &command("k-2", Command::GetGlance))
+        .await;
+    assert!(matches!(glance, ServerFrame::Ack { .. }), "{glance:?}");
+    // Devices cannot manage devices.
+    let response = f
+        .http()
+        .get(format!("http://{}/client/v1/devices", f.url))
+        .bearer_auth(&grant.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+
+    // A signature from another key does not sign in.
+    let impostor = Device {
+        key: SigningKey::generate_from_rng(&mut rand::rng()),
+        device_id: kiosk.device_id.clone(),
+    };
+    assert_eq!(f.sign_in(&impostor).await.status(), 401);
+
+    let devices: Vec<DeviceInfo> = f
+        .http()
+        .get(format!("http://{}/client/v1/devices", f.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].name, "Synthetic Phone");
+    assert!(devices[0].last_seen_ms.is_some());
+}
+
+#[tokio::test]
+async fn revoking_a_device_closes_its_socket_and_its_tokens() {
+    let f = fixture(RiskLevel::Medium).await;
+    let phone = f.pair(Vec::new()).await;
+    let grant: AccessGrant = f.sign_in(&phone).await.json().await.unwrap();
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{}/client/v1/ws", f.url))
+        .await
+        .unwrap();
+    let hello = ClientFrame::Hello {
+        version: ProtocolVersion::CURRENT,
+        client: ClientInfo {
+            kind: ClientKind::Web,
+            name: "web".into(),
+            version: None,
+            device: None,
+        },
+        capabilities: Vec::new(),
+        resume_from: None,
+        token: Some(grant.access_token.clone()),
+    };
+    socket
+        .send(Message::text(serde_json::to_string(&hello).unwrap()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut socket).await,
+        ServerFrame::Welcome { .. }
+    ));
+    let _: Vec<DeviceInfo> = f
+        .owner_post(
+            &format!("/client/v1/devices/{}/revoke", phone.device_id),
+            serde_json::json!({}),
+        )
+        .await;
+    loop {
+        let frame = next(&mut socket).await;
+        if let ServerFrame::Error { error, .. } = frame {
+            assert_eq!(error.code, ErrorCode::Unauthorized);
+            break;
+        }
+    }
+    let response = f
+        .http()
+        .post(format!("http://{}/client/v1/commands", f.url))
+        .bearer_auth(&grant.access_token)
+        .json(&command("r-1", Command::GetGlance))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    assert_eq!(f.sign_in(&phone).await.status(), 401);
+}
+
+/// An offer made in a chat is confirmed there, with an approval card.
+#[tokio::test]
+async fn a_pairing_made_in_a_chat_is_confirmed_there() {
+    let f = fixture(RiskLevel::Medium).await;
+    let (answer_tx, answer_rx) = oneshot::channel();
+    let chat = Arc::new(Chat {
+        answer: Mutex::new(Some(answer_rx)),
+        asked: AtomicUsize::new(0),
+    });
+    f.hub.register_channel(chat.clone()).await;
+    aidaemon_channels::turns::TurnRunner::new(f.deps.clone())
+        .register_session("telegram:synthetic-user-1", "telegram")
+        .await;
+    let offer: PairingOffer = f
+        .owner_post(
+            "/client/v1/pairing/offers",
+            serde_json::json!({"confirm_in_session": "telegram:synthetic-user-1"}),
+        )
+        .await;
+    let key = SigningKey::generate_from_rng(&mut rand::rng());
+    let pending: Enrollment = f
+        .redeem(&offer, &key, Vec::new())
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pending.state, EnrollmentState::Pending);
+    assert_eq!(pending.fingerprint, offer.fingerprint);
+    for _ in 0..200 {
+        if chat.asked.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    answer_tx.send(ApprovalResponse::AllowOnce).unwrap();
+    let mut state = EnrollmentState::Pending;
+    for _ in 0..200 {
+        let enrollment: Enrollment = f
+            .http()
+            .get(format!(
+                "http://{}/client/v1/enrollments/{}",
+                f.url, offer.offer_id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        state = enrollment.state;
+        if state != EnrollmentState::Pending {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(state, EnrollmentState::Approved);
+}
+
+/// The gateway serves the web client: its page and its script.
+#[tokio::test]
+async fn the_web_client_is_served() {
+    let f = fixture(RiskLevel::Medium).await;
+    let page = f
+        .http()
+        .get(format!("http://{}/client/v1/app", f.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    assert!(page.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("default-src 'self'"));
+    assert!(page.text().await.unwrap().contains("/client/v1/app/app.js"));
+    let script = f
+        .http()
+        .get(format!("http://{}/client/v1/app/app.js", f.url))
+        .send()
+        .await
+        .unwrap();
+    assert!(script.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/javascript"));
+    assert!(script.text().await.unwrap().contains("/sessions/challenge"));
 }

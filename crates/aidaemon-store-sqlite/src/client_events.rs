@@ -1,5 +1,5 @@
-//! The Client Gateway's durable event log and its remembered replies
-//! (feature `client-events`).
+//! The Client Gateway's durable event log, its remembered replies, and the
+//! devices paired with it (feature `client-events`).
 //!
 //! `client_events` holds every durable event a client may need on resume,
 //! numbered per owner by a gap-free `seq` assigned inside the insert (which
@@ -39,7 +39,68 @@ CREATE TABLE IF NOT EXISTS client_requests (
     PRIMARY KEY (owner, request_id)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_client_requests_at ON client_requests (at_ms);
+CREATE TABLE IF NOT EXISTS client_pairing (
+    offer_id       TEXT PRIMARY KEY NOT NULL,
+    code_hash      TEXT    NOT NULL,
+    origin_session TEXT,
+    created_at_ms  INTEGER NOT NULL,
+    expires_at_ms  INTEGER NOT NULL,
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    status         TEXT    NOT NULL,
+    device_name    TEXT,
+    device_kind    TEXT,
+    public_key     TEXT,
+    scopes         TEXT,
+    device_id      TEXT
+);
+CREATE TABLE IF NOT EXISTS client_devices (
+    device_id     TEXT PRIMARY KEY NOT NULL,
+    name          TEXT    NOT NULL,
+    kind          TEXT    NOT NULL,
+    public_key    TEXT    NOT NULL,
+    scopes        TEXT    NOT NULL,
+    risk_ceiling  TEXT,
+    created_at_ms INTEGER NOT NULL,
+    last_seen_ms  INTEGER,
+    revoked_at_ms INTEGER
+);
 "#;
+
+/// One pairing offer and, once redeemed, the device asking to pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingRow {
+    pub offer_id: String,
+    pub code_hash: String,
+    /// The chat the offer was made in (where the owner confirms); `None`
+    /// for one made locally.
+    pub origin_session: Option<String>,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub attempts: u32,
+    /// `open`, `pending` (redeemed, waiting for the owner), `approved`,
+    /// `denied` or `expired`.
+    pub status: String,
+    pub device_name: Option<String>,
+    pub device_kind: Option<String>,
+    pub public_key: Option<String>,
+    pub scopes: Option<String>,
+    pub device_id: Option<String>,
+}
+
+/// One paired device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRow {
+    pub device_id: String,
+    pub name: String,
+    pub kind: String,
+    pub public_key: String,
+    /// Comma-separated.
+    pub scopes: String,
+    pub risk_ceiling: Option<String>,
+    pub created_at_ms: u64,
+    pub last_seen_ms: Option<u64>,
+    pub revoked_at_ms: Option<u64>,
+}
 
 /// One logged event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +307,190 @@ impl SqliteClientEventLog {
             .execute(&self.pool)
             .await?;
         Ok(done.rows_affected())
+    }
+}
+
+impl SqliteClientEventLog {
+    pub async fn create_offer(&self, offer: &PairingRow) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO client_pairing (offer_id, code_hash, origin_session, created_at_ms,
+                 expires_at_ms, attempts, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 'open')",
+        )
+        .bind(&offer.offer_id)
+        .bind(&offer.code_hash)
+        .bind(&offer.origin_session)
+        .bind(to_i64(offer.created_at_ms))
+        .bind(to_i64(offer.expires_at_ms))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn offer(&self, offer_id: &str) -> Result<Option<PairingRow>, Error> {
+        let found = sqlx::query("SELECT * FROM client_pairing WHERE offer_id = ?1")
+            .bind(offer_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(found.as_ref().map(pairing_row))
+    }
+
+    /// Redeem an open, unexpired offer whose code hash matches, at most
+    /// `max_attempts` tries: one atomic update, so an offer pairs one
+    /// device. Returns whether it was redeemed; a wrong code counts an
+    /// attempt and closes the offer at the limit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn redeem_offer(
+        &self,
+        offer_id: &str,
+        code_hash: &str,
+        now_ms: u64,
+        max_attempts: u32,
+        device_name: &str,
+        device_kind: &str,
+        public_key: &str,
+        scopes: &str,
+    ) -> Result<bool, Error> {
+        let done = sqlx::query(
+            "UPDATE client_pairing SET status = 'pending', device_name = ?4, device_kind = ?5,
+                 public_key = ?6, scopes = ?7
+             WHERE offer_id = ?1 AND code_hash = ?2 AND status = 'open' AND expires_at_ms > ?3
+               AND attempts < ?8",
+        )
+        .bind(offer_id)
+        .bind(code_hash)
+        .bind(to_i64(now_ms))
+        .bind(device_name)
+        .bind(device_kind)
+        .bind(public_key)
+        .bind(scopes)
+        .bind(i64::from(max_attempts))
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() == 1 {
+            return Ok(true);
+        }
+        sqlx::query(
+            "UPDATE client_pairing SET attempts = attempts + 1,
+                 status = CASE WHEN attempts + 1 >= ?2 THEN 'expired' ELSE status END
+             WHERE offer_id = ?1 AND status = 'open'",
+        )
+        .bind(offer_id)
+        .bind(i64::from(max_attempts))
+        .execute(&self.pool)
+        .await?;
+        Ok(false)
+    }
+
+    /// Settle a pending offer: `approved` (with the new device's id) or
+    /// `denied`. Returns whether it was pending.
+    pub async fn decide_offer(
+        &self,
+        offer_id: &str,
+        status: &str,
+        device_id: Option<&str>,
+    ) -> Result<bool, Error> {
+        let done = sqlx::query(
+            "UPDATE client_pairing SET status = ?2, device_id = ?3
+             WHERE offer_id = ?1 AND status = 'pending'",
+        )
+        .bind(offer_id)
+        .bind(status)
+        .bind(device_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    pub async fn add_device(&self, device: &DeviceRow) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO client_devices (device_id, name, kind, public_key, scopes, risk_ceiling,
+                 created_at_ms, last_seen_ms, revoked_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
+        )
+        .bind(&device.device_id)
+        .bind(&device.name)
+        .bind(&device.kind)
+        .bind(&device.public_key)
+        .bind(&device.scopes)
+        .bind(&device.risk_ceiling)
+        .bind(to_i64(device.created_at_ms))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn device(&self, device_id: &str) -> Result<Option<DeviceRow>, Error> {
+        let found = sqlx::query("SELECT * FROM client_devices WHERE device_id = ?1")
+            .bind(device_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(found.as_ref().map(device_row))
+    }
+
+    /// Every device, revoked ones included, oldest first.
+    pub async fn devices(&self) -> Result<Vec<DeviceRow>, Error> {
+        let rows = sqlx::query("SELECT * FROM client_devices ORDER BY created_at_ms, device_id")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(device_row).collect())
+    }
+
+    /// Revoke a device; returns whether it was active.
+    pub async fn revoke_device(&self, device_id: &str, now_ms: u64) -> Result<bool, Error> {
+        let done = sqlx::query(
+            "UPDATE client_devices SET revoked_at_ms = ?2
+             WHERE device_id = ?1 AND revoked_at_ms IS NULL",
+        )
+        .bind(device_id)
+        .bind(to_i64(now_ms))
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    pub async fn touch_device(&self, device_id: &str, now_ms: u64) -> Result<(), Error> {
+        sqlx::query("UPDATE client_devices SET last_seen_ms = ?2 WHERE device_id = ?1")
+            .bind(device_id)
+            .bind(to_i64(now_ms))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+fn opt_u64(row: &sqlx::sqlite::SqliteRow, column: &str) -> Option<u64> {
+    row.get::<Option<i64>, _>(column).map(to_u64)
+}
+
+fn pairing_row(row: &sqlx::sqlite::SqliteRow) -> PairingRow {
+    PairingRow {
+        offer_id: row.get("offer_id"),
+        code_hash: row.get("code_hash"),
+        origin_session: row.get("origin_session"),
+        created_at_ms: to_u64(row.get("created_at_ms")),
+        expires_at_ms: to_u64(row.get("expires_at_ms")),
+        attempts: u32::try_from(row.get::<i64, _>("attempts")).unwrap_or(u32::MAX),
+        status: row.get("status"),
+        device_name: row.get("device_name"),
+        device_kind: row.get("device_kind"),
+        public_key: row.get("public_key"),
+        scopes: row.get("scopes"),
+        device_id: row.get("device_id"),
+    }
+}
+
+fn device_row(row: &sqlx::sqlite::SqliteRow) -> DeviceRow {
+    DeviceRow {
+        device_id: row.get("device_id"),
+        name: row.get("name"),
+        kind: row.get("kind"),
+        public_key: row.get("public_key"),
+        scopes: row.get("scopes"),
+        risk_ceiling: row.get("risk_ceiling"),
+        created_at_ms: to_u64(row.get("created_at_ms")),
+        last_seen_ms: opt_u64(row, "last_seen_ms"),
+        revoked_at_ms: opt_u64(row, "revoked_at_ms"),
     }
 }
 
