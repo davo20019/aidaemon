@@ -900,6 +900,10 @@ pub struct PairingOffer {
     pub link: String,
     /// Identifies this daemon; the device checks the redeem reply matches.
     pub fingerprint: String,
+    /// Where devices reach the gateway now (a live tunnel origin, the
+    /// configured address, or loopback). Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
 }
 
 /// `POST /client/v1/enrollments/redeem`.

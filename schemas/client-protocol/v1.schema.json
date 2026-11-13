@@ -1647,6 +1647,13 @@
         },
         "offer_id": {
           "type": "string"
+        },
+        "public_url": {
+          "description": "Where devices reach the gateway now (a live tunnel origin, the\nconfigured address, or loopback). Absent from older daemons.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

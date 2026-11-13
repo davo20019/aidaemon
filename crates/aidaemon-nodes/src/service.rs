@@ -80,22 +80,37 @@ fn validate_runtime_recovery_report(report: &RuntimeRecoveryReport) -> anyhow::R
     Ok(())
 }
 
+/// The most origins a heartbeat carries.
+pub const MAX_GATEWAY_ENDPOINTS: usize = 3;
+
 #[derive(Clone)]
 pub struct NodeService {
     store: Arc<NodeStore>,
     config: NodesConfig,
     speech: Arc<dyn super::speech::NodeSpeechSynthesizer>,
     firmware_release: Option<Arc<super::ota::FirmwareRelease>>,
+    /// Where Nodes reach the Gateway: a live tunnel origin, then
+    /// `gateway.advertised_endpoints`.
+    endpoints: aidaemon_core::EndpointSource,
 }
 
 impl NodeService {
     pub fn new(store: Arc<NodeStore>, config: NodesConfig) -> Self {
+        let endpoints =
+            aidaemon_core::EndpointSource::fixed(config.gateway.advertised_endpoints.clone());
         Self {
             store,
             config,
             speech: Arc::new(super::speech::DisabledSpeech),
             firmware_release: None,
+            endpoints,
         }
+    }
+    /// Read the origins Nodes are told about from `endpoints` instead of
+    /// the static config list.
+    pub fn with_endpoints(mut self, endpoints: aidaemon_core::EndpointSource) -> Self {
+        self.endpoints = endpoints;
+        self
     }
     pub fn with_speech(mut self, speech: Arc<dyn super::speech::NodeSpeechSynthesizer>) -> Self {
         self.speech = speech;
@@ -104,6 +119,13 @@ impl NodeService {
     pub fn with_firmware_release(mut self, release: super::ota::FirmwareRelease) -> Self {
         self.firmware_release = Some(Arc::new(release));
         self
+    }
+    /// The ordered origins sent on every heartbeat (at most three); empty
+    /// means "do not update Devices".
+    pub fn gateway_endpoints(&self) -> Vec<String> {
+        let mut endpoints = self.endpoints.current();
+        endpoints.truncate(MAX_GATEWAY_ENDPOINTS);
+        endpoints
     }
     pub fn store(&self) -> &Arc<NodeStore> {
         &self.store
@@ -394,7 +416,7 @@ impl NodeService {
             authorization_revision: context.authorization_revision,
             outbox_poll_seconds,
             firmware_update,
-            gateway_endpoints: self.config.gateway.advertised_endpoints.clone(),
+            gateway_endpoints: self.gateway_endpoints(),
             device_restart,
         })
     }
@@ -908,6 +930,39 @@ fn ensure_protocol(version: &ProtocolVersion) -> anyhow::Result<()> {
 #[cfg(test)]
 mod sensor_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn heartbeat_endpoints_put_the_live_origin_first() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let store = Arc::new(NodeStore::new(pool, [7_u8; 32]));
+        let mut config = NodesConfig::default();
+        config.gateway.advertised_endpoints = vec![
+            "https://a.example.com".into(),
+            "https://b.example.com".into(),
+            "https://c.example.com".into(),
+        ];
+        let fixed = NodeService::new(store.clone(), config.clone());
+        assert_eq!(fixed.gateway_endpoints().len(), 3);
+
+        let (source, publisher) =
+            aidaemon_core::EndpointSource::live(config.gateway.advertised_endpoints.clone());
+        let service = NodeService::new(store, config).with_endpoints(source);
+        publisher.set(Some("https://live.example.com".into()));
+        assert_eq!(
+            service.gateway_endpoints(),
+            vec![
+                "https://live.example.com",
+                "https://a.example.com",
+                "https://b.example.com"
+            ]
+        );
+        publisher.set(None);
+        assert_eq!(service.gateway_endpoints()[0], "https://a.example.com");
+    }
 
     #[test]
     fn environmental_sensor_validation_is_bounded() {

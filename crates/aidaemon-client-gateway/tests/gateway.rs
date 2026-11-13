@@ -243,6 +243,7 @@ async fn fixture(risk: RiskLevel) -> Fixture {
             enabled: true,
             ..ClientGatewayConfig::default()
         },
+        endpoints: aidaemon_core::EndpointSource::fixed(Vec::new()),
         token_file,
         approvals: Some(approvals_for_pairing),
     })

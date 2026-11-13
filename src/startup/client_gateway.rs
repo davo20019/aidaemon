@@ -93,6 +93,17 @@ fn write_owner_only(path: &std::path::Path, contents: &str) -> std::io::Result<(
     std::fs::rename(&tmp, path)
 }
 
+/// The configured `public_url`, as the origins served while no tunnel
+/// publishes a live one.
+pub(crate) fn static_origins(config: &ClientGatewayConfig) -> Vec<String> {
+    config
+        .public_url
+        .iter()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .collect()
+}
+
 /// The daemon as the gateway's host.
 pub(crate) struct DaemonClientHost {
     pub state: Arc<dyn StateStore>,
@@ -165,6 +176,7 @@ pub async fn start(
     deps: &ChannelRuntimeDeps,
     hub: Arc<ChannelHub>,
     approvals: crate::tools::ApprovalBroker,
+    endpoints: aidaemon_core::EndpointSource,
 ) -> anyhow::Result<()> {
     if !config.client_gateway.enabled {
         return Ok(());
@@ -194,6 +206,7 @@ pub async fn start(
         }),
         log,
         config: config.client_gateway.clone(),
+        endpoints,
         token_file: token_file(&config.client_gateway),
         approvals: Some(confirm_tx),
     })

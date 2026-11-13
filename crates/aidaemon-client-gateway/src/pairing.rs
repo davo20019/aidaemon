@@ -106,8 +106,8 @@ pub struct Pairing {
     log: SqliteClientEventLog,
     /// Where confirmation cards go (the hub's approval queue).
     approvals: Option<mpsc::Sender<ApprovalRequest>>,
-    /// What the offer link names as the gateway.
-    public_url: String,
+    /// What the offer link names as the gateway, read per offer.
+    public_url: crate::PublicUrl,
     fingerprint: String,
     access: Mutex<HashMap<String, Access>>,
     challenges: Mutex<HashMap<String, PendingChallenge>>,
@@ -206,12 +206,14 @@ impl Pairing {
     pub(crate) fn new(
         log: SqliteClientEventLog,
         approvals: Option<mpsc::Sender<ApprovalRequest>>,
-        public_url: String,
+        public_url: crate::PublicUrl,
         watch_ceiling: Risk,
     ) -> Self {
         // The fingerprint identifies this daemon's database, which holds
-        // the devices it paired.
-        let fingerprint = sha(&format!("aidaemon-client-gateway:{public_url}"))[..16].to_string();
+        // the devices it paired. It is keyed on the configured address,
+        // never a live tunnel origin, so it does not change when one does.
+        let fingerprint =
+            sha(&format!("aidaemon-client-gateway:{}", public_url.fallback))[..16].to_string();
         Self {
             log,
             approvals,
@@ -255,9 +257,10 @@ impl Pairing {
             })
             .await
             .map_err(internal)?;
+        let public_url = self.public_url.get();
         let link = format!(
             "aidaemon-pair:?gateway={}&offer={offer_id}&code={code}&fp={}",
-            percent(&self.public_url),
+            percent(&public_url),
             self.fingerprint
         );
         Ok(PairingOffer {
@@ -266,6 +269,7 @@ impl Pairing {
             expires_at_ms,
             link,
             fingerprint: self.fingerprint.clone(),
+            public_url: Some(public_url),
         })
     }
 

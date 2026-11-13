@@ -405,13 +405,23 @@ pub async fn run(
         plan_store.clone(),
     )
     .await?;
-    crate::startup::nodes::start(&config, pool.clone(), agent.clone(), hub.clone()).await?;
+    crate::startup::nodes::start(
+        &config,
+        pool.clone(),
+        agent.clone(),
+        hub.clone(),
+        aidaemon_core::EndpointSource::fixed(config.nodes.gateway.advertised_endpoints.clone()),
+    )
+    .await?;
     crate::startup::client_gateway::start(
         &config,
         pool.clone(),
         &channel_deps,
         hub.clone(),
         approval_tx.clone(),
+        aidaemon_core::EndpointSource::fixed(crate::startup::client_gateway::static_origins(
+            &config.client_gateway,
+        )),
     )
     .await?;
     // Give the agent its plan_store handle so the completion phase can read the

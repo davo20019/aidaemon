@@ -474,6 +474,7 @@ fn http_samples() -> Vec<(&'static str, Value)> {
                 expires_at_ms: 1_767_226_200_000,
                 link: "aidaemon-pair:?gateway=http%3A%2F%2F127.0.0.1%3A8788&offer=of-1&code=K7Q2-9FZD&fp=3b1f".into(),
                 fingerprint: "3b1f".into(),
+                public_url: Some("https://app.example.com".into()),
             })
             .unwrap(),
         ),
