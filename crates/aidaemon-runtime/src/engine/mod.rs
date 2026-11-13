@@ -21,6 +21,7 @@ pub mod settings;
 pub mod stop;
 pub mod tool_calls;
 pub mod tool_exec;
+pub mod tool_gate;
 pub mod tool_result_fit;
 pub mod work_scope;
 

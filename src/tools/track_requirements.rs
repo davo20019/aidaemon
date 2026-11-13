@@ -20,10 +20,7 @@ use crate::traits::{
 /// persisted checklist and the durable expectation event see the same drop.
 pub const UNBOUND_TARGETS_KEY: &str = "_unbound_targets";
 
-/// Start of the user-facing render in this tool's output. The agent loop
-/// locates it to lift the checklist onto the live status surface, so any
-/// model-only notice must precede it.
-pub const CHECKLIST_HEADER: &str = "Checklist updated";
+pub use aidaemon_work::plans::CHECKLIST_HEADER;
 
 /// Union of the exact receipt subjects every registered tool advertises via
 /// `ToolSemantics::stable_observation_subjects`. Checklist resource-ID targets are bound

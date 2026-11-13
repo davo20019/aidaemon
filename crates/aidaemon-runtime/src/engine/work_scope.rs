@@ -109,6 +109,84 @@ pub trait WorkScope: TurnHost {
         }
     }
 
+    /// Revalidate the immutable mandate run and exact task-attempt lease. This
+    /// runs before grant issuance and again at the final adapter boundary.
+    async fn require_live_mandate_execution(&self, expected_goal_id: &str) -> anyhow::Result<()> {
+        const FENCE_RENEWAL_SECS: i64 = 180;
+
+        let fence = self.mandate_execution().ok_or_else(|| {
+            anyhow::anyhow!("Mandate execution is missing its immutable run/task fence.")
+        })?;
+        anyhow::ensure!(
+            fence.goal_id == expected_goal_id
+                && self.goal_id() == Some(expected_goal_id)
+                && self.task_id() == Some(fence.worker_task_id.as_str()),
+            "Mandate execution identity does not match this child agent."
+        );
+        let mandate = self
+            .mandates()
+            .get_mandate_for_goal(expected_goal_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Mandate authority record disappeared."))?;
+        anyhow::ensure!(
+            mandate.id == fence.mandate_id
+                && mandate.version == fence.mandate_version
+                && mandate.authority == fence.authority
+                && mandate.is_active(),
+            "Mandate authority changed or is no longer active."
+        );
+
+        let task = self
+            .tasks()
+            .get_task(&fence.worker_task_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Mandate worker task no longer exists."))?;
+        anyhow::ensure!(
+            task.goal_id == expected_goal_id
+                && matches!(task.status.as_str(), "claimed" | "running")
+                && !task.has_error()
+                && !task.has_blocker(),
+            "Mandate worker task is no longer executable."
+        );
+
+        let attempt = self
+            .work()
+            .get_current_task_attempt(&fence.worker_task_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Mandate task-attempt lease is no longer active."))?;
+        anyhow::ensure!(
+            attempt.id == fence.attempt_id
+                && attempt.lease_token == fence.lease_token
+                && attempt.task_id == fence.worker_task_id
+                && attempt.goal_run_id == fence.goal_run_id
+                && matches!(attempt.status.as_str(), "claimed" | "running"),
+            "Mandate task-attempt lease was replaced or lost."
+        );
+        anyhow::ensure!(
+            self.work()
+                .heartbeat_task_attempt(&fence.attempt_id, &fence.lease_token, FENCE_RENEWAL_SECS,)
+                .await?,
+            "Mandate task-attempt lease expired or was revoked."
+        );
+
+        // Reload after the atomic lease check so a closed cycle cannot be
+        // rebound by goal ID to a later run.
+        let run = self
+            .work()
+            .get_current_goal_run(expected_goal_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Mandate decision cycle is no longer active."))?;
+        anyhow::ensure!(
+            run.id == fence.goal_run_id
+                && run.goal_id == expected_goal_id
+                && run.trigger_type == "mandate"
+                && run.status == "running"
+                && run.root_task_id.as_deref() == Some(fence.root_task_id.as_str()),
+            "Mandate execution is stale, blocked, or bound to a different decision cycle."
+        );
+        Ok(())
+    }
+
     /// The chat whose `/readonly` narrows this turn while it runs: a child
     /// answers to the chat that started the work, a root turn to its own.
     fn mode_session_for(&self, session_id: &str) -> String {
