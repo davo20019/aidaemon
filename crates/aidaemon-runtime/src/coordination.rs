@@ -1447,6 +1447,39 @@ impl Coordination {
     }
 }
 
+/// A run's route to the owner's chat, held until its run-end deliveries
+/// are sent. Every run a parent starts (in the foreground, in the
+/// background, a task lead's) ends through [`Self::end`]: what it declared
+/// for the owner goes out while its session still routes to the chat, and
+/// only then is the route let go. Live 2026-11-13: the route was dropped
+/// first, a background helper's declared homepage screenshot found "no
+/// channel" for its session, and nothing reached the chat.
+pub struct RunEndRoute {
+    lease: Option<aidaemon_channels::ports::SessionRouteLease>,
+}
+
+impl RunEndRoute {
+    pub fn new(lease: Option<aidaemon_channels::ports::SessionRouteLease>) -> Self {
+        Self { lease }
+    }
+
+    /// `member`'s run ended: send each deliverable it declared under the
+    /// request's delivery ledger ([`Coordination::deliver_run_end`]), then
+    /// release the route. `None` when the run is in no request tree.
+    pub async fn end(
+        self,
+        coordination: Option<&Coordination>,
+        member: &str,
+    ) -> Option<Vec<RunDelivery>> {
+        let delivered = match coordination {
+            Some(tree) => Some(tree.deliver_run_end(member).await),
+            None => None,
+        };
+        drop(self.lease);
+        delivered
+    }
+}
+
 /// Marks a member finished when its run ends, however it ends.
 pub struct RosterEntry {
     coordination: Coordination,
@@ -3418,5 +3451,127 @@ mod tests {
         });
         coordination.finish_member("child-a");
         assert!(!coordination.roster()[0].running);
+    }
+
+    /// The routes a chat keeps from a helper's session to its own.
+    #[derive(Default)]
+    struct RouteHub {
+        routes: std::sync::Mutex<HashMap<String, String>>,
+    }
+
+    #[async_trait]
+    impl aidaemon_channels::ports::OutboundRouter for RouteHub {
+        async fn send_text(&self, _session_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_text_tracked(
+            &self,
+            _session_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn edit_text(
+            &self,
+            _session_id: &str,
+            _message_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn send_media(
+            &self,
+            _session_id: &str,
+            _media: &aidaemon_channels::hub::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_media_strict(
+            &self,
+            _session_id: &str,
+            _media: &aidaemon_channels::hub::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_inline_approval(
+            &self,
+            _session_id: &str,
+            _description: &str,
+            _risk_level: aidaemon_tools::semantics::RiskLevel,
+            _warnings: &[String],
+            _permission_mode: aidaemon_tools::semantics::PermissionMode,
+        ) -> anyhow::Result<aidaemon_tools::semantics::ApprovalResponse> {
+            anyhow::bail!("no approvals in this test")
+        }
+        async fn register_session_route(&self, child: &str, parent: &str) -> bool {
+            self.routes
+                .lock()
+                .unwrap()
+                .insert(child.to_string(), parent.to_string());
+            true
+        }
+        async fn unregister_session_route(&self, child: &str, _parent: &str) {
+            self.routes.lock().unwrap().remove(child);
+        }
+    }
+
+    /// Live 2026-11-13: a background helper declared its homepage
+    /// screenshot, its route to the chat was dropped before its run-end
+    /// delivery, and the screenshot found no channel. Its run's end sends it
+    /// while the route still stands, and the record says it was sent.
+    #[tokio::test]
+    async fn a_background_helpers_declared_screenshot_is_delivered_when_its_run_ends() {
+        use aidaemon_tools::semantics::{Deliverable, DeliverableKind, DeliveryPlan};
+        let tree = Coordination::new(3, 12);
+        tree.bind_root("telegram:synthetic", "Install two sites", "turn-1");
+        let helper = "specialist:executor:drupal";
+        tree.add_member(Member {
+            session: helper.to_string(),
+            parent: "telegram:synthetic".to_string(),
+            mission: "Install Drupal".to_string(),
+            specialist: None,
+            scope: Vec::new(),
+            running: true,
+        });
+        let hub = Arc::new(RouteHub::default());
+        let router: Arc<dyn aidaemon_channels::ports::OutboundRouter> = hub.clone();
+        let lease = aidaemon_channels::ports::SessionRouteLease::register(
+            &router,
+            helper,
+            "telegram:synthetic",
+        )
+        .await;
+        let routed = hub.clone();
+        let deliverable = Deliverable {
+            kind: DeliverableKind::Screenshot {
+                page: "synthetic-drupal.ddev.site".to_string(),
+            },
+            caption: "Drupal homepage".to_string(),
+            send: Box::new(move || {
+                Box::pin(async move {
+                    // A route let go is unregistered on the next poll.
+                    tokio::task::yield_now().await;
+                    // The chat routes the helper's media by its session.
+                    match routed.routes.lock().unwrap().get(helper) {
+                        Some(_) => Ok(()),
+                        None => Err("no channel found for session".to_string()),
+                    }
+                })
+            }),
+        };
+        assert!(matches!(
+            tree.declare_deliverable(helper, deliverable),
+            DeliveryPlan::AtRunEnd { replaced: false }
+        ));
+        let delivered = RunEndRoute::new(lease)
+            .end(Some(&tree), helper)
+            .await
+            .expect("a run in the tree has a delivery record");
+        assert_eq!(delivered.len(), 1);
+        assert!(
+            matches!(delivered[0].outcome, RunDeliveryOutcome::Sent { .. }),
+            "{:?}",
+            delivered[0].outcome
+        );
     }
 }

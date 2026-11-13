@@ -1797,22 +1797,23 @@ impl TurnEngine<'_> {
             .approval_session_id()
             .map(str::to_string)
             .or_else(|| approval_session_id.map(str::to_string));
-        let approval_route_guard = if let Some(parent_session) =
-            effective_approval_session_id.as_deref()
-        {
-            let hub = match tokio::time::timeout(Duration::from_secs(2), self.hub().read()).await {
-                Ok(guard) => guard.as_ref().and_then(Weak::upgrade),
-                Err(_) => None,
-            };
-            match hub {
-                Some(hub) => {
-                    SessionRouteLease::register(&hub, &child_session, parent_session).await
+        let approval_route_guard = crate::coordination::RunEndRoute::new(
+            if let Some(parent_session) = effective_approval_session_id.as_deref() {
+                let hub =
+                    match tokio::time::timeout(Duration::from_secs(2), self.hub().read()).await {
+                        Ok(guard) => guard.as_ref().and_then(Weak::upgrade),
+                        Err(_) => None,
+                    };
+                match hub {
+                    Some(hub) => {
+                        SessionRouteLease::register(&hub, &child_session, parent_session).await
+                    }
+                    None => None,
                 }
-                None => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            },
+        );
         let parent_authority = self
             .inherited_for_child(
                 parent_authority,
@@ -2074,15 +2075,13 @@ impl TurnEngine<'_> {
             }
         };
 
-        drop(approval_route_guard);
-
         // The run ended: what it declared for the owner is sent now, once,
         // the last of each kind (its final version, never a capture taken
-        // before the work was done), and what became of each is its record.
-        let delivered = match outcome_coordination.as_ref() {
-            Some(tree) => Some(tree.deliver_run_end(&child_session_for_events).await),
-            None => None,
-        };
+        // before the work was done), while its session still routes to the
+        // chat; what became of each is its record.
+        let delivered = approval_route_guard
+            .end(outcome_coordination.as_ref(), &child_session_for_events)
+            .await;
 
         // A stopped child never reached its own closeout. The caller decides
         // what the timeout means for any durable task; here we record what
