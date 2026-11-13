@@ -45,6 +45,7 @@ use aidaemon_core::Tool;
 pub mod backend;
 pub mod background_deliverable;
 pub mod backoff;
+pub mod check_environment;
 mod checklist;
 #[cfg(feature = "checkpoints")]
 pub mod checkpoints;

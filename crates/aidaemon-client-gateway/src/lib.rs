@@ -25,6 +25,7 @@
 
 mod approvals;
 mod bus;
+pub mod client_view;
 mod config;
 mod observer;
 pub mod pairing;

@@ -129,6 +129,15 @@ tokio::task_local! {
     /// shows it changed its write roots: its outcome carries those typed
     /// effects, so the dispatcher treats what it set up like any call's.
     static RUN_CHANGED_LOCALLY: std::cell::Cell<bool>;
+    /// The name of the run this call left in the background, when it
+    /// started or moved one there.
+    static BACKGROUND_RUN_LABEL: std::cell::RefCell<Option<String>>;
+}
+
+/// Record the run this call left in the background, by its name.
+fn mark_background_run(label: &str) {
+    mark_left_in_background();
+    let _ = BACKGROUND_RUN_LABEL.try_with(|slot| *slot.borrow_mut() = Some(label.to_string()));
 }
 
 /// Record that this call's finished run changed its write roots.
@@ -3183,6 +3192,38 @@ impl CliAgentTool {
                         );
                     }
 
+                    // The runs its turn left running are answered together:
+                    // until the last of them ends this one's end is on the
+                    // card only, and the last one's end answers the turn once
+                    // from every result.
+                    let group = match (run.as_ref(), ended.as_ref()) {
+                        (Some(run), Some((Some(state), on_card))) => run.end_in_group(
+                            state,
+                            aidaemon_runtime::run_state::RunReport {
+                                text: persisted_output.clone(),
+                                untrusted: true,
+                            },
+                            run.result(Some(state), &body, *on_card),
+                            max_output_for_log,
+                        ),
+                        _ => aidaemon_runtime::background_run::RunsTurn::Alone,
+                    };
+                    let group_answer = match group {
+                        aidaemon_runtime::background_run::RunsTurn::Waiting => {
+                            info!(
+                                task_id = %task_id_for_notify,
+                                session_id = %notify_session_id,
+                                "A CLI agent's result waits for the rest of its turn's runs"
+                            );
+                            finished_for_task.store(true, Ordering::Release);
+                            let _ =
+                                completion_tx.send((exit_code, loop_detected, loop_pattern_count));
+                            return;
+                        }
+                        aidaemon_runtime::background_run::RunsTurn::Answer(answer) => Some(answer),
+                        aidaemon_runtime::background_run::RunsTurn::Alone => None,
+                    };
+
                     // The written answer, when the agent loop gives one.
                     let mut reply: Option<(
                         String,
@@ -3208,13 +3249,21 @@ impl CliAgentTool {
                                 Some(why) => format!("{status_word}. {why}"),
                                 None => status_word.to_string(),
                             };
-                            let followup = CliAgentTool::build_background_reengagement_followup(
-                                &tool_name_owned,
-                                &task_id_for_notify,
-                                &task_context,
-                                &ending,
-                                &persisted_output,
-                            );
+                            let (followup, parent_task_id) = match group_answer.as_ref() {
+                                Some(answer) => {
+                                    (answer.followup.clone(), answer.parent_task_id.clone())
+                                }
+                                None => (
+                                    CliAgentTool::build_background_reengagement_followup(
+                                        &tool_name_owned,
+                                        &task_id_for_notify,
+                                        &task_context,
+                                        &ending,
+                                        &persisted_output,
+                                    ),
+                                    None,
+                                ),
+                            };
                             info!(
                                 task_id = %task_id_for_notify,
                                 session_id = %notify_session_id,
@@ -3232,7 +3281,7 @@ impl CliAgentTool {
                                     user_role: crate::types::UserRole::Owner,
                                     channel_ctx: crate::types::ChannelContext::internal(),
                                     heartbeat: None,
-                                    parent_task_id: None,
+                                    parent_task_id,
                                     parent_tool_call_id: None,
                                     parent_result_id: None,
                                 },
@@ -3268,9 +3317,14 @@ impl CliAgentTool {
                         }
                         _ => crate::channels::present_notification(notification_type, body),
                     };
-                    let (text, envelope) = match reply {
-                        Some((text, envelope)) => (present(&text), envelope),
-                        None => (present(&body), None),
+                    let (text, envelope) = match (reply, group_answer) {
+                        // A group's answer stands alone: the card shows
+                        // each run's end.
+                        (Some((text, envelope)), Some(_)) => (text, envelope),
+                        (Some((text, envelope)), None) => (present(&text), envelope),
+                        // No answer was written: every run's own result.
+                        (None, Some(answer)) => (answer.messages.join("\n\n"), None),
+                        (None, None) => (present(&body), None),
                     };
 
                     let mut delivered = false;
@@ -3378,7 +3432,7 @@ impl CliAgentTool {
                 guard.disarm();
             }
 
-            mark_left_in_background();
+            mark_background_run(&run_label);
             return Ok(format!(
                 "{}\nCLI agent '{}' started in background (task_id={}). \
                  Use action=\"check\" with task_id=\"{}\" to see output when done.",
@@ -3616,7 +3670,7 @@ impl CliAgentTool {
                     guard.disarm();
                 }
 
-                mark_left_in_background();
+                mark_background_run(&run_label);
                 Ok(format!(
                     "{}\nCLI agent '{}' still running after {}s. Moved to background (task_id={}).\n\
                      Use action=\"check\" with task_id=\"{}\" to see output, or action=\"cancel\" to stop it.\n\n\
@@ -5038,28 +5092,32 @@ impl CliAgentTool {
                 || parsed
                     .as_ref()
                     .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
-        let (output, left_in_background, settled, changed) = RUN_CHANGED_LOCALLY
+        let (output, left_in_background, settled, changed, run_label) = BACKGROUND_RUN_LABEL
             .scope(
-                std::cell::Cell::new(false),
-                BACKGROUND_SETTLED.scope(
+                std::cell::RefCell::new(None),
+                RUN_CHANGED_LOCALLY.scope(
                     std::cell::Cell::new(false),
-                    LEFT_IN_BACKGROUND.scope(std::cell::Cell::new(false), async {
-                        let output = self
-                            .call_with_status_under_contract(
-                                arguments,
-                                status_tx,
-                                read_only_run,
-                                enforce_native_access,
-                                facts,
-                            )
-                            .await?;
-                        anyhow::Ok((
-                            output,
-                            LEFT_IN_BACKGROUND.with(std::cell::Cell::get),
-                            BACKGROUND_SETTLED.with(std::cell::Cell::get),
-                            RUN_CHANGED_LOCALLY.with(std::cell::Cell::get),
-                        ))
-                    }),
+                    BACKGROUND_SETTLED.scope(
+                        std::cell::Cell::new(false),
+                        LEFT_IN_BACKGROUND.scope(std::cell::Cell::new(false), async {
+                            let output = self
+                                .call_with_status_under_contract(
+                                    arguments,
+                                    status_tx,
+                                    read_only_run,
+                                    enforce_native_access,
+                                    facts,
+                                )
+                                .await?;
+                            anyhow::Ok((
+                                output,
+                                LEFT_IN_BACKGROUND.with(std::cell::Cell::get),
+                                BACKGROUND_SETTLED.with(std::cell::Cell::get),
+                                RUN_CHANGED_LOCALLY.with(std::cell::Cell::get),
+                                BACKGROUND_RUN_LABEL.with(|slot| slot.borrow_mut().take()),
+                            ))
+                        }),
+                    ),
                 ),
             )
             .await?;
@@ -5069,6 +5127,9 @@ impl CliAgentTool {
                 .with_verification_mode(ToolVerificationMode::ResultContent);
         }
         outcome.metadata.background_settled = settled && !left_in_background;
+        if outcome.metadata.background_started {
+            outcome.metadata.background_run_label = run_label;
+        }
         Ok(outcome)
     }
 

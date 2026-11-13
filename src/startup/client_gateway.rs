@@ -163,7 +163,7 @@ impl ClientHost for DaemonClientHost {
 /// app connection that sent the turn's message, and only that one.
 pub(crate) struct GatewayViews;
 
-impl crate::tools::client_view::ClientViews for GatewayViews {
+impl aidaemon_client_gateway::client_view::ClientViews for GatewayViews {
     fn can_show(&self, session_id: &str) -> bool {
         running().is_some_and(|gateway| gateway.views().can_show(session_id))
     }

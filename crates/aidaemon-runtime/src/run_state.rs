@@ -225,6 +225,13 @@ struct RunGroup {
     ended: HashMap<String, GroupEnd>,
 }
 
+/// The group of the runs one chat turn started: every background run that
+/// turn left running (helpers, commands, CLI agents) is answered together
+/// once the last of them ends.
+pub fn turn_group(chat: &str, task_id: &str) -> String {
+    format!("{chat}#{task_id}")
+}
+
 /// One grouped run's end with its result, held until its group's last run
 /// ends.
 #[derive(Debug, Clone)]

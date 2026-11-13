@@ -1,15 +1,24 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::execution::{BackendPath, ExecutionRequest, SharedExecutionBackend};
-use crate::traits::{Tool, ToolCapabilities, ToolRole};
+use crate::backend::SharedExecutionBackend;
+use crate::semantics::{ToolCapabilities, ToolRole};
+use crate::OutcomeTool as Tool;
+use crate::{BackendPath, ExecutionRequest};
+
+/// Where the daemon's process says its config file is.
+pub const RUNTIME_CONFIG_PATH_ENV_KEY: &str = "AIDAEMON_RUNTIME_CONFIG_PATH";
+/// Where the daemon's process says its env file is.
+pub const RUNTIME_ENV_FILE_ENV_KEY: &str = "AIDAEMON_RUNTIME_ENV_FILE";
+/// The daemon's working directory.
+pub const RUNTIME_WORKDIR_ENV_KEY: &str = "AIDAEMON_RUNTIME_WORKDIR";
 
 pub struct CheckEnvironmentTool {
-    backend: crate::execution::SharedExecutionBackend,
+    backend: SharedExecutionBackend,
 }
 
 impl CheckEnvironmentTool {
-    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+    pub fn new(backend: SharedExecutionBackend) -> Self {
         Self { backend }
     }
 }
@@ -92,8 +101,8 @@ impl Tool for CheckEnvironmentTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        _facts: &crate::semantics::ToolCallContext,
+    ) -> anyhow::Result<crate::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
             let args: Value = serde_json::from_str(arguments)?;
             let path_str = args["path"].as_str().unwrap_or(".");
@@ -170,14 +179,14 @@ impl Tool for CheckEnvironmentTool {
             Ok(output)
         }
         .await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
+        output.map(crate::semantics::ToolCallOutcome::from_output)
     }
 }
 
-impl crate::traits::ToolSemantics for CheckEnvironmentTool {
-    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
-        crate::traits::ToolDispatchFacts {
-            same_tool_streak: crate::traits::SameToolStreak::Versatile,
+impl crate::semantics::ToolSemantics for CheckEnvironmentTool {
+    fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
+        crate::semantics::ToolDispatchFacts {
+            same_tool_streak: crate::semantics::SameToolStreak::Versatile,
             ..Default::default()
         }
     }
@@ -211,19 +220,19 @@ where
 {
     let mut lines = Vec::new();
 
-    if let Ok(workdir) = lookup(crate::RUNTIME_WORKDIR_ENV_KEY) {
+    if let Ok(workdir) = lookup(RUNTIME_WORKDIR_ENV_KEY) {
         if !workdir.trim().is_empty() {
             lines.push(format!("  Working dir         {}", workdir));
         }
     }
 
-    if let Ok(config_path) = lookup(crate::RUNTIME_CONFIG_PATH_ENV_KEY) {
+    if let Ok(config_path) = lookup(RUNTIME_CONFIG_PATH_ENV_KEY) {
         if !config_path.trim().is_empty() {
             lines.push(format!("  Config path         {}", config_path));
         }
     }
 
-    if let Ok(env_path) = lookup(crate::RUNTIME_ENV_FILE_ENV_KEY) {
+    if let Ok(env_path) = lookup(RUNTIME_ENV_FILE_ENV_KEY) {
         if !env_path.trim().is_empty() {
             lines.push(format!("  Env file            {}", env_path));
         }
@@ -323,56 +332,21 @@ async fn check_config_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::ToolCalls as _;
-
-    #[test]
-    fn test_schema_has_required_fields() {
-        let tool = CheckEnvironmentTool::new(crate::execution::active_execution_backend());
-        let schema = tool.schema();
-        assert_eq!(schema["name"], "check_environment");
-        assert!(!schema["description"].as_str().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_check_environment_runs() {
-        let args = json!({}).to_string();
-        let result = CheckEnvironmentTool::new(crate::execution::active_execution_backend())
-            .call(&args)
-            .await
-            .unwrap();
-        // Should at least find git (we're in a git repo)
-        assert!(result.contains("Available Tools"));
-    }
-
-    #[tokio::test]
-    async fn test_check_environment_with_config_files() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".nvmrc"), "18.17.0").unwrap();
-        std::fs::write(dir.path().join("Dockerfile"), "FROM node:18").unwrap();
-
-        let args = json!({"path": dir.path().to_str().unwrap()}).to_string();
-        let result = CheckEnvironmentTool::new(crate::execution::active_execution_backend())
-            .call(&args)
-            .await
-            .unwrap();
-        assert!(result.contains(".nvmrc"));
-        assert!(result.contains("18.17.0"));
-        assert!(result.contains("Dockerfile"));
-    }
+    use crate::testing::ToolCalls as _;
 
     #[test]
     fn test_format_daemon_runtime_context() {
         let vars = std::collections::HashMap::from([
             (
-                crate::RUNTIME_WORKDIR_ENV_KEY.to_string(),
+                RUNTIME_WORKDIR_ENV_KEY.to_string(),
                 "/daemon/root".to_string(),
             ),
             (
-                crate::RUNTIME_CONFIG_PATH_ENV_KEY.to_string(),
+                RUNTIME_CONFIG_PATH_ENV_KEY.to_string(),
                 "/daemon/root/config.toml".to_string(),
             ),
             (
-                crate::RUNTIME_ENV_FILE_ENV_KEY.to_string(),
+                RUNTIME_ENV_FILE_ENV_KEY.to_string(),
                 "/daemon/root/.env".to_string(),
             ),
             ("AIDAEMON_NO_KEYCHAIN".to_string(), "1".to_string()),
@@ -389,10 +363,51 @@ mod tests {
         assert!(rendered.contains("env-file / environment"));
     }
 
+    #[test]
+    fn test_pad_right() {
+        assert_eq!(pad_right("git", 10), "git       ");
+        assert_eq!(pad_right("docker-compose", 10), "docker-compose");
+    }
+
+    #[test]
+    fn test_schema_has_required_fields() {
+        let tool = CheckEnvironmentTool::new(crate::testing::active_execution_backend());
+        let schema = tool.schema();
+        assert_eq!(schema["name"], "check_environment");
+        assert!(!schema["description"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_environment_runs() {
+        let args = json!({}).to_string();
+        let result = CheckEnvironmentTool::new(crate::testing::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
+        // Should at least find git (we're in a git repo)
+        assert!(result.contains("Available Tools"));
+    }
+
+    #[tokio::test]
+    async fn test_check_environment_with_config_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".nvmrc"), "18.17.0").unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM node:18").unwrap();
+
+        let args = json!({"path": dir.path().to_str().unwrap()}).to_string();
+        let result = CheckEnvironmentTool::new(crate::testing::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
+        assert!(result.contains(".nvmrc"));
+        assert!(result.contains("18.17.0"));
+        assert!(result.contains("Dockerfile"));
+    }
+
     #[tokio::test]
     async fn test_check_tool_git() {
         let result = check_tool(
-            crate::execution::active_execution_backend(),
+            crate::testing::active_execution_backend(),
             "git",
             "--version",
         )
@@ -406,17 +421,11 @@ mod tests {
     #[tokio::test]
     async fn test_check_tool_nonexistent() {
         let result = check_tool(
-            crate::execution::active_execution_backend(),
+            crate::testing::active_execution_backend(),
             "nonexistent_tool_xyz_12345",
             "--version",
         )
         .await;
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_pad_right() {
-        assert_eq!(pad_right("git", 10), "git       ");
-        assert_eq!(pad_right("docker-compose", 10), "docker-compose");
     }
 }

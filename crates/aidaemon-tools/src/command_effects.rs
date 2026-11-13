@@ -748,6 +748,24 @@ pub fn only_reads_this_computer(command: &str) -> bool {
     })
 }
 
+/// Whether every command only reads, here or across the network, and
+/// changes nothing: [`only_reads_this_computer`]'s shapes, plus `curl`
+/// reads of any site that save nothing and send no write. What a run given
+/// the network capability does when it is not this is a change somewhere
+/// the sandbox does not reach (a container engine, a service).
+pub fn only_reads(command: &str) -> bool {
+    if command_effects(command).deletes || scan(command).writes_file || sends_remote_write(command)
+    {
+        return false;
+    }
+    every_segment(command, &|program, args| match program {
+        "cd" => true,
+        "ddev" => ddev_query_ok(args),
+        "curl" => !curl_saves_files(args),
+        _ => OBSERVATION_PROGRAMS.contains(&program) && observation_args_ok(program, args),
+    })
+}
+
 /// Whether a `curl` call saves something to a file: an output, header,
 /// cookie or trace file. Output sent to `/dev/null` saves nothing.
 fn curl_saves_files(args: &[String]) -> bool {

@@ -1448,6 +1448,11 @@ pub struct ToolCallMetadata {
     /// handed off is still running when the model wants to stop.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub background_settled: bool,
+    /// The name, as the owner reads it, of the run this call left running
+    /// in the background (a helper, a command, a CLI agent): the turn's
+    /// launch line names its runs from these, never from the call's text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_run_label: Option<String>,
     /// Completion semantics for this specific tool call.
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,

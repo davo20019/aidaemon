@@ -1856,7 +1856,10 @@ impl SpawnAgentTool {
             .clone()
             .filter(|_| plan_session.as_deref() == Some(session_id.as_str()));
         if let Some(task) = parent_task_id.as_deref() {
-            runs.join_group(&background_id, &format!("{session_id}#{task}"));
+            runs.join_group(
+                &background_id,
+                &crate::run_state::turn_group(&session_id, task),
+            );
         }
         tokio::spawn(deliver_when_run_ends(
             ended_rx,
@@ -2466,11 +2469,13 @@ pub async fn update_checklist_card(hub: &dyn OutboundRouter, session_id: &str, c
 /// What a background start returns. A run that ends on the start ships this
 /// as its reply, so it is one plain line naming the helper.
 pub fn background_spawn_outcome(name: &str) -> ToolCallOutcome {
-    reported(
+    let mut outcome = reported(
         crate::background_run::started_in_background(name),
         SourceTrust::Trusted,
     )
-    .handed_to_background()
+    .handed_to_background();
+    outcome.metadata.background_run_label = Some(name.trim().to_string());
+    outcome
 }
 
 impl aidaemon_tools::semantics::ToolSemantics for SpawnAgentTool {

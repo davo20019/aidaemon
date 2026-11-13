@@ -14,7 +14,6 @@ pub use aidaemon_tools::file_delivery;
 /// SDK tools as daemon tools (no SDK tool is wrapped yet; 8.4 moves them).
 #[allow(dead_code)]
 mod file_policy;
-mod goal_ids;
 pub(crate) use file_policy::daemon_file_policy;
 pub use file_policy::DaemonPaths;
 #[cfg(test)]
@@ -86,11 +85,10 @@ mod manage_cli_agents;
 pub use manage_cli_agents::ManageCliAgentsTool;
 pub mod manage_goal_tasks;
 pub use manage_goal_tasks::ManageGoalTasksTool;
-pub mod client_view;
 pub mod report_blocker;
+pub use aidaemon_client_gateway::client_view::ClientViewTool;
 pub use aidaemon_skills::tools::{ManageSkillsTool, SkillResourcesTool, UseSkillTool};
 pub(crate) use aidaemon_tools::command_effects;
-pub use client_view::ClientViewTool;
 pub use manage_mcp::ManageMcpTool;
 pub use report_blocker::ReportBlockerTool;
 pub mod command_patterns;
@@ -110,14 +108,13 @@ mod search_files;
 pub use aidaemon_tools::project_inspect::ProjectInspectTool;
 pub use search_files::SearchFilesTool;
 pub(crate) mod run_command;
+pub use aidaemon_tools::check_environment::CheckEnvironmentTool;
 pub use aidaemon_tools::checkpoints::ListCheckpointsTool;
 pub use aidaemon_tools::git_commit::GitCommitTool;
 pub use aidaemon_tools::git_info::GitInfoTool;
 pub(crate) use aidaemon_tools::process_control;
-pub use run_command::RunCommandTool;
-mod check_environment;
 pub use aidaemon_tools::service_status::ServiceStatusTool;
-pub use check_environment::CheckEnvironmentTool;
+pub use run_command::RunCommandTool;
 
 #[cfg(test)]
 mod execution_backend_injection_tests;

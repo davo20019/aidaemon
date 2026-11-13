@@ -2,6 +2,7 @@
 //! `aidaemon_work::tools::objective_status`; the tests here run it against the
 //! daemon's assembled state store.
 
+#[cfg(test)]
 pub(crate) use aidaemon_work::tools::objective_status::*;
 
 #[cfg(test)]

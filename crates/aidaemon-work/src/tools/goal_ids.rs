@@ -5,7 +5,7 @@
 use crate::traits::Goal;
 
 /// The first characters of a goal id, as tools show it.
-pub(crate) fn short_goal_id(id: &str) -> String {
+pub fn short_goal_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
@@ -14,7 +14,7 @@ pub(crate) fn short_goal_id(id: &str) -> String {
 /// of ids. More than one match is an error that lists them, live ones
 /// first. `kind` names the candidates in the not-found error ("Goal",
 /// "Scheduled goal").
-pub(crate) fn pick_goal(handle: &str, candidates: &[Goal], kind: &str) -> anyhow::Result<String> {
+pub fn pick_goal(handle: &str, candidates: &[Goal], kind: &str) -> anyhow::Result<String> {
     let handle = handle.trim();
     anyhow::ensure!(!handle.is_empty(), "Empty goal ID");
     let mut matches: Vec<&Goal> = candidates
@@ -62,6 +62,7 @@ pub(crate) fn pick_goal(handle: &str, candidates: &[Goal], kind: &str) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::Goal;
 
     fn goal(id: &str, status: &str, description: &str) -> Goal {
         let mut goal = Goal::new_finite(description, "telegram:synthetic-user-1");

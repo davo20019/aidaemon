@@ -216,6 +216,11 @@ pub struct TurnScope<'a> {
     /// run ("Started in the background: …"): the reply of a run that stops
     /// while the job runs.
     pub background_ack: std::sync::Mutex<Option<String>>,
+    /// The names of the runs this turn left running in the background, in
+    /// launch order (each call's typed `background_run_label`): the turn's
+    /// launch line names them all
+    /// ([`crate::background_run::started_group_in_background`]).
+    pub background_runs: std::sync::Mutex<Vec<String>>,
     /// When the run took over a helper's work after the helper it waited on
     /// failed: from here to the run's end is the run's own work, measured.
     pub own_work_since: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,

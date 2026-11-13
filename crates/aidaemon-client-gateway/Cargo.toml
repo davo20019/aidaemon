@@ -41,6 +41,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 aidaemon-client-core = { path = "../aidaemon-client-core" }
+aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
 rand = "0.10"
 aidaemon-channels = { path = "../aidaemon-channels", features = ["testing"] }
 futures = "0.3"

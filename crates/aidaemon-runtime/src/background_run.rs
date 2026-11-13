@@ -20,8 +20,12 @@ use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use crate::run_state::{RunEvidence, RunMeasure, RunPhase, RunReport, RunState, RunStates};
-use crate::spawn_tool::{job_end, render_run_result, settle_background_steps, HelperCard};
+use crate::run_state::{
+    GroupEnd, GroupTurn, RunEvidence, RunMeasure, RunPhase, RunReport, RunState, RunStates,
+};
+use crate::spawn_tool::{
+    group_followup, job_end, render_run_result, settle_background_steps, HelperCard,
+};
 
 /// The reply of a turn that handed its work to a background run, and the
 /// first line of the call that started it: one plain line naming the run.
@@ -30,6 +34,55 @@ pub fn started_in_background(label: &str) -> String {
         "Started in the background: {}. Its result will come to this chat when it finishes.",
         label.trim()
     )
+}
+
+/// The launch line for the runs one turn left running, from their records:
+/// one run is named alone ([`started_in_background`]); several are named
+/// together, with one answer once the last of them ends.
+pub fn started_group_in_background(labels: &[String]) -> String {
+    let labels: Vec<&str> = labels
+        .iter()
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+        .collect();
+    match labels.as_slice() {
+        [] => "Started in the background. Its result will come to this chat when it finishes."
+            .to_string(),
+        [one] => started_in_background(one),
+        [first, second] => format!(
+            "Started 2 in the background: {first} and {second}. I'll answer when both finish."
+        ),
+        [rest @ .., last] => format!(
+            "Started {} in the background: {} and {last}. I'll answer when all of them finish.",
+            labels.len(),
+            rest.join(", ")
+        ),
+    }
+}
+
+/// What a background run's end means for its chat's answer.
+#[derive(Debug)]
+pub enum RunsTurn {
+    /// It is not one of several runs its turn started: it answers alone.
+    Alone,
+    /// Other runs of its turn still run: its end is on the card, and the
+    /// chat is answered once, when the last of them ends.
+    Waiting,
+    /// It was the last run of its turn's group: the chat gets one answer
+    /// from every run's result.
+    Answer(GroupAnswer),
+}
+
+/// The one answer a turn's group of runs gets.
+#[derive(Debug)]
+pub struct GroupAnswer {
+    /// The continuation the parent answers from ([`group_followup`]).
+    pub followup: String,
+    /// The turn's task, which the continuation continues.
+    pub parent_task_id: Option<String>,
+    /// Each run's own result message, in start order: what the chat gets
+    /// when no answer can be written.
+    pub messages: Vec<String>,
 }
 
 /// Most characters a run's label keeps.
@@ -124,6 +177,8 @@ pub struct BackgroundRun {
     /// The turn that started it: its end waits until that turn is over, so
     /// the turn's reply and kept card come first.
     turn: Option<TurnOver>,
+    /// The turn's task, when it has one: the run is one of its group.
+    task_id: Option<String>,
     work_began: DateTime<Utc>,
     /// Its card once its turn has kept one.
     card: HelperCard,
@@ -135,6 +190,12 @@ impl BackgroundRun {
     /// "continuing in the background" and settles when it ends.
     pub async fn start(home: RunHome, start: RunStart<'_>) -> Arc<Self> {
         home.runs.begin(start.id, start.chat, start.label, None);
+        // The runs one turn leaves running are one group, whatever kind they
+        // are: the chat is answered once, after the last of them.
+        if let Some(task) = start.task_id.filter(|task| !task.trim().is_empty()) {
+            home.runs
+                .join_group(start.id, &crate::run_state::turn_group(start.chat, task));
+        }
         let hub = home.hub.as_ref().and_then(Weak::upgrade);
         let before = match hub.as_ref() {
             Some(hub) => hub.checklist_surface(start.chat).await,
@@ -173,6 +234,7 @@ impl BackgroundRun {
             label: start.label.to_string(),
             status_tx: start.status_tx,
             turn: TurnOver::current(),
+            task_id: start.task_id.map(str::to_string),
             work_began: start.work_began,
         });
         run.show_on_live_card();
@@ -263,6 +325,32 @@ impl BackgroundRun {
         (Some(ended), on_card)
     }
 
+    /// Its end within its turn's group (`state`, from [`Self::finish`]):
+    /// `report` is its result as the parent reads it, `message` what the
+    /// chat gets for it alone. Given once per run.
+    pub fn end_in_group(
+        &self,
+        state: &RunState,
+        report: RunReport,
+        message: String,
+        max_report_chars: usize,
+    ) -> RunsTurn {
+        let end = GroupEnd {
+            state: state.clone(),
+            report,
+            message,
+        };
+        match self.home.runs.group_end(&self.id, end) {
+            GroupTurn::Alone => RunsTurn::Alone,
+            GroupTurn::Waiting => RunsTurn::Waiting,
+            GroupTurn::Complete(ends) => RunsTurn::Answer(GroupAnswer {
+                followup: group_followup(&ends, max_report_chars),
+                parent_task_id: self.task_id.clone(),
+                messages: ends.into_iter().map(|end| end.message).collect(),
+            }),
+        }
+    }
+
     /// Its result for the chat, from its record: the body, how it ended
     /// only when no card shows it, and the time the runtime measured.
     pub fn result(&self, state: Option<&RunState>, body: &str, on_card: bool) -> String {
@@ -299,6 +387,85 @@ mod tests {
             "a shell loop"
         );
         assert_eq!(plain_label(None, "ddev"), "ddev");
+    }
+
+    #[test]
+    fn the_launch_line_names_every_run_of_the_turn() {
+        assert_eq!(
+            started_group_in_background(&["counting script".into()]),
+            started_in_background("counting script")
+        );
+        assert_eq!(
+            started_group_in_background(&["Install Drupal".into(), "Install WordPress".into()]),
+            "Started 2 in the background: Install Drupal and Install WordPress. I'll answer \
+             when both finish."
+        );
+        assert_eq!(
+            started_group_in_background(&["a".into(), "b".into(), "c".into()]),
+            "Started 3 in the background: a, b and c. I'll answer when all of them finish."
+        );
+    }
+
+    /// A command and a CLI agent one turn left running are one group: the
+    /// first end waits, the last one answers the turn once from both.
+    #[tokio::test]
+    async fn the_runs_one_turn_leaves_running_answer_once() {
+        let home = RunHome {
+            runs: Arc::new(RunStates::default()),
+            hub: None,
+            plans: None,
+        };
+        let start = |id: &'static str, label: &'static str| RunStart {
+            id,
+            chat: "chat",
+            label,
+            task_id: Some("task-1"),
+            status_tx: None,
+            work_began: Utc::now(),
+        };
+        let command = BackgroundRun::start(home.clone(), start("command-1", "count")).await;
+        let agent = BackgroundRun::start(home.clone(), start("cli-agent-1", "Install")).await;
+        let end = |run: &BackgroundRun, state: Option<RunState>, text: &str| {
+            let state = state.expect("its record");
+            run.end_in_group(
+                &state,
+                RunReport {
+                    text: text.to_string(),
+                    untrusted: false,
+                },
+                format!("{} done", run.label()),
+                1000,
+            )
+        };
+        let (state, _) = command
+            .finish(RunPhase::Succeeded, RunEvidence::default())
+            .await;
+        assert!(matches!(end(&command, state, "8"), RunsTurn::Waiting));
+        let (state, _) = agent
+            .finish(RunPhase::Succeeded, RunEvidence::default())
+            .await;
+        match end(&agent, state, "installed") {
+            RunsTurn::Answer(answer) => {
+                assert_eq!(answer.parent_task_id.as_deref(), Some("task-1"));
+                assert_eq!(answer.messages, vec!["count done", "Install done"]);
+                assert!(answer.followup.contains("installed"));
+            }
+            other => panic!("expected the group's answer, got {other:?}"),
+        }
+
+        // A run alone in its turn answers alone.
+        let solo = BackgroundRun::start(
+            home,
+            RunStart {
+                task_id: Some("task-2"),
+                ..start("command-2", "solo")
+            },
+        )
+        .await;
+        let (state, _) = solo
+            .finish(RunPhase::Succeeded, RunEvidence::default())
+            .await;
+        assert!(matches!(end(&solo, state, "ok"), RunsTurn::Alone));
     }
 
     #[test]
