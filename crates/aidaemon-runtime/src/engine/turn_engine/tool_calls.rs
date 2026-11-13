@@ -3,6 +3,7 @@
 //! `execute_tool_outcome`, receipts and the persisted tool exchange.
 
 use super::*;
+use crate::engine::dispatcher::ToolDispatch as _;
 #[allow(unused_imports)]
 use crate::engine::{tool_result_fit::ToolResultFit, work_scope::WorkScope};
 

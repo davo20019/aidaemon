@@ -1,4 +1,5 @@
 use super::types::{BootstrapCtx, BootstrapData, BootstrapOutcome};
+use crate::engine::tool_roster::ToolRoster as _;
 use std::collections::HashMap;
 use std::time::Duration;
 

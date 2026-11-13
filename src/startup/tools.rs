@@ -1338,7 +1338,6 @@ async fn build_base_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::Agent;
     use crate::events::EventStoreForTests as _;
     use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
     use crate::memory::embeddings::EmbeddingService;
@@ -1703,7 +1702,8 @@ mod tests {
                 .as_str()
                 .unwrap_or("<unknown>")
                 .to_string();
-            let result = Agent::validate_tool_definition_contract(&schema);
+            let result =
+                aidaemon_runtime::engine::tool_roster::validate_tool_definition_contract(&schema);
             assert!(
                 result.is_ok(),
                 "tool schema contract failed for {}: {:?}",
@@ -1806,7 +1806,7 @@ mod tests {
                         .as_str()
                         .unwrap_or("<unknown>")
                         .to_string();
-                    let result = Agent::validate_tool_definition_contract(&schema);
+                    let result = aidaemon_runtime::engine::tool_roster::validate_tool_definition_contract(&schema);
                     assert!(
                         result.is_ok(),
                         "tool schema contract failed for {}: {:?}",

@@ -1,12 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::json;
+#[cfg(test)]
+use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
@@ -20,7 +24,8 @@ use crate::events::{
 };
 #[cfg(test)]
 use crate::events::{DecisionPointData, DecisionType, EventType};
-use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
+#[cfg(test)]
+use crate::execution_policy::{ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
 use crate::llm_runtime::side_calls::SideCall;
 use crate::llm_runtime::SharedLlmRuntime;
@@ -29,8 +34,12 @@ use crate::runtime_ports::OutboundRouter;
 use crate::skills;
 #[cfg(test)]
 use crate::traits::Message;
-use crate::traits::{AgentRole, StateStore, Tool, ToolCapabilities};
-use crate::types::{ChannelContext, ChannelVisibility, UserRole};
+#[cfg(test)]
+use crate::traits::ToolCapabilities;
+use crate::traits::{AgentRole, StateStore, Tool};
+#[cfg(test)]
+use crate::types::ChannelVisibility;
+use crate::types::{ChannelContext, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
 #[cfg(test)]
 use crate::events::ToolCallInfo;
@@ -86,11 +95,6 @@ mod execution_state;
 #[cfg(test)]
 pub(crate) use execution_state::ExecutionBudget;
 pub(crate) use execution_state::TargetScope;
-/// Tool-failure classification lives in `aidaemon-runtime`.
-mod loop_utils {
-    pub(in crate::agent) use aidaemon_runtime::turn::loop_utils::*;
-}
-use loop_utils::is_trigger_session;
 /// The post-run learning context lives in `aidaemon-runtime`.
 mod post_task {
     pub(crate) use aidaemon_runtime::turn::post_task::*;
@@ -192,7 +196,6 @@ mod runtime_ports;
 #[path = "runtime/spawn.rs"]
 mod spawn;
 mod turn_host;
-pub(crate) use aidaemon_runtime::engine::work_scope::WorkScope;
 /// Session notes and parent-visible deliveries, on any TurnHost.
 pub(crate) use aidaemon_runtime::turn::notes::TurnNotes;
 /// The speech-to-text fallback lives in `aidaemon-runtime`.
@@ -207,9 +210,14 @@ mod system_directives {
 }
 #[path = "runtime/system_prompt.rs"]
 mod system_prompt;
-#[path = "tools/tool_defs.rs"]
-mod tool_defs;
-#[path = "tools/tool_exec.rs"]
+/// Tool dispatch and the tool roster live in `aidaemon-runtime`
+/// (`engine::dispatcher`, `engine::tool_roster`); their tests run here, on
+/// the daemon's harness.
+#[cfg(test)]
+#[path = "tools/tool_defs_tests.rs"]
+mod tool_defs_tests;
+#[cfg(test)]
+#[path = "tools/tool_exec_tests.rs"]
 mod tool_exec;
 #[path = "turn/tool_execution/mod.rs"]
 mod tool_execution;
@@ -228,7 +236,6 @@ pub use policy_metrics::{
 // in-tree consumer (the legacy definition carried `#[allow(dead_code)]`).
 #[allow(unused_imports)]
 pub use policy_metrics::PolicyAutotuneSnapshot;
-pub(in crate::agent) use policy_metrics::POLICY_METRICS;
 
 // Free-function helpers (status, resume, project-scope cues, untrusted-reference
 // filtering, intent-gate merge). Implementation lives in `agent_helpers.rs`.

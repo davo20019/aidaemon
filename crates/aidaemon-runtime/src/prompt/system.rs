@@ -2,6 +2,7 @@
 //! specialists, channel rules, skills catalog) behind its per-session cache,
 //! the per-task context tails, and the mandate worker's built-in-only prompt.
 
+use crate::engine::tool_roster::ToolRoster as _;
 use std::hash::{Hash, Hasher};
 
 use aidaemon_channels::context::ChannelContext;

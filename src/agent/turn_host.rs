@@ -156,6 +156,28 @@ impl TurnServices for Agent {
         self.mcp_registry.as_ref()?.find_tool(name).await
     }
 
+    async fn mcp_tools_matching(
+        &self,
+        user_message: &str,
+    ) -> Vec<std::sync::Arc<dyn crate::traits::Tool>> {
+        match self.mcp_registry.as_ref() {
+            Some(registry) => registry.match_tools(user_message).await,
+            None => Vec::new(),
+        }
+    }
+
+    async fn mcp_tool_names(&self) -> Vec<String> {
+        let Some(registry) = self.mcp_registry.as_ref() else {
+            return Vec::new();
+        };
+        registry
+            .list_servers()
+            .await
+            .into_iter()
+            .flat_map(|info| info.tool_names)
+            .collect()
+    }
+
     fn transcript_writes(
         &self,
     ) -> std::sync::Arc<dyn aidaemon_runtime::turn::memory_writer::MemoryWrites> {
@@ -237,18 +259,6 @@ impl TurnHost for Agent {
 
     fn persona(&self) -> &str {
         &self.system_prompt
-    }
-
-    fn session_static_tool_roster(
-        &self,
-        user_role: crate::types::UserRole,
-        channel_ctx: &crate::types::ChannelContext,
-    ) -> Vec<(String, String)> {
-        Agent::session_static_tool_roster(self, user_role, channel_ctx)
-    }
-
-    fn has_registered_tool(&self, name: &str) -> bool {
-        Agent::has_registered_tool(self, name)
     }
 
     fn specialist_kinds(&self) -> Vec<(String, String)> {
@@ -381,74 +391,6 @@ impl TurnHost for Agent {
 
     fn skills(&self) -> &crate::skills::SkillCache {
         &self.skill_cache
-    }
-
-    fn registered_tool_definitions_with_capabilities(
-        &self,
-    ) -> (
-        Vec<serde_json::Value>,
-        std::collections::HashMap<String, crate::traits::ToolCapabilities>,
-    ) {
-        Agent::registered_tool_definitions_with_capabilities(self)
-    }
-
-    fn retain_offered_in_session(
-        &self,
-        defs: &mut Vec<serde_json::Value>,
-        capabilities: &mut std::collections::HashMap<String, crate::traits::ToolCapabilities>,
-        session_id: &str,
-    ) {
-        let withheld: std::collections::HashSet<&str> = self
-            .tools
-            .iter()
-            .filter(|tool| !tool.offered_in_session(session_id))
-            .map(|tool| tool.name())
-            .collect();
-        if withheld.is_empty() {
-            return;
-        }
-        defs.retain(|def| {
-            aidaemon_runtime::turn::helpers::tool_name_from_definition(def)
-                .is_none_or(|name| !withheld.contains(name))
-        });
-        capabilities.retain(|name, _| !withheld.contains(name.as_str()));
-    }
-
-    async fn tool_definitions_with_capabilities(
-        &self,
-        user_message: &str,
-    ) -> (
-        Vec<serde_json::Value>,
-        std::collections::HashMap<String, crate::traits::ToolCapabilities>,
-    ) {
-        Agent::tool_definitions_with_capabilities(self, user_message).await
-    }
-
-    fn filter_tool_definitions_for_policy(
-        &self,
-        defs: &[serde_json::Value],
-        capabilities: &std::collections::HashMap<String, crate::traits::ToolCapabilities>,
-        policy: &crate::execution_policy::ExecutionPolicy,
-        risk_score: f32,
-        widen: bool,
-    ) -> Vec<serde_json::Value> {
-        Agent::filter_tool_definitions_for_policy(
-            self,
-            defs,
-            capabilities,
-            policy,
-            risk_score,
-            widen,
-        )
-    }
-
-    async fn execute_tool_with_watchdog_outcome(
-        &self,
-        name: &str,
-        arguments: &str,
-        ctx: &aidaemon_runtime::engine::tool_exec::ToolExecCtx<'_>,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-        Agent::execute_tool_with_watchdog_outcome(self, name, arguments, ctx).await
     }
 
     async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String> {

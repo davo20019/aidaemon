@@ -3524,6 +3524,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
             trust_roots: None,
             lone_root_call: false,
         };
+        use aidaemon_runtime::engine::dispatcher::ToolDispatch as _;
         harness
             .agent
             .execute_tool_with_watchdog_outcome(tool, &spoof, &ctx)
@@ -4461,7 +4462,10 @@ fn no_name_keyed_dispatch_remains() {
             include_str!("../../../../crates/aidaemon-runtime/src/engine/turn_engine/mod.rs"),
         ),
         ("approvals.rs", include_str!("../approvals.rs")),
-        ("tool_defs.rs", include_str!("../../tools/tool_defs.rs")),
+        (
+            "tool_roster.rs",
+            include_str!("../../../../crates/aidaemon-runtime/src/engine/tool_roster.rs"),
+        ),
     ];
     let names = [
         "send_file",

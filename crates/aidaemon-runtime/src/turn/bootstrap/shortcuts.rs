@@ -1,3 +1,4 @@
+use crate::engine::dispatcher::ToolDispatch as _;
 use std::time::Instant;
 
 use aidaemon_channels::context::ChannelContext;

@@ -2,6 +2,7 @@
 //! transcript, then the run on the kernel ([`TurnEngine::handle_message_sdk`]).
 
 use super::*;
+use crate::engine::tool_roster::ToolRoster as _;
 use crate::turn::bootstrap::{BootstrapCtx, BootstrapData, BootstrapOutcome};
 use crate::turn::completion_contract::{CompletionContract, CompletionProgress};
 use crate::turn::execution_state::{
