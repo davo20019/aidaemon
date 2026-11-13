@@ -8,6 +8,7 @@ pub mod mcp;
 pub mod memory_pipeline;
 pub(crate) mod migrations;
 pub mod nodes;
+pub mod oauth;
 pub(crate) mod prompt;
 pub mod runtime;
 pub mod skills;

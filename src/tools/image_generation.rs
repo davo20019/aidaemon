@@ -22,7 +22,9 @@ use crate::channels::attachments::{save_tool_observation_image, sniff_image_mime
 use crate::events::{
     Event, EventStore, EventType, ResourceInvalidatedData, ResourceRegisteredData,
 };
-use crate::oauth::chatgpt_codex::{self, ChatGptCredentialManager, CODEX_BACKEND_BASE_URL};
+use crate::providers::chatgpt_login::{
+    self as chatgpt_codex, ChatGptCredentialManager, CODEX_BACKEND_BASE_URL,
+};
 use crate::traits::{
     Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolMutationEffects, ToolOutcomeStatus, ToolVerificationMode,

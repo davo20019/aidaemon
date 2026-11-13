@@ -1,26 +1,5 @@
-//! Conversation projection helpers.
-//!
-//! The canonical persistence path is event-sourced (`events` table). Event ->
-//! turn projection now lives in `crate::events::turn_from_event`; this module
-//! keeps runtime `traits::Message` compatibility helpers (including truncation).
-
-use chrono::{DateTime, Utc};
-use serde_json::Value;
-
-use crate::traits::Message;
-
-/// Project a single canonical event row into a `Message` (runtime conversation shape).
-#[allow(dead_code)] // Transitional shim while runtime callers migrate to event-native turns.
-pub fn message_from_event(
-    event_id: i64,
-    session_id: &str,
-    event_type: &str,
-    data: &Value,
-    created_at: DateTime<Utc>,
-) -> Option<Message> {
-    crate::events::turn_from_event(event_id, session_id, event_type, data, created_at)
-        .map(|turn| turn.into_message())
-}
+//! Conversation helpers kept at their old path: event -> turn projection is
+//! `aidaemon_events::turn_from_event`, truncation `truncate_with_anchor`.
 
 pub use aidaemon_events::conversation::truncate_with_anchor;
 

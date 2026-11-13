@@ -58,16 +58,20 @@ SHELL = {
 # Old paths kept as re-exports of crate items: they may hold nothing else.
 REEXPORTS = {
     "context_budget.rs",
+    "conversation.rs",
     "db",
     "execution",
     "events",
     "execution_policy.rs",
+    "health",
     "llm_markers.rs",
     "llm_runtime.rs",
     "llm_runtime",
     "mcp",
+    "oauth",
     "project_instructions.rs",
     "router.rs",
+    "skills",
     "traits",
     "traits.rs",
     "types.rs",
@@ -82,14 +86,10 @@ PENDING = {
     "state": "9.3/9.6: the SQLite store behind the facade traits",
     "memory": "9.1/9.6: memory host adapters, procedures, task learning, retention",
     "heartbeat": "9.6: heartbeat host",
-    "health": "9.6: health alert delivery",
     "nodes": "9.6: nodes host",
-    "oauth": "9.6: OAuth host",
-    "skills": "9.6: skills host",
     "terminal_bridge.rs": "9.6: terminal bridge host",
     "agent_handoff.rs": "9.5: terminal attach handoff",
     "terminal_lite.rs": "9.5: chat terminal mode",
-    "conversation.rs": "9.2: conversation projection helpers",
 }
 
 # Directories whose step is done: only adapters and tests may stay.

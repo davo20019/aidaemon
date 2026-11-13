@@ -1649,7 +1649,7 @@ mod tests {
         let state = Arc::new(SqliteStateStore::new(&db_path, 32, None, embedding_service).await?);
         let profiles: SharedHttpProfiles =
             Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let gateway = crate::oauth::daemon_gateway(
+        let gateway = crate::startup::oauth::daemon_gateway(
             state.clone() as Arc<dyn crate::traits::OAuthGatewayStore>,
             profiles,
             "http://localhost:8080".to_string(),

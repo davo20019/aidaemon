@@ -32,7 +32,7 @@ fn provider_specific_base_url_override(config: &ProviderConfig) -> Option<&str> 
 /// process-wide manager serializes refresh-token rotation across every
 /// subscription-backed adapter.
 struct DaemonChatGptAuth {
-    manager: Arc<crate::oauth::chatgpt_codex::ChatGptCredentialManager>,
+    manager: Arc<crate::providers::chatgpt_login::ChatGptCredentialManager>,
     client: reqwest::Client,
 }
 
@@ -63,7 +63,7 @@ impl aidaemon_providers::ChatGptAuth for DaemonChatGptAuth {
 }
 
 fn sdk_credentials(
-    credentials: crate::oauth::chatgpt_codex::ChatGptCredentials,
+    credentials: crate::providers::chatgpt_login::ChatGptCredentials,
 ) -> aidaemon_providers::ChatGptCredentials {
     aidaemon_providers::ChatGptCredentials {
         access_token: credentials.access_token,
@@ -79,9 +79,9 @@ pub(crate) fn chatgpt_backend(
     let client =
         super::build_http_client(std::time::Duration::from_secs(60)).map_err(anyhow::Error::msg)?;
     let mut builder = aidaemon_providers::ChatGpt::builder()
-        .base_url(base_override.unwrap_or(crate::oauth::chatgpt_codex::CODEX_BACKEND_BASE_URL))
+        .base_url(base_override.unwrap_or(crate::providers::chatgpt_login::CODEX_BACKEND_BASE_URL))
         .auth(DaemonChatGptAuth {
-            manager: crate::oauth::chatgpt_codex::shared_credential_manager(),
+            manager: crate::providers::chatgpt_login::shared_credential_manager(),
             client,
         });
     if let Some(effort) = reasoning_effort {

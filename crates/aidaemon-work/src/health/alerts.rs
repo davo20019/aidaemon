@@ -17,6 +17,14 @@ pub trait AlertDelivery: Send + Sync {
     async fn broadcast_text(&self, session_ids: &[String], text: &str);
 }
 
+/// The channel hub delivers alerts to the sessions it reaches.
+#[async_trait::async_trait]
+impl AlertDelivery for aidaemon_channels::hub::ChannelHub {
+    async fn broadcast_text(&self, session_ids: &[String], text: &str) {
+        aidaemon_channels::hub::ChannelHub::broadcast_text(self, session_ids, text).await;
+    }
+}
+
 /// Alert types for health probes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlertType {

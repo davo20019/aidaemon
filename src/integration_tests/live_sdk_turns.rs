@@ -23,7 +23,7 @@ mod live_sdk_turns {
             eprintln!("SKIPPED: set AIDAEMON_LIVE_TEST=1 to run live tests");
             return None;
         }
-        if !crate::oauth::chatgpt_codex::is_connected() {
+        if !crate::providers::chatgpt_login::is_connected() {
             eprintln!("SKIPPED: no ChatGPT login found — run `aidaemon auth login openai`");
             return None;
         }

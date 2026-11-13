@@ -2,6 +2,7 @@
 //! chat-completions JSON and the classified provider errors live in
 //! `aidaemon-runtime`; the old paths stay.
 
+pub mod chatgpt_login;
 pub(crate) mod factory;
 
 #[cfg(test)]

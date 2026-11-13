@@ -739,7 +739,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         })));
-        let gateway = crate::oauth::daemon_gateway(
+        let gateway = crate::startup::oauth::daemon_gateway(
             store.clone() as Arc<dyn crate::traits::OAuthGatewayStore>,
             Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             "http://localhost:8080".to_string(),
