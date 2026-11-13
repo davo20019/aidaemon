@@ -7370,8 +7370,22 @@ fn terminal_run_annotations(
     // when the sandbox needs the network capability to reach a local port
     // or the container engine. Judged only when the call would otherwise be
     // network (it resolves names).
-    let stays_on_this_computer =
-        reaches_network && aidaemon_tools::command_effects::reaches_only_this_computer(text);
+    //
+    // A project's own Drush or WP-CLI command run in a folder the request's
+    // work created acts on that work's own site in its own containers
+    // (live 2026-11-13: `ddev drush watchdog:show` in the Drupal site a
+    // helper had just installed asked the owner after the run read a page).
+    let runs_in_owned_folder = args
+        .working_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|dir| std::path::Path::new(dir).is_absolute())
+        .or(roots.cwd())
+        .is_some_and(|dir| roots.owns(dir));
+    let stays_on_this_computer = reaches_network
+        && (aidaemon_tools::command_effects::reaches_only_this_computer(text)
+            || (runs_in_owned_folder
+                && aidaemon_tools::command_effects::acts_on_its_ddev_project(text)));
     aidaemon_core::ToolAnnotations {
         read_only,
         destructive: effects.deletes,
@@ -10551,6 +10565,61 @@ mod tests {
             // A path that climbs out of the work's folder is not inside it.
             assert!(ann("rm -f ../claude-drupal-8/web/x.php", &made).egress);
         }
+    }
+
+    /// Live 2026-11-13: two helpers each made their site's folder with
+    /// `mkdir` (no declared `new_folders`), and every later step there
+    /// asked the owner: a read-only `ddev drush watchdog:show` among them.
+    /// A folder a succeeded call created is the request's own from then
+    /// on, so the project's own commands there ask nothing; the same
+    /// command in a folder that existed before still does.
+    #[tokio::test]
+    async fn a_folder_made_mid_run_is_the_requests_own() {
+        let (host, _) = host_and_sandboxed_terminals().await;
+        let base = tempfile::tempdir().unwrap();
+        let made = base.path().join("claude-drupal-11");
+        let older = base.path().join("claude-drupal-10");
+        std::fs::create_dir_all(&older).unwrap();
+        let (made, older) = (made.display().to_string(), older.display().to_string());
+        let owned = aidaemon_tools::semantics::OwnedFolders::default();
+        let trusted: Vec<String> = Vec::new();
+        let egress = |command: &str, working_dir: &str| {
+            let list = owned.list();
+            let roots = crate::tools::traits::TrustRoots::new(&trusted).with_owned(&list);
+            let args = serde_json::json!({
+                "action": "run", "command": command, "working_dir": working_dir,
+            });
+            host.call_annotations_in(&args.to_string(), &roots).egress
+        };
+        assert!(egress("ddev drush watchdog:show --count=8", &made));
+
+        let mkdir = serde_json::json!({"action": "run", "command": format!("mkdir {made}")});
+        let absent = aidaemon_tools::semantics::OwnedFolders::absent_write_targets(
+            &host.call_effects(&mkdir.to_string()),
+        );
+        std::fs::create_dir(&made).unwrap();
+        let claimed = owned.claim_created(&absent);
+        assert!(
+            claimed.len() == 1 && claimed[0].ends_with("/claude-drupal-11"),
+            "{claimed:?}"
+        );
+
+        assert!(!egress("ddev drush watchdog:show --count=8", &made));
+        assert!(!egress(
+            "ddev wp option update blogname 'Claude Company'",
+            &made
+        ));
+        // Code handed to the site's tools can reach anywhere: still judged.
+        assert!(egress("ddev drush php:eval 'print 1;'", &made));
+        // A folder that existed before the request is not its own.
+        assert!(egress("ddev drush watchdog:show --count=8", &older));
+        let again = serde_json::json!({"action": "run", "command": format!("mkdir -p {older}")});
+        assert!(
+            aidaemon_tools::semantics::OwnedFolders::absent_write_targets(
+                &host.call_effects(&again.to_string())
+            )
+            .is_empty()
+        );
     }
 
     #[tokio::test]

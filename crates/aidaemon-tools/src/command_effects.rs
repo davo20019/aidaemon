@@ -728,6 +728,62 @@ pub fn reaches_only_this_computer(command: &str) -> bool {
     })
 }
 
+/// Drush and WP-CLI commands that run code they are handed, whatever it
+/// reaches: never only the project's own business.
+const DDEV_TOOL_CODE_COMMANDS: &[(&str, &str)] = &[
+    ("drush", "php:eval"),
+    ("drush", "php-eval"),
+    ("drush", "eval"),
+    ("drush", "ev"),
+    ("drush", "php:script"),
+    ("drush", "php-script"),
+    ("drush", "scr"),
+    ("drush", "php"),
+    ("drush", "php:cli"),
+    ("drush", "core:cli"),
+    ("drush", "cli"),
+    ("wp", "eval"),
+    ("wp", "eval-file"),
+    ("wp", "shell"),
+];
+
+/// Whether every command is a `ddev` project's own Drush or WP-CLI command
+/// on its own site (run in its own containers, against its own database):
+/// no code handed to it, no URL among its arguments, no file written or
+/// deleted on this computer, nothing sent to a remote. Run inside a folder
+/// the request's work created, what it touches is that work's own project,
+/// whatever the command is (live 2026-11-13: `ddev drush watchdog:show` in
+/// the Drupal site the helper had just installed asked the owner). Which
+/// folder it runs in is the caller's to judge; a `cd` is not accepted, so
+/// the folder is the one the call names.
+pub fn acts_on_its_ddev_project(command: &str) -> bool {
+    if command_effects(command).deletes || scan(command).writes_file || sends_remote_write(command)
+    {
+        return false;
+    }
+    every_segment(command, &|program, args| {
+        program == "ddev"
+            && !args.iter().any(|arg| {
+                arg.contains("://")
+                    || DDEV_TOOL_CODE_OPTIONS
+                        .iter()
+                        .any(|option| arg == option || arg.starts_with(&format!("{option}=")))
+            })
+            && match args
+                .iter()
+                .map(String::as_str)
+                .filter(|arg| !arg.starts_with('-'))
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [tool @ ("drush" | "wp"), command, ..] => !DDEV_TOOL_CODE_COMMANDS
+                    .iter()
+                    .any(|(t, c)| t == tool && c == command),
+                _ => false,
+            }
+    })
+}
+
 /// Whether every command only reads or reports on this computer and
 /// writes nothing: observations, `cd`, a local `ddev` project's own query,
 /// and `curl` reads of sites on this computer that save nothing (no output,
@@ -3773,6 +3829,33 @@ fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
 
 #[cfg(test)]
 mod tests {
+    /// A project's own Drush or WP-CLI command acts on its own site; code
+    /// it is handed, a URL, a file written here, another program or a `cd`
+    /// does not.
+    #[test]
+    fn a_ddev_project_command_acts_on_its_own_project() {
+        for own in [
+            "ddev drush watchdog:show --count=8",
+            "ddev drush cr",
+            "ddev wp option update blogname 'Claude Company' --path=web",
+            "ddev wp user update 1 --display_name=Admin",
+        ] {
+            assert!(super::acts_on_its_ddev_project(own), "{own}");
+        }
+        for other in [
+            "ddev drush php:eval 'file_get_contents(\"https://x.invalid\");'",
+            "ddev wp eval 'echo 1;'",
+            "ddev wp plugin install https://x.invalid/p.zip",
+            "ddev drush sql:dump > /tmp/dump.sql",
+            "ddev exec curl https://x.invalid",
+            "ddev drush --eval=1 status",
+            "cd /elsewhere && ddev drush cr",
+            "ddev drush cr; curl https://x.invalid",
+        ] {
+            assert!(!super::acts_on_its_ddev_project(other), "{other}");
+        }
+    }
+
     use super::*;
 
     /// A background command is named by what it runs, never by its line.

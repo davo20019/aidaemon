@@ -448,6 +448,16 @@ impl TurnEngine<'_> {
                 });
             }
         }
+        // Where its declared writes land that does not exist yet: a folder
+        // it creates there is the request's own once it succeeded.
+        let absent_before = self
+            .turn_tool(scope, &request.name)
+            .map(|tool| {
+                aidaemon_tools::semantics::OwnedFolders::absent_write_targets(
+                    &tool.call_effects(arguments),
+                )
+            })
+            .unwrap_or_default();
         let executed = match self
             .execute_tool_with_watchdog_outcome(&request.name, arguments, &ctx)
             .await
@@ -517,6 +527,19 @@ impl TurnEngine<'_> {
         };
         let duration_ms = started.elapsed().as_millis() as u64;
         let failed = executed.failed();
+        if !failed && !absent_before.is_empty() {
+            let claimed = scope
+                .spawn_family
+                .owned_folders()
+                .claim_created(&absent_before);
+            if !claimed.is_empty() {
+                info!(
+                    tool = %request.name,
+                    folders = ?claimed,
+                    "A folder this request's work created is its own"
+                );
+            }
+        }
         let trust =
             self.call_output_trust(scope, &request.name, arguments, Some(executed.metadata()));
         // A site on this computer named in a trusted result, or in the

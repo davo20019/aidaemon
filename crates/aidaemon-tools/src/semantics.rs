@@ -2716,6 +2716,74 @@ impl OwnedFolders {
     pub fn list(&self) -> Vec<String> {
         self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
+
+    /// Where a call's declared writes land that does not exist yet, taken
+    /// just before it runs: what it may create. Once it succeeded,
+    /// [`Self::claim_created`] claims each that it did create as a folder.
+    pub fn absent_write_targets(effects: &aidaemon_core::CallEffects) -> Vec<std::path::PathBuf> {
+        effects
+            .keys
+            .iter()
+            .filter(|key| key.class == aidaemon_core::EffectClass::Write)
+            .map(|key| std::path::PathBuf::from(shellexpand::tilde(key.target.trim()).as_ref()))
+            .filter(|path| path.is_absolute() && std::fs::symlink_metadata(path).is_err())
+            .collect()
+    }
+
+    /// Ownership from evidence of creation: of `absent` (taken before a
+    /// call that then succeeded), each path that is now a folder was made
+    /// by this request's work (`mkdir`, a project tool's init in a new
+    /// path), so it joins the request's owned folders, as a spawn's
+    /// declared `new_folders` do (live 2026-11-13: two helpers each created
+    /// their site's folder without declaring it, and every later change
+    /// there was judged as someone else's project). A folder that existed
+    /// before never joins. Returns what it claimed.
+    pub fn claim_created(&self, absent: &[std::path::PathBuf]) -> Vec<String> {
+        let created: Vec<String> = absent
+            .iter()
+            .filter(|path| {
+                std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+            })
+            .map(|path| path.display().to_string())
+            .collect();
+        self.claim(&created);
+        created
+    }
+}
+
+#[cfg(test)]
+mod owned_folder_tests {
+    use super::OwnedFolders;
+
+    /// A folder a succeeded call created joins the request's own; one that
+    /// existed before it does not, and neither does a file it wrote.
+    #[test]
+    fn a_folder_a_call_created_becomes_owned() {
+        let base = tempfile::tempdir().unwrap();
+        let fresh = base.path().join("claude-drupal-11");
+        let file = base.path().join("notes.txt");
+        let before = base.path().join("existing-site");
+        std::fs::create_dir(&before).unwrap();
+        let key = |path: &std::path::Path| aidaemon_core::EffectKey {
+            class: aidaemon_core::EffectClass::Write,
+            target: path.display().to_string(),
+        };
+        let effects = aidaemon_core::CallEffects {
+            keys: vec![key(&fresh), key(&file), key(&before)],
+            complete: false,
+            understood: true,
+        };
+        let absent = OwnedFolders::absent_write_targets(&effects);
+        assert_eq!(absent, vec![fresh.clone(), file.clone()]);
+        std::fs::create_dir(&fresh).unwrap();
+        std::fs::write(&file, "x").unwrap();
+        let owned = OwnedFolders::default();
+        assert_eq!(
+            owned.claim_created(&absent),
+            vec![fresh.display().to_string()]
+        );
+        assert_eq!(owned.list(), vec![fresh.display().to_string()]);
+    }
 }
 
 /// Whether absolute `path` resolves inside one of `folders`, by the one
@@ -2789,6 +2857,12 @@ impl<'a> TrustRoots<'a> {
             _ => path.to_string(),
         };
         within_owned(&resolved, self.owned)
+    }
+
+    /// Whether `path` is inside a folder the request's work made for
+    /// itself (not merely inside a trusted root).
+    pub fn owns(&self, path: &str) -> bool {
+        within_owned(path, self.owned)
     }
 
     /// The directory relative paths resolve against, if any.
