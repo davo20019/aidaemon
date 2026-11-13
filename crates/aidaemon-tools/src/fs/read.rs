@@ -265,6 +265,10 @@ impl ReadFile {
                 file_size,
                 modified.as_deref(),
                 self.policy.shell_tool_name(),
+                // The commands run where the file is: macOS tools only on a
+                // local backend of a macOS daemon.
+                cfg!(target_os = "macos")
+                    && matches!(self.backend.kind(), crate::backend::BackendKind::Local),
             )));
         }
 
@@ -684,6 +688,7 @@ fn document_extraction_stub(
     file_size: u64,
     modified: Option<&str>,
     shell: &str,
+    macos: bool,
 ) -> String {
     let label = match kind {
         DocumentKind::Pdf => "PDF document",
@@ -700,24 +705,26 @@ fn document_extraction_stub(
                 "This tool cannot extract PDF text directly. Run the {shell} tool to extract it:\n"
             ));
             out.push_str(&format!("  pdftotext -layout \"{}\" -\n", quoted));
-            #[cfg(target_os = "macos")]
-            out.push_str(&format!(
-                "If pdftotext is not installed, use Spotlight's extracted text:\n  mdls -raw -name kMDItemTextContent \"{}\"\n",
-                quoted
-            ));
-            #[cfg(not(target_os = "macos"))]
-            out.push_str(
-                "If pdftotext is not installed, install poppler-utils (e.g. apt install poppler-utils) or use pandoc.\n",
-            );
+            if macos {
+                out.push_str(&format!(
+                    "If pdftotext is not installed, use Spotlight's extracted text:\n  mdls -raw -name kMDItemTextContent \"{}\"\n",
+                    quoted
+                ));
+            } else {
+                out.push_str(
+                    "If pdftotext is not installed, install poppler-utils (e.g. apt install poppler-utils) or use pandoc.\n",
+                );
+            }
         }
         DocumentKind::Word => {
             out.push_str(&format!(
                 "This tool cannot extract Word document text directly. Run the {shell} tool to extract it:\n"
             ));
-            #[cfg(target_os = "macos")]
-            out.push_str(&format!("  textutil -convert txt -stdout \"{}\"\n", quoted));
-            #[cfg(not(target_os = "macos"))]
-            out.push_str(&format!("  pandoc -t plain \"{}\"\n", quoted));
+            if macos {
+                out.push_str(&format!("  textutil -convert txt -stdout \"{}\"\n", quoted));
+            } else {
+                out.push_str(&format!("  pandoc -t plain \"{}\"\n", quoted));
+            }
         }
     }
     out.push_str("Do not ask the user to convert the file — extract it yourself.");
@@ -785,5 +792,49 @@ fn format_text_file_header(
             path, line_summary, file_size, modified
         ),
         None => format!("File: {} ({}, {} bytes)\n", path, line_summary, file_size),
+    }
+}
+
+#[cfg(test)]
+mod document_stub_tests {
+    use super::*;
+
+    /// macOS-only extraction commands are suggested only where the file is
+    /// on a macOS machine; a remote or non-macOS backend gets portable ones.
+    #[test]
+    fn extraction_commands_follow_where_the_file_is() {
+        let remote = document_extraction_stub(
+            DocumentKind::Pdf,
+            "/workspace/report.pdf",
+            10,
+            None,
+            "terminal",
+            false,
+        );
+        assert!(
+            remote.contains("pdftotext") && !remote.contains("mdls"),
+            "{remote}"
+        );
+        let word = document_extraction_stub(
+            DocumentKind::Word,
+            "/workspace/notes.docx",
+            10,
+            None,
+            "terminal",
+            false,
+        );
+        assert!(
+            word.contains("pandoc") && !word.contains("textutil"),
+            "{word}"
+        );
+        let mac = document_extraction_stub(
+            DocumentKind::Pdf,
+            "/Users/synthetic/report.pdf",
+            10,
+            None,
+            "terminal",
+            true,
+        );
+        assert!(mac.contains("mdls"), "{mac}");
     }
 }

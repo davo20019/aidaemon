@@ -61,7 +61,7 @@ impl Tool for ShareMemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Make a memory permanently shareable in the current channel. Use when the owner approves sharing cross-channel information."
+        "Make a memory global: visible in every channel and chat, permanently. Use only when the owner approves sharing it."
     }
 
     fn schema(&self) -> Value {

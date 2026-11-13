@@ -1858,7 +1858,16 @@ impl Default for ToolsConfig {
 
 impl ToolsConfig {
     pub fn is_enabled(&self, tool_name: &str) -> bool {
-        !self.disabled.iter().any(|name| name == tool_name)
+        // `self_diagnose` was registered as `diagnose`; a config that
+        // disabled it by that name keeps it disabled.
+        let legacy = match tool_name {
+            "self_diagnose" => Some("diagnose"),
+            _ => None,
+        };
+        !self
+            .disabled
+            .iter()
+            .any(|name| name == tool_name || Some(name.as_str()) == legacy)
     }
 }
 

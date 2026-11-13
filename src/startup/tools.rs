@@ -441,7 +441,7 @@ fn optional_enabled_always(_: &AppConfig) -> bool {
 const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
     OptionalToolSpec {
         id: OptionalToolId::Diagnose,
-        name: "diagnose",
+        name: "self_diagnose",
         enabled_if: optional_enabled_diagnostics,
     },
     OptionalToolSpec {
