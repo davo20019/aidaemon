@@ -1,7 +1,8 @@
 //! The daemon's agent as the turn runtime's host.
 
-use aidaemon_events::stores::DialogueStateStore;
-use aidaemon_runtime::host::{DecisionRecorder, TurnStores, TurnWorkspace};
+use aidaemon_events::stores::{DialogueStateStore, MessageStore};
+use aidaemon_runtime::host::{DecisionRecorder, TurnHost, TurnStores, TurnWorkspace};
+use aidaemon_runtime::turn_runtime::TurnRuntime;
 
 use super::Agent;
 use crate::events::EventStore;
@@ -9,6 +10,10 @@ use crate::execution::ExecutionBackend;
 
 impl TurnStores for Agent {
     fn dialogue_states(&self) -> &dyn DialogueStateStore {
+        &*self.state
+    }
+
+    fn messages(&self) -> &dyn MessageStore {
         &*self.state
     }
 
@@ -47,5 +52,19 @@ impl DecisionRecorder for Agent {
             metadata,
         )
         .await;
+    }
+}
+
+impl TurnHost for Agent {
+    fn turn_runtime(&self) -> &TurnRuntime {
+        &self.runtime
+    }
+
+    fn is_worker(&self) -> bool {
+        self.depth > 0 || self.mandate_execution.is_some()
+    }
+
+    fn inherited_authority(&self) -> Option<&aidaemon_runtime::authority::InheritedAuthority> {
+        self.inherited_authority.as_ref()
     }
 }

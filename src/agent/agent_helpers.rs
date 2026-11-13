@@ -5,36 +5,13 @@
 //! filesystem-reference cue detection, untrusted-external-reference tool
 //! filtering, and the intent-gate decision merge.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use serde_json::Value;
-use tokio::sync::mpsc;
 
 #[cfg(test)]
 use super::contains_keyword_as_words;
 use super::execution_state::StepExecutionOutcome;
-use super::StatusUpdate;
 
-/// Best-effort send — never blocks the agent loop if the receiver is slow/full.
-pub fn send_status(tx: &Option<mpsc::Sender<StatusUpdate>>, update: StatusUpdate) {
-    if let Some(ref tx) = tx {
-        let _ = tx.try_send(update);
-    }
-}
-
-/// Update the heartbeat timestamp to signal the agent is alive.
-/// No-op when heartbeat is None (sub-agents, triggers, tests).
-pub fn touch_heartbeat(hb: &Option<Arc<AtomicU64>>) {
-    if let Some(ref hb) = hb {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        hb.store(now, Ordering::Relaxed);
-    }
-}
+pub use aidaemon_runtime::turn::helpers::{send_status, touch_heartbeat};
 
 pub(in crate::agent) use aidaemon_runtime::turn::tool_summary::summarize_tool_args;
 
@@ -152,20 +129,7 @@ impl ResumeCheckpoint {
     }
 }
 
-pub(in crate::agent) fn truncate_for_resume(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    for (count, ch) in text.chars().enumerate() {
-        if count >= max_chars {
-            out.push_str("...");
-            return out;
-        }
-        out.push(ch);
-    }
-    out
-}
+pub(in crate::agent) use aidaemon_runtime::turn::helpers::truncate_for_resume;
 
 fn normalize_for_resume_intent(text: &str) -> String {
     text.split_whitespace()

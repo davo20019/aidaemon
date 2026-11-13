@@ -102,7 +102,7 @@ mod recall_guardrails {
 }
 #[path = "policy/trust_tier.rs"]
 pub(crate) mod trust_tier;
-use loop_utils::{fixup_message_ordering, is_trigger_session};
+use loop_utils::is_trigger_session;
 /// The post-run learning context lives in `aidaemon-runtime`.
 mod post_task {
     pub(crate) use aidaemon_runtime::turn::post_task::*;
@@ -187,10 +187,6 @@ pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;
 pub(in crate::agent) use history::FollowupMode;
 pub(in crate::agent) use history::TurnContext;
-/// Received images and audio as content blocks live in `aidaemon-runtime`.
-pub(crate) mod attachment_content {
-    pub(crate) use aidaemon_runtime::media::attachment_content::*;
-}
 pub(in crate::agent) mod eval;
 /// Evidence routing lives in `aidaemon-runtime`.
 mod inquiry {
@@ -238,16 +234,6 @@ mod tool_execution;
 mod tool_result_notices {
     pub(in crate::agent) use aidaemon_runtime::turn::tool_result_notices::*;
 }
-/// Whole-turn eviction lives in `aidaemon-runtime`.
-pub(crate) mod turn_eviction {
-    pub(crate) use aidaemon_runtime::turn::turn_eviction::*;
-}
-/// Per-turn rendering lives in `aidaemon-runtime`.
-pub(crate) mod turn_render {
-    pub(crate) use aidaemon_runtime::turn::turn_render::*;
-}
-#[path = "turn/turn_render_cache.rs"]
-pub(crate) mod turn_render_cache;
 /// Image attachments live in `aidaemon-runtime`.
 pub(crate) mod vision {
     pub(crate) use aidaemon_runtime::media::vision::*;
@@ -702,10 +688,6 @@ impl Agent {
     #[cfg(test)]
     pub(crate) fn event_store(&self) -> &Arc<EventStore> {
         &self.event_store
-    }
-
-    pub(crate) fn render_options(&self, model: &str) -> turn_render::RenderOptions {
-        self.runtime.render_options(model)
     }
 
     pub(in crate::agent) async fn install_harness_eval(&self, accumulator: HarnessEvalAccumulator) {
