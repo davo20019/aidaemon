@@ -77,7 +77,7 @@ impl Agent {
         String,
         String,
         Vec<String>,
-        Option<crate::project_instructions::ProjectInstructionTracker>,
+        Option<aidaemon_runtime::turn::project_instructions::ProjectInstructionTracker>,
     )> {
         build_system_prompt_for_message(
             self,

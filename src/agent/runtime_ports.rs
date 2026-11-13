@@ -248,6 +248,10 @@ impl ConversationRuntime for Agent {
     ) -> anyhow::Result<()> {
         <Self as AgentIngress>::record_response_delivery(self, session_id, delivery).await
     }
+
+    async fn interpret_background_result(&self, command: &str, output: &str) -> Option<String> {
+        Agent::interpret_background_result(self, command, output).await
+    }
 }
 
 #[async_trait]

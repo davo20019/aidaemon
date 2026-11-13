@@ -94,7 +94,8 @@ pub async fn wire_hub_cycles(
     if let Some(tt) = terminal_tool {
         tt.set_runs(runs.clone());
         tt.set_hub(Arc::downgrade(&outbound));
-        tt.set_agent(Arc::downgrade(agent));
+        let runtime: Arc<dyn ConversationRuntime> = agent.clone();
+        tt.set_agent(Arc::downgrade(&runtime));
         // Durable plan store for completion-time deliverable attribution and the
         // conservative delivery-step write-back.
         tt.set_plan_store(plan_store.clone());

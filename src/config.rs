@@ -1397,88 +1397,7 @@ impl Default for BrowserConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
-pub struct ComputerUseConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_cu_screenshot_max_width")]
-    pub screenshot_max_width: u32,
-    #[serde(default = "default_cu_screenshot_max_height")]
-    pub screenshot_max_height: u32,
-    #[serde(default = "default_cu_screenshot_max_bytes")]
-    pub screenshot_max_bytes: u64,
-    #[serde(default = "default_cu_ax_max_depth")]
-    pub ax_max_depth: u32,
-    #[serde(default = "default_cu_ax_max_nodes")]
-    pub ax_max_nodes: u32,
-    #[serde(default = "default_cu_action_timeout_secs")]
-    pub action_timeout_secs: u64,
-    #[serde(default = "default_cu_max_mutating_actions")]
-    pub max_mutating_actions: u32,
-    #[serde(default = "default_cu_max_consecutive_observations")]
-    pub max_consecutive_observations: u32,
-    #[serde(default = "default_cu_max_wall_clock_secs")]
-    pub max_wall_clock_secs: u64,
-    #[serde(default)]
-    pub always_allowed_apps: Vec<String>,
-    #[serde(default)]
-    pub mirror_screenshots_to_channel: bool,
-}
-
-fn default_cu_screenshot_max_width() -> u32 {
-    1280
-}
-fn default_cu_screenshot_max_height() -> u32 {
-    800
-}
-fn default_cu_screenshot_max_bytes() -> u64 {
-    2_000_000
-}
-fn default_cu_ax_max_depth() -> u32 {
-    12
-}
-fn default_cu_ax_max_nodes() -> u32 {
-    500
-}
-fn default_cu_action_timeout_secs() -> u64 {
-    10
-}
-fn default_cu_max_mutating_actions() -> u32 {
-    40
-}
-fn default_cu_max_consecutive_observations() -> u32 {
-    3
-}
-fn default_cu_max_wall_clock_secs() -> u64 {
-    600
-}
-
-impl Default for ComputerUseConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            screenshot_max_width: default_cu_screenshot_max_width(),
-            screenshot_max_height: default_cu_screenshot_max_height(),
-            screenshot_max_bytes: default_cu_screenshot_max_bytes(),
-            ax_max_depth: default_cu_ax_max_depth(),
-            ax_max_nodes: default_cu_ax_max_nodes(),
-            action_timeout_secs: default_cu_action_timeout_secs(),
-            max_mutating_actions: default_cu_max_mutating_actions(),
-            max_consecutive_observations: default_cu_max_consecutive_observations(),
-            max_wall_clock_secs: default_cu_max_wall_clock_secs(),
-            always_allowed_apps: Vec::new(),
-            mirror_screenshots_to_channel: false,
-        }
-    }
-}
-
-impl ComputerUseConfig {
-    #[cfg_attr(not(feature = "computer_use"), allow(dead_code))]
-    pub fn action_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.action_timeout_secs.clamp(1, 120))
-    }
-}
+pub use aidaemon_runtime::settings::ComputerUseConfig;
 
 impl BrowserConfig {
     /// What the browser tool takes from `[browser]`.
@@ -1741,52 +1660,7 @@ fn default_task_token_budget() -> Option<u64> {
     Some(500_000)
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct CliAgentsConfig {
-    #[serde(default = "default_cli_agents_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_cli_agents_timeout_secs")]
-    pub timeout_secs: u64,
-    #[serde(default = "default_cli_agents_max_output_chars")]
-    pub max_output_chars: usize,
-    #[serde(default)]
-    pub tools: HashMap<String, CliToolConfig>,
-}
-
-impl Default for CliAgentsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_cli_agents_enabled(),
-            timeout_secs: default_cli_agents_timeout_secs(),
-            max_output_chars: default_cli_agents_max_output_chars(),
-            tools: HashMap::new(),
-        }
-    }
-}
-
-fn default_cli_agents_enabled() -> bool {
-    false
-}
-
-fn default_cli_agents_timeout_secs() -> u64 {
-    600
-}
-fn default_cli_agents_max_output_chars() -> usize {
-    16000
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct CliToolConfig {
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub max_output_chars: Option<usize>,
-}
+pub use aidaemon_runtime::tools::cli_agent::CliAgentsConfig;
 
 #[allow(unused_imports)]
 pub use aidaemon_tools::web_search::{SearchBackendKind, SearchConfig};

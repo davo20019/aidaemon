@@ -147,12 +147,12 @@ pub fn classify_target(
             el.subrole.as_deref().unwrap_or("")
         )
         .to_ascii_lowercase();
-        if crate::tools::consequential::names_consequential_action(&label) {
+        if aidaemon_tools::consequential::names_consequential_action(&label) {
             return ActionClass::Consequential;
         }
     }
     if let Some(text) = typed_text {
-        if crate::tools::consequential::names_consequential_action(text) {
+        if aidaemon_tools::consequential::names_consequential_action(text) {
             return ActionClass::Consequential;
         }
     }

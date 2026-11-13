@@ -17,5 +17,3 @@ pub use aidaemon_tools::backend::SharedExecutionBackend;
 pub use aidaemon_tools::testing::active_execution_backend;
 
 pub use aidaemon_tools::execution::build_execution_backend;
-#[cfg(test)]
-pub use aidaemon_tools::execution::local_backend;
