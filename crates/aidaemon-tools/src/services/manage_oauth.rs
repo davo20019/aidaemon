@@ -31,7 +31,10 @@ struct ManageOAuthArgs {
     identity_url: Option<String>,
     account_id_pointer: Option<String>,
     client_id: Option<String>,
-    client_secret: Option<String>,
+    /// No longer a parameter: secrets never travel as tool arguments. Kept
+    /// only to notice a model that still sends one; the value is dropped
+    /// unread.
+    client_secret: Option<serde::de::IgnoredAny>,
     display_name: Option<String>,
     auth_type: Option<String>,
     authorize_url: Option<String>,
@@ -1216,11 +1219,14 @@ impl ManageOAuthTool {
         ))
     }
 
+    /// Stores the (non-secret) client ID and checks that the owner has put
+    /// the client secret in the secret store. The secret itself never comes
+    /// from the model.
     async fn handle_set_credentials(
         &self,
         service: &str,
-        client_id: &str,
-        client_secret: &str,
+        client_id: Option<&str>,
+        secret_sent_as_argument: bool,
     ) -> anyhow::Result<String> {
         if self.gateway.get_provider(service).await.is_none() {
             return Ok(format!(
@@ -1229,11 +1235,36 @@ impl ManageOAuthTool {
             ));
         }
 
+        let (client_id_cmd, client_secret_cmd) = Self::credential_commands(service);
+        if secret_sent_as_argument {
+            return Ok(format!(
+                "Nothing was stored: secrets are not accepted as tool arguments. \
+                 Ask the owner to run `{}` in their own terminal, then call \
+                 set_credentials again without the secret.",
+                client_secret_cmd
+            ));
+        }
+
         let id_key = format!("oauth_{}_client_id", service);
         let secret_key = format!("oauth_{}_client_secret", service);
 
-        self.gateway.secrets().set(&id_key, client_id)?;
-        self.gateway.secrets().set(&secret_key, client_secret)?;
+        if let Some(client_id) = client_id.map(str::trim).filter(|id| !id.is_empty()) {
+            self.gateway.secrets().set(&id_key, client_id)?;
+        } else if !self.gateway.secrets().contains(&id_key) {
+            return Ok(format!(
+                "No client ID for '{}'. Pass client_id, or the owner runs `{}`.",
+                service, client_id_cmd
+            ));
+        }
+
+        if !self.gateway.secrets().contains(&secret_key) {
+            return Ok(format!(
+                "The client secret for '{}' is not in the secret store. Ask the owner to \
+                 run `{}` in their own terminal (never paste it in chat), then call \
+                 set_credentials again.",
+                service, client_secret_cmd
+            ));
+        }
 
         Ok(format!(
             "Credentials stored for '{}'. You can now use 'connect' to authorize.",
@@ -1252,7 +1283,7 @@ impl ManageOAuthTool {
 
 /// The tool's one description: the schema the model reads and
 /// `description()` both use it.
-const TOOL_DESCRIPTION: &str = "OAuth. Never paste secrets; inspect first; connect reauthorizes; bind_account proves identity. Manual auth → manage_http_auth.";
+const TOOL_DESCRIPTION: &str = "OAuth. Secrets never in args: owner runs `aidaemon keychain set <key>`. Inspect first; connect reauthorizes; bind_account proves identity. Manual auth → manage_http_auth.";
 
 fn manage_oauth_schema() -> Value {
     json!({
@@ -1270,7 +1301,6 @@ fn manage_oauth_schema() -> Value {
                 "identity_url": { "type": "string" },
                 "account_id_pointer": { "type": "string" },
                 "client_id": { "type": "string" },
-                "client_secret": { "type": "string" },
                 "display_name": { "type": "string" },
                 "auth_type": {
                     "type": "string",
@@ -1435,16 +1465,12 @@ impl ManageOAuthTool {
                     Self::validate_service_name(args.service.as_deref().ok_or_else(|| {
                         anyhow::anyhow!("'set_credentials' requires 'service' parameter")
                     })?)?;
-                let client_id = args
-                    .client_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'set_credentials' requires 'client_id'"))?;
-                let client_secret = args
-                    .client_secret
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'set_credentials' requires 'client_secret'"))?;
-                self.handle_set_credentials(&service, client_id, client_secret)
-                    .await
+                self.handle_set_credentials(
+                    &service,
+                    args.client_id.as_deref(),
+                    args.client_secret.is_some(),
+                )
+                .await
             }
             "refresh" => {
                 let service = Self::validate_service_name(
@@ -2397,5 +2423,97 @@ allowed_domains = ["api.linear.app"]
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A `client_secret` the model still sends is dropped unread: nothing is
+    /// stored and the reply never echoes it.
+    #[tokio::test]
+    async fn set_credentials_refuses_a_secret_argument() {
+        let _isolation = KeychainIsolation::acquire();
+        let config_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path());
+        let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        gateway
+            .register_provider(
+                crate::services::oauth::providers::get_builtin_provider("twitter").unwrap(),
+            )
+            .await;
+
+        let output = call_approved(
+            &tool,
+            r#"{"action":"set_credentials","service":"twitter","client_id":"synthetic-id","client_secret":"sk-synthetic-test-key"}"#,
+        )
+        .await
+        .unwrap();
+
+        assert!(!output.contains("sk-synthetic-test-key"), "{output}");
+        assert!(
+            output.contains("aidaemon keychain set oauth_twitter_client_secret"),
+            "{output}"
+        );
+        assert!(!gateway.secrets().contains("oauth_twitter_client_secret"));
+        assert!(!gateway.secrets().contains("oauth_twitter_client_id"));
+    }
+
+    #[tokio::test]
+    async fn set_credentials_uses_the_owner_stored_secret() {
+        let isolation = KeychainIsolation::acquire();
+        std::fs::write(
+            isolation.env_file_path(),
+            "OAUTH_TWITTER_CLIENT_SECRET=sk-synthetic-test-key\n",
+        )
+        .unwrap();
+        let config_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path());
+        let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        gateway
+            .register_provider(
+                crate::services::oauth::providers::get_builtin_provider("twitter").unwrap(),
+            )
+            .await;
+
+        let output = call_approved(
+            &tool,
+            r#"{"action":"set_credentials","service":"twitter","client_id":"synthetic-id"}"#,
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("Credentials stored"), "{output}");
+        assert_eq!(
+            gateway
+                .secrets()
+                .get("oauth_twitter_client_id")
+                .unwrap()
+                .expose(),
+            "synthetic-id"
+        );
+        assert!(gateway.has_credentials("twitter"));
+    }
+
+    #[tokio::test]
+    async fn set_credentials_without_the_secret_names_the_owner_command() {
+        let _isolation = KeychainIsolation::acquire();
+        let config_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path());
+        let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        gateway
+            .register_provider(
+                crate::services::oauth::providers::get_builtin_provider("twitter").unwrap(),
+            )
+            .await;
+
+        let output = call_approved(
+            &tool,
+            r#"{"action":"set_credentials","service":"twitter","client_id":"synthetic-id"}"#,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            output.contains("aidaemon keychain set oauth_twitter_client_secret"),
+            "{output}"
+        );
+        assert!(!gateway.secrets().contains("oauth_twitter_client_secret"));
     }
 }

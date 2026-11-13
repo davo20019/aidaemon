@@ -43,12 +43,25 @@ default = "claude-sonnet-4-20250514"
     #[tokio::test]
     async fn sensitive_changes_ask_with_the_old_wording_and_no_secret_in_the_subject() {
         let (_dir, path) = write_temp_config(FAILOVER_CONFIG);
-        let tool = ConfigManagerTool::new(
-            crate::config::config_file(path),
-            Arc::new(aidaemon_secrets::MemorySecretStore::new()),
-        );
+        // The owner already stored the new failover's key themselves.
+        let secrets = aidaemon_secrets::MemorySecretStore::new();
+        aidaemon_secrets::SecretStore::set(
+            &secrets,
+            "provider_fallback_1_api_key",
+            "sk-synthetic-test-key",
+        )
+        .unwrap();
+        let tool = ConfigManagerTool::new(crate::config::config_file(path), Arc::new(secrets));
 
-        let set = json!({"action": "set", "key": "provider.api_key", "value": "synthetic-secret"});
+        // A literal secret value is refused before any card.
+        let literal =
+            json!({"action": "set", "key": "provider.api_key", "value": "synthetic-secret"});
+        assert!(matches!(
+            tool.owner_approval(&literal).await,
+            OwnerApprovalNeed::NotNeeded
+        ));
+
+        let set = json!({"action": "set", "key": "provider.api_key", "value": "keychain"});
         let OwnerApprovalNeed::Ask(request) = tool.owner_approval(&set).await else {
             panic!("a secret change must ask");
         };
@@ -61,9 +74,8 @@ default = "claude-sonnet-4-20250514"
             request.warnings,
             vec!["Modifying security-sensitive configuration".to_string()]
         );
-        assert!(!request.subject.contains("synthetic-secret"));
         let mut other = set.clone();
-        other["value"] = json!("synthetic-other-secret");
+        other["key"] = json!("provider.fallbacks[0].api_key");
         let OwnerApprovalNeed::Ask(changed) = tool.owner_approval(&other).await else {
             panic!("a secret change must ask");
         };
@@ -79,7 +91,7 @@ default = "claude-sonnet-4-20250514"
             request.summary
         );
 
-        let add = json!({"action": "add_failover_provider", "provider": "anthropic", "api_key": "synthetic-key"});
+        let add = json!({"action": "add_failover_provider", "provider": "anthropic"});
         let OwnerApprovalNeed::Ask(request) = tool.owner_approval(&add).await else {
             panic!("a failover addition must ask");
         };
@@ -88,7 +100,7 @@ default = "claude-sonnet-4-20250514"
             "{}",
             request.summary
         );
-        assert!(!request.subject.contains("synthetic-key"));
+        assert!(!request.subject.contains("sk-synthetic-test-key"));
 
         for no_card in [
             json!({"action": "set", "key": "provider.models.default", "value": "\"other\""}),
