@@ -1,5 +1,4 @@
-mod background_model;
-pub mod embeddings;
+pub use aidaemon_memory::embeddings;
 pub(crate) mod history_intake;
 pub(crate) mod jobs_host;
 pub mod people_intelligence;

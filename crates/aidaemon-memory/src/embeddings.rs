@@ -1,15 +1,15 @@
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testing")))]
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testing")))]
 use std::sync::{Arc, Mutex};
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testing")))]
 use tokio::sync::OnceCell;
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testing")))]
 use tokio::task;
 use tracing::info;
 
-use super::background_model::BackgroundModel;
+use crate::background_model::BackgroundModel;
 
 /// Stable identifier persisted beside every derived embedding. Changing the
 /// model creates a new index generation instead of silently mixing vectors.
@@ -19,7 +19,7 @@ pub const EMBEDDING_MODEL_ID: &str = "fastembed/all-MiniLM-L6-v2";
 /// model in a `std::sync::Mutex` so blocking-thread callers can take it,
 /// embed, and release. Calls serialize, but embedding itself is CPU-bound
 /// and short, so this is acceptable for our usage pattern.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testing")))]
 type SharedModel = Arc<Mutex<TextEmbedding>>;
 
 /// Cross-encoder reranker for the explicit memory-search path. A multilingual
@@ -29,7 +29,7 @@ const RERANKER_MODEL: RerankerModel = RerankerModel::JINARerankerV2BaseMultiling
 
 #[derive(Clone)]
 pub struct EmbeddingService {
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "testing")))]
     model: Arc<OnceCell<SharedModel>>,
     /// Loaded in the background on first use and kept even when the search
     /// that started the load stops waiting; one rerank runs at a time, and a
@@ -42,7 +42,7 @@ impl EmbeddingService {
     /// The model is loaded lazily on the first embedding request.
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "testing")))]
             model: Arc::new(OnceCell::new()),
             reranker: BackgroundModel::new("reranker", || {
                 let options =
@@ -55,7 +55,7 @@ impl EmbeddingService {
     }
 
     /// Returns the model, initializing it on first call.
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "testing")))]
     async fn get_model(&self) -> anyhow::Result<SharedModel> {
         let model = self
             .model
@@ -78,10 +78,10 @@ impl EmbeddingService {
     /// Runs on a blocking thread to avoid blocking the async runtime.
     #[allow(dead_code)]
     pub async fn embed(&self, text: String) -> anyhow::Result<Vec<f32>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         return Ok(deterministic_test_embedding(&text));
 
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "testing")))]
         {
             let model = self.get_model().await?;
             task::spawn_blocking(move || {
@@ -98,13 +98,13 @@ impl EmbeddingService {
     /// Compute embeddings for multiple strings.
     #[allow(dead_code)]
     pub async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         return Ok(texts
             .iter()
             .map(|text| deterministic_test_embedding(text))
             .collect());
 
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "testing")))]
         {
             let model = self.get_model().await?;
             task::spawn_blocking(move || {
@@ -134,7 +134,7 @@ impl EmbeddingService {
         // treat this error as "rerank unavailable" and fall back to bi-encoder
         // order, so test behavior stays deterministic and offline. The reranker
         // is exercised by live/ignored tests and in production builds.
-        if cfg!(test) {
+        if cfg!(any(test, feature = "testing")) {
             anyhow::bail!("reranker disabled in test builds");
         }
         self.reranker
@@ -150,7 +150,7 @@ impl EmbeddingService {
 }
 
 #[async_trait::async_trait]
-impl aidaemon_memory::Embedder for EmbeddingService {
+impl crate::Embedder for EmbeddingService {
     fn model_id(&self) -> &str {
         EMBEDDING_MODEL_ID
     }
@@ -159,15 +159,15 @@ impl aidaemon_memory::Embedder for EmbeddingService {
         384
     }
 
-    async fn embed(&self, texts: &[String]) -> aidaemon_memory::Result<Vec<Vec<f32>>> {
+    async fn embed(&self, texts: &[String]) -> crate::Result<Vec<Vec<f32>>> {
         self.embed_batch(texts.to_vec())
             .await
-            .map_err(|error| aidaemon_memory::MemoryError::Embedding(format!("{error:#}")))
+            .map_err(|error| crate::MemoryError::Embedding(format!("{error:#}")))
     }
 }
 
 #[async_trait::async_trait]
-impl aidaemon_memory::sqlite::Reranker for EmbeddingService {
+impl crate::sqlite::Reranker for EmbeddingService {
     async fn rerank(
         &self,
         query: String,
@@ -184,8 +184,8 @@ impl aidaemon_memory::sqlite::Reranker for EmbeddingService {
     /// from live searches, where relevant related facts (a parent link, a
     /// sibling) sat within 2 of the top hit and irrelevant ones 2.9 or more
     /// below it.
-    fn relevance_floor(&self) -> Option<aidaemon_memory::search::RelevanceFloor> {
-        Some(aidaemon_memory::search::RelevanceFloor {
+    fn relevance_floor(&self) -> Option<crate::search::RelevanceFloor> {
+        Some(crate::search::RelevanceFloor {
             lexical: -3.0,
             semantic: -2.25,
             related_gap: Some(2.5),
@@ -193,7 +193,7 @@ impl aidaemon_memory::sqlite::Reranker for EmbeddingService {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 fn deterministic_test_embedding(text: &str) -> Vec<f32> {
     use std::hash::{Hash, Hasher};
 

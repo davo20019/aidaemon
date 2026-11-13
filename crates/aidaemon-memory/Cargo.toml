@@ -22,6 +22,9 @@ default = []
 # Local ONNX embeddings (AllMiniLM-L6-v2) via fastembed. Downloads the model
 # on first use, so it is off by default; `HashEmbedder` works offline.
 fastembed = ["dep:fastembed"]
+# Deterministic, offline embeddings from `embeddings::EmbeddingService` and
+# no reranker, for tests of hosts built on it.
+testing = []
 # Exposes `aidaemon_memory::conformance`, the `MemoryStore` conformance kit
 # for authors of custom stores.
 conformance = ["aidaemon-core/testing"]

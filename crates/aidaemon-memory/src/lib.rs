@@ -73,11 +73,17 @@
 //! `aidaemon_policies::Recall` (snippets for injection) in your own crate.
 //! The SDK only ever sees those traits.
 
+#[cfg(feature = "fastembed")]
+mod background_model;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod consolidation;
 mod embed;
 pub mod embedding_index;
+/// The daemon's local embedder and reranker (fastembed); deterministic,
+/// offline vectors under the `testing` feature.
+#[cfg(feature = "fastembed")]
+pub mod embeddings;
 pub mod episodes;
 mod error;
 mod extract;
