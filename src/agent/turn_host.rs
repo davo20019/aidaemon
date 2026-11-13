@@ -245,6 +245,28 @@ impl TurnHost for Agent {
         Agent::registered_tool_definitions_with_capabilities(self)
     }
 
+    fn retain_offered_in_session(
+        &self,
+        defs: &mut Vec<serde_json::Value>,
+        capabilities: &mut std::collections::HashMap<String, crate::traits::ToolCapabilities>,
+        session_id: &str,
+    ) {
+        let withheld: std::collections::HashSet<&str> = self
+            .tools
+            .iter()
+            .filter(|tool| !tool.offered_in_session(session_id))
+            .map(|tool| tool.name())
+            .collect();
+        if withheld.is_empty() {
+            return;
+        }
+        defs.retain(|def| {
+            aidaemon_runtime::turn::helpers::tool_name_from_definition(def)
+                .is_none_or(|name| !withheld.contains(name))
+        });
+        capabilities.retain(|name, _| !withheld.contains(name.as_str()));
+    }
+
     async fn tool_definitions_with_capabilities(
         &self,
         user_message: &str,

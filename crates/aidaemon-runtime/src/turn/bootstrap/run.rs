@@ -339,8 +339,9 @@ async fn build_isolated_mandate_bootstrap(
     // This is the registered child roster only. `tool_definitions_with_capabilities`
     // additionally performs message-triggered MCP composition, which is outside
     // v1 mandate authority even when the resulting view would later fail closed.
-    let (mut tool_defs, available_capabilities) =
+    let (mut tool_defs, mut available_capabilities) =
         agent.registered_tool_definitions_with_capabilities();
+    agent.retain_offered_in_session(&mut tool_defs, &mut available_capabilities, session_id);
     crate::turn::helpers::sort_tool_definitions_by_name(&mut tool_defs);
     let base_tool_defs = tool_defs.clone();
 
@@ -893,6 +894,21 @@ pub async fn run_bootstrap(
             if before != defs.len() {
                 tool_filter_stages.push(GateFilterStage::new(
                     "desktop_control_visibility",
+                    before,
+                    defs.len(),
+                    "filtered",
+                ));
+            }
+        }
+
+        // Tools whose offer depends on this session's live state (a client
+        // connection that can be moved) ask for themselves.
+        {
+            let before = defs.len();
+            agent.retain_offered_in_session(&mut defs, &mut caps, session_id);
+            if before != defs.len() {
+                tool_filter_stages.push(GateFilterStage::new(
+                    "session_offer",
                     before,
                     defs.len(),
                     "filtered",

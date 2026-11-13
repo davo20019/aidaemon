@@ -5,11 +5,28 @@
 // the session's work, y/s/a/n answer the card (only with the composer empty
 // and the card on screen long enough to have been read), Alt+N starts a
 // session. The status row always says what state the connection is in.
+//
+// The agent may move the view (`view_action` events, capability
+// `view_actions`): open a session, bring a card up, show a piece of work,
+// focus a pane. Each move shows a one-line note of what moved and why, with
+// Back (Alt+B); Esc or the next key dismisses it. While the owner has text
+// in the composer a move is only offered (Go, Alt+G), so a message never
+// lands in a session the agent picked. A move never answers anything: a
+// card it brings up is armed afresh, and it can only ever ask for history.
 
-import type { Approval, ApprovalDecision, Command, ServerFrame } from "./protocol";
+import type { Approval, ApprovalDecision, Command, ServerFrame, ViewAction } from "./protocol";
 import type { Connection, LinkState } from "./link.js";
 import type { Platform } from "./platform.js";
-import { apply as reduce, newState, nextApproval, running, title as titleOf, type State } from "./state.js";
+import {
+  apply as reduce,
+  newState,
+  nextApproval,
+  running,
+  takeViewRequest,
+  title as titleOf,
+  type State,
+  type ViewRequest,
+} from "./state.js";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -39,6 +56,23 @@ function el(tag: string, props: Record<string, string> = {}, ...children: (Node 
   return node;
 }
 
+/** Where the view was before a move, for Back. */
+interface Back {
+  selected: string | null;
+  shownApproval: string | null;
+}
+
+interface Note {
+  text: string;
+  back: Back | null;
+  /** A move offered while the owner typed, taken with Go. */
+  held: ViewRequest | null;
+  since: number;
+}
+
+/** How long a note of a view move stays up. */
+const NOTE_FOR_MS = 15_000;
+
 interface PaletteItem {
   label: string;
   hint?: string;
@@ -56,6 +90,9 @@ export class Screen {
   private card: { id: string; since: number } | null = null;
   private paletteIndex = 0;
   private flash: string | null = null;
+  private note: Note | null = null;
+  /** The approval a view move brought up, shown instead of the oldest. */
+  private shownApproval: string | null = null;
 
   constructor(private platform: Platform) {
     this.state.last_seq = platform.loadSeq();
@@ -74,7 +111,7 @@ export class Screen {
     $("app").hidden = false;
     $("unpair").hidden = false;
     this.connection?.stop();
-    this.connection = this.platform.connection([]);
+    this.connection = this.platform.connection(["view_actions"]);
     this.connection.start(
       {
         onState: (state) => this.linkState(state),
@@ -114,6 +151,8 @@ export class Screen {
       this.fetched.add(frame.result.session_id);
     }
     this.platform.saveSeq(this.state.last_seq);
+    const request = takeViewRequest(this.state);
+    if (request) this.viewRequest(request);
     if (this.state.notice && this.state.notice !== notice) this.say(this.state.notice);
     for (const approval of Object.values(this.state.approvals)) {
       if (!waiting.has(approval.id)) this.platform.notify("Approval needed", approval.summary);
@@ -124,6 +163,126 @@ export class Screen {
   private say(text: string) {
     this.flash = text;
     this.renderStatus();
+  }
+
+  // --- View moves --------------------------------------------------------------
+
+  /** The card on screen: the one a move brought up while it waits, else the oldest. */
+  shown(): Approval | undefined {
+    return (this.shownApproval ? this.state.approvals[this.shownApproval] : undefined) ?? nextApproval(this.state);
+  }
+
+  private describe(action: ViewAction): string {
+    switch (action.kind) {
+      case "open_session":
+        return `open ${this.title(action.session_id)}`;
+      case "show_approval": {
+        const approval = this.state.approvals[action.approval_id];
+        return approval ? `the approval "${approval.summary}"` : "an approval that is no longer waiting";
+      }
+      case "show_task": {
+        const task = this.state.tasks[action.task_id];
+        return task ? `work #${task.number} ${task.description}` : "work that is no longer running";
+      }
+      case "focus_pane":
+        return `the ${action.pane} pane`;
+      case "new_session":
+        return "a new session";
+      case "show_devices":
+        return "your paired devices";
+    }
+  }
+
+  /** A move the agent asked for: taken now, or offered while the owner types. */
+  viewRequest(request: ViewRequest) {
+    const input = $("text") as HTMLTextAreaElement;
+    const because = request.reason.trim() ? ` (${request.reason.trim().replace(/\.$/, "")})` : "";
+    if (input.value || !$("palette").hidden) {
+      this.note = { text: `The assistant suggests: ${this.describe(request.action)}${because}.`, back: null, held: request, since: Date.now() };
+      return this.renderNote();
+    }
+    this.moveView(request, because);
+  }
+
+  private moveView(request: ViewRequest, because: string) {
+    const back: Back = { selected: this.selected, shownApproval: this.shownApproval };
+    const what = this.describe(request.action);
+    let text = `Moved to ${what}`;
+    const action = request.action;
+    switch (action.kind) {
+      case "open_session":
+        this.select(action.session_id);
+        break;
+      case "show_approval":
+        if (this.state.approvals[action.approval_id]) {
+          this.shownApproval = action.approval_id;
+          // A card a move brings up is armed afresh.
+          this.card = { id: action.approval_id, since: Date.now() };
+          text = `Showing ${what}: read it, then y / n`;
+          $("cards").scrollIntoView({ block: "nearest" });
+        } else {
+          text = `Could not show ${what}`;
+        }
+        break;
+      case "show_task": {
+        const row = document.querySelector(`[data-task="${CSS.escape(action.task_id)}"]`);
+        if (row) {
+          row.classList.add("flash");
+          row.scrollIntoView({ block: "nearest" });
+        } else {
+          text = `Could not show ${what}`;
+        }
+        break;
+      }
+      case "focus_pane":
+        if (action.pane === "sessions") ($("sessionlist").querySelector("button") ?? $("text")).focus();
+        else if (action.pane === "tasks") ($("tasklist").querySelector("button") ?? $("text")).focus();
+        else $("text").focus();
+        if (action.pane === "approvals") text = "The approval card is above the composer";
+        break;
+      case "new_session":
+        this.select(null);
+        break;
+      case "show_devices": {
+        // Listing them is the owner's own command: one Enter away.
+        const input = $("text") as HTMLTextAreaElement;
+        if (!input.value) input.value = "/devices";
+        input.focus();
+        text = "Press Enter to list your paired devices";
+        break;
+      }
+      default:
+        return;
+    }
+    this.note = { text: `${text}${because}.`, back, held: null, since: Date.now() };
+    this.render();
+  }
+
+  private goBack() {
+    const back = this.note?.back;
+    if (!back) return;
+    this.note = null;
+    this.shownApproval = back.shownApproval;
+    this.select(back.selected);
+  }
+
+  private takeHeld() {
+    const held = this.note?.held;
+    if (!held) return;
+    this.note = null;
+    this.moveView(held, held.reason.trim() ? ` (${held.reason.trim()})` : "");
+  }
+
+  private renderNote() {
+    const note = this.note;
+    $("note").hidden = !note;
+    if (!note) return;
+    $("notetext").textContent = note.text;
+    const button = $("noteback") as HTMLButtonElement;
+    button.hidden = !note.back && !note.held;
+    button.textContent = note.held ? "Go (Alt+G)" : "Back (Alt+B)";
+    button.onclick = () => (note.held ? this.takeHeld() : this.goBack());
+    $("noteclose").onclick = () => this.dismissNote();
   }
 
   // --- Actions -----------------------------------------------------------------
@@ -154,7 +313,7 @@ export class Screen {
 
   /** The card on screen, when its keys may answer it now. */
   armedCard(now = Date.now()): Approval | undefined {
-    const approval = nextApproval(this.state);
+    const approval = this.shown();
     if (!approval || !this.card || this.card.id !== approval.id) return undefined;
     return now - this.card.since >= ARM_AFTER_MS ? approval : undefined;
   }
@@ -317,6 +476,14 @@ export class Screen {
       }
       return;
     }
+    if (e.altKey && e.code === "KeyB" && this.note?.back) {
+      e.preventDefault();
+      return this.goBack();
+    }
+    if (e.altKey && e.code === "KeyG" && this.note?.held) {
+      e.preventDefault();
+      return this.takeHeld();
+    }
     if (e.altKey && e.code === "KeyN") {
       e.preventDefault();
       return this.newSession();
@@ -326,6 +493,11 @@ export class Screen {
     if (inField) return;
     if (e.key === "Escape") {
       if (this.dismissNote()) return;
+    } else if (this.note && !["Shift", "Alt", "Control", "Meta"].includes(e.key)) {
+      // Any other key dismisses the note and does what it does.
+      this.dismissNote();
+    }
+    if (e.key === "Escape") {
       if (input.value) return;
       if (this.stop()) e.preventDefault();
       return;
@@ -340,9 +512,12 @@ export class Screen {
     }
   }
 
-  /** Hook for notes shown above the chat; true when one was dismissed. */
+  /** Dismiss the note of a view move; whether there was one. */
   dismissNote(): boolean {
-    return false;
+    if (!this.note) return false;
+    this.note = null;
+    this.renderNote();
+    return true;
   }
 
   private completions(text: string): string[] {
@@ -352,10 +527,11 @@ export class Screen {
 
   private tick() {
     // A card becomes armed after it has been read: show its keys as live.
-    const approval = nextApproval(this.state);
+    const approval = this.shown();
     if (approval && this.card?.id === approval.id && !$("cards").classList.contains("armed") && this.armedCard()) {
       this.renderCard();
     }
+    if (this.note && Date.now() - this.note.since > NOTE_FOR_MS) this.dismissNote();
     this.renderStatus();
   }
 
@@ -368,6 +544,7 @@ export class Screen {
   // --- Drawing ---------------------------------------------------------------------
 
   render() {
+    this.renderNote();
     this.renderSessions();
     this.renderChat();
     this.renderCard();
@@ -427,7 +604,7 @@ export class Screen {
   }
 
   private renderCard() {
-    const approval = nextApproval(this.state);
+    const approval = this.shown();
     const box = $("cards");
     if (!approval) {
       this.card = null;
@@ -482,7 +659,7 @@ export class Screen {
         ? tasks.map((t) => {
             const cancel = el("button", {}, "Cancel");
             cancel.onclick = () => this.send({ type: "cancel_task", task_id: t.id });
-            return el("div", { class: "task" }, `#${t.number} ${t.description}`, el("br"), el("small", {}, this.title(t.session_id)), el("br"), cancel);
+            return el("div", { class: "task", "data-task": t.id }, `#${t.number} ${t.description}`, el("br"), el("small", {}, this.title(t.session_id)), el("br"), cancel);
           })
         : [el("p", { class: "empty" }, "Nothing running.")]),
     );

@@ -164,6 +164,19 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
         Vec<serde_json::Value>,
         std::collections::HashMap<String, aidaemon_tools::semantics::ToolCapabilities>,
     );
+    /// Drop from `defs` and `capabilities` the tools not offered on a turn
+    /// of `session_id` (each tool's `ToolSemantics::offered_in_session`).
+    /// The default keeps everything.
+    fn retain_offered_in_session(
+        &self,
+        _defs: &mut Vec<serde_json::Value>,
+        _capabilities: &mut std::collections::HashMap<
+            String,
+            aidaemon_tools::semantics::ToolCapabilities,
+        >,
+        _session_id: &str,
+    ) {
+    }
     /// The tools offered for `user_message`: the registered ones plus the MCP
     /// tools it calls for.
     async fn tool_definitions_with_capabilities(

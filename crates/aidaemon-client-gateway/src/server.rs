@@ -182,6 +182,7 @@ fn caller_of(
         kind,
         device,
         principal,
+        view_connection: None,
     }
 }
 
@@ -564,12 +565,17 @@ async fn run_socket(
         .await;
     }
     let revoked = principal.revoked.clone();
-    let caller = caller_of(
+    let mut caller = caller_of(
         Some(client.kind),
         client.device.clone(),
         &capabilities,
         principal,
     );
+    // A socket that can be moved gets its own outbox for view actions.
+    let mut view = capabilities
+        .contains(&Capability::ViewActions)
+        .then(|| gateway.views.connect());
+    caller.view_connection = view.as_ref().map(|view| view.id);
 
     // Subscribe before reading the log, so nothing falls between them.
     let mut live = gateway.bus.subscribe();
@@ -578,7 +584,7 @@ async fn run_socket(
         &mut socket,
         &ServerFrame::Welcome {
             version: ProtocolVersion::CURRENT,
-            server_capabilities: vec![Capability::Compact],
+            server_capabilities: vec![Capability::Compact, Capability::ViewActions],
             owner: gateway.owner(),
             latest_seq: latest,
         },
@@ -637,6 +643,14 @@ async fn run_socket(
                         }).await?;
                     }
                 }
+            }
+            Some(frame) = async {
+                match view.as_mut() {
+                    Some(view) => view.outbox.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                send(&mut socket, &frame).await?;
             }
             Some(reply) = replies.recv() => {
                 if let Some(reply) = fit(&reply, caller.compact) {

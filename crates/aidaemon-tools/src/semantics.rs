@@ -2523,6 +2523,16 @@ pub trait ToolSemantics: Send + Sync {
     fn is_available(&self) -> bool {
         true
     }
+
+    /// Whether the tool is offered on a turn of `session_id`, judged from
+    /// the tool's own typed state, never from the request's wording.
+    ///
+    /// Default: true. A tool whose only effect lands on one client
+    /// connection (the agent-driven view) is offered only while that
+    /// session's turn came from a connection that can show it.
+    fn offered_in_session(&self, _session_id: &str) -> bool {
+        true
+    }
 }
 
 /// Effects that send data or act outside the owner's machine and workspace,

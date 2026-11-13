@@ -148,6 +148,29 @@ impl ClientHost for DaemonClientHost {
     }
 }
 
+/// The agent-driven view on the running gateway: `client_view` moves the
+/// app connection that sent the turn's message, and only that one.
+pub(crate) struct GatewayViews;
+
+impl crate::tools::client_view::ClientViews for GatewayViews {
+    fn can_show(&self, session_id: &str) -> bool {
+        running().is_some_and(|gateway| gateway.views().can_show(session_id))
+    }
+
+    fn show(
+        &self,
+        session_id: &str,
+        action: aidaemon_client_protocol::ViewAction,
+        reason: &str,
+    ) -> Result<(), String> {
+        let gateway = running().ok_or_else(|| "the Client Gateway is off".to_string())?;
+        gateway
+            .views()
+            .show(session_id, action, reason)
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// The running gateway, for the chat's device commands; unset while it is
 /// off.
 static GATEWAY: std::sync::OnceLock<Arc<ClientGateway>> = std::sync::OnceLock::new();

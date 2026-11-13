@@ -130,6 +130,7 @@
         }
       }
     },
-    "tasks": {}
+    "tasks": {},
+    "view_request": null
   }
 }

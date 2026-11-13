@@ -205,6 +205,7 @@
         "started_at_ms": 1767225602000,
         "state": "running"
       }
-    }
+    },
+    "view_request": null
   }
 }

@@ -4,8 +4,10 @@
 // the desktop shell and under Node for the shared fixtures
 // (crates/aidaemon-client-core/tests/fixtures/reducer), which hold it to the
 // Rust reducer in aidaemon-client-core. Its JSON shape is the Rust `State`'s.
+/** The view actions this client knows; any other kind is ignored. */
+const VIEW_KINDS = new Set(["open_session", "show_approval", "show_task", "focus_pane", "new_session", "show_devices"]);
 export function newState() {
-    return { last_seq: null, sessions: {}, order: [], approvals: {}, tasks: {}, notice: null };
+    return { last_seq: null, sessions: {}, order: [], approvals: {}, tasks: {}, notice: null, view_request: null };
 }
 /** A turn status in a few words. */
 export function statusText(status) {
@@ -171,6 +173,11 @@ function applyEvent(state, sessionId, event) {
         case "approval_resolved":
             delete state.approvals[event.approval_id];
             return;
+        case "view_action":
+            // Kinds this client does not know are ignored.
+            if (VIEW_KINDS.has(event.action.kind))
+                state.view_request = { action: event.action, reason: event.reason ?? "" };
+            return;
         case "task_updated":
             if (event.task.state === "running" || event.task.state === "cancelling") {
                 state.tasks[event.task.id] = event.task;
@@ -180,6 +187,12 @@ function applyEvent(state, sessionId, event) {
             }
             return;
     }
+}
+/** The view move asked for, once. */
+export function takeViewRequest(state) {
+    const request = state.view_request;
+    state.view_request = null;
+    return request;
 }
 /** The oldest approval waiting, which the card shows. */
 export function nextApproval(state) {

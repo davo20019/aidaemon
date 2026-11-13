@@ -121,7 +121,7 @@ export class SocketLink {
         ws.onopen = () => {
             const hello = {
                 type: "hello",
-                version: { major: 1, minor: 0 },
+                version: { major: 1, minor: 1 },
                 client: this.options.client,
                 capabilities: this.options.capabilities,
                 resume_from: this.resumeFrom() ?? undefined,

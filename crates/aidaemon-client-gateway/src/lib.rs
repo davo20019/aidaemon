@@ -30,6 +30,7 @@ mod observer;
 pub mod pairing;
 mod server;
 pub mod token;
+pub mod views;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -56,6 +57,7 @@ pub use config::ClientGatewayConfig;
 pub use observer::{AppChannel, AppSurface, GatewayObserver, Ids};
 pub use pairing::{Pairing, Principal};
 pub use server::{router, serve};
+pub use views::{ViewError, ViewTargets};
 
 /// The hub channel and turn platform name of the app.
 pub const APP_CHANNEL: &str = "app";
@@ -119,6 +121,9 @@ pub struct Caller {
     pub compact: bool,
     /// The token's owner: the local owner or a paired device.
     pub principal: Principal,
+    /// The caller's socket, when it declared `view_actions`: a message it
+    /// sends makes it the session's view target.
+    pub view_connection: Option<u64>,
 }
 
 impl Caller {
@@ -129,6 +134,7 @@ impl Caller {
             device: None,
             compact: false,
             principal: Principal::owner(),
+            view_connection: None,
         }
     }
 }
@@ -146,6 +152,7 @@ pub struct ClientGateway {
     pub(crate) config: ClientGatewayConfig,
     pub(crate) token_file: PathBuf,
     pub(crate) pairing: Arc<Pairing>,
+    pub(crate) views: Arc<ViewTargets>,
     /// Requests being handled now, so a retry waits for the first answer.
     in_flight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -217,6 +224,7 @@ impl ClientGateway {
             active,
             config: deps.config,
             token_file: deps.token_file,
+            views: Arc::default(),
             in_flight: Mutex::default(),
         });
         let upkeep = Arc::downgrade(&gateway);
@@ -264,6 +272,12 @@ impl ClientGateway {
 
     pub fn pairing(&self) -> &Arc<Pairing> {
         &self.pairing
+    }
+
+    /// The connections the agent may move, by session (the agent-driven
+    /// view).
+    pub fn views(&self) -> &Arc<ViewTargets> {
+        &self.views
     }
 
     /// Where devices reach the gateway.
@@ -387,8 +401,14 @@ impl ClientGateway {
                 text,
                 attachments,
             } => {
-                self.send_message(request_id, session_id, text, attachments.is_empty())
-                    .await
+                self.send_message(
+                    request_id,
+                    session_id,
+                    text,
+                    attachments.is_empty(),
+                    caller.view_connection,
+                )
+                .await
             }
             Command::StopTurn { session_id } => {
                 let report = stop::stop(
@@ -483,6 +503,7 @@ impl ClientGateway {
         session_id: Option<String>,
         text: String,
         no_attachments: bool,
+        view_connection: Option<u64>,
     ) -> Result<CommandResult, ProtocolError> {
         if !no_attachments {
             return Err(ProtocolError::new(
@@ -511,6 +532,9 @@ impl ClientGateway {
             }
         };
         self.runner.register_session(&session_id, APP_CHANNEL).await;
+        // The turn this message starts may move the sender's view, and only
+        // the sender's, when it declared the capability.
+        self.views.message_from(&session_id, view_connection);
         if new_session {
             self.publisher.publish(
                 Some(session_id.clone()),

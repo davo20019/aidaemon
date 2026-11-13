@@ -1,0 +1,127 @@
+{
+  "description": "A show_devices view action is held for the client to take; the approval and the work it may point at are untouched.",
+  "frames": [
+    {
+      "at_ms": 1767225601000,
+      "event": {
+        "approval": {
+          "card": {
+            "action": {
+              "kind": "command",
+              "line": "rm -r /tmp/synthetic-drafts"
+            },
+            "impact": {
+              "kind": "deletes",
+              "targets": [
+                "/tmp/synthetic-drafts"
+              ]
+            },
+            "reason": {
+              "kind": "after_a_decline"
+            }
+          },
+          "channel": "telegram",
+          "detail": "rm -r /tmp/synthetic-drafts",
+          "id": "a1",
+          "kind": "command",
+          "options": [
+            "approve_once",
+            "approve_session",
+            "deny"
+          ],
+          "requested_at_ms": 1767225601000,
+          "risk": "high",
+          "session_id": "telegram:synthetic-user-1",
+          "summary": "Your assistant wants to delete the synthetic drafts"
+        },
+        "type": "approval_requested"
+      },
+      "seq": 1,
+      "session_id": "telegram:synthetic-user-1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225602000,
+      "event": {
+        "task": {
+          "description": "Working on your message",
+          "id": "b1:app:s1#4",
+          "number": 4,
+          "session_id": "app:s1",
+          "started_at_ms": 1767225602000,
+          "state": "running"
+        },
+        "type": "task_updated"
+      },
+      "seq": 2,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225600000,
+      "event": {
+        "action": {
+          "kind": "show_devices"
+        },
+        "reason": "You asked to see it",
+        "type": "view_action"
+      },
+      "session_id": "app:s1",
+      "type": "event"
+    }
+  ],
+  "state": {
+    "approvals": {
+      "a1": {
+        "card": {
+          "action": {
+            "kind": "command",
+            "line": "rm -r /tmp/synthetic-drafts"
+          },
+          "impact": {
+            "kind": "deletes",
+            "targets": [
+              "/tmp/synthetic-drafts"
+            ]
+          },
+          "reason": {
+            "kind": "after_a_decline"
+          }
+        },
+        "channel": "telegram",
+        "detail": "rm -r /tmp/synthetic-drafts",
+        "id": "a1",
+        "kind": "command",
+        "options": [
+          "approve_once",
+          "approve_session",
+          "deny"
+        ],
+        "requested_at_ms": 1767225601000,
+        "risk": "high",
+        "session_id": "telegram:synthetic-user-1",
+        "summary": "Your assistant wants to delete the synthetic drafts"
+      }
+    },
+    "last_seq": 2,
+    "notice": null,
+    "order": [],
+    "sessions": {},
+    "tasks": {
+      "b1:app:s1#4": {
+        "description": "Working on your message",
+        "id": "b1:app:s1#4",
+        "number": 4,
+        "session_id": "app:s1",
+        "started_at_ms": 1767225602000,
+        "state": "running"
+      }
+    },
+    "view_request": {
+      "action": {
+        "kind": "show_devices"
+      },
+      "reason": "You asked to see it"
+    }
+  }
+}

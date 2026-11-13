@@ -9,14 +9,22 @@
 //! screen for [`ARM_AFTER`] unchanged, so a card that appears never takes a
 //! key meant for something else), Ctrl-P opens the palette of sessions and
 //! commands, Ctrl-N starts a session, Alt-Up/Down switch sessions.
+//!
+//! The agent may move the view (`view_action` events): open a session,
+//! bring a card into view, show a piece of work, focus a pane. Each move
+//! shows a one-line note of what moved and why (Ctrl-B goes back, Esc or
+//! any key dismisses it); while the owner has text in the box the move is
+//! only offered (Ctrl-G takes it), so a message never lands in a session
+//! the agent picked. A move never answers anything: a card it brings up is
+//! armed afresh, and it can only ever ask for history.
 
 use std::time::{Duration, Instant};
 
 use aidaemon_client_core::link::{DropKind, Update};
-use aidaemon_client_core::state::{Line, State};
+use aidaemon_client_core::state::{Line, State, ViewRequest};
 use aidaemon_client_protocol::{
     Approval, ApprovalDecision, AskReason, Capability, CardAction, Command, CommandResult, Impact,
-    Risk, ServerFrame,
+    Pane, Risk, ServerFrame, ViewAction,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -26,7 +34,10 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 /// What this client asks for in `hello`.
-pub const CAPABILITIES: &[Capability] = &[];
+pub const CAPABILITIES: &[Capability] = &[Capability::ViewActions];
+
+/// How long a note of a view move stays up.
+const NOTE_FOR: Duration = Duration::from_secs(15);
 
 /// How long a card must be on screen, unchanged, before a key answers it.
 pub const ARM_AFTER: Duration = Duration::from_millis(600);
@@ -79,6 +90,22 @@ pub enum PaletteItem {
     Session(String),
 }
 
+/// Where the view was before a move, for Ctrl-B.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Back {
+    pub selected: Option<String>,
+    pub focus: Focus,
+    pub shown_approval: Option<String>,
+}
+
+/// The one-line note of a view move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    pub text: String,
+    pub back: Option<Back>,
+    pub since: Instant,
+}
+
 #[derive(Debug, Default)]
 pub struct Palette {
     pub query: String,
@@ -100,6 +127,13 @@ pub struct App {
     card: Option<(String, Instant)>,
     /// A line for the status row that a key clears.
     pub flash: Option<String>,
+    /// The note of the last view move.
+    pub note: Option<Note>,
+    /// A move offered while the owner was typing (Ctrl-G takes it).
+    pub held: Option<ViewRequest>,
+    /// The approval a view move brought up, shown instead of the oldest
+    /// while it waits.
+    pub shown_approval: Option<String>,
     /// Sessions whose history was asked for.
     fetched: std::collections::HashSet<String>,
     /// Waiting for the session the next message starts.
@@ -119,6 +153,9 @@ impl Default for App {
             palette: None,
             card: None,
             flash: None,
+            note: None,
+            held: None,
+            shown_approval: None,
             fetched: Default::default(),
             awaiting_new: false,
         }
@@ -168,6 +205,9 @@ impl App {
                     self.flash = self.state.notice.clone();
                 }
                 self.after_frame(&frame);
+                if let Some(request) = self.state.take_view_request() {
+                    commands.extend(self.view_request(request, now));
+                }
             }
         }
         self.observe_card(now);
@@ -176,12 +216,29 @@ impl App {
 
     /// Time passes (redraw tick).
     pub fn tick(&mut self) {
-        self.observe_card(Instant::now());
+        let now = Instant::now();
+        if self
+            .note
+            .as_ref()
+            .is_some_and(|note| now.duration_since(note.since) > NOTE_FOR)
+        {
+            self.note = None;
+        }
+        self.observe_card(now);
+    }
+
+    /// The card on screen: the one a view move brought up while it waits,
+    /// else the oldest.
+    pub fn shown_approval(&self) -> Option<&Approval> {
+        self.shown_approval
+            .as_ref()
+            .and_then(|id| self.state.approvals.get(id))
+            .or_else(|| self.state.next_approval())
     }
 
     /// Note which card is on screen, so its keys arm after [`ARM_AFTER`].
     pub fn observe_card(&mut self, now: Instant) {
-        let shown = self.state.next_approval().map(|a| a.id.clone());
+        let shown = self.shown_approval().map(|a| a.id.clone());
         match (&self.card, shown) {
             (Some((id, _)), Some(shown)) if *id == shown => {}
             (_, Some(shown)) => self.card = Some((shown, now)),
@@ -191,9 +248,118 @@ impl App {
 
     /// The card on screen, when a key may answer it at `now`.
     pub fn armed_card(&self, now: Instant) -> Option<&Approval> {
-        let approval = self.state.next_approval()?;
+        let approval = self.shown_approval()?;
         let (id, since) = self.card.as_ref()?;
         (*id == approval.id && now.duration_since(*since) >= ARM_AFTER).then_some(approval)
+    }
+
+    /// A view move the agent asked for: taken now, or only offered while
+    /// the owner has text in the box. Returns the reads it needs (history);
+    /// a view move never sends anything else.
+    pub fn view_request(&mut self, request: ViewRequest, now: Instant) -> Vec<Command> {
+        if !self.input.is_empty() || self.palette.is_some() {
+            self.note = Some(Note {
+                text: format!(
+                    "The assistant suggests: {}{}. Ctrl-G to go there.",
+                    self.describe(&request.action),
+                    because(&request.reason)
+                ),
+                back: None,
+                since: now,
+            });
+            self.held = Some(request);
+            return Vec::new();
+        }
+        self.held = None;
+        self.move_view(request, now)
+    }
+
+    fn describe(&self, action: &ViewAction) -> String {
+        match action {
+            ViewAction::OpenSession { session_id } => {
+                format!("open {}", self.state.title(session_id))
+            }
+            ViewAction::ShowApproval { approval_id } => match self.state.approvals.get(approval_id)
+            {
+                Some(approval) => format!("the approval \"{}\"", approval.summary),
+                None => "an approval that is no longer waiting".into(),
+            },
+            ViewAction::ShowTask { task_id } => match self.state.tasks.get(task_id) {
+                Some(task) => format!("work #{} {}", task.number, task.description),
+                None => "work that is no longer running".into(),
+            },
+            ViewAction::FocusPane { pane } => format!("the {pane:?} pane").to_lowercase(),
+            ViewAction::NewSession => "a new session".into(),
+            ViewAction::ShowDevices => "your paired devices".into(),
+            ViewAction::Unknown => "something this version cannot show".into(),
+        }
+    }
+
+    fn move_view(&mut self, request: ViewRequest, now: Instant) -> Vec<Command> {
+        let back = Back {
+            selected: self.selected.clone(),
+            focus: self.focus,
+            shown_approval: self.shown_approval.clone(),
+        };
+        let what = self.describe(&request.action);
+        let mut commands = Vec::new();
+        let mut text = format!("Moved to {what}");
+        match request.action {
+            ViewAction::OpenSession { session_id } => {
+                if let Some(Action::Send(command)) = self.open_session(Some(session_id)) {
+                    commands.push(command);
+                }
+            }
+            ViewAction::ShowApproval { approval_id } => {
+                if self.state.approvals.contains_key(&approval_id) {
+                    self.shown_approval = Some(approval_id.clone());
+                    // A card a move brings up is armed afresh.
+                    self.card = Some((approval_id, now));
+                    text = format!("Showing {what}: read it, then y / n");
+                } else {
+                    text = format!("Could not show {what}");
+                }
+            }
+            ViewAction::ShowTask { task_id } => {
+                if let Some(at) = self.state.running().iter().position(|t| t.id == task_id) {
+                    self.task_index = at;
+                    self.focus = Focus::Tasks;
+                } else {
+                    text = format!("Could not show {what}");
+                }
+            }
+            ViewAction::FocusPane { pane } => match pane {
+                Pane::Sessions => self.focus = Focus::Sessions,
+                Pane::Chat => self.focus = Focus::Chat,
+                Pane::Tasks => self.focus = Focus::Tasks,
+                // Cards are answered from the message box; it keeps the keys.
+                Pane::Approvals => {
+                    self.focus = Focus::Chat;
+                    text = "The approval card is above the message box".into();
+                }
+                Pane::Unknown => return Vec::new(),
+            },
+            ViewAction::NewSession => {
+                self.selected = None;
+                self.focus = Focus::Chat;
+            }
+            ViewAction::ShowDevices => {
+                // Listing them is the owner's own command: one Enter away.
+                self.input = "/devices".into();
+                self.focus = Focus::Chat;
+                text = "Press Enter to list your paired devices".into();
+            }
+            ViewAction::Unknown => return Vec::new(),
+        }
+        self.note = Some(Note {
+            text: format!(
+                "{text}{}. Ctrl-B back · Esc dismiss",
+                because(&request.reason)
+            ),
+            back: Some(back),
+            since: now,
+        });
+        commands
     }
 
     /// After a frame: follow a session this client just started.
@@ -288,6 +454,35 @@ impl App {
         self.flash = None;
         if self.palette.is_some() {
             return self.palette_key(key);
+        }
+        match key.code {
+            KeyCode::Char('b') if ctrl && self.note.as_ref().is_some_and(|n| n.back.is_some()) => {
+                if let Some(back) = self.note.take().and_then(|note| note.back) {
+                    self.selected = back.selected;
+                    self.focus = back.focus;
+                    self.shown_approval = back.shown_approval;
+                    self.observe_card(now);
+                }
+                return None;
+            }
+            KeyCode::Char('g') if ctrl && self.held.is_some() => {
+                let request = self.held.take()?;
+                self.note = None;
+                return self
+                    .move_view(request, now)
+                    .into_iter()
+                    .next()
+                    .map(Action::Send);
+            }
+            KeyCode::Esc if self.note.is_some() => {
+                self.note = None;
+                self.held = None;
+                return None;
+            }
+            _ => {
+                // Any other key dismisses the note and does what it does.
+                self.note = None;
+            }
         }
         match key.code {
             KeyCode::Char('c') if ctrl => {
@@ -391,6 +586,11 @@ impl App {
                 _ => None,
             },
         }
+    }
+
+    /// Whether a move is waiting for Ctrl-G.
+    pub fn holds_move(&self) -> bool {
+        self.held.is_some()
     }
 
     fn completing(&self) -> bool {
@@ -606,11 +806,12 @@ impl App {
     }
 
     pub fn draw(&self, frame: &mut Frame) {
-        let card = self.state.next_approval();
+        let card = self.shown_approval();
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),
+                Constraint::Length(if self.note.is_some() { 1 } else { 0 }),
                 Constraint::Length(if card.is_some() { 10 } else { 0 }),
                 Constraint::Length(3),
                 Constraint::Length(1),
@@ -627,8 +828,17 @@ impl App {
         self.draw_sessions(frame, columns[0]);
         self.draw_chat(frame, columns[1]);
         self.draw_tasks(frame, columns[2]);
+        if let Some(note) = &self.note {
+            frame.render_widget(
+                Paragraph::new(TextLine::from(Span::styled(
+                    format!(" ↪ {}", note.text),
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                ))),
+                rows[1],
+            );
+        }
         if let Some(approval) = card {
-            self.draw_card(frame, rows[1], approval);
+            self.draw_card(frame, rows[2], approval);
         }
         let input = Paragraph::new(self.input.as_str()).block(self.block(
             Focus::Chat,
@@ -638,8 +848,8 @@ impl App {
                 "Message (new session)"
             },
         ));
-        frame.render_widget(input, rows[2]);
-        self.draw_status(frame, rows[3]);
+        frame.render_widget(input, rows[3]);
+        self.draw_status(frame, rows[4]);
         if self.palette.is_some() {
             self.draw_palette(frame);
         }
@@ -951,5 +1161,15 @@ impl App {
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         frame.render_stateful_widget(list, rect, &mut list_state);
+    }
+}
+
+/// `reason` as a clause of a note.
+fn because(reason: &str) -> String {
+    let reason = reason.trim().trim_end_matches('.');
+    if reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({reason})")
     }
 }

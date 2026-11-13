@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The agent can move your app's view. Ask in the TUI or the web client ("show me what's waiting", "open the plan session") and it opens the session, brings the approval card up, shows the running work or focuses a pane, with a one-line note of what moved and why and a way back. Only the app you typed in moves; a move never answers an approval, sends, pairs or stops anything, and while you are typing it is only offered. New tool `client_view`, offered only on a turn sent from an app that can show it (on with `[client_gateway]`; turn off with the tool switch `client_view`).
+- The TUI and the web client are keyboard-first: Esc stops the session's work, `y`/`s`/`a`/`n` answer the card once it has been on screen long enough to read, one palette (Ctrl-P in the TUI, Ctrl/Cmd+K on the web) for sessions and commands, and a status line that always says whether the daemon is connected, reconnecting, not running or has signed the device out.
+
 ### Dependencies updated
 
 - Every dependency moved to its latest semver-compatible release, and to its latest major: reqwest 0.13 (one HTTP client in the tree, rustls), sqlx 0.9 with libsqlite3-sys 0.37 (SQLCipher builds unchanged), rand 0.10 with the RustCrypto 0.11 generation (sha2, hmac, hkdf, aes-gcm, p256 0.14), tokio-tungstenite 0.30, toml 1.2 and toml_edit 0.25, self_update 1.3, sysinfo 0.40, dirs 7, croner 4, strum 0.28, dialoguer 0.12, base64 0.23, htmd 0.5, portable-pty 0.9, fastembed 7 (same AllMiniLM-L6-v2 model, so stored embeddings stay valid), chromiumoxide 0.9, keyring 4 (finds secrets saved by keyring 3), async-imap 0.12 and others. serde_yaml (deprecated) is replaced by serde-saphyr, read with YAML 1.2 scalars so config and scenario files parse as before. Digests, keys and signatures are byte-for-byte the same. Built and linted on Rust 1.99.

@@ -96,7 +96,7 @@ export type ApprovalOutcome =
  * This interface was referenced by `ProtocolTypes`'s JSON-Schema
  * via the `definition` "Capability".
  */
-export type Capability = "compact" | "deltas" | "goals" | "attachments" | "push";
+export type Capability = "compact" | "deltas" | "goals" | "attachments" | "push" | "view_actions";
 /**
  * A frame from a client to the daemon.
  *
@@ -352,6 +352,14 @@ export type Event =
   | {
       goal: GoalSummary;
       type: "goal_updated";
+    }
+  | {
+      action: ViewAction;
+      /**
+       * Why, in a few plain words, for the note the client shows.
+       */
+      reason?: string;
+      type: "view_action";
     };
 /**
  * What a running turn is doing.
@@ -408,6 +416,45 @@ export type StepState = "started" | "completed" | "failed";
  * via the `definition` "TurnState".
  */
 export type TurnState = ("failed" | "cancelled") | "completed" | "empty" | "handed_off";
+/**
+ * Where the agent asks a client to take its view. Every variant only
+ * changes what is on screen: none carries a decision, a message or a
+ * device, so none can answer an approval or act for the owner. Kinds a
+ * client does not know read as `Unknown` and are ignored.
+ *
+ * This interface was referenced by `ProtocolTypes`'s JSON-Schema
+ * via the `definition` "ViewAction".
+ */
+export type ViewAction =
+  | {
+      kind: "open_session";
+      session_id: string;
+    }
+  | {
+      approval_id: string;
+      kind: "show_approval";
+    }
+  | {
+      kind: "show_task";
+      task_id: string;
+    }
+  | {
+      kind: "focus_pane";
+      pane: Pane;
+    }
+  | {
+      kind: "new_session";
+    }
+  | {
+      kind: "show_devices";
+    };
+/**
+ * A part of a client's screen.
+ *
+ * This interface was referenced by `ProtocolTypes`'s JSON-Schema
+ * via the `definition` "Pane".
+ */
+export type Pane = "sessions" | "chat" | "approvals" | "tasks";
 /**
  * A frame from the daemon to a client.
  *
@@ -493,6 +540,7 @@ export interface ProtocolTypes {
   OwnerInfo?: OwnerInfo;
   PairingDecision?: PairingDecision;
   PairingOffer?: PairingOffer;
+  Pane?: Pane;
   ProtocolError?: ProtocolError;
   ProtocolVersion?: ProtocolVersion;
   RedeemRequest?: RedeemRequest;
@@ -508,6 +556,7 @@ export interface ProtocolTypes {
   TaskSummary?: TaskSummary;
   TurnState?: TurnState;
   TurnStatus?: TurnStatus;
+  ViewAction?: ViewAction;
 }
 /**
  * A short-lived access token for one device.

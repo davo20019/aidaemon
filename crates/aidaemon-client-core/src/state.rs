@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use aidaemon_client_protocol::{
     Approval, CommandResult, Event, HistoryMessage, ServerFrame, SessionSummary, Snapshot,
-    TaskState, TaskSummary, TurnState, TurnStatus,
+    TaskState, TaskSummary, TurnState, TurnStatus, ViewAction,
 };
 
 /// One line of a transcript.
@@ -56,6 +56,17 @@ pub struct State {
     pub tasks: BTreeMap<String, TaskSummary>,
     /// The latest error or notice from the gateway, shown in the status bar.
     pub notice: Option<String>,
+    /// The latest view move the agent asked this client for, until the
+    /// client takes it ([`State::take_view_request`]). Never touches the
+    /// approvals, the work or the transcripts.
+    pub view_request: Option<ViewRequest>,
+}
+
+/// A view move the agent asked for, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ViewRequest {
+    pub action: ViewAction,
+    pub reason: String,
 }
 
 /// A turn status in a few words.
@@ -289,8 +300,21 @@ impl State {
                     self.tasks.remove(&task.id);
                 }
             }
+            // Kinds this client does not know are ignored.
+            Event::ViewAction {
+                action: ViewAction::Unknown,
+                ..
+            } => {}
+            Event::ViewAction { action, reason } => {
+                self.view_request = Some(ViewRequest { action, reason });
+            }
             Event::GoalUpdated { .. } | Event::Unknown => {}
         }
+    }
+
+    /// The view move asked for, once.
+    pub fn take_view_request(&mut self) -> Option<ViewRequest> {
+        self.view_request.take()
     }
 
     /// The oldest approval waiting, which the card shows.

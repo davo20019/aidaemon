@@ -15,6 +15,7 @@ import type {
   Snapshot,
   TaskSummary,
   TurnStatus,
+  ViewAction,
 } from "./protocol";
 
 export type Line =
@@ -45,10 +46,23 @@ export interface State {
   tasks: Record<string, TaskSummary>;
   /** The latest error or notice from the gateway. */
   notice: string | null;
+  /**
+   * The latest view move the agent asked this client for, until the screen
+   * takes it (takeViewRequest). Never touches approvals, work or transcripts.
+   */
+  view_request: ViewRequest | null;
 }
 
+export interface ViewRequest {
+  action: ViewAction;
+  reason: string;
+}
+
+/** The view actions this client knows; any other kind is ignored. */
+const VIEW_KINDS = new Set(["open_session", "show_approval", "show_task", "focus_pane", "new_session", "show_devices"]);
+
 export function newState(): State {
-  return { last_seq: null, sessions: {}, order: [], approvals: {}, tasks: {}, notice: null };
+  return { last_seq: null, sessions: {}, order: [], approvals: {}, tasks: {}, notice: null, view_request: null };
 }
 
 /** A turn status in a few words. */
@@ -215,6 +229,10 @@ function applyEvent(state: State, sessionId: string | null, event: Event) {
     case "approval_resolved":
       delete state.approvals[event.approval_id];
       return;
+    case "view_action":
+      // Kinds this client does not know are ignored.
+      if (VIEW_KINDS.has(event.action.kind)) state.view_request = { action: event.action, reason: event.reason ?? "" };
+      return;
     case "task_updated":
       if (event.task.state === "running" || event.task.state === "cancelling") {
         state.tasks[event.task.id] = event.task;
@@ -223,6 +241,13 @@ function applyEvent(state: State, sessionId: string | null, event: Event) {
       }
       return;
   }
+}
+
+/** The view move asked for, once. */
+export function takeViewRequest(state: State): ViewRequest | null {
+  const request = state.view_request;
+  state.view_request = null;
+  return request;
 }
 
 /** The oldest approval waiting, which the card shows. */

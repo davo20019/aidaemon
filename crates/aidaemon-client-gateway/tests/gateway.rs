@@ -1265,3 +1265,243 @@ async fn the_client_core_pairs_and_signs_in_with_a_device_key() {
     }
     assert!(welcomed);
 }
+
+// ---------------------------------------------------------------------------
+// The agent-driven view
+// ---------------------------------------------------------------------------
+
+/// A socket with these capabilities, past its welcome.
+async fn socket_with(f: &Fixture, capabilities: Vec<Capability>) -> Socket {
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{}/client/v1/ws", f.url))
+        .await
+        .unwrap();
+    let hello = ClientFrame::Hello {
+        version: ProtocolVersion::CURRENT,
+        client: ClientInfo {
+            kind: ClientKind::Tui,
+            name: "test".into(),
+            version: None,
+            device: None,
+        },
+        capabilities,
+        resume_from: Some(0),
+        token: Some(f.token.clone()),
+    };
+    socket
+        .send(Message::text(serde_json::to_string(&hello).unwrap()))
+        .await
+        .unwrap();
+    let ServerFrame::Welcome {
+        server_capabilities,
+        ..
+    } = next(&mut socket).await
+    else {
+        panic!("welcome first");
+    };
+    assert!(server_capabilities.contains(&Capability::ViewActions));
+    socket
+}
+
+/// Send `frame` on `socket` and read until its ack; every frame before it.
+async fn command_on(socket: &mut Socket, frame: &ClientFrame) -> (CommandResult, Vec<ServerFrame>) {
+    socket
+        .send(Message::text(serde_json::to_string(frame).unwrap()))
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    loop {
+        match next(socket).await {
+            ServerFrame::Ack { result, .. } => return (result, seen),
+            other => seen.push(other),
+        }
+    }
+}
+
+/// Every view action the socket gets within `wait`.
+async fn view_actions_within(socket: &mut Socket, wait: Duration) -> Vec<ViewAction> {
+    let mut actions = Vec::new();
+    let until = tokio::time::Instant::now() + wait;
+    while let Ok(Some(Ok(message))) = tokio::time::timeout_at(until, socket.next()).await {
+        if let Message::Text(text) = message {
+            if let ServerFrame::Event {
+                event: Event::ViewAction { action, .. },
+                seq,
+                ..
+            } = serde_json::from_str(&text).unwrap()
+            {
+                assert_eq!(seq, None, "view actions are never logged");
+                actions.push(action);
+            }
+        }
+    }
+    actions
+}
+
+/// The view action goes to the connection that sent the turn's message and
+/// declared the capability; a client without it, or one that only watches,
+/// is never sent the event, and a message from a client that cannot be
+/// moved leaves the session without a target.
+#[tokio::test]
+async fn a_view_action_reaches_only_the_capable_sender() {
+    let f = fixture(RiskLevel::Medium).await;
+    let mut sender = socket_with(&f, vec![Capability::ViewActions]).await;
+    let mut plain = socket_with(&f, Vec::new()).await;
+    let mut watcher = socket_with(&f, vec![Capability::ViewActions]).await;
+    let (result, _) =
+        command_on(&mut sender, &command("v-1", send("Show me what's waiting"))).await;
+    let CommandResult::MessageAccepted { session_id, .. } = result else {
+        panic!("accepted");
+    };
+    assert!(f.gateway.views().can_show(&session_id));
+    f.gateway
+        .views()
+        .show(
+            &session_id,
+            ViewAction::OpenSession {
+                session_id: session_id.clone(),
+            },
+            "You asked to see it",
+        )
+        .unwrap();
+    assert_eq!(
+        view_actions_within(&mut sender, Duration::from_millis(500)).await,
+        vec![ViewAction::OpenSession {
+            session_id: session_id.clone()
+        }]
+    );
+    assert!(view_actions_within(&mut plain, Duration::from_millis(300))
+        .await
+        .is_empty());
+    assert!(
+        view_actions_within(&mut watcher, Duration::from_millis(300))
+            .await
+            .is_empty()
+    );
+    // Nothing of it reached the log, so no later replay can move a view.
+    let logged = f.gateway.bus().after(0, 500).await.unwrap();
+    assert!(!logged.iter().any(|frame| matches!(
+        frame,
+        ServerFrame::Event {
+            event: Event::ViewAction { .. },
+            ..
+        }
+    )));
+
+    // A message into the same session over HTTP (no capability) clears the
+    // target: the next turn cannot move anyone.
+    let ack = f
+        .post(
+            &[],
+            &command(
+                "v-2",
+                Command::SendMessage {
+                    session_id: Some(session_id.clone()),
+                    text: "Carry on".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+        )
+        .await;
+    assert!(matches!(ack, ServerFrame::Ack { .. }), "{ack:?}");
+    assert!(!f.gateway.views().can_show(&session_id));
+    assert_eq!(
+        f.gateway
+            .views()
+            .show(&session_id, ViewAction::NewSession, "again"),
+        Err(aidaemon_client_gateway::ViewError::NoClient)
+    );
+    // A session of another chat never has a target.
+    assert!(!f.gateway.views().can_show("telegram:synthetic-user-1"));
+}
+
+/// No view action can resolve an approval: with a card waiting, every kind
+/// of view action (pointing at that very card where it can) is delivered,
+/// and the card is still pending, no answer is logged and the turn that
+/// asked is still waiting for the owner.
+#[tokio::test]
+async fn no_view_action_can_resolve_an_approval() {
+    let f = fixture(RiskLevel::Medium).await;
+    let mut socket = socket_with(&f, vec![Capability::ViewActions]).await;
+    let (result, _) = command_on(&mut socket, &command("v-1", send("Please approve this"))).await;
+    let CommandResult::MessageAccepted { session_id, .. } = result else {
+        panic!("accepted");
+    };
+    let approval_id = loop {
+        if let ServerFrame::Event {
+            event: Event::ApprovalRequested { approval },
+            ..
+        } = next(&mut socket).await
+        {
+            break approval.id;
+        }
+    };
+    let every_action = [
+        ViewAction::OpenSession {
+            session_id: session_id.clone(),
+        },
+        ViewAction::ShowApproval {
+            approval_id: approval_id.clone(),
+        },
+        ViewAction::ShowTask {
+            task_id: "any".into(),
+        },
+        ViewAction::FocusPane {
+            pane: Pane::Approvals,
+        },
+        ViewAction::NewSession,
+        ViewAction::ShowDevices,
+        ViewAction::Unknown,
+    ];
+    // The list is every kind there is: adding one fails to compile here.
+    for action in &every_action {
+        match action {
+            ViewAction::OpenSession { .. }
+            | ViewAction::ShowApproval { .. }
+            | ViewAction::ShowTask { .. }
+            | ViewAction::FocusPane { .. }
+            | ViewAction::NewSession
+            | ViewAction::ShowDevices
+            | ViewAction::Unknown => {}
+        }
+    }
+    for action in &every_action {
+        f.gateway
+            .views()
+            .show(&session_id, action.clone(), "Look at this")
+            .unwrap();
+    }
+    let delivered = view_actions_within(&mut socket, Duration::from_millis(800)).await;
+    assert_eq!(delivered, every_action.to_vec());
+    let (_, snapshot) = f.gateway.snapshot().await;
+    assert!(
+        snapshot
+            .pending_approvals
+            .iter()
+            .any(|a| a.id == approval_id),
+        "the card is still waiting"
+    );
+    let logged = f.gateway.bus().after(0, 500).await.unwrap();
+    assert!(!logged.iter().any(|frame| matches!(
+        frame,
+        ServerFrame::Event {
+            event: Event::ApprovalResolved { .. } | Event::TurnCompleted { .. },
+            ..
+        }
+    )));
+    // Only the owner's own command answers it.
+    let (result, _) = command_on(
+        &mut socket,
+        &command(
+            "v-2",
+            Command::ResolveApproval {
+                approval_id: approval_id.clone(),
+                decision: ApprovalDecision::Deny,
+            },
+        ),
+    )
+    .await;
+    assert!(
+        matches!(result, CommandResult::ApprovalResolved { .. }),
+        "{result:?}"
+    );
+}

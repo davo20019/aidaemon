@@ -320,6 +320,11 @@
           "const": "push",
           "description": "Push notifications through a relay.",
           "type": "string"
+        },
+        {
+          "const": "view_actions",
+          "description": "The agent may move this connection's view (`view_action` events):\nopen a session, show an approval or a piece of work, focus a pane.\nSent only to the connection whose message started the turn, never\nreplayed, and never able to answer, pair, send or stop anything.",
+          "type": "string"
         }
       ]
     },
@@ -1397,6 +1402,27 @@
             "goal"
           ],
           "type": "object"
+        },
+        {
+          "description": "Ephemeral, and only to the one connection that declared\n`view_actions` and sent the turn's message: the agent asks this\nclient to move its view. The client shows a short note of what moved\nand why. A view action only changes what is on screen; it never\nanswers an approval, pairs or revokes a device, sends a message or\nstops work.",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/ViewAction"
+            },
+            "reason": {
+              "description": "Why, in a few plain words, for the note the client shows.",
+              "type": "string"
+            },
+            "type": {
+              "const": "view_action",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "action"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1657,6 +1683,16 @@
         "fingerprint"
       ],
       "type": "object"
+    },
+    "Pane": {
+      "description": "A part of a client's screen.",
+      "enum": [
+        "sessions",
+        "chat",
+        "approvals",
+        "tasks"
+      ],
+      "type": "string"
     },
     "ProtocolError": {
       "properties": {
@@ -2256,6 +2292,105 @@
           "required": [
             "kind",
             "text"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ViewAction": {
+      "description": "Where the agent asks a client to take its view. Every variant only\nchanges what is on screen: none carries a decision, a message or a\ndevice, so none can answer an approval or act for the owner. Kinds a\nclient does not know read as `Unknown` and are ignored.",
+      "oneOf": [
+        {
+          "description": "Open a session's transcript.",
+          "properties": {
+            "kind": {
+              "const": "open_session",
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Bring a waiting approval's card into view (not answer it).",
+          "properties": {
+            "approval_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "show_approval",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "approval_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Show an entry of the running-work list.",
+          "properties": {
+            "kind": {
+              "const": "show_task",
+              "type": "string"
+            },
+            "task_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "task_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Move the keyboard to a pane.",
+          "properties": {
+            "kind": {
+              "const": "focus_pane",
+              "type": "string"
+            },
+            "pane": {
+              "$ref": "#/$defs/Pane"
+            }
+          },
+          "required": [
+            "kind",
+            "pane"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Clear the composer's target, so the next message starts a session.",
+          "properties": {
+            "kind": {
+              "const": "new_session",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Show the paired devices.",
+          "properties": {
+            "kind": {
+              "const": "show_devices",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
           ],
           "type": "object"
         }

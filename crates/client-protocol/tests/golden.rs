@@ -335,6 +335,15 @@ fn server_samples() -> Vec<ServerFrame> {
             },
         ),
         event(Some(12), Event::Unknown),
+        event(
+            None,
+            Event::ViewAction {
+                action: ViewAction::ShowApproval {
+                    approval_id: "a-7f3e-1".into(),
+                },
+                reason: "You asked what is waiting".into(),
+            },
+        ),
         ack(CommandResult::MessageAccepted {
             session_id: "app:6c1f".into(),
             new_session: true,
@@ -633,5 +642,42 @@ fn every_turn_status_round_trips() {
     for status in statuses {
         let text = serde_json::to_string(&status).unwrap();
         assert_eq!(serde_json::from_str::<TurnStatus>(&text).unwrap(), status);
+    }
+}
+
+/// Every view action round-trips, and each is only a place on screen: an
+/// exhaustive match fails to compile when a kind is added without being
+/// listed here, and none carries a decision.
+#[test]
+fn every_view_action_round_trips_and_carries_no_decision() {
+    let actions = [
+        ViewAction::OpenSession {
+            session_id: "app:6c1f".into(),
+        },
+        ViewAction::ShowApproval {
+            approval_id: "a-7f3e-1".into(),
+        },
+        ViewAction::ShowTask {
+            task_id: "b9e1-4".into(),
+        },
+        ViewAction::FocusPane { pane: Pane::Tasks },
+        ViewAction::NewSession,
+        ViewAction::ShowDevices,
+    ];
+    for action in actions {
+        match &action {
+            ViewAction::OpenSession { .. }
+            | ViewAction::ShowApproval { .. }
+            | ViewAction::ShowTask { .. }
+            | ViewAction::FocusPane { .. }
+            | ViewAction::NewSession
+            | ViewAction::ShowDevices
+            | ViewAction::Unknown => {}
+        }
+        let value = serde_json::to_value(&action).unwrap();
+        for field in ["decision", "outcome", "text", "device_id", "command"] {
+            assert!(value.get(field).is_none(), "{value} carries {field}");
+        }
+        assert_eq!(serde_json::from_value::<ViewAction>(value).unwrap(), action);
     }
 }
