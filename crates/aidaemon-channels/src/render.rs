@@ -247,6 +247,7 @@ mod tests {
             ),
             reason: "deploys need a human".into(),
             kind: aidaemon_core::InterruptKind::default(),
+            digest: None,
         };
         let text = approval_text(&interruption, 80);
         assert!(text.contains("`deploy`"));

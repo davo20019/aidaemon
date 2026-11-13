@@ -446,10 +446,12 @@ async fn a_paused_parent_keeps_its_child_and_only_the_parent_is_listed() {
             call: ToolCall::new("k1", "send", json!({})),
             reason: "the owner must confirm".to_string(),
             kind: InterruptKind::default(),
+            digest: None,
         },
         hook_index: None,
         hook_chain: Vec::new(),
         child: child.map(Box::new),
+        waived: Vec::new(),
     };
     let mut parent = RunState::new("parent", "telegram:synthetic-user-1", "go");
     let mut child = RunState::new("child", "telegram:synthetic-user-1/sub/c1", "task")
@@ -496,6 +498,7 @@ async fn a_run_paused_for_an_answer_has_not_ended() {
                 call: ToolCall::new("c1", "terminal", serde_json::json!({})),
                 reason: "needs the owner".to_string(),
                 kind: InterruptKind::Untrusted,
+                digest: None,
             },
         },
         usage: Default::default(),

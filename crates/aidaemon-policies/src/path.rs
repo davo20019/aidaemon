@@ -49,9 +49,7 @@ pub fn resolve_path(path: &Path) -> io::Result<PathBuf> {
     let mut links = 0usize;
     while let Some(part) = pending.pop_front() {
         if part == ".." {
-            if missing > 0 {
-                missing -= 1;
-            }
+            missing = missing.saturating_sub(1);
             resolved.pop();
             continue;
         }

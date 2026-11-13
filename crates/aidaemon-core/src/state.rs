@@ -60,6 +60,14 @@ pub struct Interruption {
     /// reads as [`InterruptKind::Untrusted`].
     #[serde(default)]
     pub kind: InterruptKind,
+    /// A keyed digest binding an answer to exactly this question: the
+    /// run, the call (id, tool, canonical arguments), the hook that asked
+    /// and a nonce. `Resolution::Approve` is honored only for the call it
+    /// was given for, and only once; see [`crate::Agent::resume`]. `None`
+    /// in state saved before digests existed (an approval of it is judged
+    /// again from the first hook).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
 }
 
 /// The unfinished tool batch of an interrupted turn.
@@ -89,6 +97,12 @@ pub struct Pending {
     /// [`Pending::interruption`] is then a copy of the deepest run's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child: Option<Box<RunState>>,
+    /// Hooks the owner already answered for this same call (unchanged
+    /// since), bound by [`Interruption::digest`]: an approval waives them
+    /// with the one that asked last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[doc(hidden)]
+    pub waived: Vec<usize>,
 }
 
 /// A tool batch that was executing when the state was last saved. Present

@@ -277,6 +277,7 @@ mod tests {
             call: sdk::ToolCall::new("c1", "browser", serde_json::json!({})),
             reason: "r".to_string(),
             kind,
+            digest: None,
         }
     }
 

@@ -1441,6 +1441,7 @@ mod tests {
             call: sdk::ToolCall::new("c1", "future_tool", json!({})),
             reason: "a future check".to_string(),
             kind: sdk::InterruptKind::Untrusted,
+            digest: None,
         };
         match unknown_interrupt_kind(&interruption) {
             sdk::Resolution::Deny { reason } => {

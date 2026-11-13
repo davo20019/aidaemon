@@ -48,6 +48,7 @@ const STUCK_SKIP_REASON: &str =
     "the run was stopped by the stuck detector before this call started";
 
 /// How a tool batch ended.
+#[allow(clippy::large_enum_variant)] // short-lived; moved into `RunStatus`
 enum BatchEnd {
     Done,
     Interrupted(Interruption),
@@ -86,6 +87,15 @@ enum Verdict {
 struct Approved {
     call: ToolCall,
     annotations: ToolAnnotations,
+}
+
+/// Who asked the question a batch is held on.
+enum Asker {
+    /// The hook at `index`, after the owner answered the hooks in `waived`
+    /// for this same call.
+    Hook { index: usize, waived: Vec<usize> },
+    /// A child run the call started, paused on its own question.
+    Child(Box<RunState>),
 }
 
 /// What a dispatch asks of the tool.
@@ -186,7 +196,6 @@ impl<'a> Driver<'a> {
     ) -> Result<RunOutcome, CoreError> {
         if let Some(mut pending) = self.state.pending.take() {
             let resolution = self.settle(&pending.interruption, resolution);
-            self.emit(Event::RunResumed).await?;
             let earlier: Vec<String> = pending.calls[..pending.next]
                 .iter()
                 .map(|c| c.id.clone())
@@ -196,20 +205,19 @@ impl<'a> Driver<'a> {
                 started: earlier.clone(),
                 done: earlier,
             });
-            // A position in a different chain is a different hook: judge
-            // the call from the start rather than skip one.
-            let resume_after = pending
-                .hook_index
-                .filter(|_| pending.hook_chain == self.hook_chain());
+            // An approval waives the hooks it answered, and only for the
+            // exact call it was given for; anything else is judged from
+            // the first hook.
+            let waived = match resolution {
+                Some(Resolution::Approve) if pending.child.is_none() => {
+                    self.verify_approval(&pending).await?
+                }
+                _ => Vec::new(),
+            };
+            self.emit(Event::RunResumed).await?;
             let child = pending.child.take();
             match self
-                .execute_batch(
-                    &pending.calls,
-                    pending.next,
-                    resolution,
-                    resume_after,
-                    child,
-                )
+                .execute_batch(&pending.calls, pending.next, resolution, waived, child)
                 .await?
             {
                 BatchEnd::Done => self.checkpoint().await?,
@@ -480,7 +488,10 @@ impl<'a> Driver<'a> {
                 ..InFlight::default()
             });
             self.checkpoint().await?;
-            match self.execute_batch(&calls, 0, None, None, None).await? {
+            match self
+                .execute_batch(&calls, 0, None, Vec::new(), None)
+                .await?
+            {
                 BatchEnd::Done => self.checkpoint().await?,
                 end => return self.finish_batch(end).await,
             }
@@ -498,11 +509,11 @@ impl<'a> Driver<'a> {
         calls: &[ToolCall],
         start: usize,
         resolution: Option<Resolution>,
-        resume_after: Option<usize>,
+        waived: Vec<usize>,
         child: Option<Box<RunState>>,
     ) -> Result<BatchEnd, CoreError> {
         let end = self
-            .run_batch(calls, start, resolution, resume_after, child)
+            .run_batch(calls, start, resolution, waived, child)
             .await?;
         Ok(match end {
             BatchEnd::Done | BatchEnd::Limit(_) | BatchEnd::Stuck(_) => {
@@ -527,7 +538,7 @@ impl<'a> Driver<'a> {
         calls: &[ToolCall],
         start: usize,
         mut resolution: Option<Resolution>,
-        resume_after: Option<usize>,
+        mut waived: Vec<usize>,
         mut child: Option<Box<RunState>>,
     ) -> Result<BatchEnd, CoreError> {
         let mut group: Vec<Approved> = Vec::new();
@@ -672,19 +683,23 @@ impl<'a> Driver<'a> {
             } else {
                 None
             };
+            // Hooks answered for this call; a rewrite makes it another
+            // call and forgets them.
+            let mut waived_now = Vec::new();
             let mut verdict = match settled {
-                // An approval settles only the hook that interrupted: the
-                // hooks after it still judge the call.
+                // An approval waives only the questions it answered: every
+                // other hook, before the one that asked as well as after
+                // it, judges the call again.
                 Some(Resolution::Approve) => {
-                    self.decide(&mut call, &mut info, resume_after.map_or(0, |i| i + 1))
-                        .await
+                    waived_now = std::mem::take(&mut waived);
+                    self.decide(&mut call, &mut info, &mut waived_now).await
                 }
                 Some(
                     Resolution::Deny { reason }
                     | Resolution::OwnerDeclined { reason, .. }
                     | Resolution::Unanswered { reason },
                 ) => Verdict::Deny(reason),
-                None => self.decide(&mut call, &mut info, 0).await,
+                None => self.decide(&mut call, &mut info, &mut waived_now).await,
             };
             // A rewrite may introduce egress after reads were queued. Let
             // those reads taint the run before judging the rewritten call.
@@ -695,7 +710,7 @@ impl<'a> Driver<'a> {
                 {
                     return Ok(end);
                 }
-                verdict = self.decide(&mut call, &mut info, 0).await;
+                verdict = self.decide(&mut call, &mut info, &mut waived_now).await;
             }
             // A hook may have rewritten the call; judge and record what runs.
             let annotations = info.annotations;
@@ -802,16 +817,27 @@ impl<'a> Driver<'a> {
                     {
                         return Ok(end);
                     }
-                    // Save the call exactly as the hooks left it: a resumed
-                    // `Approve` runs what the approver was shown, including
-                    // any rewrite, without consulting the hooks again.
+                    // Save the call exactly as the hooks left it, bound to
+                    // the question by a digest: a resumed `Approve` waives
+                    // this hook (and those already answered) for this call
+                    // only.
                     let interruption = Interruption {
                         call: call.clone(),
                         reason,
                         kind,
+                        digest: None,
                     };
                     return self
-                        .hold_batch(calls, index, call, interruption, Some(hook_index), None)
+                        .hold_batch(
+                            calls,
+                            index,
+                            call,
+                            interruption,
+                            Asker::Hook {
+                                index: hook_index,
+                                waived: waived_now,
+                            },
+                        )
                         .await;
                 }
             }
@@ -843,9 +869,27 @@ impl<'a> Driver<'a> {
         index: usize,
         call: ToolCall,
         interruption: Interruption,
-        hook_index: Option<usize>,
-        child: Option<Box<RunState>>,
+        asker: Asker,
     ) -> Result<BatchEnd, CoreError> {
+        let (hook_index, child, mut waived) = match asker {
+            Asker::Hook { index, waived } => (Some(index), None, waived),
+            Asker::Child(child) => (None, Some(child), Vec::new()),
+        };
+        let hook_chain = self.hook_chain();
+        let mut interruption = interruption;
+        waived.sort_unstable();
+        waived.dedup();
+        if let Some(hook_index) = hook_index {
+            let question = crate::binding::Question {
+                run_id: self.state.run_id,
+                turn: self.state.turn,
+                call: &call,
+                hook_index,
+                hook_name: hook_chain.get(hook_index).map_or("", String::as_str),
+                waived: &waived,
+            };
+            interruption.digest = Some(crate::binding::digest(&self.approval_key(), &question));
+        }
         let mut pending_calls = calls.to_vec();
         pending_calls[index] = call;
         self.state.in_flight = None;
@@ -854,8 +898,9 @@ impl<'a> Driver<'a> {
             next: index,
             interruption: interruption.clone(),
             hook_index,
-            hook_chain: self.hook_chain(),
+            hook_chain,
             child,
+            waived,
         });
         self.emit(Event::Interrupted {
             interruption: interruption.clone(),
@@ -898,7 +943,7 @@ impl<'a> Driver<'a> {
             // A runtime handle: the resumed child gets the set in force then.
             child.shared_declines = None;
             let end = self
-                .hold_batch(calls, index, item.call, interruption, None, Some(child))
+                .hold_batch(calls, index, item.call, interruption, Asker::Child(child))
                 .await?;
             return Ok(Some(end));
         }
@@ -935,16 +980,29 @@ impl<'a> Driver<'a> {
     /// action through another tool. That includes effects declined in a
     /// run sharing this run's declines ([`crate::SharedDeclines`]), however
     /// recently: they are taken in first.
-    async fn decide(&mut self, call: &mut ToolCall, info: &mut ToolInfo, from: usize) -> Verdict {
+    ///
+    /// Hooks in `waived` are skipped: the owner answered their question
+    /// about this exact call. A rewrite makes it another call, so it clears
+    /// `waived`.
+    async fn decide(
+        &mut self,
+        call: &mut ToolCall,
+        info: &mut ToolInfo,
+        waived: &mut Vec<usize>,
+    ) -> Verdict {
         self.state.sync_declines();
         if let Some(reason) = declined_reason(&self.state.declined, info) {
             return Verdict::Deny(reason);
         }
         let ctx = self.ctx();
         let guard = self.guard(HookPoint::BeforeTool);
-        let mut hook_index = from;
+        let mut hook_index = 0;
         let mut rewrites = 0;
         while let Some(hook) = self.agent.hooks.get(hook_index) {
+            if waived.contains(&hook_index) {
+                hook_index += 1;
+                continue;
+            }
             let answer = guard
                 .run(hook.as_ref(), hook.before_tool(&ctx, call, info))
                 .await
@@ -998,6 +1056,7 @@ impl<'a> Driver<'a> {
                     // Every judgment applies to exact arguments. A rewrite
                     // invalidates earlier authority, scans and approvals.
                     hook_index = 0;
+                    waived.clear();
                     continue;
                 }
                 ToolDecision::Rewrite { .. } => {}
@@ -1399,7 +1458,7 @@ impl<'a> Driver<'a> {
             indeterminate,
         })
         .await?;
-        self.execute_batch(&in_flight.calls, 0, None, None, None)
+        self.execute_batch(&in_flight.calls, 0, None, Vec::new(), None)
             .await
     }
 
@@ -1464,6 +1523,70 @@ impl<'a> Driver<'a> {
     }
 
     /// The names of the installed hooks, in order.
+    fn approval_key(&self) -> [u8; 32] {
+        self.agent
+            .approval_key
+            .unwrap_or_else(crate::binding::process_key)
+    }
+
+    /// The hooks an `Approve` of `pending` waives: the one that asked and
+    /// those answered before it, when the saved call is still the one the
+    /// digest names and the chain is the one that asked. Anything else
+    /// (an edited or swapped call, another chain, state saved before
+    /// digests) waives nothing: the call is judged from the first hook. An
+    /// approval already used, in this process or (with a store) by a run
+    /// that has moved on, is refused.
+    async fn verify_approval(&self, pending: &Pending) -> Result<Vec<usize>, CoreError> {
+        let (Some(hook_index), Some(given)) =
+            (pending.hook_index, pending.interruption.digest.as_deref())
+        else {
+            return Ok(Vec::new());
+        };
+        let chain = self.hook_chain();
+        let Some(call) = pending.calls.get(pending.next) else {
+            return Ok(Vec::new());
+        };
+        if pending.hook_chain != chain || hook_index >= chain.len() {
+            return Ok(Vec::new());
+        }
+        let mut waived = pending.waived.clone();
+        waived.sort_unstable();
+        waived.dedup();
+        if waived.iter().any(|&i| i == hook_index || i >= chain.len()) {
+            return Ok(Vec::new());
+        }
+        let question = crate::binding::Question {
+            run_id: self.state.run_id,
+            turn: self.state.turn,
+            call,
+            hook_index,
+            hook_name: &chain[hook_index],
+            waived: &waived,
+        };
+        let expected = crate::binding::digest(&self.approval_key(), &question);
+        if !crate::binding::same(&expected, given) {
+            return Ok(Vec::new());
+        }
+        if let Some(store) = &self.agent.store {
+            if let Some(stored) = store.load_state(self.state.run_id).await? {
+                let still_waiting = stored.pending.as_ref().is_some_and(|p| {
+                    p.interruption
+                        .digest
+                        .as_deref()
+                        .is_none_or(|d| crate::binding::same(d, given))
+                });
+                if !still_waiting {
+                    return Err(CoreError::ApprovalAlreadyUsed);
+                }
+            }
+        }
+        if !crate::binding::consume(given) {
+            return Err(CoreError::ApprovalAlreadyUsed);
+        }
+        waived.push(hook_index);
+        Ok(waived)
+    }
+
     fn hook_chain(&self) -> Vec<String> {
         self.agent
             .hooks

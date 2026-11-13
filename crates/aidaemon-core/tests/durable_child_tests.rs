@@ -856,7 +856,16 @@ async fn a_snapshot_saved_at_the_old_schema_still_resumes() {
     let counters = Counters::default();
     let provider = scripted(vec![text("Sent for Alice Rivera.")]);
     let agent = leaf_agent("a", provider.clone(), &counters);
+    // Saved before approvals carried a digest: nothing binds the approval
+    // to the call, so the call is judged again and the owner asked again.
     let out = agent.resume(saved, approve()).await.unwrap();
+    let RunStatus::Interrupted { interruption } = &out.status else {
+        panic!("an unbound approval is asked again: {:?}", out.status);
+    };
+    assert_eq!(interruption.call.id, "c1");
+    assert!(interruption.digest.is_some());
+    assert_eq!(counters.send.load(Ordering::SeqCst), 0);
+    let out = agent.resume(out.state, approve()).await.unwrap();
 
     assert!(out.is_succeeded(), "{:?}", out.status);
     assert_eq!(out.final_text.as_deref(), Some("Sent for Alice Rivera."));

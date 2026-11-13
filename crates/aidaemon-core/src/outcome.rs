@@ -11,6 +11,7 @@ use crate::stuck::StuckSignal;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
 #[non_exhaustive]
+#[allow(clippy::large_enum_variant)] // boxing `Interrupted` would break every match on it
 pub enum RunStatus {
     /// The model gave a final answer and every stop hook accepted it.
     Completed,

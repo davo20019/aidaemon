@@ -36,6 +36,10 @@ pub enum CoreError {
     PendingInterruption,
     #[error("saved run state has schema {found}; this kernel resumes up to {supported}")]
     UnsupportedRunState { found: u32, supported: u32 },
+    /// The approval in this state was already used: an answer runs its
+    /// call once, however many copies of the state are resumed.
+    #[error("this approval was already used; the call it approved does not run again")]
+    ApprovalAlreadyUsed,
     #[error(transparent)]
     Store(#[from] StoreError),
 }

@@ -70,6 +70,8 @@ pub(crate) struct AgentInner {
     pub max_output_tokens: Option<u32>,
     /// Carried by every call's [`crate::ToolContext`].
     pub extensions: Extensions,
+    /// Keys approval digests; `None` uses the process's random key.
+    pub approval_key: Option<[u8; 32]>,
 }
 
 /// An agent is configuration: a stable id, a model, instructions, tools and
@@ -284,6 +286,7 @@ pub struct AgentBuilder {
     store: Option<Arc<dyn RunStore>>,
     max_output_tokens: Option<u32>,
     extensions: Extensions,
+    approval_key: Option<[u8; 32]>,
 }
 
 impl AgentBuilder {
@@ -304,6 +307,7 @@ impl AgentBuilder {
             store: None,
             max_output_tokens: None,
             extensions: Extensions::default(),
+            approval_key: None,
         }
     }
 
@@ -399,6 +403,17 @@ impl AgentBuilder {
 
     /// Application values every tool call can read from
     /// [`crate::ToolContext::extensions`]. Replaces any earlier set.
+    /// The key approval digests are made with
+    /// ([`crate::Interruption::digest`]). Without one each process uses its
+    /// own random key, so an approval saved by one process and resumed by
+    /// another is not honored: its call is judged again and the owner asked
+    /// again. Give every process that resumes the same runs the same secret
+    /// key to honor approvals across them.
+    pub fn approval_key(mut self, key: [u8; 32]) -> Self {
+        self.approval_key = Some(key);
+        self
+    }
+
     pub fn tool_extensions(mut self, extensions: Extensions) -> Self {
         self.extensions = extensions;
         self
@@ -452,6 +467,7 @@ impl AgentBuilder {
                 store: self.store,
                 max_output_tokens: self.max_output_tokens,
                 extensions: self.extensions,
+                approval_key: self.approval_key,
             }),
         })
     }

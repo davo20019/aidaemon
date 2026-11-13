@@ -493,6 +493,10 @@ impl Preset {
             .undeclared_read_only(undeclared_reads);
         let mut approval =
             ApprovalPolicy::new(self.approvals).ask_undeclared_writes(ask_undeclared);
+        // Rules judge paths resolved against the same base as the guard.
+        if let Some(base) = roots.first() {
+            approval = approval.base_dir(base);
+        }
         for name in &path_free {
             scope = scope.path_free_tool(name.clone());
             approval = approval.path_free_tool(name.clone());

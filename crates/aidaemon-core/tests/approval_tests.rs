@@ -753,6 +753,7 @@ fn untrusted_egress_is_judged_by_kind() {
         call: call("c1", "send", json!({})),
         reason: reason.clone(),
         kind: InterruptKind::Untrusted,
+        digest: None,
     };
     assert!(is_untrusted_egress(&untrusted));
     let owner = Interruption {
