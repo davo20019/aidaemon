@@ -58,7 +58,6 @@ mod single_instance;
 mod skills;
 mod startup;
 mod state;
-mod stt_setup;
 use aidaemon_channels::tasks;
 #[cfg(feature = "terminal-bridge")]
 mod terminal_bridge;
@@ -725,7 +724,7 @@ fn handle_client_token_command(args: &[String], config_path: &Path) -> anyhow::R
     // Read only the gateway's table: loading the whole config would
     // resolve secrets from the keychain.
     let settings = crate::startup::client_gateway::settings_from_file(config_path);
-    let path = crate::startup::client_gateway::mint_local_token(&settings)?;
+    let path = aidaemon_client_gateway::token::mint_local_token(&settings)?;
     if print {
         println!("{}", std::fs::read_to_string(&path)?.trim());
     }

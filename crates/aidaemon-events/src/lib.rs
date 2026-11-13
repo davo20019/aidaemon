@@ -10,6 +10,7 @@ pub mod conversation;
 pub mod conversation_turn;
 pub mod dialogue;
 pub mod execution_graph;
+pub mod harness_report;
 pub mod mandate_grant;
 pub mod model_call_telemetry;
 pub mod payloads;

@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::channels::attachments::save_tool_observation_image;
 use crate::config::{ComputerUseConfig, ProviderKind, VisionConfig};
 use crate::events::{Event, EventStore, EventType};
 use crate::traits::{
@@ -15,6 +14,7 @@ use crate::traits::{
     ToolRole,
 };
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
+use aidaemon_channels::attachments::save_tool_observation_image;
 
 mod approvals;
 pub mod cache;

@@ -26,6 +26,8 @@
 pub mod bot;
 mod events;
 pub mod format;
+#[cfg(feature = "bot")]
+pub mod history_tool;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;

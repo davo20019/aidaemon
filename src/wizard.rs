@@ -1122,7 +1122,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     }
 
     // ── Whisper STT (optional) ──────────────────────────────────────────
-    let stt_probe = crate::stt_setup::probe_stt_environment();
+    let stt_probe = aidaemon_tools::stt_setup::probe_stt_environment();
     let mut stt_enabled = false;
     let mut stt_language = "en".to_string();
     let mut stt_probe_final = stt_probe.clone();
@@ -1134,7 +1134,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     println!();
     println!(
         "  {}",
-        crate::stt_setup::format_stt_probe_report(&stt_probe)
+        aidaemon_tools::stt_setup::format_stt_probe_report(&stt_probe)
     );
 
     if stt_probe.whisper_cli.is_some() {
@@ -1149,8 +1149,11 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
                 let model_path: String = Input::new()
                     .with_prompt("  Path to Whisper GGML model (.bin)")
                     .interact_text()?;
-                stt_probe_final =
-                    crate::stt_setup::SttProbe::resolve(None, Some(model_path.trim()), None);
+                stt_probe_final = aidaemon_tools::stt_setup::SttProbe::resolve(
+                    None,
+                    Some(model_path.trim()),
+                    None,
+                );
             }
             if !stt_probe_final.is_complete() {
                 println!("  STT stack incomplete — skipping (install ffmpeg and/or model).");
@@ -1298,7 +1301,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
         "\n# Uncomment to enable browser tool:\n# [browser]\n# enabled = true\n".to_string()
     };
     let stt_section =
-        crate::stt_setup::stt_config_section(&stt_probe_final, stt_enabled, &stt_language);
+        aidaemon_tools::stt_setup::stt_config_section(&stt_probe_final, stt_enabled, &stt_language);
 
     let agent_name_config = toml_string_literal(&agent_name);
     let config = format!(

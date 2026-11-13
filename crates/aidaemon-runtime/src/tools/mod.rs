@@ -1,7 +1,11 @@
 //! Tools that join several domains (memory with scheduled work, the
 //! automation surfaces), so they live where those crates meet.
 
+pub mod config_manager;
+pub mod diagnose;
 pub mod escalate;
+pub mod image_generation;
+pub mod manage_api;
 pub mod manage_automations;
 pub mod manage_memories;
 pub mod policy_metrics;

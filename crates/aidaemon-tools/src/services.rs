@@ -9,6 +9,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "oauth")]
+pub mod manage_http_auth;
+#[cfg(feature = "oauth")]
+pub mod manage_oauth;
+#[cfg(feature = "oauth")]
 pub mod oauth;
 
 /// The conversation's audience, shared across the SDK.

@@ -853,9 +853,12 @@ pub async fn register_optional_tools(
                 }
                 std::fs::create_dir_all(&inbox_dir)?;
                 tools.push(Arc::new(
-                    GenerateImageTool::chatgpt_subscription(PathBuf::from(&inbox_dir))
-                        .map_err(anyhow::Error::msg)?
-                        .with_event_store(event_store.clone()),
+                    GenerateImageTool::chatgpt_subscription(
+                        PathBuf::from(&inbox_dir),
+                        crate::providers::chatgpt_login::shared_credential_manager(),
+                    )
+                    .map_err(anyhow::Error::msg)?
+                    .with_event_store(event_store.clone()),
                 ));
             }
             OptionalToolId::CliAgents => {
@@ -1076,9 +1079,10 @@ async fn register_runtime_tool_by_id(
         }
         RuntimeToolId::ManageHttpAuth => {
             tools.push(Arc::new(ManageHttpAuthTool::new(
-                config_path.to_path_buf(),
+                crate::config::config_file(config_path),
                 http_profiles,
                 state as Arc<dyn crate::traits::StateStore>,
+                crate::config::shared_secret_store(),
             )));
         }
         RuntimeToolId::ManageOauth => {
@@ -1117,7 +1121,7 @@ async fn register_runtime_tool_by_id(
             tools.push(Arc::new(ManageOAuthTool::new(
                 gateway.clone(),
                 state.clone() as Arc<dyn crate::traits::StateStore>,
-                config_path.to_path_buf(),
+                crate::config::config_file(config_path),
             )));
             *oauth_gateway = Some(gateway);
         }
@@ -1137,12 +1141,13 @@ async fn register_runtime_tool_by_id(
             };
 
             tools.push(Arc::new(ManageApiTool::new(
-                config_path.to_path_buf(),
+                crate::config::config_file(config_path),
                 skills_dir,
                 config.skills.registries.clone(),
                 config.search.clone(),
                 http_profiles,
-                state.clone() as Arc<dyn crate::traits::StateStore>,
+                state.clone() as Arc<dyn crate::traits::OAuthStore>,
+                state.clone() as Arc<dyn crate::traits::SkillsStore>,
                 gateway,
             )));
         }
@@ -1279,7 +1284,10 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::ConfigManager => BuiltBaseTool {
-            tool: Arc::new(ConfigManagerTool::new(config_path.to_path_buf())),
+            tool: Arc::new(ConfigManagerTool::new(
+                crate::config::config_file(config_path),
+                crate::config::shared_secret_store(),
+            )),
             terminal_tool: None,
         },
         BaseToolId::WebFetch => BuiltBaseTool {

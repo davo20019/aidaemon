@@ -51,6 +51,7 @@ mod checklist;
 pub mod checkpoints;
 pub mod command_effects;
 pub mod command_risk;
+pub mod config_file;
 pub mod consequential;
 pub mod daemon_guard;
 pub mod duration_format;
@@ -80,6 +81,7 @@ pub mod service_status;
 pub mod services;
 mod shell;
 pub mod status;
+pub mod stt_setup;
 pub mod system;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

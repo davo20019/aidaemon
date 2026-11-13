@@ -26,6 +26,7 @@ bot = [
     "dep:aidaemon-tools",
     "dep:anyhow",
     "dep:chrono",
+    "dep:regex",
     "dep:shell-words",
     "dep:uuid",
     "reqwest/query",
@@ -38,6 +39,7 @@ aidaemon-events = { version = "0.2.0", path = "../aidaemon-events", optional = t
 aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools", optional = true }
 anyhow = { version = "1", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+regex = { version = "1", optional = true }
 shell-words = { version = "1", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 async-trait = "0.1"
@@ -53,4 +55,5 @@ tracing = "0.1"
 [dev-dependencies]
 aidaemon-channels = { path = "../aidaemon-channels", features = ["conformance"] }
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
 tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time", "net", "io-util"] }

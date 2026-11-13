@@ -2,7 +2,6 @@
 //! transcripts and slash commands from the daemon's stores) and its start.
 //! Off unless `[client_gateway] enabled = true`.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use aidaemon_client_gateway::{ClientGateway, ClientGatewayConfig, ClientHost, GatewayDeps};
@@ -13,24 +12,6 @@ use crate::channels::{ChannelHub, ChannelRuntimeDeps};
 use crate::config::AppConfig;
 use crate::traits::StateStore;
 use crate::types::UserRole;
-
-/// Where the local client token's hash is kept.
-pub(crate) fn token_file(config: &ClientGatewayConfig) -> PathBuf {
-    match config.token_file.as_deref().map(str::trim) {
-        Some(path) if !path.is_empty() => PathBuf::from(shellexpand::tilde(path).into_owned()),
-        _ => dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".aidaemon")
-            .join("client-gateway-token.sha256"),
-    }
-}
-
-/// Where the owner's own copy of the local token is kept, next to its hash,
-/// readable by the owner only, so `aidaemon tui` and `aidaemon web` need no
-/// flags. Same trust as the config and the database beside it.
-pub(crate) fn client_token_file(config: &ClientGatewayConfig) -> PathBuf {
-    token_file(config).with_file_name("client-token")
-}
 
 /// The `[client_gateway]` table of the config file, read without resolving
 /// the rest (which would touch the keychain). Missing or invalid: defaults.
@@ -43,54 +24,18 @@ pub(crate) fn settings_from_file(config_path: &std::path::Path) -> ClientGateway
         .unwrap_or_default()
 }
 
-/// Mint a new local token (revoking the old one at once), keep its hash for
-/// the gateway and the owner's copy in [`client_token_file`]. Returns the
-/// copy's path; the token itself is never printed or returned.
-pub(crate) fn mint_local_token(config: &ClientGatewayConfig) -> std::io::Result<PathBuf> {
-    let token = aidaemon_client_gateway::token::mint(&token_file(config))?;
-    let path = client_token_file(config);
-    write_owner_only(&path, &format!("{token}\n"))?;
-    Ok(path)
-}
-
-/// The local token: `AIDAEMON_CLIENT_TOKEN`, else the owner's copy. A copy
-/// that no longer matches the gateway's hash (minted elsewhere) is `None`.
-pub(crate) fn local_token(config: &ClientGatewayConfig) -> Option<String> {
-    if let Ok(token) = std::env::var("AIDAEMON_CLIENT_TOKEN") {
-        if !token.trim().is_empty() {
-            return Some(token.trim().to_string());
-        }
-    }
-    let token = std::fs::read_to_string(client_token_file(config)).ok()?;
-    let token = token.trim().to_string();
-    aidaemon_client_gateway::token::verify(&token_file(config), &token).then_some(token)
-}
-
 /// The local token, minting one when there is none that still works.
 pub(crate) fn local_token_or_mint(config: &ClientGatewayConfig) -> anyhow::Result<String> {
-    if let Some(token) = local_token(config) {
+    if let Some(token) = aidaemon_client_gateway::token::local_token(config) {
         return Ok(token);
     }
-    let path = mint_local_token(config)?;
+    let path = aidaemon_client_gateway::token::mint_local_token(config)?;
     eprintln!(
         "Minted a local Client Gateway token (saved to {}).",
         path.display()
     );
-    local_token(config).ok_or_else(|| anyhow::anyhow!("the token just minted does not verify"))
-}
-
-fn write_owner_only(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, path)
+    aidaemon_client_gateway::token::local_token(config)
+        .ok_or_else(|| anyhow::anyhow!("the token just minted does not verify"))
 }
 
 /// The configured `public_url`, as the origins served while no tunnel
@@ -230,7 +175,7 @@ pub async fn start(
         log,
         config: config.client_gateway.clone(),
         endpoints,
-        token_file: token_file(&config.client_gateway),
+        token_file: aidaemon_client_gateway::token::token_file(&config.client_gateway),
         approvals: Some(confirm_tx),
     })
     .await?;
