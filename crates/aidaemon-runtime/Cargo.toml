@@ -32,7 +32,7 @@ aidaemon-mcp = { version = "0.2.0", path = "../aidaemon-mcp" }
 aidaemon-memory = { version = "0.2.0", path = "../aidaemon-memory" }
 aidaemon-policies = { version = "0.2.0", path = "../aidaemon-policies" }
 aidaemon-skills = { version = "0.2.0", path = "../aidaemon-skills" }
-aidaemon-providers = { version = "0.2.0", path = "../aidaemon-providers" }
+aidaemon-providers = { version = "0.2.0", path = "../aidaemon-providers", features = ["chatgpt-login"] }
 aidaemon-store-sqlite = { version = "0.2.0", path = "../aidaemon-store-sqlite" }
 aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools", features = ["oauth"] }
 aidaemon-secrets = { version = "0.2.0", path = "../aidaemon-secrets", default-features = false }
@@ -64,6 +64,7 @@ aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 aidaemon-decisions = { path = "../aidaemon-decisions", features = ["testing", "gemini"] }
 aidaemon-events = { path = "../aidaemon-events", features = ["testing"] }
 aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
+axum = "0.8"
 proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

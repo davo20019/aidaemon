@@ -577,6 +577,7 @@ dependencies = [
  "aidaemon-work",
  "anyhow",
  "async-trait",
+ "axum",
  "base64 0.23.1",
  "chrono",
  "dirs 7.0.0",
