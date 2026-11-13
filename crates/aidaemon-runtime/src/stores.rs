@@ -33,6 +33,7 @@ pub trait StateStore:
     + HistorySearchStore
     + GoalTraceStore
     + MandateToolStore
+    + ManageGoalTasksStore
     + aidaemon_work::scheduler::SchedulerStore
     + McpRegistryStore
     + SkillsStore
@@ -107,10 +108,10 @@ pub mod prelude {
         ConversationSummaryStore, DialogueStateStore, DynamicBotStore, DynamicCliAgentStore,
         DynamicMcpServerStore, EpisodeStore, FactStore, GoalBudgetStore, GoalNotificationStore,
         GoalScheduleStore, GoalStore, GoalTraceStore, HealthCheckStore, HistorySearchStore,
-        LearningStore, MandateStore, MandateToolStore, McpRegistryStore, MessageStore,
-        NotificationStore, OAuthGatewayStore, OAuthStore, PeopleStore, PromptSnapshotStore,
-        ReportBlockerStore, ScheduledGoalRunsStore, ScheduledRunStore, SessionChannelStore,
-        SettingsStore, SkillStore, SkillsStore, StateStore, TaskDispatchStore, TaskStore,
-        TokenUsageStore, WorkCoordinationStore,
+        LearningStore, ManageGoalTasksStore, MandateStore, MandateToolStore, McpRegistryStore,
+        MessageStore, NotificationStore, OAuthGatewayStore, OAuthStore, PeopleStore,
+        PromptSnapshotStore, ReportBlockerStore, ScheduledGoalRunsStore, ScheduledRunStore,
+        SessionChannelStore, SettingsStore, SkillStore, SkillsStore, StateStore, TaskDispatchStore,
+        TaskStore, TokenUsageStore, WorkCoordinationStore,
     };
 }

@@ -9,11 +9,9 @@ use crate::traits::*;
 
 #[test]
 fn unbound_checklist_target_no_longer_leaves_an_all_success_audit_partial() {
-    use crate::tools::track_requirements::{
-        bind_checklist_targets, executor_expectations_from_checklist_arguments,
-        StableSubjectVocabulary,
-    };
+    use crate::tools::track_requirements::{bind_checklist_targets, StableSubjectVocabulary};
     use crate::traits::StableObservationSubject;
+    use aidaemon_work::plans::checklist_args::executor_expectations_from_checklist_arguments;
 
     let objective_facets = [
         ToolSemanticFacet::Schedule,

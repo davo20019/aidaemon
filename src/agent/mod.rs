@@ -434,6 +434,7 @@ pub(crate) use goal_dispatch::{
 };
 #[cfg(test)]
 pub(in crate::agent) use goal_dispatch::{parse_wait_task_seconds, user_facing_task_description};
+#[cfg(test)]
 pub(crate) use goal_dispatch::{
     SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS, SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
 };

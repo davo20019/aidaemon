@@ -1085,6 +1085,17 @@ impl<T> GoalTraceStore for T where
 {
 }
 
+/// Focused persistence contract used by goal task management.
+pub trait ManageGoalTasksStore:
+    GoalStore + TaskStore + MandateStore + WorkCoordinationStore + NotificationStore
+{
+}
+
+impl<T> ManageGoalTasksStore for T where
+    T: GoalStore + TaskStore + MandateStore + WorkCoordinationStore + NotificationStore
+{
+}
+
 /// Focused persistence contract used by blocker reporting.
 pub trait ReportBlockerStore:
     TaskStore + GoalStore + NotificationStore + WorkCoordinationStore

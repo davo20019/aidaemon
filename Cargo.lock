@@ -796,6 +796,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "croner",
+ "dirs 7.0.0",
  "futures",
  "hex",
  "iana-time-zone",
