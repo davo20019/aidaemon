@@ -321,6 +321,10 @@ pub struct RunAggregate {
     /// checklist declaration. `partial`/`blocked` cap the run below success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_claimed_outcome: Option<super::ExecutorClaimedOutcome>,
+    /// The resource the executor declared its work ran out of, with an
+    /// unfinished outcome ([`super::ShortResource`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_short_of: Option<super::ShortResource>,
     /// Exact resources the request named for verification (from the
     /// compiled contract). A refusal touching one of them binds every
     /// untargeted observation obligation to that boundary.
@@ -403,6 +407,7 @@ impl RunAggregate {
             contract_present: false,
             executor_expectations_present: false,
             executor_claimed_outcome: None,
+            executor_short_of: None,
             verification_targets: Vec::new(),
             contract_fingerprint: None,
             effect_revision: 0,
@@ -713,6 +718,10 @@ impl RunAggregate {
     fn install_executor_expectations(&mut self, declared: ExecutorExpectationsDeclaredData) {
         self.executor_expectations_present = true;
         self.executor_claimed_outcome = declared.outcome;
+        self.executor_short_of = declared
+            .outcome
+            .filter(|outcome| outcome.unfinished())
+            .and(declared.short_of);
         let exact_resource_targets = declared.schema_version >= 2;
         let depended_on: BTreeSet<usize> = declared
             .items
@@ -4610,6 +4619,7 @@ mod tests {
                 task_id: "task-1".to_string(),
                 items,
                 outcome: None,
+                short_of: None,
             },
         )
     }
@@ -4748,6 +4758,29 @@ mod tests {
                 unfinished,
                 "{outcome}: {:?}",
                 aggregate.lifecycle_phase()
+            );
+        }
+    }
+
+    /// The resource a run ran out of is kept only with an unfinished
+    /// verdict: a `done` never carries a reason it stopped.
+    #[test]
+    fn the_resource_a_run_ran_out_of_comes_with_an_unfinished_verdict() {
+        for (outcome, kept) in [("blocked", true), ("partial", true), ("done", false)] {
+            let mut event = executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::NONE,
+                true,
+                &["/tmp/proj/routes.yml"],
+                "pending",
+            )]);
+            event.data["outcome"] = serde_json::json!(outcome);
+            event.data["short_of"] = serde_json::json!("docker_disk_space");
+            let aggregate = RunAggregate::replay("task-1", &[event]);
+            assert_eq!(
+                aggregate.executor_short_of,
+                kept.then_some(crate::ShortResource::DockerDiskSpace),
+                "{outcome}"
             );
         }
     }

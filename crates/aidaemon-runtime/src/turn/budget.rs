@@ -204,7 +204,88 @@ pub fn scheduled_run_budget_pressure_pct(
         .then(|| status.tokens_used.saturating_mul(100) / budget)
 }
 
-/// Ask the owner to approve a one-time budget extension for the current run.
+/// A budget extension that is the owner's decision: what the spending is
+/// for, what it cost so far, what it would allow and why it is asked, all
+/// in plain words on the card (live 2026-11-13: "extend the task token
+/// budget from 500000 to 1000000 and continue execution (target: task token
+/// budget)" reached the owner mid-run with nothing saying what it was for).
+pub struct BudgetAsk<'a> {
+    /// `task` (one request and its helpers) or `goal daily`.
+    pub scope_label: &'a str,
+    /// The work it is for, in the words it was asked in.
+    pub work: String,
+    pub used: i64,
+    pub current: i64,
+    pub proposed: i64,
+    /// Why this is past the automatic policy.
+    pub why: String,
+}
+
+impl BudgetAsk<'_> {
+    /// What is asked, in one line.
+    pub fn action(&self) -> String {
+        format!(
+            "let \u{201c}{}\u{201d} keep going past its token budget, up to {} tokens",
+            self.work,
+            thousands(self.proposed)
+        )
+    }
+
+    /// What it cost so far.
+    pub fn cost(&self) -> String {
+        if self.scope_label == "task" {
+            format!(
+                "This request and the helpers it started have used {} tokens, past its budget of \
+                 {}.",
+                thousands(self.used),
+                thousands(self.current)
+            )
+        } else {
+            format!(
+                "It has used {} tokens of its {} budget of {}.",
+                thousands(self.used),
+                self.scope_label,
+                thousands(self.current)
+            )
+        }
+    }
+}
+
+/// The work a request is, for the owner: its first line, cut at a word.
+pub fn work_words(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("this request");
+    const MAX: usize = 80;
+    if line.chars().count() <= MAX {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(MAX).collect();
+    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
+    format!("{}\u{2026}", cut.trim_end())
+}
+
+/// `1000000` as "1,000,000".
+pub fn thousands(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    if n < 0 {
+        format!("-{out}")
+    } else {
+        out
+    }
+}
+
+/// Ask the owner to approve one budget extension past the automatic
+/// policy ([`BudgetAsk`]).
 ///
 /// Returns true only when the owner explicitly approves.
 #[allow(clippy::too_many_arguments)]
@@ -215,11 +296,10 @@ pub async fn request_budget_continue_approval(
     iteration: usize,
     session_id: &str,
     user_role: UserRole,
-    scope_label: &str,
-    used_tokens: i64,
-    current_budget: i64,
-    proposed_budget: i64,
+    ask: BudgetAsk<'_>,
 ) -> bool {
+    let (scope_label, used_tokens, current_budget, proposed_budget) =
+        (ask.scope_label, ask.used, ask.current, ask.proposed);
     if user_role != UserRole::Owner {
         return false;
     }
@@ -246,19 +326,13 @@ pub async fn request_budget_continue_approval(
     };
 
     let approval_request = build_needs_approval_request(
+        ask.action(),
+        None,
+        ask.cost(),
+        ask.why.clone(),
         format!(
-            "extend the {} token budget from {} to {} and continue execution",
-            scope_label, current_budget, proposed_budget
-        ),
-        Some(format!("{} token budget", scope_label)),
-        format!(
-            "Current usage is {} tokens, which exhausted the {} budget.",
-            used_tokens, scope_label
-        ),
-        "Explicit owner approval is required before spending more tokens on this run.",
-        format!(
-            "If approved, I will continue the current work inside the extended {} budget.",
-            scope_label
+            "If you allow it, the work continues within {} tokens.",
+            thousands(proposed_budget)
         ),
         None,
     );
@@ -502,10 +576,19 @@ pub async fn enforce_goal_daily_budget_control(
                 ctx.iteration,
                 ctx.session_id,
                 ctx.user_role,
-                "goal daily",
-                ctx.status.tokens_used_today,
-                old_gbudget,
-                new_gbudget,
+                BudgetAsk {
+                    scope_label: "goal daily",
+                    work: "this goal's work today".to_string(),
+                    used: ctx.status.tokens_used_today,
+                    current: old_gbudget,
+                    proposed: new_gbudget,
+                    why: if *ctx.budget_extensions_count >= ctx.max_budget_extensions {
+                        crate::engine::budgets::AskWhy::ExtensionsUsed(*ctx.budget_extensions_count)
+                    } else {
+                        crate::engine::budgets::AskWhy::NoProgress
+                    }
+                    .words(),
+                },
             )
             .await
         } else {

@@ -313,7 +313,8 @@ impl Tool for TrackRequirementsTool {
          If the user adds, changes or cancels work while you are working, pass the revised list \
          before continuing. \
          Before your final answer, pass the list once more with outcome: done, partial, or blocked; \
-         the request is reported that way, and only receipts can confirm done. \
+         the request is reported that way, and only receipts can confirm done. When it stopped \
+         because this machine ran out of disk, Docker disk or memory, add short_of. \
          Skip this only for a single read-only lookup, a plain answer or conversation, or when \
          the user forbids it."
     }
@@ -421,6 +422,11 @@ impl Tool for TrackRequirementsTool {
                         "type": "string",
                         "description": "Your verdict on the whole request, set on your last call before the final answer.",
                         "enum": ["done", "partial", "blocked"]
+                    },
+                    "short_of": {
+                        "type": "string",
+                        "description": "With outcome partial or blocked: the resource on this machine the work ran out of, when that is what stopped it (the owner can free it).",
+                        "enum": aidaemon_events::ShortResource::PROTOCOL_NAMES
                     }
                 },
                 "required": ["items"],
@@ -672,6 +678,18 @@ impl crate::traits::ToolSemantics for TrackRequirementsTool {
                 ));
             }
         }
+        if let Some(short_of) = value.get("short_of") {
+            if short_of
+                .as_str()
+                .and_then(aidaemon_events::ShortResource::from_protocol_name)
+                .is_none()
+            {
+                return Err(ToolArgumentContractViolation::new(format!(
+                    "short_of must be one of {}",
+                    aidaemon_events::ShortResource::PROTOCOL_NAMES.join(", ")
+                )));
+            }
+        }
         if let Some(items) = value.get("items").and_then(Value::as_array) {
             for (index, item) in items.iter().enumerate() {
                 parse_expectation_targets(item.get("targets")).map_err(|error| {
@@ -741,6 +759,23 @@ mod tests {
         let declared =
             executor_expectations_from_checklist_arguments("task-synthetic", &none).unwrap();
         assert_eq!(declared.outcome, None);
+        assert_eq!(declared.short_of, None);
+
+        // What it ran out of is typed too.
+        let short =
+            format!(r#"{{"items":[{item}],"outcome":"blocked","short_of":"docker_disk_space"}}"#);
+        assert!(tool.validate_arguments(&short).is_ok());
+        assert_eq!(
+            executor_expectations_from_checklist_arguments("task-synthetic", &short)
+                .unwrap()
+                .short_of,
+            Some(aidaemon_events::ShortResource::DockerDiskSpace)
+        );
+        assert!(tool
+            .validate_arguments(&format!(
+                r#"{{"items":[{item}],"outcome":"blocked","short_of":"low disk"}}"#
+            ))
+            .is_err());
     }
 
     #[tokio::test]

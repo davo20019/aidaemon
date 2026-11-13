@@ -868,30 +868,10 @@ pub fn owner_wait_note(waited: Duration) -> String {
 }
 
 /// A background helper's measured run for the chat, from its run record:
-/// one duration, from its first step to its end, and the times it spans
-/// (live 2026-11-13: "Ran 2m 44s (8:34 PM ET to 8:37 PM ET)" read as the
-/// whole run, but was its first to last tool call). `None` while it runs.
-/// When the owner's request that started it is on record, the line also
-/// says how long after that request it was done, so "how long did it take"
-/// is answered from the record, request to finish.
+/// its one labelled time set ([`crate::run_state::RunTimes::line`]), the
+/// same line its card shows. `None` while it runs.
 pub fn background_timing(run: &crate::run_state::RunState) -> Option<String> {
-    let span = run.span()?;
-    Some(format!(
-        "{MEASURED_TIMING_MARK}{}{}",
-        took_line(span, run.waited),
-        run.requested_at
-            .map(|requested| since_request(requested, span.to))
-            .unwrap_or_default()
-    ))
-}
-
-/// " Done 4m 10s after your request (4:25:46 AM ET)." from the measured
-/// request time and end.
-pub fn since_request(
-    requested: chrono::DateTime<chrono::Utc>,
-    done: chrono::DateTime<chrono::Utc>,
-) -> String {
-    format!(" Done {}.", since_request_view(requested, done).words)
+    Some(format!("{MEASURED_TIMING_MARK}{}", run.times()?.line()))
 }
 
 /// How long after the owner's request `done` was, for a card: its seconds
@@ -914,24 +894,10 @@ pub fn since_request_view(
 
 /// How long a helper took and when, for the owner, from what the runtime
 /// measured: "Took 21s (2:21:16 PM to 2:21:37 PM ET)." and its wait for the
-/// owner's answer. The one wording every surface shows a helper's time in.
+/// owner's answer. A run with no request on record: one with a request
+/// gives its whole time set ([`crate::run_state::RunTimes::line`]).
 pub fn took_line(span: crate::run_state::MeasuredSpan, waited: Duration) -> String {
-    let wait = if waited.as_secs() == 0 {
-        String::new()
-    } else {
-        format!(
-            " It waited {} of that for your answer.",
-            aidaemon_tools::duration_format::compact_seconds(
-                i64::try_from(waited.as_secs()).unwrap_or(i64::MAX),
-                aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
-            )
-        )
-    };
-    format!(
-        "Took {} ({}).{wait}",
-        compact(span.took()),
-        owner_clock_range(span.from, span.to)
-    )
+    crate::run_state::RunTimes::new(span.from, span.to, None, waited).line()
 }
 
 /// One result for a batch call: each child's result under its mission, in
@@ -2234,11 +2200,16 @@ async fn answer_group(route: &ResultRoute, ends: Vec<crate::run_state::GroupEnd>
 }
 
 /// The continuation a turn's group of runs gets once the last of them
-/// ended: each run's name, how it ended and the times the runtime measured
-/// (from its record, never from its report), then its report. The parent
-/// answers the owner's request once from this. The card already shows each
+/// ended: each run's name, how it ended and its one time set from its
+/// record ([`crate::run_state::RunTimes::line`], the line its card shows),
+/// then its report (told never to state a time: the record is the only
+/// source of one). The parent answers
+/// the owner's request once from this, and the record's labelled times are
+/// the only durations it sees (live 2026-11-13: the answer said "its agent
+/// took 3m 55s" and "stopped after 2m", work-start figures, under a card
+/// that said "Done 5m 54s after your request"). The card already shows each
 /// run's end and the group's total, so the answer is told not to list them
-/// again; a request that asked how long gets these measurements as given.
+/// again; a request that asked how long gets these lines as given.
 pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usize) -> String {
     let mut out = String::from(
         "[Background helpers finished]\n\
@@ -2258,12 +2229,8 @@ pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usi
             index + 1,
             state.label.trim()
         ));
-        if let Some(span) = state.span() {
-            out.push_str(&format!("Measured: {}", took_line(span, state.waited)));
-            if let Some(requested) = state.requested_at {
-                out.push_str(&since_request(requested, span.to));
-            }
-            out.push('\n');
+        if let Some(times) = state.times() {
+            out.push_str(&format!("Times: {}\n", times.line()));
         }
         if let Some(line) = state.evidence.line() {
             out.push_str(&line);
@@ -2279,20 +2246,24 @@ pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usi
     }
     let last = ends
         .iter()
-        .filter_map(|end| end.state.requested_at.zip(end.state.ended_at))
-        .max_by_key(|(_, ended)| *ended);
-    if let (true, Some((requested, ended))) = (ends.len() > 1, last) {
+        .filter_map(|end| end.state.times()?.after_request())
+        .max_by_key(|span| span.to);
+    if let (true, Some(last)) = (ends.len() > 1, last) {
         out.push_str(&format!(
             "\nThe last of them ended {}.\n",
-            since_request_view(requested, ended).words
+            since_request_view(last.from, last.to).words
         ));
     }
     out.push_str(
         "\nAnswer the owner's original request now, once, from these results. The chat's card \
          already shows how each helper ended and its time, and each helper already sent what it \
-         delivered: don't list them again line by line or resend anything. When the request asked \
-         how long something took, answer with these measurements exactly as given; never work out \
-         a time yourself. Don't call tools to re-check this work.",
+         delivered: don't list them again line by line or resend anything. The \"Times\" lines \
+         are the only durations there are: \"took\" is a helper's own work from its start to its \
+         end, \"after your request\" counts from the owner's request. If you mention a time, \
+         quote one of these figures with its own words (\"took …\" or \"… after your request\"); \
+         never call one by the other's name and never work a time out yourself. A record's \
+         \"Next step\" is the daemon's offer: make it in your answer, as given. Don't call tools \
+         to re-check this work.",
     );
     out
 }
@@ -2659,16 +2630,24 @@ impl SpawnAgentTool {
         // quote. Several helpers of one request each carry theirs, and the
         // card says when the last one ended.
         let since = requested_at.map(|requested| since_request_view(requested, measured.finished));
+        // Its one time set ([`crate::run_state::RunTimes`]): the card's line
+        // and the parent's, labelled the same.
+        let times = crate::run_state::RunTimes::new(
+            measured.began(),
+            measured.finished,
+            requested_at,
+            measured.waited,
+        );
         let mut window = if failed {
             failed_run_window(&helper_name, &measured)
         } else {
             run_window(&helper_name, &measured)
         };
-        if let Some(since) = since.as_ref() {
+        if requested_at.is_some() {
             window.push_str(&format!(
-                "\nIt ended {} (measured from the owner's request; the last helper of a \
-                 request to end gives the whole request's time).",
-                since.words
+                "\nCounted from the owner's request: {} (the last helper of a request to end \
+                 gives the whole request's time).",
+                times.line()
             ));
         }
         // Its header on the turn's card ends with how it ended and the time
@@ -2685,7 +2664,7 @@ impl SpawnAgentTool {
                 phase,
                 background: false,
                 step: None,
-                took: Some(took_line(measured.span(), measured.waited)),
+                took: Some(times.line()),
                 since_request: since,
             }));
         }
@@ -2789,7 +2768,7 @@ impl SpawnAgentTool {
 #[cfg(test)]
 mod group_tests {
     use super::*;
-    use crate::run_state::{GroupEnd, GroupTurn, RunMeasure, RunReport, RunStates};
+    use crate::run_state::{GroupEnd, GroupTurn, RunMeasure, RunReport, RunState, RunStates};
     use crate::spawn::{ChildAgentRequest, ChildAgentRun, ChildAgentRuntime, RunsAnswer};
 
     /// A parent that records the group answers it is asked to write.
@@ -2932,13 +2911,114 @@ mod group_tests {
             .expect(followup);
         assert!(drupal < wordpress, "in start order: {followup}");
         assert_eq!(
-            followup.matches("Measured: Took 3m 5s").count(),
+            followup.matches("Times: Took 3m 5s").count(),
             2,
             "{followup}"
         );
         assert!(followup.contains("It waited 1m 24s of that"), "{followup}");
         assert!(followup.contains("Drupal is up.") && followup.contains("WordPress is up."));
         assert!(followup.contains("don't list them again"), "{followup}");
+    }
+
+    /// Live 2026-11-13 (Drupal and WordPress, 8:16:45 AM request): the
+    /// group answer said WordPress's "agent took 3m 55s" and Drupal
+    /// "stopped after 2m" under a card that said "Done 5m 54s after your
+    /// request". The continuation carries each run's one time set, every
+    /// figure labelled ("took" for its own work, "after your request" from
+    /// the request), and the record's figures appear only on its labelled
+    /// lines.
+    #[test]
+    fn the_group_followup_has_only_the_records_labelled_times() {
+        use chrono::TimeZone;
+        let requested = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 13, 13, 16, 45)
+            .unwrap()
+            + chrono::Duration::milliseconds(866);
+        let at = |secs: i64| requested + chrono::Duration::seconds(secs);
+        let run = |id: &str, label: &str, phase, began: i64, ended: i64| RunState {
+            id: id.to_string(),
+            chat: "chat".to_string(),
+            label: label.to_string(),
+            phase,
+            requested_at: Some(requested),
+            started_at: at(111),
+            ended_at: Some(at(ended)),
+            work_began: Some(at(began)),
+            waited: Duration::ZERO,
+            step: None,
+            evidence: Default::default(),
+            card: Default::default(),
+        };
+        let end = |state: RunState, report: &str| GroupEnd {
+            state,
+            report: RunReport {
+                text: report.to_string(),
+                untrusted: false,
+            },
+            message: String::new(),
+        };
+        let ends = vec![
+            end(
+                run("d", "Install Drupal demo site", RunPhase::Stopped, 117, 237),
+                "DDEV could not start: low Docker disk space.",
+            ),
+            end(
+                run(
+                    "w",
+                    "Install WordPress demo site",
+                    RunPhase::Succeeded,
+                    119,
+                    354,
+                ),
+                "WordPress is up at https://wp.ddev.site.",
+            ),
+        ];
+        let followup = group_followup(&ends, 8_000);
+        let drupal = ends[0].state.times().unwrap();
+        let wordpress = ends[1].state.times().unwrap();
+        assert_eq!(wordpress.took(), chrono::Duration::seconds(235));
+        assert_eq!(
+            wordpress.started_after_request(),
+            Some(chrono::Duration::seconds(119))
+        );
+        assert_eq!(
+            wordpress.after_request().map(|span| span.took()),
+            Some(chrono::Duration::seconds(354))
+        );
+        for times in [drupal, wordpress] {
+            assert!(
+                followup.contains(&format!("Times: {}", times.line())),
+                "{followup}"
+            );
+        }
+        assert!(
+            wordpress.line().starts_with("Took 3m 55s ("),
+            "{}",
+            wordpress.line()
+        );
+        assert!(
+            wordpress.line().ends_with(
+                ", started 1m 59s after your request, so it ended 5m 54s after your request."
+            ),
+            "{}",
+            wordpress.line()
+        );
+        assert!(
+            followup.contains("The last of them ended 5m 54s after your request ("),
+            "{followup}"
+        );
+        // The record's figures appear only on its labelled lines.
+        for figure in ["3m 55s", "5m 54s", "1m 59s"] {
+            for line in followup.lines().filter(|line| line.contains(figure)) {
+                assert!(
+                    line.starts_with("Times: ") || line.starts_with("The last of them ended "),
+                    "{figure} outside the record's lines: {line}"
+                );
+            }
+        }
+        assert!(followup.contains("DDEV could not start: low Docker disk space."));
+        assert!(followup.contains("WordPress is up at https://wp.ddev.site"));
+        assert!(followup.contains("quote one of these figures with its own words"));
     }
 
     /// A run alone in its group, or in none, is its own answer; a group's

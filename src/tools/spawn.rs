@@ -2166,7 +2166,6 @@ mod child_runtime_tests {
         })
         .await
         .expect("the kept card shows the helper's step");
-        assert!(card.contains("Count slowly to 30"), "{card}");
         assert!(
             card.contains(
                 "⏳ Running in the background: Slow count to 30\nRunning a command · last output: 15"

@@ -51,7 +51,14 @@ impl CardView<'_> {
 /// the turn's own step.
 pub fn render_card(view: &CardView<'_>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(plan) = view.plan {
+    // A one-step plan is its step; with a run on the card that run is the
+    // step, so its line is the card's one line for it (live 2026-11-13: a
+    // background shell loop showed "Run your shell loop…" from its plan
+    // above "Running in the background: a shell loop" for the same work).
+    if let Some(plan) = view
+        .plan
+        .filter(|plan| plan.steps > 1 || view.helpers.is_empty())
+    {
         parts.push(plan_with_run_header(plan, &view.helpers));
     }
     for (helper, elapsed) in &view.helpers {
@@ -84,20 +91,7 @@ fn plan_with_run_header(plan: &PlanCard, helpers: &[(HelperView, Option<Duration
     let text = plan.text.trim_end();
     let phases: Vec<RunPhase> = helpers.iter().map(|(helper, _)| helper.phase).collect();
     let Some(header) = plan.header_with_runs(&phases) else {
-        // A one-step plan is its step: a run that failed or stopped changes
-        // only its done mark.
-        let worst = phases
-            .iter()
-            .filter(|phase| matches!(phase, RunPhase::Failed | RunPhase::Stopped))
-            .max_by_key(|phase| matches!(phase, RunPhase::Failed));
-        return match worst {
-            Some(worst) if plan.steps < 2 && is_completed_checklist(text) => {
-                let headline = worst.helper_headline(false);
-                let mark = headline.split(' ').next().unwrap_or_default();
-                format!("{mark}{}", text.trim_start().trim_start_matches('✅'))
-            }
-            _ => text.to_string(),
-        };
+        return text.to_string();
     };
     match text.split_once('\n') {
         Some((_, body)) => format!("{header}\n{body}"),
@@ -178,20 +172,15 @@ fn helper_block(helper: &HelperView, elapsed: Option<Duration>) -> String {
                 elapsed.unwrap_or_default(),
             ));
         }
+        // Its one measured line, from its record: how long its work took
+        // and, when a request started it, when after that request it
+        // started and ended, each figure labelled. The card adds no time
+        // of its own.
         (phase, _, Some(took)) if phase.is_terminal() => {
             block.push('\n');
             block.push_str(took.trim());
         }
         _ => {}
-    }
-    if let (true, Some(since)) = (helper.phase.is_terminal(), helper.since_request.as_ref()) {
-        let verb = if helper.phase == RunPhase::Succeeded {
-            "Done"
-        } else {
-            "Ended"
-        };
-        block.push_str(if helper.took.is_some() { " " } else { "\n" });
-        block.push_str(&format!("{verb} {}.", since.words.trim()));
     }
     block
 }
@@ -648,6 +637,47 @@ mod tests {
         );
     }
 
+    /// Live 2026-11-13: one background shell loop, a one-step plan for it.
+    /// The card named the work twice ("Run your shell loop…" from the plan,
+    /// then the run's own line). A one-step plan's step is the run, so the
+    /// card shows the run's line alone, while it runs and once it ended.
+    #[test]
+    fn a_one_step_plan_with_a_run_is_the_runs_one_line() {
+        let one_step = plan("⏳ Run your shell loop that prints 1 to 15", 1);
+        let running = HelperView::running("a shell loop", true, None);
+        let card = render_card(&CardView {
+            plan: Some(&one_step),
+            helpers: vec![(running.clone(), None)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(card, "⏳ Running in the background: a shell loop");
+        let ended = HelperView {
+            took: Some("Took 30s (8:23:49 AM to 8:24:19 AM ET), started 13s after your request, so it ended 43s after your request.".into()),
+            ..ended("a shell loop", RunPhase::Succeeded, true)
+        };
+        let card = render_card(&CardView {
+            plan: Some(&plan("✅ Run your shell loop that prints 1 to 15", 1)),
+            helpers: vec![(ended, None)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            card,
+            "✅ Finished in the background: a shell loop\nTook 30s (8:23:49 AM to 8:24:19 AM \
+             ET), started 13s after your request, so it ended 43s after your request."
+        );
+        // Without a run the one-step plan is still drawn.
+        assert_eq!(
+            render_card(&CardView {
+                plan: Some(&one_step),
+                ..Default::default()
+            })
+            .unwrap(),
+            "⏳ Run your shell loop that prints 1 to 15"
+        );
+    }
+
     /// How a card ends is decided once from its typed state: a helper on
     /// it, or a plan of more than one step, keeps it; anything else
     /// collapses. The rendered text never decides.
@@ -772,8 +802,10 @@ mod tests {
             both_done.starts_with("✅ Done · 3 of 3 steps"),
             "{both_done}"
         );
+        // Each helper's line is its record's one measured line, nothing
+        // added to it.
         assert!(
-            both_done.contains("Took 310s. Done 310s after your request"),
+            both_done.contains("Install Drupal\nTook 310s.\n"),
             "{both_done}"
         );
         assert!(
