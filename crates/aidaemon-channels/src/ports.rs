@@ -119,8 +119,8 @@ pub trait AgentIngress: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MidRunIntent {
     /// A question about the running work: how it is going, what it found,
-    /// whether a result is ready. Answered now from the work's live state;
-    /// the run goes on undisturbed.
+    /// whether a result is ready. Answered now from the work's typed live
+    /// state (never in the model's words); the run goes on undisturbed.
     AboutRunningWork,
     /// It changes or adds to the running work: the run takes it in.
     ChangesWork,
@@ -140,7 +140,9 @@ pub struct HelperProgress {
     pub progress: String,
     /// How long ago that progress came.
     pub since: std::time::Duration,
-    /// How long it has been running (since its first progress).
+    /// How long it has been running (since its first progress). The reply
+    /// says the running list's time instead when the helper is on it, the
+    /// clock `/tasks` reads.
     pub running_for: std::time::Duration,
 }
 
@@ -168,15 +170,14 @@ pub struct RunningItem {
     pub number: u64,
     pub title: String,
     pub elapsed: std::time::Duration,
+    /// What it is: `None` for a chat turn.
+    pub work: Option<ChatWorkKind>,
 }
 
 /// How a message sent mid-run is handled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MidRunReading {
     pub intent: MidRunIntent,
-    /// For [`MidRunIntent::AboutRunningWork`]: a short reply drawn from the
-    /// [`RunningWork`]; without one the channel says the state itself.
-    pub answer: Option<String>,
     /// For [`MidRunIntent::StopsWork`]: the numbers of the
     /// [`RunningWork::running`] items to stop; empty for what bare `/cancel`
     /// stops.

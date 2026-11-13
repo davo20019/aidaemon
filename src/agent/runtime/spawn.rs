@@ -387,8 +387,9 @@ const MAX_REPORT_TOOL_RECORDS: usize = 5_000;
 /// turn, leaving whichever wrote last looking like the whole task). Each of
 /// the child's steps (a tool starting or ending) is likewise that child's
 /// progress line, so the parent's card and its status reply say what each
-/// helper is doing ("Drupal install: running the site installer"). Every
-/// other update passes through unchanged.
+/// helper is doing ("Drupal install: running the site installer"), and so
+/// is a step of the child's that goes on in the background. Every other
+/// update passes through unchanged.
 fn child_status_sender(
     parent: Option<mpsc::Sender<StatusUpdate>>,
     mission: &str,
@@ -419,6 +420,16 @@ fn child_status_sender(
                 StatusUpdate::ToolComplete { name, .. } => StatusUpdate::SubAgentProgress {
                     label: label.clone(),
                     progress: aidaemon_channels::live_status::step_ended_line(&name),
+                },
+                // A child's step that went on in the background is that
+                // child's progress, never the parent's own step (live
+                // 2026-11-13: "… goes on in the background" stood on the
+                // card as if the turn itself had handed off).
+                StatusUpdate::StepHandedOff { name, to_helper } => StatusUpdate::SubAgentProgress {
+                    label: label.clone(),
+                    progress: aidaemon_channels::live_status::helper_step_handed_off(
+                        &name, to_helper,
+                    ),
                 },
                 other => other,
             };
@@ -3705,7 +3716,7 @@ impl Agent {
              - For public URL reachability or text, use an HTTP-capable tool or curl when a browser is unavailable; require browser access only for visual or interactive claims.\n\
              - Use report_blocker only for owner_input, missing_authority, external_dependency, ambiguous_external_effect, safety_boundary, or genuinely recovery_exhausted conditions.\n\
              - When using report_blocker, include blocker_class, external_effect_state, recovery_attempts, outcome, reason, partial_work when applicable, exact_need, next_step, and target. For missing_authority, set dependency_repair=true only for a minimal reversible local repair of a path named by failed required-workflow evidence; otherwise set it false.\n\
-             - When setup needs a new password or secret, generate a strong random one, pass it through a file or environment variable when the tool accepts one (not on a command line), save it in a project-folder file readable only by the owner (permissions 600), and report that file's path, never the secret.\n\
+             - When setup needs a new password or secret, generate a strong random one and save it alone in a project-folder file readable only by the owner (permissions 600). Keep it out of every command's text, a `$(cat file)` substitution included (process lists, logs and approval cards show it): use a way that reads the file, standard input or an environment variable (wp-cli: `--prompt=admin_password < file`); when the tool only takes an argument, let it make a throwaway one (output to /dev/null) and set yours afterwards with code that reads the file (Drupal: `drush php:eval` setting the admin user's password from `trim(file_get_contents(...))`). Report the file's path, never the secret.\n\
              - Return the FULL content you produced — not a meta-description of what you did.\n\
              - NEVER return just \"I researched X\" or \"Generated a report about Y\". Return the actual content.\n\
              - Include specific outputs (file paths, data retrieved, commands run).\n\
@@ -3755,7 +3766,8 @@ mod tests {
 
     /// Two parallel children each declare a checklist. Neither reaches the
     /// parent's card as a checklist (which would replace the parent's plan);
-    /// each becomes a progress line naming its own child.
+    /// each becomes a progress line naming its own child, and so does a
+    /// child's step handed to the background.
     #[tokio::test]
     async fn a_childs_checklist_never_replaces_the_parents_plan() {
         let (parent_tx, mut parent_rx) = mpsc::channel(16);
@@ -3793,6 +3805,13 @@ mod tests {
             })
             .await
             .unwrap();
+        drupal
+            .send(StatusUpdate::StepHandedOff {
+                name: "Counting 1 to 60 slowly".into(),
+                to_helper: false,
+            })
+            .await
+            .unwrap();
         drupal.send(StatusUpdate::Thinking(2)).await.unwrap();
         drop((wordpress, drupal));
 
@@ -3812,6 +3831,9 @@ mod tests {
         assert_eq!(
             lines,
             vec![
+                "Build the Drupal demo site for Acme Corp: counting 1 to 60 slowly goes on in \
+                 the background"
+                    .to_string(),
                 "Build the Drupal demo site for Acme Corp: finished running the site installer"
                     .to_string(),
                 "Build the Drupal demo site for Acme Corp: running the site installer".to_string(),

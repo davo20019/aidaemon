@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use aidaemon_tools::duration_format::{compact_seconds, ZeroUnitStyle};
 use aidaemon_tools::status::StatusUpdate;
 
-use crate::ports::{HelperProgress, RunningWork};
+use crate::ports::{ChatWorkKind, HelperProgress, RunningWork};
 
 /// How many helpers a reply lists.
 const MAX_HELPERS: usize = 6;
@@ -176,9 +176,24 @@ fn ago(duration: Duration) -> String {
     )
 }
 
+/// Whether `helper` (its card label, cut with "…" when long) is the
+/// running item titled `title` (which names the helper in full).
+fn helper_is(helper: &HelperProgress, title: &str) -> bool {
+    let label = helper.label.trim();
+    if label.is_empty() {
+        return false;
+    }
+    match label.strip_suffix('…') {
+        Some(stem) => title.contains(stem.trim_end()),
+        None => title.ends_with(label),
+    }
+}
+
 /// Where the running work stands, from its typed state: the request and how
-/// long it has run, its latest step, and each helper's job, progress and
-/// running time.
+/// long it has run, its latest step, then one line per helper and
+/// background command with its current step and its time from the running
+/// list, the same clock and numbers `/tasks` shows. A helper that is no
+/// longer on that list keeps its last step, without a time.
 pub fn running_work_status(work: &RunningWork) -> String {
     let mut lines = vec![format!(
         "Still working on \"{}\" ({} so far).",
@@ -192,19 +207,52 @@ pub fn running_work_status(work: &RunningWork) -> String {
             ago(*since)
         ));
     }
-    for helper in work.helpers.iter().take(MAX_HELPERS) {
-        lines.push(format!(
-            "• {}: {} (running {})",
+    let mut listed = vec![false; work.helpers.len()];
+    let mut items = Vec::new();
+    for item in work.running.iter().filter(|item| item.work.is_some()) {
+        let helper = (item.work == Some(ChatWorkKind::SubAgent))
+            .then(|| {
+                work.helpers
+                    .iter()
+                    .enumerate()
+                    .find(|(i, helper)| !listed[*i] && helper_is(helper, &item.title))
+            })
+            .flatten();
+        items.push(match helper {
+            Some((i, helper)) => {
+                listed[i] = true;
+                format!(
+                    "• {}: {} ({} so far)",
+                    crate::presentation::word_preview(&helper.label, 60),
+                    crate::presentation::word_preview(&helper.progress, 80),
+                    ago(item.elapsed)
+                )
+            }
+            None => format!(
+                "• {} ({} so far)",
+                crate::presentation::word_preview(&item.title, 80),
+                ago(item.elapsed)
+            ),
+        });
+    }
+    for (helper, _) in work
+        .helpers
+        .iter()
+        .zip(&listed)
+        .filter(|(_, listed)| !**listed)
+    {
+        items.push(format!(
+            "• {}: {}",
             crate::presentation::word_preview(&helper.label, 60),
             crate::presentation::word_preview(&helper.progress, 80),
-            ago(helper.running_for)
         ));
     }
+    lines.extend(items.into_iter().take(MAX_HELPERS));
     lines.join("\n")
 }
 
-/// The reply to a question about the running work when the agent gave no
-/// answer: what the state itself says, in plain words.
+/// The reply to a question about the running work: what its typed state
+/// says, in plain words.
 pub fn running_work_reply(work: &RunningWork) -> String {
     let mut lines = vec![running_work_status(work)];
     if let Some(plan) = &work.plan {
@@ -287,26 +335,69 @@ mod tests {
         assert!(live.snapshot("s", "x", Duration::ZERO).last_step.is_none());
     }
 
+    /// Live 2026-11-13: "how's it going?" got one paragraph ("about 38
+    /// seconds... each about 10 seconds") while `/tasks` said 55s and 26s.
+    /// The reply is the typed state, one line per helper with its current
+    /// step and the running list's time: the numbers `/tasks` shows.
     #[test]
-    fn the_fallback_reply_says_the_state_in_plain_words() {
+    fn the_status_reply_lists_each_helper_with_the_times_tasks_shows() {
+        let now = chrono::Utc::now();
+        let list = crate::stop::WorkList::for_tests(vec![
+            (
+                1,
+                "Sub-agent: Slow count A",
+                now - chrono::Duration::seconds(26),
+                "r",
+            ),
+            (
+                2,
+                "Sub-agent: Slow count B",
+                now - chrono::Duration::seconds(26),
+                "r",
+            ),
+        ]);
         let work = RunningWork {
-            request: "Set up two demo sites".into(),
-            elapsed: Duration::from_secs(330),
-            last_step: Some(("installing the blog".into(), Duration::from_secs(20))),
+            request: "Count to 100 twice, slowly".into(),
+            elapsed: Duration::from_secs(55),
+            last_step: None,
             plan: None,
-            helpers: vec![HelperProgress {
-                label: "Set up the blog".into(),
-                progress: "step 2 of 4".into(),
-                since: Duration::from_secs(5),
-                running_for: Duration::from_secs(130),
-            }],
-            ..RunningWork::default()
+            helpers: ["Slow count A", "Slow count B"]
+                .into_iter()
+                .map(|label| HelperProgress {
+                    label: label.into(),
+                    progress: "running a command".into(),
+                    since: Duration::from_secs(4),
+                    // Its own first-progress clock, which the reply no
+                    // longer reads for a listed helper.
+                    running_for: Duration::from_secs(10),
+                })
+                .collect(),
+            running: list.items(now),
         };
         let reply = running_work_reply(&work);
-        assert!(reply.starts_with("Still working on \"Set up two demo sites\" (5m 30s so far)."));
-        assert!(reply.contains("Latest step: installing the blog (20s ago)."));
-        assert!(reply.contains("• Set up the blog: step 2 of 4 (running 2m 10s)"));
+        let tasks = list.lines(now);
+        assert_eq!(tasks[0], "#1 Sub-agent: Slow count A (26s so far)");
+        assert!(reply.starts_with("Still working on \"Count to 100 twice, slowly\" (55s so far)."));
+        assert!(
+            reply.contains("\n• Slow count A: running a command (26s so far)\n"),
+            "{reply}"
+        );
+        assert!(
+            reply.contains("\n• Slow count B: running a command (26s so far)"),
+            "{reply}"
+        );
+        assert!(!reply.contains("10s"), "{reply}");
         assert!(reply.ends_with("I'll send the results when it's done."));
-        assert!(!reply.contains('#'));
+
+        // A helper no longer listed keeps its last step, without a time.
+        let ended = RunningWork {
+            running: Vec::new(),
+            ..work
+        };
+        let reply = running_work_reply(&ended);
+        assert!(
+            reply.contains("• Slow count A: running a command\n"),
+            "{reply}"
+        );
     }
 }

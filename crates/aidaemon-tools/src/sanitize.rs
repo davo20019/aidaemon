@@ -534,6 +534,162 @@ pub fn redact_secrets_only(text: &str) -> String {
     result
 }
 
+/// What a hidden secret reads as in a command the owner is shown.
+const HIDDEN_SECRET: &str = "[REDACTED:secret]";
+
+/// A name that holds a secret: an option (`--account-pass`), a variable
+/// (`DB_PASSWORD`) or a file (`ADMIN_PASSWORD.txt`).
+static SECRET_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)pass(?:word|wd)?|secret|credential|token|api[-_]?key|private[-_]?key")
+        .expect("valid secret-name regex")
+});
+
+/// A name for where a secret is kept rather than the secret itself
+/// (`--password-file`, `TOKEN_PATH`): its value is a path, shown as is.
+static SECRET_LOCATION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:file|path|dir|stdin|env)$").expect("valid secret-location regex")
+});
+
+/// An option or a variable assignment whose value follows: `--name=`,
+/// `--name value`, `NAME=`.
+static VALUE_HOLDER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[\s;&|(])(?:(--?[A-Za-z][A-Za-z0-9_-]*)(=|[ \t]+)|([A-Za-z_][A-Za-z0-9_]*)=)")
+        .expect("valid value-holder regex")
+});
+
+/// Where the shell word starting at `start` ends: through quotes, escapes
+/// and command substitutions, up to whitespace or an operator.
+fn shell_word_end(text: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < text.len() {
+        match text[i] {
+            b'\\' => i += 2,
+            b'\'' => i = skip_single_quoted(text, i + 1),
+            b'"' => i = skip_double_quoted(text, i + 1),
+            b'`' => i = skip_backticks(text, i + 1),
+            b'$' if text.get(i + 1) == Some(&b'(') => i = skip_substitution(text, i + 2),
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b')' => break,
+            _ => i += 1,
+        }
+    }
+    i.min(text.len())
+}
+
+fn skip_single_quoted(text: &[u8], from: usize) -> usize {
+    text[from.min(text.len())..]
+        .iter()
+        .position(|b| *b == b'\'')
+        .map_or(text.len(), |at| from + at + 1)
+}
+
+fn skip_backticks(text: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < text.len() {
+        match text[i] {
+            b'\\' => i += 2,
+            b'`' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    text.len()
+}
+
+fn skip_double_quoted(text: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < text.len() {
+        match text[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            b'`' => i = skip_backticks(text, i + 1),
+            b'$' if text.get(i + 1) == Some(&b'(') => i = skip_substitution(text, i + 2),
+            _ => i += 1,
+        }
+    }
+    text.len()
+}
+
+/// Past the `)` closing a `$(` whose body starts at `from`.
+fn skip_substitution(text: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < text.len() {
+        match text[i] {
+            b'\\' => i += 2,
+            b'\'' => i = skip_single_quoted(text, i + 1),
+            b'"' => i = skip_double_quoted(text, i + 1),
+            b'`' => i = skip_backticks(text, i + 1),
+            b'$' if text.get(i + 1) == Some(&b'(') => i = skip_substitution(text, i + 2),
+            b')' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    text.len()
+}
+
+/// Whether `name` (an option or a variable) holds a secret value.
+fn names_a_secret_value(name: &str) -> bool {
+    let name = name.trim_start_matches('-');
+    SECRET_NAME.is_match(name) && !SECRET_LOCATION.is_match(name)
+}
+
+/// A command as an approval card shows it: secret shapes hidden
+/// ([`redact_secrets_only`]), and so is every value that is a secret by
+/// what holds it or where it comes from: the value of an option or a
+/// variable named for one (`--account-pass=…`, `DB_PASSWORD=…`), and a
+/// command substitution that reads one (`$(cat ADMIN_PASSWORD.txt)`,
+/// `$(gh auth token)`). Paths stay readable, a `--password-file` path too.
+/// Live 2026-11-13: a Drupal install card showed `--account-pass=` with the
+/// read of the generated password file.
+pub fn redact_command_secrets(command: &str) -> String {
+    let text = redact_secrets_only(command);
+    let bytes = text.as_bytes();
+    let mut hidden: Vec<(usize, usize)> = Vec::new();
+    for caps in VALUE_HOLDER.captures_iter(&text) {
+        let (name, separator) = match (caps.get(1), caps.get(2), caps.get(3)) {
+            (Some(option), Some(separator), _) => (option, separator.as_str()),
+            (None, None, Some(variable)) => (variable, "="),
+            _ => continue,
+        };
+        if !names_a_secret_value(name.as_str()) {
+            continue;
+        }
+        let start = caps.get(0).map_or(name.end(), |all| all.end());
+        // `--password` followed by another option takes no value.
+        if separator != "=" && bytes.get(start) == Some(&b'-') {
+            continue;
+        }
+        let end = shell_word_end(bytes, start);
+        if end > start && !text[start..end].starts_with(HIDDEN_SECRET) {
+            hidden.push((start, end));
+        }
+    }
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'$' && bytes[i + 1] == b'(' {
+            let end = skip_substitution(bytes, i + 2);
+            let covered = hidden.iter().any(|(from, to)| *from <= i && end <= *to);
+            if !covered && SECRET_NAME.is_match(&text[i + 2..end.saturating_sub(1).max(i + 2)]) {
+                hidden.push((i, end));
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    hidden.sort_unstable();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (from, to) in hidden {
+        if from < at {
+            continue;
+        }
+        out.push_str(&text[at..from]);
+        out.push_str(HIDDEN_SECRET);
+        at = to;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
 /// Replace the current user's home directory prefix with `~` in status-ping
 /// summaries. Only occurrences followed by `/` are rewritten, so paths that
 /// merely share the prefix (`/Users/jordanx`) are untouched.
@@ -1481,5 +1637,38 @@ mod tests {
         ));
 
         assert_eq!(found, vec![first.to_string(), second.to_string()]);
+    }
+
+    /// An approval card never shows a secret: a value read from a
+    /// credential file, an option or variable named for one, or a secret
+    /// shape. The rest of the command, paths included, stays readable.
+    #[test]
+    fn a_card_command_hides_secret_values_by_what_holds_them() {
+        let drush = "ddev drush site:install standard -y --account-name=admin \
+            --account-pass=\"$(sed -n 's/^Password: //p' /p/claude-drupal-4/ADMIN_PASSWORD.txt)\" \
+            --site-name='Claude Drupal 4' > /dev/null";
+        assert_eq!(
+            redact_command_secrets(drush),
+            "ddev drush site:install standard -y --account-name=admin \
+             --account-pass=[REDACTED:secret] --site-name='Claude Drupal 4' > /dev/null"
+        );
+        assert_eq!(
+            redact_command_secrets(
+                "PW=$(cat ~/site/ADMIN_PASSWORD.txt) && DB_PASSWORD=hunter22 wp db create --password hunter22"
+            ),
+            "PW=[REDACTED:secret] && DB_PASSWORD=[REDACTED:secret] wp db create --password [REDACTED:secret]"
+        );
+        assert_eq!(
+            redact_command_secrets("echo \"$(gh auth token)\" | docker login --password-stdin"),
+            "echo \"[REDACTED:secret]\" | docker login --password-stdin"
+        );
+        for kept in [
+            "wp core install --prompt=admin_password < /p/site/ADMIN_PASSWORD.txt",
+            "mysql --password-file=/p/site/db.pass -e 'select 1'",
+            "PW=$(openssl rand -base64 18) && echo done",
+            "ls -la /p/claude-drupal-4",
+        ] {
+            assert_eq!(redact_command_secrets(kept), kept);
+        }
     }
 }

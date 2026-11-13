@@ -841,7 +841,9 @@ pub fn program_label(command: &str) -> String {
 /// The approval card for running `line`, from its structure: the folders
 /// it only looks inside, and the one effect worth a warning (deleting,
 /// with the targets when they can be read, or sending a write to a
-/// service). `title` is the call's own few words for itself.
+/// service). `title` is the call's own few words for itself. The line is
+/// shown with every secret value hidden
+/// ([`crate::sanitize::redact_command_secrets`]).
 pub fn command_card(line: &str, title: Option<String>) -> aidaemon_core::ApprovalCard {
     let effects = command_effects(line);
     let impact = if effects.deletes {
@@ -856,7 +858,7 @@ pub fn command_card(line: &str, title: Option<String>) -> aidaemon_core::Approva
     aidaemon_core::ApprovalCard {
         impact,
         ..aidaemon_core::ApprovalCard::new(aidaemon_core::CardAction::Command {
-            line: line.to_string(),
+            line: crate::sanitize::redact_command_secrets(line),
             title,
             looks_inside: looked_inside(line),
         })

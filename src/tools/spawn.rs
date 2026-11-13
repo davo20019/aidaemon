@@ -1708,9 +1708,12 @@ impl SpawnAgentTool {
                 };
                 let (shown, truncation) =
                     bounded_child_response(&response, self.max_response_chars);
+                // The measured run leads, so a cut of a long result never
+                // loses it: the parent's final reply gives each helper's
+                // start, end and duration from it.
                 let mut outcome = reported(
                     format!(
-                        "{shown}\n\n{window}{}",
+                        "{window}\n\n{shown}{}",
                         coordination_trailer(tree, &run.session)
                     ),
                     run.trust,
@@ -2517,6 +2520,25 @@ mod child_runtime_tests {
         );
     }
 
+    /// The parent's final reply gives each helper's start, end and duration
+    /// from the daemon's measurement: a child's result leads with it, in the
+    /// owner's 12-hour clock, so a cut of a long report never drops it.
+    #[tokio::test]
+    async fn a_childs_result_leads_with_its_measured_run_in_the_owners_clock() {
+        let report = "x".repeat(200_000);
+        let child = ScriptedChild::new(&report, Duration::ZERO);
+        let tool = tool_for(&child);
+        let args = json!({"mission": "Slow count", "task": "t"}).to_string();
+        let outcome = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        let first = outcome.output.lines().next().unwrap_or_default();
+        assert!(first.starts_with("Sub-agent ran "), "{first}");
+        assert!(first.contains(" AM ") || first.contains(" PM "), "{first}");
+        assert!(first.contains("measured by the daemon"), "{first}");
+    }
+
     /// One call with `tasks` starts its children together: they overlap,
     /// every result comes back under its mission with when it ran, and the
     /// call succeeds only because each child did.
@@ -2871,8 +2893,10 @@ mod child_runtime_tests {
             .await
             .unwrap();
 
+        // The measured run leads, then the child's own report.
         assert!(
-            outcome.output.starts_with("Finished."),
+            outcome.output.starts_with("Sub-agent ran ")
+                && outcome.output.contains("\n\nFinished."),
             "{}",
             outcome.output
         );

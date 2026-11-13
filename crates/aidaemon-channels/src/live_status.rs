@@ -44,9 +44,21 @@ pub fn step_handed_off_line(step: &str, to_helper: bool) -> String {
     }
 }
 
-/// A helper's start line, one per helper.
+/// A helper's start line, one per helper. It stays on the card while the
+/// helper works, its latest step under it.
 pub fn helper_started_line(label: &str) -> String {
     format!("Started in the background: {}", label.trim())
+}
+
+/// A helper's own step that went on in the background, as its progress
+/// line ("counting 1 to 60 goes on in the background").
+pub fn helper_step_handed_off(step: &str, to_helper: bool) -> String {
+    let line = step_handed_off_line(step, to_helper);
+    let mut chars = line.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => line,
+    }
 }
 
 /// Abstraction over the chat surface so `LiveStatus` is testable without a bot.
@@ -129,12 +141,17 @@ impl LiveStatus {
             .checklist
             .as_deref()
             .is_some_and(crate::live_status::is_completed_checklist);
+        // Each helper keeps its start line, the same words for every helper
+        // (live 2026-11-13: a first step replaced it, "Slow count to 60:
+        // counting 1 to 60 slowly"), with its latest step under it.
         for (label, line, since) in &self.helpers {
             parts.push(match line {
                 HelperLine::Started => helper_started_line(label),
-                HelperLine::Progress(progress) => {
-                    line_with_elapsed(&format!("🤖 {label}: {progress}"), since.elapsed())
-                }
+                HelperLine::Progress(progress) => format!(
+                    "{}\n🤖 {}",
+                    helper_started_line(label),
+                    line_with_elapsed(progress, since.elapsed())
+                ),
             });
         }
         if !done {
@@ -461,8 +478,8 @@ mod tests {
         let card = sink.edits.lock().unwrap().last().unwrap().1.clone();
         assert_eq!(
             card,
-            "📋 Plan\n☐ a\n\nStarted in the background: Counter A\n\n🤖 Counter B: running a \
-             command\n\n⏳ Waiting for the helpers"
+            "📋 Plan\n☐ a\n\nStarted in the background: Counter A\n\nStarted in the background: \
+             Counter B\n🤖 running a command\n\n⏳ Waiting for the helpers"
         );
         // Nothing changed: nothing is re-sent.
         assert!(!s.flush_if_changed(&sink).await);

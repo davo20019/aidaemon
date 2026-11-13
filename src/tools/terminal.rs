@@ -4203,7 +4203,8 @@ impl TerminalTool {
         Ok(Some(aidaemon_core::OwnerApprovalRequest {
             card,
             effects: Vec::new(),
-            summary: subject.clone(),
+            // What a channel without cards shows: no secret either.
+            summary: crate::tools::sanitize::redact_command_secrets(&subject),
             subject,
             risk: crate::agent::approvals::approval_risk(ask.risk),
             warnings,
