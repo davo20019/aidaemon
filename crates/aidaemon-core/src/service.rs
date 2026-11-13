@@ -48,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 /// Most doublings of a failing service's interval.
 const MAX_BACKOFF_DOUBLINGS: u32 = 5;
 
-/// When a service runs (see the [module](self) for the exact rules).
+/// When a service runs (see [`ServiceHost`] for the exact rules).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Schedule {
@@ -294,6 +294,13 @@ fn last_daily(wall: u64, hour: u8, minute: u8) -> u64 {
 }
 
 /// Runs [`Service`]s until told to stop.
+///
+/// The rules it schedules by: [`Every`](Schedule::Every) counts from launch
+/// to launch, a service never overlaps itself, a failure doubles the wait
+/// per failure in a row (up to 2^5, reset by a success),
+/// [`DailyUtc`](Schedule::DailyUtc) runs once a day at its UTC time (a
+/// failed run waits for the next day), due work starts on the next tick or
+/// wake-up, and every launch ends with exactly one [`ServiceEvent::Ended`].
 pub struct ServiceHost {
     slots: Vec<Slot>,
     tick: Duration,
