@@ -57,6 +57,7 @@ use super::sdk_provider::{
 use super::tool_exec::ToolExecCtx;
 use super::Agent;
 use super::TurnHistory;
+use super::TurnNotes;
 use crate::agent::vision::encode_image_attachment;
 use crate::config::{AppConfig, ProviderKind, VisionConfig};
 use crate::events::{EventEmitter, EventType, TaskOutcome, TaskStatus};

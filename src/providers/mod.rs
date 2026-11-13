@@ -4,10 +4,9 @@
 
 pub(crate) mod factory;
 
+#[cfg(test)]
+pub use aidaemon_runtime::chat_bridge::ModelFailure;
 pub(crate) use aidaemon_runtime::chat_bridge::{
     build_http_client, context_overflow, describe_reset, sdk_backed, streaming,
-    ProviderRecoveryRoute,
 };
-pub use aidaemon_runtime::chat_bridge::{
-    MalformedResponseReason, ModelFailure, ProviderError, ProviderErrorKind,
-};
+pub use aidaemon_runtime::chat_bridge::{ProviderError, ProviderErrorKind};

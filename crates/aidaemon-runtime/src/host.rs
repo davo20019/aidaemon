@@ -94,10 +94,16 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
     /// The bundled specialists only (no user overrides), for a mandate
     /// worker's prompt.
     fn bundled_specialist_kinds(&self) -> Vec<(String, String)>;
+    /// The memory system serving the agent's turns.
+    fn memory_plugin(&self) -> &dyn crate::turn::memory::MemoryPlugin;
     /// Whether the memory system is the daemon's own.
-    fn memory_is_daemons_own(&self) -> bool;
+    fn memory_is_daemons_own(&self) -> bool {
+        self.memory_plugin().is_daemons_own()
+    }
     /// Whether the memory system serves the daemon tool `name` itself.
-    fn memory_owns_daemon_tool(&self, name: &str) -> bool;
+    fn memory_owns_daemon_tool(&self, name: &str) -> bool {
+        self.memory_plugin().owned_daemon_tools().contains(&name)
+    }
     /// A shared handle to the execution backend.
     fn execution_backend_handle(&self) -> aidaemon_tools::backend::SharedExecutionBackend;
     /// What a spawned child inherited from the turn that spawned it; `None`
@@ -141,16 +147,17 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
     fn side_calls(&self) -> &crate::llm::gateway::SideCallGateway;
     /// The model this agent runs on.
     fn model_lock(&self) -> &tokio::sync::RwLock<String>;
-    /// Whether the owner pinned the model (`/model`), so routing leaves it.
-    async fn model_override_active(&self, session_id: &str) -> bool;
-    /// The model for this turn and whether routing chose it.
-    async fn select_turn_model(
+    /// Set when the owner pinned the model (`/model`), so routing leaves it.
+    fn model_override_lock(&self) -> &tokio::sync::RwLock<bool>;
+    /// The stored fallback model, tried first when a call fails.
+    fn fallback_model_lock(&self) -> &tokio::sync::RwLock<String>;
+    /// Models that recently answered with a billing error, and when; shared
+    /// across the agent tree.
+    fn billing_failed_models(
         &self,
-        snapshot: &crate::llm::LlmRuntimeSnapshot,
-        router: Option<&aidaemon_providers::routing::Router>,
-        profile: crate::policy::execution::ModelProfile,
-        session_id: &str,
-    ) -> (String, bool);
+    ) -> &std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, std::time::Instant>>>;
+    /// Record the configuration as last known good (a model call succeeded).
+    async fn stamp_lastgood(&self);
     /// A shared handle to the message store, for spawned work.
     fn message_log(&self) -> std::sync::Arc<dyn MessageStore>;
     /// A shared handle to what conversation compaction reads and writes.
@@ -185,16 +192,14 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
         risk_score: f32,
         widen: bool,
     ) -> Vec<serde_json::Value>;
-    /// Stop the CLI agents running for the session (a stop command); the
-    /// tool's reply.
-    async fn cancel_cli_agents(
+    /// Run one tool call with the host's tool execution (its watchdog,
+    /// mandate validation and workspace scoping).
+    async fn execute_tool_with_watchdog_outcome(
         &self,
-        session_id: &str,
-        task_id: &str,
-        status_tx: Option<tokio::sync::mpsc::Sender<aidaemon_tools::status::StatusUpdate>>,
-        channel_ctx: &aidaemon_channels::context::ChannelContext,
-        user_role: aidaemon_tools::semantics::UserRole,
-    ) -> anyhow::Result<String>;
+        name: &str,
+        arguments: &str,
+        ctx: &crate::engine::tool_exec::ToolExecCtx<'_>,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome>;
     /// Cancel the finite work the session started (background task leads
     /// and executors); what was cancelled.
     async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String>;

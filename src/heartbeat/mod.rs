@@ -22,6 +22,7 @@ pub(crate) use aidaemon_work::scheduler::*;
 pub use aidaemon_work::heartbeat::{DbHealthGate, HeartbeatTelemetry, JobObserver};
 
 use crate::agent::Agent;
+use crate::agent::TurnNotes;
 use crate::goal_tokens::GoalTokenRegistry;
 use crate::runtime_ports::OutboundRouter;
 use crate::traits::{Goal, StateStore, Task};

@@ -125,12 +125,8 @@ impl TurnHost for Agent {
             .collect()
     }
 
-    fn memory_is_daemons_own(&self) -> bool {
-        self.memory.is_daemons_own()
-    }
-
-    fn memory_owns_daemon_tool(&self, name: &str) -> bool {
-        self.memory.owned_daemon_tools().contains(&name)
+    fn memory_plugin(&self) -> &dyn aidaemon_runtime::turn::memory::MemoryPlugin {
+        &*self.memory
     }
 
     fn execution_backend_handle(&self) -> crate::execution::SharedExecutionBackend {
@@ -208,18 +204,23 @@ impl TurnHost for Agent {
         &self.model
     }
 
-    async fn model_override_active(&self, session_id: &str) -> bool {
-        Agent::model_override_active(self, session_id).await
+    fn model_override_lock(&self) -> &tokio::sync::RwLock<bool> {
+        &self.model_override
     }
 
-    async fn select_turn_model(
+    fn fallback_model_lock(&self) -> &tokio::sync::RwLock<String> {
+        &self.fallback_model
+    }
+
+    fn billing_failed_models(
         &self,
-        snapshot: &crate::llm_runtime::LlmRuntimeSnapshot,
-        router: Option<&crate::router::Router>,
-        profile: crate::execution_policy::ModelProfile,
-        session_id: &str,
-    ) -> (String, bool) {
-        Agent::select_turn_model(self, snapshot, router, profile, session_id).await
+    ) -> &std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, std::time::Instant>>>
+    {
+        &self.billing_failed_models
+    }
+
+    async fn stamp_lastgood(&self) {
+        Agent::stamp_lastgood(self).await;
     }
 
     fn message_log(&self) -> std::sync::Arc<dyn MessageStore> {
@@ -273,40 +274,13 @@ impl TurnHost for Agent {
         )
     }
 
-    async fn cancel_cli_agents(
+    async fn execute_tool_with_watchdog_outcome(
         &self,
-        session_id: &str,
-        task_id: &str,
-        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        channel_ctx: &crate::types::ChannelContext,
-        user_role: crate::types::UserRole,
-    ) -> anyhow::Result<String> {
-        self.execute_tool_with_watchdog(
-            "cli_agent",
-            r#"{"action": "cancel_all"}"#,
-            &super::tool_exec::ToolExecCtx {
-                file_fence: None,
-                mcp_tool: None,
-                owner_approval_by_kernel: false,
-                session_id,
-                task_id: Some(task_id),
-                status_tx,
-                channel_visibility: channel_ctx.visibility,
-                channel_id: channel_ctx.channel_id.as_deref(),
-                project_scope: None,
-                trusted: channel_ctx.trusted,
-                user_role,
-                workspace_grant: channel_ctx.active_workspace_grant(user_role),
-                mandate_authority: None,
-                tool_call_id: None,
-                mutation_forbidden: false,
-                scope_escalation: None,
-                turn_authority: None,
-                trust_roots: None,
-                lone_root_call: false,
-            },
-        )
-        .await
+        name: &str,
+        arguments: &str,
+        ctx: &aidaemon_runtime::engine::tool_exec::ToolExecCtx<'_>,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        Agent::execute_tool_with_watchdog_outcome(self, name, arguments, ctx).await
     }
 
     async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String> {

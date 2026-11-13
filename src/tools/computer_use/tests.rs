@@ -309,7 +309,7 @@ async fn app_control_is_asked_through_the_kernel() {
     ));
 
     // Allow Once covers one call.
-    let run = crate::testing::call_through_kernel(
+    let run = aidaemon_tools::testing::call_through_kernel(
         &tool,
         &raw,
         facts.clone(),
@@ -329,7 +329,7 @@ async fn app_control_is_asked_through_the_kernel() {
     assert!(out.contains("through the agent kernel"), "{out}");
 
     // A decline keeps nothing.
-    let run = crate::testing::call_through_kernel(
+    let run = aidaemon_tools::testing::call_through_kernel(
         &tool,
         &raw,
         facts.clone(),
@@ -341,7 +341,7 @@ async fn app_control_is_asked_through_the_kernel() {
     assert!(run.output.contains("Denied"), "{}", run.output);
 
     // Allow Session covers the session's later calls without a card.
-    let run = crate::testing::call_through_kernel(
+    let run = aidaemon_tools::testing::call_through_kernel(
         &tool,
         &raw,
         facts.clone(),
@@ -350,7 +350,7 @@ async fn app_control_is_asked_through_the_kernel() {
     .await
     .unwrap();
     assert!(run.asked.is_some());
-    let run = crate::testing::call_through_kernel(
+    let run = aidaemon_tools::testing::call_through_kernel(
         &tool,
         &raw,
         facts.clone(),

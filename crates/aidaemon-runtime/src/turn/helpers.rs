@@ -173,3 +173,17 @@ pub fn filter_tool_defs_for_untrusted_external_reference(defs: &[Value]) -> Vec<
         .cloned()
         .collect()
 }
+
+/// Render the model-facing truncation notice from structured metadata.
+/// Exactly one call site in the agent loop renders this; tools must not
+/// embed it in their returned output.
+pub fn render_truncation_notice(info: &aidaemon_tools::semantics::TruncationInfo) -> String {
+    match info.remediation_hint.as_deref() {
+        Some(hint) => aidaemon_tools::text::truncation_notice_with_hint(
+            info.shown_chars,
+            info.total_chars,
+            hint,
+        ),
+        None => aidaemon_tools::text::truncation_notice(info.shown_chars, info.total_chars),
+    }
+}
