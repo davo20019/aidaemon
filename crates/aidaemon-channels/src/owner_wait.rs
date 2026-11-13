@@ -98,10 +98,10 @@ impl OwnerWaitClock {
 
     /// Mark a card as waiting on the owner in the current turn.
     pub fn begin_waiting() -> Option<OwnerWaiting> {
-        Some(Self::current()?.begin())
+        Some(Self::current()?.open_wait())
     }
 
-    fn begin(&self) -> OwnerWaiting {
+    fn open_wait(&self) -> OwnerWaiting {
         {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
             state.open += 1;
@@ -111,7 +111,7 @@ impl OwnerWaitClock {
         }
         OwnerWaiting {
             clock: self.clone(),
-            _parent: self.1.as_ref().map(|parent| Box::new(parent.begin())),
+            _parent: self.1.as_ref().map(|parent| Box::new(parent.open_wait())),
         }
     }
 }
