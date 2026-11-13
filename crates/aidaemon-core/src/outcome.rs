@@ -106,4 +106,47 @@ impl RunOutcome {
     pub fn turns(&self) -> u32 {
         self.state.turn
     }
+
+    /// How long the run took, summed across resumes, on the runtime's
+    /// clock (Tokio's, so a test with paused time measures paused time).
+    pub fn elapsed(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.state.elapsed_ms)
+    }
+
+    /// Each tool call of this run with the result the model was given, in
+    /// call order: the receipt (tool, arguments, status, details) and the
+    /// text of the tool message that answered it. A sub-agent's answer
+    /// reaches its parent this way. `text` is `None` when no message
+    /// answers the call any more (a hook edited the transcript).
+    pub fn tool_results(&self) -> Vec<CallResult<'_>> {
+        self.state
+            .run_receipts()
+            .map(|receipt| {
+                let message = self.state.messages.iter().rev().find(|m| {
+                    m.role == crate::Role::Tool
+                        && m.tool_call_id.as_deref() == Some(receipt.call_id.as_str())
+                });
+                CallResult {
+                    receipt,
+                    text: message.map(|m| m.content.as_str()),
+                }
+            })
+            .collect()
+    }
+}
+
+/// One tool call of a run and what the model was told about it (see
+/// [`RunOutcome::tool_results`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CallResult<'a> {
+    pub receipt: &'a Receipt,
+    /// The tool message the model saw for this call.
+    pub text: Option<&'a str>,
+}
+
+impl CallResult<'_> {
+    /// The call ran and succeeded.
+    pub fn succeeded(&self) -> bool {
+        self.receipt.succeeded()
+    }
 }

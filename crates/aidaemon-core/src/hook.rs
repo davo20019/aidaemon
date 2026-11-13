@@ -81,6 +81,20 @@ pub enum ToolDecision {
     },
 }
 
+impl ToolDecision {
+    /// Pause the run for the owner to answer `request`
+    /// ([`InterruptKind::OwnerApproval`]), with the summary as the reason.
+    /// Build the request with [`crate::OwnerApprovalRequest::for_call`] to
+    /// carry the call's declared effects, so a decline binds the rest of
+    /// the run.
+    pub fn ask(request: crate::OwnerApprovalRequest) -> Self {
+        ToolDecision::Interrupt {
+            reason: format!("approval required: {}", request.summary),
+            kind: InterruptKind::OwnerApproval(request),
+        }
+    }
+}
+
 /// What an `on_stop` hook decides when the model replies without tool calls.
 ///
 /// Stopping and succeeding are separate decisions. A hook can let the run

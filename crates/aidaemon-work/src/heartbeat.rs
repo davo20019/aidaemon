@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aidaemon_core::{ServiceEvent, ServiceGate, ServiceObserver};
+use aidaemon_core::{ServiceEvent, ServiceGate, ServiceObserver, ServiceRunEnd};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::Serialize;
@@ -160,46 +160,44 @@ impl ServiceObserver for JobObserver {
     fn event(&self, event: ServiceEvent) {
         let telemetry = self.telemetry.as_ref();
         match event {
-            ServiceEvent::Launched { service } => {
+            ServiceEvent::Launched { service, .. } => {
                 tracing::debug!(job = %service, "Heartbeat job starting");
                 if let Some(t) = telemetry {
                     t.mark_started(&service);
                 }
             }
-            ServiceEvent::Succeeded {
-                service,
-                previous_failures,
-            } => {
-                if previous_failures > 0 {
-                    info!(job = %service, prev_failures = previous_failures, "Heartbeat job recovered");
+            ServiceEvent::Ended {
+                service, outcome, ..
+            } => match outcome {
+                ServiceRunEnd::Succeeded { previous_failures } => {
+                    if previous_failures > 0 {
+                        info!(job = %service, prev_failures = previous_failures, "Heartbeat job recovered");
+                    }
+                    if let Some(t) = telemetry {
+                        t.mark_success(&service);
+                    }
                 }
-                if let Some(t) = telemetry {
-                    t.mark_success(&service);
+                ServiceRunEnd::Failed { failures, error } => {
+                    error!(
+                        job = %service,
+                        error = %error,
+                        consecutive_failures = failures,
+                        "Heartbeat job failed — backing off"
+                    );
+                    if let Some(t) = telemetry {
+                        t.mark_failure(&service, failures, error);
+                    }
                 }
-            }
-            ServiceEvent::Failed {
-                service,
-                failures,
-                error,
-            } => {
-                error!(
-                    job = %service,
-                    error = %error,
-                    consecutive_failures = failures,
-                    "Heartbeat job failed — backing off"
-                );
-                if let Some(t) = telemetry {
-                    t.mark_failure(&service, failures, error);
+                _ => {
+                    if let Some(t) = telemetry {
+                        t.mark_not_running(&service);
+                    }
                 }
-            }
+            },
             ServiceEvent::StartFailed { service, error } => {
                 error!(job = %service, error = %error, "Heartbeat service failed to start");
             }
-            ServiceEvent::Finished { service } => {
-                if let Some(t) = telemetry {
-                    t.mark_not_running(&service);
-                }
-            }
+            _ => {}
         }
     }
 }
@@ -216,21 +214,30 @@ mod tests {
 
         observer.event(ServiceEvent::Launched {
             service: "job".into(),
+            run: 1,
         });
         assert!(telemetry.snapshots()[0].is_running);
-        observer.event(ServiceEvent::Failed {
+        observer.event(ServiceEvent::Ended {
             service: "job".into(),
-            failures: 2,
-            error: "boom".into(),
+            run: 1,
+            outcome: ServiceRunEnd::Failed {
+                failures: 2,
+                error: "boom".into(),
+            },
+            elapsed: Duration::ZERO,
         });
         let failed = &telemetry.snapshots()[0];
         assert_eq!(failed.consecutive_failures, 2);
         assert_eq!(failed.last_error.as_deref(), Some("boom"));
         assert!(!failed.is_running);
 
-        observer.event(ServiceEvent::Succeeded {
+        observer.event(ServiceEvent::Ended {
             service: "job".into(),
-            previous_failures: 2,
+            run: 2,
+            outcome: ServiceRunEnd::Succeeded {
+                previous_failures: 2,
+            },
+            elapsed: Duration::ZERO,
         });
         let recovered = &telemetry.snapshots()[0];
         assert_eq!(recovered.consecutive_failures, 0);

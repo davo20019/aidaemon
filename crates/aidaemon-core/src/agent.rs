@@ -307,6 +307,9 @@ impl AgentBuilder {
         }
     }
 
+    /// The model id sent with every request. Unset, the provider's
+    /// [`Provider::default_model`] is used, and building fails with
+    /// [`BuildError::MissingModel`] when it has none.
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
         self
@@ -409,7 +412,13 @@ impl AgentBuilder {
             return Err(BuildError::EmptyAgentId);
         }
         let provider = self.provider.ok_or(BuildError::MissingProvider)?;
-        let model = self.model.ok_or(BuildError::MissingModel)?;
+        let model = match self.model {
+            Some(model) => model,
+            None => provider
+                .default_model()
+                .map(str::to_string)
+                .ok_or(BuildError::MissingModel)?,
+        };
 
         let mut tools = HashMap::new();
         let mut specs = Vec::with_capacity(self.tools.len());

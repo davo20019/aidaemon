@@ -210,6 +210,17 @@ impl CallEffects {
             understood: true,
         }
     }
+
+    /// The tool vouches that the call changes no file: the list is
+    /// `complete` and names no path. For a call that may change things
+    /// (whose default effects are [`CallEffects::unknown`]), scope and
+    /// approval policies take an empty [`crate::AccessManifest`] as "changes
+    /// no path", not "paths not declared". A delegation, a ticket or an
+    /// order lookup declares this with [`CallEffects::none`] or its own
+    /// non-path keys. Effects never describe reads.
+    pub fn touches_no_paths(&self) -> bool {
+        self.complete && !self.keys.iter().any(|key| key.class.is_path())
+    }
 }
 
 /// How much is at stake in an approval request.
@@ -243,6 +254,88 @@ pub struct OwnerApprovalRequest {
     /// `summary` and `warnings` as they are.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<Box<ApprovalCard>>,
+}
+
+impl OwnerApprovalRequest {
+    /// The request to ask the owner about `call`, the way
+    /// `aidaemon_policies::ApprovalPolicy` asks: the call's declared effects
+    /// (from `info`), its tool and arguments as the subject grants match,
+    /// [`ApprovalRisk::Critical`] for a destructive tool and
+    /// [`ApprovalRisk::High`] otherwise, and a card naming the action (a
+    /// command line collapsed under its title, else the tool with its
+    /// arguments collapsed). `why` ends the summary when it is not empty.
+    ///
+    /// A hook asks with it through [`crate::ToolDecision::ask`]:
+    ///
+    /// ```
+    /// use aidaemon_core::{OwnerApprovalRequest, ToolCall, ToolDecision, ToolInfo};
+    ///
+    /// fn decide(call: &ToolCall, info: &ToolInfo) -> ToolDecision {
+    ///     ToolDecision::ask(OwnerApprovalRequest::for_call(call, info, "it spends money"))
+    /// }
+    /// ```
+    pub fn for_call(call: &crate::ToolCall, info: &crate::ToolInfo, why: &str) -> Self {
+        Self::for_tool(&call.name, &call.arguments, info, why)
+    }
+
+    /// [`OwnerApprovalRequest::for_call`] from a tool name and arguments
+    /// (`Value::Null` when there are none).
+    pub fn for_tool(
+        tool: &str,
+        arguments: &serde_json::Value,
+        info: &crate::ToolInfo,
+        why: &str,
+    ) -> Self {
+        let subject = if arguments.is_null() {
+            tool.to_string()
+        } else {
+            format!("{tool} {arguments}")
+        };
+        let why = why.trim();
+        Self {
+            card: Some(Box::new(call_card(tool, arguments, info))),
+            effects: info.effects.keys.clone(),
+            summary: if why.is_empty() {
+                format!("Run {subject}")
+            } else {
+                format!("Run {subject}: {why}")
+            },
+            subject,
+            risk: if info.annotations.destructive {
+                ApprovalRisk::Critical
+            } else {
+                ApprovalRisk::High
+            },
+            warnings: Vec::new(),
+        }
+    }
+}
+
+/// The card for a call asked about, from the call's own fields and its
+/// annotations: a command line (with its own title) shown collapsed under a
+/// plain sentence, else the tool's name with its arguments collapsed. Never
+/// the raw JSON as the headline.
+fn call_card(tool: &str, arguments: &serde_json::Value, info: &crate::ToolInfo) -> ApprovalCard {
+    let text = |key: &str| arguments.get(key).and_then(serde_json::Value::as_str);
+    let action = match text("command").or_else(|| text("script")) {
+        Some(line) => CardAction::Command {
+            line: line.to_string(),
+            title: text("description")
+                .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|title| !title.is_empty()),
+            looks_inside: Vec::new(),
+        },
+        None => CardAction::Use {
+            what: format!("use {}", tool.replace('_', " ")),
+            detail: (!arguments.is_null()).then(|| arguments.to_string()),
+        },
+    };
+    ApprovalCard {
+        impact: info.annotations.destructive.then(|| HighImpact::Deletes {
+            targets: Vec::new(),
+        }),
+        ..ApprovalCard::new(action)
+    }
 }
 
 /// An approval card's content as facts, so every channel says the same

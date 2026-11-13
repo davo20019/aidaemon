@@ -4,7 +4,11 @@
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// The runtime's clock, like the timeouts the loop enforces, so elapsed
+// time and wall-clock limits agree and follow Tokio's paused time in tests.
+use tokio::time::Instant;
 
 use futures::future::join_all;
 use futures::{FutureExt, StreamExt};
@@ -1753,6 +1757,7 @@ impl<'a> Driver<'a> {
             status: status.clone(),
             usage: self.state.usage,
             turns: self.state.turn,
+            elapsed_ms: self.state.elapsed_ms,
         })
         .await?;
         let outcome = RunOutcome {
