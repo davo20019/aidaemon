@@ -49,10 +49,13 @@ pub struct aidaemon_core::card::HelperView
 pub aidaemon_core::card::HelperView::background: bool
 pub aidaemon_core::card::HelperView::label: alloc::string::String
 pub aidaemon_core::card::HelperView::phase: aidaemon_core::card::RunPhase
+pub aidaemon_core::card::HelperView::reason: core::option::Option<alloc::string::String>
 pub aidaemon_core::card::HelperView::since_request: core::option::Option<aidaemon_core::card::SinceRequest>
 pub aidaemon_core::card::HelperView::step: core::option::Option<aidaemon_core::card::Step>
+pub aidaemon_core::card::HelperView::steps: alloc::vec::Vec<usize>
 pub aidaemon_core::card::HelperView::took: core::option::Option<alloc::string::String>
 impl aidaemon_core::card::HelperView
+pub fn aidaemon_core::card::HelperView::for_steps(self, &[usize]) -> Self
 pub fn aidaemon_core::card::HelperView::running(&str, bool, core::option::Option<aidaemon_core::card::Step>) -> Self
 pub struct aidaemon_core::card::PlanCard
 pub aidaemon_core::card::PlanCard::done: usize
@@ -64,6 +67,9 @@ pub fn aidaemon_core::card::PlanCard::header_with_runs(&self, &[aidaemon_core::c
 pub struct aidaemon_core::card::SinceRequest
 pub aidaemon_core::card::SinceRequest::secs: u64
 pub aidaemon_core::card::SinceRequest::words: alloc::string::String
+pub fn aidaemon_core::card::run_attempts(&[&aidaemon_core::card::HelperView]) -> alloc::vec::Vec<usize>
+pub fn aidaemon_core::card::superseded_line(&aidaemon_core::card::HelperView, usize, &aidaemon_core::card::HelperView, usize) -> alloc::string::String
+pub fn aidaemon_core::card::superseded_runs(&[&aidaemon_core::card::HelperView]) -> alloc::vec::Vec<core::option::Option<usize>>
 pub mod aidaemon_core::conformance
 pub mod aidaemon_core::conformance::provider_checks
 pub const aidaemon_core::conformance::provider_checks::COMPLETE_MATCHES_STREAM: &str
@@ -136,6 +142,14 @@ impl aidaemon_core::mandate_card::MandateConfirmationCard
 pub fn aidaemon_core::mandate_card::MandateConfirmationCard::essentials(&self) -> [(aidaemon_core::mandate_card::Essential, &str); 5]
 pub fn aidaemon_core::mandate_card::MandateConfirmationCard::from_lines(&[alloc::string::String]) -> core::option::Option<Self>
 pub fn aidaemon_core::mandate_card::MandateConfirmationCard::into_lines(self) -> alloc::vec::Vec<alloc::string::String>
+pub mod aidaemon_core::redaction
+pub struct aidaemon_core::redaction::SecretTooShort
+pub aidaemon_core::redaction::SecretTooShort::chars: usize
+pub const aidaemon_core::redaction::MIN_SECRET_CHARS: usize
+pub trait aidaemon_core::redaction::Redact: core::marker::Send + core::marker::Sync
+pub fn aidaemon_core::redaction::Redact::redact(&self, &str) -> alloc::string::String
+pub fn aidaemon_core::redaction::redact_registered(&str) -> alloc::borrow::Cow<'_, str>
+pub fn aidaemon_core::redaction::register_secret(&str) -> core::result::Result<(), aidaemon_core::redaction::SecretTooShort>
 pub mod aidaemon_core::testing
 pub enum aidaemon_core::testing::ProviderError
 pub aidaemon_core::testing::ProviderError::Auth(alloc::string::String)
@@ -247,6 +261,7 @@ pub fn aidaemon_core::ChannelVisibility::fmt(&self, &mut core::fmt::Formatter<'_
 pub aidaemon_core::CoreError::AgentMismatch
 pub aidaemon_core::CoreError::AgentMismatch::expected: alloc::string::String
 pub aidaemon_core::CoreError::AgentMismatch::found: alloc::string::String
+pub aidaemon_core::CoreError::ApprovalAlreadyUsed
 pub aidaemon_core::CoreError::NotInterrupted
 pub aidaemon_core::CoreError::PendingInterruption
 pub aidaemon_core::CoreError::Store(aidaemon_core::StoreError)
@@ -628,6 +643,7 @@ pub fn aidaemon_core::Agent::with_limits(&self, aidaemon_core::Limits) -> aidaem
 pub struct aidaemon_core::AgentBuilder
 impl aidaemon_core::AgentBuilder
 pub fn aidaemon_core::AgentBuilder::allow_unguarded(self) -> Self
+pub fn aidaemon_core::AgentBuilder::approval_key(self, [u8; 32]) -> Self
 pub fn aidaemon_core::AgentBuilder::attest(self, aidaemon_core::Safeguard) -> Self
 pub fn aidaemon_core::AgentBuilder::build(self) -> core::result::Result<aidaemon_core::Agent, aidaemon_core::BuildError>
 pub fn aidaemon_core::AgentBuilder::event_sink(self, impl aidaemon_core::EventSink + 'static) -> Self
@@ -691,6 +707,7 @@ pub fn aidaemon_core::AuthorityHook::on_run_end<'life0, 'life1, 'life2, 'life3, 
 pub fn aidaemon_core::AuthorityHook::on_run_start<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub fn aidaemon_core::AuthorityHook::on_stop<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::StopDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::AuthorityHook::on_stuck<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::StuckSignal) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::StuckDecision>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
+pub fn aidaemon_core::AuthorityHook::redactor(&self) -> core::option::Option<&dyn aidaemon_core::redaction::Redact>
 pub fn aidaemon_core::AuthorityHook::safeguards(&self) -> &'static [aidaemon_core::Safeguard]
 pub fn aidaemon_core::AuthorityHook::timeout(&self) -> core::option::Option<core::time::Duration>
 impl core::fmt::Debug for aidaemon_core::AuthorityHook
@@ -811,6 +828,7 @@ impl aidaemon_core::HookContext<'_>
 pub fn aidaemon_core::HookContext<'_>::run_receipts(&self) -> impl core::iter::traits::iterator::Iterator<Item = &aidaemon_core::Receipt>
 pub struct aidaemon_core::Interruption
 pub aidaemon_core::Interruption::call: aidaemon_core::ToolCall
+pub aidaemon_core::Interruption::digest: core::option::Option<alloc::string::String>
 pub aidaemon_core::Interruption::kind: aidaemon_core::InterruptKind
 pub aidaemon_core::Interruption::reason: alloc::string::String
 pub struct aidaemon_core::Limits
@@ -1118,6 +1136,7 @@ pub fn aidaemon_core::UntrustedHook::on_run_end<'life0, 'life1, 'life2, 'life3, 
 pub fn aidaemon_core::UntrustedHook::on_run_start<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub fn aidaemon_core::UntrustedHook::on_stop<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::StopDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::UntrustedHook::on_stuck<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::StuckSignal) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::StuckDecision>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
+pub fn aidaemon_core::UntrustedHook::redactor(&self) -> core::option::Option<&dyn aidaemon_core::redaction::Redact>
 pub fn aidaemon_core::UntrustedHook::safeguards(&self) -> &'static [aidaemon_core::Safeguard]
 pub fn aidaemon_core::UntrustedHook::timeout(&self) -> core::option::Option<core::time::Duration>
 pub struct aidaemon_core::Usage
@@ -1166,6 +1185,7 @@ pub fn aidaemon_core::Hook::on_run_end<'life0, 'life1, 'life2, 'life3, 'async_tr
 pub fn aidaemon_core::Hook::on_run_start<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub fn aidaemon_core::Hook::on_stop<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::StopDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::Hook::on_stuck<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::StuckSignal) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::StuckDecision>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
+pub fn aidaemon_core::Hook::redactor(&self) -> core::option::Option<&dyn aidaemon_core::redaction::Redact>
 pub fn aidaemon_core::Hook::safeguards(&self) -> &'static [aidaemon_core::Safeguard]
 pub fn aidaemon_core::Hook::timeout(&self) -> core::option::Option<core::time::Duration>
 impl aidaemon_core::Hook for aidaemon_core::AuthorityHook
@@ -1183,6 +1203,7 @@ pub fn aidaemon_core::AuthorityHook::on_run_end<'life0, 'life1, 'life2, 'life3, 
 pub fn aidaemon_core::AuthorityHook::on_run_start<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub fn aidaemon_core::AuthorityHook::on_stop<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::StopDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::AuthorityHook::on_stuck<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::StuckSignal) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::StuckDecision>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
+pub fn aidaemon_core::AuthorityHook::redactor(&self) -> core::option::Option<&dyn aidaemon_core::redaction::Redact>
 pub fn aidaemon_core::AuthorityHook::safeguards(&self) -> &'static [aidaemon_core::Safeguard]
 pub fn aidaemon_core::AuthorityHook::timeout(&self) -> core::option::Option<core::time::Duration>
 impl aidaemon_core::Hook for aidaemon_core::UntrustedHook
@@ -1200,6 +1221,7 @@ pub fn aidaemon_core::UntrustedHook::on_run_end<'life0, 'life1, 'life2, 'life3, 
 pub fn aidaemon_core::UntrustedHook::on_run_start<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub fn aidaemon_core::UntrustedHook::on_stop<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::StopDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::UntrustedHook::on_stuck<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::StuckSignal) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::StuckDecision>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
+pub fn aidaemon_core::UntrustedHook::redactor(&self) -> core::option::Option<&dyn aidaemon_core::redaction::Redact>
 pub fn aidaemon_core::UntrustedHook::safeguards(&self) -> &'static [aidaemon_core::Safeguard]
 pub fn aidaemon_core::UntrustedHook::timeout(&self) -> core::option::Option<core::time::Duration>
 pub trait aidaemon_core::InterruptResolver: core::marker::Send + core::marker::Sync
@@ -1302,6 +1324,9 @@ pub fn aidaemon_core::FnTool<F, Fut>::spec(&self) -> aidaemon_core::ToolSpec
 pub fn aidaemon_core::FnTool<F, Fut>::suspends(&self) -> bool
 pub fn aidaemon_core::FnTool<F, Fut>::timeout(&self) -> core::option::Option<core::time::Duration>
 pub fn aidaemon_core::FnTool<F, Fut>::validate(&self, &serde_json::value::Value) -> core::result::Result<(), alloc::string::String>
+pub fn aidaemon_core::check_argument_types(&serde_json::value::Value, &serde_json::value::Value) -> core::result::Result<(), alloc::string::String>
+pub fn aidaemon_core::check_arguments(&serde_json::value::Value, &serde_json::value::Value) -> core::result::Result<(), alloc::string::String>
 pub async fn aidaemon_core::collect_stream(futures_core::stream::BoxStream<'_, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>) -> core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>
 pub fn aidaemon_core::is_untrusted_egress(&aidaemon_core::Interruption) -> bool
+pub fn aidaemon_core::strip_reserved_arguments(&mut serde_json::map::Map<alloc::string::String, serde_json::value::Value>)
 pub type aidaemon_core::ToolResult = core::result::Result<aidaemon_core::ToolOutput, aidaemon_core::ToolError>
