@@ -117,11 +117,19 @@ impl<'a> Driver<'a> {
         // Tools that start other runs share this set, so a decline in any of
         // them binds the rest.
         let own_declines = state.shared_declines().is_none();
-        let state = if own_declines {
+        let mut state = if own_declines {
             state.share_declines(SharedDeclines::new())
         } else {
             state
         };
+        // What the caller put in (the user's message, an earlier run's
+        // transcript) is redacted before anything reads it.
+        let scrub = crate::redaction::Scrubber {
+            hooks: &agent.hooks,
+        };
+        for message in &mut state.messages {
+            scrub.message(message);
+        }
         Self {
             agent,
             state,
@@ -288,6 +296,10 @@ impl<'a> Driver<'a> {
                         .await;
                 }
             }
+            // Whatever the hooks added, no secret reaches the model.
+            for message in &mut request.messages {
+                self.scrubber().message(message);
+            }
 
             // 3. Call the model (streamed; non-streaming providers yield a
             //    single final event), bounded by the remaining wall-clock budget.
@@ -382,10 +394,10 @@ impl<'a> Driver<'a> {
                 // Without the calls: a call with no result is a request
                 // providers refuse, and these will never run.
                 if !response.text.is_empty() {
-                    self.state.messages.push(
-                        Message::assistant(response.text, Vec::new())
-                            .with_reasoning(response.reasoning),
-                    );
+                    let mut message = Message::assistant(response.text, Vec::new())
+                        .with_reasoning(response.reasoning);
+                    self.scrubber().message(&mut message);
+                    self.state.messages.push(message);
                 }
                 self.state
                     .messages
@@ -393,10 +405,12 @@ impl<'a> Driver<'a> {
                 self.checkpoint().await?;
                 continue;
             }
-            self.state.messages.push(
-                Message::assistant(response.text.clone(), calls.clone())
-                    .with_reasoning(response.reasoning.clone()),
-            );
+            // The transcript keeps the calls redacted; `calls` keeps the
+            // exact arguments the tools run with.
+            let mut message = Message::assistant(response.text.clone(), calls.clone())
+                .with_reasoning(response.reasoning.clone());
+            self.scrubber().message(&mut message);
+            self.state.messages.push(message);
 
             // 4a. No tool calls: the model thinks it is done. Ask stop hooks.
             if calls.is_empty() {
@@ -890,6 +904,11 @@ impl<'a> Driver<'a> {
             };
             interruption.digest = Some(crate::binding::digest(&self.approval_key(), &question));
         }
+        // The owner sees the question without secrets; the digest and the
+        // pending call keep the exact arguments.
+        self.scrubber().json(&mut interruption.call);
+        self.scrubber().text(&mut interruption.reason);
+        self.scrubber().json(&mut interruption.kind);
         let mut pending_calls = calls.to_vec();
         pending_calls[index] = call;
         self.state.in_flight = None;
@@ -1300,6 +1319,10 @@ impl<'a> Driver<'a> {
         }
         // A hook may have rewritten the result; the limit still holds.
         output.content = truncate_middle(&output.content, self.agent.limits.max_tool_output_chars);
+        let mut receipt = receipt;
+        self.scrubber().text(&mut output.content);
+        self.scrubber().value(&mut output.details);
+        self.scrubber().receipt(&mut receipt);
         self.state.messages.push(
             Message::tool_result(receipt.call_id.clone(), output.content.clone())
                 .with_images(output.images.iter().cloned())
@@ -1523,6 +1546,12 @@ impl<'a> Driver<'a> {
     }
 
     /// The names of the installed hooks, in order.
+    fn scrubber(&self) -> crate::redaction::Scrubber<'_> {
+        crate::redaction::Scrubber {
+            hooks: &self.agent.hooks,
+        }
+    }
+
     fn approval_key(&self) -> [u8; 32] {
         self.agent
             .approval_key
@@ -1813,6 +1842,8 @@ impl<'a> Driver<'a> {
     }
 
     async fn emit(&self, event: Event) -> Result<(), CoreError> {
+        let mut event = event;
+        self.scrubber().json(&mut event);
         for sink in &self.agent.sinks {
             sink.emit(self.state.run_id, &event);
         }
@@ -1878,6 +1909,10 @@ impl<'a> Driver<'a> {
             turns: self.state.turn,
         })
         .await?;
+        let mut final_text = final_text;
+        if let Some(text) = &mut final_text {
+            self.scrubber().text(text);
+        }
         let outcome = RunOutcome {
             status,
             final_text,
@@ -1978,6 +2013,11 @@ impl HookGuard<'_> {
     }
 
     async fn record(&self, event: Event) {
+        let mut event = event;
+        crate::redaction::Scrubber {
+            hooks: &self.agent.hooks,
+        }
+        .json(&mut event);
         for sink in &self.agent.sinks {
             sink.emit(self.run_id, &event);
         }

@@ -23,8 +23,11 @@ default = ["keychain"]
 keychain = ["dep:keyring"]
 
 [dependencies]
+aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
 anyhow = "1"
 dotenvy = "0.15"
+tracing = "0.1"
+zeroize = "1"
 
 # keyring 4 (`v1` feature, the default): Keychain on macOS, Credential
 # Manager on Windows, the Secret Service on other unix. It finds entries

@@ -8,6 +8,11 @@
 //! account names aidaemon's configuration uses.
 //!
 //! Secret values never appear in errors or logs; keys and file paths may.
+//! A store hands a value out as a [`Secret`]: its `Debug` is redacted, its
+//! memory is wiped on drop, and creating it registers the value with
+//! [`aidaemon_core::redaction`], so every agent run in the process redacts
+//! it from model requests, events, receipts, approval questions and saved
+//! state without being told about it.
 
 #![forbid(unsafe_code)]
 
@@ -17,12 +22,69 @@ use std::sync::Mutex;
 
 pub mod names;
 
+/// A secret value. `Debug` prints `Secret([REDACTED])`, there is no
+/// `Display`, and the memory is zeroed on drop. Creating one registers the
+/// value with the kernel's redaction ([`aidaemon_core::redaction`]), so a
+/// run that uses it never sends it out (see that module for what is
+/// covered). Read it with [`Secret::expose`] only where it is used.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(zeroize::Zeroizing<String>);
+
+impl Secret {
+    /// Wrap `value` and register it for redaction. A value too short to
+    /// redact (under [`aidaemon_core::redaction::MIN_SECRET_CHARS`]) is
+    /// still returned, with a warning logged (without the value): it will
+    /// appear as is wherever it is used.
+    pub fn new(value: impl Into<String>) -> Self {
+        let value = value.into();
+        if let Err(error) = aidaemon_core::redaction::register_secret(&value) {
+            tracing::warn!(%error, "secret not redacted");
+        }
+        Self(zeroize::Zeroizing::new(value))
+    }
+
+    /// The value, for the one place that needs it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// The value as a plain `String`, which is no longer wiped on drop.
+    pub fn into_exposed(self) -> String {
+        self.0.to_string()
+    }
+
+    /// Whether the value is long enough for the kernel to redact it.
+    pub fn is_redacted(&self) -> bool {
+        self.0.chars().count() >= aidaemon_core::redaction::MIN_SECRET_CHARS
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret([REDACTED])")
+    }
+}
+
+impl PartialEq<str> for Secret {
+    fn eq(&self, other: &str) -> bool {
+        self.expose() == other
+    }
+}
+
+impl PartialEq<&str> for Secret {
+    fn eq(&self, other: &&str) -> bool {
+        self.expose() == *other
+    }
+}
+
 /// Where secrets are kept, by key.
 ///
 /// Implementations must never log or put a secret's value in an error.
 pub trait SecretStore: Send + Sync {
     /// Read the secret stored under `key`. Errors when it is missing.
-    fn get(&self, key: &str) -> anyhow::Result<String>;
+    /// Implementations build the value with [`Secret::new`], which
+    /// registers it for redaction.
+    fn get(&self, key: &str) -> anyhow::Result<Secret>;
     /// Store `value` under `key`, replacing any earlier value.
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()>;
     /// Remove the secret under `key`.
@@ -52,14 +114,16 @@ impl MemorySecretStore {
 }
 
 impl SecretStore for MemorySecretStore {
-    fn get(&self, key: &str) -> anyhow::Result<String> {
+    fn get(&self, key: &str) -> anyhow::Result<Secret> {
         self.values()
             .get(key)
             .cloned()
+            .map(Secret::new)
             .ok_or_else(|| anyhow::anyhow!("secret '{}' not set", key))
     }
 
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let _ = aidaemon_core::redaction::register_secret(value);
         self.values().insert(key.to_string(), value.to_string());
         Ok(())
     }
@@ -134,13 +198,13 @@ impl EnvSecretStore {
 }
 
 impl SecretStore for EnvSecretStore {
-    fn get(&self, key: &str) -> anyhow::Result<String> {
+    fn get(&self, key: &str) -> anyhow::Result<Secret> {
         let env_key = key.to_uppercase();
         let env_path = self.env_file_path();
         if env_path.exists() {
             if let Some(val) = read_env_secret_from_file(&env_path, &env_key)? {
                 if !val.is_empty() {
-                    return Ok(val);
+                    return Ok(Secret::new(val));
                 }
             }
             anyhow::bail!(
@@ -152,7 +216,7 @@ impl SecretStore for EnvSecretStore {
 
         if let Ok(val) = std::env::var(&env_key) {
             if !val.is_empty() {
-                return Ok(val);
+                return Ok(Secret::new(val));
             }
         }
 
@@ -164,6 +228,7 @@ impl SecretStore for EnvSecretStore {
     }
 
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let _ = aidaemon_core::redaction::register_secret(value);
         upsert_env_secret(&self.env_file_path(), key, value)
     }
 
@@ -240,16 +305,18 @@ impl KeychainSecretStore {
 
 #[cfg(feature = "keychain")]
 impl SecretStore for KeychainSecretStore {
-    fn get(&self, key: &str) -> anyhow::Result<String> {
+    fn get(&self, key: &str) -> anyhow::Result<Secret> {
         if self.keychain_disabled() {
             return self.env.get(key);
         }
         self.entry(key)?
             .get_password()
+            .map(Secret::new)
             .map_err(|e| anyhow::anyhow!("Failed to read '{}' from OS keychain: {}", key, e))
     }
 
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let _ = aidaemon_core::redaction::register_secret(value);
         if self.keychain_disabled() {
             return self.env.set(key, value);
         }
@@ -270,7 +337,7 @@ impl SecretStore for KeychainSecretStore {
 /// Without the `keychain` feature the store always uses its env file.
 #[cfg(not(feature = "keychain"))]
 impl SecretStore for KeychainSecretStore {
-    fn get(&self, key: &str) -> anyhow::Result<String> {
+    fn get(&self, key: &str) -> anyhow::Result<Secret> {
         self.env.get(key)
     }
 

@@ -242,6 +242,14 @@ pub trait Hook: Send + Sync {
         std::any::type_name::<Self>()
     }
 
+    /// What this hook hides from everything that leaves the kernel. The
+    /// kernel applies it, with the secrets registered in
+    /// [`crate::redaction`], to model requests, events, receipts, the
+    /// question put to the owner and the saved state. Default: nothing.
+    fn redactor(&self) -> Option<&dyn crate::redaction::Redact> {
+        None
+    }
+
     /// How long one call of this hook may take, in place of
     /// [`crate::Limits::hook_timeout`]. The wall-clock budget still applies.
     fn timeout(&self) -> Option<Duration> {

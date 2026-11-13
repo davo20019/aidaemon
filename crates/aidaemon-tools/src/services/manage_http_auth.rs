@@ -309,9 +309,13 @@ impl ManageHttpAuthTool {
             if let Some(ref value) = inline_value {
                 if value == "keychain" {
                     match self.secrets.get(&key_name) {
-                        Ok(secret) if !secret.is_empty() => {
+                        Ok(secret) if !secret.expose().is_empty() => {
                             configured_secret_fields.push(*field);
-                            Self::set_secret_field(&mut live_profile, field, Some(secret));
+                            Self::set_secret_field(
+                                &mut live_profile,
+                                field,
+                                Some(secret.into_exposed()),
+                            );
                         }
                         _ => missing_secret_fields.push(*field),
                     }
@@ -324,9 +328,9 @@ impl ManageHttpAuthTool {
             }
 
             match self.secrets.get(&key_name) {
-                Ok(secret) if !secret.is_empty() => {
+                Ok(secret) if !secret.expose().is_empty() => {
                     detected_secret_fields.push(*field);
-                    Self::set_secret_field(&mut live_profile, field, Some(secret));
+                    Self::set_secret_field(&mut live_profile, field, Some(secret.into_exposed()));
                 }
                 _ => missing_secret_fields.push(*field),
             }

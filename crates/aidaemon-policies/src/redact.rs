@@ -8,7 +8,7 @@ use regex::Regex;
 
 /// Literal secrets shorter than this are ignored: redacting every `abc`
 /// would destroy output without protecting anything.
-pub(crate) const MIN_LITERAL_LEN: usize = 6;
+pub(crate) const MIN_LITERAL_LEN: usize = aidaemon_core::redaction::MIN_SECRET_CHARS;
 
 /// Replaces secrets in tool output before the model sees it.
 ///
@@ -20,9 +20,14 @@ pub(crate) const MIN_LITERAL_LEN: usize = 6;
 /// values with [`Redactor::secret`] (for example the API keys from your own
 /// config).
 ///
-/// Only `ToolOutput::content` changes. Receipts are final before
-/// `after_tool` runs, and this hook never edits them; keep secrets out of
-/// receipt `details` at the tool level.
+/// As a hook it redacts tool output before the model sees it, and it offers
+/// itself to the kernel ([`Hook::redactor`]), which applies it with the
+/// secrets registered in [`aidaemon_core::redaction`] (every value an
+/// `aidaemon_secrets` store hands out) to everything that leaves the run:
+/// model requests, events, receipts including arguments and details, the
+/// question put to the owner and the saved state. Literals under 6
+/// characters are refused ([`Redactor::try_secret`]). Encodings of a secret
+/// (hex, base64, a token split in two) are not recognized.
 #[derive(Debug, Clone)]
 pub struct Redactor {
     patterns: Vec<(&'static str, Regex)>,
@@ -82,15 +87,38 @@ impl Redactor {
             .collect()
     }
 
-    /// Also redact this exact value wherever it appears.
-    pub fn secret(mut self, value: impl Into<String>) -> Self {
+    /// Also redact this exact value wherever it appears. A value under
+    /// [`MIN_SECRET_CHARS`](aidaemon_core::redaction::MIN_SECRET_CHARS)
+    /// characters cannot be redacted without garbling ordinary text: it is
+    /// not added, and a warning is logged (without the value). Use
+    /// [`Redactor::try_secret`] to get the refusal as an error.
+    pub fn secret(self, value: impl Into<String>) -> Self {
         let value = value.into();
-        if value.chars().count() >= MIN_LITERAL_LEN {
-            self.literals.push(value);
-            // Longest first, so a secret that contains another is fully hidden.
-            self.literals.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        let fallback = self.clone();
+        match self.try_secret(value) {
+            Ok(redactor) => redactor,
+            Err(error) => {
+                tracing::warn!(%error, "Redactor::secret: value not added");
+                fallback
+            }
         }
-        self
+    }
+
+    /// Like [`Redactor::secret`], but a value too short to redact is an
+    /// error.
+    pub fn try_secret(
+        mut self,
+        value: impl Into<String>,
+    ) -> Result<Self, aidaemon_core::redaction::SecretTooShort> {
+        let value = value.into();
+        let chars = value.chars().count();
+        if chars < MIN_LITERAL_LEN {
+            return Err(aidaemon_core::redaction::SecretTooShort { chars });
+        }
+        self.literals.push(value);
+        // Longest first, so a secret that contains another is fully hidden.
+        self.literals.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        Ok(self)
     }
 
     /// Add a custom pattern with a label used in the placeholder.
@@ -121,8 +149,21 @@ impl Redactor {
     }
 }
 
+impl aidaemon_core::redaction::Redact for Redactor {
+    fn redact(&self, text: &str) -> String {
+        Redactor::redact(self, text)
+    }
+}
+
 #[async_trait]
 impl Hook for Redactor {
+    /// The kernel applies this redactor at its boundary too: model
+    /// requests, events, receipts (arguments and details), the owner's
+    /// question and the saved state.
+    fn redactor(&self) -> Option<&dyn aidaemon_core::redaction::Redact> {
+        Some(self)
+    }
+
     async fn after_tool(
         &self,
         _ctx: &HookContext<'_>,

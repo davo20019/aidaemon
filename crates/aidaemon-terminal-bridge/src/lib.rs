@@ -3050,7 +3050,7 @@ async fn load_or_create_key_material(secrets: &dyn SecretStore) -> anyhow::Resul
 
     let mut source = KeySource::Generated;
     let secret = match secrets.get(TERMINAL_DAEMON_KEYCHAIN_FIELD) {
-        Ok(encoded) => match parse_daemon_secret_key_from_encoded(&encoded) {
+        Ok(encoded) => match parse_daemon_secret_key_from_encoded(encoded.expose()) {
             Ok(secret) => {
                 source = KeySource::Keychain;
                 secret

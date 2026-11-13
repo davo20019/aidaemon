@@ -669,13 +669,13 @@ pub fn store_credentials(secrets: &dyn SecretStore, creds: &ChatGptCredentials) 
 
 /// Load stored credentials from `secrets`, if a login has happened.
 pub fn load_credentials(secrets: &dyn SecretStore) -> Option<ChatGptCredentials> {
-    let access_token = secrets.get(&key("access_token")).ok()?;
-    let refresh_token = secrets.get(&key("refresh_token")).ok()?;
-    let account_id = secrets.get(&key("account_id")).ok()?;
+    let access_token = secrets.get(&key("access_token")).ok()?.into_exposed();
+    let refresh_token = secrets.get(&key("refresh_token")).ok()?.into_exposed();
+    let account_id = secrets.get(&key("account_id")).ok()?.into_exposed();
     let expires_at = secrets
         .get(&key("expires_at"))
         .ok()
-        .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw.expose()).ok())
         .map(|dt| dt.with_timezone(&Utc))
         // An unreadable expiry should force a refresh, not a panic or a stale token.
         .unwrap_or_else(|| Utc::now() - chrono::Duration::hours(1));

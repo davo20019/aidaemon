@@ -1072,7 +1072,8 @@ impl ConfigManagerTool {
         }
 
         let secret = self.secrets.get(old_key)?;
-        let (new_value, _stored, note) = self.resolve_secret_config_value(new_key, &secret, true);
+        let (new_value, _stored, note) =
+            self.resolve_secret_config_value(new_key, secret.expose(), true);
         provider_table.insert(field_name.to_string(), new_value);
         cleanup_keys.push(old_key.to_string());
         if let Some(note) = note {
@@ -1116,7 +1117,7 @@ impl ConfigManagerTool {
 
             let secret = self.secrets.get(&old_key)?;
             let (new_value, _stored, note) =
-                self.resolve_secret_config_value(&new_key, &secret, true);
+                self.resolve_secret_config_value(&new_key, secret.expose(), true);
             *header_value = new_value;
             cleanup_keys.push(old_key);
             if let Some(note) = note {

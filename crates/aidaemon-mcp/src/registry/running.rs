@@ -297,7 +297,7 @@ impl McpRegistry {
             let keychain_key = format!("mcp_{}_{}", name, key);
             match self.secrets.get(&keychain_key) {
                 Ok(val) => {
-                    resolved_config.env.insert(key.clone(), val);
+                    resolved_config.env.insert(key.clone(), val.into_exposed());
                 }
                 Err(e) => {
                     warn!(key = %keychain_key, error = %e, "Failed to resolve env from keychain");
@@ -375,7 +375,7 @@ impl McpRegistry {
             let keychain_key = format!("mcp_{}_{}", server.name, key);
             match self.secrets.get(&keychain_key) {
                 Ok(val) => {
-                    env.insert(key.clone(), val);
+                    env.insert(key.clone(), val.into_exposed());
                 }
                 Err(e) => {
                     warn!(

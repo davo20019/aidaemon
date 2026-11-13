@@ -834,7 +834,7 @@ impl ManageOAuthTool {
             };
             let response = client
                 .get(identity_url)
-                .bearer_auth(token)
+                .bearer_auth(token.expose())
                 .header(reqwest::header::ACCEPT, "application/json")
                 .send()
                 .await

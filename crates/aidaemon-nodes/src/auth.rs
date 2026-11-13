@@ -16,7 +16,7 @@ const INSTANCE_KEYCHAIN_FIELD: &str = "node_gateway_instance_key_v1";
 pub fn load_or_create_instance_key(secrets: &dyn SecretStore) -> anyhow::Result<[u8; 32]> {
     if let Ok(encoded) = secrets.get(INSTANCE_KEYCHAIN_FIELD) {
         let decoded = URL_SAFE_NO_PAD
-            .decode(encoded.trim())
+            .decode(encoded.expose().trim())
             .map_err(|_| anyhow::anyhow!("Stored Node Gateway instance key is malformed"))?;
         anyhow::ensure!(
             decoded.len() == 32,

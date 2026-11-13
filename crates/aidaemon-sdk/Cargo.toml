@@ -18,11 +18,15 @@ exclude = ["tests/", "benches/"]
 publish = false
 
 [features]
-default = ["providers", "tools", "policies", "agents", "sqlite", "macros", "memory"]
+default = ["providers", "tools", "policies", "agents", "sqlite", "macros", "memory", "secrets"]
 macros = ["dep:aidaemon-macros"]
 providers = ["dep:aidaemon-providers"]
 tools = ["dep:aidaemon-tools"]
 policies = ["dep:aidaemon-policies"]
+# Secret stores; every value they hand out is redacted from runs.
+secrets = ["dep:aidaemon-secrets"]
+# The OS credential store behind `secrets::KeychainSecretStore`.
+keychain = ["secrets", "aidaemon-secrets/keychain"]
 otel = ["policies", "aidaemon-policies/otel"]
 agents = ["dep:aidaemon-agents"]
 sqlite = ["dep:aidaemon-store-sqlite"]
@@ -37,7 +41,7 @@ telegram = ["channels", "dep:aidaemon-channel-telegram"]
 slack = ["channels", "dep:aidaemon-channel-slack"]
 discord = ["channels", "dep:aidaemon-channel-discord"]
 testing = ["aidaemon-core/testing", "aidaemon-channels?/testing", "dep:tokio"]
-full = ["macros", "providers", "tools", "policies", "agents", "sqlite", "mcp", "eval", "testing", "memory", "events", "work", "telegram", "slack", "discord", "otel"]
+full = ["macros", "providers", "tools", "policies", "secrets", "keychain", "agents", "sqlite", "mcp", "eval", "testing", "memory", "events", "work", "telegram", "slack", "discord", "otel"]
 
 [dependencies]
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
@@ -51,6 +55,7 @@ tokio = { version = "1", features = ["rt", "time", "macros"], optional = true }
 aidaemon-providers = { version = "0.2.0", path = "../aidaemon-providers", optional = true }
 aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools", optional = true }
 aidaemon-policies = { version = "0.2.0", path = "../aidaemon-policies", optional = true }
+aidaemon-secrets = { version = "0.2.0", path = "../aidaemon-secrets", optional = true, default-features = false }
 aidaemon-agents = { version = "0.2.0", path = "../aidaemon-agents", optional = true }
 aidaemon-store-sqlite = { version = "0.2.0", path = "../aidaemon-store-sqlite", optional = true }
 aidaemon-mcp = { version = "0.2.0", path = "../aidaemon-mcp", optional = true }
@@ -72,6 +77,10 @@ tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 tempfile = "3"
 chrono = "0.4"
+
+[[test]]
+name = "store_secrets_redacted"
+required-features = ["secrets", "testing"]
 
 [[test]]
 name = "web_fetch_egress"

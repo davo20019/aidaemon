@@ -80,9 +80,11 @@ fn resolve_env_file_path() -> PathBuf {
     secret_store().env_store().env_file_path()
 }
 
-/// Read a secret from the daemon's secret store.
+/// Read a secret from the daemon's secret store. The value is registered
+/// for redaction on the way out (`aidaemon_secrets::Secret`).
 pub fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
     aidaemon_secrets::SecretStore::get(secret_store().as_ref(), field_name)
+        .map(aidaemon_secrets::Secret::into_exposed)
 }
 
 /// Store a secret in the OS keychain under the `aidaemon` service.

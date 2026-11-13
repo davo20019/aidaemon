@@ -10,6 +10,7 @@
 //! | [`providers`] | `providers` (default) | OpenAI-compatible and Anthropic models, streaming |
 //! | [`tools`] | `tools` (default) | Workspace file tools, search, sandboxed shell, web fetch, checklist |
 //! | [`policies`] | `policies` (default) | Approvals, scope and egress guards, streak guard, redaction, instructions, context window, conversation compaction, memory, tracing |
+//! | [`secrets`] | `secrets` (default; `keychain` for the OS store) | Secret stores whose values come out as `Secret` and are redacted from every run |
 //! | [`agents`] | `agents` (default) | Agents as tools, child budgets |
 //! | [`store`] | `sqlite` (default) | Durable runs on SQLite, crash recovery queries, upkeep (`store::maintenance`: planner statistics, live snapshots) |
 //! | [`mcp`] | `mcp` | MCP servers as tools |
@@ -154,6 +155,9 @@ pub use aidaemon_tools as tools;
 
 #[cfg(feature = "policies")]
 pub use aidaemon_policies as policies;
+
+#[cfg(feature = "secrets")]
+pub use aidaemon_secrets as secrets;
 
 #[cfg(feature = "agents")]
 pub use aidaemon_agents as agents;

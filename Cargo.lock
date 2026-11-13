@@ -626,6 +626,7 @@ dependencies = [
  "aidaemon-memory",
  "aidaemon-policies",
  "aidaemon-providers",
+ "aidaemon-secrets",
  "aidaemon-store-sqlite",
  "aidaemon-tools",
  "aidaemon-work",
@@ -646,10 +647,13 @@ dependencies = [
 name = "aidaemon-secrets"
 version = "0.2.0"
 dependencies = [
+ "aidaemon-core",
  "anyhow",
  "dotenvy",
  "keyring",
  "tempfile",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]

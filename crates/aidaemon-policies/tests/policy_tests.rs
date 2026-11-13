@@ -210,7 +210,7 @@ async fn scope_guard_denies_paths_outside_roots() {
 // ---------- after_tool ----------
 
 #[tokio::test]
-async fn redactor_and_untrusted_reshape_output_but_not_receipts() {
+async fn redactor_and_untrusted_reshape_output_and_redact_receipts() {
     let secret_body = "token=ghp_abcdefghijklmnopqrstuvwxyz0123456789 pw=synthetic-pass-123";
     let provider = Arc::new(ScriptedProvider::new([
         tool_calls([
@@ -232,10 +232,10 @@ async fn redactor_and_untrusted_reshape_output_but_not_receipts() {
 
     let file = tool_text(&out, "c1");
     assert_eq!(file, "token=[REDACTED:github_token] pw=[REDACTED:secret]");
+    // Receipts leave the run too: their details are redacted the same way.
     assert_eq!(
         out.receipts()[0].details["raw"],
-        secret_body,
-        "receipt untouched"
+        "token=[REDACTED:github_token] pw=[REDACTED:secret]",
     );
 
     let web = tool_text(&out, "c2");

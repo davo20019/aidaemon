@@ -33,6 +33,7 @@ mod outcome;
 mod provider;
 mod quota;
 mod receipt;
+pub mod redaction;
 mod run_loop;
 mod safeguard;
 mod service;

@@ -526,11 +526,13 @@ impl OAuthGateway {
         let client_id = self
             .secrets
             .get(&client_id_key)
-            .map_err(|_| self.missing_credential("Client ID", &client_id_key))?;
+            .map_err(|_| self.missing_credential("Client ID", &client_id_key))?
+            .into_exposed();
         let client_secret = self
             .secrets
             .get(&client_secret_key)
-            .map_err(|_| self.missing_credential("Client secret", &client_secret_key))?;
+            .map_err(|_| self.missing_credential("Client secret", &client_secret_key))?
+            .into_exposed();
         Ok((client_id, client_secret))
     }
 
@@ -967,7 +969,7 @@ impl OAuthGateway {
                                 access_token: None,
                                 access_token_secret: None,
                                 user_id: conn.account_id.clone(),
-                                token: Some(token),
+                                token: Some(token.into_exposed()),
                                 header_name: None,
                                 header_value: None,
                                 username: None,
@@ -1061,7 +1063,8 @@ impl OAuthGateway {
         let refresh_token = self
             .secrets
             .get(&rt_key)
-            .map_err(|_| anyhow::anyhow!("No refresh token found for '{}'", service))?;
+            .map_err(|_| anyhow::anyhow!("No refresh token found for '{}'", service))?
+            .into_exposed();
 
         let (client_id, client_secret) = self.get_credentials(service)?;
 
