@@ -14,6 +14,7 @@ pub mod mandates;
 pub mod plans;
 pub mod reminders;
 pub mod schedule;
+pub mod scheduled_runs;
 pub mod scheduler;
 pub mod schema;
 pub mod sqlite;

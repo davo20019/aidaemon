@@ -1,6 +1,8 @@
 use super::bootstrap::{BootstrapCtx, BootstrapData, BootstrapOutcome};
 use super::message_build::{MessageBuildCtx, MessageBuildData};
 use super::*;
+#[allow(unused_imports)]
+use crate::agent::{ToolResultFit, WorkScope};
 use crate::events::TaskOutcome;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,7 +1,10 @@
 //! The daemon's agent as the turn runtime's host.
 
 use aidaemon_events::stores::{DialogueStateStore, MessageStore};
-use aidaemon_runtime::host::{DecisionRecorder, TurnHost, TurnStores, TurnWorkspace};
+use aidaemon_runtime::host::{
+    DecisionRecorder, EngineContext, EngineHostOps, TurnHost, TurnLimits, TurnServices, TurnStores,
+    TurnWorkspace,
+};
 use aidaemon_runtime::turn_runtime::TurnRuntime;
 
 use super::Agent;
@@ -34,6 +37,18 @@ impl TurnStores for Agent {
     }
 
     fn goals(&self) -> &dyn aidaemon_work::stores::GoalStore {
+        &*self.state
+    }
+
+    fn work(&self) -> &dyn aidaemon_work::scheduler::SchedulerStore {
+        &*self.state
+    }
+
+    fn token_usage(&self) -> &dyn aidaemon_events::provider::TokenUsageStore {
+        &*self.state
+    }
+
+    fn dynamic_bots(&self) -> &dyn aidaemon_channels::hub::DynamicBotStore {
         &*self.state
     }
 
@@ -76,6 +91,101 @@ impl DecisionRecorder for Agent {
             metadata,
         )
         .await;
+    }
+}
+
+impl EngineContext for Agent {
+    fn daemon_paths(&self) -> &crate::tools::DaemonPaths {
+        &self.daemon_paths
+    }
+
+    fn engine_settings(
+        &self,
+    ) -> &std::sync::Arc<aidaemon_runtime::engine::settings::SdkEngineSettings> {
+        &self.sdk_engine
+    }
+
+    fn run_store(&self) -> Option<&std::sync::Arc<aidaemon_store_sqlite::SqliteStore>> {
+        self.run_store.as_ref()
+    }
+
+    fn approval_session_id(&self) -> Option<&str> {
+        self.approval_session_id.as_deref()
+    }
+
+    fn owner_approvals(&self) -> &std::sync::Arc<aidaemon_runtime::approvals::OwnerApprovals> {
+        &self.owner_approvals
+    }
+
+    fn child_progress(&self) -> Option<&crate::tools::ProgressClock> {
+        self.child_progress.as_ref()
+    }
+
+    fn untrusted_read_flag(&self) -> &std::sync::Arc<std::sync::atomic::AtomicBool> {
+        &self.read_untrusted
+    }
+
+    fn running_children(&self) -> &std::sync::Arc<aidaemon_runtime::spawn::RunningChildren> {
+        &self.running_children
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnServices for Agent {
+    fn task_registry(&self) -> Option<&std::sync::Arc<crate::tasks::TaskRegistry>> {
+        self.task_registry.get()
+    }
+
+    async fn plan_store(&self) -> Option<std::sync::Arc<crate::plans::PlanStore>> {
+        self.plan_store.read().await.clone()
+    }
+
+    async fn mcp_tool(&self, name: &str) -> Option<std::sync::Arc<dyn crate::traits::Tool>> {
+        self.mcp_registry.as_ref()?.find_tool(name).await
+    }
+
+    fn transcript_writes(
+        &self,
+    ) -> std::sync::Arc<dyn aidaemon_runtime::turn::memory_writer::MemoryWrites> {
+        self.transcript_writes.clone()
+    }
+
+    fn cancel_token(&self) -> Option<&tokio_util::sync::CancellationToken> {
+        self.cancel_token.as_ref()
+    }
+
+    fn interactive_slot(&self) -> Option<u32> {
+        self.interactive_slot
+    }
+
+    fn turn_limits(&self) -> TurnLimits {
+        TurnLimits {
+            llm_call_timeout: self.limits.llm_call_timeout,
+            task_token_budget: self.limits.task_token_budget,
+            spawn_family: self.limits.spawn_family,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl EngineHostOps for Agent {
+    async fn defer_request_for_provider_recovery(
+        &self,
+        session_id: &str,
+        user_text: &str,
+        user_role: crate::types::UserRole,
+        channel_ctx: &crate::types::ChannelContext,
+        error: &anyhow::Error,
+    ) -> Option<u16> {
+        Agent::defer_request_for_provider_recovery(
+            self,
+            session_id,
+            user_text,
+            user_role,
+            channel_ctx,
+            error,
+        )
+        .await
     }
 }
 

@@ -18,6 +18,7 @@ pub mod helpers;
 pub mod inquiry;
 pub mod loop_utils;
 pub mod memory;
+pub mod memory_writer;
 pub mod message_build;
 pub mod notes;
 pub mod post_task;

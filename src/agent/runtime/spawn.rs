@@ -2079,15 +2079,6 @@ impl Agent {
         }
     }
 
-    /// The chat whose `/readonly` narrows this turn while it runs: a child
-    /// answers to the chat that started the work, a root turn to its own.
-    pub(crate) fn mode_session_for(&self, session_id: &str) -> String {
-        self.inherited_authority
-            .as_ref()
-            .and_then(|inherited| inherited.mode_session.clone())
-            .unwrap_or_else(|| session_id.to_string())
-    }
-
     /// Internal helper to create and run a child agent.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_child_inner(

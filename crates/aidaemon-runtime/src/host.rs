@@ -7,6 +7,14 @@
 //! - [`TurnWorkspace`]: where the turn's file work happens (the execution
 //!   backend and the configured project roots).
 //! - [`DecisionRecorder`]: where the turn's decision points go.
+//! - [`EngineContext`]: what the turn engine is handed with the agent (the
+//!   daemon's paths, the engine settings, the run store, the approval chat
+//!   and a child's links to its parent).
+//! - [`TurnServices`]: the registries and per-run handles a turn uses (the
+//!   task registry, plans, MCP tools, transcript writes, cancellation, the
+//!   interactive slot and the turn's limits).
+//! - [`EngineHostOps`]: what only the host can do for the engine (queue a
+//!   request for provider recovery).
 //! - [`TurnHost`]: all of the above plus the agent's turn runtime and who
 //!   the agent is; the turn's handlers in this crate run on it.
 
@@ -31,6 +39,14 @@ pub trait TurnStores: Send + Sync {
     fn summaries(&self) -> &dyn aidaemon_events::stores::ConversationSummaryStore;
     /// Goals (a goal's bound workspace scopes its tasks' turns).
     fn goals(&self) -> &dyn aidaemon_work::stores::GoalStore;
+    /// The work stores beyond the conversation: tasks and their activity
+    /// log, goals' schedules and runs, a scheduled run's persisted budget
+    /// state, and the notices delivered to the owner.
+    fn work(&self) -> &dyn aidaemon_work::scheduler::SchedulerStore;
+    /// Token usage, and the mandate runs' token leases.
+    fn token_usage(&self) -> &dyn aidaemon_events::provider::TokenUsageStore;
+    /// The bots added at runtime.
+    fn dynamic_bots(&self) -> &dyn aidaemon_channels::hub::DynamicBotStore;
     /// The event log.
     fn events(&self) -> &EventStore;
     /// A shared handle to the event log, for emitters and spawned work.
@@ -61,10 +77,83 @@ pub trait DecisionRecorder: Send + Sync {
     );
 }
 
+/// What the turn engine is handed with the agent.
+pub trait EngineContext: Send + Sync {
+    /// The daemon's own paths (config, data, logs), which file policy and
+    /// path classification read.
+    fn daemon_paths(&self) -> &aidaemon_tools::path_class::DaemonPaths;
+    /// How turns run on the SDK kernel; shared by every agent in the tree.
+    fn engine_settings(&self) -> &std::sync::Arc<crate::engine::settings::SdkEngineSettings>;
+    /// The durable kernel run store, when runs are recorded.
+    fn run_store(&self) -> Option<&std::sync::Arc<aidaemon_store_sqlite::SqliteStore>>;
+    /// The chat whose approval grants a child's turns share; `None` for a
+    /// root agent (its own session's grants apply).
+    fn approval_session_id(&self) -> Option<&str>;
+    /// The owner's approvals: pending cards and session grants.
+    fn owner_approvals(&self) -> &std::sync::Arc<crate::approvals::OwnerApprovals>;
+    /// A spawned child's progress clock, read by its parent's watchdog.
+    fn child_progress(&self) -> Option<&aidaemon_channels::owner_wait::ProgressClock>;
+    /// Set once this agent's turn read untrusted content; its parent reads it.
+    fn untrusted_read_flag(&self) -> &std::sync::Arc<std::sync::atomic::AtomicBool>;
+    /// The sub-agents running for the requests of this agent's tree.
+    fn running_children(&self) -> &std::sync::Arc<crate::spawn::RunningChildren>;
+}
+
+/// The limits one turn runs under.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TurnLimits {
+    /// The configured per-call model timeout (`None`: the engine default).
+    pub llm_call_timeout: Option<std::time::Duration>,
+    /// The token budget of one task.
+    pub task_token_budget: Option<u64>,
+    /// How many sub-agents one request's tree may run.
+    pub spawn_family: crate::authority::SpawnFamilyLimits,
+}
+
+/// The registries and per-run handles a turn uses.
+#[async_trait::async_trait]
+pub trait TurnServices: Send + Sync {
+    /// The running tasks of every chat (`/tasks`, cancel).
+    fn task_registry(&self) -> Option<&std::sync::Arc<aidaemon_channels::tasks::TaskRegistry>>;
+    /// The task plans, when plans are enabled.
+    async fn plan_store(&self) -> Option<std::sync::Arc<aidaemon_work::plans::PlanStore>>;
+    /// The available MCP tool named `name`, if a connected server offers it.
+    async fn mcp_tool(&self, name: &str)
+        -> Option<std::sync::Arc<dyn aidaemon_tools::OutcomeTool>>;
+    /// Where a turn's memory side effects go (extraction, summaries,
+    /// learning).
+    fn transcript_writes(&self) -> std::sync::Arc<dyn crate::turn::memory_writer::MemoryWrites>;
+    /// Cancels this agent's run (a child or a background task).
+    fn cancel_token(&self) -> Option<&tokio_util::sync::CancellationToken>;
+    /// The local model slot an interactive turn pins to keep its cache warm.
+    fn interactive_slot(&self) -> Option<u32>;
+    /// The limits this agent's turns run under.
+    fn turn_limits(&self) -> TurnLimits;
+}
+
+/// What only the host can do for the turn engine.
+#[async_trait::async_trait]
+pub trait EngineHostOps: Send + Sync {
+    /// Queue (or re-queue) a request whose provider failed before any tool
+    /// work committed, to run again once the provider recovers. Returns the
+    /// attempt number that will run next, or `None` when the request is not
+    /// deferrable or has exhausted its cap.
+    async fn defer_request_for_provider_recovery(
+        &self,
+        session_id: &str,
+        user_text: &str,
+        user_role: aidaemon_tools::semantics::UserRole,
+        channel_ctx: &aidaemon_channels::context::ChannelContext,
+        error: &anyhow::Error,
+    ) -> Option<u16>;
+}
+
 /// The host a turn runs on: its stores, workspace and decision record, the
 /// agent's [`TurnRuntime`] and where the agent stands in its tree.
 #[async_trait::async_trait]
-pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
+pub trait TurnHost:
+    TurnStores + TurnWorkspace + DecisionRecorder + EngineContext + TurnServices + EngineHostOps
+{
     /// The agent's turn settings and caches.
     fn turn_runtime(&self) -> &crate::turn_runtime::TurnRuntime;
     /// Whether this agent works for another (a spawned child, or a mandate's

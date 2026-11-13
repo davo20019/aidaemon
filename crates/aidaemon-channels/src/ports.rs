@@ -321,6 +321,23 @@ pub trait OutboundRouter: Send + Sync {
     async fn checklist_surface(&self, _session_id: &str) -> Option<String> {
         None
     }
+    /// The first card the session's chat kept after card `after` (`None`:
+    /// after none), when the channel can tell; a background run's line is
+    /// drawn on the card its starting turn kept, never a later turn's. The
+    /// default suits routers without a card history: the current card, when
+    /// it is a different one.
+    async fn checklist_surface_after(
+        &self,
+        session_id: &str,
+        after: Option<&str>,
+    ) -> Option<String> {
+        let now = self.checklist_surface(session_id).await;
+        if now.as_deref() == after {
+            None
+        } else {
+            now
+        }
+    }
     /// Record a plan card sent outside a turn (see [`Self::checklist_surface`]).
     async fn register_checklist_surface(&self, _session_id: &str, _message_id: &str) {}
     async fn request_inline_approval(

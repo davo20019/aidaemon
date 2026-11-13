@@ -413,11 +413,15 @@ impl HelperCard {
             return;
         }
         let plan = job_plan(self.plans.as_ref(), self.plan_session.as_deref(), &self.job).await;
-        // Without a plan the card is the helpers' own, kept by the turn; a
-        // background status message is the turn's reply and is never
-        // drawn over.
+        // Without a plan the card is the helpers' own: the one the turn that
+        // started this helper kept, never a later turn's. A background status
+        // message is the turn's reply and is never drawn over.
         let surface = match (&plan, now.0, now.1) {
-            (_, Some(card), _) => card,
+            (None, _, _) => match run_card(hub.as_ref(), &self.runs, &self.job, &self.chat).await {
+                Some(card) => card,
+                None => return,
+            },
+            (Some(_), Some(card), _) => card,
             (Some(_), None, Some(status)) => status,
             _ => return,
         };
@@ -1698,6 +1702,7 @@ impl SpawnAgentTool {
             ),
             None => (None, None),
         };
+        runs.card_before(&background_id, at_start.0.clone());
         let status_tx = show_helper_steps_on_card(
             status_tx,
             HelperCard {
@@ -2060,12 +2065,30 @@ pub async fn settle_background_steps(
         update_checklist_card(hub.as_ref(), chat_session, &card).await;
         return;
     }
-    if runs.get(job_id).is_none() {
-        return;
-    }
-    if let Some(surface) = hub.checklist_surface(chat_session).await {
+    // The card the run's own turn kept: a later turn's card is that turn's.
+    if let Some(surface) = run_card(hub.as_ref(), runs, job_id, chat_session).await {
         if let Err(error) = hub.edit_text(chat_session, &surface, &card).await {
             warn!(session_id = %chat_session, %error, "Could not settle a helper's card");
+        }
+    }
+}
+
+/// The card run `job` is drawn on: the one its run record names, else the
+/// first card the chat kept after the run began (the card its starting turn
+/// kept), which is then recorded on the run. `None` while that turn has not
+/// kept one, or once the chat's card history no longer tells which it was.
+pub async fn run_card(
+    hub: &dyn OutboundRouter,
+    runs: &crate::run_state::RunStates,
+    job: &str,
+    chat: &str,
+) -> Option<String> {
+    match runs.get(job)?.card {
+        crate::run_state::RunCard::Kept(card) => Some(card),
+        crate::run_state::RunCard::Pending { before } => {
+            let card = hub.checklist_surface_after(chat, before.as_deref()).await?;
+            runs.keep_card(job, &card);
+            Some(card)
         }
     }
 }

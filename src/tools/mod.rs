@@ -101,7 +101,6 @@ mod semantic_command_risk;
 // Deterministic tools
 pub(crate) use aidaemon_tools::fs_utils;
 mod read_file;
-pub(crate) use read_file::render_read_file_output_within;
 pub use read_file::ReadFileTool;
 mod write_file;
 pub use write_file::WriteFileTool;

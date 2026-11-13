@@ -3,6 +3,8 @@
 //! `execute_tool_outcome`, receipts and the persisted tool exchange.
 
 use super::*;
+#[allow(unused_imports)]
+use crate::agent::{ToolResultFit, WorkScope};
 
 pub(in crate::agent) use aidaemon_runtime::engine::tool_calls::*;
 
@@ -1686,7 +1688,7 @@ impl Agent {
         request: &KernelCall,
         arguments: &str,
     ) -> Result<Option<crate::traits::MandateAuthorityGrant>, String> {
-        let goal_id = match self.mandate_goal_id_for_tool_exec(ctx).await {
+        let goal_id = match self.mandate_goal_id_for_tool_exec(ctx.task_id).await {
             Ok(Some(goal_id)) => goal_id,
             Ok(None) => return Ok(None),
             Err(error) => return Err(format!("[MANDATE AUTHORITY BLOCKED] {error}")),

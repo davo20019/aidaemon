@@ -61,9 +61,45 @@ pub struct ChannelHub {
     /// background job settling checklist steps edits it, so the card moves
     /// from "running in the background" to what happened.
     checklist_surfaces: RwLock<HashMap<String, String>>,
+    /// Per-session cards kept, oldest first (the last [`CARD_HISTORY`]), so a
+    /// background run edits the card its own turn kept, not a later one.
+    checklist_history: RwLock<HashMap<String, CardHistory>>,
     /// Sees every approval card and may answer it from elsewhere; set late,
     /// once the Client Gateway starts.
     approval_tap: std::sync::RwLock<Option<Arc<dyn ApprovalTap>>>,
+}
+
+/// How many kept cards per session the hub remembers.
+const CARD_HISTORY: usize = 32;
+
+/// One session's kept cards, oldest first.
+#[derive(Default)]
+struct CardHistory {
+    cards: std::collections::VecDeque<String>,
+    /// Older cards were dropped, so "the first card" is no longer known.
+    trimmed: bool,
+}
+
+impl CardHistory {
+    fn push(&mut self, message_id: &str) {
+        if self.cards.back().map(String::as_str) == Some(message_id) {
+            return;
+        }
+        self.cards.push_back(message_id.to_string());
+        if self.cards.len() > CARD_HISTORY {
+            self.cards.pop_front();
+            self.trimmed = true;
+        }
+    }
+
+    fn after(&self, after: Option<&str>) -> Option<String> {
+        let next = match after {
+            None if self.trimmed => return None,
+            None => 0,
+            Some(after) => self.cards.iter().position(|card| card == after)? + 1,
+        };
+        self.cards.get(next).cloned()
+    }
 }
 
 impl ChannelHub {
@@ -79,6 +115,7 @@ impl ChannelHub {
             recent_media_deliveries: RwLock::new(HashMap::new()),
             background_status_surfaces: RwLock::new(HashMap::new()),
             checklist_surfaces: RwLock::new(HashMap::new()),
+            checklist_history: RwLock::new(HashMap::new()),
             approval_tap: std::sync::RwLock::new(None),
         }
     }
@@ -124,6 +161,27 @@ impl ChannelHub {
             .write()
             .await
             .insert(session_id.to_string(), message_id.to_string());
+        self.checklist_history
+            .write()
+            .await
+            .entry(session_id.to_string())
+            .or_default()
+            .push(message_id);
+    }
+
+    /// The first card this session's chat kept after card `after` (`None`:
+    /// after none). `None` when no card followed it, or the history no
+    /// longer reaches back to it.
+    pub async fn checklist_surface_after(
+        &self,
+        session_id: &str,
+        after: Option<&str>,
+    ) -> Option<String> {
+        self.checklist_history
+            .read()
+            .await
+            .get(session_id)?
+            .after(after)
     }
 
     /// The plan card a turn left in this session's chat, if any.
@@ -1011,6 +1069,14 @@ impl OutboundRouter for ChannelHub {
         ChannelHub::register_checklist_surface(self, session_id, message_id).await
     }
 
+    async fn checklist_surface_after(
+        &self,
+        session_id: &str,
+        after: Option<&str>,
+    ) -> Option<String> {
+        ChannelHub::checklist_surface_after(self, session_id, after).await
+    }
+
     async fn request_inline_approval(
         &self,
         session_id: &str,
@@ -1622,5 +1688,27 @@ mod tests {
         // Now send_text should succeed
         let result = hub.send_text("sess_1", "Hello Discord!").await;
         assert!(result.is_ok());
+    }
+
+    /// A card is found by the card kept before it: the first one after,
+    /// not the newest; nothing once the history no longer reaches back.
+    #[test]
+    fn card_history_finds_the_first_card_after_another() {
+        let mut history = super::CardHistory::default();
+        assert_eq!(history.after(None), None);
+        history.push("a");
+        history.push("b");
+        history.push("b");
+        history.push("c");
+        assert_eq!(history.after(None).as_deref(), Some("a"));
+        assert_eq!(history.after(Some("a")).as_deref(), Some("b"));
+        assert_eq!(history.after(Some("b")).as_deref(), Some("c"));
+        assert_eq!(history.after(Some("c")), None);
+        assert_eq!(history.after(Some("unknown")), None);
+        for card in 0..super::CARD_HISTORY {
+            history.push(&format!("later-{card}"));
+        }
+        assert_eq!(history.after(None), None, "the first card was dropped");
+        assert_eq!(history.after(Some("a")), None);
     }
 }

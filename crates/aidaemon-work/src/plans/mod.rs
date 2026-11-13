@@ -14,6 +14,11 @@ mod tracking;
 
 pub use store::{migrate_task_plans, PlanStore};
 
+/// Start of the user-facing render in this tool's output. The agent loop
+/// locates it to lift the checklist onto the live status surface, so any
+/// model-only notice must precede it.
+pub const CHECKLIST_HEADER: &str = "Checklist updated";
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
