@@ -2113,7 +2113,12 @@ impl TurnEngine<'_> {
                     .task_run_aggregate(&child_session_for_events, &end.task_id)
                     .await
                     .ok();
-                crate::spawn::run_phase(child_outcome, Some(end), aggregate.as_ref())
+                crate::spawn::run_phase(
+                    child_outcome,
+                    Some(end),
+                    aggregate.as_ref(),
+                    delivered.as_deref(),
+                )
             }
             _ => (
                 crate::spawn::unexplained_end(

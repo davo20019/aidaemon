@@ -585,6 +585,15 @@ pub enum RunDeliveryOutcome {
 }
 
 impl RunDelivery {
+    /// It reached the owner: sent now, or already sent by another agent of
+    /// the request. Either way the deliverable is in the chat.
+    pub fn reached_owner(&self) -> bool {
+        matches!(
+            self.outcome,
+            RunDeliveryOutcome::Sent { .. } | RunDeliveryOutcome::AlreadySent { .. }
+        )
+    }
+
     /// One plain line for a result or an answer ("Sent to the owner:
     /// Screenshot of wp.ddev.site (at 11:39:51 AM)").
     pub fn line(&self) -> String {

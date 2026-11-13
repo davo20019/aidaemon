@@ -107,23 +107,41 @@ pub struct WorkRecord {
     /// Work it started still runs: that explains a stop.
     pub still_running: bool,
     /// Its steps that needed a change, in order, each with whether a
-    /// receipt confirmed it.
+    /// receipt confirmed it. A step whose only effect is delivering
+    /// something to the owner is not a change: it is listed here with
+    /// whether its delivery record says it went out.
     pub change_steps: Vec<(String, bool)>,
+    /// Some step of it declared a change other than a delivery. A run that
+    /// declared none was sent to look or to deliver, and never ends as
+    /// "nothing was changed".
+    pub declares_change: bool,
     /// A receipt shows it changed something.
     pub changed_something: bool,
+    /// Its run-end delivery record shows something it declared reached the
+    /// owner: a delivery is work done.
+    pub delivered: bool,
 }
 
 /// A run that did none of its work, from its typed records: it did not
-/// succeed, it had steps that need a change, none of them was done, nothing
-/// it did changed anything, and neither the owner's answer nor work still
-/// running explains the stop. Such a run failed: whatever its reply says,
-/// nothing it was sent to do happened. The one rule for every helper.
+/// succeed, it declared a change, none of its steps was done, nothing it did
+/// changed anything, nothing it declared was delivered, and neither the
+/// owner's answer nor work still running explains the stop. Such a run
+/// failed: whatever its reply says, nothing it was sent to do happened. The
+/// one rule for every helper. A run sent to look or to deliver declared no
+/// change and is never judged by it (live 2026-11-13: two "Capture …
+/// screenshot" helpers delivered their photos and ended "nothing was
+/// changed").
 pub fn nothing_done(record: &WorkRecord) -> Option<RunFailure> {
     if record.succeeded || record.owner_declined || record.still_running {
         return None;
     }
     let a_step_done = record.change_steps.iter().any(|(_, done)| *done);
-    if record.change_steps.is_empty() || a_step_done || record.changed_something {
+    if !record.declares_change
+        || record.change_steps.is_empty()
+        || a_step_done
+        || record.changed_something
+        || record.delivered
+    {
         return None;
     }
     Some(RunFailure::NothingDone {
@@ -178,7 +196,9 @@ pub fn program_phase(end: &ProgramEnd) -> (RunEnd, RunEvidence) {
         } else {
             Vec::new()
         },
+        declares_change: end.expects_change,
         changed_something: end.changed_something,
+        delivered: false,
     };
     match nothing_done(&record) {
         Some(failure) => (RunEnd::Failed(failure), RunEvidence::default()),
@@ -275,6 +295,7 @@ mod tests {
                 .iter()
                 .map(|(step, done)| (step.to_string(), *done))
                 .collect(),
+            declares_change: !steps.is_empty(),
             changed_something: changed,
             ..WorkRecord::default()
         }
@@ -303,6 +324,30 @@ mod tests {
             ..record(&[("Install WordPress", false)], false)
         };
         assert_eq!(nothing_done(&explained), None);
+    }
+
+    /// Live 2026-11-13: a helper sent to capture and deliver a homepage
+    /// screenshot delivered it and ended "Failed: nothing was changed". A
+    /// delivery is work done, and a run that declared no change is never
+    /// judged as having changed nothing.
+    #[test]
+    fn a_run_sent_to_look_or_deliver_did_its_work() {
+        let delivered = WorkRecord {
+            delivered: true,
+            ..record(
+                &[("Start the WordPress project only if it is stopped", false)],
+                false,
+            )
+        };
+        assert_eq!(nothing_done(&delivered), None);
+        let looked = WorkRecord {
+            declares_change: false,
+            ..record(
+                &[("Deliver your WordPress homepage screenshot", false)],
+                false,
+            )
+        };
+        assert_eq!(nothing_done(&looked), None);
     }
 
     /// Live 2026-11-13: codex exited 0 after its own sandbox refused `ddev`,

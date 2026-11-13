@@ -83,10 +83,17 @@ pub struct SpawnChildResult {
 /// typed steps that declared a side effect and that no receipt matched are
 /// its evidence, listed only when it declared more than one step (a
 /// one-step run's step is the run itself).
+///
+/// `delivered` is its run-end delivery record
+/// ([`crate::coordination::RunEndRoute::end`]): what it declared for the
+/// owner and what became of it. A step whose only effect is a delivery is
+/// done when its delivery went out, whatever its receipts say: the delivery
+/// record is that step's typed evidence.
 pub fn run_phase(
     outcome: TaskOutcome,
     end: Option<&TaskEndData>,
     aggregate: Option<&aidaemon_events::RunAggregate>,
+    delivered: Option<&[crate::coordination::RunDelivery]>,
 ) -> (crate::run_state::RunEnd, crate::run_state::RunEvidence) {
     use crate::run_state::{RunEnd, RunEvidence, RunFailure};
     use aidaemon_events::RunObligationState;
@@ -109,13 +116,27 @@ pub fn run_phase(
         };
         return (end, RunEvidence::default());
     }
-    let checklist: Vec<&aidaemon_events::RunObligation> = aggregate
+    let delivered_steps = delivered_steps(aggregate, delivered);
+    // Its steps, a delivered step as done: the delivery record is its proof.
+    let credited: Vec<aidaemon_events::RunObligation> = aggregate
         .obligations
         .iter()
         .filter(|(id, _)| id.contains("/obligation:checklist:"))
-        .map(|(_, obligation)| obligation)
+        .map(|(id, obligation)| {
+            let mut obligation = obligation.clone();
+            if delivered_steps.contains(id) {
+                obligation.state = RunObligationState::Satisfied;
+            }
+            obligation
+        })
         .collect();
-    if let Some(failure) = nothing_done(outcome, &checklist, aggregate) {
+    let checklist: Vec<&aidaemon_events::RunObligation> = credited.iter().collect();
+    let delivered_any = delivered.is_some_and(|delivered| {
+        delivered
+            .iter()
+            .any(crate::coordination::RunDelivery::reached_owner)
+    });
+    if let Some(failure) = nothing_done(outcome, &checklist, aggregate, delivered_any) {
         return (RunEnd::Failed(failure), RunEvidence::default());
     }
     let only_receipts_missing = outcome == TaskOutcome::Partial
@@ -137,17 +158,16 @@ pub fn run_phase(
         );
     }
     let unconfirmed = if checklist.len() > 1 {
-        let mut pending: Vec<(&String, String)> = aggregate
-            .obligations
+        let mut pending: Vec<(&String, String)> = checklist
             .iter()
-            .filter(|(id, obligation)| {
+            .filter(|obligation| {
                 // A step that changes nothing needs no receipt: the
                 // helper's report says what it found.
-                id.contains("/obligation:checklist:")
-                    && obligation.state == RunObligationState::Pending
+                obligation.state == RunObligationState::Pending
                     && !obligation.required_effect.is_empty()
             })
-            .map(|(id, obligation)| {
+            .map(|obligation| {
+                let id = &obligation.id;
                 // The step in its own words: never the internal demand text
                 // (live 2026-11-13: "checklist item 2 … needs a succeeded
                 // receipt carrying local_workspace_write|process_state").
@@ -239,8 +259,12 @@ fn nothing_done(
     outcome: TaskOutcome,
     checklist: &[&aidaemon_events::RunObligation],
     aggregate: &aidaemon_events::RunAggregate,
+    delivered: bool,
 ) -> Option<crate::run_state::RunFailure> {
     use aidaemon_events::RunObligationState;
+    let declares_change = checklist
+        .iter()
+        .any(|obligation| changes_more_than_delivery(obligation.required_effect));
     let mut steps: Vec<(&String, String, bool)> = checklist
         .iter()
         .filter(|obligation| !obligation.required_effect.is_empty())
@@ -264,11 +288,50 @@ fn nothing_done(
             .into_iter()
             .map(|(_, step, done)| (step, done))
             .collect(),
+        declares_change,
         changed_something: aggregate.operations.values().any(|operation| {
             operation.outcome == Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded)
                 && !operation.mutation_effects.is_empty()
         }),
+        delivered,
     })
+}
+
+/// A step's declared effect changes something besides delivering to the
+/// owner.
+fn changes_more_than_delivery(effect: aidaemon_tools::semantics::ToolMutationEffects) -> bool {
+    use aidaemon_tools::semantics::ToolMutationEffects;
+    !effect.is_empty() && effect.intersect(ToolMutationEffects::EXTERNAL_DELIVERY) != effect
+}
+
+/// The run's checklist steps its delivery record proves: each step whose
+/// only effect is a delivery, in order, one per deliverable that reached
+/// the owner (sent now, or already sent by another agent of the request).
+/// Typed evidence: the step's declared effect and the run's delivery
+/// record, never its words.
+fn delivered_steps(
+    aggregate: &aidaemon_events::RunAggregate,
+    delivered: Option<&[crate::coordination::RunDelivery]>,
+) -> std::collections::BTreeSet<String> {
+    use aidaemon_events::RunObligationState;
+    let reached = delivered
+        .unwrap_or_default()
+        .iter()
+        .filter(|delivery| delivery.reached_owner())
+        .count();
+    let mut steps: Vec<&String> = aggregate
+        .obligations
+        .iter()
+        .filter(|(id, obligation)| {
+            id.contains("/obligation:checklist:")
+                && obligation.state != RunObligationState::Satisfied
+                && !obligation.required_effect.is_empty()
+                && !changes_more_than_delivery(obligation.required_effect)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    steps.sort();
+    steps.into_iter().take(reached).cloned().collect()
 }
 
 #[derive(Debug)]
@@ -1431,7 +1494,7 @@ mod tests {
             &[("failed_permanent", 0), ("succeeded", 0), ("succeeded", 0)],
         );
         assert_eq!(
-            nothing_done(TaskOutcome::Partial, &checklist(&run), &run),
+            nothing_done(TaskOutcome::Partial, &checklist(&run), &run, false),
             Some(RunFailure::NothingDone {
                 undone: vec!["step 1".to_string(), "step 3".to_string()],
             })
@@ -1444,22 +1507,32 @@ mod tests {
     fn a_run_that_did_some_of_its_work_did_not_fail_for_nothing_done() {
         let changed = aggregate(&[("deferred", 2)], &[("succeeded", 2)]);
         assert_eq!(
-            nothing_done(TaskOutcome::Partial, &checklist(&changed), &changed),
+            nothing_done(TaskOutcome::Partial, &checklist(&changed), &changed, false),
             None
         );
         let step_done = aggregate(&[("satisfied", 2), ("deferred", 64)], &[]);
         assert_eq!(
-            nothing_done(TaskOutcome::Partial, &checklist(&step_done), &step_done),
+            nothing_done(
+                TaskOutcome::Partial,
+                &checklist(&step_done),
+                &step_done,
+                false
+            ),
             None
         );
         let looked_only = aggregate(&[("deferred", 0)], &[("succeeded", 0)]);
         assert_eq!(
-            nothing_done(TaskOutcome::Partial, &checklist(&looked_only), &looked_only),
+            nothing_done(
+                TaskOutcome::Partial,
+                &checklist(&looked_only),
+                &looked_only,
+                false
+            ),
             None
         );
         let undone = aggregate(&[("deferred", 2)], &[]);
         assert_eq!(
-            nothing_done(TaskOutcome::Succeeded, &checklist(&undone), &undone),
+            nothing_done(TaskOutcome::Succeeded, &checklist(&undone), &undone, false),
             None
         );
     }
@@ -1480,7 +1553,7 @@ mod tests {
             "tool_calls_count": 1,
         }))
         .unwrap();
-        let (phase, evidence) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run));
+        let (phase, evidence) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run), None);
         assert_eq!(phase, crate::run_state::RunEnd::Succeeded);
         let line = evidence.line().expect("an evidence line");
         assert_eq!(
@@ -1495,6 +1568,71 @@ mod tests {
         ] {
             assert!(!line.contains(internal), "{line}");
         }
+    }
+
+    /// Live 2026-11-13: two helpers sent to capture and deliver a homepage
+    /// screenshot delivered their photos and ended "Failed: It ended
+    /// without doing any of its work: nothing was changed". The delivery
+    /// record is the deliver step's evidence, and a delivery is work done.
+    #[test]
+    fn a_run_that_delivered_what_it_declared_did_its_work() {
+        let end: aidaemon_events::TaskEndData = serde_json::from_value(serde_json::json!({
+            "task_id": "t",
+            "status": "completed",
+            "duration_secs": 1,
+            "iterations": 1,
+            "tool_calls_count": 1,
+        }))
+        .unwrap();
+        // A conditional start it found it did not need, and the delivery.
+        let run = aggregate(&[("deferred", 128), ("pending", 64)], &[("succeeded", 0)]);
+        let sent = [crate::coordination::RunDelivery {
+            kind: aidaemon_tools::semantics::DeliverableKind::Screenshot {
+                page: "wp.ddev.site".to_string(),
+            },
+            caption: "Screenshot of wp.ddev.site".to_string(),
+            outcome: crate::coordination::RunDeliveryOutcome::Sent {
+                at: chrono::Utc::now(),
+            },
+        }];
+        let (phase, _) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run), Some(&sent));
+        assert!(
+            !matches!(
+                phase,
+                crate::run_state::RunEnd::Failed(RunFailure::NothingDone { .. })
+            ),
+            "{phase:?}"
+        );
+        // Without the delivery the same run did none of its work.
+        let (phase, _) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run), None);
+        assert!(matches!(
+            phase,
+            crate::run_state::RunEnd::Failed(RunFailure::NothingDone { .. })
+        ));
+        // A run that declared only a delivery was sent to deliver, never
+        // to change: it is not judged by what it changed.
+        let delivery_only = aggregate(&[("pending", 64)], &[("succeeded", 0)]);
+        assert_eq!(
+            nothing_done(
+                TaskOutcome::Partial,
+                &checklist(&delivery_only),
+                &delivery_only,
+                false
+            ),
+            None
+        );
+        // Its own verdict done and its delivery sent: it succeeded, and the
+        // delivered step is not listed as one only its report vouches for.
+        let mut claimed = aggregate(&[("pending", 128), ("pending", 64)], &[("succeeded", 0)]);
+        claimed.executor_claimed_outcome = Some(aidaemon_events::ExecutorClaimedOutcome::Done);
+        let (phase, evidence) = run_phase(
+            TaskOutcome::Partial,
+            Some(&end),
+            Some(&claimed),
+            Some(&sent),
+        );
+        assert_eq!(phase, crate::run_state::RunEnd::Succeeded);
+        assert_eq!(evidence.unconfirmed, vec!["step 0".to_string()]);
     }
 
     /// Live 2026-11-13: DDEV stopped on low Docker disk space and the
@@ -1514,7 +1652,7 @@ mod tests {
         let mut run = aggregate(&[("satisfied", 0), ("pending", 2)], &[("succeeded", 0)]);
         run.executor_claimed_outcome = Some(aidaemon_events::ExecutorClaimedOutcome::Blocked);
         run.executor_short_of = Some(aidaemon_events::ShortResource::DockerDiskSpace);
-        let (end, _) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run));
+        let (end, _) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run), None);
         assert_eq!(
             end,
             crate::run_state::RunEnd::Stopped(Some(crate::run_state::RunFailure::ShortOf(
@@ -1563,12 +1701,18 @@ mod tests {
             run.executor_claimed_outcome = Some(aidaemon_events::ExecutorClaimedOutcome::Done);
             run
         };
-        let (phase, _) = run_phase(TaskOutcome::Partial, Some(&end), Some(&shape("succeeded")));
+        let (phase, _) = run_phase(
+            TaskOutcome::Partial,
+            Some(&end),
+            Some(&shape("succeeded")),
+            None,
+        );
         assert_eq!(phase, crate::run_state::RunEnd::Succeeded);
         let (phase, _) = run_phase(
             TaskOutcome::Partial,
             Some(&end),
             Some(&shape("backgrounded")),
+            None,
         );
         assert_eq!(phase.phase(), crate::run_state::RunPhase::Stopped);
     }
