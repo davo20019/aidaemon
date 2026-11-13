@@ -974,6 +974,11 @@ pub struct ExecutorExpectationItem {
     /// work cannot make it stale.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<usize>,
+    /// The owner's units of work (indices into the turn contract's
+    /// `owner_units`) this item carries out: the typed link from the
+    /// executor's plan to the owner's request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_units: Vec<usize>,
     /// The model's declared status (`pending`, `in_progress`, `completed`,
     /// `deferred`, ...). Receipts decide satisfaction; only an explicit
     /// `deferred`/`skipped` abandons an item.

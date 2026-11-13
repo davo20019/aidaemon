@@ -137,6 +137,11 @@ pub struct CompletionContract {
     pub adopted_evidence_bindings: Vec<aidaemon_events::traits::AdoptedEvidenceBinding>,
     pub connected_content_mode: ConnectedContentMode,
     pub verification_targets: Vec<VerificationTarget>,
+    /// The owner's units of work, compiled from the owner's own message by
+    /// the request compiler ([`crate::turn::task_planning::compile_owner_units`]),
+    /// apart from the model that carries them out. The closeout judges the
+    /// run against them, never only against the executor's own checklist.
+    pub owner_units: Vec<aidaemon_events::traits::RequestWorkUnit>,
 }
 
 impl CompletionContract {
@@ -213,6 +218,7 @@ pub fn persistable_completion_contract(contract: &CompletionContract) -> Request
                 value: target.value.clone(),
             })
             .collect(),
+        owner_units: contract.owner_units.clone(),
     }
 }
 
@@ -297,6 +303,7 @@ pub fn completion_contract_from_persisted(
                 value: target.value.clone(),
             })
             .collect(),
+        owner_units: contract.owner_units.clone(),
     }
 }
 
@@ -2226,6 +2233,7 @@ pub fn infer_completion_contract_with_content_mode(
         adopted_evidence_bindings: Vec::new(),
         connected_content_mode,
         verification_targets,
+        owner_units: Vec::new(),
     }
 }
 

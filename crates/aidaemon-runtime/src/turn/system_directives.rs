@@ -269,11 +269,12 @@ impl SystemDirective {
                 "[SYSTEM] Internal check, not shown to the user: the owner asked for work that nothing has taken on yet: {}. \
                  Each thing the owner asked for is done in its own right: work started on another part, or a job left running for it, does not do this one. \
                  An instruction to do something is carried out now, anew, unless the owner said otherwise. \
-                 Do it yourself, or launch a job for it that names it in its checklist_items, before this turn ends. \
+                 Do it yourself, or launch a job for it that names it in its checklist_items, before this turn ends; \
+                 something the owner asked for that your checklist does not carry gets an item of its own, with its owner_units, that does that work. \
                  What memory, history or existing files show was done before is context for the work, never its result, \
                  so reporting the state of earlier work does not answer the instruction. \
                  Do the work now with the available tools; when earlier results exist, work alongside them under fresh names and say so up front. \
-                 Only if the work truly cannot start without the owner's choice (redoing it would replace or duplicate results they may want kept), \
+                 Only if the work truly cannot start without the owner's choice (redoing it would replace or duplicate results they may want kept, or what exists might be what they meant), \
                  pass track_requirements once more with outcome needs_owner and make your next reply that one question. \
                  Your next reply without tool calls is sent to the user; do not mention this check, the checklist, receipts or the ledger.",
                 if items.is_empty() {

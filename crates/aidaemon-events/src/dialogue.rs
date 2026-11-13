@@ -421,6 +421,22 @@ pub struct RequestCompletionContract {
     pub adopted_evidence_bindings: Vec<AdoptedEvidenceBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verification_targets: Vec<RequestVerificationTarget>,
+    /// The owner's units of work, compiled from the owner's own message
+    /// apart from the model that carries them out (its checklist is its
+    /// plan, never the request). Empty: none were compiled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_units: Vec<RequestWorkUnit>,
+}
+
+/// One result the owner asked for, in the owner's terms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestWorkUnit {
+    /// The result, briefly, as the owner put it.
+    pub what: String,
+    /// It asks for new work or a change (something made, installed, changed
+    /// or removed), not only for a look at what is there. A look covers
+    /// such a unit only as context: it is done by the change itself.
+    pub asks_change: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

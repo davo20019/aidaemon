@@ -365,6 +365,12 @@ impl Tool for TrackRequirementsTool {
                                     "items": { "type": "integer", "minimum": 0 },
                                     "uniqueItems": true
                                 },
+                                "owner_units": {
+                                    "type": "array",
+                                    "description": "The owner's units of work (numbered in \"What the owner asked for\") this item carries out. Each unit the owner asked for as new work needs an item that does that work; a look at what already exists does not do it.",
+                                    "items": { "type": "integer", "minimum": 0 },
+                                    "uniqueItems": true
+                                },
                                 "mutation_effects": {
                                     "type": "array",
                                     "description": "Typed outcomes required for receipt-based completion.",

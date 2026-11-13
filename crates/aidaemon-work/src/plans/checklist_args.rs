@@ -60,16 +60,8 @@ pub fn executor_expectations_from_checklist_arguments(
             targets,
             observation_targets,
             unbound_targets: unbound_targets_of(item),
-            depends_on: item
-                .get("depends_on")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(|value| value.as_u64().and_then(|n| usize::try_from(n).ok()))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            depends_on: indices(item.get("depends_on")),
+            owner_units: indices(item.get("owner_units")),
             status: item
                 .get("status")
                 .and_then(Value::as_str)
@@ -90,6 +82,19 @@ pub fn executor_expectations_from_checklist_arguments(
             .and_then(Value::as_str)
             .and_then(aidaemon_events::ShortResource::from_protocol_name),
     })
+}
+
+/// A list of indices (`depends_on`, `owner_units`); anything else is none.
+fn indices(value: Option<&Value>) -> Vec<usize> {
+    value
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_u64().and_then(|n| usize::try_from(n).ok()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Decode checklist evidence targets once for both persistence and the durable

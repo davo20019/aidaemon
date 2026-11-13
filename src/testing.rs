@@ -50,6 +50,9 @@ pub struct MockChatCall {
 pub struct MockProvider {
     responses: Mutex<Vec<ProviderResponse>>,
     relationship_assessment_responses: Mutex<Vec<ProviderResponse>>,
+    /// The request compiler's replies (the owner's units of work), kept
+    /// apart from the main-loop queue. With none, it compiles nothing.
+    owner_unit_responses: Mutex<Vec<ProviderResponse>>,
     response_delays: Mutex<Vec<Duration>>,
     pub call_log: Mutex<Vec<MockChatCall>>,
     reject_non_default_options: bool,
@@ -75,6 +78,7 @@ impl MockProvider {
         Self {
             responses: Mutex::new(Vec::new()),
             relationship_assessment_responses: Mutex::new(Vec::new()),
+            owner_unit_responses: Mutex::new(Vec::new()),
             response_delays: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
@@ -92,6 +96,7 @@ impl MockProvider {
         Self {
             responses: Mutex::new(responses),
             relationship_assessment_responses: Mutex::new(Vec::new()),
+            owner_unit_responses: Mutex::new(Vec::new()),
             response_delays: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
@@ -112,6 +117,7 @@ impl MockProvider {
         Self {
             responses: Mutex::new(responses),
             relationship_assessment_responses: Mutex::new(Vec::new()),
+            owner_unit_responses: Mutex::new(Vec::new()),
             response_delays: Mutex::new(response_delays),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
@@ -194,6 +200,27 @@ impl MockProvider {
     pub fn with_relationship_assessments(mut self, responses: Vec<ProviderResponse>) -> Self {
         self.relationship_assessment_responses = Mutex::new(responses);
         self
+    }
+
+    /// Supply the request compiler's replies: the owner's units of work for
+    /// the next owner messages, in order.
+    pub fn with_owner_units(mut self, responses: Vec<ProviderResponse>) -> Self {
+        self.owner_unit_responses = Mutex::new(responses);
+        self
+    }
+
+    /// The request compiler's reply naming `units` (what, asks for change).
+    pub fn owner_units(units: &[(&str, bool)]) -> ProviderResponse {
+        Self::text_response(
+            &json!({
+                "schema_version": 1,
+                "units": units
+                    .iter()
+                    .map(|(what, asks_change)| json!({"what": what, "asks_change": asks_change}))
+                    .collect::<Vec<_>>(),
+            })
+            .to_string(),
+        )
     }
 
     /// One typed dialogue edge from the relationship router, naming no exact
@@ -340,6 +367,25 @@ impl MockProvider {
         tools: &[Value],
         options: &ChatOptions,
     ) -> anyhow::Result<ProviderResponse> {
+        // The request compiler runs beside every owner turn: answered from
+        // its own queue, never recorded in call_log.
+        if messages.iter().any(|m| {
+            m.get("content").and_then(|c| c.as_str()).is_some_and(|s| {
+                s.contains(aidaemon_runtime::turn::task_planning::REQUEST_UNITS_SYSTEM)
+            })
+        }) {
+            let mut units = self.owner_unit_responses.lock().await;
+            if !units.is_empty() {
+                return Ok(units.remove(0));
+            }
+            return Ok(ProviderResponse {
+                content: None,
+                tool_calls: vec![],
+                usage: None,
+                thinking: None,
+                response_note: None,
+            });
+        }
         // Silently intercept relationship-router and evaluator calls without
         // recording them in call_log.
         if self.skip_planning_calls {

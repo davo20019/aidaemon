@@ -378,6 +378,14 @@ pub struct RunAggregate {
     /// id; this alias is the typed bridge that lets it prove ours.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub adopted_obligation_aliases: BTreeMap<String, String>,
+    /// The owner's units of work, from the compiled contract: the request
+    /// as the owner made it, apart from the executing model's checklist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_units: Vec<crate::traits::RequestWorkUnit>,
+    /// Checklist item index -> the owner's units it carries out, as the
+    /// executing model linked them (`owner_units` on an item).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub checklist_owner_units: BTreeMap<usize, Vec<usize>>,
     /// How this run's path targets and hints compare. The backend's fixed
     /// facts, not part of the projection, so never serialized.
     #[serde(skip, default = "LexicalPaths::daemon_host")]
@@ -432,6 +440,8 @@ impl RunAggregate {
             prepared_response_id: None,
             delivery_states: BTreeMap::new(),
             adopted_obligation_aliases: BTreeMap::new(),
+            owner_units: Vec::new(),
+            checklist_owner_units: BTreeMap::new(),
             paths,
         }
     }
@@ -554,6 +564,7 @@ impl RunAggregate {
         self.obligations
             .retain(|id, _| id.contains("/obligation:checklist:"));
         self.response_contract = compiled.contract.response_contract.clone();
+        self.owner_units = compiled.contract.owner_units.clone();
         self.allowed_tool_names = compiled
             .contract
             .allowed_tool_names
@@ -734,6 +745,12 @@ impl RunAggregate {
             .flat_map(|item| item.depends_on.iter().copied())
             .collect();
         let mut declared_ids = BTreeSet::new();
+        self.checklist_owner_units = declared
+            .items
+            .iter()
+            .filter(|item| !item.owner_units.is_empty())
+            .map(|item| (item.index, item.owner_units.clone()))
+            .collect();
         for item in &declared.items {
             let id = format!("task:{}/obligation:checklist:{}", self.task_id, item.index);
             // `failed`: tried and not achieved. Not demanded again, never done.
@@ -1193,10 +1210,116 @@ impl RunAggregate {
     /// ([`super::ExecutorClaimedOutcome::NeedsOwner`]). Live 2026-11-13: two
     /// installs declared, one helper launched for the first, and the turn
     /// handed off with the second never started and no reason given.
+    ///
+    /// The owner's own units of work come after the declared items
+    /// ([`Self::uncovered_owner_units`], as `…/owner:<n>` ids): a unit
+    /// asking for change that nothing attempted is work nothing took on,
+    /// whatever the executing model's checklist says.
     pub fn unattempted_declared_work(&self) -> Vec<String> {
         if self.executor_short_of.is_some() {
             return Vec::new();
         }
+        let mut open = self.unattempted_checklist_work();
+        open.extend(
+            self.uncovered_owner_units()
+                .into_iter()
+                .map(|unit| self.owner_unit_id(unit)),
+        );
+        open
+    }
+
+    /// The id an uncovered owner unit is listed under.
+    pub fn owner_unit_id(&self, unit: usize) -> String {
+        format!("task:{}/owner:{unit}", self.task_id)
+    }
+
+    /// The owner unit an id from [`Self::unattempted_declared_work`] names.
+    pub fn owner_unit_of(&self, id: &str) -> Option<&crate::traits::RequestWorkUnit> {
+        let index: usize = id.rsplit_once("/owner:")?.1.parse().ok()?;
+        self.owner_units.get(index)
+    }
+
+    /// The owner's units asking for change (new work, not a look) that
+    /// nothing in this run attempted. Judged from typed facts only:
+    ///
+    /// - a unit the executing model linked to checklist items is covered
+    ///   by one of them that changes something and was attempted; linked
+    ///   only to observations, it was not (a look at what exists is
+    ///   context for new work, never the work: core rule 8);
+    /// - with no item linked to any unit, each attempted change (a call
+    ///   that changed something, was refused or declined, or a launch that
+    ///   took on a change or named nothing) covers one unit at most, in
+    ///   order;
+    /// - with links, a unit no item links to was not attempted.
+    ///
+    /// Live 2026-11-13: "one installing Drupal and the other one
+    /// WordPress": the run declared only checks and screenshots of existing
+    /// sites, met its own checklist, and never asked.
+    pub fn uncovered_owner_units(&self) -> Vec<usize> {
+        if self.executor_short_of.is_some() {
+            return Vec::new();
+        }
+        let change_units: Vec<usize> = self
+            .owner_units
+            .iter()
+            .enumerate()
+            .filter(|(_, unit)| unit.asks_change)
+            .map(|(index, _)| index)
+            .collect();
+        if change_units.is_empty() {
+            return Vec::new();
+        }
+        let item_changes = |index: usize| {
+            self.obligations
+                .get(&format!(
+                    "task:{}/obligation:checklist:{index}",
+                    self.task_id
+                ))
+                .is_some_and(|obligation| obligation.class == RunObligationClass::Achieve)
+        };
+        if self.checklist_owner_units.is_empty() {
+            let attempts = self
+                .operations
+                .values()
+                .filter(|operation| {
+                    operation.mutating
+                        || operation.policy_denied
+                        || operation.owner_declined
+                        || (operation.is_background_in_flight()
+                            && (operation.checklist_items.is_empty()
+                                || operation
+                                    .checklist_items
+                                    .iter()
+                                    .any(|item| item_changes(*item))))
+                })
+                .count();
+            return change_units.into_iter().skip(attempts).collect();
+        }
+        let unattempted = self.unattempted_checklist_items_of(&self.unattempted_checklist_work());
+        change_units
+            .into_iter()
+            .filter(|unit| {
+                !self
+                    .checklist_owner_units
+                    .iter()
+                    .filter(|(_, units)| units.contains(unit))
+                    .any(|(item, _)| item_changes(*item) && !unattempted.contains(item))
+            })
+            .collect()
+    }
+
+    fn unattempted_checklist_items_of(&self, ids: &[String]) -> BTreeSet<usize> {
+        ids.iter()
+            .filter_map(|id| {
+                id.rsplit_once("/obligation:checklist:")
+                    .and_then(|(_, index)| index.parse().ok())
+            })
+            .collect()
+    }
+
+    /// The declared checklist items nothing took on
+    /// ([`Self::unattempted_declared_work`] without the owner's units).
+    fn unattempted_checklist_work(&self) -> Vec<String> {
         let attempted = |operation: &&RunOperation| {
             operation.mutating
                 || operation.policy_denied
@@ -1283,13 +1406,7 @@ impl RunAggregate {
 
     /// The checklist indices of [`Self::unattempted_declared_work`].
     pub fn unattempted_checklist_items(&self) -> BTreeSet<usize> {
-        self.unattempted_declared_work()
-            .iter()
-            .filter_map(|id| {
-                id.rsplit_once("/obligation:checklist:")
-                    .and_then(|(_, index)| index.parse().ok())
-            })
-            .collect()
+        self.unattempted_checklist_items_of(&self.unattempted_declared_work())
     }
 
     /// Whether any declared work was never attempted
@@ -1314,8 +1431,22 @@ impl RunAggregate {
     pub fn expectation_summaries(&self, obligation_ids: &[String]) -> Vec<String> {
         obligation_ids
             .iter()
-            .filter_map(|id| self.obligations.get(id))
+            .filter_map(|id| {
+                if let Some(unit) = self.owner_unit_of(id) {
+                    // The owner's own words. A look at what already exists
+                    // does not do it: the change itself does.
+                    return Some(Err(format!(
+                        "\"{}\" (the owner asked for this as new work; nothing in this run has done it, and a look at what already exists does not)",
+                        unit.what.trim()
+                    )));
+                }
+                self.obligations.get(id).map(Ok)
+            })
             .map(|obligation| {
+                let obligation = match obligation {
+                    Ok(obligation) => obligation,
+                    Err(line) => return line,
+                };
                 if let Some(summary) = obligation.summary.as_ref() {
                     summary.clone()
                 } else if let Some(requirement) = obligation.evidence_requirement.as_ref() {
@@ -2926,6 +3057,7 @@ mod tests {
                     evidence_requirements: requirements,
                     adopted_evidence_bindings: Vec::new(),
                     verification_targets: Vec::new(),
+                    owner_units: Vec::new(),
                 },
                 required_invocations: Vec::new(),
             },
@@ -3988,6 +4120,7 @@ mod tests {
                     evidence_requirements: vec![denial_requirement],
                     adopted_evidence_bindings: Vec::new(),
                     verification_targets: Vec::new(),
+                    owner_units: Vec::new(),
                 },
                 required_invocations: Vec::new(),
             },
@@ -4782,6 +4915,7 @@ mod tests {
             observation_targets: Vec::new(),
             unbound_targets: Vec::new(),
             depends_on: Vec::new(),
+            owner_units: Vec::new(),
             status: status.to_string(),
         }
     }
@@ -6939,6 +7073,179 @@ mod tests {
         ));
         renumber(&mut events);
         assert!(!RunAggregate::replay("task-1", &events).declared_work_unattempted());
+    }
+
+    /// The compiled contract carrying the owner's units (what, asks for
+    /// change).
+    fn owner_contract(units: &[(&str, bool)]) -> Event {
+        let mut compiled = contract(Vec::new());
+        compiled.data["contract"]["owner_units"] = serde_json::json!(
+            units
+                .iter()
+                .map(|(what, asks_change)| serde_json::json!({
+                    "what": what,
+                    "asks_change": asks_change,
+                }))
+                .collect::<Vec<_>>()
+        );
+        compiled
+    }
+
+    fn linked(mut item: ExecutorExpectationItem, units: &[usize]) -> ExecutorExpectationItem {
+        item.owner_units = units.to_vec();
+        item
+    }
+
+    fn launch_naming(id: &str, items: serde_json::Value) -> Vec<Event> {
+        let mut launch = result(
+            id,
+            "spawn_agent",
+            ToolOutcomeStatus::Backgrounded,
+            0,
+            ToolCallSemantics::default(),
+        );
+        launch.data["receipt"]["checklist_items"] = items;
+        vec![call(id, "spawn_agent"), launch]
+    }
+
+    /// Live 2026-11-13, after /clear: "Have two parallel agents. One
+    /// installing Drupal and the other one WordPress … They should send a
+    /// screenshot of the homepage." The run declared only screenshots of
+    /// existing sites, launched one helper for each, met its own checklist
+    /// and never asked. The owner's installs were never attempted.
+    #[test]
+    fn a_change_the_owner_asked_for_covered_only_by_a_look_is_unattempted() {
+        let units = [
+            ("Install Drupal with DDEV in ~/projects", true),
+            ("Install WordPress with DDEV in ~/projects", true),
+            ("Screenshot of the Drupal homepage", false),
+            ("Screenshot of the WordPress homepage", false),
+            ("How long each took", false),
+        ];
+        let screenshot = |index, unit| {
+            linked(
+                checklist_item(index, ToolMutationEffects::NONE, true, &[], "background"),
+                &[unit],
+            )
+        };
+        let mut events = vec![
+            owner_contract(&units),
+            declared_with_outcome(vec![screenshot(0, 2), screenshot(1, 3)], None),
+        ];
+        events.extend(launch_naming("spawn-drupal", serde_json::json!([0])));
+        events.extend(launch_naming("spawn-wordpress", serde_json::json!([1])));
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(aggregate.uncovered_owner_units(), vec![0, 1]);
+        assert!(aggregate.declared_work_unattempted());
+        let summaries = aggregate.expectation_summaries(&aggregate.unattempted_declared_work());
+        assert!(
+            summaries[0].contains("Install Drupal with DDEV in ~/projects"),
+            "{summaries:?}"
+        );
+
+        // Held, the run takes the installs on: an item per install, linked
+        // to the owner's unit, handed to a helper.
+        let install = |index, unit| {
+            linked(
+                checklist_item(
+                    index,
+                    ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    false,
+                    &[],
+                    "background",
+                ),
+                &[unit],
+            )
+        };
+        events.push(declared_with_outcome(
+            vec![
+                screenshot(0, 2),
+                screenshot(1, 3),
+                install(2, 0),
+                install(3, 1),
+            ],
+            None,
+        ));
+        events.extend(launch_naming("spawn-installs", serde_json::json!([2, 3])));
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(aggregate.uncovered_owner_units(), Vec::<usize>::new());
+        assert!(!aggregate.declared_work_unattempted());
+
+        // Or it asks the owner the one question: the closeout honours a
+        // needs_owner verdict (`unattempted_work_verdict`), and the ledger
+        // still says the installs were not attempted.
+        let mut asked = events[..events.len() - 3].to_vec();
+        asked.push(declared_with_outcome(
+            vec![screenshot(0, 2), screenshot(1, 3)],
+            Some(crate::ExecutorClaimedOutcome::NeedsOwner),
+        ));
+        renumber(&mut asked);
+        let aggregate = RunAggregate::replay("task-1", &asked);
+        assert_eq!(aggregate.uncovered_owner_units(), vec![0, 1]);
+    }
+
+    /// "Screenshot my existing Drupal site" asks for no change: a look is
+    /// its whole work, and nothing is owed beyond it.
+    #[test]
+    fn a_request_to_look_is_satisfied_by_a_look() {
+        let mut events = vec![
+            owner_contract(&[("Screenshot of my existing Drupal site", false)]),
+            declared_with_outcome(
+                vec![linked(
+                    checklist_item(0, ToolMutationEffects::NONE, true, &[], "pending"),
+                    &[0],
+                )],
+                None,
+            ),
+            call("look", "terminal"),
+            result(
+                "look",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                terminal_observation_semantics(None),
+            ),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate.uncovered_owner_units().is_empty());
+        assert!(!aggregate.declared_work_unattempted());
+    }
+
+    /// A run that links nothing is judged by its attempts: each change it
+    /// attempted covers one of the owner's change units at most.
+    #[test]
+    fn unlinked_owner_units_are_covered_one_attempt_each() {
+        let mut events = vec![
+            owner_contract(&[("Install Drupal", true), ("Install WordPress", true)]),
+            call("install", "terminal"),
+            result(
+                "install",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                workspace_write_semantics("/tmp/drupal"),
+            ),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(aggregate.uncovered_owner_units(), vec![1]);
+        events.push(call("install-2", "terminal"));
+        events.push(result(
+            "install-2",
+            "terminal",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            workspace_write_semantics("/tmp/wordpress"),
+        ));
+        renumber(&mut events);
+        assert!(
+            RunAggregate::replay("task-1", &events)
+                .uncovered_owner_units()
+                .is_empty()
+        );
     }
 
     /// A request that only observes (a status question) declares no work,

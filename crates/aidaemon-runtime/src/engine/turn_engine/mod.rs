@@ -1454,7 +1454,10 @@ impl TurnEngine<'_> {
                     .unwrap_or_default();
                 if !not_attempted.is_empty() {
                     if let Some(plan_store) = self.plan_store().await {
-                        let indices = not_attempted.iter().map(|(index, _)| *index).collect();
+                        let indices = not_attempted
+                            .iter()
+                            .filter_map(|(index, _)| *index)
+                            .collect();
                         match plan_store
                             .mark_not_attempted(session_id, &task_id, &indices)
                             .await

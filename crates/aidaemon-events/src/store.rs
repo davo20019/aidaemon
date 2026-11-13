@@ -4637,6 +4637,7 @@ mod tests {
             }],
             adopted_evidence_bindings: Vec::new(),
             verification_targets: Vec::new(),
+            owner_units: Vec::new(),
         };
         store
             .append(Event::new(

@@ -580,6 +580,16 @@ impl TurnEngine<'_> {
                 task_context_tail.push_str(&note);
             }
         }
+        // The owner's units of work, numbered, so the run's checklist can
+        // answer for each of them.
+        if let Some(note) = crate::turn::task_planning::owner_units_note(
+            &turn_context.completion_contract.owner_units,
+        ) {
+            if !task_context_tail.is_empty() {
+                task_context_tail.push_str("\n\n");
+            }
+            task_context_tail.push_str(&note);
+        }
         let prior_assistant_message_id = preserve_archived_context
             .then(|| {
                 dialogue_state

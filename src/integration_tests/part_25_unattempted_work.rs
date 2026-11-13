@@ -329,3 +329,109 @@ async fn an_item_still_untaken_after_the_pass_ends_not_attempted() {
         crate::events::TaskOutcome::Partial
     );
 }
+
+// ==================== The request is the owner's words ====================
+//
+// Live 2026-11-13, after `/clear`: "Have two parallel agents. One installing
+// Drupal and the other one WordPress for a Claude company. Both use ddev. At
+// ~/projects/. Tell me how long it takes for them to finish. They should send
+// a screenshot of the homepage." The run declared only checks and screenshots
+// of existing sites, met that checklist, and never asked whether to install
+// new ones. The request contract is compiled from the owner's message apart
+// from the executor, and a change the owner asked for that only a look covers
+// was not attempted.
+
+fn owner_units_of_the_live_request() -> crate::traits::ProviderResponse {
+    MockProvider::owner_units(&[
+        ("Install Drupal with ddev in ~/projects", true),
+        ("Install WordPress with ddev in ~/projects", true),
+        ("Homepage screenshot of each site", false),
+        ("How long each took", false),
+    ])
+}
+
+fn screenshot_checks(outcome: Option<&str>) -> String {
+    let mut args = json!({"items": [
+        {"text": "Capture your Drupal homepage screenshot", "status": "completed", "requires_observation": true, "owner_units": [2]},
+        {"text": "Capture your WordPress homepage screenshot", "status": "completed", "requires_observation": true, "owner_units": [2]}
+    ]});
+    if let Some(outcome) = outcome {
+        args["outcome"] = json!(outcome);
+    }
+    args.to_string()
+}
+
+/// The run plans checks of the sites that exist, meets its own checklist
+/// and answers: it is held for the owner's installs, and asks the owner the
+/// one question through `needs_owner`.
+#[tokio::test]
+async fn a_change_request_answered_only_with_checks_is_held_for_the_owners_units() {
+    let session = "owner-units-held";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", &screenshot_checks(None)),
+        MockProvider::tool_call_response("synthetic_site_list", "{}"),
+        MockProvider::tool_call_response("track_requirements", &screenshot_checks(Some("done"))),
+        MockProvider::text_response("Both sites are up; here are their homepages."),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &screenshot_checks(Some("needs_owner")),
+        ),
+        MockProvider::text_response(
+            "Those sites exist. Install new ones, or check the existing ones?",
+        ),
+        MockProvider::text_response("UNREACHED"),
+    ])
+    .with_owner_units(vec![owner_units_of_the_live_request()]);
+    let harness = unattempted_work_harness(provider).await;
+    let reply = ask_owner_turn(
+        &harness,
+        session,
+        "Have two parallel agents. One installing Drupal and the other one WordPress. Both use ddev. At ~/projects/. Tell me how long it takes for them to finish. They should send a screenshot of the homepage.",
+    )
+    .await;
+
+    assert_eq!(
+        reply,
+        "Those sites exist. Install new ones, or check the existing ones?"
+    );
+    assert!(held_for_unattempted_work(&harness, session).await);
+    // The run read the owner's units, numbered, from its first call on.
+    let calls = harness.provider.call_log.lock().await;
+    let first = serde_json::to_string(&calls[0].messages).unwrap();
+    assert!(first.contains("[What the owner asked for]"), "{first}");
+    assert!(first.contains("Install WordPress with ddev in ~/projects"));
+    // The demand named the owner's install, in the owner's words.
+    let demand = serde_json::to_string(&calls[4].messages).unwrap();
+    assert!(
+        demand.contains("Install Drupal with ddev in ~/projects"),
+        "{demand}"
+    );
+}
+
+/// "Screenshot my existing Drupal site" asks for no change: the check is
+/// the work, and the run answers without being held.
+#[tokio::test]
+async fn a_request_to_check_is_satisfied_by_a_check() {
+    let session = "owner-units-check";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": [
+                {"text": "Capture your Drupal homepage screenshot", "status": "pending", "requires_observation": true, "owner_units": [0]}
+            ]})
+            .to_string(),
+        ),
+        MockProvider::tool_call_response("synthetic_site_list", "{}"),
+        MockProvider::text_response("Your Drupal site is up; here is its homepage."),
+        MockProvider::text_response("UNREACHED"),
+    ])
+    .with_owner_units(vec![MockProvider::owner_units(&[(
+        "Screenshot of my existing Drupal site",
+        false,
+    )])]);
+    let harness = unattempted_work_harness(provider).await;
+    let reply = ask_owner_turn(&harness, session, "Screenshot my existing Drupal site.").await;
+
+    assert_eq!(reply, "Your Drupal site is up; here is its homepage.");
+    assert!(!held_for_unattempted_work(&harness, session).await);
+}

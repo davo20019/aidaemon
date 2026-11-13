@@ -116,6 +116,7 @@ async fn finalize_turn_assessment(
     structural_resume: bool,
     initial_turn_context: &TurnContext,
     relationship_fallback: Option<&crate::turn::task_planning::PlannedTaskShape>,
+    owner_units: Option<Vec<aidaemon_events::traits::RequestWorkUnit>>,
 ) -> anyhow::Result<TurnContext> {
     // Only the relationship producer may select an antecedent.
     let relationship_shape = relationship_fallback
@@ -236,6 +237,11 @@ async fn finalize_turn_assessment(
         crate::turn::completion_contract::retain_structural_completion_contract(
             &mut turn_context.completion_contract,
         );
+    }
+    // The owner's units of work, compiled from the owner's own message: the
+    // request the run answers for, beside its own checklist.
+    if let Some(units) = owner_units.filter(|units| !units.is_empty()) {
+        turn_context.completion_contract.owner_units = units;
     }
     // Presentation follows the request lifecycle, not session recency. A new
     // external request clears it; a structural resume or a validated adoption
@@ -1139,52 +1145,69 @@ pub async fn run_bootstrap(
             _ => None,
         }
     };
-    let (relationship_fallback, digest_outcome) = match digest {
-        Some(digest) if digest_awaited => {
-            let outcome = agent
-                .side_calls()
-                .decide(
-                    crate::llm::decisions::Decision::TurnDigest,
-                    digest.request,
-                    crate::llm::decide::DecisionContext::turn(session_id, &task_id),
-                )
-                .await;
-            let decided =
-                crate::turn::task_planning::digest_relationship(&outcome, &digest.antecedents);
-            let relationship = match decided {
-                Some(shape) => {
-                    info!(
-                        session_id,
-                        relationship = ?shape.request_relationship,
-                        "Turn digest decided the relationship; router skipped"
-                    );
-                    Some(shape)
-                }
-                // Below threshold, failed or timed out: today's router.
-                None => router.await,
-            };
-            (relationship, Some(outcome))
+    // The request compiler reads only a message a person wrote, beside the
+    // router and the digest.
+    let compile_units = async {
+        if ctx.internal_continuation || planner_skip_reason.is_some() || agent.works_for_mandate() {
+            return None;
         }
-        Some(digest) => {
-            let side_calls = agent.side_calls().clone();
-            let state = agent.message_log();
-            let session = session_id.to_string();
-            let task = task_id.clone();
-            let message_id = user_msg_id.clone();
-            tokio::spawn(async move {
-                let outcome = side_calls
+        crate::turn::task_planning::compile_owner_units(
+            agent.side_calls(),
+            user_text,
+            planner_context.as_deref(),
+        )
+        .await
+    };
+    let relationship_and_digest = async {
+        match digest {
+            Some(digest) if digest_awaited => {
+                let outcome = agent
+                    .side_calls()
                     .decide(
                         crate::llm::decisions::Decision::TurnDigest,
                         digest.request,
-                        crate::llm::decide::DecisionContext::turn(&session, &task),
+                        crate::llm::decide::DecisionContext::turn(session_id, &task_id),
                     )
                     .await;
-                annotate_identity(&*state, &session, &message_id, &outcome).await;
-            });
-            (router.await, None)
+                let decided =
+                    crate::turn::task_planning::digest_relationship(&outcome, &digest.antecedents);
+                let relationship = match decided {
+                    Some(shape) => {
+                        info!(
+                            session_id,
+                            relationship = ?shape.request_relationship,
+                            "Turn digest decided the relationship; router skipped"
+                        );
+                        Some(shape)
+                    }
+                    // Below threshold, failed or timed out: today's router.
+                    None => router.await,
+                };
+                (relationship, Some(outcome))
+            }
+            Some(digest) => {
+                let side_calls = agent.side_calls().clone();
+                let state = agent.message_log();
+                let session = session_id.to_string();
+                let task = task_id.clone();
+                let message_id = user_msg_id.clone();
+                tokio::spawn(async move {
+                    let outcome = side_calls
+                        .decide(
+                            crate::llm::decisions::Decision::TurnDigest,
+                            digest.request,
+                            crate::llm::decide::DecisionContext::turn(&session, &task),
+                        )
+                        .await;
+                    annotate_identity(&*state, &session, &message_id, &outcome).await;
+                });
+                (router.await, None)
+            }
+            None => (router.await, None),
         }
-        None => (router.await, None),
     };
+    let ((relationship_fallback, digest_outcome), owner_units) =
+        tokio::join!(relationship_and_digest, compile_units);
     if let Some(outcome) = digest_outcome.as_ref() {
         annotate_identity(agent.messages(), session_id, &user_msg_id, outcome).await;
     }
@@ -1236,6 +1259,7 @@ pub async fn run_bootstrap(
         resume_checkpoint.is_some(),
         &initial_turn_context,
         relationship_fallback.as_ref(),
+        owner_units,
     )
     .await?;
     // "Don't remember this" is settled before the turn's memory policy is

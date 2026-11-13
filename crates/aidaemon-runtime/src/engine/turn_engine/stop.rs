@@ -10,10 +10,14 @@ pub fn record_not_attempted(
     scope: &TurnScope<'_>,
     aggregate: &aidaemon_events::run_aggregate::RunAggregate,
 ) -> Vec<String> {
-    let items: Vec<(usize, String)> = aggregate
+    let items: Vec<(Option<usize>, String)> = aggregate
         .unattempted_declared_work()
         .iter()
         .filter_map(|id| {
+            // One of the owner's own units: its words, no step on the card.
+            if let Some(unit) = aggregate.owner_unit_of(id) {
+                return Some((None, unit.what.trim().to_string()));
+            }
             let index = id
                 .rsplit_once("/obligation:checklist:")
                 .and_then(|(_, index)| index.parse().ok())?;
@@ -23,7 +27,7 @@ pub fn record_not_attempted(
                 .clone()
                 .or_else(|| obligation.summary.clone())
                 .unwrap_or_default();
-            Some((index, step))
+            Some((Some(index), step))
         })
         .collect();
     let unmet = if items.is_empty() {
@@ -36,7 +40,7 @@ pub fn record_not_attempted(
     };
     if let Ok(mut recorded) = scope.not_attempted.lock() {
         for item in items {
-            if !recorded.iter().any(|(index, _)| *index == item.0) {
+            if !recorded.contains(&item) {
                 recorded.push(item);
             }
         }
@@ -686,11 +690,15 @@ impl TurnEngine<'_> {
         )
         .await;
         // Every declared step deferred, skipped or dropped, with none of
-        // the work attempted: the same stop as an unfinished verdict.
+        // the work attempted: the same stop as an unfinished verdict. A
+        // change the owner asked for that nothing attempted is judged now,
+        // whatever else is reachable: no observation the ledger may still
+        // demand does it.
+        let owner_units_uncovered = !aggregate.uncovered_owner_units().is_empty();
         match unattempted_work_verdict(
             work_unattempted,
             aggregate.executor_claimed_outcome,
-            !decision.work_reachable(),
+            !decision.work_reachable() || owner_units_uncovered,
             changes_permitted,
             scope.unattempted_work_demanded.load(Ordering::Relaxed),
         ) {

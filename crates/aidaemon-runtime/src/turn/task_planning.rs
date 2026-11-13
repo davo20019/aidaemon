@@ -264,6 +264,148 @@ pub async fn generate_task_relationship(
     })
 }
 
+/// The request compiler's system line. Test providers recognise the call by
+/// it.
+pub const REQUEST_UNITS_SYSTEM: &str = "You are a request contract compiler. Return only valid JSON. You list what the owner asked for, in the owner's terms; you cannot authorize actions or decide how the work is done.";
+
+/// The most units one request compiles to.
+const MAX_OWNER_UNITS: usize = 12;
+
+#[derive(serde::Deserialize)]
+struct OwnerUnitsResponse {
+    schema_version: u32,
+    #[serde(default)]
+    units: Vec<OwnerUnitResponse>,
+}
+
+#[derive(serde::Deserialize)]
+struct OwnerUnitResponse {
+    what: String,
+    asks_change: bool,
+}
+
+/// Compile the owner's message into the units of work it asks for: each
+/// result the owner wants, in the owner's terms, and whether it asks for
+/// new work or a change rather than a look at what is there. This is the
+/// request's contract as the owner made it, compiled apart from the model
+/// that carries it out, so the run is judged against the owner's words and
+/// not only against its own checklist (live 2026-11-13: "one installing
+/// Drupal and the other one WordPress" was planned as checks and
+/// screenshots of existing sites).
+///
+/// One tool-less side call. Any failure or unreadable reply returns `None`:
+/// the turn then has no owner units, as before.
+pub async fn compile_owner_units(
+    side_calls: &SideCallGateway,
+    user_text: &str,
+    conversation_context: Option<&str>,
+) -> Option<Vec<aidaemon_events::traits::RequestWorkUnit>> {
+    let context = conversation_context
+        .filter(|context| !context.trim().is_empty())
+        .map(|context| {
+            format!(
+                "Recent conversation, as context for what the current message refers to:\n{}\n\n",
+                truncate_str(context, 6000)
+            )
+        })
+        .unwrap_or_default();
+    let prompt = format!(
+        "{context}Current owner message:\n{user_text}\n\n\
+         Return exactly: {{\"schema_version\":1,\"units\":[{{\"what\":\"...\",\"asks_change\":true|false}}]}}.\n\
+         A unit is one result the owner wants from this message, written briefly in the owner's own terms and language. \
+         Separate results are separate units, even when one sentence asks for them together. \
+         asks_change is true when the owner wants the world to be different afterwards: something made, installed, set up, changed or removed, \
+         a result that does not exist until the work is done. It is false when the owner wants only to know or see something: to look, check, find, measure, report or be shown. \
+         Judge what the owner wants done, not what may already exist: asking for something to be made is new work even if something like it exists, \
+         and only the owner can say that what exists will do. \
+         If the message answers an earlier question, the units are the earlier request as this answer settles it. \
+         A message that asks for nothing (thanks, a greeting, a remark) has no units.",
+        user_text = truncate_str(user_text, 4000),
+    );
+    let request = sdk::ModelRequest {
+        model: String::new(),
+        messages: vec![
+            sdk::Message::system(REQUEST_UNITS_SYSTEM),
+            sdk::Message::user(prompt),
+        ],
+        max_output_tokens: Some(1024),
+        options: sdk::RequestOptions {
+            response_format: typed_object_response_format("request_units"),
+            reasoning_effort: Some("low".to_string()),
+            single_attempt: false,
+            fallback_when_unspent: false,
+            cache_key: None,
+        },
+        ..Default::default()
+    };
+    let response = match side_calls
+        .provider(SideCall::RequestUnits)
+        .complete(&request)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(%error, "Request compiler got no answer");
+            return None;
+        }
+    };
+    parse_owner_units(&response.text)
+}
+
+/// The owner units in a compiler reply; `None` when it holds none readable.
+pub fn parse_owner_units(text: &str) -> Option<Vec<aidaemon_events::traits::RequestWorkUnit>> {
+    let json = crate::turn::helpers::extract_json_object(text)?;
+    let parsed: OwnerUnitsResponse = serde_json::from_str(&json).ok()?;
+    if parsed.schema_version != 1 {
+        return None;
+    }
+    Some(
+        parsed
+            .units
+            .into_iter()
+            .filter_map(|unit| {
+                let what = unit.what.split_whitespace().collect::<Vec<_>>().join(" ");
+                (!what.is_empty()).then(|| aidaemon_events::traits::RequestWorkUnit {
+                    what: truncate_str(&what, 200).to_string(),
+                    asks_change: unit.asks_change,
+                })
+            })
+            .take(MAX_OWNER_UNITS)
+            .collect(),
+    )
+}
+
+/// What the run reads of the owner's units: numbered, so its checklist can
+/// link each item to the units it carries out (`owner_units`).
+pub fn owner_units_note(units: &[aidaemon_events::traits::RequestWorkUnit]) -> Option<String> {
+    if units.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = units
+        .iter()
+        .enumerate()
+        .map(|(index, unit)| {
+            format!(
+                "{index}. {}{}",
+                unit.what,
+                if unit.asks_change {
+                    " (new work: done only by doing it)"
+                } else {
+                    " (to look at or report)"
+                }
+            )
+        })
+        .collect();
+    Some(format!(
+        "[What the owner asked for] Compiled from the owner's message, apart from your plan:\n{}\n\
+         Your checklist answers for each of these: give every item the owner_units it carries out. \
+         What earlier work, memory or existing files show is context for these, never their result. \
+         If one cannot start without the owner's choice (for example, what exists might be what they meant), \
+         ask that one question with outcome needs_owner instead of doing something else in its place.",
+        lines.join("\n")
+    ))
+}
+
 /// The turn digest's request: one decision call per user message. The
 /// relationship question is asked only when there is a conversation to
 /// relate to; its options carry the antecedent, one `continuation_<n>`
@@ -526,6 +668,29 @@ mod tests {
     /// An opted-out turn's one policy event carries the opt-out's reason
     /// whatever else suppressed its memory, so history search (which keys on
     /// that reason) leaves it out; recall still follows the policy.
+    /// The compiler's reply becomes the owner's units, in the owner's
+    /// terms; anything unreadable compiles to none.
+    #[test]
+    fn owner_units_parse_from_the_compiler_reply() {
+        let units = parse_owner_units(
+            r#"{"schema_version":1,"units":[{"what":"Install  Drupal","asks_change":true},{"what":"  ","asks_change":true},{"what":"Homepage screenshot","asks_change":false}]}"#,
+        )
+        .unwrap();
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].what, "Install Drupal");
+        assert!(units[0].asks_change);
+        assert!(!units[1].asks_change);
+        assert!(parse_owner_units("not json").is_none());
+        assert!(parse_owner_units(r#"{"schema_version":2,"units":[]}"#).is_none());
+        let note = owner_units_note(&units).unwrap();
+        assert!(note.contains("0. Install Drupal (new work"), "{note}");
+        assert!(
+            note.contains("1. Homepage screenshot (to look at"),
+            "{note}"
+        );
+        assert!(owner_units_note(&[]).is_none());
+    }
+
     #[test]
     fn an_opted_out_turn_records_the_opt_out_whatever_its_policy() {
         use aidaemon_memory::policy::TurnAuthor;

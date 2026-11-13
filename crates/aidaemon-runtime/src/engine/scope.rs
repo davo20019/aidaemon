@@ -57,7 +57,9 @@ pub struct TurnScope<'a> {
     /// Declared items the run ended without attempting, after its one pass
     /// (index, the step in the model's own words): their typed reason, "not
     /// attempted", reaches the card and the reply.
-    pub not_attempted: std::sync::Mutex<Vec<(usize, String)>>,
+    /// Each with its checklist index; `None`: one of the owner's own units
+    /// of work, which has no step on the card.
+    pub not_attempted: std::sync::Mutex<Vec<(Option<usize>, String)>>,
     /// Extra passes the ledger demanded so far.
     pub closeout_demands: std::sync::atomic::AtomicU32,
     /// The latest closeout let the run stop after a demand while the ledger

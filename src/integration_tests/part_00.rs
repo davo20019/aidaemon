@@ -583,7 +583,8 @@ async fn cadence_inside_draft_only_mandate_request_is_model_directed_not_schedul
 #[tokio::test]
 async fn test_llm_call_event_emitted_with_telemetry() {
     // A fresh session has no relationship to classify, so a simple turn records
-    // exactly its one main response: 10 input / 5 output tokens.
+    // its one main response (10 input / 5 output tokens) and the request
+    // compiler's side call, which the mock answers with nothing (0 / 0).
     let harness =
         setup_test_agent_with_models(MockProvider::new(), "gpt-5.6-terra", "gpt-5.6-terra")
             .await
@@ -611,10 +612,13 @@ async fn test_llm_call_event_emitted_with_telemetry() {
         .await
         .expect("llm stats should compute");
 
-    assert_eq!(stats.total_calls, 1, "expected one response event");
+    assert_eq!(
+        stats.total_calls, 2,
+        "expected the response and the request compiler's call"
+    );
     assert_eq!(stats.failed_calls, 0);
-    assert_eq!(stats.avg_input_tokens, 10);
-    assert_eq!(stats.avg_output_tokens, 5);
+    assert_eq!(stats.avg_input_tokens, 5);
+    assert_eq!(stats.avg_output_tokens, 2);
     assert_eq!(stats.fell_back_count, 0);
     // Latency is recorded (may be ~0ms against an instant mock provider).
     assert!(stats.p95_latency_ms >= stats.p50_latency_ms);
