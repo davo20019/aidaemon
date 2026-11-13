@@ -172,7 +172,7 @@ discord = ["dep:aidaemon-channel-discord"]
 slack = ["dep:aidaemon-channel-slack"]
 execution-docker = ["aidaemon-tools/docker"]
 terminal-bridge = ["dep:aidaemon-terminal-bridge"]
-encryption = ["libsqlite3-sys/bundled-sqlcipher"]
+encryption = ["libsqlite3-sys/bundled-sqlcipher", "aidaemon-runtime/encryption"]
 computer_use = ["aidaemon-runtime/computer_use"]
 # Export runs to an OTLP backend when `[telemetry]` names one.
 otel = ["aidaemon-policies/otel", "dep:opentelemetry_sdk"]

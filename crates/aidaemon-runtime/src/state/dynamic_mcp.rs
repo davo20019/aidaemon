@@ -1,10 +1,10 @@
 use super::*;
 
 #[async_trait]
-impl crate::traits::DynamicMcpServerStore for SqliteStateStore {
+impl crate::state::types::DynamicMcpServerStore for SqliteStateStore {
     async fn save_dynamic_mcp_server(
         &self,
-        server: &crate::traits::DynamicMcpServer,
+        server: &crate::state::types::DynamicMcpServer,
     ) -> anyhow::Result<i64> {
         let result = sqlx::query(
             "INSERT INTO dynamic_mcp_servers (name, command, args_json, env_keys_json, triggers_json, enabled, created_at)
@@ -25,7 +25,7 @@ impl crate::traits::DynamicMcpServerStore for SqliteStateStore {
 
     async fn list_dynamic_mcp_servers(
         &self,
-    ) -> anyhow::Result<Vec<crate::traits::DynamicMcpServer>> {
+    ) -> anyhow::Result<Vec<crate::state::types::DynamicMcpServer>> {
         let rows = sqlx::query(
             "SELECT id, name, command, args_json, env_keys_json, triggers_json, enabled, created_at
              FROM dynamic_mcp_servers ORDER BY created_at ASC",
@@ -35,7 +35,7 @@ impl crate::traits::DynamicMcpServerStore for SqliteStateStore {
 
         let mut servers = Vec::new();
         for row in rows {
-            servers.push(crate::traits::DynamicMcpServer {
+            servers.push(crate::state::types::DynamicMcpServer {
                 id: row.get::<i64, _>("id"),
                 name: row.get::<String, _>("name"),
                 command: row.get::<String, _>("command"),
@@ -59,7 +59,7 @@ impl crate::traits::DynamicMcpServerStore for SqliteStateStore {
 
     async fn update_dynamic_mcp_server(
         &self,
-        server: &crate::traits::DynamicMcpServer,
+        server: &crate::state::types::DynamicMcpServer,
     ) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE dynamic_mcp_servers SET command = ?, args_json = ?, env_keys_json = ?, triggers_json = ?, enabled = ? WHERE id = ?"

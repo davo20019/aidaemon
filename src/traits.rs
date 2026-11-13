@@ -60,10 +60,12 @@ pub use aidaemon_work::mandates::{
 #[cfg(test)]
 pub use channels::ChannelCapabilities;
 pub use channels::HubChannel;
+#[allow(unused_imports)]
 pub use dynamic::{
     CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,
     OAuthConnection, PendingOAuthFlow, SkillDraft,
 };
+#[allow(unused_imports)]
 pub use history::{
     HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, HistoryToolActivity,
     ProjectionStats, RecentToolTurn, TaskBookends,

@@ -1,8 +1,11 @@
 use super::*;
 
 #[async_trait]
-impl crate::traits::SkillStore for SqliteStateStore {
-    async fn add_dynamic_skill(&self, skill: &crate::traits::DynamicSkill) -> anyhow::Result<i64> {
+impl crate::state::types::SkillStore for SqliteStateStore {
+    async fn add_dynamic_skill(
+        &self,
+        skill: &crate::state::types::DynamicSkill,
+    ) -> anyhow::Result<i64> {
         let result = sqlx::query(
             "INSERT INTO dynamic_skills (name, description, triggers_json, body, source, source_url, enabled, version, resources_json, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))"
@@ -21,7 +24,7 @@ impl crate::traits::SkillStore for SqliteStateStore {
         Ok(result.last_insert_rowid())
     }
 
-    async fn get_dynamic_skills(&self) -> anyhow::Result<Vec<crate::traits::DynamicSkill>> {
+    async fn get_dynamic_skills(&self) -> anyhow::Result<Vec<crate::state::types::DynamicSkill>> {
         let rows = sqlx::query(
             "SELECT id, name, description, triggers_json, body, source, source_url, enabled, version, resources_json, created_at
              FROM dynamic_skills ORDER BY created_at ASC"
@@ -31,7 +34,7 @@ impl crate::traits::SkillStore for SqliteStateStore {
 
         let mut skills = Vec::new();
         for row in rows {
-            skills.push(crate::traits::DynamicSkill {
+            skills.push(crate::state::types::DynamicSkill {
                 id: row.get::<i64, _>("id"),
                 name: row.get::<String, _>("name"),
                 description: row.get::<String, _>("description"),
@@ -71,7 +74,7 @@ impl crate::traits::SkillStore for SqliteStateStore {
         &self,
         min_success: i32,
         min_rate: f32,
-    ) -> anyhow::Result<Vec<crate::traits::Procedure>> {
+    ) -> anyhow::Result<Vec<crate::state::types::Procedure>> {
         let rows = sqlx::query(
             "SELECT id, name, trigger_pattern, steps, success_count, failure_count,
                     avg_duration_secs, last_used_at, created_at, updated_at
@@ -89,7 +92,7 @@ impl crate::traits::SkillStore for SqliteStateStore {
         for row in rows {
             let steps_json: String = row.get("steps");
             let steps: Vec<String> = serde_json::from_str(&steps_json).unwrap_or_default();
-            procedures.push(crate::traits::Procedure {
+            procedures.push(crate::state::types::Procedure {
                 id: row.get::<i64, _>("id"),
                 name: row.get::<String, _>("name"),
                 trigger_pattern: row.get::<String, _>("trigger_pattern"),
@@ -134,7 +137,10 @@ impl crate::traits::SkillStore for SqliteStateStore {
         Ok(procedures)
     }
 
-    async fn add_skill_draft(&self, draft: &crate::traits::SkillDraft) -> anyhow::Result<i64> {
+    async fn add_skill_draft(
+        &self,
+        draft: &crate::state::types::SkillDraft,
+    ) -> anyhow::Result<i64> {
         let result = sqlx::query(
             "INSERT INTO skill_drafts (name, description, triggers_json, body, source_procedure, status, created_at)
              VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'))",
@@ -149,7 +155,9 @@ impl crate::traits::SkillStore for SqliteStateStore {
         Ok(result.last_insert_rowid())
     }
 
-    async fn get_pending_skill_drafts(&self) -> anyhow::Result<Vec<crate::traits::SkillDraft>> {
+    async fn get_pending_skill_drafts(
+        &self,
+    ) -> anyhow::Result<Vec<crate::state::types::SkillDraft>> {
         let rows = sqlx::query(
             "SELECT id, name, description, triggers_json, body, source_procedure, status, created_at
              FROM skill_drafts WHERE status = 'pending' ORDER BY created_at ASC",
@@ -159,7 +167,7 @@ impl crate::traits::SkillStore for SqliteStateStore {
 
         let mut drafts = Vec::new();
         for row in rows {
-            drafts.push(crate::traits::SkillDraft {
+            drafts.push(crate::state::types::SkillDraft {
                 id: row.get::<i64, _>("id"),
                 name: row.get::<String, _>("name"),
                 description: row.get::<String, _>("description"),
@@ -173,7 +181,10 @@ impl crate::traits::SkillStore for SqliteStateStore {
         Ok(drafts)
     }
 
-    async fn get_skill_draft(&self, id: i64) -> anyhow::Result<Option<crate::traits::SkillDraft>> {
+    async fn get_skill_draft(
+        &self,
+        id: i64,
+    ) -> anyhow::Result<Option<crate::state::types::SkillDraft>> {
         let row = sqlx::query(
             "SELECT id, name, description, triggers_json, body, source_procedure, status, created_at
              FROM skill_drafts WHERE id = ?",
@@ -182,7 +193,7 @@ impl crate::traits::SkillStore for SqliteStateStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|row| crate::traits::SkillDraft {
+        Ok(row.map(|row| crate::state::types::SkillDraft {
             id: row.get::<i64, _>("id"),
             name: row.get::<String, _>("name"),
             description: row.get::<String, _>("description"),

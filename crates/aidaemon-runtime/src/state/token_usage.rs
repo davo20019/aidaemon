@@ -1,7 +1,7 @@
 use super::*;
 
 #[async_trait]
-impl crate::traits::TokenUsageStore for SqliteStateStore {
+impl crate::state::types::TokenUsageStore for SqliteStateStore {
     async fn record_token_usage(
         &self,
         session_id: &str,

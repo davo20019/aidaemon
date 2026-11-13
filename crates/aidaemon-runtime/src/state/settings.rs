@@ -1,7 +1,7 @@
 use super::*;
 
 #[async_trait]
-impl crate::traits::SettingsStore for SqliteStateStore {
+impl crate::state::types::SettingsStore for SqliteStateStore {
     async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM settings WHERE key = ?")
             .bind(key)

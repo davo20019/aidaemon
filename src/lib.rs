@@ -6,10 +6,10 @@ mod config;
 mod context_budget;
 mod conversation;
 mod core;
+#[cfg(test)]
 use aidaemon_work::schedule as cron_utils;
 mod daemon;
 mod dashboard;
-mod db;
 #[allow(dead_code)]
 mod events;
 mod otel_export;

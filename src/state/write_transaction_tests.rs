@@ -91,7 +91,7 @@ fn production_transactions_begin_immediate() {
     assert!(
         offenders.is_empty(),
         "use `begin_with(\"BEGIN IMMEDIATE\")` for write transactions \
-         (see src/state/sqlite/write_transaction_tests.rs):\n{}",
+         (see src/state/write_transaction_tests.rs):\n{}",
         offenders.join("\n")
     );
 }

@@ -1,7 +1,7 @@
 use super::*;
 
 #[async_trait]
-impl crate::traits::SessionChannelStore for SqliteStateStore {
+impl crate::state::types::SessionChannelStore for SqliteStateStore {
     async fn save_session_channel(
         &self,
         session_id: &str,

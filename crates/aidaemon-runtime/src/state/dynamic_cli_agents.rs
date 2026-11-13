@@ -1,10 +1,10 @@
 use super::*;
 
 #[async_trait]
-impl crate::traits::DynamicCliAgentStore for SqliteStateStore {
+impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
     async fn save_dynamic_cli_agent(
         &self,
-        agent: &crate::traits::DynamicCliAgent,
+        agent: &crate::state::types::DynamicCliAgent,
     ) -> anyhow::Result<i64> {
         let result = sqlx::query(
             "INSERT INTO dynamic_cli_agents (name, command, args_json, description, timeout_secs, max_output_chars, enabled, created_at)
@@ -25,7 +25,9 @@ impl crate::traits::DynamicCliAgentStore for SqliteStateStore {
         Ok(result.last_insert_rowid())
     }
 
-    async fn list_dynamic_cli_agents(&self) -> anyhow::Result<Vec<crate::traits::DynamicCliAgent>> {
+    async fn list_dynamic_cli_agents(
+        &self,
+    ) -> anyhow::Result<Vec<crate::state::types::DynamicCliAgent>> {
         let rows = sqlx::query(
             "SELECT id, name, command, args_json, description, timeout_secs, max_output_chars, enabled, created_at
              FROM dynamic_cli_agents ORDER BY created_at ASC",
@@ -35,7 +37,7 @@ impl crate::traits::DynamicCliAgentStore for SqliteStateStore {
 
         let mut agents = Vec::new();
         for row in rows {
-            agents.push(crate::traits::DynamicCliAgent {
+            agents.push(crate::state::types::DynamicCliAgent {
                 id: row.get::<i64, _>("id"),
                 name: row.get::<String, _>("name"),
                 command: row.get::<String, _>("command"),
@@ -62,7 +64,7 @@ impl crate::traits::DynamicCliAgentStore for SqliteStateStore {
 
     async fn update_dynamic_cli_agent(
         &self,
-        agent: &crate::traits::DynamicCliAgent,
+        agent: &crate::state::types::DynamicCliAgent,
     ) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE dynamic_cli_agents SET command = ?, args_json = ?, description = ?, timeout_secs = ?, max_output_chars = ?, enabled = ? WHERE id = ?",
@@ -125,7 +127,7 @@ impl crate::traits::DynamicCliAgentStore for SqliteStateStore {
     async fn get_cli_agent_invocations(
         &self,
         limit: usize,
-    ) -> anyhow::Result<Vec<crate::traits::CliAgentInvocation>> {
+    ) -> anyhow::Result<Vec<crate::state::types::CliAgentInvocation>> {
         let rows = sqlx::query(
             "SELECT id, task_id, session_id, agent_name, prompt_summary, working_dir, started_at, completed_at, exit_code, output_summary, success, duration_secs
              FROM cli_agent_invocations ORDER BY started_at DESC LIMIT ?",
@@ -136,7 +138,7 @@ impl crate::traits::DynamicCliAgentStore for SqliteStateStore {
 
         let mut invocations = Vec::new();
         for row in rows {
-            invocations.push(crate::traits::CliAgentInvocation {
+            invocations.push(crate::state::types::CliAgentInvocation {
                 id: row.get::<i64, _>("id"),
                 task_id: row.get::<Option<String>, _>("task_id"),
                 session_id: row.get::<String, _>("session_id"),

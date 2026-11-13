@@ -1,8 +1,10 @@
 use super::*;
-use crate::memory::embeddings::EmbeddingService;
-use crate::traits::FactStore;
-use crate::traits::{ExtractedMemoryEntity, ExtractedMemoryGraph, ExtractedMemoryRelationship};
+use crate::state::types::FactStore;
+use crate::state::types::{
+    ExtractedMemoryEntity, ExtractedMemoryGraph, ExtractedMemoryRelationship,
+};
 use aidaemon_memory::embedding_index::*;
+use aidaemon_memory::embeddings::EmbeddingService;
 use aidaemon_memory::encode_embedding;
 use aidaemon_memory::stores::MemoryGraphStore;
 use std::sync::Arc;
@@ -361,7 +363,7 @@ async fn selected_fact_projects_only_its_canonical_source_message() {
     .await
     .unwrap();
 
-    aidaemon_runtime::history::project_event_span(&store.pool, selected_event_id)
+    crate::history::project_event_span(&store.pool, selected_event_id)
         .await
         .unwrap();
     store.project_fact_memory(fact_id).await.unwrap();

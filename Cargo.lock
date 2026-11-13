@@ -578,6 +578,7 @@ dependencies = [
  "aidaemon-exposure",
  "aidaemon-mcp",
  "aidaemon-memory",
+ "aidaemon-nodes",
  "aidaemon-policies",
  "aidaemon-providers",
  "aidaemon-secrets",

@@ -1,6 +1,6 @@
 use super::*;
-use crate::memory::embeddings::EmbeddingService;
-use crate::traits::FactStore;
+use crate::state::types::FactStore;
+use aidaemon_memory::embeddings::EmbeddingService;
 use std::sync::Arc;
 
 async fn store() -> (tempfile::TempDir, SqliteStateStore) {

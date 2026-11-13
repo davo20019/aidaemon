@@ -1,3 +1,8 @@
+//! The daemon's state database: one SQLite file behind every store slice of
+//! the `StateStore` facade (`crate::stores`). The record types and traits
+//! come from the crates that own them; this is their SQLite end, plus the
+//! state schema (`migrations`).
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -8,10 +13,44 @@ use sqlx::{Row, SqlitePool};
 use tokio::sync::RwLock;
 
 #[cfg(test)]
-use crate::traits::Task;
-use crate::traits::{ConversationSummary, Message, TokenUsage, TokenUsageRecord};
+use types::Task;
+use types::{ConversationSummary, Message, TokenUsage, TokenUsageRecord};
 
-use crate::memory::embeddings::EmbeddingService;
+/// The store's record types and traits, from the crates that own them.
+mod types {
+    #[cfg(test)]
+    pub(crate) use crate::stores::prelude as store_prelude;
+    pub(crate) use crate::stores::*;
+    pub(crate) use aidaemon_channels::hub::DynamicBot;
+    pub(crate) use aidaemon_events::conversation::{
+        infer_message_annotations, ConversationSummary, Message, MessageAnnotation,
+    };
+    pub(crate) use aidaemon_events::dialogue::DialogueState;
+    pub(crate) use aidaemon_events::provider::{TokenUsage, TokenUsageRecord};
+    pub(crate) use aidaemon_mcp::registry::DynamicMcpServer;
+    #[cfg(test)]
+    pub(crate) use aidaemon_memory::records::{
+        Episode, ExtractedMemoryEntity, ExtractedMemoryGraph, ExtractedMemoryRelationship,
+        FactPrivacy,
+    };
+    pub(crate) use aidaemon_memory::records::{
+        HistoryCoverage, HistoryMessage, HistoryScope, HistoryToolActivity, ProjectionStats,
+        RecentToolTurn, TaskBookends,
+    };
+    pub(crate) use aidaemon_memory::skills::{DynamicSkill, SkillDraft};
+    pub(crate) use aidaemon_memory::Procedure;
+    #[cfg(test)]
+    pub(crate) use aidaemon_memory::{BehaviorPattern, ErrorSolution};
+    pub(crate) use aidaemon_tools::services::{
+        CliAgentInvocation, DynamicCliAgent, OAuthConnection, PendingOAuthFlow,
+    };
+    #[cfg(test)]
+    pub(crate) use aidaemon_work::goals::{
+        Goal, GoalRun, GoalSchedule, NotificationEntry, Task, TaskActivity, TaskAttemptPatch,
+    };
+    #[cfg(test)]
+    pub(crate) use aidaemon_work::mandates::{Mandate, MandateAuthority};
+}
 
 impl aidaemon_work::sqlite::WorkDatabase for SqliteStateStore {
     fn work_pool(&self) -> &SqlitePool {
@@ -19,7 +58,7 @@ impl aidaemon_work::sqlite::WorkDatabase for SqliteStateStore {
     }
 
     fn redact_secrets(&self, text: &str) -> String {
-        crate::tools::sanitize::redact_secrets(text)
+        aidaemon_tools::sanitize::redact_secrets(text)
     }
 }
 
@@ -47,8 +86,11 @@ pub struct SqliteStateStore {
     working_memory: Arc<RwLock<HashMap<String, VecDeque<Message>>>>,
     memory: aidaemon_memory::sqlite::SqliteMemory,
     cap: usize,
+    /// Where dynamic bots' tokens go instead of the database. Without one
+    /// they stay in their rows (as in tests, which never open the OS store).
+    secrets: Option<Arc<dyn aidaemon_secrets::SecretStore>>,
     #[cfg(test)]
-    embedding_service: Arc<EmbeddingService>,
+    embedding_service: Arc<dyn aidaemon_memory::Embedder>,
 }
 
 impl SqliteStateStore {
@@ -64,7 +106,7 @@ impl SqliteStateStore {
 }
 
 /// Lets tests seed and read memory on the store they already hold.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl std::ops::Deref for SqliteStateStore {
     type Target = aidaemon_memory::sqlite::SqliteMemory;
 
@@ -74,22 +116,29 @@ impl std::ops::Deref for SqliteStateStore {
 }
 
 impl SqliteStateStore {
-    pub async fn new(
+    /// Opens (or creates) the database at `db_path` and brings its schema
+    /// up to date. `embeddings` embeds and reranks long-term memory.
+    pub async fn new<E>(
         db_path: &str,
         cap: usize,
         encryption_key: Option<&str>,
-        embedding_service: Arc<EmbeddingService>,
-    ) -> anyhow::Result<Self> {
+        embeddings: Arc<E>,
+    ) -> anyhow::Result<Self>
+    where
+        E: aidaemon_memory::Embedder + aidaemon_memory::sqlite::Reranker + 'static,
+    {
         // Unit tests create thousands of NamedTempFile-backed databases. WAL
         // sidecars outlive the already-unlinked main file until every pooled
         // connection closes and can consume tens of gigabytes in one suite.
         // Delete journaling keeps test databases self-contained; production
         // retains WAL concurrency and crash behavior.
-        let (journal_mode_name, journal_mode_pragma) = if cfg!(test) {
+        let (journal_mode_name, journal_mode_pragma) = if cfg!(any(test, feature = "testing")) {
             ("delete", "PRAGMA journal_mode = DELETE")
         } else {
             ("wal", "PRAGMA journal_mode = WAL")
         };
+        // Only the `encryption` feature adds to these.
+        #[cfg_attr(not(feature = "encryption"), allow(unused_mut))]
         let mut opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
@@ -155,17 +204,24 @@ impl SqliteStateStore {
         set_db_file_permissions(db_path);
 
         migrations::migrate_state(&pool).await?;
-        crate::nodes::store::migrate(&pool).await?;
+        aidaemon_nodes::store::migrate(&pool).await?;
 
         let pool_for_memory = pool.clone();
         Ok(Self {
             pool,
             working_memory: Arc::new(RwLock::new(HashMap::new())),
-            memory: crate::memory::sqlite_memory(pool_for_memory, embedding_service.clone()),
+            memory: sqlite_memory(pool_for_memory, embeddings.clone()),
             cap,
+            secrets: None,
             #[cfg(test)]
-            embedding_service,
+            embedding_service: embeddings,
         })
+    }
+
+    /// Keeps dynamic bots' tokens in `secrets`, with a reference in the row.
+    pub fn with_secret_store(mut self, secrets: Arc<dyn aidaemon_secrets::SecretStore>) -> Self {
+        self.secrets = Some(secrets);
+        self
     }
 
     async fn hydrate_from_events(
@@ -225,7 +281,7 @@ impl SqliteStateStore {
                 }
             };
 
-            if let Some(message) = crate::events::turn_from_event(
+            if let Some(message) = aidaemon_events::conversation_turn::turn_from_event(
                 event_id,
                 &row_session_id,
                 &event_type,
@@ -256,22 +312,48 @@ impl SqliteStateStore {
     }
 }
 
-/// Resolve a "keychain:key_name" reference to the actual value from OS keychain.
-/// Falls back to the raw string if keychain lookup fails or it's not a reference.
-fn resolve_keychain_ref(value: &str) -> String {
-    if let Some(key_name) = value.strip_prefix("keychain:") {
-        match crate::config::resolve_from_keychain(key_name) {
-            Ok(password) => return password,
-            Err(_) => {
-                tracing::warn!(
-                    key = key_name,
-                    "Failed to resolve keychain reference for dynamic bot"
-                );
+/// The daemon's memory store over its state database. Errors keep only what
+/// the failing tool said, without the daemon's own wrapper lines.
+pub fn sqlite_memory<E>(
+    pool: SqlitePool,
+    embeddings: Arc<E>,
+) -> aidaemon_memory::sqlite::SqliteMemory
+where
+    E: aidaemon_memory::Embedder + aidaemon_memory::sqlite::Reranker + 'static,
+{
+    fn without_scaffolding(error: &str) -> String {
+        error
+            .lines()
+            .filter(|line| !crate::message_content::is_internal_scaffolding_line(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    aidaemon_memory::sqlite::SqliteMemory::new(pool.clone(), embeddings.clone())
+        .with_message_log(Arc::new(crate::history::EventHistory::new(pool, None)))
+        .with_reranker(embeddings)
+        .with_channel_ids(Arc::new(crate::history::SessionChannelIds))
+        .with_error_cleaner(without_scaffolding)
+}
+
+impl SqliteStateStore {
+    /// Resolve a "keychain:key_name" reference to the actual value from the
+    /// secret store. Falls back to the raw string if the lookup fails or it's
+    /// not a reference.
+    fn resolve_keychain_ref(&self, value: &str) -> String {
+        if let Some(key_name) = value.strip_prefix("keychain:") {
+            match self.secrets.as_deref().map(|secrets| secrets.get(key_name)) {
+                Some(Ok(secret)) => return secret.into_exposed(),
+                _ => {
+                    tracing::warn!(
+                        key = key_name,
+                        "Failed to resolve keychain reference for dynamic bot"
+                    );
+                }
             }
         }
+        // Fall back to raw value (backward compat with pre-existing plaintext entries)
+        value.to_string()
     }
-    // Fall back to raw value (backward compat with pre-existing plaintext entries)
-    value.to_string()
 }
 
 mod conversation_summary;
@@ -280,9 +362,9 @@ mod dynamic_bots;
 mod dynamic_cli_agents;
 mod dynamic_mcp;
 mod health_checks;
-pub(crate) mod history_search;
+mod history_search;
 mod messages;
-pub(crate) mod migrations;
+pub mod migrations;
 mod oauth;
 mod prompt_snapshots;
 mod session_channels;
@@ -294,29 +376,38 @@ mod token_usage;
 mod memory_store_tests;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod write_transaction_tests;
 
 #[cfg(test)]
 mod turn_id_hydration_tests {
     use super::*;
-    use crate::events::EventStoreForTests as _;
-    use crate::events::{Event, EventStore, EventType};
-    use crate::traits::MessageStore;
+    use aidaemon_events::{Event, EventStore, EventType};
+    use types::MessageStore;
+
+    /// The event store on the daemon's seams, over the same pool.
+    async fn event_store(pool: SqlitePool) -> EventStore {
+        EventStore::on_paths(
+            pool,
+            aidaemon_tools::LexicalPaths::daemon_host(),
+            Arc::new(crate::history::HistoryEventHost),
+        )
+        .await
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn hydrate_propagates_turn_id_from_event() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("turn_id_hydration.db");
         let db_path = db_path.to_str().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service =
+            Arc::new(aidaemon_memory::embeddings::EmbeddingService::new().unwrap());
         let store = SqliteStateStore::new(db_path, 50, None, embedding_service)
             .await
             .unwrap();
 
         // Append a user-message event carrying a turn_id through the event store,
         // sharing the same pool the state store hydrates from.
-        let events = EventStore::new(store.pool()).await.unwrap();
+        let events = event_store(store.pool()).await;
         let ev = Event::new(
             "sess-hydrate",
             EventType::UserMessage,
@@ -348,11 +439,12 @@ mod turn_id_hydration_tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("clear_ctx.db");
         let db_path = db_path.to_str().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service =
+            Arc::new(aidaemon_memory::embeddings::EmbeddingService::new().unwrap());
         let store = SqliteStateStore::new(db_path, 50, None, embedding_service)
             .await
             .unwrap();
-        let events = EventStore::new(store.pool()).await.unwrap();
+        let events = event_store(store.pool()).await;
         let sess = "sess-clear";
 
         append_user(&events, sess, "before-one").await;
@@ -384,11 +476,12 @@ mod turn_id_hydration_tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("advance_ctx.db");
         let db_path = db_path.to_str().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service =
+            Arc::new(aidaemon_memory::embeddings::EmbeddingService::new().unwrap());
         let store = SqliteStateStore::new(db_path, 50, None, embedding_service)
             .await
             .unwrap();
-        let events = EventStore::new(store.pool()).await.unwrap();
+        let events = event_store(store.pool()).await;
         let sess = "sess-advance";
 
         events
@@ -481,11 +574,12 @@ mod turn_id_hydration_tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("wipe.db");
         let db_path = db_path.to_str().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service =
+            Arc::new(aidaemon_memory::embeddings::EmbeddingService::new().unwrap());
         let store = SqliteStateStore::new(db_path, 50, None, embedding_service)
             .await
             .unwrap();
-        let events = EventStore::new(store.pool()).await.unwrap();
+        let events = event_store(store.pool()).await;
         let sess = "sess-wipe";
 
         append_user(&events, sess, "gone-one").await;

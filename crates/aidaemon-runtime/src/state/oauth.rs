@@ -1,10 +1,10 @@
 use super::*;
 
 #[async_trait]
-impl crate::traits::OAuthStore for SqliteStateStore {
+impl crate::state::types::OAuthStore for SqliteStateStore {
     async fn save_oauth_connection(
         &self,
-        conn: &crate::traits::OAuthConnection,
+        conn: &crate::state::types::OAuthConnection,
     ) -> anyhow::Result<i64> {
         let now = chrono::Utc::now().to_rfc3339();
         let result = sqlx::query(
@@ -29,7 +29,7 @@ impl crate::traits::OAuthStore for SqliteStateStore {
 
     async fn save_pending_oauth_flow(
         &self,
-        flow: &crate::traits::PendingOAuthFlow,
+        flow: &crate::state::types::PendingOAuthFlow,
     ) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT INTO pending_oauth_flows (state, service, code_verifier, session_id, created_at) \
@@ -51,7 +51,7 @@ impl crate::traits::OAuthStore for SqliteStateStore {
     async fn get_oauth_connection(
         &self,
         service: &str,
-    ) -> anyhow::Result<Option<crate::traits::OAuthConnection>> {
+    ) -> anyhow::Result<Option<crate::state::types::OAuthConnection>> {
         let row = sqlx::query(
             "SELECT id, service, auth_type, username, account_id, scopes, token_expires_at, created_at, updated_at \
              FROM oauth_connections WHERE service = ?",
@@ -60,7 +60,7 @@ impl crate::traits::OAuthStore for SqliteStateStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| crate::traits::OAuthConnection {
+        Ok(row.map(|r| crate::state::types::OAuthConnection {
             id: r.get("id"),
             service: r.get("service"),
             auth_type: r.get("auth_type"),
@@ -76,7 +76,7 @@ impl crate::traits::OAuthStore for SqliteStateStore {
     async fn get_pending_oauth_flow(
         &self,
         state: &str,
-    ) -> anyhow::Result<Option<crate::traits::PendingOAuthFlow>> {
+    ) -> anyhow::Result<Option<crate::state::types::PendingOAuthFlow>> {
         let row = sqlx::query(
             "SELECT state, service, code_verifier, session_id, created_at \
              FROM pending_oauth_flows WHERE state = ?",
@@ -85,7 +85,7 @@ impl crate::traits::OAuthStore for SqliteStateStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| crate::traits::PendingOAuthFlow {
+        Ok(row.map(|r| crate::state::types::PendingOAuthFlow {
             state: r.get("state"),
             service: r.get("service"),
             code_verifier: r.try_get("code_verifier").unwrap_or(None),
@@ -94,7 +94,9 @@ impl crate::traits::OAuthStore for SqliteStateStore {
         }))
     }
 
-    async fn list_oauth_connections(&self) -> anyhow::Result<Vec<crate::traits::OAuthConnection>> {
+    async fn list_oauth_connections(
+        &self,
+    ) -> anyhow::Result<Vec<crate::state::types::OAuthConnection>> {
         let rows = sqlx::query(
             "SELECT id, service, auth_type, username, account_id, scopes, token_expires_at, created_at, updated_at \
              FROM oauth_connections ORDER BY service ASC",
@@ -104,7 +106,7 @@ impl crate::traits::OAuthStore for SqliteStateStore {
 
         Ok(rows
             .iter()
-            .map(|r| crate::traits::OAuthConnection {
+            .map(|r| crate::state::types::OAuthConnection {
                 id: r.get("id"),
                 service: r.get("service"),
                 auth_type: r.get("auth_type"),
@@ -137,7 +139,7 @@ impl crate::traits::OAuthStore for SqliteStateStore {
 
     async fn list_pending_oauth_flows(
         &self,
-    ) -> anyhow::Result<Vec<crate::traits::PendingOAuthFlow>> {
+    ) -> anyhow::Result<Vec<crate::state::types::PendingOAuthFlow>> {
         let rows = sqlx::query(
             "SELECT state, service, code_verifier, session_id, created_at \
              FROM pending_oauth_flows ORDER BY created_at ASC",
@@ -147,7 +149,7 @@ impl crate::traits::OAuthStore for SqliteStateStore {
 
         Ok(rows
             .iter()
-            .map(|r| crate::traits::PendingOAuthFlow {
+            .map(|r| crate::state::types::PendingOAuthFlow {
                 state: r.get("state"),
                 service: r.get("service"),
                 code_verifier: r.try_get("code_verifier").unwrap_or(None),

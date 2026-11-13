@@ -744,7 +744,9 @@ async fn uncaptured_session_scan_matches_the_left_join_it_replaced() {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    crate::db::migrations::migrate_events(&pool).await.unwrap();
+    aidaemon_events::schema::migrate_events(&pool)
+        .await
+        .unwrap();
     let at = |minute: u32| format!("2026-01-01T10:{minute:02}:00+00:00");
     // (session, conversation events at minutes, latest episode end)
     let sessions: [(&str, &[u32], Option<u32>); 6] = [

@@ -1,7 +1,7 @@
 use super::*;
-use crate::memory::embeddings::EmbeddingService;
-use crate::traits::FactStore;
-use crate::types::FactPrivacy;
+use crate::state::types::FactPrivacy;
+use crate::state::types::FactStore;
+use aidaemon_memory::embeddings::EmbeddingService;
 use std::sync::Arc;
 
 async fn setup_store() -> (SqliteStateStore, tempfile::NamedTempFile) {

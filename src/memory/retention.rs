@@ -156,7 +156,7 @@ impl RetentionManager {
         // Derived rows are harmless if temporarily orphaned because all reads
         // join back to events, but clean them promptly to reclaim FTS space.
         for _ in 0..100 {
-            match crate::state::sqlite::history_search::remove_orphans(&self.pool, 500).await {
+            match aidaemon_runtime::history::search::remove_orphans(&self.pool, 500).await {
                 Ok(500) => tokio::task::yield_now().await,
                 Ok(_) => break,
                 Err(error) => {

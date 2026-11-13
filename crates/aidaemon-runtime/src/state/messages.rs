@@ -1,7 +1,7 @@
 use super::*;
 
 #[async_trait]
-impl crate::traits::MessageStore for SqliteStateStore {
+impl crate::state::types::MessageStore for SqliteStateStore {
     async fn append_message(&self, msg: &Message) -> anyhow::Result<()> {
         // Canonical persistence is event-sourced (events table). Keep only an
         // in-memory hot window here for low-latency context assembly.
@@ -52,18 +52,18 @@ impl crate::traits::MessageStore for SqliteStateStore {
         &self,
         session_id: &str,
         message_id: &str,
-        annotation: crate::traits::MessageAnnotation,
+        annotation: crate::state::types::MessageAnnotation,
     ) -> anyhow::Result<()> {
         // Stored annotations replace inferred ones, so the first added
         // annotation starts from what would have been inferred.
         fn add(
-            annotations: &mut Vec<crate::traits::MessageAnnotation>,
+            annotations: &mut Vec<crate::state::types::MessageAnnotation>,
             content: Option<&str>,
-            annotation: &crate::traits::MessageAnnotation,
+            annotation: &crate::state::types::MessageAnnotation,
         ) {
             if annotations.is_empty() {
                 *annotations =
-                    crate::traits::infer_message_annotations(content.unwrap_or_default());
+                    crate::state::types::infer_message_annotations(content.unwrap_or_default());
             }
             if !annotations.contains(annotation) {
                 annotations.push(annotation.clone());
@@ -107,7 +107,7 @@ impl crate::traits::MessageStore for SqliteStateStore {
         let event_id: i64 = row.get("id");
         let raw: String = row.get("data");
         let mut data: serde_json::Value = serde_json::from_str(&raw)?;
-        let mut annotations: Vec<crate::traits::MessageAnnotation> = data
+        let mut annotations: Vec<crate::state::types::MessageAnnotation> = data
             .get("annotations")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
@@ -145,7 +145,7 @@ impl crate::traits::MessageStore for SqliteStateStore {
                     // Fall through to DB hydrate path.
                     return self.hydrate(session_id).await.map(|deque| {
                         let msgs: Vec<_> = deque.iter().cloned().collect();
-                        crate::conversation::truncate_with_anchor(msgs, limit)
+                        aidaemon_events::conversation::truncate_with_anchor(msgs, limit)
                     });
                 }
             };
@@ -166,7 +166,7 @@ impl crate::traits::MessageStore for SqliteStateStore {
                 if !deque.is_empty() {
                     let msgs: Vec<_> = deque.iter().cloned().collect();
                     let before_len = msgs.len();
-                    let result = crate::conversation::truncate_with_anchor(msgs, limit);
+                    let result = aidaemon_events::conversation::truncate_with_anchor(msgs, limit);
                     tracing::debug!(
                         session_id,
                         before_truncate = before_len,
@@ -182,7 +182,7 @@ impl crate::traits::MessageStore for SqliteStateStore {
         tracing::debug!(session_id, "get_history: cold start, hydrating from DB");
         let deque = self.hydrate(session_id).await?;
         let msgs: Vec<_> = deque.iter().cloned().collect();
-        let result = crate::conversation::truncate_with_anchor(msgs, limit);
+        let result = aidaemon_events::conversation::truncate_with_anchor(msgs, limit);
         tracing::debug!(
             session_id,
             hydrated_count = deque.len(),

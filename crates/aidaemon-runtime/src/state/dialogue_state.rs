@@ -1,8 +1,8 @@
 use super::*;
-use crate::traits::DialogueState;
+use crate::state::types::DialogueState;
 
 #[async_trait]
-impl crate::traits::DialogueStateStore for SqliteStateStore {
+impl crate::state::types::DialogueStateStore for SqliteStateStore {
     async fn get_dialogue_state(&self, session_id: &str) -> anyhow::Result<Option<DialogueState>> {
         let row = sqlx::query("SELECT state_json FROM dialogue_states WHERE session_id = ?")
             .bind(session_id)

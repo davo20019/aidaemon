@@ -204,7 +204,7 @@ async fn migrate_legacy_messages_to_events(pool: &SqlitePool) -> anyhow::Result<
 pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     // Ensure canonical events schema exists even when only SqliteStateStore is
     // initialized (without EventStore bootstrap).
-    crate::db::migrations::migrate_events(pool).await?;
+    aidaemon_events::schema::migrate_events(pool).await?;
 
     // Long-term memory's tables belong to its store.
     aidaemon_memory::sqlite::migrate(pool).await?;
@@ -555,7 +555,7 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     // Migrate legacy message rows into canonical events and remove the table.
     migrate_legacy_messages_to_events(pool).await?;
 
-    aidaemon_work::schema::migrate_work_tables(pool, crate::cron_utils::is_one_shot_schedule)
+    aidaemon_work::schema::migrate_work_tables(pool, aidaemon_work::schedule::is_one_shot_schedule)
         .await?;
 
     // Token alert detector dedupe/cooldown state.
@@ -1321,7 +1321,7 @@ mod schema_golden_tests {
 
     fn assert_matches_golden(name: &str, actual: &str) {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/state/sqlite/schema_golden")
+            .join("src/state/schema_golden")
             .join(name);
         if std::env::var_os("UPDATE_SCHEMA_GOLDEN").is_some() {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

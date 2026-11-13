@@ -74,6 +74,7 @@ pub mod settings;
 pub mod spawn;
 pub mod spawn_tool;
 pub mod specialists;
+pub mod state;
 pub mod stores;
 pub mod tools;
 pub mod turn;

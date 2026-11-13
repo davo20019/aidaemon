@@ -5,15 +5,15 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 
-pub(crate) use aidaemon_runtime::history::search::*;
+pub(super) use crate::history::search::*;
 
-use crate::traits::{
+use crate::state::types::{
     HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, HistoryToolActivity,
     ProjectionStats, RecentToolTurn, TaskBookends,
 };
 
 #[async_trait]
-impl HistorySearchStore for crate::state::SqliteStateStore {
+impl HistorySearchStore for super::SqliteStateStore {
     async fn history_snapshot_max_event_id(&self) -> anyhow::Result<i64> {
         snapshot_max_event_id(&self.pool()).await
     }

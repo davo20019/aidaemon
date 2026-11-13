@@ -1,11 +1,11 @@
 use super::*;
-use crate::memory::embeddings::EmbeddingService;
-use crate::traits::store_prelude::*;
-use crate::traits::{
+use crate::state::types::store_prelude::*;
+use crate::state::types::FactPrivacy;
+use crate::state::types::{
     BehaviorPattern, DynamicBot, DynamicMcpServer, DynamicSkill, Episode, ErrorSolution, Goal,
     GoalSchedule, Message, Procedure, SkillDraft, TokenUsage,
 };
-use crate::types::FactPrivacy;
+use aidaemon_memory::embeddings::EmbeddingService;
 use aidaemon_memory::encode_embedding;
 use std::sync::Arc;
 
@@ -158,9 +158,10 @@ async fn episode_search_finds_older_than_500_without_counting_a_recall() {
     let query = "distinctive zircon deployment";
     let embedding = store
         .embedding_service
-        .embed(query.to_string())
+        .embed(&[query.to_string()])
         .await
-        .unwrap();
+        .unwrap()
+        .remove(0);
     let blob = aidaemon_memory::encode_embedding(&embedding);
     let old = (chrono::Utc::now() - chrono::Duration::days(3_000)).to_rfc3339();
     let matching_id = sqlx::query(
@@ -218,7 +219,7 @@ async fn episode_search_finds_older_than_500_without_counting_a_recall() {
         .unwrap();
     assert_eq!(recall_count, 1);
 
-    let channel_results = crate::traits::EpisodeStore::get_relevant_episodes_for_channel(
+    let channel_results = crate::state::types::EpisodeStore::get_relevant_episodes_for_channel(
         store.memory(),
         query,
         5,
@@ -591,7 +592,9 @@ async fn test_open_store_migration_skips_preexisting_event_rows() {
     let db_url = format!("sqlite:{}", db_file.path().display());
     let pool = sqlx::SqlitePool::connect(&db_url).await.unwrap();
 
-    crate::db::migrations::migrate_events(&pool).await.unwrap();
+    aidaemon_events::schema::migrate_events(&pool)
+        .await
+        .unwrap();
 
     sqlx::query(
         "CREATE TABLE messages (
@@ -1014,9 +1017,10 @@ async fn test_get_relevant_facts_freshness_boost_affects_sorting() {
     let query = "what is my dog's name?";
     let q = store
         .embedding_service
-        .embed(query.to_string())
+        .embed(&[query.to_string()])
         .await
-        .unwrap();
+        .unwrap()
+        .remove(0);
     let q_norm = (q.iter().map(|x| x * x).sum::<f32>()).sqrt();
     assert!(q_norm > 0.0, "Query embedding norm should be > 0");
     let uq: Vec<f32> = q.iter().map(|x| x / q_norm).collect();
@@ -1106,9 +1110,10 @@ async fn test_get_relevant_facts_freshness_boost_does_not_override_threshold() {
     let query = "what is my dog's name?";
     let q = store
         .embedding_service
-        .embed(query.to_string())
+        .embed(&[query.to_string()])
         .await
-        .unwrap();
+        .unwrap()
+        .remove(0);
     let q_norm = (q.iter().map(|x| x * x).sum::<f32>()).sqrt();
     assert!(q_norm > 0.0);
     let uq: Vec<f32> = q.iter().map(|x| x / q_norm).collect();
@@ -1197,9 +1202,10 @@ async fn test_get_relevant_facts_does_not_pad_with_unrelated_recent_facts() {
     let query = "rust deployment strategy";
     let q = store
         .embedding_service
-        .embed(query.to_string())
+        .embed(&[query.to_string()])
         .await
-        .unwrap();
+        .unwrap()
+        .remove(0);
     let q_norm = (q.iter().map(|x| x * x).sum::<f32>()).sqrt();
     assert!(q_norm > 0.0);
     let uq: Vec<f32> = q.iter().map(|x| x / q_norm).collect();
@@ -1288,9 +1294,10 @@ async fn test_get_relevant_facts_missing_embedding_lexical_can_compete() {
     let query = "what is my dog's name?";
     let q = store
         .embedding_service
-        .embed(query.to_string())
+        .embed(&[query.to_string()])
         .await
-        .unwrap();
+        .unwrap()
+        .remove(0);
     let q_norm = (q.iter().map(|x| x * x).sum::<f32>()).sqrt();
     assert!(q_norm > 0.0);
     let uq: Vec<f32> = q.iter().map(|x| x / q_norm).collect();
@@ -1385,9 +1392,10 @@ async fn test_get_relevant_facts_lexical_value_matching_uses_word_boundaries() {
     let query = "dog";
     let q = store
         .embedding_service
-        .embed(query.to_string())
+        .embed(&[query.to_string()])
         .await
-        .unwrap();
+        .unwrap()
+        .remove(0);
     let q_norm = (q.iter().map(|x| x * x).sum::<f32>()).sqrt();
     assert!(q_norm > 0.0);
     let uq: Vec<f32> = q.iter().map(|x| x / q_norm).collect();
@@ -2089,19 +2097,23 @@ async fn test_token_usage_since_filter() {
 async fn setup_mandate_token_budget_run(
     store: &SqliteStateStore,
     budget_per_cycle: i64,
-) -> (Goal, crate::traits::Mandate, crate::traits::GoalRun) {
+) -> (
+    Goal,
+    crate::state::types::Mandate,
+    crate::state::types::GoalRun,
+) {
     let goal = Goal::new_continuous(
         "Exercise one aggregate mandate token budget",
         "owner-budget-session",
         Some(budget_per_cycle),
         Some(budget_per_cycle.saturating_mul(10)),
     );
-    let mandate = crate::traits::Mandate::new(
+    let mandate = crate::state::types::Mandate::new(
         &goal.id,
         None,
         "Bound every worker in this decision cycle",
         &goal.session_id,
-        crate::traits::MandateAuthority::default(),
+        crate::state::types::MandateAuthority::default(),
         60,
         3_600,
         300,
@@ -2532,7 +2544,7 @@ async fn test_oauth_connection_crud() {
     let (store, _tmp) = setup_test_store().await;
 
     // Insert
-    let conn = crate::traits::OAuthConnection {
+    let conn = crate::state::types::OAuthConnection {
         id: 0,
         service: "twitter".to_string(),
         auth_type: "oauth2_pkce".to_string(),
@@ -2593,7 +2605,7 @@ async fn test_oauth_connection_crud() {
     );
 
     // Upsert (same service, different data)
-    let conn2 = crate::traits::OAuthConnection {
+    let conn2 = crate::state::types::OAuthConnection {
         id: 0,
         service: "twitter".to_string(),
         auth_type: "oauth2_pkce".to_string(),
@@ -2639,7 +2651,7 @@ async fn test_oauth_connection_not_found() {
 async fn test_pending_oauth_flow_crud() {
     let (store, _tmp) = setup_test_store().await;
 
-    let flow = crate::traits::PendingOAuthFlow {
+    let flow = crate::state::types::PendingOAuthFlow {
         state: "state-123".to_string(),
         service: "twitter".to_string(),
         code_verifier: Some("verifier-abc".to_string()),
@@ -2681,7 +2693,7 @@ async fn test_dynamic_cli_agent_crud() {
     assert!(agents.is_empty());
 
     // Save a new agent
-    let agent = crate::traits::DynamicCliAgent {
+    let agent = crate::state::types::DynamicCliAgent {
         id: 0,
         name: "test-agent".to_string(),
         command: "echo".to_string(),
@@ -2726,7 +2738,7 @@ async fn test_dynamic_cli_agent_crud() {
 async fn test_dynamic_cli_agent_upsert() {
     let (store, _db) = setup_test_store().await;
 
-    let agent = crate::traits::DynamicCliAgent {
+    let agent = crate::state::types::DynamicCliAgent {
         id: 0,
         name: "upsert-agent".to_string(),
         command: "echo".to_string(),
@@ -2740,7 +2752,7 @@ async fn test_dynamic_cli_agent_upsert() {
     store.save_dynamic_cli_agent(&agent).await.unwrap();
 
     // Save again with same name — should upsert
-    let agent2 = crate::traits::DynamicCliAgent {
+    let agent2 = crate::state::types::DynamicCliAgent {
         id: 0,
         name: "upsert-agent".to_string(),
         command: "bash".to_string(),
@@ -2896,7 +2908,7 @@ async fn test_goals_crud() {
     let (store, _file) = setup_test_store().await;
 
     // Create
-    let goal = crate::traits::Goal::new_finite("Build a website", "session_1");
+    let goal = crate::state::types::Goal::new_finite("Build a website", "session_1");
     store.create_goal(&goal).await.unwrap();
 
     // Get
@@ -2925,9 +2937,9 @@ async fn test_goals_crud() {
 async fn test_goals_session_filter() {
     let (store, _file) = setup_test_store().await;
 
-    let goal1 = crate::traits::Goal::new_finite("Task A", "session_1");
-    let goal2 = crate::traits::Goal::new_finite("Task B", "session_2");
-    let goal3 = crate::traits::Goal::new_finite("Task C", "session_1");
+    let goal1 = crate::state::types::Goal::new_finite("Task A", "session_1");
+    let goal2 = crate::state::types::Goal::new_finite("Task B", "session_2");
+    let goal3 = crate::state::types::Goal::new_finite("Task C", "session_1");
 
     store.create_goal(&goal1).await.unwrap();
     store.create_goal(&goal2).await.unwrap();
@@ -2946,11 +2958,11 @@ async fn test_tasks_crud() {
     let (store, _file) = setup_test_store().await;
 
     // Create parent goal first (FK)
-    let goal = crate::traits::Goal::new_finite("Parent goal", "session_1");
+    let goal = crate::state::types::Goal::new_finite("Parent goal", "session_1");
     store.create_goal(&goal).await.unwrap();
 
     let now = chrono::Utc::now().to_rfc3339();
-    let task = crate::traits::Task {
+    let task = crate::state::types::Task {
         id: uuid::Uuid::new_v4().to_string(),
         goal_id: goal.id.clone(),
         description: "Step 1: create files".to_string(),
@@ -2998,7 +3010,7 @@ async fn test_tasks_crud() {
 #[tokio::test]
 async fn implicit_goal_run_does_not_infer_a_root_from_creation_order() {
     let (store, _file) = setup_test_store().await;
-    let goal = crate::traits::Goal::new_continuous(
+    let goal = crate::state::types::Goal::new_continuous(
         "Synthetic recurring work",
         "synthetic-owner-session",
         Some(10_000),
@@ -3006,7 +3018,7 @@ async fn implicit_goal_run_does_not_infer_a_root_from_creation_order() {
     );
     store.create_goal(&goal).await.unwrap();
 
-    let task = crate::traits::Task {
+    let task = crate::state::types::Task {
         id: uuid::Uuid::new_v4().to_string(),
         goal_id: goal.id.clone(),
         description: "Recover the current synthetic run".to_string(),
@@ -3047,10 +3059,10 @@ async fn implicit_goal_run_does_not_infer_a_root_from_creation_order() {
 #[tokio::test]
 async fn generic_task_update_cannot_bypass_human_unblock_transition() {
     let (store, _file) = setup_test_store().await;
-    let goal = crate::traits::Goal::new_finite("Parent goal", "session_1");
+    let goal = crate::state::types::Goal::new_finite("Parent goal", "session_1");
     store.create_goal(&goal).await.unwrap();
     let now = chrono::Utc::now().to_rfc3339();
-    let task = crate::traits::Task {
+    let task = crate::state::types::Task {
         id: uuid::Uuid::new_v4().to_string(),
         goal_id: goal.id.clone(),
         description: "Blocked work".to_string(),
@@ -3088,10 +3100,10 @@ async fn generic_task_update_cannot_bypass_human_unblock_transition() {
 #[tokio::test]
 async fn migration_repairs_completed_task_overwritten_after_blocked_attempt() {
     let (store, _file) = setup_test_store().await;
-    let goal = crate::traits::Goal::new_finite("Parent goal", "session_1");
+    let goal = crate::state::types::Goal::new_finite("Parent goal", "session_1");
     store.create_goal(&goal).await.unwrap();
     let now = chrono::Utc::now().to_rfc3339();
-    let task = crate::traits::Task {
+    let task = crate::state::types::Task {
         id: uuid::Uuid::new_v4().to_string(),
         goal_id: goal.id.clone(),
         description: "Inspect deployment tooling".to_string(),
@@ -3122,7 +3134,7 @@ async fn migration_repairs_completed_task_overwritten_after_blocked_attempt() {
         .patch_task_from_attempt(
             &attempt.id,
             &attempt.lease_token,
-            &crate::traits::TaskAttemptPatch {
+            &crate::state::types::TaskAttemptPatch {
                 status: "blocked".to_string(),
                 blocker: Some("Preflight did not run".to_string()),
                 ..Default::default()
@@ -3151,11 +3163,11 @@ async fn migration_repairs_completed_task_overwritten_after_blocked_attempt() {
 async fn test_claim_task() {
     let (store, _file) = setup_test_store().await;
 
-    let goal = crate::traits::Goal::new_finite("Goal", "session_1");
+    let goal = crate::state::types::Goal::new_finite("Goal", "session_1");
     store.create_goal(&goal).await.unwrap();
 
     let now = chrono::Utc::now().to_rfc3339();
-    let task = crate::traits::Task {
+    let task = crate::state::types::Task {
         id: uuid::Uuid::new_v4().to_string(),
         goal_id: goal.id.clone(),
         description: "Claimable task".to_string(),
@@ -3196,11 +3208,11 @@ async fn test_claim_task() {
 async fn test_task_activity_log() {
     let (store, _file) = setup_test_store().await;
 
-    let goal = crate::traits::Goal::new_finite("Goal", "session_1");
+    let goal = crate::state::types::Goal::new_finite("Goal", "session_1");
     store.create_goal(&goal).await.unwrap();
 
     let now = chrono::Utc::now().to_rfc3339();
-    let task = crate::traits::Task {
+    let task = crate::state::types::Task {
         id: uuid::Uuid::new_v4().to_string(),
         goal_id: goal.id.clone(),
         description: "Task".to_string(),
@@ -3224,7 +3236,7 @@ async fn test_task_activity_log() {
     store.create_task(&task).await.unwrap();
 
     // Log activity
-    let activity = crate::traits::TaskActivity {
+    let activity = crate::state::types::TaskActivity {
         id: 0,
         task_id: task.id.clone(),
         activity_type: "tool_call".to_string(),
@@ -3250,10 +3262,10 @@ async fn test_task_activity_log() {
 /// Create a fresh goal + a `running` task with `started_at` set `started_secs_ago`
 /// seconds in the past. Each call makes its own goal (FK parent).
 async fn wd_create_running_task(store: &SqliteStateStore, task_id: &str, started_secs_ago: i64) {
-    let goal = crate::traits::Goal::new_finite("wd-goal", "wd-sess");
+    let goal = crate::state::types::Goal::new_finite("wd-goal", "wd-sess");
     store.create_goal(&goal).await.unwrap();
     let started = (chrono::Utc::now() - chrono::Duration::seconds(started_secs_ago)).to_rfc3339();
-    let task = crate::traits::Task {
+    let task = crate::state::types::Task {
         id: task_id.to_string(),
         goal_id: goal.id.clone(),
         description: "wd".to_string(),
@@ -3282,7 +3294,7 @@ async fn log_task_activity_normalizes_created_at_to_sqlite_datetime() {
     let (store, _file) = setup_test_store().await;
     wd_create_running_task(&store, "t-norm", 0).await;
 
-    let activity = crate::traits::TaskActivity {
+    let activity = crate::state::types::TaskActivity {
         id: 0,
         task_id: "t-norm".to_string(),
         activity_type: "tool".to_string(),
@@ -3337,7 +3349,7 @@ async fn migration_normalizes_legacy_rfc3339_task_activity_rows() {
 /// so it goes through the same `datetime(?)` write normalization as production).
 async fn wd_log_activity(store: &SqliteStateStore, task_id: &str, secs_ago: i64) {
     let created = (chrono::Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339();
-    let activity = crate::traits::TaskActivity {
+    let activity = crate::state::types::TaskActivity {
         id: 0,
         task_id: task_id.to_string(),
         activity_type: "tool_call".to_string(),
@@ -3396,7 +3408,7 @@ async fn stuck_query_timeout_zero_selects_all_running_for_startup_recovery() {
 async fn test_notification_queue_enqueue_and_fetch() {
     let (store, _file) = setup_test_store().await;
 
-    let entry = crate::traits::NotificationEntry::new(
+    let entry = crate::state::types::NotificationEntry::new(
         "goal-1",
         "session-1",
         "completed",
@@ -3417,7 +3429,7 @@ async fn test_notification_queue_enqueue_and_fetch() {
 async fn test_notification_queue_status_update_has_expiry() {
     let (store, _file) = setup_test_store().await;
 
-    let entry = crate::traits::NotificationEntry::new(
+    let entry = crate::state::types::NotificationEntry::new(
         "goal-1",
         "session-1",
         "progress",
@@ -3436,7 +3448,7 @@ async fn test_notification_queue_status_update_has_expiry() {
 async fn test_notification_queue_mark_delivered() {
     let (store, _file) = setup_test_store().await;
 
-    let entry = crate::traits::NotificationEntry::new(
+    let entry = crate::state::types::NotificationEntry::new(
         "goal-1",
         "session-1",
         "failed",
@@ -3457,13 +3469,17 @@ async fn test_notification_queue_priority_ordering() {
     let (store, _file) = setup_test_store().await;
 
     // Enqueue status_update first
-    let status =
-        crate::traits::NotificationEntry::new("goal-1", "session-1", "progress", "Progress update");
+    let status = crate::state::types::NotificationEntry::new(
+        "goal-1",
+        "session-1",
+        "progress",
+        "Progress update",
+    );
     store.enqueue_notification(&status).await.unwrap();
 
     // Enqueue critical second
     let critical =
-        crate::traits::NotificationEntry::new("goal-2", "session-1", "failed", "Goal failed");
+        crate::state::types::NotificationEntry::new("goal-2", "session-1", "failed", "Goal failed");
     store.enqueue_notification(&critical).await.unwrap();
 
     let pending = store.get_pending_notifications(10).await.unwrap();
@@ -3480,29 +3496,37 @@ async fn test_notification_queue_does_not_starve_recent_entries() {
     let now = chrono::Utc::now();
 
     let mut exhausted =
-        crate::traits::NotificationEntry::new(goal_id, "stale-session", "token_alert", "old");
+        crate::state::types::NotificationEntry::new(goal_id, "stale-session", "token_alert", "old");
     exhausted.created_at = (now - chrono::Duration::minutes(30)).to_rfc3339();
     exhausted.attempts = 10;
     store.enqueue_notification(&exhausted).await.unwrap();
 
-    let mut exhausted_status =
-        crate::traits::NotificationEntry::new(goal_id, "status-session", "progress", "old status");
+    let mut exhausted_status = crate::state::types::NotificationEntry::new(
+        goal_id,
+        "status-session",
+        "progress",
+        "old status",
+    );
     exhausted_status.created_at = now.to_rfc3339();
     exhausted_status.attempts = 10;
     store.enqueue_notification(&exhausted_status).await.unwrap();
 
     let mut stale =
-        crate::traits::NotificationEntry::new(goal_id, "stale-session", "progress", "stale");
+        crate::state::types::NotificationEntry::new(goal_id, "stale-session", "progress", "stale");
     stale.created_at = (now - chrono::Duration::days(2)).to_rfc3339();
     store.enqueue_notification(&stale).await.unwrap();
 
     let mut earlier =
-        crate::traits::NotificationEntry::new(goal_id, "old-session", "token_alert", "old");
+        crate::state::types::NotificationEntry::new(goal_id, "old-session", "token_alert", "old");
     earlier.created_at = (now - chrono::Duration::hours(1)).to_rfc3339();
     store.enqueue_notification(&earlier).await.unwrap();
 
-    let mut recent =
-        crate::traits::NotificationEntry::new(goal_id, "recent-session", "token_alert", "recent");
+    let mut recent = crate::state::types::NotificationEntry::new(
+        goal_id,
+        "recent-session",
+        "token_alert",
+        "recent",
+    );
     recent.created_at = now.to_rfc3339();
     store.enqueue_notification(&recent).await.unwrap();
 
@@ -3520,14 +3544,22 @@ async fn test_notification_queue_does_not_starve_recent_entries() {
 async fn test_notification_queue_normalizes_mixed_timestamp_formats() {
     let (store, _file) = setup_test_store().await;
 
-    let mut older =
-        crate::traits::NotificationEntry::new("goal-mixed-time", "session-1", "failed", "older");
+    let mut older = crate::state::types::NotificationEntry::new(
+        "goal-mixed-time",
+        "session-1",
+        "failed",
+        "older",
+    );
     older.id = "older-rfc3339".to_string();
     older.created_at = "2026-07-30T12:00:00Z".to_string();
     store.enqueue_notification(&older).await.unwrap();
 
-    let mut newer =
-        crate::traits::NotificationEntry::new("goal-mixed-time", "session-1", "failed", "newer");
+    let mut newer = crate::state::types::NotificationEntry::new(
+        "goal-mixed-time",
+        "session-1",
+        "failed",
+        "newer",
+    );
     newer.id = "newer-sqlite".to_string();
     newer.created_at = "2026-07-30 13:00:00".to_string();
     store.enqueue_notification(&newer).await.unwrap();
@@ -3545,10 +3577,18 @@ async fn test_goal_notification_claim_is_atomic_and_single_writer() {
     goal.id = "goal-atomic-notification".to_string();
     store.create_goal(&goal).await.unwrap();
 
-    let first =
-        crate::traits::NotificationEntry::new(&goal.id, &goal.session_id, "completed", "first");
-    let second =
-        crate::traits::NotificationEntry::new(&goal.id, &goal.session_id, "completed", "second");
+    let first = crate::state::types::NotificationEntry::new(
+        &goal.id,
+        &goal.session_id,
+        "completed",
+        "first",
+    );
+    let second = crate::state::types::NotificationEntry::new(
+        &goal.id,
+        &goal.session_id,
+        "completed",
+        "second",
+    );
 
     let (first_result, second_result) = tokio::join!(
         store.enqueue_goal_notification(&first),
@@ -3574,7 +3614,7 @@ async fn test_goal_notification_enqueue_failure_rolls_back_claim() {
     goal.id = "goal-rollback-notification".to_string();
     store.create_goal(&goal).await.unwrap();
 
-    let blocker = crate::traits::NotificationEntry::new(
+    let blocker = crate::state::types::NotificationEntry::new(
         "different-goal",
         "session-1",
         "completed",
@@ -3582,7 +3622,7 @@ async fn test_goal_notification_enqueue_failure_rolls_back_claim() {
     );
     store.enqueue_notification(&blocker).await.unwrap();
 
-    let mut conflicting = crate::traits::NotificationEntry::new(
+    let mut conflicting = crate::state::types::NotificationEntry::new(
         &goal.id,
         &goal.session_id,
         "completed",
@@ -3595,8 +3635,12 @@ async fn test_goal_notification_enqueue_failure_rolls_back_claim() {
     assert!(stored_goal.notified_at.is_none());
     assert_eq!(stored_goal.notification_attempts, 0);
 
-    let valid =
-        crate::traits::NotificationEntry::new(&goal.id, &goal.session_id, "completed", "valid");
+    let valid = crate::state::types::NotificationEntry::new(
+        &goal.id,
+        &goal.session_id,
+        "completed",
+        "valid",
+    );
     assert!(store.enqueue_goal_notification(&valid).await.unwrap());
 }
 
@@ -3605,15 +3649,19 @@ async fn test_notification_queue_cleanup_expired() {
     let (store, _file) = setup_test_store().await;
 
     // Insert a notification with an already-expired expires_at
-    let mut entry =
-        crate::traits::NotificationEntry::new("goal-1", "session-1", "stalled", "Goal stalled");
+    let mut entry = crate::state::types::NotificationEntry::new(
+        "goal-1",
+        "session-1",
+        "stalled",
+        "Goal stalled",
+    );
     // Set expires_at to the past
     entry.expires_at = Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
     store.enqueue_notification(&entry).await.unwrap();
 
     // Also insert a non-expired critical notification
     let critical =
-        crate::traits::NotificationEntry::new("goal-2", "session-1", "failed", "Goal failed");
+        crate::state::types::NotificationEntry::new("goal-2", "session-1", "failed", "Goal failed");
     store.enqueue_notification(&critical).await.unwrap();
 
     // Cleanup should remove the expired one
@@ -3630,8 +3678,12 @@ async fn test_notification_queue_cleanup_expired() {
 async fn test_notification_queue_increment_attempt() {
     let (store, _file) = setup_test_store().await;
 
-    let entry =
-        crate::traits::NotificationEntry::new("goal-1", "session-1", "completed", "Goal done");
+    let entry = crate::state::types::NotificationEntry::new(
+        "goal-1",
+        "session-1",
+        "completed",
+        "Goal done",
+    );
     store.enqueue_notification(&entry).await.unwrap();
 
     store
@@ -3921,12 +3973,12 @@ async fn test_migrate_balanced_mandates_to_cadence_funded_capacity_only() {
         Some(100_000),
         Some(1_000_000),
     );
-    let managed = crate::traits::Mandate::new(
+    let managed = crate::state::types::Mandate::new(
         &managed_goal.id,
         None,
         "Review a synthetic managed source",
         "owner-session",
-        crate::traits::MandateAuthority::default(),
+        crate::state::types::MandateAuthority::default(),
         900,
         21_600,
         3_600,
@@ -3942,12 +3994,12 @@ async fn test_migrate_balanced_mandates_to_cadence_funded_capacity_only() {
         Some(30_000),
         Some(720_000),
     );
-    let mut custom = crate::traits::Mandate::new(
+    let mut custom = crate::state::types::Mandate::new(
         &custom_goal.id,
         None,
         "Review a synthetic custom source",
         "owner-session",
-        crate::traits::MandateAuthority::default(),
+        crate::state::types::MandateAuthority::default(),
         900,
         21_600,
         3_600,
@@ -4742,14 +4794,18 @@ async fn reopening_store_closes_inactive_legacy_continuous_runs() {
 async fn completing_a_task_refreshes_goal_last_useful_action() {
     let (store, _tmp) = setup_test_store().await;
 
-    let mut goal =
-        crate::traits::Goal::new_continuous("daily tweet", "session-1", Some(5000), Some(500_000));
+    let mut goal = crate::state::types::Goal::new_continuous(
+        "daily tweet",
+        "session-1",
+        Some(5000),
+        Some(500_000),
+    );
     let stale = "2026-01-01T00:00:00+00:00".to_string();
     goal.last_useful_action = Some(stale.clone());
     store.create_goal(&goal).await.unwrap();
 
     let now_ts = chrono::Utc::now().to_rfc3339();
-    let mut task = crate::traits::Task {
+    let mut task = crate::state::types::Task {
         id: uuid::Uuid::new_v4().to_string(),
         goal_id: goal.id.clone(),
         description: "do the thing".to_string(),
@@ -5097,7 +5153,12 @@ async fn fold_restated_facts_keeps_the_most_authoritative_copy() {
         ("database_engine", "PostgreSQL 16", "progressive", 0),
     ] {
         let text = aidaemon_memory::sqlite::build_fact_embedding_text("project", key, value);
-        let vector = store.embedding_service.embed(text).await.unwrap();
+        let vector = store
+            .embedding_service
+            .embed(&[text])
+            .await
+            .unwrap()
+            .remove(0);
         sqlx::query(
             "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, privacy, embedding)
              VALUES ('project', ?, ?, ?, ?, ?, ?, 'channel', ?)",

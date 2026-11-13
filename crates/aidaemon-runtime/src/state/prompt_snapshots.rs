@@ -1,7 +1,7 @@
 use super::*;
 
 #[async_trait]
-impl crate::traits::PromptSnapshotStore for SqliteStateStore {
+impl crate::state::types::PromptSnapshotStore for SqliteStateStore {
     async fn save_prompt_snapshot(&self, hash: &str, content: &str) -> anyhow::Result<()> {
         const MAX_PROMPT_SNAPSHOTS: i64 = 500;
         sqlx::query(

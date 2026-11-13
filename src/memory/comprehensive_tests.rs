@@ -16,7 +16,7 @@
 //! M. Context window (additional edge cases)
 
 use crate::memory::embeddings::EmbeddingService;
-use crate::state::sqlite::SqliteStateStore;
+use crate::state::SqliteStateStore;
 use crate::traits::store_prelude::*;
 use crate::traits::{BehaviorPattern, Episode, ErrorSolution, Person, Procedure};
 use crate::types::FactPrivacy;

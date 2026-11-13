@@ -273,7 +273,7 @@ pub(crate) async fn init_heartbeat_coordinator(
                 let pool = history_projection_pool.clone();
                 async move {
                     let stats =
-                        crate::state::sqlite::history_search::repair_and_backfill(&pool, 4).await?;
+                        aidaemon_runtime::history::search::repair_and_backfill(&pool, 4).await?;
                     if stats.projected > 0
                         || stats.orphans_removed > 0
                         || stats.fts_rebuilt

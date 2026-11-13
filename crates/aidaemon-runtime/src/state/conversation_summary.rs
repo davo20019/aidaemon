@@ -1,7 +1,7 @@
 use super::*;
 
 #[async_trait]
-impl crate::traits::ConversationSummaryStore for SqliteStateStore {
+impl crate::state::types::ConversationSummaryStore for SqliteStateStore {
     async fn get_conversation_summary(
         &self,
         session_id: &str,
