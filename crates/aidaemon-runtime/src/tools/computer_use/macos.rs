@@ -19,7 +19,7 @@ use xcap::image::imageops::FilterType;
 use xcap::image::RgbaImage;
 use xcap::Window;
 
-use crate::config::ComputerUseConfig;
+use crate::settings::ComputerUseConfig;
 
 use super::cache::{SnapshotCache, SnapshotKey};
 use super::harness::{ComputerHarness, HarnessRequestContext};

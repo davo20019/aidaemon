@@ -127,7 +127,7 @@ async fn make_terminal_with_hub(
             pool,
         )
         .await
-        .with_state(state.clone() as Arc<dyn StateStore>)
+        .with_stores(state.clone(), state.clone())
         .with_delivery_dirs(inbox_dir, outbox_dirs),
     );
 

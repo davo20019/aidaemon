@@ -243,12 +243,12 @@ impl Prompts {
                     .await?;
             }
             channel
-                .ask(&ApprovalPrompt {
-                    id: id.clone(),
-                    conversation: conversation.clone(),
-                    text: last.clone(),
+                .ask(&ApprovalPrompt::new(
+                    id.clone(),
+                    conversation.clone(),
+                    last.clone(),
                     choices,
-                })
+                ))
                 .await
         }
         .await;

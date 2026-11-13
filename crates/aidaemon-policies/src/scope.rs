@@ -98,7 +98,12 @@ impl ScopeGuard {
     /// The decision for one call, without a hook context.
     pub fn decide(&self, tool_name: &str, info: &ToolInfo) -> ToolDecision {
         if info.access.is_empty() {
-            if self.path_free.contains(tool_name) {
+            // Named path-free, or a call that may change things whose
+            // effects vouch it changes no path. (Effects say nothing about
+            // reads, and a read-only call's default effects are empty, so
+            // they never vouch for a read.)
+            let writes_no_paths = !info.annotations.read_only && info.effects.touches_no_paths();
+            if self.path_free.contains(tool_name) || writes_no_paths {
                 return ToolDecision::Allow;
             }
             let policy = if info.annotations.read_only {

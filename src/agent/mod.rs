@@ -83,17 +83,18 @@ mod policy_signals {
 #[cfg(test)]
 use policy_signals::is_short_user_correction;
 /// Validation state lives in `aidaemon-runtime`.
+#[cfg(test)]
 mod validation_state {
     pub(crate) use aidaemon_runtime::turn::validation_state::*;
 }
-pub(crate) use validation_state::{
-    derive_executor_step_result, persist_executor_handoff_context, persist_executor_result_context,
-    ExecutorHandoff, TaskValidationOutcome,
-};
+#[cfg(test)]
+pub(crate) use validation_state::{persist_executor_handoff_context, ExecutorHandoff};
+#[cfg(test)]
 #[path = "turn/execution_state.rs"]
 mod execution_state;
 #[cfg(test)]
 pub(crate) use execution_state::ExecutionBudget;
+#[cfg(test)]
 pub(crate) use execution_state::TargetScope;
 /// The post-run learning context lives in `aidaemon-runtime`.
 mod post_task {

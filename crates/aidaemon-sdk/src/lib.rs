@@ -17,13 +17,22 @@
 //! | [`eval`] | `eval` | YAML scenarios, N-of-M pass rates, baseline comparison |
 //! | [`memory`] | `memory` (+ `fastembed`) | Long-term memory: facts, episodes, hybrid recall; every part swappable |
 //! | [`events`] | `events` | The immutable event store, its payloads and the run aggregate |
-//! | [`work`] | `work` | Goals, mandates, tasks, work coordination and notifications, with their SQLite store |
+//! | [`work`] | `work` | **Internal, unstable:** the daemon's goals, mandates, tasks and notifications. Not for applications; schedule your own work with [`ServiceHost`] |
 //! | [`channels`] | `channels` | The `Channel` contract and the runner that connects channels to agents |
 //! | [`channels::telegram`], [`channels::slack`], [`channels::discord`] | `telegram`, `slack`, `discord` | Built-in channel adapters |
-//! | [`testing`] | `testing` | Scripted provider for tests; the shared behavior suite (`testing::behavior`) |
+//! | `channels::conformance` | `conformance` | The channel conformance kit, for your own adapter's tests |
+//! | [`secrets`] | `secrets` | Where an agent keeps its secrets: the `SecretStore` trait, the OS keychain, an env file, an in-memory store |
+//! | [`testing`] | `testing` | Scripted provider for tests (and Tokio's `test-util`, for paused time); the shared behavior suite (`testing::behavior`) |
 //! | [`tool`] | `macros` (default) | `#[tool]`: a tool from a plain function, schema derived |
 //! | [`mod@preset`] | `providers` + `policies` (default) | A short start: provider, safeguards, store and default tools in a few lines |
 //! | [`structured`] | always | Typed output: a model call or an agent's final answer as your type, one repair retry |
+//!
+//! Background work is in the kernel, at the crate root: a [`Service`]
+//! states its [`Schedule`] (every so often, every tick, continuously, or
+//! daily at a UTC time) and a [`ServiceHost`] runs it, with backoff after
+//! failures, one run at a time per service, and one [`ServiceEvent::Ended`]
+//! per run (its number, outcome and duration) for a [`ServiceObserver`].
+//! The `scheduled_worker` example drives an agent from one.
 //!
 //! ```no_run
 //! # #[cfg(all(feature = "providers", feature = "tools", feature = "policies"))]
@@ -185,6 +194,11 @@ pub use aidaemon_work as work;
 pub mod channels {
     pub use aidaemon_channels::*;
 
+    /// The typed status a channel can render natively: helper runs, plan
+    /// cards and steps ([`card`]), drawn as text by
+    /// [`live_status::render_card`].
+    pub use aidaemon_core::card;
+
     #[cfg(feature = "discord")]
     pub use aidaemon_channel_discord as discord;
     #[cfg(feature = "slack")]
@@ -196,13 +210,17 @@ pub mod channels {
 /// The names most agents need, plus the enabled modules.
 pub mod prelude {
     pub use aidaemon_core::{
-        Agent, AgentBuilder, Event, Hook, HookContext, Limits, Message, Provider, Resolution,
-        RunOutcome, RunState, RunStatus, StopDecision, Tool, ToolAnnotations, ToolContext,
-        ToolDecision, ToolInfo, ToolOutput, ToolResult, ToolSpec,
+        Agent, AgentBuilder, CallResult, Event, Hook, HookContext, Limits, Message, Provider,
+        Receipt, ReceiptStatus, Resolution, Role, RunOutcome, RunState, RunStatus, SourceTrust,
+        StopDecision, Tool, ToolAnnotations, ToolCall, ToolContext, ToolDecision, ToolError,
+        ToolInfo, ToolOutput, ToolResult, ToolSpec,
     };
 
     #[cfg(feature = "macros")]
     pub use crate::tool;
+
+    #[cfg(all(feature = "providers", feature = "policies"))]
+    pub use crate::preset::{preset, Preset, PresetError};
 
     #[cfg(feature = "agents")]
     pub use crate::agents;

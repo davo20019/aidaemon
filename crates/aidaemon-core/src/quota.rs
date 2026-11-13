@@ -138,6 +138,10 @@ impl Provider for QuotaGuard {
         self.inner.name()
     }
 
+    fn default_model(&self) -> Option<&str> {
+        self.inner.default_model()
+    }
+
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
         if let Some(error) = self.blocked(&request.model) {
             return Err(error);

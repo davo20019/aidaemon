@@ -314,6 +314,7 @@ impl EventSink for OtelSink {
                 status,
                 usage,
                 turns,
+                ..
             } => {
                 let mut run = runs.remove(&run_id).unwrap_or_default();
                 let failed = !matches!(

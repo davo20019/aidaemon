@@ -230,6 +230,13 @@ pub trait Provider: Send + Sync {
     fn unavailable_until(&self, _model: &str) -> Option<std::time::SystemTime> {
         None
     }
+
+    /// The model to use when the agent names none. `None` (the default)
+    /// means the agent must name one with [`crate::AgentBuilder::model`];
+    /// a provider that serves one model, or a test double, says which.
+    fn default_model(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Drain a stream into its final response. Useful for implementing
@@ -265,6 +272,9 @@ impl<P: Provider + ?Sized> Provider for std::sync::Arc<P> {
     // daemon's model backends) reported a used-up model as available.
     fn unavailable_until(&self, model: &str) -> Option<std::time::SystemTime> {
         (**self).unavailable_until(model)
+    }
+    fn default_model(&self) -> Option<&str> {
+        (**self).default_model()
     }
 }
 
@@ -311,6 +321,9 @@ impl<P: Provider> Provider for Retry<P> {
     }
     fn unavailable_until(&self, model: &str) -> Option<std::time::SystemTime> {
         self.inner.unavailable_until(model)
+    }
+    fn default_model(&self) -> Option<&str> {
+        self.inner.default_model()
     }
 
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {

@@ -9,7 +9,9 @@ pub enum BuildError {
     EmptyAgentId,
     #[error("no provider configured")]
     MissingProvider,
-    #[error("no model configured")]
+    /// No [`crate::AgentBuilder::model`], and the provider has no
+    /// [`crate::Provider::default_model`].
+    #[error("no model configured: call `.model(..)` (the provider names no default model)")]
     MissingModel,
     #[error("duplicate tool name `{0}`")]
     DuplicateTool(String),

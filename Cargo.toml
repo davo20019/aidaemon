@@ -161,9 +161,7 @@ aidaemon-runtime = { version = "=0.2.0", path = "crates/aidaemon-runtime" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tikv-jemallocator = "0.7"
-axuielement = { version = "0.10", optional = true }
 xcap = { version = "0.9", optional = true }
-enigo = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.7"
@@ -176,10 +174,11 @@ slack = ["dep:aidaemon-channel-slack"]
 execution-docker = ["aidaemon-tools/docker"]
 terminal-bridge = ["dep:aidaemon-terminal-bridge"]
 encryption = ["libsqlite3-sys/bundled-sqlcipher"]
-computer_use = []
+computer_use = ["aidaemon-runtime/computer_use"]
 # Export runs to an OTLP backend when `[telemetry]` names one.
 otel = ["aidaemon-policies/otel", "dep:opentelemetry_sdk"]
-computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo"]
+# The probe binary reads the window list itself (xcap).
+computer_use-macos = ["computer_use", "aidaemon-runtime/computer_use-macos", "dep:xcap"]
 # The aidaemon-memory crate as the memory plugin for agent turns.
 sdk-memory = ["aidaemon-memory/fastembed"]
 

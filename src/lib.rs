@@ -3,7 +3,7 @@
 mod agent;
 mod agent_handoff;
 mod channels;
-mod cli_agent_flags;
+use aidaemon_tools::cli_agent_flags;
 mod config;
 mod context_budget;
 mod conversation;
@@ -12,7 +12,6 @@ use aidaemon_work::schedule as cron_utils;
 mod daemon;
 mod dashboard;
 mod db;
-use aidaemon_tools::duration_format;
 #[allow(dead_code)]
 mod events;
 mod otel_export;
@@ -45,7 +44,6 @@ pub mod nodes;
 mod oauth;
 #[allow(unused_imports)]
 use aidaemon_work::plans;
-mod project_instructions;
 mod providers;
 use aidaemon_channels::queue::policy as queue_policy;
 use aidaemon_channels::queue::telemetry as queue_telemetry;
@@ -1089,17 +1087,7 @@ fn run_chatgpt_logout() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn normalize_terminal_agent_name(raw: &str) -> Option<&'static str> {
-    let normalized = raw.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "codex" => Some("codex"),
-        "claude" => Some("claude"),
-        "gemini" => Some("gemini"),
-        "opencode" => Some("opencode"),
-        _ => None,
-    }
-}
-
+pub(crate) use aidaemon_tools::cli_agent_flags::terminal_agent_name as normalize_terminal_agent_name;
 pub(crate) use aidaemon_tools::permission_bypass::normalize_terminal_agent_permission_aliases;
 
 fn parse_terminal_agent_launch_args(

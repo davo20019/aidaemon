@@ -128,11 +128,18 @@ pub enum Event {
         status: RunStatus,
         usage: Usage,
         turns: u32,
+        /// How long the run took, summed across resumes, on the runtime's
+        /// clock (see [`crate::RunOutcome::elapsed`]).
+        #[serde(default)]
+        elapsed_ms: u64,
     },
 }
 
 /// Receives events synchronously as they happen. Keep it cheap; forward to a
-/// channel if the consumer is slow.
+/// channel if the consumer is slow. Events carry no timestamps: a sink is
+/// called the moment each happens, so it stamps them with whatever clock it
+/// keeps (receipts carry each call's `duration_ms`, and
+/// [`Event::Finished`] the run's `elapsed_ms`).
 pub trait EventSink: Send + Sync {
     fn emit(&self, run_id: RunId, event: &Event);
 

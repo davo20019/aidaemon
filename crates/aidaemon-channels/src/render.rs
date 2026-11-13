@@ -1,23 +1,22 @@
 //! Text the runner shows: live status, approval prompts, run endings.
 
-use std::collections::HashMap;
-
 use aidaemon_core::{
     Event, FinishOutcome, Interruption, LimitKind, ReceiptStatus, RunOutcome, RunStatus,
 };
+
+use crate::channel::{ProgressPhase, RunEnding, RunProgress, ToolProgress, ToolState};
 
 const MAX_TOOL_LINES: usize = 8;
 
 /// Live status of one run, rebuilt from its events.
 #[derive(Debug, Default)]
 pub(crate) struct Progress {
-    tool_lines: Vec<(String, String)>,
-    line_by_call: HashMap<String, usize>,
+    tools: Vec<ToolProgress>,
     stream: String,
 }
 
 impl Progress {
-    /// Apply an event. Returns true if the rendered text changed.
+    /// Apply an event. Returns true if the status changed.
     pub(crate) fn apply(&mut self, event: &Event) -> bool {
         match event {
             Event::TurnStarted { .. } => {
@@ -30,26 +29,23 @@ impl Progress {
                 !text.is_empty()
             }
             Event::ToolStarted { call_id, tool } => {
-                self.tool_lines
-                    .push((call_id.clone(), format!("- Running `{tool}`")));
-                if self.tool_lines.len() > MAX_TOOL_LINES {
-                    self.tool_lines.remove(0);
-                }
-                self.reindex();
+                self.push(ToolProgress {
+                    call_id: call_id.clone(),
+                    tool: tool.clone(),
+                    state: ToolState::Running,
+                });
                 true
             }
             Event::ToolFinished { receipt } => {
-                let line = format!("- `{}`: {}", receipt.tool, receipt_word(receipt.status));
-                match self.line_by_call.get(&receipt.call_id) {
-                    Some(&i) => self.tool_lines[i].1 = line,
-                    None => {
-                        // Refused before dispatch: no ToolStarted was emitted.
-                        self.tool_lines.push((receipt.call_id.clone(), line));
-                        if self.tool_lines.len() > MAX_TOOL_LINES {
-                            self.tool_lines.remove(0);
-                        }
-                        self.reindex();
-                    }
+                let state = ToolState::Ended(receipt.status);
+                match self.tools.iter_mut().find(|t| t.call_id == receipt.call_id) {
+                    Some(line) => line.state = state,
+                    // Refused before dispatch: no ToolStarted was emitted.
+                    None => self.push(ToolProgress {
+                        call_id: receipt.call_id.clone(),
+                        tool: receipt.tool.clone(),
+                        state,
+                    }),
                 }
                 true
             }
@@ -57,43 +53,33 @@ impl Progress {
         }
     }
 
-    fn reindex(&mut self) {
-        self.line_by_call = self
-            .tool_lines
-            .iter()
-            .enumerate()
-            .map(|(i, (id, _))| (id.clone(), i))
-            .collect();
+    fn push(&mut self, tool: ToolProgress) {
+        self.tools.push(tool);
+        if self.tools.len() > MAX_TOOL_LINES {
+            self.tools.remove(0);
+        }
     }
 
-    /// The status message body while the run is active.
-    pub(crate) fn render(&self, max_chars: usize) -> String {
-        let mut out = String::from("_Working..._");
-        for (_, line) in &self.tool_lines {
-            out.push('\n');
-            out.push_str(line);
+    /// The status while the run is active.
+    pub(crate) fn working(&self) -> RunProgress {
+        RunProgress {
+            phase: ProgressPhase::Working,
+            tools: self.tools.clone(),
+            streamed: self.stream.clone(),
         }
-        let stream = self.stream.trim();
-        if !stream.is_empty() {
-            out.push_str("\n\n");
-            let room = max_chars.saturating_sub(out.chars().count() + 4);
-            out.push_str(&tail_chars(stream, room));
-        }
-        truncate_chars(&out, max_chars)
     }
 
-    /// The status message body after the run (the answer follows separately).
-    pub(crate) fn render_final(&self, word: &str, max_chars: usize) -> String {
-        let mut out = format!("_{word}_");
-        for (_, line) in &self.tool_lines {
-            out.push('\n');
-            out.push_str(line);
+    /// The status after the run (the answer follows separately).
+    pub(crate) fn ended(&self, ending: RunEnding) -> RunProgress {
+        RunProgress {
+            phase: ProgressPhase::Ended(ending),
+            tools: self.tools.clone(),
+            streamed: String::new(),
         }
-        truncate_chars(&out, max_chars)
     }
 }
 
-fn receipt_word(status: ReceiptStatus) -> &'static str {
+pub(crate) fn receipt_word(status: ReceiptStatus) -> &'static str {
     match status {
         ReceiptStatus::Succeeded => "done",
         ReceiptStatus::Failed => "failed",
@@ -120,7 +106,7 @@ pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
 }
 
 /// The last `max` characters, with a leading ellipsis if cut.
-fn tail_chars(text: &str, max: usize) -> String {
+pub(crate) fn tail_chars(text: &str, max: usize) -> String {
     let count = text.chars().count();
     if count <= max {
         return text.to_string();
@@ -206,29 +192,41 @@ pub(crate) fn outcome_ending_text(outcome: &RunOutcome) -> String {
     ending_text(&outcome.status)
 }
 
-/// [`status_word`] for a whole outcome: a completed run whose objective
+/// [`status_ending`] for a whole outcome: a completed run whose objective
 /// was not met reads "Partly done", like a partial finish.
-pub(crate) fn outcome_word(outcome: &RunOutcome) -> &'static str {
+pub(crate) fn outcome_ending(outcome: &RunOutcome) -> RunEnding {
     if outcome.is_completed() && !outcome.is_succeeded() {
-        return "Partly done";
+        return RunEnding::PartlyDone;
     }
-    status_word(&outcome.status)
+    status_ending(&outcome.status)
+}
+
+/// How the final status edit names a run's end.
+pub(crate) fn status_ending(status: &RunStatus) -> RunEnding {
+    match status {
+        RunStatus::Completed => RunEnding::Done,
+        RunStatus::Interrupted { .. } => RunEnding::WaitingForApproval,
+        RunStatus::Cancelled => RunEnding::Stopped,
+        RunStatus::Finished { outcome, .. } => match outcome {
+            FinishOutcome::Succeeded => RunEnding::Done,
+            FinishOutcome::Partial => RunEnding::PartlyDone,
+            FinishOutcome::Blocked => RunEnding::Blocked,
+            _ => RunEnding::Ended,
+        },
+        _ => RunEnding::Ended,
+    }
 }
 
 /// One word for the final status-message edit.
+#[cfg(test)]
 pub(crate) fn status_word(status: &RunStatus) -> &'static str {
-    match status {
-        RunStatus::Completed => "Done",
-        RunStatus::Interrupted { .. } => "Waiting for approval",
-        RunStatus::Cancelled => "Stopped",
-        RunStatus::Finished { outcome, .. } => match outcome {
-            FinishOutcome::Succeeded => "Done",
-            FinishOutcome::Partial => "Partly done",
-            FinishOutcome::Blocked => "Blocked",
-            _ => "Ended",
-        },
-        _ => "Ended",
-    }
+    status_ending(status).word()
+}
+
+/// [`status_word`] for a whole outcome.
+#[cfg(test)]
+pub(crate) fn outcome_word(outcome: &RunOutcome) -> &'static str {
+    outcome_ending(outcome).word()
 }
 
 #[cfg(test)]
@@ -264,15 +262,15 @@ mod tests {
             turn: 1,
             text: "thinking".into()
         }));
-        assert!(p.render(200).contains("thinking"));
+        assert!(p.working().to_markdown(200).contains("thinking"));
         assert!(p.apply(&Event::TurnStarted { turn: 2 }));
-        assert!(!p.render(200).contains("thinking"));
+        assert!(!p.working().to_markdown(200).contains("thinking"));
         p.apply(&Event::ToolStarted {
             call_id: "c1".into(),
             tool: "search".into(),
         });
-        assert!(p.render(200).contains("Running `search`"));
-        assert!(p.render(10).chars().count() <= 10);
+        assert!(p.working().to_markdown(200).contains("Running `search`"));
+        assert!(p.working().to_markdown(10).chars().count() <= 10);
     }
 
     /// A run a tool finished reads by its outcome, never as an unexpected

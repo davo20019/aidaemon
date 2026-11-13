@@ -260,6 +260,7 @@ impl EventSink for TracingSink {
                 status,
                 usage,
                 turns,
+                ..
             } => {
                 let status = status_name(status);
                 run.record("status", status.as_str());

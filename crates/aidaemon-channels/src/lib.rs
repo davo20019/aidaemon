@@ -57,9 +57,10 @@ pub mod testing;
 
 pub use approvals::{ApprovalStore, MemoryApprovalStore, StoredApproval};
 pub use channel::{
-    ApprovalAnswer, ApprovalChoice, ApprovalPrompt, Attachment, AttachmentKind, Channel,
-    ChannelCapabilities, ChannelError, ChannelEvent, CommandInvocation, CommandSpec, Conversation,
-    ConversationKind, InboundMessage, MessageRef, OutboundFile, OutboundMessage, Sender,
+    ApprovalAnswer, ApprovalChoice, ApprovalDetails, ApprovalPrompt, Attachment, AttachmentKind,
+    Channel, ChannelCapabilities, ChannelError, ChannelEvent, CommandInvocation, CommandSpec,
+    Conversation, ConversationKind, InboundMessage, MessageRef, OutboundFile, OutboundMessage,
+    ProgressPhase, RunEnding, RunProgress, Sender, ToolProgress, ToolState,
     DEFAULT_MAX_DOWNLOAD_BYTES,
 };
 pub use commands::{builtin_commands, CommandContext, CommandHandler, CommandReply};

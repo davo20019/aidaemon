@@ -975,6 +975,43 @@ async fn approval_falls_back_to_text_commands_without_buttons() {
 }
 
 #[tokio::test]
+async fn a_channel_without_buttons_is_never_asked_for_them() {
+    // Its `ask` would show buttons nobody can press; the runner goes by
+    // its capabilities and sends the text prompt instead.
+    let provider = deploy_script("Deployed via command.");
+    let run = Setup::new(provider)
+        .channel(
+            TestChannel::new("telegram")
+                .with_edits(true)
+                .asks_regardless(true),
+        )
+        .start();
+    run.say("chat-1", "deploy please");
+    assert!(run.wait_text("chat-1", "/approve ").await);
+    assert!(run.channel.prompts().is_empty());
+    let id = fallback_id(&run.channel.sent_texts("chat-1")).expect("prompt id");
+    run.say("chat-1", &format!("/approve {id}"));
+    assert!(run.wait_text("chat-1", "Deployed via command.").await);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_prompt_carries_its_request_as_data() {
+    let provider = deploy_script("Deployed.");
+    let run = Setup::new(provider)
+        .channel(TestChannel::new("telegram").with_buttons(true))
+        .start();
+    run.say("chat-1", "deploy please");
+    assert!(run.channel.wait_for(WAIT, |c| c.prompts().len() == 1).await);
+    let prompt = run.channel.prompts().remove(0);
+    let details = prompt.details.expect("typed details");
+    assert_eq!(details.tool, "deploy");
+    assert_eq!(details.arguments, json!({"target": "staging"}));
+    assert!(details.reason.contains("deploys need a human"));
+    run.stop().await;
+}
+
+#[tokio::test]
 async fn deny_tells_the_model_and_skips_the_tool() {
     let provider = deploy_script("Okay, I will not deploy.");
     let run = Setup::new(provider.clone())

@@ -774,3 +774,85 @@ fn default_write_consistency_max_stale_task_starts() -> u64 {
 fn default_write_consistency_max_missing_message_id_events() -> u64 {
     0
 }
+
+/// `[computer_use]`: whether the desktop tool is on, and its limits.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ComputerUseConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_cu_screenshot_max_width")]
+    pub screenshot_max_width: u32,
+    #[serde(default = "default_cu_screenshot_max_height")]
+    pub screenshot_max_height: u32,
+    #[serde(default = "default_cu_screenshot_max_bytes")]
+    pub screenshot_max_bytes: u64,
+    #[serde(default = "default_cu_ax_max_depth")]
+    pub ax_max_depth: u32,
+    #[serde(default = "default_cu_ax_max_nodes")]
+    pub ax_max_nodes: u32,
+    #[serde(default = "default_cu_action_timeout_secs")]
+    pub action_timeout_secs: u64,
+    #[serde(default = "default_cu_max_mutating_actions")]
+    pub max_mutating_actions: u32,
+    #[serde(default = "default_cu_max_consecutive_observations")]
+    pub max_consecutive_observations: u32,
+    #[serde(default = "default_cu_max_wall_clock_secs")]
+    pub max_wall_clock_secs: u64,
+    #[serde(default)]
+    pub always_allowed_apps: Vec<String>,
+    #[serde(default)]
+    pub mirror_screenshots_to_channel: bool,
+}
+
+fn default_cu_screenshot_max_width() -> u32 {
+    1280
+}
+fn default_cu_screenshot_max_height() -> u32 {
+    800
+}
+fn default_cu_screenshot_max_bytes() -> u64 {
+    2_000_000
+}
+fn default_cu_ax_max_depth() -> u32 {
+    12
+}
+fn default_cu_ax_max_nodes() -> u32 {
+    500
+}
+fn default_cu_action_timeout_secs() -> u64 {
+    10
+}
+fn default_cu_max_mutating_actions() -> u32 {
+    40
+}
+fn default_cu_max_consecutive_observations() -> u32 {
+    3
+}
+fn default_cu_max_wall_clock_secs() -> u64 {
+    600
+}
+
+impl Default for ComputerUseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            screenshot_max_width: default_cu_screenshot_max_width(),
+            screenshot_max_height: default_cu_screenshot_max_height(),
+            screenshot_max_bytes: default_cu_screenshot_max_bytes(),
+            ax_max_depth: default_cu_ax_max_depth(),
+            ax_max_nodes: default_cu_ax_max_nodes(),
+            action_timeout_secs: default_cu_action_timeout_secs(),
+            max_mutating_actions: default_cu_max_mutating_actions(),
+            max_consecutive_observations: default_cu_max_consecutive_observations(),
+            max_wall_clock_secs: default_cu_max_wall_clock_secs(),
+            always_allowed_apps: Vec::new(),
+            mirror_screenshots_to_channel: false,
+        }
+    }
+}
+
+impl ComputerUseConfig {
+    pub fn action_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.action_timeout_secs.clamp(1, 120))
+    }
+}

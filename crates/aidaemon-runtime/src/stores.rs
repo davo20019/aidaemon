@@ -27,6 +27,7 @@ pub use aidaemon_work::stores::*;
 pub trait StateStore:
     Send
     + Sync
+    + crate::tools::cli_agent::CliAgentStore
     + crate::turn::compaction::CompactionStore
     + MessageStore
     + DialogueStateStore

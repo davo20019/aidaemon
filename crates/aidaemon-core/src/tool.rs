@@ -369,6 +369,15 @@ impl ToolOutput {
 #[error("{0}")]
 pub struct ToolError(pub String);
 
+impl ToolError {
+    /// A failure with this message, for the model and the receipt:
+    /// `Err(ToolError::new("order not found"))`. `?` on an `io::Error`,
+    /// and `.into()` on a `&str` or `String`, build one too.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
 impl From<String> for ToolError {
     fn from(value: String) -> Self {
         Self(value)

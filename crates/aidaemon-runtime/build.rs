@@ -6,8 +6,9 @@ fn main() {
     // baked into those objects point at a Toolchains/ layout that CLT does not
     // have, so linking fails with undefined __swift_FORCE_LOAD_$_swiftCompatibility*
     // symbols. Emit the CLT location explicitly; a build-script link-search path
-    // propagates to bins, tests, and doctests alike. On machines with full Xcode
-    // the directory is absent and nothing is emitted.
+    // propagates to bins, tests, and doctests alike, this crate's and its
+    // dependents'. On machines with full Xcode the directory is absent and
+    // nothing is emitted.
     println!("cargo:rerun-if-changed=build.rs");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let computer_use_macos = std::env::var("CARGO_FEATURE_COMPUTER_USE_MACOS").is_ok();

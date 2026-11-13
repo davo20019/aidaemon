@@ -204,21 +204,21 @@ async fn edit_calls_chat_update() {
 #[tokio::test]
 async fn ask_renders_buttons_with_encoded_values() {
     let api = ok_api().await;
-    let prompt = ApprovalPrompt {
-        id: "prompt-42".into(),
-        conversation: thread(),
-        text: "Run `rm -rf build/`?".into(),
-        choices: vec![
+    let prompt = ApprovalPrompt::new(
+        "prompt-42",
+        thread(),
+        "Run `rm -rf build/`?",
+        vec![
             ApprovalChoice {
-                id: "approve".into(),
-                label: "Approve".into(),
+                id: "approve".to_string(),
+                label: "Approve".to_string(),
             },
             ApprovalChoice {
-                id: "deny".into(),
-                label: "Deny".into(),
+                id: "deny".to_string(),
+                label: "Deny".to_string(),
             },
         ],
-    };
+    );
     let r = channel(&api).ask(&prompt).await.unwrap();
     assert_eq!(r.conversation_id, "C000SYNTH:1700000000.000100");
     assert_eq!(r.message_id, "1700000001.000000");
@@ -251,17 +251,16 @@ async fn ask_renders_buttons_with_encoded_values() {
 #[tokio::test]
 async fn ask_puts_a_collapsed_block_under_the_summary() {
     let api = ok_api().await;
-    let prompt = ApprovalPrompt {
-        id: "prompt-43".into(),
-        conversation: thread(),
-        text: "**Your assistant wants to run a command on your computer.**\n\n\
-               ```details\nrm -rf build/ && echo <done>\n```"
-            .into(),
-        choices: vec![ApprovalChoice {
-            id: "once".into(),
-            label: "Allow".into(),
+    let prompt = ApprovalPrompt::new(
+        "prompt-43",
+        thread(),
+        "**Your assistant wants to run a command on your computer.**\n\n\
+               ```details\nrm -rf build/ && echo <done>\n```",
+        vec![ApprovalChoice {
+            id: "once".to_string(),
+            label: "Allow".to_string(),
         }],
-    };
+    );
     channel(&api).ask(&prompt).await.unwrap();
     let body = api.calls("chat.postMessage")[0].json();
     let blocks = body["blocks"].as_array().unwrap();

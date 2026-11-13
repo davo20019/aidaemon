@@ -443,21 +443,21 @@ async fn callback_query_becomes_approval_and_is_answered() {
         id: format!("{GROUP_CHAT}:42"),
         kind: ConversationKind::Thread,
     };
-    let prompt = ApprovalPrompt {
-        id: "approval-7f3c".to_string(),
-        conversation: thread.clone(),
-        text: "Run `terminal` command?".to_string(),
-        choices: vec![
+    let prompt = ApprovalPrompt::new(
+        "approval-7f3c",
+        thread.clone(),
+        "Run `terminal` command?",
+        vec![
             ApprovalChoice {
-                id: "allow_once".into(),
-                label: "Allow once".into(),
+                id: "allow_once".to_string(),
+                label: "Allow once".to_string(),
             },
             ApprovalChoice {
-                id: "deny".into(),
-                label: "Deny".into(),
+                id: "deny".to_string(),
+                label: "Deny".to_string(),
             },
         ],
-    };
+    );
     let sent = ch.ask(&prompt).await.unwrap();
     let ask_call = &mock.calls("sendMessage")[0];
     let data = ask_call.body["reply_markup"]["inline_keyboard"][0][1]["callback_data"]
@@ -782,25 +782,25 @@ async fn ask_renders_inline_keyboard_with_compact_callback_data() {
     };
     let long_id = format!("approval-{}", "x".repeat(80));
     for prompt_id in ["p-1", long_id.as_str()] {
-        let prompt = ApprovalPrompt {
-            id: prompt_id.to_string(),
-            conversation: dm.clone(),
-            text: "Allow **write_file** to `notes.md`?".to_string(),
-            choices: vec![
+        let prompt = ApprovalPrompt::new(
+            prompt_id.to_string(),
+            dm.clone(),
+            "Allow **write_file** to `notes.md`?",
+            vec![
                 ApprovalChoice {
-                    id: "allow_once".into(),
-                    label: "Allow once".into(),
+                    id: "allow_once".to_string(),
+                    label: "Allow once".to_string(),
                 },
                 ApprovalChoice {
-                    id: "allow_session".into(),
-                    label: "Allow for session".into(),
+                    id: "allow_session".to_string(),
+                    label: "Allow for session".to_string(),
                 },
                 ApprovalChoice {
-                    id: "deny".into(),
-                    label: "Deny".into(),
+                    id: "deny".to_string(),
+                    label: "Deny".to_string(),
                 },
             ],
-        };
+        );
         ch.ask(&prompt).await.unwrap();
     }
     let calls = mock.calls("sendMessage");

@@ -114,6 +114,151 @@ async fn without_a_provider_or_the_default_hooks_building_fails() {
     );
 }
 
+/// A provider that names no default model.
+struct Nameless;
+
+#[async_trait::async_trait]
+impl aidaemon_sdk::Provider for Nameless {
+    fn name(&self) -> &str {
+        "nameless"
+    }
+    async fn complete(
+        &self,
+        _request: &aidaemon_sdk::ModelRequest,
+    ) -> Result<aidaemon_sdk::ModelResponse, aidaemon_sdk::ProviderError> {
+        Ok(text("hi"))
+    }
+}
+
+#[tokio::test]
+async fn the_model_comes_from_the_provider_or_the_error_says_to_set_it() {
+    if std::env::var("AIDAEMON_MODEL").is_ok() {
+        return; // the environment names the model, by design
+    }
+    // A scripted provider names its own model: no `.model(..)` needed.
+    let model = ScriptedProvider::new([text("hi")]);
+    let seen = model.clone();
+    let agent = preset("x").provider(model).build().await.unwrap();
+    agent.run("test:synthetic-user", "hi").await.unwrap();
+    assert_eq!(seen.requests()[0].model, "scripted");
+
+    let err = preset("x").provider(Nameless).build().await.err().unwrap();
+    assert!(
+        matches!(&err, PresetError::NoModel { provider } if provider == "nameless"),
+        "{err}"
+    );
+    assert!(err.to_string().contains(".model(..)"), "{err}");
+}
+
+#[tokio::test]
+async fn the_model_is_offered_only_the_tools_named() {
+    let model = ScriptedProvider::new([text("hi")]);
+    let seen = model.clone();
+    let agent = preset("x")
+        .provider(model)
+        .tool(ReadNote)
+        .build()
+        .await
+        .unwrap();
+    agent.run("test:synthetic-user", "hi").await.unwrap();
+    let offered: Vec<String> = seen.requests()[0]
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert_eq!(offered, ["read_note"], "no memory tools unless asked for");
+}
+
+#[cfg(feature = "memory")]
+#[tokio::test]
+async fn memory_is_added_when_asked_for() {
+    let agent = preset("x")
+        .provider(ScriptedProvider::new([text("hi")]))
+        .with_memory()
+        .build()
+        .await
+        .unwrap();
+    let names: Vec<&str> = agent.tool_specs().iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"remember_fact"), "{names:?}");
+}
+
+/// Its only effect is a synthetic ticket queue: it touches no files.
+fn no_effects<A>(_: &A) -> aidaemon_sdk::CallEffects {
+    aidaemon_sdk::CallEffects::none()
+}
+
+/// File a synthetic ticket.
+#[tool(write, effects = no_effects)]
+fn file_ticket(title: String) -> String {
+    format!("filed: {title}")
+}
+
+/// A tool that may change things declares it touches no file with its
+/// effects: neither refused under a workspace nor asked about without one.
+#[tokio::test]
+async fn effects_that_name_no_path_vouch_for_a_tool() {
+    for workspace in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = preset("x")
+            .provider(ScriptedProvider::new([
+                tool_calls([call("c1", "file_ticket", json!({"title": "printer"}))]),
+                text("Filed."),
+            ]))
+            .tool(FileTicket);
+        if workspace {
+            agent = agent.workspace(dir.path());
+        }
+        let outcome = agent
+            .build()
+            .await
+            .unwrap()
+            .run("test:synthetic-user", "file it")
+            .await
+            .unwrap();
+        assert!(outcome.is_completed(), "{:?}", outcome.status);
+        assert!(outcome.tool_results()[0].succeeded());
+    }
+}
+
+/// A sub-agent under a preset parent runs without asking the owner: the
+/// delegation declares it changes no file, and the child's own calls are
+/// judged by the child's hooks.
+#[cfg(feature = "agents")]
+#[tokio::test]
+async fn a_sub_agent_runs_under_a_preset_parent_without_an_approval_trap() {
+    use aidaemon_sdk::agents::AgentExt;
+
+    let helper = preset("helper")
+        .provider(ScriptedProvider::new([]).then_repeat(text("HELPER-RESULT")))
+        .build()
+        .await
+        .unwrap();
+    for workspace in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = preset("parent")
+            .provider(ScriptedProvider::new([
+                tool_calls([call("p1", "helper", json!({"task": "help"}))]),
+                text("combined"),
+            ]))
+            .tool(helper.as_tool("helper", "A helper"));
+        if workspace {
+            parent = parent.workspace(dir.path());
+        }
+        let outcome = parent
+            .build()
+            .await
+            .unwrap()
+            .run("test:synthetic-user", "go")
+            .await
+            .unwrap();
+        assert!(outcome.is_completed(), "{:?}", outcome.status);
+        let results = outcome.tool_results();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].succeeded(), "{:?}", results[0].receipt);
+        assert!(results[0].text.unwrap().contains("HELPER-RESULT"));
+    }
+}
+
 #[tokio::test]
 async fn a_scripted_fallback_is_used_when_no_key_is_set() {
     if std::env::var("ANTHROPIC_API_KEY").is_ok() || std::env::var("OPENAI_API_KEY").is_ok() {

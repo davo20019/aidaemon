@@ -7,14 +7,16 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::config::{ComputerUseConfig, ProviderKind, VisionConfig};
-use crate::events::{Event, EventStore, EventType};
-use crate::traits::{
+use crate::settings::{ComputerUseConfig, VisionConfig};
+use crate::tools::traits::{
     Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolRole,
 };
-use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
 use aidaemon_channels::attachments::save_tool_observation_image;
+use aidaemon_channels::hub::{MediaKind, MediaMessage};
+use aidaemon_events::{Event, EventStore, EventType};
+use aidaemon_providers::routing::ProviderKind;
+use aidaemon_tools::semantics::ApprovalResponse;
 
 mod approvals;
 pub mod cache;
@@ -23,6 +25,11 @@ pub mod capability;
 pub mod harness;
 #[cfg(all(target_os = "macos", feature = "computer_use-macos"))]
 pub mod macos;
+#[cfg(any(
+    test,
+    feature = "testing",
+    not(all(target_os = "macos", feature = "computer_use-macos"))
+))]
 mod mock;
 pub mod pin_registry;
 mod policy;
@@ -198,9 +205,19 @@ impl ComputerUseTool {
         media_tx: mpsc::Sender<MediaMessage>,
         events: Option<Arc<EventStore>>,
     ) -> Self {
-        #[cfg(all(not(test), target_os = "macos", feature = "computer_use-macos"))]
+        // Tests, here and in a host's test build (`testing`), never drive
+        // the real desktop.
+        #[cfg(all(
+            not(any(test, feature = "testing")),
+            target_os = "macos",
+            feature = "computer_use-macos"
+        ))]
         let harness: Arc<dyn ComputerHarness> = Arc::new(macos::MacOsHarness::new(config.clone()));
-        #[cfg(any(test, not(all(target_os = "macos", feature = "computer_use-macos"))))]
+        #[cfg(any(
+            test,
+            feature = "testing",
+            not(all(target_os = "macos", feature = "computer_use-macos"))
+        ))]
         let harness: Arc<dyn ComputerHarness> = Arc::new(mock::MockHarness::new(config.clone()));
 
         Self {
@@ -1313,19 +1330,6 @@ fn optional_generation(args: &Value) -> Option<u64> {
         .filter(|generation| *generation > 0)
 }
 
-fn required_u64(args: &Value, key: &str) -> Result<u64, String> {
-    args.get(key)
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| format!("Missing required parameter: {key}"))
-}
-
-fn required_u32(args: &Value, key: &str) -> Result<u32, String> {
-    args.get(key)
-        .and_then(|v| v.as_u64())
-        .and_then(|v| u32::try_from(v).ok())
-        .ok_or_else(|| format!("Missing required parameter: {key}"))
-}
-
 fn element_target_from(element: Option<&IndexedElement>, index: Option<u32>) -> ElementTarget {
     match element {
         Some(el) => ElementTarget {
@@ -1399,15 +1403,15 @@ impl Tool for ComputerUseTool {
     fn approval_card_kind(
         &self,
         request: &aidaemon_core::OwnerApprovalRequest,
-    ) -> crate::types::ApprovalKind {
+    ) -> aidaemon_tools::semantics::ApprovalKind {
         if request
             .warnings
             .iter()
             .any(|warning| warning == approvals::CONSEQUENTIAL_WARNING)
         {
-            crate::types::ApprovalKind::CommandOnce
+            aidaemon_tools::semantics::ApprovalKind::CommandOnce
         } else {
-            crate::types::ApprovalKind::Command
+            aidaemon_tools::semantics::ApprovalKind::Command
         }
     }
 
@@ -1417,7 +1421,7 @@ impl Tool for ComputerUseTool {
     /// this call alone.
     async fn record_owner_answer(
         &self,
-        call: &crate::traits::ApprovalCall<'_>,
+        call: &crate::tools::traits::ApprovalCall<'_>,
         facts: &ToolCallContext,
         response: Option<ApprovalResponse>,
     ) {
@@ -1545,8 +1549,8 @@ impl Tool for ComputerUseTool {
     async fn execute(
         &self,
         arguments: &str,
-        facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        facts: &crate::tools::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::tools::traits::ToolCallOutcome> {
         let facts = facts.clone();
 
         let args: Value = serde_json::from_str(arguments)?;
@@ -1701,10 +1705,10 @@ impl Tool for ComputerUseTool {
 }
 
 #[async_trait::async_trait]
-impl crate::traits::ToolSemantics for ComputerUseTool {
-    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
-        crate::traits::ToolDispatchFacts {
-            same_tool_streak: crate::traits::SameToolStreak::Stepwise,
+impl crate::tools::traits::ToolSemantics for ComputerUseTool {
+    fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
+        crate::tools::traits::ToolDispatchFacts {
+            same_tool_streak: crate::tools::traits::SameToolStreak::Stepwise,
             needs_live_model: true,
             // App approvals are kept per session and per bundle, and
             // consequential ones per call, by the tool (`record_owner_answer`).
@@ -1717,15 +1721,15 @@ impl crate::traits::ToolSemantics for ComputerUseTool {
     /// action, asks the owner; the call that runs must match the card.
     async fn owner_approval_request(
         &self,
-        call: &crate::traits::ApprovalCall<'_>,
+        call: &crate::tools::traits::ApprovalCall<'_>,
         facts: &ToolCallContext,
-    ) -> crate::traits::OwnerApprovalNeed {
+    ) -> crate::tools::traits::OwnerApprovalNeed {
         if call.refused {
-            return crate::traits::OwnerApprovalNeed::NotNeeded;
+            return crate::tools::traits::OwnerApprovalNeed::NotNeeded;
         }
         match self.owner_approval_need(call.arguments, facts).await {
-            Some(need) => crate::traits::OwnerApprovalNeed::Ask(need.request),
-            None => crate::traits::OwnerApprovalNeed::Unjudged,
+            Some(need) => crate::tools::traits::OwnerApprovalNeed::Ask(need.request),
+            None => crate::tools::traits::OwnerApprovalNeed::Unjudged,
         }
     }
 
@@ -1789,7 +1793,7 @@ impl crate::traits::ToolSemantics for ComputerUseTool {
 
 #[cfg(test)]
 pub async fn test_tool(config: ComputerUseConfig, inbox: PathBuf) -> ComputerUseTool {
-    use crate::config::FilesConfig;
+    use crate::settings::FilesConfig;
 
     let files = FilesConfig {
         vision_enabled: true,

@@ -1,23 +1,23 @@
-use crate::traits::ToolSemantics;
+use crate::tools::traits::ToolSemantics;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
-use crate::traits::{
+use crate::tools::traits::{
     Tool, ToolCallAccessManifest, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
     ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus, ToolRole, ToolTargetHint,
     ToolTargetHintKind, ToolVerificationMode,
 };
 
-use super::daemon_guard::detect_daemonization_primitives;
-use super::fs_utils;
+use aidaemon_tools::daemon_guard::detect_daemonization_primitives;
+use aidaemon_tools::fs_utils;
 
 pub struct RunCommandTool {
-    backend: crate::execution::SharedExecutionBackend,
+    backend: aidaemon_tools::backend::SharedExecutionBackend,
 }
 
 impl RunCommandTool {
-    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+    pub fn new(backend: aidaemon_tools::backend::SharedExecutionBackend) -> Self {
         Self { backend }
     }
 }
@@ -217,19 +217,19 @@ impl Tool for RunCommandTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        _facts: &crate::tools::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::tools::traits::ToolCallOutcome> {
         self.run_outcome(arguments).await
     }
 }
 
-impl crate::traits::ToolSemantics for RunCommandTool {
+impl crate::tools::traits::ToolSemantics for RunCommandTool {
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action
     }
 
-    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
-        crate::traits::ToolDispatchFacts {
+    fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
+        crate::tools::traits::ToolDispatchFacts {
             checkpoints_writes: true,
             ..Default::default()
         }
@@ -245,8 +245,8 @@ impl crate::traits::ToolSemantics for RunCommandTool {
         }
     }
 
-    fn receipt_kind(&self, _arguments: &str) -> crate::traits::ToolReceiptKind {
-        crate::traits::ToolReceiptKind::Process
+    fn receipt_kind(&self, _arguments: &str) -> crate::tools::traits::ToolReceiptKind {
+        crate::tools::traits::ToolReceiptKind::Process
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
@@ -461,11 +461,11 @@ fn routing_rejection(message: String, route_to: &str) -> ToolCallOutcome {
         output: message,
         metadata: ToolCallMetadata {
             outcome_status: Some(ToolOutcomeStatus::Blocked),
-            invocation_stage: crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+            invocation_stage: crate::tools::traits::ToolInvocationStage::RejectedBeforeDispatch,
             contract_rejected: true,
             effective_tool_name: Some(route_to.to_string()),
             semantics: ToolCallSemantics::observation(),
-            access_enforcement: crate::traits::ToolAccessEnforcement::ControllerEnforced,
+            access_enforcement: crate::tools::traits::ToolAccessEnforcement::ControllerEnforced,
             ..ToolCallMetadata::default()
         },
         finish: None,
@@ -594,8 +594,8 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
         s.to_string()
     } else {
         let half = max_chars / 2;
-        let front_end = crate::utils::floor_char_boundary(s, half);
-        let back_start = crate::utils::floor_char_boundary(s, s.len() - half);
+        let front_end = aidaemon_tools::text::floor_char_boundary(s, half);
+        let back_start = aidaemon_tools::text::floor_char_boundary(s, s.len() - half);
         format!(
             "{}\n\n... ({} chars truncated) ...\n\n{}",
             &s[..front_end],
@@ -608,11 +608,11 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::ToolCalls as _;
+    use aidaemon_tools::testing::ToolCalls as _;
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = RunCommandTool::new(crate::execution::active_execution_backend());
+        let tool = RunCommandTool::new(aidaemon_tools::testing::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "run_command");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -697,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_safe_command() {
         let args = json!({"command": "ls"}).to_string();
-        let result = RunCommandTool::new(crate::execution::active_execution_backend())
+        let result = RunCommandTool::new(aidaemon_tools::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
@@ -707,7 +707,7 @@ mod tests {
     #[tokio::test]
     async fn completed_negative_command_is_a_typed_observation() {
         let args = json!({"command": "/usr/bin/false"}).to_string();
-        let outcome = RunCommandTool::new(crate::execution::active_execution_backend())
+        let outcome = RunCommandTool::new(aidaemon_tools::testing::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -739,7 +739,7 @@ mod tests {
             "working_dir": dir.path().to_str().unwrap()
         })
         .to_string();
-        let outcome = RunCommandTool::new(crate::execution::active_execution_backend())
+        let outcome = RunCommandTool::new(aidaemon_tools::testing::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -756,7 +756,7 @@ mod tests {
         })
         .to_string();
 
-        let error = RunCommandTool::new(crate::execution::active_execution_backend())
+        let error = RunCommandTool::new(aidaemon_tools::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap_err()
@@ -770,7 +770,7 @@ mod tests {
         let args = json!({"command": "rm -rf /"}).to_string();
         // A routing rejection is a typed outcome, not an error, so a later
         // successful terminal retry can supersede it.
-        let out = RunCommandTool::new(crate::execution::active_execution_backend())
+        let out = RunCommandTool::new(aidaemon_tools::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
@@ -780,7 +780,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_npm_install_rejected_with_actionable_guidance() {
         let args = json!({"command": "npm install tailwindcss"}).to_string();
-        let out = RunCommandTool::new(crate::execution::active_execution_backend())
+        let out = RunCommandTool::new(aidaemon_tools::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
@@ -793,7 +793,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_shell_operator_rejected() {
         let args = json!({"command": "ls | grep foo"}).to_string();
-        let out = RunCommandTool::new(crate::execution::active_execution_backend())
+        let out = RunCommandTool::new(aidaemon_tools::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
@@ -803,7 +803,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_quoted_command_substitution_rejected() {
         let args = json!({"command": r#"ls "$(id)""#}).to_string();
-        let out = RunCommandTool::new(crate::execution::active_execution_backend())
+        let out = RunCommandTool::new(aidaemon_tools::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
@@ -813,7 +813,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_daemonization_rejected() {
         let args = json!({"command": "cargo test &"}).to_string();
-        let out = RunCommandTool::new(crate::execution::active_execution_backend())
+        let out = RunCommandTool::new(aidaemon_tools::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
@@ -829,7 +829,7 @@ mod tests {
         })
         .to_string();
 
-        let result = RunCommandTool::new(crate::execution::active_execution_backend())
+        let result = RunCommandTool::new(aidaemon_tools::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
@@ -841,7 +841,7 @@ mod tests {
         // `npm run build` is not on the safe list; the rejection routes to
         // terminal and must not read as a dispatched, failed mutation — else
         // a later successful terminal retry is overwritten by this rejection.
-        let outcome = RunCommandTool::new(crate::execution::active_execution_backend())
+        let outcome = RunCommandTool::new(aidaemon_tools::testing::active_execution_backend())
             .run_outcome(&serde_json::json!({ "command": "npm run build" }).to_string())
             .await
             .expect("routing rejection is a typed outcome, not an error");
@@ -849,7 +849,7 @@ mod tests {
         assert_eq!(meta.outcome_status, Some(ToolOutcomeStatus::Blocked));
         assert_eq!(
             meta.invocation_stage,
-            crate::traits::ToolInvocationStage::RejectedBeforeDispatch
+            crate::tools::traits::ToolInvocationStage::RejectedBeforeDispatch
         );
         assert!(meta.contract_rejected);
         assert_eq!(meta.effective_tool_name.as_deref(), Some("terminal"));

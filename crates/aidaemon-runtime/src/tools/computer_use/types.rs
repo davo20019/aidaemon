@@ -1,4 +1,4 @@
-use crate::config::ComputerUseConfig;
+use crate::settings::ComputerUseConfig;
 
 /// Running application entry returned by `list_apps`.
 #[derive(Debug, Clone, PartialEq, Eq)]

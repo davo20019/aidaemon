@@ -131,6 +131,13 @@ pub mod channel_checks {
 /// by the mock; the kit itself waits up to [`EVENT_TIMEOUT`] for the
 /// resulting event. Updates injected while `run` is not active should be
 /// delivered when it next runs (as a real platform would).
+///
+/// The kit calls `run` more than once and, between runs, drops the event
+/// receiver before injecting. For a pull channel (polling, a socket) the
+/// mock queues the update. A push channel (a webhook server) cannot queue
+/// for it: make injection best effort, bounded by a timeout, and never
+/// panic when the adapter's listener is not up (a refused connection is a
+/// dropped update, as on a real platform while the adapter is down).
 #[async_trait]
 pub trait ChannelHarness: Send + Sync {
     /// A direct (one-to-one) conversation that `send`, `edit` and `ask` can
@@ -480,11 +487,11 @@ pub async fn check_channel(
         );
     }
 
-    let prompt = ApprovalPrompt {
-        id: "conformance-prompt-1".to_string(),
-        conversation: conversation.clone(),
-        text: "Allow the conformance probe to continue?".to_string(),
-        choices: vec![
+    let prompt = ApprovalPrompt::new(
+        "conformance-prompt-1",
+        conversation.clone(),
+        "Allow the conformance probe to continue?",
+        vec![
             ApprovalChoice {
                 id: "approve".to_string(),
                 label: "Approve".to_string(),
@@ -494,7 +501,7 @@ pub async fn check_channel(
                 label: "Deny".to_string(),
             },
         ],
-    };
+    );
     let asked = channel.ask(&prompt).await;
     let asked_ref = asked.as_ref().ok().cloned();
     let ask_ok = asked.is_ok();

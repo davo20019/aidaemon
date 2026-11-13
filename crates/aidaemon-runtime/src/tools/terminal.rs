@@ -1,4 +1,4 @@
-use crate::traits::ToolSemantics;
+use crate::tools::traits::ToolSemantics;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,26 +17,31 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::events::{
+use crate::spawn::{ConversationRequest, ConversationRuntime};
+use crate::tools::traits::{
+    GoalStore, NotificationStore, Tool, ToolArgumentContractViolation, ToolCallContext,
+    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
+};
+use aidaemon_channels::hub::{MediaKind, MediaMessage};
+use aidaemon_channels::ports::OutboundRouter;
+use aidaemon_core::card::Step;
+use aidaemon_events::text::{truncate_str, truncate_with_note};
+use aidaemon_events::{
     ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, DecisionPointData,
     DecisionType, DiagnosticSeverity, EventStore, EventType,
 };
-use crate::execution::{BackendKind, ExecutionRequest, ProcessHandle, SharedExecutionBackend};
-use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
-use crate::traits::{
-    StateStore, Tool, ToolArgumentContractViolation, ToolCallContext, ToolCallMetadata,
-    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus,
-    ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
+use aidaemon_tools::semantics::ApprovalResponse;
+use aidaemon_tools::status::StatusUpdate;
+use aidaemon_tools::{
+    backend::SharedExecutionBackend, BackendKind, ExecutionRequest, ProcessHandle,
 };
-use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
-use crate::utils::{truncate_str, truncate_with_note};
-use aidaemon_core::card::Step;
 
 use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
-use super::command_risk::{approval_floor_reason, PermissionMode, RiskLevel};
-use super::daemon_guard::detect_daemonization_primitives;
-use super::process_control::{send_sigkill, send_sigterm};
 use super::semantic_command_risk::assess_command;
+use aidaemon_tools::command_risk::{approval_floor_reason, PermissionMode, RiskLevel};
+use aidaemon_tools::daemon_guard::detect_daemonization_primitives;
+use aidaemon_tools::process_control::{send_sigkill, send_sigterm};
 
 /// Max bytes per stream buffer (1 MB) to prevent unbounded memory growth.
 const BUFFER_CAP: usize = 1_048_576;
@@ -91,7 +96,7 @@ const COMMAND_OUTPUT_PROGRESS_EVERY: Duration = Duration::from_secs(3);
 /// or digit (a bar of `=`, a spinner) says nothing and is skipped. `None`
 /// before it printed anything that does (live 2026-11-13: "last output: For
 /// full details use 'ddev describe'.[0m").
-pub(crate) fn latest_output_line(output: &[u8]) -> Option<String> {
+pub fn latest_output_line(output: &[u8]) -> Option<String> {
     const MAX_CHARS: usize = 100;
     let start = output.len().saturating_sub(4096);
     let tail = strip_terminal_controls(&String::from_utf8_lossy(&output[start..]));
@@ -99,7 +104,7 @@ pub(crate) fn latest_output_line(output: &[u8]) -> Option<String> {
         .split(['\n', '\r'])
         .map(|line| line.trim())
         .rfind(|line| line.chars().any(char::is_alphanumeric))?;
-    let line = crate::tools::sanitize::redact_secrets_only(line);
+    let line = aidaemon_tools::sanitize::redact_secrets_only(line);
     Some(if line.chars().count() > MAX_CHARS {
         let cut: String = line.chars().take(MAX_CHARS - 1).collect();
         format!("{}\u{2026}", cut.trim_end())
@@ -484,7 +489,7 @@ const BACKGROUND_DELIVERY_DEDUPE_WINDOW: Duration = Duration::from_secs(600);
 /// Sliding-window limiter for background-completion agent re-engagements.
 /// Records `now` and returns `true` when the session still has budget;
 /// returns `false` (recording nothing) once the cap is reached.
-pub(crate) fn reengagement_allowed(
+pub fn reengagement_allowed(
     log: &mut HashMap<String, std::collections::VecDeque<Instant>>,
     session_id: &str,
     now: Instant,
@@ -562,21 +567,21 @@ async fn attribute_background_deliverable(
     command_start: std::time::SystemTime,
     command_end: std::time::SystemTime,
 ) -> DeliverableAttribution {
-    let ctx = crate::tools::background_deliverable::attribute_declared_deliverables_backend(
+    let ctx = aidaemon_tools::background_deliverable::attribute_declared_deliverables_backend(
         backend.clone(),
         declared_write_paths,
         command_start,
         command_end,
     )
     .await;
-    match crate::tools::background_deliverable::auto_send_decision(&ctx) {
-        crate::tools::background_deliverable::AutoSendDecision::One(p) => {
+    match aidaemon_tools::background_deliverable::auto_send_decision(&ctx) {
+        aidaemon_tools::background_deliverable::AutoSendDecision::One(p) => {
             DeliverableAttribution::One(p)
         }
-        crate::tools::background_deliverable::AutoSendDecision::Ambiguous(paths) => {
+        aidaemon_tools::background_deliverable::AutoSendDecision::Ambiguous(paths) => {
             DeliverableAttribution::Ambiguous(paths)
         }
-        crate::tools::background_deliverable::AutoSendDecision::None => {
+        aidaemon_tools::background_deliverable::AutoSendDecision::None => {
             if !ctx.unconfirmed_candidates.is_empty() {
                 DeliverableAttribution::ExpectedMissing(ctx.unconfirmed_candidates)
             } else {
@@ -587,8 +592,8 @@ async fn attribute_background_deliverable(
 }
 
 /// Map a [`file_delivery::DeliveryError`] to a short, honest user-facing reason.
-fn describe_delivery_error(err: &crate::tools::file_delivery::DeliveryError) -> String {
-    use crate::tools::file_delivery::DeliveryError;
+fn describe_delivery_error(err: &aidaemon_tools::file_delivery::DeliveryError) -> String {
+    use aidaemon_tools::file_delivery::DeliveryError;
     match err {
         DeliveryError::FileNotFound(_) => "the file no longer exists".to_string(),
         DeliveryError::NotRegularFile(_) => "it is not a regular file".to_string(),
@@ -648,9 +653,9 @@ async fn deliver_attributed_background_file(
     inbox_dir: &std::path::Path,
     outbox_dirs: &[PathBuf],
     delivered_deliverables: &Arc<Mutex<HashMap<(String, String), DeliverableDeliveryState>>>,
-    plan_store: Option<&Arc<crate::plans::PlanStore>>,
+    plan_store: Option<&Arc<aidaemon_work::plans::PlanStore>>,
     hub: Option<&Arc<dyn OutboundRouter>>,
-    state: Option<&Arc<dyn crate::traits::StateStore>>,
+    state: Option<&Arc<dyn NotificationStore>>,
     goal_id: &str,
     pid: u32,
 ) {
@@ -675,7 +680,8 @@ async fn deliver_attributed_background_file(
             .canonicalize(&backend_path)
             .await
             .unwrap_or(backend_path);
-        if crate::tools::file_delivery::is_path_blocked(std::path::Path::new(canonical.as_str())) {
+        if aidaemon_tools::file_delivery::is_path_blocked(std::path::Path::new(canonical.as_str()))
+        {
             let msg = format!(
                 "⚠️ The background command produced `{original_name}`, but that path is blocked \
                  from delivery for security reasons."
@@ -695,7 +701,7 @@ async fn deliver_attributed_background_file(
         }
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let ready = match crate::tools::file_delivery::prepare_delivery(
+    let ready = match aidaemon_tools::file_delivery::prepare_delivery(
         &delivery_path.to_string_lossy(),
         &cwd,
         inbox_dir,
@@ -821,7 +827,7 @@ async fn deliver_attributed_background_file(
 
 async fn deliver_background_text(
     hub: Option<&Arc<dyn OutboundRouter>>,
-    state: Option<&Arc<dyn crate::traits::StateStore>>,
+    state: Option<&Arc<dyn NotificationStore>>,
     session_id: &str,
     goal_id: &str,
     message: &str,
@@ -841,8 +847,9 @@ async fn deliver_background_text(
     }
     if !delivered {
         if let Some(state) = state {
-            let entry =
-                crate::traits::NotificationEntry::new(goal_id, session_id, "progress", message);
+            let entry = crate::tools::traits::NotificationEntry::new(
+                goal_id, session_id, "progress", message,
+            );
             if let Err(e) = state.enqueue_notification(&entry).await {
                 warn!(
                     pid,
@@ -870,7 +877,7 @@ pub struct TerminalTool {
     /// Permission persistence mode: picks the buttons on the owner's cards.
     permission_mode: PermissionMode,
     /// Host vs sandbox execution.
-    confinement: crate::types::TerminalConfinement,
+    confinement: aidaemon_tools::TerminalConfinement,
     running: Arc<Mutex<HashMap<u32, RunningProcess>>>,
     running_by_dedupe_key: Arc<Mutex<HashMap<String, u32>>>,
     task_processes: Arc<Mutex<HashMap<String, HashSet<u32>>>>,
@@ -883,12 +890,15 @@ pub struct TerminalTool {
     max_output_chars: usize,
     pool: Option<SqlitePool>,
     event_store: Option<Arc<EventStore>>,
-    state: Option<Arc<dyn StateStore>>,
+    /// Where a goal's run is looked up (its owner's session).
+    goals: Option<Arc<dyn GoalStore>>,
+    /// Progress notes for a session no chat reaches now.
+    notifications: Option<Arc<dyn NotificationStore>>,
     hub: OnceLock<Weak<dyn OutboundRouter>>,
     /// Weak reference to the agent, used to re-engage the agent loop when
     /// a background terminal command completes so the agent can process the
     /// output and continue working on the original task.
-    agent: OnceLock<Weak<crate::agent::Agent>>,
+    agent: OnceLock<Weak<dyn ConversationRuntime>>,
     /// Per-session timestamps of recent background-completion re-engagements,
     /// used by [`reengagement_allowed`] to cap runaway re-engagement loops.
     reengagements: Arc<Mutex<HashMap<String, std::collections::VecDeque<Instant>>>>,
@@ -900,10 +910,10 @@ pub struct TerminalTool {
     /// Durable plan store, used at background completion to read the session's
     /// incomplete checklist (for deliverable attribution + the conservative
     /// delivery-step write-back). Wired via [`set_plan_store`].
-    plan_store: OnceLock<Arc<crate::plans::PlanStore>>,
+    plan_store: OnceLock<Arc<aidaemon_work::plans::PlanStore>>,
     /// The runtime's run records: a command moved to the background is a run
     /// there, shown on its turn's card. Wired via [`set_runs`].
-    runs: OnceLock<Arc<aidaemon_runtime::run_state::RunStates>>,
+    runs: OnceLock<Arc<crate::run_state::RunStates>>,
     /// Inbox directory for harness-side file delivery recovery-copy. Defaults to
     /// the system temp dir until wired via [`with_delivery_dirs`].
     inbox_dir: PathBuf,
@@ -912,7 +922,7 @@ pub struct TerminalTool {
     /// The gateway novel shell commands are assessed through, by their
     /// complete effects. Deterministic checks remain a non-downgradable safety
     /// floor; invalid/unavailable model assessments fail closed to approval.
-    side_calls: OnceLock<crate::llm_runtime::gateway::SideCallGateway>,
+    side_calls: OnceLock<crate::llm::gateway::SideCallGateway>,
 }
 
 /// Split a chained command into individual segments by pipe, semicolon, &&, ||.
@@ -940,7 +950,7 @@ fn extract_segment_binary(segment: &str) -> &str {
 /// command. Exact executable basenames are used for workload classification;
 /// this is not natural-language keyword matching.
 fn parsed_command_invocations(command: &str) -> Vec<(String, Vec<String>)> {
-    crate::tools::command_risk::structural_shell_invocations(command)
+    aidaemon_tools::command_risk::structural_shell_invocations(command)
         .into_iter()
         .filter_map(|invocation| {
             let program = std::path::Path::new(&invocation.program)
@@ -1162,7 +1172,7 @@ fn detect_unscoped_recursive_grep(command: &str) -> Option<(String, String)> {
 }
 
 fn recursive_grep_block_message(pattern: &str, path: &str) -> String {
-    let ignore_globs = super::fs_utils::DEFAULT_IGNORE_DIRS.join(",");
+    let ignore_globs = aidaemon_tools::fs_utils::DEFAULT_IGNORE_DIRS.join(",");
     format!(
         "Blocked: broad recursive `grep` without include/exclude filters is likely to stall on large trees.\n\
 Detected pattern: \"{}\"\n\
@@ -1245,7 +1255,7 @@ fn detect_unbounded_disk_scan_segment(segment: &str) -> Option<(String, String)>
 /// Scan the whole command (including chained `&&`/`|`/`;` segments) for an
 /// unbounded whole-disk/whole-home scan.
 fn detect_unbounded_disk_scan(command: &str) -> Option<(String, String)> {
-    for (segment, _) in crate::tools::command_risk::split_by_operators(command) {
+    for (segment, _) in aidaemon_tools::command_risk::split_by_operators(command) {
         if let Some(hit) = detect_unbounded_disk_scan_segment(&segment) {
             return Some(hit);
         }
@@ -1299,9 +1309,9 @@ async fn drain_to_buffer<R: tokio::io::AsyncRead + Unpin>(mut reader: R, buf: Ar
 /// Render an elapsed-seconds count as a friendly duration for user-facing
 /// progress messages (e.g. 65 -> "1m 5s", 40 -> "40s", 3600 -> "1h 0m").
 fn humanize_elapsed(secs: u64) -> String {
-    crate::duration_format::compact_seconds(
+    aidaemon_tools::duration_format::compact_seconds(
         secs as i64,
-        crate::duration_format::ZeroUnitStyle::Keep,
+        aidaemon_tools::duration_format::ZeroUnitStyle::Keep,
     )
 }
 
@@ -1311,12 +1321,12 @@ fn humanize_elapsed(secs: u64) -> String {
 /// attach it to the outgoing `ToolCallOutcome.metadata.truncation` (rendered
 /// once by the agent loop); background-delivery call sites, which bypass the
 /// loop entirely, render it inline immediately via
-/// `crate::utils::render_truncation_notice`.
+/// `crate::turn::helpers::render_truncation_notice`.
 fn format_output(
     stdout: &str,
     stderr: &str,
     max_chars: usize,
-) -> (String, Option<crate::traits::TruncationInfo>) {
+) -> (String, Option<crate::tools::traits::TruncationInfo>) {
     let mut result = String::new();
     if !stdout.is_empty() {
         result.push_str(stdout);
@@ -1339,7 +1349,7 @@ fn format_output(
             truncate_at -= 1;
         }
         result.truncate(truncate_at);
-        truncation = Some(crate::traits::TruncationInfo {
+        truncation = Some(crate::tools::traits::TruncationInfo {
             shown_chars: result.chars().count(),
             total_chars,
             remediation_hint: None,
@@ -1802,7 +1812,7 @@ async fn confined_terminal_execution_request_inner(
     {
         let target_path = std::path::Path::new(target);
         if backend
-            .metadata(&crate::execution::BackendPath::new(target.clone()))
+            .metadata(&aidaemon_tools::BackendPath::new(target.clone()))
             .await
             .is_err()
         {
@@ -1861,8 +1871,8 @@ async fn confined_terminal_execution_request_inner(
 /// `/private/tmp/new-root`, including before the requested create occurs.
 async fn canonicalize_access_path(
     backend: &SharedExecutionBackend,
-    path: crate::execution::BackendPath,
-) -> crate::execution::BackendPath {
+    path: aidaemon_tools::BackendPath,
+) -> aidaemon_tools::BackendPath {
     if let Ok(canonical) = backend.canonicalize(&path).await {
         return canonical;
     }
@@ -2125,14 +2135,14 @@ fn macos_manifest_sandbox_policy(
 fn macos_manifest_sandbox_request(
     shell_source: &str,
     script_via_stdin: bool,
-    cwd: Option<crate::execution::BackendPath>,
+    cwd: Option<aidaemon_tools::BackendPath>,
     read_paths: &[String],
     write_paths: &[String],
     executable_paths: &[String],
     sandbox_environment: std::collections::BTreeMap<String, String>,
     capabilities: ConfinedCapabilities,
 ) -> anyhow::Result<ExecutionRequest> {
-    let traversal_cwd = cwd.as_ref().map(crate::execution::BackendPath::as_str);
+    let traversal_cwd = cwd.as_ref().map(aidaemon_tools::BackendPath::as_str);
     let policy = macos_manifest_sandbox_policy(
         traversal_cwd,
         read_paths,
@@ -2218,7 +2228,7 @@ impl NativeSandboxRuntimeSupport {
 
 fn parsed_command_programs(command: &str) -> Vec<String> {
     let mut programs = Vec::new();
-    for invocation in crate::tools::command_risk::structural_shell_invocations(command) {
+    for invocation in aidaemon_tools::command_risk::structural_shell_invocations(command) {
         if !programs.contains(&invocation.program) {
             programs.push(invocation.program);
         }
@@ -2229,7 +2239,7 @@ fn parsed_command_programs(command: &str) -> Vec<String> {
 /// Return the immutable installation root that owns an executable managed by a
 /// recognized toolchain/package layout. Runtime support is granted read-only
 /// to this root; it never becomes task-data authority.
-fn managed_executable_runtime_root(executable: &crate::execution::BackendPath) -> Option<String> {
+fn managed_executable_runtime_root(executable: &aidaemon_tools::BackendPath) -> Option<String> {
     let path = PathBuf::from(executable.as_str());
     let components = path
         .components()
@@ -2272,7 +2282,7 @@ fn managed_executable_runtime_root(executable: &crate::execution::BackendPath) -
     Some(root.to_string_lossy().into_owned())
 }
 
-fn homebrew_stable_runtime_alias(executable: &crate::execution::BackendPath) -> Option<String> {
+fn homebrew_stable_runtime_alias(executable: &aidaemon_tools::BackendPath) -> Option<String> {
     let path = PathBuf::from(executable.as_str());
     let components = path
         .components()
@@ -2298,7 +2308,7 @@ fn homebrew_stable_runtime_alias(executable: &crate::execution::BackendPath) -> 
 /// the alias namespace directory, while the canonical Cellar root remains the
 /// boundary that authorizes the formula's actual contents. Granting the
 /// namespace alone does not expose another formula's Cellar files.
-fn homebrew_alias_namespace(executable: &crate::execution::BackendPath) -> Option<String> {
+fn homebrew_alias_namespace(executable: &aidaemon_tools::BackendPath) -> Option<String> {
     let alias = PathBuf::from(homebrew_stable_runtime_alias(executable)?);
     alias
         .parent()
@@ -2311,7 +2321,7 @@ fn homebrew_alias_namespace(executable: &crate::execution::BackendPath) -> Optio
 /// which standard-library trees its child process will need.
 async fn add_python_runtime_support(
     backend: &SharedExecutionBackend,
-    executable: &crate::execution::BackendPath,
+    executable: &aidaemon_tools::BackendPath,
     support: &mut NativeSandboxRuntimeSupport,
 ) {
     let probe = r#"import json,sys; print(json.dumps({"base_prefix":sys.base_prefix,"prefix":sys.prefix,"path":sys.path}))"#;
@@ -2347,7 +2357,7 @@ async fn add_python_runtime_support(
         .filter_map(Value::as_str)
         .filter(|path| path.starts_with('/'))
     {
-        let path = crate::execution::BackendPath::new(path.to_string());
+        let path = aidaemon_tools::BackendPath::new(path.to_string());
         if backend.metadata(&path).await.is_ok() {
             support.add_read(path.to_string());
             support.add_executable(path.to_string());
@@ -2358,7 +2368,7 @@ async fn add_python_runtime_support(
         .filter_map(|key| profile.get(key).and_then(Value::as_str))
         .filter(|path| path.starts_with('/'))
     {
-        let prefix = crate::execution::BackendPath::new(prefix.to_string());
+        let prefix = aidaemon_tools::BackendPath::new(prefix.to_string());
         for dependency in [prefix.join("lib"), prefix.join("pyvenv.cfg")] {
             if backend.metadata(&dependency).await.is_ok() {
                 support.add_read(dependency.to_string());
@@ -2391,7 +2401,7 @@ async fn add_macos_developer_runtime_support(
         .ok()
         .filter(|path| path.starts_with('/'));
     if sdk_root.is_none() {
-        let xcrun = crate::execution::BackendPath::new("/usr/bin/xcrun");
+        let xcrun = aidaemon_tools::BackendPath::new("/usr/bin/xcrun");
         if backend.metadata(&xcrun).await.is_ok() {
             if let Ok(output) = backend
                 .execute(
@@ -2424,7 +2434,7 @@ async fn add_macos_developer_runtime_support(
             "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
         ] {
             if backend
-                .metadata(&crate::execution::BackendPath::new(candidate))
+                .metadata(&aidaemon_tools::BackendPath::new(candidate))
                 .await
                 .is_ok()
             {
@@ -2434,7 +2444,7 @@ async fn add_macos_developer_runtime_support(
         }
     }
     if let Some(sdk_root) = sdk_root {
-        let sdk_path = crate::execution::BackendPath::new(sdk_root.clone());
+        let sdk_path = aidaemon_tools::BackendPath::new(sdk_root.clone());
         if backend.metadata(&sdk_path).await.is_ok() {
             if let Some(developer_root) = macos_developer_root_from_sdk_root(&sdk_root) {
                 support.add_read(developer_root.clone());
@@ -2536,7 +2546,7 @@ async fn native_sandbox_runtime_support(
             }
         }
         if let Some(runtime_alias) = homebrew_stable_runtime_alias(&canonical) {
-            let alias_path = crate::execution::BackendPath::new(runtime_alias.clone());
+            let alias_path = aidaemon_tools::BackendPath::new(runtime_alias.clone());
             if backend.metadata(&alias_path).await.is_ok() {
                 support.add_read(runtime_alias);
                 support.add_executable(alias_path.to_string());
@@ -2577,7 +2587,7 @@ async fn native_sandbox_runtime_support(
                     .map(str::trim)
                     .find(|line| line.starts_with('/'))
                 {
-                    let actual = crate::execution::BackendPath::new(actual.to_string());
+                    let actual = aidaemon_tools::BackendPath::new(actual.to_string());
                     if let Some(bin_dir) = actual.parent() {
                         support.prefer_path_prefix(bin_dir.to_string());
                         // Rust compiler tools load libraries and target data
@@ -2606,7 +2616,7 @@ async fn native_sandbox_runtime_support(
                 backend.home_hint().join(".config/git/config"),
                 backend.home_hint().join(".config/git/ignore"),
                 backend.home_hint().join(".config/git/attributes"),
-                crate::execution::BackendPath::new("/etc/gitconfig".to_string()),
+                aidaemon_tools::BackendPath::new("/etc/gitconfig".to_string()),
             ] {
                 if backend.metadata(&config).await.is_ok() {
                     support.add_read(config.to_string());
@@ -2665,7 +2675,7 @@ async fn native_sandbox_runtime_support(
 /// caller falls back to any declared write root.
 async fn provision_managed_scratch(backend: &SharedExecutionBackend) -> Option<String> {
     let parent = std::env::temp_dir().join("aidaemon-scratch");
-    let parent_path = crate::execution::BackendPath::new(parent.to_string_lossy().to_string());
+    let parent_path = aidaemon_tools::BackendPath::new(parent.to_string_lossy().to_string());
     backend.create_dir_all(&parent_path).await.ok()?;
     // Prune scratch dirs older than 6 hours so a long-lived daemon does not
     // accumulate them. Best-effort; a busy directory is simply skipped.
@@ -2682,7 +2692,7 @@ async fn provision_managed_scratch(backend: &SharedExecutionBackend) -> Option<S
         }
     }
     let dir = parent.join(uuid::Uuid::new_v4().to_string());
-    let dir_path = crate::execution::BackendPath::new(dir.to_string_lossy().to_string());
+    let dir_path = aidaemon_tools::BackendPath::new(dir.to_string_lossy().to_string());
     backend.create_dir_all(&dir_path).await.ok()?;
     Some(
         backend
@@ -2718,7 +2728,7 @@ async fn add_manifest_runtime_environment(
     let preferred_root = declared_roots.first().map(|path| (*path).clone());
     let preferred_is_directory = if let Some(path) = preferred_root.as_ref() {
         backend
-            .metadata(&crate::execution::BackendPath::new(path.clone()))
+            .metadata(&aidaemon_tools::BackendPath::new(path.clone()))
             .await
             .ok()
             .is_some_and(|metadata| metadata.is_dir())
@@ -2734,7 +2744,7 @@ async fn add_manifest_runtime_environment(
     if future_scratch_root {
         if let Some(path) = preferred_root.as_ref() {
             if let Err(error) = backend
-                .create_dir_all(&crate::execution::BackendPath::new(path.clone()))
+                .create_dir_all(&aidaemon_tools::BackendPath::new(path.clone()))
                 .await
             {
                 tracing::warn!(path = %path, %error, "Failed to prepare declared future write root");
@@ -2746,7 +2756,7 @@ async fn add_manifest_runtime_environment(
         .flatten();
     if scratch_root.is_none() {
         for path in declared_roots.iter().skip(1) {
-            let candidate = crate::execution::BackendPath::new((*path).clone());
+            let candidate = aidaemon_tools::BackendPath::new((*path).clone());
             if backend
                 .metadata(&candidate)
                 .await
@@ -2768,7 +2778,7 @@ async fn add_manifest_runtime_environment(
             .sort_by_key(|path| std::cmp::Reverse(std::path::Path::new(path).components().count()));
         let mut selected = None;
         for path in existing_paths {
-            let candidate = crate::execution::BackendPath::new(path.clone());
+            let candidate = aidaemon_tools::BackendPath::new(path.clone());
             if backend
                 .metadata(&candidate)
                 .await
@@ -2794,7 +2804,7 @@ async fn add_manifest_runtime_environment(
     // The scratch root is either the managed dir (already created) or an
     // existing declared directory; a declared future root was created above.
     if !std::path::Path::new(&scratch_root).exists() {
-        let path = crate::execution::BackendPath::new(scratch_root.clone());
+        let path = aidaemon_tools::BackendPath::new(scratch_root.clone());
         if let Err(error) = backend.create_dir_all(&path).await {
             tracing::warn!(path = %scratch_root, %error, "Failed to prepare runtime scratch root");
             return;
@@ -2804,7 +2814,7 @@ async fn add_manifest_runtime_environment(
     // canonical identity. Temporary roots on macOS can pass through `/var`
     // and `/private/var` aliases; resolving once here prevents the shell from
     // receiving an environment path that differs from the policy path.
-    let scratch_path = crate::execution::BackendPath::new(scratch_root);
+    let scratch_path = aidaemon_tools::BackendPath::new(scratch_root);
     let scratch_root = backend
         .canonicalize(&scratch_path)
         .await
@@ -2837,9 +2847,9 @@ async fn add_manifest_runtime_environment(
     let neutral_npmrc = format!("{scratch_root}/.aidaemon-npmrc");
     if backend
         .write(
-            &crate::execution::BackendPath::new(neutral_npmrc.clone()),
+            &aidaemon_tools::BackendPath::new(neutral_npmrc.clone()),
             b"",
-            crate::execution::WriteMode::Overwrite,
+            aidaemon_tools::WriteMode::Overwrite,
             true,
         )
         .await
@@ -3093,7 +3103,7 @@ async fn materialized_write_roots(
     backend: &SharedExecutionBackend,
     write_roots: &[String],
     write_paths: &[String],
-    cwd: Option<&crate::execution::BackendPath>,
+    cwd: Option<&aidaemon_tools::BackendPath>,
 ) -> Vec<String> {
     let mut on_disk = std::collections::HashMap::new();
     for path in write_roots.iter().chain(write_paths.iter()) {
@@ -3110,8 +3120,8 @@ async fn materialized_write_roots(
 async fn resolve_access_path(
     backend: &SharedExecutionBackend,
     path: &str,
-    cwd: Option<&crate::execution::BackendPath>,
-) -> anyhow::Result<crate::execution::BackendPath> {
+    cwd: Option<&aidaemon_tools::BackendPath>,
+) -> anyhow::Result<aidaemon_tools::BackendPath> {
     let path = path.trim();
     anyhow::ensure!(!path.is_empty(), "execution access path cannot be empty");
     let prepared = if path.starts_with('/') || path == "~" || path.starts_with("~/") {
@@ -3162,17 +3172,17 @@ static REENGAGE_SERIALIZER: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[cfg(test)]
-pub(crate) async fn acquire_reengagement_slot() -> tokio::sync::MutexGuard<'static, ()> {
+pub async fn acquire_reengagement_slot() -> tokio::sync::MutexGuard<'static, ()> {
     REENGAGE_SERIALIZER.lock().await
 }
 
 /// Run one background completion continuation under the shared serializer and
 /// a single wall-clock budget that includes waiting for the serializer. This is
 /// the authoritative boundary for terminal and delegated CLI completions.
-pub(crate) async fn run_background_continuation(
+pub async fn run_background_continuation(
     agent: &dyn ConversationRuntime,
     request: ConversationRequest,
-) -> anyhow::Result<crate::runtime_ports::AgentResponseEnvelope> {
+) -> anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope> {
     run_background_continuation_with_timeout(agent, request, BACKGROUND_CONTINUATION_TIMEOUT).await
 }
 
@@ -3180,7 +3190,7 @@ async fn run_background_continuation_with_timeout(
     agent: &dyn ConversationRuntime,
     request: ConversationRequest,
     timeout: Duration,
-) -> anyhow::Result<crate::runtime_ports::AgentResponseEnvelope> {
+) -> anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope> {
     let session_id = request.session_id.clone();
     let deadline = tokio::time::Instant::now() + timeout;
     let _slot = tokio::time::timeout_at(deadline, REENGAGE_SERIALIZER.lock())
@@ -3242,7 +3252,7 @@ impl TerminalTool {
     pub async fn new(
         backend: SharedExecutionBackend,
         allowed_prefixes: Vec<String>,
-        _approval_tx: super::ApprovalBroker,
+        _approval_tx: crate::approvals::broker::ApprovalBroker,
         initial_timeout_secs: u64,
         max_output_chars: usize,
         permission_mode: PermissionMode,
@@ -3352,7 +3362,7 @@ impl TerminalTool {
             session_approved: Arc::new(RwLock::new(HashSet::new())),
             capability_grants: Arc::new(RwLock::new(persisted_capabilities)),
             permission_mode,
-            confinement: crate::types::TerminalConfinement::default(),
+            confinement: aidaemon_tools::TerminalConfinement::default(),
             running: Arc::new(Mutex::new(HashMap::new())),
             running_by_dedupe_key: Arc::new(Mutex::new(HashMap::new())),
             task_processes: Arc::new(Mutex::new(HashMap::new())),
@@ -3362,7 +3372,8 @@ impl TerminalTool {
             max_output_chars,
             pool: Some(pool),
             event_store: None,
-            state: None,
+            goals: None,
+            notifications: None,
             hub: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
@@ -3387,12 +3398,12 @@ impl TerminalTool {
     }
 
     /// Choose host or sandbox execution (see `[terminal] confinement`).
-    pub fn with_confinement(mut self, confinement: crate::types::TerminalConfinement) -> Self {
+    pub fn with_confinement(mut self, confinement: aidaemon_tools::TerminalConfinement) -> Self {
         match confinement {
-            crate::types::TerminalConfinement::Host => {
+            aidaemon_tools::TerminalConfinement::Host => {
                 info!("Terminal runs commands on the host (set [terminal] confinement = \"sandbox\" to confine them)")
             }
-            crate::types::TerminalConfinement::Sandbox => {
+            aidaemon_tools::TerminalConfinement::Sandbox => {
                 info!("Terminal runs commands inside the OS sandbox with task-scoped policy")
             }
         }
@@ -3405,15 +3416,21 @@ impl TerminalTool {
         self
     }
 
-    pub fn with_state(mut self, state: Arc<dyn StateStore>) -> Self {
-        self.state = Some(state);
+    /// The host's goals and notification queue.
+    pub fn with_stores(
+        mut self,
+        goals: Arc<dyn GoalStore>,
+        notifications: Arc<dyn NotificationStore>,
+    ) -> Self {
+        self.goals = Some(goals);
+        self.notifications = Some(notifications);
         self
     }
 
     /// Enable semantic risk assessment for novel terminal commands, through
     /// the side-call gateway. Wired after provider startup; the gateway reads
     /// the shared runtime, so model hot-swaps stay visible.
-    pub fn set_side_calls(&self, side_calls: crate::llm_runtime::gateway::SideCallGateway) {
+    pub fn set_side_calls(&self, side_calls: crate::llm::gateway::SideCallGateway) {
         assert!(
             self.side_calls.set(side_calls).is_ok(),
             "TerminalTool::set_side_calls called more than once"
@@ -3433,7 +3450,7 @@ impl TerminalTool {
 
     /// Set agent reference so background command completions can re-engage
     /// the agent loop to process the output and continue the original task.
-    pub fn set_agent(&self, agent: Weak<crate::agent::Agent>) {
+    pub fn set_agent(&self, agent: Weak<dyn ConversationRuntime>) {
         self.agent
             .set(agent)
             .expect("TerminalTool::set_agent called more than once");
@@ -3442,25 +3459,25 @@ impl TerminalTool {
     /// Wire the durable plan store so the background completion notifier can read
     /// the session's incomplete checklist (for deliverable attribution + the
     /// conservative delivery-step write-back).
-    pub fn set_plan_store(&self, plan_store: Arc<crate::plans::PlanStore>) {
+    pub fn set_plan_store(&self, plan_store: Arc<aidaemon_work::plans::PlanStore>) {
         let _ = self.plan_store.set(plan_store);
     }
 
     /// Wire the runtime's run records (see `runs`).
-    pub fn set_runs(&self, runs: Arc<aidaemon_runtime::run_state::RunStates>) {
+    pub fn set_runs(&self, runs: Arc<crate::run_state::RunStates>) {
         let _ = self.runs.set(runs);
     }
 
     /// Where a background run of this terminal reports.
-    fn run_home(&self) -> aidaemon_runtime::background_run::RunHome {
-        aidaemon_runtime::background_run::RunHome {
+    fn run_home(&self) -> crate::background_run::RunHome {
+        crate::background_run::RunHome {
             runs: self.runs.get_or_init(Default::default).clone(),
             hub: self.hub.get().cloned(),
             plans: self.plan_store.get().cloned(),
         }
     }
 
-    pub(crate) fn wiring_ready(&self) -> bool {
+    pub fn wiring_ready(&self) -> bool {
         self.hub.get().and_then(Weak::upgrade).is_some()
             && self.agent.get().and_then(Weak::upgrade).is_some()
             && self.plan_store.get().is_some()
@@ -3913,7 +3930,8 @@ impl TerminalTool {
             ),
         );
         if let Some(store) = &self.event_store {
-            let emitter = crate::events::EventEmitter::new(store.clone(), trust.session_id.clone());
+            let emitter =
+                aidaemon_events::EventEmitter::new(store.clone(), trust.session_id.clone());
             let _ = emitter
                 .emit(
                     EventType::ApprovalRequested,
@@ -3929,15 +3947,15 @@ impl TerminalTool {
         // A command's card says what it does from its structure; the
         // trust-all switch keeps its own wording.
         let card = (subject != Self::TRUST_ALL_SUBJECT)
-            .then(|| crate::tools::command_effects::command_card(&subject, call_title(&args)))
+            .then(|| aidaemon_tools::command_effects::command_card(&subject, call_title(&args)))
             .map(Box::new);
         Ok(Some(aidaemon_core::OwnerApprovalRequest {
             card,
             effects: Vec::new(),
             // What a channel without cards shows: no secret either.
-            summary: crate::tools::sanitize::redact_command_secrets(&subject),
+            summary: aidaemon_tools::sanitize::redact_command_secrets(&subject),
             subject,
-            risk: crate::agent::approvals::approval_risk(ask.risk),
+            risk: crate::approvals::approval_risk(ask.risk),
             warnings,
         }))
     }
@@ -3961,7 +3979,8 @@ impl TerminalTool {
             return;
         };
         if let Some(store) = &self.event_store {
-            let emitter = crate::events::EventEmitter::new(store.clone(), trust.session_id.clone());
+            let emitter =
+                aidaemon_events::EventEmitter::new(store.clone(), trust.session_id.clone());
             let approval_type = match response {
                 Some(ApprovalResponse::AllowOnce) => Some("once"),
                 Some(ApprovalResponse::AllowSession) => Some("session"),
@@ -4244,7 +4263,7 @@ impl TerminalTool {
         pid: u32,
         proc: RunningProcess,
         reason: &str,
-    ) -> anyhow::Result<(String, Option<crate::traits::TruncationInfo>)> {
+    ) -> anyhow::Result<(String, Option<crate::tools::traits::TruncationInfo>)> {
         self.terminate_running_process_verified(pid, proc, reason)
             .await
             .map(|(output, truncation, _)| (output, truncation))
@@ -4257,7 +4276,7 @@ impl TerminalTool {
         pid: u32,
         proc: RunningProcess,
         reason: &str,
-    ) -> anyhow::Result<(String, Option<crate::traits::TruncationInfo>, bool)> {
+    ) -> anyhow::Result<(String, Option<crate::tools::traits::TruncationInfo>, bool)> {
         proc.notify_on_completion.store(false, Ordering::Relaxed);
         let started_at = proc.started_at;
         let command = proc.command.clone();
@@ -4398,7 +4417,7 @@ impl TerminalTool {
     /// approved the card its rules asked for this call).
     async fn handle_trust_all(
         &self,
-        kernel_approved: Option<&crate::traits::ApprovalScope>,
+        kernel_approved: Option<&crate::tools::traits::ApprovalScope>,
     ) -> anyhow::Result<String> {
         {
             let prefixes = self.allowed_prefixes.read().await;
@@ -4409,7 +4428,7 @@ impl TerminalTool {
                 );
             }
         }
-        if kernel_approved != Some(&crate::traits::ApprovalScope::Call) {
+        if kernel_approved != Some(&crate::tools::traits::ApprovalScope::Call) {
             anyhow::bail!(
                 "terminal trust_all requires approval through the agent kernel; it was called \
                  outside an approved agent call"
@@ -4814,7 +4833,7 @@ impl TerminalTool {
                 if session_id.is_empty() {
                     continue;
                 }
-                let emitter = crate::events::EventEmitter::new(store.clone(), session_id)
+                let emitter = aidaemon_events::EventEmitter::new(store.clone(), session_id)
                     .with_task_id(task_id);
                 if let Err(error) = emitter.emit(EventType::DecisionPoint, event).await {
                     warn!(%error, "Failed to persist background watchdog sample");
@@ -4990,8 +5009,8 @@ impl TerminalTool {
                     }
                 }
                 if !delivered {
-                    if let Some(ref state) = self.state {
-                        let entry = crate::traits::NotificationEntry::new(
+                    if let Some(ref state) = self.notifications {
+                        let entry = crate::tools::traits::NotificationEntry::new(
                             &goal_id,
                             &session_id,
                             "progress",
@@ -5039,7 +5058,7 @@ impl TerminalTool {
             deletion_observation_candidates(command, working_dir, write_paths, write_roots);
         let mut deletion_preexisting: Vec<String> = Vec::new();
         for path in &deletion_candidates {
-            let backend_path = crate::execution::BackendPath::new(path.clone());
+            let backend_path = aidaemon_tools::BackendPath::new(path.clone());
             if self.backend.metadata(&backend_path).await.is_ok() {
                 deletion_preexisting.push(path.clone());
             }
@@ -5313,11 +5332,13 @@ impl TerminalTool {
                     let mut semantics = metadata.semantics.clone();
                     let mut observed_deletion = false;
                     for path in &deletion_preexisting {
-                        let backend_path = crate::execution::BackendPath::new(path.clone());
+                        let backend_path = aidaemon_tools::BackendPath::new(path.clone());
                         if self.backend.metadata(&backend_path).await.is_err() {
                             observed_deletion = true;
-                            semantics = semantics
-                                .with_target_hint(crate::traits::ToolTargetHintKind::Path, path);
+                            semantics = semantics.with_target_hint(
+                                crate::tools::traits::ToolTargetHintKind::Path,
+                                path,
+                            );
                         }
                     }
                     if observed_deletion {
@@ -5326,17 +5347,17 @@ impl TerminalTool {
                             .union(ToolMutationEffects::DESTRUCTIVE);
                         if !semantics.mutates_state() {
                             semantics.effect =
-                                crate::traits::ToolCallEffect::ObservationAndMutation;
+                                crate::tools::traits::ToolCallEffect::ObservationAndMutation;
                         }
                     }
                     // Type the URLs a fetch-only command proved it reached:
                     // its exit status vouches for every fetch, so the receipt
                     // is an observation of each URL, as written.
-                    let fetched = crate::tools::command_effects::proven_fetch_urls(command)
+                    let fetched = aidaemon_tools::command_effects::proven_fetch_urls(command)
                         .unwrap_or_default();
                     for url in &fetched {
-                        semantics =
-                            semantics.with_target_hint(crate::traits::ToolTargetHintKind::Url, url);
+                        semantics = semantics
+                            .with_target_hint(crate::tools::traits::ToolTargetHintKind::Url, url);
                     }
                     if observed_deletion || !fetched.is_empty() {
                         metadata.semantics = semantics;
@@ -5378,7 +5399,7 @@ impl TerminalTool {
                     return Ok(ToolCallOutcome {
                         metadata: ToolCallMetadata {
                             outcome_status: Some(ToolOutcomeStatus::Backgrounded),
-                            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+                            invocation_stage: crate::tools::traits::ToolInvocationStage::Dispatched,
                             access_enforcement: confined_process_access_enforcement(),
                             background_started: true,
                             detached: true,
@@ -5473,7 +5494,7 @@ impl TerminalTool {
                 let mut notifier_started = false;
                 // The name of the run this command became, when it is one.
                 let mut run_label: Option<String> = None;
-                let state_for_notify = self.state.clone();
+                let state_for_notify = self.notifications.clone();
                 let hub_for_notify = self.get_hub();
                 let agent_for_notify = self.agent.get().and_then(|w| w.upgrade());
                 let reengagements_for_notify = self.reengagements.clone();
@@ -5569,7 +5590,7 @@ impl TerminalTool {
                             format_output(&stdout, &stderr, max_output_chars);
                         if let Some(info) = truncation.as_ref() {
                             output.push('\n');
-                            output.push_str(&crate::utils::render_truncation_notice(info));
+                            output.push_str(&crate::turn::helpers::render_truncation_notice(info));
                         }
                         persist_background_completion_receipt(
                             &event_store,
@@ -5609,16 +5630,16 @@ impl TerminalTool {
                     let run = if detach || session_for_notify.is_empty() {
                         None
                     } else {
-                        let label = aidaemon_runtime::background_run::plain_label(
+                        let label = crate::background_run::plain_label(
                             title,
-                            &crate::tools::command_effects::program_label(command),
+                            &aidaemon_tools::command_effects::program_label(command),
                         );
                         let work_began = chrono::Utc::now()
                             - chrono::Duration::from_std(foreground_wait).unwrap_or_default();
                         Some(
-                            aidaemon_runtime::background_run::BackgroundRun::start(
+                            crate::background_run::BackgroundRun::start(
                                 self.run_home(),
-                                aidaemon_runtime::background_run::RunStart {
+                                crate::background_run::RunStart {
                                     id: &format!("command-{pid}-{}", uuid::Uuid::new_v4()),
                                     chat: &session_for_notify,
                                     label: &label,
@@ -5665,18 +5686,16 @@ impl TerminalTool {
                                     None => None,
                                 }
                             };
-                            let present = |ended: &Option<(
-                                Option<aidaemon_runtime::run_state::RunState>,
-                                bool,
-                            )>,
-                                           body: &str| {
-                                match (run, ended) {
-                                    (Some(run), Some((state, on_card))) => {
-                                        run.result(state.as_ref(), body, *on_card)
+                            let present =
+                                |ended: &Option<(Option<crate::run_state::RunState>, bool)>,
+                                 body: &str| {
+                                    match (run, ended) {
+                                        (Some(run), Some((state, on_card))) => {
+                                            run.result(state.as_ref(), body, *on_card)
+                                        }
+                                        _ => body.to_string(),
                                     }
-                                    _ => body.to_string(),
-                                }
-                            };
+                                };
 
                             let mut completion_rx = completion_rx;
                             let mut step_tick =
@@ -5715,9 +5734,9 @@ impl TerminalTool {
                                 }
                             };
                             let phase = match exit_code {
-                                Some(0) => aidaemon_runtime::run_state::RunPhase::Succeeded,
-                                Some(_) => aidaemon_runtime::run_state::RunPhase::Failed,
-                                None => aidaemon_runtime::run_state::RunPhase::Stopped,
+                                Some(0) => crate::run_state::RunPhase::Succeeded,
+                                Some(_) => crate::run_state::RunPhase::Failed,
+                                None => crate::run_state::RunPhase::Stopped,
                             };
                             if !notify_on_completion.load(Ordering::Relaxed) {
                                 // A check or a stop already reported its end:
@@ -5733,17 +5752,17 @@ impl TerminalTool {
                                     // group: when it was the last, the others'
                                     // results go out now.
                                     if let Some(state) = state {
-                                        if let aidaemon_runtime::background_run::RunsTurn::Answer(
-                                            answer,
-                                        ) = run.end_in_group(
-                                            &state,
-                                            aidaemon_runtime::run_state::RunReport {
-                                                text: String::new(),
-                                                untrusted: false,
-                                            },
-                                            String::new(),
-                                            max_output_chars,
-                                        ) {
+                                        if let crate::background_run::RunsTurn::Answer(answer) = run
+                                            .end_in_group(
+                                                &state,
+                                                crate::run_state::RunReport {
+                                                    text: String::new(),
+                                                    untrusted: false,
+                                                },
+                                                String::new(),
+                                                max_output_chars,
+                                            )
+                                        {
                                             for message in answer
                                                 .messages
                                                 .iter()
@@ -5787,7 +5806,9 @@ impl TerminalTool {
                             let mut with_notice = formatted;
                             if let Some(ref info) = truncation {
                                 with_notice.push('\n');
-                                with_notice.push_str(&crate::utils::render_truncation_notice(info));
+                                with_notice.push_str(
+                                    &crate::turn::helpers::render_truncation_notice(info),
+                                );
                             }
                             let output = truncate_with_note(&with_notice, 2500);
                             let elapsed_secs = started_at_for_notify.elapsed().as_secs();
@@ -5891,23 +5912,19 @@ impl TerminalTool {
                             let group = match (run, ended.as_ref()) {
                                 (Some(run), Some((Some(state), _))) => run.end_in_group(
                                     state,
-                                    aidaemon_runtime::run_state::RunReport {
+                                    crate::run_state::RunReport {
                                         text: output.clone(),
                                         untrusted: true,
                                     },
                                     present(&ended, &raw_result),
                                     max_output_chars,
                                 ),
-                                _ => aidaemon_runtime::background_run::RunsTurn::Alone,
+                                _ => crate::background_run::RunsTurn::Alone,
                             };
-                            let group_waiting = matches!(
-                                group,
-                                aidaemon_runtime::background_run::RunsTurn::Waiting
-                            );
+                            let group_waiting =
+                                matches!(group, crate::background_run::RunsTurn::Waiting);
                             let group_answer = match group {
-                                aidaemon_runtime::background_run::RunsTurn::Answer(answer) => {
-                                    Some(answer)
-                                }
+                                crate::background_run::RunsTurn::Answer(answer) => Some(answer),
                                 _ => None,
                             };
                             if group_waiting {
@@ -5970,7 +5987,7 @@ impl TerminalTool {
                                     // Background deliveries bypass the agent loop's
                                     // completion sanitizer.
                                     let message =
-                                        crate::tools::sanitize::sanitize_user_facing_reply(
+                                        aidaemon_tools::sanitize::sanitize_user_facing_reply(
                                             &message,
                                         );
                                     // A result is a duplicate by its body: the
@@ -6060,8 +6077,8 @@ impl TerminalTool {
                                                 session_id: session_for_notify.clone(),
                                                 user_text: followup,
                                                 status_tx: None,
-                                                user_role: crate::types::UserRole::Owner,
-                                                channel_ctx: crate::types::ChannelContext::internal(
+                                                user_role: aidaemon_tools::semantics::UserRole::Owner,
+                                                channel_ctx: aidaemon_channels::context::ChannelContext::internal(
                                                 ),
                                                 heartbeat: None,
                                                 parent_task_id,
@@ -6077,7 +6094,7 @@ impl TerminalTool {
                                                 // Defense-in-depth: never leak scaffolding
                                                 // the re-engaged loop may echo.
                                                 let reply =
-                                                    crate::tools::sanitize::sanitize_user_facing_reply(
+                                                    aidaemon_tools::sanitize::sanitize_user_facing_reply(
                                                         &envelope.text,
                                                     );
                                                 if !reply.trim().is_empty() {
@@ -6107,7 +6124,7 @@ impl TerminalTool {
                                                                 &session_for_notify,
                                                                 envelope.delivery(
                                                                     "background_router",
-                                                                    crate::events::ResponseDeliveryState::Failed,
+                                                                    aidaemon_events::ResponseDeliveryState::Failed,
                                                                     Vec::new(),
                                                                     Some("duplicate_suppressed".to_string()),
                                                                 ),
@@ -6124,7 +6141,7 @@ impl TerminalTool {
                                                                 &session_for_notify,
                                                                 envelope.delivery(
                                                                     "background_router",
-                                                                    crate::events::ResponseDeliveryState::Queued,
+                                                                    aidaemon_events::ResponseDeliveryState::Queued,
                                                                     Vec::new(),
                                                                     None,
                                                                 ),
@@ -6144,7 +6161,7 @@ impl TerminalTool {
                                                                         &session_for_notify,
                                                                         envelope.delivery(
                                                                             "background_router",
-                                                                            crate::events::ResponseDeliveryState::PlatformAcknowledged,
+                                                                            aidaemon_events::ResponseDeliveryState::PlatformAcknowledged,
                                                                             platform_id.into_iter().collect(),
                                                                             None,
                                                                         ),
@@ -6157,7 +6174,7 @@ impl TerminalTool {
                                                                         &session_for_notify,
                                                                         envelope.delivery(
                                                                             "background_router",
-                                                                            crate::events::ResponseDeliveryState::Failed,
+                                                                            aidaemon_events::ResponseDeliveryState::Failed,
                                                                             Vec::new(),
                                                                             Some("transport_error".to_string()),
                                                                         ),
@@ -6307,10 +6324,7 @@ impl TerminalTool {
                     let lead = run_label
                         .as_deref()
                         .map(|label| {
-                            format!(
-                                "{}\n",
-                                aidaemon_runtime::background_run::started_in_background(label)
-                            )
+                            format!("{}\n", crate::background_run::started_in_background(label))
                         })
                         .unwrap_or_default();
                     format!(
@@ -6549,7 +6563,7 @@ impl TerminalTool {
         // Route background completion notifications to the origin session
         // when this terminal run is tied to a goal/task lead.
         let mut notify_session_id = exec_ctx.session_id.clone();
-        if let (Some(state), Some(goal_id)) = (self.state.as_ref(), exec_ctx.goal_id.as_deref()) {
+        if let (Some(state), Some(goal_id)) = (self.goals.as_ref(), exec_ctx.goal_id.as_deref()) {
             if let Ok(Some(goal)) = state.get_goal(goal_id).await {
                 if !goal.session_id.trim().is_empty() {
                     notify_session_id = goal.session_id;
@@ -6603,7 +6617,7 @@ impl TerminalTool {
                     && !terminal_run_annotations(
                         &args,
                         self.confinement,
-                        &crate::traits::TrustRoots::new(&[]),
+                        &crate::tools::traits::TrustRoots::new(&[]),
                     )
                     .read_only
                 {
@@ -6620,7 +6634,7 @@ impl TerminalTool {
                 // before the call and asked the owner where it requires it.
                 // The tool never asks. Outside the kernel, a command the
                 // ladder would ask about is refused.
-                if exec_ctx.kernel_approved != Some(crate::traits::ApprovalScope::Call)
+                if exec_ctx.kernel_approved != Some(crate::tools::traits::ApprovalScope::Call)
                     && self.approval_ladder(&args, command, &trust).await.is_some()
                 {
                     anyhow::bail!(
@@ -6653,7 +6667,7 @@ impl TerminalTool {
                 // repair an unpreparable projection it authored without
                 // involving the model), and the full root only when it is the
                 // command's working directory, which must exist before exec.
-                let mut created_future_roots: Vec<crate::execution::BackendPath> = Vec::new();
+                let mut created_future_roots: Vec<aidaemon_tools::BackendPath> = Vec::new();
                 if !args.write_roots.is_empty() {
                     let cwd = if let Some(path) = args.working_dir.as_deref() {
                         Some(self.backend.resolve_path(path).await?)
@@ -6689,7 +6703,7 @@ impl TerminalTool {
                             std::path::Path::new(resolved.as_str())
                                 .parent()
                                 .map(|parent| {
-                                    crate::execution::BackendPath::new(
+                                    aidaemon_tools::BackendPath::new(
                                         parent.to_string_lossy().to_string(),
                                     )
                                 })
@@ -6714,7 +6728,7 @@ impl TerminalTool {
                 let launch_trust = match exec_ctx.trust_roots.as_deref() {
                     Some(roots) => self.output_trust(
                         arguments,
-                        &crate::traits::TrustRoots::new(roots)
+                        &crate::tools::traits::TrustRoots::new(roots)
                             .with_cwd(exec_ctx.trust_cwd.as_deref()),
                     ),
                     None => aidaemon_core::SourceTrust::Untrusted,
@@ -6781,7 +6795,7 @@ impl TerminalTool {
             outcome.metadata.access_enforcement = if run_is_confined(self.confinement) {
                 confined_process_access_enforcement()
             } else {
-                crate::traits::ToolAccessEnforcement::NotApplicable
+                crate::tools::traits::ToolAccessEnforcement::NotApplicable
             };
         }
 
@@ -6795,7 +6809,7 @@ impl TerminalTool {
 fn background_job_title(command: &str, title: Option<&str>) -> String {
     let what = title
         .map(str::to_string)
-        .unwrap_or_else(|| crate::tools::command_effects::program_label(command));
+        .unwrap_or_else(|| aidaemon_tools::command_effects::program_label(command));
     format!("Background command: {what}")
 }
 
@@ -6810,8 +6824,9 @@ fn call_title(args: &TerminalArgs) -> Option<String> {
     if title.is_empty() {
         return None;
     }
-    let title =
-        crate::tools::sanitize::redact_secrets(&crate::tools::sanitize::shorten_home_dir(&title));
+    let title = aidaemon_tools::sanitize::redact_secrets(
+        &aidaemon_tools::sanitize::shorten_home_dir(&title),
+    );
     Some(truncate_str(&title, CALL_TITLE_CHARS).to_string())
 }
 
@@ -6864,8 +6879,8 @@ struct TerminalRunRequest<'a> {
 /// untrusted external triggers are not sandboxed by exception; they are
 /// protected by the mandatory per-command approval that path already
 /// enforces.
-fn run_is_confined(confinement: crate::types::TerminalConfinement) -> bool {
-    confinement == crate::types::TerminalConfinement::Sandbox
+fn run_is_confined(confinement: aidaemon_tools::TerminalConfinement) -> bool {
+    confinement == aidaemon_tools::TerminalConfinement::Sandbox
 }
 
 /// Host execution request: the command as the daemon's user, in the resolved
@@ -6987,7 +7002,7 @@ pub(crate) struct TerminalTrust {
     /// Started by an automated trigger: every run asks.
     pub untrusted_source: bool,
     /// Out-of-scope targets routed to the owner (a confined capability).
-    pub scope_escalation: Option<crate::traits::ScopeEscalation>,
+    pub scope_escalation: Option<crate::tools::traits::ScopeEscalation>,
 }
 
 impl TerminalTrust {
@@ -6996,7 +7011,7 @@ impl TerminalTrust {
     fn for_approval(ctx: &ToolCallContext) -> Self {
         Self {
             session_id: ctx.session_id.clone(),
-            owner: ctx.user_role == Some(crate::types::UserRole::Owner),
+            owner: ctx.user_role == Some(aidaemon_tools::semantics::UserRole::Owner),
             trusted_session: ctx.trusted_session,
             untrusted_source: ctx.untrusted_source,
             scope_escalation: ctx.scope_escalation.clone(),
@@ -7006,7 +7021,7 @@ impl TerminalTrust {
     fn from_execution_context(session_id: &str, ctx: &ToolCallContext) -> Self {
         Self {
             session_id: session_id.to_string(),
-            owner: ctx.user_role == Some(crate::types::UserRole::Owner),
+            owner: ctx.user_role == Some(aidaemon_tools::semantics::UserRole::Owner),
             trusted_session: ctx.trusted_session,
             untrusted_source: ctx.untrusted_source,
             scope_escalation: ctx.scope_escalation.clone().filter(|e| !e.is_empty()),
@@ -7047,13 +7062,13 @@ fn extract_terminal_exit_code(output: &str) -> Option<i32> {
 fn sandbox_access_denial(
     stderr: &str,
     exit_code: Option<i32>,
-) -> Option<crate::traits::ToolAccessDenial> {
+) -> Option<crate::tools::traits::ToolAccessDenial> {
     let denied = exit_code.is_some_and(|code| code != 0)
         && stderr.lines().any(|line| {
             let line = line.trim().to_ascii_lowercase();
             line.contains("operation not permitted") || line.contains("permission denied")
         });
-    denied.then(|| crate::traits::ToolAccessDenial {
+    denied.then(|| crate::tools::traits::ToolAccessDenial {
         reason_code: "sandbox_policy_denied".to_string(),
         enforcement: confined_process_access_enforcement(),
         exit_code,
@@ -7083,7 +7098,7 @@ struct BackgroundCompletion<'a> {
     tool_call_id: &'a str,
     exit_code: Option<i32>,
     output: &'a str,
-    truncation: Option<crate::traits::TruncationInfo>,
+    truncation: Option<crate::tools::traits::TruncationInfo>,
     stderr: &'a str,
     semantics: ToolCallSemantics,
     elapsed_secs: u64,
@@ -7104,22 +7119,22 @@ async fn persist_background_completion_receipt(
         ToolOutcomeStatus::from_process_exit_code,
     );
     let mut metadata = foreground_terminal_metadata(ended.exit_code);
-    metadata.receipt_kind = crate::traits::ToolReceiptKind::Process;
+    metadata.receipt_kind = crate::tools::traits::ToolReceiptKind::Process;
     metadata.effective_tool_name = Some("terminal".to_string());
     metadata.truncation = ended.truncation.clone();
     metadata.semantics = ended.semantics.clone();
     metadata.access_denial = sandbox_access_denial(ended.stderr, ended.exit_code);
-    let provenance = crate::traits::ToolResultProvenance::from_authoritative_result(
+    let provenance = crate::tools::traits::ToolResultProvenance::from_authoritative_result(
         ended.output,
         &metadata,
-        crate::traits::ToolResultContentSource::ToolOutput,
+        crate::tools::traits::ToolResultContentSource::ToolOutput,
     );
     let result_id = provenance.result_id.clone();
     metadata.result_provenance = Some(provenance);
-    let mut receipt = crate::events::ToolReceiptV1::from_metadata(
+    let mut receipt = aidaemon_events::ToolReceiptV1::from_metadata(
         &metadata,
         outcome_status,
-        crate::events::ToolOutcomeEvidenceSource::ToolReported,
+        aidaemon_events::ToolOutcomeEvidenceSource::ToolReported,
         None,
     );
     receipt.completion_obligation_ids = event_store
@@ -7128,12 +7143,12 @@ async fn persist_background_completion_receipt(
         .unwrap_or_default();
     receipt.continuation_obligation_ids = receipt.completion_obligation_ids.clone();
     let emitter =
-        crate::events::EventEmitter::new(event_store.clone(), ended.session_id.to_string())
+        aidaemon_events::EventEmitter::new(event_store.clone(), ended.session_id.to_string())
             .with_task_id(ended.task_id.to_string());
     if let Err(error) = emitter
         .emit(
-            crate::events::EventType::ToolResult,
-            crate::events::ToolResultData {
+            aidaemon_events::EventType::ToolResult,
+            aidaemon_events::ToolResultData {
                 message_id: None,
                 tool_call_id: ended.tool_call_id.to_string(),
                 name: "terminal".to_string(),
@@ -7166,7 +7181,7 @@ fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
     ToolCallMetadata {
         outcome_status: exit_code.map(ToolOutcomeStatus::from_process_exit_code),
         exit_code,
-        invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+        invocation_stage: crate::tools::traits::ToolInvocationStage::Dispatched,
         access_enforcement: enforcement,
         timed_out: false,
         background_started: false,
@@ -7180,14 +7195,14 @@ fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
     }
 }
 
-pub(crate) fn confined_process_access_enforcement() -> crate::traits::ToolAccessEnforcement {
+pub(crate) fn confined_process_access_enforcement() -> crate::tools::traits::ToolAccessEnforcement {
     #[cfg(target_os = "macos")]
     {
-        crate::traits::ToolAccessEnforcement::KernelEnforced
+        crate::tools::traits::ToolAccessEnforcement::KernelEnforced
     }
     #[cfg(not(target_os = "macos"))]
     {
-        crate::traits::ToolAccessEnforcement::AdapterEnforced
+        crate::tools::traits::ToolAccessEnforcement::AdapterEnforced
     }
 }
 
@@ -7201,7 +7216,7 @@ fn background_completion_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
     ToolCallMetadata {
         outcome_status: exit_code.map(ToolOutcomeStatus::from_process_exit_code),
         exit_code,
-        invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+        invocation_stage: crate::tools::traits::ToolInvocationStage::Dispatched,
         access_enforcement: confined_process_access_enforcement(),
         ..Default::default()
     }
@@ -7217,7 +7232,7 @@ fn background_observation_metadata(
 ) -> ToolCallMetadata {
     ToolCallMetadata {
         outcome_status: Some(outcome_status),
-        invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+        invocation_stage: crate::tools::traits::ToolInvocationStage::Dispatched,
         access_enforcement: confined_process_access_enforcement(),
         detached,
         completion_notifications_enabled,
@@ -7225,7 +7240,7 @@ fn background_observation_metadata(
     }
 }
 
-fn terminal_receipt_kind(arguments: &str) -> crate::traits::ToolReceiptKind {
+fn terminal_receipt_kind(arguments: &str) -> crate::tools::traits::ToolReceiptKind {
     let action = serde_json::from_str::<Value>(arguments)
         .ok()
         .and_then(|value| {
@@ -7236,9 +7251,9 @@ fn terminal_receipt_kind(arguments: &str) -> crate::traits::ToolReceiptKind {
         })
         .unwrap_or(TerminalAction::Run);
     if action.runs_command() {
-        crate::traits::ToolReceiptKind::Process
+        crate::tools::traits::ToolReceiptKind::Process
     } else {
-        crate::traits::ToolReceiptKind::Generic
+        crate::tools::traits::ToolReceiptKind::Generic
     }
 }
 
@@ -7321,8 +7336,8 @@ fn terminal_run_semantics_from_access(
 /// `terminal_call_semantics`, deliberately stays separate).
 fn terminal_run_annotations(
     args: &TerminalArgs,
-    confinement: crate::types::TerminalConfinement,
-    roots: &crate::traits::TrustRoots<'_>,
+    confinement: aidaemon_tools::TerminalConfinement,
+    roots: &crate::tools::traits::TrustRoots<'_>,
 ) -> aidaemon_core::ToolAnnotations {
     let text = match (args.command.as_deref(), args.script.as_deref()) {
         (Some(command), None) => command,
@@ -7330,7 +7345,7 @@ fn terminal_run_annotations(
         // Neither or both is an invalid run; never read-only.
         _ => "",
     };
-    let effects = crate::tools::command_effects::command_effects(text);
+    let effects = aidaemon_tools::command_effects::command_effects(text);
     let has_write_targets = args
         .write_paths
         .iter()
@@ -7343,7 +7358,7 @@ fn terminal_run_annotations(
     let read_only = !has_write_targets
         && !args.network
         && (effects.observation_only
-            || crate::tools::command_effects::only_reads_this_computer(text));
+            || aidaemon_tools::command_effects::only_reads_this_computer(text));
     // Writing into git configuration changes what later git commands run:
     // a declared target that is git configuration, a declared root holding a
     // repository, or a command word naming git configuration.
@@ -7351,13 +7366,13 @@ fn terminal_run_annotations(
         .write_paths
         .iter()
         .chain(args.write_roots.iter())
-        .any(|path| crate::tools::command_effects::is_git_config_path(path))
+        .any(|path| aidaemon_tools::command_effects::is_git_config_path(path))
         || args.write_roots.iter().any(|root| {
-            crate::tools::command_effects::root_holds_repository(root, args.working_dir.as_deref())
+            aidaemon_tools::command_effects::root_holds_repository(root, args.working_dir.as_deref())
         })
         // An observation-only command cannot write by construction.
         || (!effects.observation_only
-            && crate::tools::command_effects::command_names_git_config_path(text));
+            && aidaemon_tools::command_effects::command_names_git_config_path(text));
     // A delete is egress unless every target is inside the trusted roots.
     // Relative targets resolve against the call's own absolute working
     // directory; without one (the dispatcher may still pick it) they are
@@ -7385,7 +7400,7 @@ fn terminal_run_annotations(
     let host_beyond_local_work =
         !run_is_confined(confinement) && !effects.observation_only && !effects.local_work_only;
     let reaches_network = args.network
-        || crate::tools::command_effects::fetches_network(text)
+        || aidaemon_tools::command_effects::fetches_network(text)
         || host_beyond_local_work;
     // A request to a site on this computer (a dev site the work set up) or
     // a local project's own query reaches nothing outside the machine, even
@@ -7393,7 +7408,7 @@ fn terminal_run_annotations(
     // or the container engine. Judged only when the call would otherwise be
     // network (it resolves names).
     let stays_on_this_computer =
-        reaches_network && crate::tools::command_effects::reaches_only_this_computer(text);
+        reaches_network && aidaemon_tools::command_effects::reaches_only_this_computer(text);
     aidaemon_core::ToolAnnotations {
         read_only,
         destructive: effects.deletes,
@@ -7437,7 +7452,7 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
             });
             // A command that asks a remote service to change something is a
             // remote mutation, however it reaches the service.
-            if command.is_some_and(crate::tools::command_effects::sends_remote_write) {
+            if command.is_some_and(aidaemon_tools::command_effects::sends_remote_write) {
                 let effects = if has_write_targets {
                     ToolMutationEffects::REMOTE_MUTATION
                         .union(ToolMutationEffects::LOCAL_WORKSPACE_WRITE)
@@ -7463,8 +7478,8 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
             if !has_write_targets
                 && has_network
                 && command.is_some_and(|command| {
-                    !crate::tools::command_effects::command_effects(command).observation_only
-                        && !crate::tools::command_effects::only_reads(command)
+                    !aidaemon_tools::command_effects::command_effects(command).observation_only
+                        && !aidaemon_tools::command_effects::only_reads(command)
                 })
             {
                 return ToolCallSemantics::observation_and_mutation_with(
@@ -7481,7 +7496,7 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
     }
 }
 
-fn terminal_access_manifest(arguments: &str) -> crate::traits::ToolCallAccessManifest {
+fn terminal_access_manifest(arguments: &str) -> crate::tools::traits::ToolCallAccessManifest {
     let parsed = serde_json::from_str::<Value>(arguments).ok();
     let execution_cwd = parsed
         .as_ref()
@@ -7494,11 +7509,7 @@ fn terminal_access_manifest(arguments: &str) -> crate::traits::ToolCallAccessMan
         execution_cwd
             .as_deref()
             .filter(|_| !path.starts_with('/') && path != "~" && !path.starts_with("~/"))
-            .map(|cwd| {
-                crate::execution::BackendPath::new(cwd)
-                    .join(path)
-                    .to_string()
-            })
+            .map(|cwd| aidaemon_tools::BackendPath::new(cwd).join(path).to_string())
             .unwrap_or_else(|| path.to_string())
     };
     // Execution location and data authority are independent. Merely selecting
@@ -7554,7 +7565,7 @@ fn terminal_access_manifest(arguments: &str) -> crate::traits::ToolCallAccessMan
             .map(resolve)
             .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, path)),
     );
-    crate::traits::ToolCallAccessManifest {
+    crate::tools::traits::ToolCallAccessManifest {
         execution_cwd,
         read_targets,
         write_targets,
@@ -7645,12 +7656,12 @@ impl TerminalAction {
 /// `run` declares what its command does (see
 /// `command_effects::shell_call_effects`), anything else is undeclared.
 fn terminal_call_effects(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     arguments: &str,
 ) -> aidaemon_core::CallEffects {
     terminal_call_effects_on(
         arguments,
-        crate::tools::command_effects::execution_backend_is_local(backend),
+        aidaemon_tools::command_effects::execution_backend_is_local(backend),
     )
 }
 
@@ -7659,7 +7670,7 @@ fn terminal_call_effects(
 /// command touches live there, so they are not resolved on the local disk:
 /// path effects are left undeclared and the call is incomplete.
 fn terminal_call_effects_on(arguments: &str, local: bool) -> aidaemon_core::CallEffects {
-    use crate::tools::command_effects::{path_effect, shell_call_effects, without_local_paths};
+    use aidaemon_tools::command_effects::{path_effect, shell_call_effects, without_local_paths};
     let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
         return aidaemon_core::CallEffects::unknown();
     };
@@ -7758,7 +7769,7 @@ impl Tool for TerminalTool {
 
     async fn record_owner_answer(
         &self,
-        call: &crate::traits::ApprovalCall<'_>,
+        call: &crate::tools::traits::ApprovalCall<'_>,
         facts: &ToolCallContext,
         response: Option<ApprovalResponse>,
     ) {
@@ -7844,9 +7855,9 @@ impl Tool for TerminalTool {
     async fn execute(
         &self,
         arguments: &str,
-        facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-        let status_tx = crate::traits::status_sender(facts);
+        facts: &crate::tools::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::tools::traits::ToolCallOutcome> {
+        let status_tx = aidaemon_tools::status::status_sender(facts);
         let exec_ctx = facts.clone();
 
         self.execute_terminal(arguments, status_tx, &exec_ctx).await
@@ -7854,7 +7865,7 @@ impl Tool for TerminalTool {
 }
 
 #[async_trait::async_trait]
-impl crate::traits::ToolSemantics for TerminalTool {
+impl crate::tools::traits::ToolSemantics for TerminalTool {
     fn canonicalize_arguments(
         &self,
         arguments: &str,
@@ -7866,15 +7877,15 @@ impl crate::traits::ToolSemantics for TerminalTool {
         validate_terminal_argument_contract(arguments)
     }
 
-    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
-        crate::traits::ToolDispatchFacts {
+    fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
+        crate::tools::traits::ToolDispatchFacts {
             runs_as_judged: true,
             keeps_own_grants: true,
             shell_command_line: true,
             always_offered: true,
-            same_tool_streak: crate::traits::SameToolStreak::Versatile,
+            same_tool_streak: crate::tools::traits::SameToolStreak::Versatile,
             records_launch_trust: true,
-            goal_context: crate::traits::GoalContext::BackgroundDelivery,
+            goal_context: crate::tools::traits::GoalContext::BackgroundDelivery,
             ..Default::default()
         }
     }
@@ -7885,10 +7896,10 @@ impl crate::traits::ToolSemantics for TerminalTool {
     /// refuses needs nobody.
     async fn owner_approval_request(
         &self,
-        call: &crate::traits::ApprovalCall<'_>,
+        call: &crate::tools::traits::ApprovalCall<'_>,
         facts: &ToolCallContext,
-    ) -> crate::traits::OwnerApprovalNeed {
-        use crate::traits::OwnerApprovalNeed;
+    ) -> crate::tools::traits::OwnerApprovalNeed {
+        use crate::tools::traits::OwnerApprovalNeed;
         if let Some(reason) = Self::unreadable_reason(call.arguments) {
             return OwnerApprovalNeed::Ask(self.unreadable_request(call.as_sent, &reason));
         }
@@ -7913,7 +7924,7 @@ impl crate::traits::ToolSemantics for TerminalTool {
         }
     }
 
-    fn receipt_kind(&self, arguments: &str) -> crate::traits::ToolReceiptKind {
+    fn receipt_kind(&self, arguments: &str) -> crate::tools::traits::ToolReceiptKind {
         terminal_receipt_kind(arguments)
     }
 
@@ -7928,7 +7939,7 @@ impl crate::traits::ToolSemantics for TerminalTool {
     fn call_annotations_in(
         &self,
         arguments: &str,
-        roots: &crate::traits::TrustRoots<'_>,
+        roots: &crate::tools::traits::TrustRoots<'_>,
     ) -> aidaemon_core::ToolAnnotations {
         let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
             return aidaemon_core::ToolAnnotations::WRITE;
@@ -7951,7 +7962,7 @@ impl crate::traits::ToolSemantics for TerminalTool {
     fn output_trust(
         &self,
         arguments: &str,
-        roots: &crate::traits::TrustRoots<'_>,
+        roots: &crate::tools::traits::TrustRoots<'_>,
     ) -> aidaemon_core::SourceTrust {
         let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
             return aidaemon_core::SourceTrust::Untrusted;
@@ -7978,7 +7989,7 @@ impl crate::traits::ToolSemantics for TerminalTool {
             .as_deref()
             .or(args.script.as_deref())
             .unwrap_or("");
-        if args.network || crate::tools::command_effects::fetches_network(text) {
+        if args.network || aidaemon_tools::command_effects::fetches_network(text) {
             return aidaemon_core::SourceTrust::Untrusted;
         }
         // The run's own absolute directory, else the turn's cwd (where a
@@ -8000,12 +8011,12 @@ impl crate::traits::ToolSemantics for TerminalTool {
             // On the host nothing enforces declared reads: trust comes from
             // the command's structure. An observation or ordinary local work,
             // run inside the roots, on operands that all resolve inside them.
-            let effects = crate::tools::command_effects::command_effects(text);
+            let effects = aidaemon_tools::command_effects::command_effects(text);
             (effects.observation_only
                 || effects.local_work_only
-                || crate::tools::command_effects::is_observation_reading_input(text))
+                || aidaemon_tools::command_effects::is_observation_reading_input(text))
                 && working_dir.is_some_and(|dir| roots.contains(dir))
-                && crate::tools::command_effects::path_operands(text)
+                && aidaemon_tools::command_effects::path_operands(text)
                     .is_some_and(|operands| operands.iter().all(|path| roots.contains(path)))
         };
         if trusted {
@@ -8025,14 +8036,17 @@ impl crate::traits::ToolSemantics for TerminalTool {
         .flatten()
     }
 
-    fn call_access_manifest(&self, arguments: &str) -> crate::traits::ToolCallAccessManifest {
+    fn call_access_manifest(
+        &self,
+        arguments: &str,
+    ) -> crate::tools::traits::ToolCallAccessManifest {
         terminal_access_manifest(arguments)
     }
 
     fn adapter_owned_access_manifest(
         &self,
         _arguments: &str,
-    ) -> crate::traits::ToolCallAccessManifest {
+    ) -> crate::tools::traits::ToolCallAccessManifest {
         // A confined process must load its shell and immutable system
         // executables before it can exercise the task manifest.  These roots
         // are adapter-owned runtime capabilities, not task data grants.  The
@@ -8050,7 +8064,7 @@ impl crate::traits::ToolSemantics for TerminalTool {
         .into_iter()
         .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, path.to_string()))
         .collect();
-        crate::traits::ToolCallAccessManifest {
+        crate::tools::traits::ToolCallAccessManifest {
             adapter_read_targets,
             ..Default::default()
         }
@@ -8189,13 +8203,16 @@ impl crate::traits::ToolSemantics for TerminalTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::embeddings::EmbeddingService;
-    use crate::state::SqliteStateStore;
-    use crate::testing::CallWithFacts;
-    use crate::testing::MockProvider;
-    use crate::traits::ToolCalls as _;
-    use crate::traits::ToolSemantics;
-    use crate::traits::{NotificationStore, StateStore};
+    use crate::tools::traits::NotificationStore;
+    use crate::tools::traits::ToolSemantics;
+    use aidaemon_core::testing::ScriptedProvider;
+    use aidaemon_tools::testing::CallWithFacts;
+    use aidaemon_tools::testing::ToolCalls as _;
+
+    /// The work stores (goals, notifications) on a fresh database at `path`.
+    async fn work_store(path: &str) -> aidaemon_work::sqlite::SqliteWorkStore {
+        aidaemon_work::sqlite::open_for_tests(path).await
+    }
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use std::time::Duration;
@@ -8226,8 +8243,8 @@ mod tests {
     /// The dispatcher's context for an owner's call the kernel approved.
     fn kernel_owner_ctx() -> ToolCallContext {
         ToolCallContext {
-            kernel_approved: Some(crate::traits::ApprovalScope::Call),
-            user_role: Some(crate::types::UserRole::Owner),
+            kernel_approved: Some(crate::tools::traits::ApprovalScope::Call),
+            user_role: Some(aidaemon_tools::semantics::UserRole::Owner),
             ..Default::default()
         }
     }
@@ -8241,9 +8258,9 @@ mod tests {
     }
 
     async fn semantic_gateway(
-        provider: Arc<MockProvider>,
-    ) -> crate::llm_runtime::gateway::SideCallGateway {
-        crate::llm_runtime::gateway::test_support::gateway_with(provider)
+        provider: Arc<ScriptedProvider>,
+    ) -> crate::llm::gateway::SideCallGateway {
+        crate::llm::gateway::test_support::gateway_with(provider)
             .await
             .0
     }
@@ -8276,11 +8293,11 @@ mod tests {
     fn terminal_receipt_protocol_is_selected_per_action() {
         assert_eq!(
             terminal_receipt_kind(r#"{"action":"run","command":"/usr/bin/false"}"#),
-            crate::traits::ToolReceiptKind::Process
+            crate::tools::traits::ToolReceiptKind::Process
         );
         assert_eq!(
             terminal_receipt_kind(r#"{"action":"trust_all"}"#),
-            crate::traits::ToolReceiptKind::Generic
+            crate::tools::traits::ToolReceiptKind::Generic
         );
     }
 
@@ -8310,17 +8327,17 @@ mod tests {
         assert!(semantics.mutates_state());
         assert_eq!(
             semantics.verification_mode,
-            crate::traits::ToolVerificationMode::ResultContent
+            crate::tools::traits::ToolVerificationMode::ResultContent
         );
         assert!(semantics
             .mutation_effects
-            .intersects(crate::traits::ToolMutationEffects::LOCAL_WORKSPACE_WRITE));
+            .intersects(crate::tools::traits::ToolMutationEffects::LOCAL_WORKSPACE_WRITE));
     }
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn confined_manifest_denies_undeclared_system_file_read() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         let request = confined_terminal_execution_request(
             &backend,
             "/usr/bin/head -n 1 /etc/hosts",
@@ -8345,7 +8362,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn empty_manifest_is_fail_closed_not_ambient_access() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         let request = confined_terminal_execution_request(
             &backend,
             "/usr/bin/head -n 1 /etc/hosts",
@@ -8357,7 +8374,7 @@ mod tests {
         .expect("confined request");
         assert!(matches!(
             request.command,
-            crate::execution::CommandSpec::Argv { .. }
+            aidaemon_tools::CommandSpec::Argv { .. }
         ));
         let output = backend
             .execute(request, Duration::from_secs(30))
@@ -8384,7 +8401,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn execution_cwd_does_not_implicitly_grant_child_file_reads() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         let root = tempfile::tempdir().expect("root");
         let private_child = root.path().join("private.txt");
         std::fs::write(&private_child, "NOT_AUTHORIZED").expect("private fixture");
@@ -8410,7 +8427,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn exact_read_grant_does_not_expose_a_sibling() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         let root = tempfile::tempdir().expect("root");
         let allowed = root.path().join("allowed.txt");
         let sibling = root.path().join("sibling.txt");
@@ -8458,7 +8475,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn exact_write_grant_cannot_mutate_a_sibling() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         let root = tempfile::tempdir().expect("root");
         let allowed = root.path().join("allowed");
         let sibling = root.path().join("sibling.txt");
@@ -8499,7 +8516,7 @@ mod tests {
     async fn manifest_grants_cannot_escape_through_an_internal_symlink() {
         use std::os::unix::fs::symlink;
 
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         let root = tempfile::tempdir().expect("root");
         let allowed = root.path().join("allowed");
         let outside = root.path().join("outside.txt");
@@ -8564,24 +8581,24 @@ mod tests {
 
     #[test]
     fn confinement_is_a_single_switch_defaulting_to_host() {
-        use crate::types::TerminalConfinement;
+        use aidaemon_tools::TerminalConfinement;
         assert_eq!(TerminalConfinement::default(), TerminalConfinement::Host);
         assert!(!run_is_confined(TerminalConfinement::Host));
         assert!(run_is_confined(TerminalConfinement::Sandbox));
-        let parsed: crate::types::TerminalConfinement =
+        let parsed: aidaemon_tools::TerminalConfinement =
             serde_json::from_str("\"sandbox\"").unwrap();
         assert_eq!(parsed, TerminalConfinement::Sandbox);
     }
 
     #[tokio::test]
     async fn host_request_runs_the_command_unwrapped_in_the_working_dir() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         let request =
             host_terminal_execution_request(&backend, "npx wrangler deploy", false, Some("/tmp"))
                 .await
                 .expect("host request");
         match &request.command {
-            crate::execution::CommandSpec::Shell(command) => {
+            aidaemon_tools::CommandSpec::Shell(command) => {
                 assert_eq!(command, "npx wrangler deploy")
             }
             other => panic!("expected plain shell command, got {other:?}"),
@@ -8595,7 +8612,7 @@ mod tests {
             .await
             .expect("host script request");
         match &script.command {
-            crate::execution::CommandSpec::Argv { program, args } => {
+            aidaemon_tools::CommandSpec::Argv { program, args } => {
                 assert_eq!(program, "/bin/sh");
                 assert_eq!(args, &vec!["-eu".to_string(), "-s".to_string()]);
             }
@@ -8644,7 +8661,7 @@ mod tests {
         // The escalation comes from the dispatcher's typed context; an
         // argument naming one is ignored.
         let trust = TerminalTrust {
-            scope_escalation: Some(crate::traits::ScopeEscalation {
+            scope_escalation: Some(crate::tools::traits::ScopeEscalation {
                 read_paths: vec!["/Users/alice/Library/Preferences/.wrangler".to_string()],
                 write_paths: vec!["/Users/alice/Library/Preferences/.wrangler/logs".to_string()],
             }),
@@ -8797,7 +8814,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn confined_root_cwd_preserves_compound_negative_process_result() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         let request = confined_terminal_execution_request(
             &backend,
             "/bin/sh -c 'printf SYNTHETIC_BEFORE; /usr/bin/false'",
@@ -8893,7 +8910,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_script_uses_stdin_and_stops_after_negative_step() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none() {
             return;
         }
@@ -8910,8 +8927,8 @@ mod tests {
         .await
         .expect("confined script request");
         let serialized_args = match &request.command {
-            crate::execution::CommandSpec::Argv { args, .. } => args.join("\n"),
-            crate::execution::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
+            aidaemon_tools::CommandSpec::Argv { args, .. } => args.join("\n"),
+            aidaemon_tools::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
         };
         assert!(!serialized_args.contains("SYNTHETIC_BEFORE"));
         assert_eq!(request.stdin.as_deref(), Some(script.as_bytes()));
@@ -9010,7 +9027,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_run_does_not_turn_a_declared_descendant_root_into_a_directory() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend
                 .resolve_executable("printf")
@@ -9065,7 +9082,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_script_prepares_future_declared_scratch_before_heredoc() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend.resolve_executable("cat").await.unwrap().is_none()
         {
@@ -9118,7 +9135,7 @@ mod tests {
 
     #[tokio::test]
     async fn nested_managed_runtime_executes_through_combined_shell_flags() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none() {
             return;
         }
@@ -9183,7 +9200,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_sandbox_runtime_grants_node_libraries_for_package_runners() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         let Some(node) = backend.resolve_executable("node").await.unwrap() else {
             return;
         };
@@ -9216,8 +9233,8 @@ mod tests {
 
     #[tokio::test]
     async fn confined_read_only_command_still_gets_a_writable_managed_scratch() {
-        let backend = crate::execution::active_execution_backend();
-        if backend.kind() != crate::execution::BackendKind::Local {
+        let backend = aidaemon_tools::testing::active_execution_backend();
+        if backend.kind() != aidaemon_tools::BackendKind::Local {
             return;
         }
         let project = tempfile::tempdir().expect("project");
@@ -9257,8 +9274,8 @@ mod tests {
         );
         // The sandbox policy must authorize writing that scratch.
         let serialized = match &request.command {
-            crate::execution::CommandSpec::Argv { args, .. } => args.join("\n"),
-            crate::execution::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
+            aidaemon_tools::CommandSpec::Argv { args, .. } => args.join("\n"),
+            aidaemon_tools::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
         };
         assert!(
             serialized.contains(&scratch),
@@ -9268,7 +9285,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_sandbox_runtime_grants_a_conda_prefix_by_its_marker() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         // Find any resolvable executable whose prefix carries `conda-meta`.
         let mut conda_prefix = None;
         for program in ["node", "python3", "python"] {
@@ -9308,7 +9325,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_sandbox_runtime_grants_git_its_own_config_files_only_for_git() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         if backend.resolve_executable("git").await.unwrap().is_none() {
             return;
         }
@@ -9338,7 +9355,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_sandbox_runtime_supports_local_rust_toolchain_without_home_access() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend.resolve_executable("cargo").await.unwrap().is_none()
         {
@@ -9363,14 +9380,14 @@ mod tests {
         .await
         .expect("confined request");
         let serialized = match &request.command {
-            crate::execution::CommandSpec::Argv { args, .. } => args.join("\n"),
-            crate::execution::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
+            aidaemon_tools::CommandSpec::Argv { args, .. } => args.join("\n"),
+            aidaemon_tools::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
         };
         assert!(!serialized.contains("credentials.toml"));
         assert!(!serialized.contains(&format!("\"path\":\"{}\"", backend.home_hint())));
         let sandbox_path = request.env.get("PATH").cloned().unwrap_or_default();
         let canonical_cwd = backend
-            .canonicalize(&crate::execution::BackendPath::new(cwd.clone()))
+            .canonicalize(&aidaemon_tools::BackendPath::new(cwd.clone()))
             .await
             .expect("canonical project root")
             .to_string();
@@ -9386,7 +9403,7 @@ mod tests {
         assert_eq!(request.env.get("XDG_CACHE_HOME"), Some(&tmpdir));
         let git_config = backend.home_hint().join(".gitconfig").to_string();
         if backend
-            .metadata(&crate::execution::BackendPath::new(git_config.clone()))
+            .metadata(&aidaemon_tools::BackendPath::new(git_config.clone()))
             .await
             .is_ok()
         {
@@ -9413,7 +9430,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_cargo_project_creation_uses_exact_runtime_config_grant() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend.resolve_executable("cargo").await.unwrap().is_none()
         {
@@ -9431,12 +9448,12 @@ mod tests {
         .await
         .expect("confined request");
         let serialized = match &request.command {
-            crate::execution::CommandSpec::Argv { args, .. } => args.join("\n"),
-            crate::execution::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
+            aidaemon_tools::CommandSpec::Argv { args, .. } => args.join("\n"),
+            aidaemon_tools::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
         };
         let git_config = backend.home_hint().join(".gitconfig").to_string();
         if backend
-            .metadata(&crate::execution::BackendPath::new(git_config.clone()))
+            .metadata(&aidaemon_tools::BackendPath::new(git_config.clone()))
             .await
             .is_ok()
         {
@@ -9459,7 +9476,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_cargo_lifecycle_can_create_and_remove_exact_absent_root() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend.resolve_executable("cargo").await.unwrap().is_none()
         {
@@ -9495,31 +9512,31 @@ mod tests {
     #[test]
     fn managed_runtime_root_is_derived_from_installation_layout_not_tool_name() {
         assert_eq!(
-            managed_executable_runtime_root(&crate::execution::BackendPath::new(
+            managed_executable_runtime_root(&aidaemon_tools::BackendPath::new(
                 "/opt/homebrew/Cellar/python@3.14/3.14.6/bin/python3.14"
             )),
             Some("/opt/homebrew/Cellar/python@3.14/3.14.6".to_string())
         );
         assert_eq!(
-            homebrew_stable_runtime_alias(&crate::execution::BackendPath::new(
+            homebrew_stable_runtime_alias(&aidaemon_tools::BackendPath::new(
                 "/opt/homebrew/Cellar/python@3.14/3.14.6/bin/python3.14"
             )),
             Some("/opt/homebrew/opt/python@3.14".to_string())
         );
         assert_eq!(
-            homebrew_alias_namespace(&crate::execution::BackendPath::new(
+            homebrew_alias_namespace(&aidaemon_tools::BackendPath::new(
                 "/opt/homebrew/Cellar/python@3.14/3.14.6/bin/python3.14"
             )),
             Some("/opt/homebrew/opt".to_string())
         );
         assert_eq!(
-            managed_executable_runtime_root(&crate::execution::BackendPath::new(
+            managed_executable_runtime_root(&aidaemon_tools::BackendPath::new(
                 "/synthetic/user/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc"
             )),
             Some("/synthetic/user/.rustup/toolchains/stable-aarch64-apple-darwin".to_string())
         );
         assert_eq!(
-            managed_executable_runtime_root(&crate::execution::BackendPath::new("/usr/bin/false")),
+            managed_executable_runtime_root(&aidaemon_tools::BackendPath::new("/usr/bin/false")),
             None
         );
         #[cfg(target_os = "macos")]
@@ -9541,7 +9558,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_managed_python_can_create_run_and_remove_exact_venv_root() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend
                 .resolve_executable("python3")
@@ -9642,9 +9659,9 @@ mod tests {
         let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         drop(approval_rx);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
@@ -9677,39 +9694,37 @@ mod tests {
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         drop(approval_rx);
-        let provider = Arc::new(MockProvider::with_responses(vec![
-            MockProvider::text_response(
-                r#"{"dangerous":false,"risk_level":"safe","effects":["observation"],"reasons":["Prints a literal string"]}"#,
-            ),
-        ]));
+        let provider = Arc::new(ScriptedProvider::new(vec![aidaemon_core::testing::text(
+            r#"{"dangerous":false,"risk_level":"safe","effects":["observation"],"reasons":["Prints a literal string"]}"#,
+        )]));
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         tool.set_side_calls(semantic_gateway(provider.clone()).await);
 
         let output = tool
             .call_with(
                 r#"{"action":"run","command":"echo semantic-ok"}"#,
-                crate::testing::call_facts("telegram:synthetic-owner"),
+                aidaemon_tools::testing::call_facts("telegram:synthetic-owner"),
             )
             .await
             .unwrap();
         assert!(output.contains("semantic-ok"), "{output}");
         assert!(!output.contains("approval"), "{output}");
-        assert_eq!(provider.call_count().await, 1);
+        assert_eq!(provider.requests().len(), 1);
     }
 
     #[tokio::test]
     async fn failed_run_undoes_a_future_root_the_runtime_created() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none() {
             return;
         }
@@ -9722,25 +9737,25 @@ mod tests {
                 let _ = req.response_tx.send(ApprovalResponse::AllowOnce);
             }
         });
-        let provider = Arc::new(MockProvider::with_responses(vec![
-            MockProvider::text_response(
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            aidaemon_core::testing::text(
                 r#"{"dangerous":false,"risk_level":"safe","effects":["local_workspace_write"],"reasons":["Writes one scratch file"]}"#,
             ),
-            MockProvider::text_response(
+            aidaemon_core::testing::text(
                 r#"{"dangerous":false,"risk_level":"safe","effects":["local_workspace_write"],"reasons":["Exits with a fixed status"]}"#,
             ),
         ]));
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         tool.set_side_calls(semantic_gateway(provider.clone()).await);
 
         let parent = tempfile::tempdir().expect("parent");
@@ -9808,7 +9823,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_preparation_failure_is_typed_and_names_the_declaration() {
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none() {
             return;
         }
@@ -9821,22 +9836,20 @@ mod tests {
                 let _ = req.response_tx.send(ApprovalResponse::AllowOnce);
             }
         });
-        let provider = Arc::new(MockProvider::with_responses(vec![
-            MockProvider::text_response(
-                r#"{"dangerous":false,"risk_level":"safe","effects":["local_workspace_write"],"reasons":["Writes one scratch file"]}"#,
-            ),
-        ]));
+        let provider = Arc::new(ScriptedProvider::new(vec![aidaemon_core::testing::text(
+            r#"{"dangerous":false,"risk_level":"safe","effects":["local_workspace_write"],"reasons":["Writes one scratch file"]}"#,
+        )]));
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         tool.set_side_calls(semantic_gateway(provider.clone()).await);
 
         let parent = tempfile::tempdir().expect("parent");
@@ -9868,7 +9881,7 @@ mod tests {
         assert_eq!(failure.value, impossible_root.to_string_lossy());
         assert_eq!(
             outcome.metadata.invocation_stage,
-            crate::traits::ToolInvocationStage::RejectedBeforeIo
+            crate::tools::traits::ToolInvocationStage::RejectedBeforeIo
         );
         assert!(!outcome.output.contains("SYNTHETIC_NEVER_RUNS"));
     }
@@ -9879,22 +9892,20 @@ mod tests {
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let provider = Arc::new(MockProvider::with_responses(vec![
-            MockProvider::text_response(
-                r#"{"dangerous":true,"risk_level":"high","effects":["external_mutation"],"reasons":["Pushes commits to a remote repository"]}"#,
-            ),
-        ]));
+        let provider = Arc::new(ScriptedProvider::new(vec![aidaemon_core::testing::text(
+            r#"{"dangerous":true,"risk_level":"high","effects":["external_mutation"],"reasons":["Pushes commits to a remote repository"]}"#,
+        )]));
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         tool.set_side_calls(semantic_gateway(provider).await);
 
         let args = serde_json::json!({"action":"run","command":"git push synthetic-remote main"});
@@ -9938,9 +9949,9 @@ mod tests {
         let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         drop(approval_rx);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Yolo,
@@ -9958,7 +9969,7 @@ mod tests {
                 None,
                 ToolCallContext {
                     mutation_forbidden: true,
-                    ..crate::testing::call_facts("telegram:synthetic-owner")
+                    ..aidaemon_tools::testing::call_facts("telegram:synthetic-owner")
                 },
             )
             .await
@@ -9980,20 +9991,20 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let sandboxed = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx.clone()),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx.clone()),
             1,
             1000,
             PermissionMode::Default,
             pool.clone(),
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         let _host = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
@@ -10001,7 +10012,7 @@ mod tests {
         )
         .await;
         let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
-        let roots = crate::traits::TrustRoots::new(&roots_list);
+        let roots = crate::tools::traits::TrustRoots::new(&roots_list);
         let trust = |tool: &TerminalTool, args: serde_json::Value| {
             tool.output_trust(&args.to_string(), &roots)
         };
@@ -10040,9 +10051,9 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let host = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
@@ -10050,7 +10061,7 @@ mod tests {
         )
         .await;
         let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
-        let roots = crate::traits::TrustRoots::new(&roots_list);
+        let roots = crate::tools::traits::TrustRoots::new(&roots_list);
         for command in [
             "cat <> f",
             "cat << EOF\nx\nEOF",
@@ -10101,9 +10112,9 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let host = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
@@ -10111,7 +10122,7 @@ mod tests {
         )
         .await;
         let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
-        let roots = crate::traits::TrustRoots::new(&roots_list);
+        let roots = crate::tools::traits::TrustRoots::new(&roots_list);
         let run = |command: &str| {
             serde_json::json!({
                 "action": "run",
@@ -10127,7 +10138,7 @@ mod tests {
         let status = run("git status");
         assert_eq!(host.output_trust(&status, &roots), SourceTrust::Trusted);
         assert!(
-            host.call_annotations_in(&status, &crate::traits::TrustRoots::new(&[]))
+            host.call_annotations_in(&status, &crate::tools::traits::TrustRoots::new(&[]))
                 .read_only
         );
         assert_eq!(
@@ -10148,9 +10159,9 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let host = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
@@ -10159,7 +10170,7 @@ mod tests {
         .await;
         let project = "/tmp/aidaemon-test/project";
         let roots_list = vec![project.to_string()];
-        let roots = crate::traits::TrustRoots::new(&roots_list);
+        let roots = crate::tools::traits::TrustRoots::new(&roots_list);
         let run = |command: &str, working_dir: &str| {
             serde_json::json!({"action":"run","command":command,"working_dir":working_dir})
                 .to_string()
@@ -10217,9 +10228,9 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let host = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
@@ -10227,7 +10238,7 @@ mod tests {
         )
         .await;
         let roots_list: Vec<String> = vec![];
-        let roots = crate::traits::TrustRoots::new(&roots_list);
+        let roots = crate::tools::traits::TrustRoots::new(&roots_list);
         for command in [
             "curl https://example.invalid",
             "git clone https://example.invalid/r.git",
@@ -10240,7 +10251,7 @@ mod tests {
                 SourceTrust::Untrusted,
                 "{command}"
             );
-            let ann = host.call_annotations_in(&args, &crate::traits::TrustRoots::new(&[]));
+            let ann = host.call_annotations_in(&args, &crate::tools::traits::TrustRoots::new(&[]));
             assert!(ann.egress && !ann.read_only, "{command}");
         }
     }
@@ -10252,9 +10263,9 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let host = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx.clone()),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx.clone()),
             1,
             1000,
             PermissionMode::Default,
@@ -10262,16 +10273,16 @@ mod tests {
         )
         .await;
         let sandboxed = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         (host, sandboxed)
     }
 
@@ -10284,7 +10295,7 @@ mod tests {
         let ann = |command: &str| {
             host.call_annotations_in(
                 &serde_json::json!({"action":"run","command":command}).to_string(),
-                &crate::traits::TrustRoots::new(&[]),
+                &crate::tools::traits::TrustRoots::new(&[]),
             )
         };
         for read in [
@@ -10337,7 +10348,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_to_a_site_on_this_computer_is_not_outbound() {
         let (host, sandboxed) = host_and_sandboxed_terminals().await;
-        let roots = crate::traits::TrustRoots::new(&[]);
+        let roots = crate::tools::traits::TrustRoots::new(&[]);
         let ann = |terminal: &TerminalTool, command: &str, network: bool| {
             terminal.call_annotations_in(
                 &serde_json::json!({"action":"run","command":command,"network":network})
@@ -10414,7 +10425,7 @@ mod tests {
         let ann = |command: &str| {
             host.call_annotations_in(
                 &serde_json::json!({"action":"run","command":command}).to_string(),
-                &crate::traits::TrustRoots::new(&[]),
+                &crate::tools::traits::TrustRoots::new(&[]),
             )
         };
         for local in [
@@ -10461,7 +10472,7 @@ mod tests {
         let base = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
         let project = format!("{base}/project");
         let roots_list = vec![project.clone()];
-        let roots = crate::traits::TrustRoots::new(&roots_list);
+        let roots = crate::tools::traits::TrustRoots::new(&roots_list);
         for tool in [&host, &sandboxed] {
             let ann = |command: &str, working_dir: Option<&str>| {
                 let mut args = serde_json::json!({"action":"run","command":command});
@@ -10513,18 +10524,21 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         let ann = |args: serde_json::Value| {
-            tool.call_annotations_in(&args.to_string(), &crate::traits::TrustRoots::new(&[]))
+            tool.call_annotations_in(
+                &args.to_string(),
+                &crate::tools::traits::TrustRoots::new(&[]),
+            )
         };
         let config = ann(serde_json::json!({
             "action":"run","command":"touch x","write_paths":["/tmp/aidaemon-test/r/.git/config"]
@@ -10555,16 +10569,16 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         let ann = |command: &str, root: &std::path::Path| {
             tool.call_annotations_in(
                 &serde_json::json!({
@@ -10572,7 +10586,7 @@ mod tests {
                     "write_roots":[root.to_string_lossy()]
                 })
                 .to_string(),
-                &crate::traits::TrustRoots::new(&[]),
+                &crate::tools::traits::TrustRoots::new(&[]),
             )
         };
         let planted = ann("cp x .git/config", &repo);
@@ -10593,18 +10607,21 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         let ann = |args: serde_json::Value| {
-            tool.call_annotations_in(&args.to_string(), &crate::traits::TrustRoots::new(&[]))
+            tool.call_annotations_in(
+                &args.to_string(),
+                &crate::tools::traits::TrustRoots::new(&[]),
+            )
         };
         let global = ann(serde_json::json!({"action":"run","command":"cp x ~/.gitconfig"}));
         assert!(global.egress && !global.read_only);
@@ -10629,22 +10646,20 @@ mod tests {
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         drop(approval_rx);
-        let provider = Arc::new(MockProvider::with_responses(vec![
-            MockProvider::text_response(
-                r#"{"dangerous":false,"risk_level":"safe","effects":["observation"],"reasons":["Generates a bounded numeric sequence on stdout"]}"#,
-            ),
-        ]));
+        let provider = Arc::new(ScriptedProvider::new(vec![aidaemon_core::testing::text(
+            r#"{"dangerous":false,"risk_level":"safe","effects":["observation"],"reasons":["Generates a bounded numeric sequence on stdout"]}"#,
+        )]));
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Default,
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         tool.set_side_calls(semantic_gateway(provider.clone()).await);
 
         let outcome = tool
@@ -10672,7 +10687,7 @@ mod tests {
             "{}",
             outcome.output
         );
-        assert_eq!(provider.call_count().await, 0);
+        assert_eq!(provider.requests().len(), 0);
     }
 
     #[tokio::test]
@@ -10685,16 +10700,16 @@ mod tests {
         let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         drop(approval_rx);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             1000,
             PermissionMode::Yolo,
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         let args = serde_json::json!({
             "action": "run",
             "command": format!("touch {}", target.display()),
@@ -10707,7 +10722,7 @@ mod tests {
                 None,
                 ToolCallContext {
                     mutation_forbidden: false,
-                    ..crate::testing::call_facts("telegram:synthetic-owner")
+                    ..aidaemon_tools::testing::call_facts("telegram:synthetic-owner")
                 },
             )
             .await
@@ -10719,7 +10734,7 @@ mod tests {
         );
         assert_eq!(
             outcome.metadata.invocation_stage,
-            crate::traits::ToolInvocationStage::Dispatched
+            crate::tools::traits::ToolInvocationStage::Dispatched
         );
         assert!(!outcome.metadata.contract_rejected);
         assert_eq!(
@@ -10762,14 +10777,14 @@ mod tests {
         async fn continue_conversation(
             &self,
             _request: ConversationRequest,
-        ) -> anyhow::Result<crate::runtime_ports::AgentResponseEnvelope> {
+        ) -> anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope> {
             std::future::pending().await
         }
 
         async fn record_continuation_delivery(
             &self,
             _session_id: &str,
-            _delivery: crate::events::ResponseDeliveryData,
+            _delivery: aidaemon_events::ResponseDeliveryData,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -10781,8 +10796,8 @@ mod tests {
             session_id: "telegram:synthetic-timeout".to_string(),
             user_text: "synthetic completion".to_string(),
             status_tx: None,
-            user_role: crate::types::UserRole::Owner,
-            channel_ctx: crate::types::ChannelContext::internal(),
+            user_role: aidaemon_tools::semantics::UserRole::Owner,
+            channel_ctx: aidaemon_channels::context::ChannelContext::internal(),
             heartbeat: None,
             parent_task_id: Some("synthetic-parent".to_string()),
             parent_tool_call_id: Some("synthetic-call".to_string()),
@@ -11021,17 +11036,12 @@ mod tests {
     async fn deletion_run_receipt_carries_destructive_effect() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -11054,7 +11064,7 @@ mod tests {
             .call_with_execution_context(
                 &args.to_string(),
                 None,
-                crate::testing::call_facts("sess_del_receipt"),
+                aidaemon_tools::testing::call_facts("sess_del_receipt"),
             )
             .await
             .unwrap();
@@ -11087,7 +11097,7 @@ mod tests {
             .call_with_execution_context(
                 &args.to_string(),
                 None,
-                crate::testing::call_facts("sess_del_receipt"),
+                aidaemon_tools::testing::call_facts("sess_del_receipt"),
             )
             .await
             .unwrap();
@@ -11107,17 +11117,12 @@ mod tests {
     async fn fetch_run_receipt_names_the_url_only_when_the_fetch_is_proven() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
-            crate::tools::ApprovalBroker::new(approval_tx_raw),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx_raw),
             30,
             4000,
             PermissionMode::Yolo,
@@ -11150,7 +11155,7 @@ mod tests {
                 tool.call_with_execution_context(
                     &args.to_string(),
                     None,
-                    crate::testing::call_facts("sess_fetch_receipt"),
+                    aidaemon_tools::testing::call_facts("sess_fetch_receipt"),
                 )
                 .await
                 .unwrap()
@@ -11207,17 +11212,12 @@ mod tests {
     async fn timed_out_background_run_sets_notification_metadata_when_available() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11226,13 +11226,13 @@ mod tests {
             pool,
         )
         .await
-        .with_state(state as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state);
 
         let outcome = tool
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 2; echo notify-meta"}"#,
                 None,
-                crate::testing::call_facts("sess_meta"),
+                aidaemon_tools::testing::call_facts("sess_meta"),
             )
             .await
             .unwrap();
@@ -11252,17 +11252,12 @@ mod tests {
     async fn background_run_hands_off_at_launch_without_detaching() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -11271,14 +11266,14 @@ mod tests {
             pool,
         )
         .await
-        .with_state(state as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state);
 
         let started = Instant::now();
         let outcome = tool
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 20; echo counted","background":true}"#,
                 None,
-                crate::testing::call_facts("sess_background_job"),
+                aidaemon_tools::testing::call_facts("sess_background_job"),
             )
             .await
             .unwrap();
@@ -11300,7 +11295,7 @@ mod tests {
                         .unwrap()
                 ),
                 None,
-                crate::testing::call_facts("sess_background_job"),
+                aidaemon_tools::testing::call_facts("sess_background_job"),
             )
             .await;
     }
@@ -11329,28 +11324,23 @@ mod tests {
     async fn a_helpers_long_command_reports_its_output_as_it_runs() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
-            crate::tools::ApprovalBroker::new(approval_tx_raw),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx_raw),
             30,
             4000,
             PermissionMode::Yolo,
             state.pool(),
         )
         .await
-        .with_state(state as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state);
         let helper = || ToolCallContext {
             grant_session: "telegram:synthetic-chat".to_string(),
             task_id: Some("helper-task".to_string()),
-            ..crate::testing::call_facts("specialist:executor:synthetic-count")
+            ..aidaemon_tools::testing::call_facts("specialist:executor:synthetic-count")
         };
         let lines = |rx: &mut mpsc::Receiver<StatusUpdate>| {
             let mut lines = Vec::new();
@@ -11413,17 +11403,12 @@ mod tests {
     async fn sub_agent_background_run_keeps_the_run() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -11432,11 +11417,11 @@ mod tests {
             pool,
         )
         .await
-        .with_state(state as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state);
 
         let child = ToolCallContext {
             grant_session: "telegram:synthetic-chat".to_string(),
-            ..crate::testing::call_facts("specialist:executor:synthetic-child")
+            ..aidaemon_tools::testing::call_facts("specialist:executor:synthetic-child")
         };
         let outcome = tool
             .call_with_execution_context(
@@ -11473,17 +11458,12 @@ mod tests {
     async fn the_chat_lists_its_background_command_and_stops_it() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -11492,11 +11472,11 @@ mod tests {
             pool,
         )
         .await
-        .with_state(state as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state);
 
         let chat = ToolCallContext {
             task_id: Some("turn-count".to_string()),
-            ..crate::testing::call_facts("telegram:synthetic-count")
+            ..aidaemon_tools::testing::call_facts("telegram:synthetic-count")
         };
         let outcome = tool
             .call_with_execution_context(
@@ -11533,17 +11513,12 @@ mod tests {
     async fn a_sub_agent_job_counts_as_ended_by_its_task_end() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -11552,12 +11527,12 @@ mod tests {
             pool,
         )
         .await
-        .with_state(state as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state);
 
         let child = ToolCallContext {
             grant_session: "telegram:synthetic-chat".to_string(),
             task_id: Some("child-task".to_string()),
-            ..crate::testing::call_facts("specialist:executor:synthetic-count")
+            ..aidaemon_tools::testing::call_facts("specialist:executor:synthetic-count")
         };
         let outcome = tool
             .call_with_execution_context(
@@ -11586,11 +11561,11 @@ mod tests {
 
     #[test]
     fn notifications_reach_the_chat_or_a_goal_session_only() {
-        let chat = crate::testing::call_facts("telegram:synthetic-chat");
+        let chat = aidaemon_tools::testing::call_facts("telegram:synthetic-chat");
         assert!(notifications_reach(&chat, "telegram:synthetic-chat"));
         let child = ToolCallContext {
             grant_session: "telegram:synthetic-chat".to_string(),
-            ..crate::testing::call_facts("specialist:executor:synthetic-child")
+            ..aidaemon_tools::testing::call_facts("specialist:executor:synthetic-child")
         };
         assert!(!notifications_reach(
             &child,
@@ -11611,17 +11586,12 @@ mod tests {
     async fn background_run_without_notifier_keeps_the_run() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         // No state queue and no hub: no completion notifier can start.
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -11635,7 +11605,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 20; echo counted","background":true}"#,
                 None,
-                crate::testing::call_facts("sess_background_no_notifier"),
+                aidaemon_tools::testing::call_facts("sess_background_no_notifier"),
             )
             .await
             .unwrap();
@@ -11656,7 +11626,7 @@ mod tests {
             .call_with_execution_context(
                 &format!(r#"{{"action":"kill","pid":{pid}}}"#),
                 None,
-                crate::testing::call_facts("sess_background_no_notifier"),
+                aidaemon_tools::testing::call_facts("sess_background_no_notifier"),
             )
             .await;
     }
@@ -11668,17 +11638,12 @@ mod tests {
     async fn detached_service_shows_stderr_startup_and_is_listed_for_its_session() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -11689,7 +11654,7 @@ mod tests {
         .await;
 
         let outcome = tool
-            .call_with_execution_context(r#"{"action":"run","command":"echo 'ready at https://synthetic-tunnel.example.test' >&2; sleep 30","detach":true}"#, None, crate::testing::call_facts("sess_service"))
+            .call_with_execution_context(r#"{"action":"run","command":"echo 'ready at https://synthetic-tunnel.example.test' >&2; sleep 30","detach":true}"#, None, aidaemon_tools::testing::call_facts("sess_service"))
             .await
             .unwrap();
         assert!(outcome.metadata.detached);
@@ -11725,7 +11690,7 @@ mod tests {
         tool.call_with_execution_context(
             &format!(r#"{{"action":"kill","pid":{pid}}}"#),
             None,
-            crate::testing::call_facts("sess_service"),
+            aidaemon_tools::testing::call_facts("sess_service"),
         )
         .await
         .unwrap();
@@ -11736,19 +11701,14 @@ mod tests {
     async fn detached_run_launches_and_returns_after_startup_grace() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         // A 30s foreground window: without launch-and-return, `sleep 5`
         // would run to completion and be reported synchronously.
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -11763,7 +11723,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 5","detach":true}"#,
                 None,
-                crate::testing::call_facts("sess_detach"),
+                aidaemon_tools::testing::call_facts("sess_detach"),
             )
             .await
             .unwrap();
@@ -11795,7 +11755,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"exit 3","detach":true}"#,
                 None,
-                crate::testing::call_facts("sess_detach"),
+                aidaemon_tools::testing::call_facts("sess_detach"),
             )
             .await
             .unwrap();
@@ -11807,17 +11767,12 @@ mod tests {
     async fn checking_finished_background_process_returns_completion_receipt() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11831,7 +11786,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 2; echo done-marker"}"#,
                 None,
-                crate::testing::call_facts("sess_check_done"),
+                aidaemon_tools::testing::call_facts("sess_check_done"),
             )
             .await
             .unwrap();
@@ -11870,17 +11825,12 @@ mod tests {
     async fn checking_reaped_background_process_returns_completion_receipt() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11894,7 +11844,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 2; echo reap-marker"}"#,
                 None,
-                crate::testing::call_facts("sess_reap_done"),
+                aidaemon_tools::testing::call_facts("sess_reap_done"),
             )
             .await
             .unwrap();
@@ -11931,17 +11881,12 @@ mod tests {
     async fn still_running_check_and_kill_receipts_are_not_background_launches() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11955,7 +11900,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 30"}"#,
                 None,
-                crate::testing::call_facts("sess_check_kill"),
+                aidaemon_tools::testing::call_facts("sess_check_kill"),
             )
             .await
             .unwrap();
@@ -11991,17 +11936,12 @@ mod tests {
     async fn confined_command_can_create_its_own_declared_write_root() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -12010,7 +11950,7 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
 
         let root = std::env::temp_dir().join(format!("aid-own-root-{}", uuid::Uuid::new_v4()));
         let root_str = root.to_string_lossy().to_string();
@@ -12027,7 +11967,7 @@ mod tests {
             .call_with_execution_context(
                 &args.to_string(),
                 None,
-                crate::testing::call_facts("sess_own_root"),
+                aidaemon_tools::testing::call_facts("sess_own_root"),
             )
             .await
             .unwrap();
@@ -12049,17 +11989,12 @@ mod tests {
     async fn future_write_root_used_as_working_dir_is_prepared_for_spawn() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -12068,7 +12003,7 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
 
         let root = std::env::temp_dir().join(format!("aid-cwd-root-{}", uuid::Uuid::new_v4()));
         let root_str = root.to_string_lossy().to_string();
@@ -12085,7 +12020,7 @@ mod tests {
             .call_with_execution_context(
                 &args.to_string(),
                 None,
-                crate::testing::call_facts("sess_cwd_root"),
+                aidaemon_tools::testing::call_facts("sess_cwd_root"),
             )
             .await
             .unwrap();
@@ -12097,17 +12032,12 @@ mod tests {
     async fn timed_out_background_run_clears_notification_metadata_when_unavailable() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12116,13 +12046,13 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
 
         let outcome = tool
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 2; echo no-notify-meta"}"#,
                 None,
-                crate::testing::call_facts("sess_meta2"),
+                aidaemon_tools::testing::call_facts("sess_meta2"),
             )
             .await
             .unwrap();
@@ -12417,9 +12347,9 @@ mod tests {
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12428,12 +12358,12 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
 
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"nohup sleep 1 &"}"#,
-                crate::testing::call_facts("s1"),
+                aidaemon_tools::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -12446,9 +12376,9 @@ mod tests {
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12457,12 +12387,12 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
 
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"grep -rc \"async fn\" ."}"#,
-                crate::testing::call_facts("s1"),
+                aidaemon_tools::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -12475,17 +12405,12 @@ mod tests {
     async fn test_background_terminal_completion_enqueues_notification() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12494,12 +12419,12 @@ mod tests {
             pool,
         )
         .await
-        .with_state(state.clone() as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state.clone());
 
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 2; echo terminal-notify-ok"}"#,
-                crate::testing::call_facts("sess_notify"),
+                aidaemon_tools::testing::call_facts("sess_notify"),
             )
             .await
             .unwrap();
@@ -12524,28 +12449,23 @@ mod tests {
         );
     }
 
-    async fn card_chat_terminal(chat: &crate::testing::CardChat) -> TerminalTool {
+    async fn card_chat_terminal(chat: &aidaemon_channels::testing::CardChat) -> TerminalTool {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
         std::mem::forget(db_file);
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
-            crate::tools::ApprovalBroker::new(approval_tx_raw),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx_raw),
             1,
             4000,
             PermissionMode::Yolo,
             state.pool(),
         )
         .await
-        .with_state(state as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state);
         tool.set_hub(chat.outbound());
         tool
     }
@@ -12558,7 +12478,7 @@ mod tests {
     /// with no final header).
     #[tokio::test]
     async fn a_background_command_shows_one_card_that_settles() {
-        let chat = crate::testing::CardChat::new("telegram:synthetic-card").await;
+        let chat = aidaemon_channels::testing::CardChat::new("telegram:synthetic-card").await;
         let tool = card_chat_terminal(&chat).await;
         let outcome = chat
             .turn(
@@ -12566,7 +12486,7 @@ mod tests {
                     tool.call_with_execution_context(
                         r#"{"action":"run","command":"echo step-one; sleep 5; echo all-done","description":"counting script","background":true}"#,
                         Some(tx),
-                        crate::testing::call_facts("telegram:synthetic-card"),
+                        aidaemon_tools::testing::call_facts("telegram:synthetic-card"),
                     )
                 },
                 |outcome| {
@@ -12605,14 +12525,14 @@ mod tests {
     /// settles the card with nothing else to say: no message of its own.
     #[tokio::test]
     async fn a_quiet_background_command_settles_its_card_and_says_nothing() {
-        let chat = crate::testing::CardChat::new("telegram:synthetic-quiet").await;
+        let chat = aidaemon_channels::testing::CardChat::new("telegram:synthetic-quiet").await;
         let tool = card_chat_terminal(&chat).await;
         chat.turn(
             |tx| {
                 tool.call_with_execution_context(
                     r#"{"action":"run","command":"sleep 3","background":true}"#,
                     Some(tx),
-                    crate::testing::call_facts("telegram:synthetic-quiet"),
+                    aidaemon_tools::testing::call_facts("telegram:synthetic-quiet"),
                 )
             },
             |_| String::new(),
@@ -12896,17 +12816,12 @@ mod tests {
     async fn test_idle_reap_stops_hung_background_process() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12915,14 +12830,14 @@ mod tests {
             pool,
         )
         .await
-        .with_state(state.clone() as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state.clone());
 
         // No-output, long-running command — stands in for a whole-disk scan that
         // never exits. It is moved to background after the 1s initial timeout.
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 120"}"#,
-                crate::testing::call_facts("sess_reap"),
+                aidaemon_tools::testing::call_facts("sess_reap"),
             )
             .await
             .unwrap();
@@ -12977,17 +12892,12 @@ mod tests {
     async fn test_idle_reap_spares_streaming_process() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12996,12 +12906,12 @@ mod tests {
             pool,
         )
         .await
-        .with_state(state.clone() as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state.clone());
 
         // Emits a line roughly every 0.2s for a while — a stand-in for a dev server
         // or a scan that is genuinely making progress.
         let response = tool
-            .call_with(r#"{"action":"run","command":"for i in $(seq 1 50); do echo line-$i; sleep 0.2; done"}"#, crate::testing::call_facts("sess_stream"))
+            .call_with(r#"{"action":"run","command":"for i in $(seq 1 50); do echo line-$i; sleep 0.2; done"}"#, aidaemon_tools::testing::call_facts("sess_stream"))
             .await
             .unwrap();
         assert!(response.contains("Moved to background (pid="));
@@ -13068,17 +12978,12 @@ mod tests {
     async fn test_background_terminal_short_output_is_delivered() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -13087,14 +12992,14 @@ mod tests {
             pool,
         )
         .await
-        .with_state(state.clone() as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state.clone());
 
         // Output "42" (2 chars) — the command text contains 40 and 2 but not 42,
         // so finding "42" in a notification proves the OUTPUT was delivered.
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 2; echo $((40 + 2))"}"#,
-                crate::testing::call_facts("sess_short"),
+                aidaemon_tools::testing::call_facts("sess_short"),
             )
             .await
             .unwrap();
@@ -13128,17 +13033,12 @@ mod tests {
     async fn test_background_terminal_duplicate_result_is_suppressed() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -13147,12 +13047,12 @@ mod tests {
             pool,
         )
         .await
-        .with_state(state.clone() as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state.clone());
 
         let first = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 2; echo duplicate-result"}"#,
-                crate::testing::call_facts("sess_dupe_result"),
+                aidaemon_tools::testing::call_facts("sess_dupe_result"),
             )
             .await
             .unwrap();
@@ -13161,7 +13061,7 @@ mod tests {
         let second = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 2; printf '%s\n' duplicate-result"}"#,
-                crate::testing::call_facts("sess_dupe_result"),
+                aidaemon_tools::testing::call_facts("sess_dupe_result"),
             )
             .await
             .unwrap();
@@ -13207,17 +13107,12 @@ mod tests {
     async fn test_background_terminal_kill_suppresses_completion_notification() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -13226,12 +13121,12 @@ mod tests {
             pool,
         )
         .await
-        .with_state(state.clone() as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state.clone());
 
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 10"}"#,
-                crate::testing::call_facts("sess_kill"),
+                aidaemon_tools::testing::call_facts("sess_kill"),
             )
             .await
             .unwrap();
@@ -13240,7 +13135,7 @@ mod tests {
         let kill_response = tool
             .call_with(
                 &format!(r#"{{"action":"kill","pid":{}}}"#, pid),
-                crate::testing::call_facts("sess_kill"),
+                aidaemon_tools::testing::call_facts("sess_kill"),
             )
             .await
             .unwrap();
@@ -13264,9 +13159,9 @@ mod tests {
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -13275,12 +13170,12 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
 
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 2; echo post-reap-ok"}"#,
-                crate::testing::call_facts("s1"),
+                aidaemon_tools::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -13291,7 +13186,7 @@ mod tests {
         let check = tool
             .call_with(
                 &format!(r#"{{"action":"check","pid":{}}}"#, pid),
-                crate::testing::call_facts("s1"),
+                aidaemon_tools::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -13310,9 +13205,9 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
-            crate::tools::ApprovalBroker::new(approval_tx),
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
             1,
             4000,
             PermissionMode::Yolo,
@@ -13327,7 +13222,7 @@ mod tests {
         .unwrap();
         let project_dir = project.path().to_string_lossy().into_owned();
         let roots_list = vec![project_dir.clone()];
-        let roots = crate::traits::TrustRoots::new(&roots_list).with_cwd(Some(&project_dir));
+        let roots = crate::tools::traits::TrustRoots::new(&roots_list).with_cwd(Some(&project_dir));
         let launch = |command: &str| {
             serde_json::json!({
                 "action": "run",
@@ -13340,7 +13235,7 @@ mod tests {
         let launch_facts = ToolCallContext {
             trust_roots: Some(vec![project_dir.clone()]),
             trust_cwd: Some(project_dir.clone()),
-            ..crate::testing::call_facts("s1")
+            ..aidaemon_tools::testing::call_facts("s1")
         };
         let check = |pid: u32| serde_json::json!({"action": "check", "pid": pid}).to_string();
         for (command, expected) in [
@@ -13371,9 +13266,9 @@ mod tests {
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -13382,7 +13277,7 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
 
         let response = tool
             .call_with(
@@ -13404,7 +13299,7 @@ mod tests {
         let check = tool
             .call_with(
                 &format!(r#"{{"action":"check","pid":{}}}"#, pid),
-                crate::testing::call_facts("s1"),
+                aidaemon_tools::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -13419,17 +13314,12 @@ mod tests {
     async fn test_task_end_disowns_background_process_with_active_notifier() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
+        let state = Arc::new(work_store(&db_path).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -13438,7 +13328,7 @@ mod tests {
             pool,
         )
         .await
-        .with_state(state.clone() as Arc<dyn StateStore>);
+        .with_stores(state.clone(), state.clone());
 
         let response = tool
             .call_with(
@@ -13464,7 +13354,7 @@ mod tests {
         let check = tool
             .call_with(
                 &format!(r#"{{"action":"check","pid":{}}}"#, pid),
-                crate::testing::call_facts("sess_disown"),
+                aidaemon_tools::testing::call_facts("sess_disown"),
             )
             .await
             .unwrap();
@@ -13498,9 +13388,9 @@ mod tests {
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -13509,7 +13399,7 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
 
         let first = tool
             .call_with(
@@ -13558,9 +13448,9 @@ mod tests {
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -13569,7 +13459,7 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
 
         tokio::spawn(async move {
             while let Some(req) = approval_rx.recv().await {
@@ -13596,7 +13486,7 @@ mod tests {
         let check = tool
             .call_with(
                 &format!(r#"{{"action":"check","pid":{}}}"#, pid),
-                crate::testing::call_facts("s1"),
+                aidaemon_tools::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -13608,7 +13498,7 @@ mod tests {
         let _ = tool
             .call_with(
                 &format!(r#"{{"action":"kill","pid":{}}}"#, pid),
-                crate::testing::call_facts("s1"),
+                aidaemon_tools::testing::call_facts("s1"),
             )
             .await;
     }
@@ -13627,9 +13517,9 @@ mod tests {
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, mut approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             2, // 2 second timeout
@@ -13638,7 +13528,7 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
 
         // Auto-approve the daemonization approval request
         tokio::spawn(async move {
@@ -13688,9 +13578,9 @@ mod tests {
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -13699,7 +13589,7 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
 
         // Build a command >500 chars with UNQUOTED heredoc (should be soft-blocked)
         let large_content = "x".repeat(600);
@@ -13709,7 +13599,7 @@ mod tests {
             "command": command});
 
         let response = tool
-            .call_with(&args.to_string(), crate::testing::call_facts("s1"))
+            .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s1"))
             .await
             .unwrap();
         assert!(
@@ -13730,9 +13620,9 @@ mod tests {
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -13741,7 +13631,7 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
 
         // Build a command >500 chars with QUOTED heredoc (should be allowed)
         let large_content = "echo 'hello'";
@@ -13754,7 +13644,7 @@ mod tests {
             "command": command});
 
         let response = tool
-            .call_with(&args.to_string(), crate::testing::call_facts("s1"))
+            .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s1"))
             .await
             .unwrap();
         assert!(
@@ -13801,10 +13691,10 @@ mod tests {
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         // Empty permanent prefix list — only session approvals exist.
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
             approval_tx,
             1,
@@ -13911,10 +13801,10 @@ mod tests {
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let original = "cd /Users/u/proj && npm run dev -- --port 3000";
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![original.to_string()],
             approval_tx,
             1,
@@ -13923,7 +13813,7 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         std::mem::forget(db_file);
 
         assert!(
@@ -13950,9 +13840,9 @@ mod tests {
         let (approval_tx_raw, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         // Close the approval channel so any approval attempt fails loudly.
         drop(approval_rx);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["echo".to_string()],
             approval_tx,
             1,
@@ -13961,13 +13851,13 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         std::mem::forget(db_file);
 
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"echo hi","detach":true}"#,
-                crate::testing::call_facts("s1"),
+                aidaemon_tools::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -13988,9 +13878,9 @@ mod tests {
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         drop(approval_rx);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["echo".to_string()],
             approval_tx,
             1,
@@ -13999,7 +13889,7 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
         std::mem::forget(db_file);
 
         let args = serde_json::json!({"action":"run","command":"echo hi","detach":true});
@@ -14030,22 +13920,12 @@ mod tests {
     #[tokio::test]
     async fn terminal_blocks_unbounded_disk_scan_without_spawning() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(
-                db_file.path().to_str().unwrap(),
-                100,
-                None,
-                embedding_service,
-            )
-            .await
-            .unwrap(),
-        );
+        let state = Arc::new(work_store(db_file.path().to_str().unwrap()).await);
         let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -14054,12 +13934,12 @@ mod tests {
             pool,
         )
         .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
 
         let resp = tool
             .call_with(
                 r#"{"action":"run","command":"du -a / 2>/dev/null | sort -rn | head -n 10"}"#,
-                crate::testing::call_facts("s"),
+                aidaemon_tools::testing::call_facts("s"),
             )
             .await
             .unwrap();
@@ -14079,7 +13959,7 @@ mod tests {
         let ok = tool
             .call_with(
                 r#"{"action":"run","command":"echo scoped-ok"}"#,
-                crate::testing::call_facts("s"),
+                aidaemon_tools::testing::call_facts("s"),
             )
             .await
             .unwrap();
@@ -14099,9 +13979,9 @@ mod tests {
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, approval_rx) = mpsc::channel::<ApprovalRequest>(4);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let approval_tx = crate::approvals::broker::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
+            aidaemon_tools::testing::active_execution_backend(),
             vec![],
             approval_tx,
             1,
@@ -14124,7 +14004,7 @@ mod tests {
         // refused; the dispatcher's typed fact, not an argument, says so.
         let ctx = ToolCallContext {
             untrusted_source: true,
-            user_role: Some(crate::types::UserRole::Owner),
+            user_role: Some(aidaemon_tools::semantics::UserRole::Owner),
             ..Default::default()
         };
         let error = tool
@@ -14165,7 +14045,7 @@ mod policy_dump_probe {
         };
         let command =
             std::env::var("AIDAEMON_POLICY_PROBE_CMD").unwrap_or_else(|_| "npm run build".into());
-        let backend = crate::execution::active_execution_backend();
+        let backend = aidaemon_tools::testing::active_execution_backend();
         let writes = std::env::var("AIDAEMON_POLICY_PROBE_WRITES")
             .ok()
             .map(|w| w.split(':').map(str::to_string).collect::<Vec<_>>())
@@ -14195,7 +14075,7 @@ mod policy_dump_probe {
         .await
         .expect("confined request");
         match &request.command {
-            crate::execution::CommandSpec::Argv { args, .. } => {
+            aidaemon_tools::CommandSpec::Argv { args, .. } => {
                 let policy = args.get(1).cloned().unwrap_or_default();
                 std::fs::write("/tmp/aidaemon-policy-probe.sb", &policy).unwrap();
                 println!("ARGS={}", serde_json::to_string(args).unwrap());
@@ -14216,7 +14096,7 @@ mod call_effects_tests {
 
     fn run(command: &str) -> CallEffects {
         terminal_call_effects(
-            &*crate::execution::active_execution_backend(),
+            &*aidaemon_tools::testing::active_execution_backend(),
             &serde_json::json!({"action": "run", "command": command}).to_string(),
         )
     }
@@ -14256,7 +14136,7 @@ mod call_effects_tests {
         assert!(!effects.complete);
         assert_eq!(
             effects.keys,
-            vec![crate::tools::command_effects::path_effect(
+            vec![aidaemon_tools::command_effects::path_effect(
                 EffectClass::Write,
                 &format!("{dir}/site/homepage.png"),
                 None
@@ -14273,7 +14153,7 @@ mod call_effects_tests {
             assert!(!run(command).complete, "{command}");
         }
         let script = terminal_call_effects(
-            &*crate::execution::active_execution_backend(),
+            &*aidaemon_tools::testing::active_execution_backend(),
             &serde_json::json!({"action": "run", "script": "ls\nbash run.sh"}).to_string(),
         );
         assert!(!script.complete);
@@ -14288,7 +14168,7 @@ mod call_effects_tests {
         assert_eq!(
             effects.keys,
             vec![
-                crate::tools::command_effects::path_effect(EffectClass::Write, &path, None)
+                aidaemon_tools::command_effects::path_effect(EffectClass::Write, &path, None)
                     .unwrap()
             ]
         );
@@ -14298,14 +14178,14 @@ mod call_effects_tests {
     #[test]
     fn terminal_relative_paths_resolve_against_working_dir() {
         let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
-        let effects = terminal_call_effects(&*crate::execution::active_execution_backend(),
+        let effects = terminal_call_effects(&*aidaemon_tools::testing::active_execution_backend(),
             &serde_json::json!({"action": "run", "command": "echo x > out.txt", "working_dir": dir})
                 .to_string(),
         );
         assert!(!effects.complete);
         assert_eq!(
             effects.keys,
-            vec![crate::tools::command_effects::path_effect(
+            vec![aidaemon_tools::command_effects::path_effect(
                 EffectClass::Write,
                 &format!("{dir}/out.txt"),
                 None
@@ -14349,7 +14229,10 @@ mod call_effects_tests {
             })
             .to_string();
             assert_eq!(
-                terminal_call_effects(&*crate::execution::active_execution_backend(), &arguments),
+                terminal_call_effects(
+                    &*aidaemon_tools::testing::active_execution_backend(),
+                    &arguments
+                ),
                 CallEffects::unknown(),
                 "{action}"
             );
@@ -14362,7 +14245,7 @@ mod call_effects_tests {
     #[test]
     fn terminal_check_reads_and_other_actions_are_undeclared() {
         let check = terminal_call_effects(
-            &*crate::execution::active_execution_backend(),
+            &*aidaemon_tools::testing::active_execution_backend(),
             r#"{"action":"check","pid":42}"#,
         );
         assert_eq!(check, CallEffects::none());
@@ -14372,7 +14255,7 @@ mod call_effects_tests {
             "{",
         ] {
             assert_eq!(
-                terminal_call_effects(&*crate::execution::active_execution_backend(), other),
+                terminal_call_effects(&*aidaemon_tools::testing::active_execution_backend(), other),
                 CallEffects::unknown(),
                 "{other}"
             );

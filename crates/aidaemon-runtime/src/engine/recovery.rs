@@ -116,6 +116,7 @@ impl Drop for EndIfDropped {
                 status: sdk::RunStatus::Cancelled,
                 usage: sdk::Usage::default(),
                 turns: 0,
+                elapsed_ms: 0,
             };
             if let Err(error) = store.append(run_id, &ended).await {
                 warn!(%run_id, %error, "Could not record the end of a stopped run");

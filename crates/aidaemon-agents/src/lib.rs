@@ -26,12 +26,24 @@
 //!   [`ToolOutput::with_usage`], which the kernel adds to the parent run, so
 //!   parent token limits cover delegated work. Per-child caps come from
 //!   [`ChildBudget`] (default `max_turns` 20).
-//! - **Failures are visible.** A child that ends with anything other than
-//!   `Completed` becomes an error result (failed receipt) naming the status.
+//! - **Failures are visible, and the parent decides.** A child that ends
+//!   with anything other than `Completed` becomes an error result (failed
+//!   receipt) naming the status. The parent's run does not fail with it:
+//!   the parent's model sees the error and carries on. Read each child's
+//!   answer and how it ended with `RunOutcome::tool_results` on the
+//!   parent's outcome.
 //! - **Sequential by default.** The tool is annotated
 //!   [`ToolAnnotations::WRITE`], so two children never run concurrently
 //!   unless the caller marks them read-only (e.g. research children). A
-//!   suspending child always runs alone.
+//!   suspending child always runs alone. To run several tasks at once
+//!   without a model choosing them, use [`run_all`].
+//! - **No file access of its own.** A delegation declares
+//!   [`CallEffects::none`]: the call itself changes no file; each of the
+//!   child's own calls is judged by the child's hooks. So a parent's scope
+//!   guard and approval policy (the SDK preset's included) neither refuse
+//!   it nor ask the owner for not declaring paths; an approval mode that
+//!   asks before every write (`ApprovalMode::AllWrites`) still asks before
+//!   a delegation that is not read-only.
 //! - **Depth guard.** Nesting depth is the number of `/sub/` segments in the
 //!   session id; calls beyond `max_depth` are refused.
 //!
@@ -65,10 +77,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aidaemon_core::{
-    Agent, AgentBuilder, AuthorityHook, BuildError, CancellationToken, CoreError, FinishOutcome,
-    Hook, HookContext, InterruptResolver, Interruption, Limits, Message, ModelRequest, Resolution,
-    Role, RunOutcome, RunState, RunStatus, Tool, ToolAnnotations, ToolContext, ToolError,
-    ToolOutput, ToolResult, ToolSpec,
+    Agent, AgentBuilder, AuthorityHook, BuildError, CallEffects, CancellationToken, CoreError,
+    FinishOutcome, Hook, HookContext, InterruptResolver, Interruption, Limits, Message,
+    ModelRequest, Resolution, Role, RunOutcome, RunState, RunStatus, Tool, ToolAnnotations,
+    ToolContext, ToolError, ToolOutput, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -85,6 +97,21 @@ pub const DEFAULT_MAX_DEPTH: usize = 3;
 /// Session id for the child spawned by `call_id` inside `parent_session`.
 pub fn child_session_id(parent_session: &str, call_id: &str) -> String {
     format!("{parent_session}{SUB_SEGMENT}{call_id}")
+}
+
+/// Run each `(agent, task)` at the same time, each in its own child session
+/// of `session` (`{session}/sub/job-{n}`), and return their outcomes in the
+/// order given. For fan-out the application decides, not the model: the
+/// runs share nothing and a failed one does not stop the others.
+pub async fn run_all<'a>(
+    session: &str,
+    jobs: impl IntoIterator<Item = (&'a Agent, String)>,
+) -> Vec<Result<RunOutcome, CoreError>> {
+    let runs = jobs.into_iter().enumerate().map(|(n, (agent, task))| {
+        let session = child_session_id(session, &format!("job-{n}"));
+        async move { agent.run(&session, task).await }
+    });
+    futures::future::join_all(runs).await
 }
 
 /// Nesting depth encoded in a session id: the number of `/sub/` segments.
@@ -490,6 +517,12 @@ impl Tool for AgentTool {
 
     fn annotations(&self) -> ToolAnnotations {
         self.annotations
+    }
+
+    /// The delegation itself changes nothing: the child's own calls carry
+    /// their effects, judged by the child's hooks.
+    fn effects(&self, _arguments: &Value) -> CallEffects {
+        CallEffects::none()
     }
 
     fn validate(&self, arguments: &Value) -> Result<(), String> {

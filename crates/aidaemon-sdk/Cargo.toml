@@ -40,8 +40,9 @@ channels = ["dep:aidaemon-channels"]
 telegram = ["channels", "dep:aidaemon-channel-telegram"]
 slack = ["channels", "dep:aidaemon-channel-slack"]
 discord = ["channels", "dep:aidaemon-channel-discord"]
-testing = ["aidaemon-core/testing", "aidaemon-channels?/testing", "dep:tokio"]
-full = ["macros", "providers", "tools", "policies", "secrets", "keychain", "agents", "sqlite", "mcp", "eval", "testing", "memory", "events", "work", "telegram", "slack", "discord", "otel"]
+conformance = ["channels", "aidaemon-channels/conformance"]
+testing = ["aidaemon-core/testing", "aidaemon-channels?/testing", "dep:tokio", "tokio/test-util"]
+full = ["macros", "providers", "tools", "policies", "secrets", "keychain", "agents", "sqlite", "mcp", "eval", "testing", "memory", "events", "work", "telegram", "slack", "discord", "otel", "conformance"]
 
 [dependencies]
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
@@ -132,6 +133,14 @@ required-features = ["testing", "memory"]
 
 [[example]]
 name = "channel_bot"
+required-features = ["macros", "testing", "channels"]
+
+[[example]]
+name = "scheduled_worker"
+required-features = ["testing"]
+
+[[example]]
+name = "own_channel"
 required-features = ["macros", "testing", "channels"]
 
 [[example]]

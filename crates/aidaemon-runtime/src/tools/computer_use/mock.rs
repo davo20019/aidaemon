@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::config::ComputerUseConfig;
+use crate::settings::ComputerUseConfig;
 
 use super::cache::{SnapshotCache, SnapshotKey};
 use super::harness::{ComputerHarness, HarnessRequestContext};

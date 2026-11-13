@@ -1,6 +1,7 @@
 //! Capability-floor checks for vision+tools computer-use loops.
 
-use crate::config::{ProviderKind, VisionConfig};
+use crate::settings::VisionConfig;
+use aidaemon_providers::routing::ProviderKind;
 
 const DEFAULT_VISION_MODEL_PATTERNS: &[&str] = &[
     "gpt-4o",
@@ -96,7 +97,7 @@ pub fn pick_capable_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::FilesConfig;
+    use crate::settings::FilesConfig;
 
     fn vision() -> VisionConfig {
         VisionConfig::from_files(&FilesConfig {

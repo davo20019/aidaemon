@@ -3,53 +3,75 @@
 //! tools and hooks against the real loop without a model.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::message::ToolCall;
-use crate::provider::{ModelRequest, ModelResponse, Provider, ProviderError, ToolSpec, Usage};
+use crate::provider::{Provider, ToolSpec, Usage};
+
+/// The types a script is made of, here so tests import one module.
+pub use crate::provider::{ModelRequest, ModelResponse, ProviderError};
 
 /// Returns scripted replies in order and records every request it saw.
-#[derive(Default)]
+///
+/// Clones share one script and one request log, so keep a clone to inspect
+/// [`ScriptedProvider::requests`] after handing the provider to a builder:
+///
+/// ```
+/// use aidaemon_core::testing::{text, ScriptedProvider};
+///
+/// let model = ScriptedProvider::new([text("hi")]);
+/// let seen = model.clone(); // same script, same request log
+/// # let _ = (model, seen.requests());
+/// ```
+///
+/// Its [`Provider::default_model`] is [`SCRIPTED_MODEL`], so an agent on it
+/// needs no `.model(..)`.
+#[derive(Clone, Default)]
 pub struct ScriptedProvider {
-    script: Mutex<VecDeque<Result<ModelResponse, ProviderError>>>,
+    inner: Arc<Script>,
+}
+
+#[derive(Default)]
+struct Script {
+    replies: Mutex<VecDeque<Result<ModelResponse, ProviderError>>>,
     /// Returned once the script is exhausted, if set.
-    repeat: Option<ModelResponse>,
+    repeat: Mutex<Option<ModelResponse>>,
     requests: Mutex<Vec<ModelRequest>>,
 }
 
+/// The model id a [`ScriptedProvider`] reports as its default.
+pub const SCRIPTED_MODEL: &str = "scripted";
+
 impl ScriptedProvider {
     pub fn new(replies: impl IntoIterator<Item = ModelResponse>) -> Self {
-        Self {
-            script: Mutex::new(replies.into_iter().map(Ok).collect()),
-            ..Self::default()
-        }
+        Self::with_results(replies.into_iter().map(Ok))
     }
 
     /// Script that may include provider errors.
     pub fn with_results(
         results: impl IntoIterator<Item = Result<ModelResponse, ProviderError>>,
     ) -> Self {
-        Self {
-            script: Mutex::new(results.into_iter().collect()),
-            ..Self::default()
-        }
+        let provider = Self::default();
+        *provider.inner.replies.lock().expect("poisoned") = results.into_iter().collect();
+        provider
     }
 
     /// After the script runs out, keep returning `reply` forever.
-    pub fn then_repeat(mut self, reply: ModelResponse) -> Self {
-        self.repeat = Some(reply);
+    pub fn then_repeat(self, reply: ModelResponse) -> Self {
+        *self.inner.repeat.lock().expect("poisoned") = Some(reply);
         self
     }
 
+    /// Every request seen so far, by this provider and its clones.
     pub fn requests(&self) -> Vec<ModelRequest> {
-        self.requests.lock().expect("poisoned").clone()
+        self.inner.requests.lock().expect("poisoned").clone()
     }
 
     pub fn remaining(&self) -> usize {
-        self.script.lock().expect("poisoned").len()
+        self.inner.replies.lock().expect("poisoned").len()
     }
 }
 
@@ -59,15 +81,21 @@ impl Provider for ScriptedProvider {
         "scripted"
     }
 
+    fn default_model(&self) -> Option<&str> {
+        Some(SCRIPTED_MODEL)
+    }
+
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
-        self.requests
+        self.inner
+            .requests
             .lock()
             .expect("poisoned")
             .push(request.clone());
-        let next = self.script.lock().expect("poisoned").pop_front();
-        match (next, &self.repeat) {
+        let next = self.inner.replies.lock().expect("poisoned").pop_front();
+        let repeat = self.inner.repeat.lock().expect("poisoned").clone();
+        match (next, repeat) {
             (Some(result), _) => result,
-            (None, Some(reply)) => Ok(reply.clone()),
+            (None, Some(reply)) => Ok(reply),
             (None, None) => Err(ProviderError::Other(
                 "scripted provider: script exhausted".into(),
             )),
@@ -133,6 +161,10 @@ pub struct StreamingProvider<P>(pub P);
 impl<P: Provider> Provider for StreamingProvider<P> {
     fn name(&self) -> &str {
         "scripted-streaming"
+    }
+
+    fn default_model(&self) -> Option<&str> {
+        self.0.default_model()
     }
 
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
