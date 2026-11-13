@@ -1,0 +1,16 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "session": {
+      "channel": "app",
+      "id": "app:6c1f",
+      "last_activity_ms": 1767225600000,
+      "title": "Synthetic report for Alice Rivera",
+      "writable": true
+    },
+    "type": "session_created"
+  },
+  "seq": 1,
+  "session_id": "app:6c1f",
+  "type": "event"
+}

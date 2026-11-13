@@ -330,6 +330,7 @@ jobs:
           # sdk-docs and msrv lists in ci.yml.
           SDK_CRATES=(
             aidaemon-macros
+            aidaemon-client-protocol
             aidaemon-secrets
             aidaemon-core
             aidaemon-agents
@@ -345,6 +346,7 @@ jobs:
             aidaemon-channel-slack
             aidaemon-channel-telegram
             aidaemon-events
+            aidaemon-client-gateway
             aidaemon-tool-browser
             aidaemon-memory
             aidaemon-skills

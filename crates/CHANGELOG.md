@@ -12,6 +12,12 @@ stability promise.
 
 ## [Unreleased]
 
+### Added
+- `aidaemon-client-protocol`: pairing and device-session types (`OfferRequest`, `PairingOffer`, `RedeemRequest`, `Enrollment`, `PairingDecision`, `Challenge`, `SessionRequest`, `AccessGrant`, `DeviceInfo`, `Scope`, `challenge_message`); the schema drops schemars' empty `enum` alternatives so code generators accept it. `aidaemon-client-gateway`: device pairing (`Pairing`, `Principal`), scope and risk-ceiling checks, revocation that closes sockets, and the web client at `/client/v1/app`. `aidaemon-store-sqlite`: `SqliteClientEventLog` keeps pairing offers and devices.
+- New crate `aidaemon-client-gateway`: the Client Gateway that serves the client protocol over WebSocket and HTTP on a host's `TurnDeps`, `ChannelHub` and a `ClientHost`; durable resume log and idempotent commands on `aidaemon-store-sqlite`'s new `SqliteClientEventLog` (feature `client-events`, tables created when the log is opened, outside the versioned migrations).
+- `aidaemon-channels`: `turns::TurnObserver` and `TurnWatch` (a field of `TurnDeps` and `BotDeps`) see every turn a runner runs; `hub::ApprovalTap` (`ChannelHub::set_approval_tap`) sees every approval card and may answer it, first answer wins, and a chat card closed by an answer from elsewhere says that answer instead of "expired". `hub::ApprovalRequest` gains `expires_at_ms`.
+- New crate `aidaemon-client-protocol`: the wire types of the AIdaemon Client Protocol v1 (`/client/v1`) for the owner's own apps: `ClientFrame`/`ServerFrame`, typed commands, results and events, `Approval` with typed risk and card facts, `TaskSummary`, `Snapshot`, `Glance` (watch kind, `compact` capability, `get_glance`), `ProtocolVersion` and a closed `ErrorCode` set. Its JSON Schema is checked in at `schemas/client-protocol/v1.schema.json` (`cargo run -p aidaemon-client-protocol --bin export-client-schema`), with golden fixtures for every frame.
+
 ### Dependencies updated
 - Latest releases throughout, including reqwest 0.13, sqlx 0.9, rand 0.10, the RustCrypto 0.11 generation (sha2, hmac, p256 0.14), tokio-tungstenite 0.30, toml 1.2, strum 0.28, dirs 7, croner 4, base64 0.23, fastembed 7 (same model and vectors), chromiumoxide 0.9, keyring 4, async-imap 0.12 and syn 3; `aidaemon-eval` and `aidaemon-skills` read YAML with serde-saphyr (YAML 1.2 scalars) instead of the deprecated serde_yaml. `rust-version` is now 1.94 (sqlx 0.9).
 

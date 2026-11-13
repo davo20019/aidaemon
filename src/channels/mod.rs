@@ -48,6 +48,8 @@ pub(crate) struct ChannelRuntimeDeps {
     pub max_file_size_mb: u64,
     pub state: Arc<dyn crate::traits::StateStore>,
     pub watchdog_stale_threshold_secs: u64,
+    /// Who sees every turn: the Client Gateway, when it runs.
+    pub watch: aidaemon_channels::turns::TurnWatch,
 }
 
 impl ChannelRuntimeDeps {
@@ -62,6 +64,7 @@ impl ChannelRuntimeDeps {
             inbox_dir: self.inbox_dir.clone(),
             max_file_size_mb: self.max_file_size_mb,
             watchdog_stale_threshold_secs: self.watchdog_stale_threshold_secs,
+            watch: self.watch.clone(),
         }
     }
 
@@ -84,6 +87,7 @@ impl ChannelRuntimeDeps {
             sessions: self.state.clone(),
             task_registry: self.task_registry.clone(),
             watchdog_stale_threshold_secs: self.watchdog_stale_threshold_secs,
+            watch: self.watch.clone(),
         }
     }
 }

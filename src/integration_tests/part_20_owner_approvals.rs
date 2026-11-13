@@ -683,6 +683,7 @@ fn card_runner(
         max_file_size_mb: 10,
         state,
         watchdog_stale_threshold_secs: 0,
+        watch: Default::default(),
     }
     .turn_deps());
     (runner, registry)

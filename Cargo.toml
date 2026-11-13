@@ -30,6 +30,9 @@ authors = ["David Loor <davo20019@gmail.com>"]
 members = [
     "crates/node-protocol",
     "crates/node-sdk",
+    "crates/client-protocol",
+    "crates/aidaemon-tui",
+    "crates/aidaemon-client-gateway",
     "crates/aidaemon-core",
     "crates/aidaemon-providers",
     "crates/aidaemon-tools",
@@ -89,6 +92,8 @@ strum = { version = "0.28", features = ["derive"] }
 futures = "0.3"
 axum = "0.8"
 dialoguer = "0.12"
+# The pairing code as a QR code in the terminal (`aidaemon pair`).
+qrcode = { version = "0.14", default-features = false }
 shellexpand = "3"
 dirs = "7"
 fastembed = { version = "7", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
@@ -114,7 +119,7 @@ serialport = { version = "4.10", default-features = false }
 # The agent kernel (workspace crate).
 aidaemon-core = { version = "=0.2.0", path = "crates/aidaemon-core" }
 # The kernel's run journal and checkpoints, on the daemon's own pool.
-aidaemon-store-sqlite = { version = "=0.2.0", path = "crates/aidaemon-store-sqlite" }
+aidaemon-store-sqlite = { version = "=0.2.0", path = "crates/aidaemon-store-sqlite", features = ["client-events"] }
 aidaemon-policies = { version = "=0.2.0", path = "crates/aidaemon-policies" }
 aidaemon-decisions = { version = "=0.2.0", path = "crates/aidaemon-decisions", features = ["gemini"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"], optional = true }
@@ -125,6 +130,9 @@ aidaemon-skills = { version = "=0.2.0", path = "crates/aidaemon-skills" }
 aidaemon-secrets = { version = "=0.2.0", path = "crates/aidaemon-secrets" }
 # Nodes: hardware companions, their Gateway, store and tools.
 aidaemon-nodes = { version = "=0.2.0", path = "crates/aidaemon-nodes" }
+# The Client Gateway (`/client/v1`) and its wire types, for the owner's apps.
+aidaemon-client-gateway = { version = "=0.2.0", path = "crates/aidaemon-client-gateway" }
+aidaemon-client-protocol = { version = "=0.2.0", path = "crates/client-protocol" }
 # The terminal bridge (`/agent` sessions and the local attach/share/start CLIs).
 aidaemon-terminal-bridge = { version = "=0.2.0", path = "crates/aidaemon-terminal-bridge", optional = true }
 aidaemon-tool-browser = { version = "=0.2.0", path = "crates/aidaemon-tool-browser" }
@@ -200,6 +208,9 @@ serial_test = "4"
 # `test-util` enables tokio's pausable fake clock (`#[tokio::test(start_paused = true)]`,
 # `tokio::time::advance`) used by the deterministic bounded-wait browser tests.
 tokio = { version = "1", features = ["test-util"] }
+# A real WebSocket client for the Client Gateway's tests, and a device key.
+tokio-tungstenite = "0.30"
+p256 = { version = "0.14", features = ["ecdsa"] }
 
 # libsqlite3-sys is never named in code: the `encryption` feature turns on its
 # bundled SQLCipher build under sqlx.

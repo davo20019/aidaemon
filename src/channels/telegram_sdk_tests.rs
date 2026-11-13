@@ -107,6 +107,7 @@ async fn channel_with_config(
                 max_file_size_mb: 10,
                 state: harness.state.clone(),
                 watchdog_stale_threshold_secs: 0,
+                watch: Default::default(),
             },
             String::new(),
             Vec::new(),

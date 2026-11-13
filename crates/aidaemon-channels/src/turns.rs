@@ -147,6 +147,61 @@ pub trait TurnSurface: Send + Sync + 'static {
     }
 }
 
+/// A turn as it starts, for a [`TurnObserver`].
+pub struct TurnStart<'a> {
+    pub session_id: &'a str,
+    /// The task registry's id for the turn.
+    pub turn: u64,
+    /// The surface's platform (`telegram`, `app`...).
+    pub platform: &'static str,
+    /// What the sender said.
+    pub text: &'a str,
+    pub attachments: &'a [MessageAttachment],
+    pub user_role: UserRole,
+    /// How the running-work list names it.
+    pub description: &'a str,
+}
+
+/// A turn as it ends, for a [`TurnObserver`].
+pub struct TurnFinish<'a> {
+    pub session_id: &'a str,
+    pub turn: u64,
+    pub platform: &'static str,
+    pub end: TurnEnd,
+    /// The reply as delivered (Markdown); empty when there was none.
+    pub reply: &'a str,
+    /// The work goes on in the background; its report comes later.
+    pub handed_off: bool,
+    /// Why it failed or was cancelled.
+    pub error: Option<&'a str>,
+}
+
+/// Sees every turn a runner runs, whatever its platform, so one place can
+/// show all the work (the Client Gateway). Called inline: return quickly.
+pub trait TurnObserver: Send + Sync {
+    fn turn_started(&self, turn: &TurnStart<'_>);
+    /// One of the turn's status updates, as the surface gets it.
+    fn turn_status(&self, session_id: &str, turn: u64, update: &StatusUpdate);
+    fn turn_finished(&self, turn: &TurnFinish<'_>);
+}
+
+/// Where a runner reports its turns: empty until an observer is set, which
+/// may happen after the runners are built. Clones share the slot.
+#[derive(Clone, Default)]
+pub struct TurnWatch(Arc<std::sync::RwLock<Option<Arc<dyn TurnObserver>>>>);
+
+impl TurnWatch {
+    /// Report turns to `observer` from now on.
+    pub fn set(&self, observer: Arc<dyn TurnObserver>) {
+        *self.0.write().unwrap_or_else(|p| p.into_inner()) = Some(observer);
+    }
+
+    /// The observer, if one is set.
+    pub fn observer(&self) -> Option<Arc<dyn TurnObserver>> {
+        self.0.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
 /// What a [`TurnRunner`] runs turns with.
 #[derive(Clone)]
 pub struct TurnDeps {
@@ -159,6 +214,8 @@ pub struct TurnDeps {
     /// Heartbeat silence (seconds) after which a turn is cancelled as hung;
     /// 0 never cancels.
     pub watchdog_stale_threshold_secs: u64,
+    /// Who sees every turn (empty by default).
+    pub watch: TurnWatch,
 }
 
 /// Per session: each queued message's text and its notice's message id.
@@ -545,6 +602,18 @@ impl TurnRunner {
             // Shown in "current task (…)" notices and cancel replies.
             let description = crate::presentation::word_preview(&text, 80);
             let (task_id, cancel) = registry.register(&session_id, &description).await;
+            let observer = self.deps.watch.observer();
+            if let Some(observer) = observer.as_ref() {
+                observer.turn_started(&TurnStart {
+                    session_id: &session_id,
+                    turn: task_id,
+                    platform: surface.platform(),
+                    text: &text,
+                    attachments: &attachments,
+                    user_role: role,
+                    description: &description,
+                });
+            }
             self.live.begin(&session_id, task_id);
             let heartbeat = Arc::new(AtomicU64::new(now_secs()));
             registry.set_heartbeat(task_id, heartbeat.clone()).await;
@@ -560,9 +629,13 @@ impl TurnRunner {
             {
                 let live = self.live.clone();
                 let session_id = session_id.clone();
+                let observer = observer.clone();
                 tokio::spawn(async move {
                     while let Some(update) = run_updates.recv().await {
                         live.record(&session_id, task_id, &update);
+                        if let Some(observer) = observer.as_ref() {
+                            observer.turn_status(&session_id, task_id, &update);
+                        }
                         let _ = shown_tx.send(update).await;
                     }
                 });
@@ -661,13 +734,24 @@ impl TurnRunner {
                             ),
                         )
                         .await;
-                    surface
-                        .turn_ended(if empty {
-                            TurnEnd::Empty
-                        } else {
-                            TurnEnd::Delivered
-                        })
-                        .await;
+                    let end = if empty {
+                        TurnEnd::Empty
+                    } else {
+                        TurnEnd::Delivered
+                    };
+                    if let Some(observer) = observer.as_ref() {
+                        observer.turn_finished(&TurnFinish {
+                            session_id: &session_id,
+                            turn: task_id,
+                            platform,
+                            end,
+                            reply: if empty { "" } else { &reply },
+                            handed_off: envelope.disposition
+                                == aidaemon_events::AssistantResponseDisposition::BackgroundHandoff,
+                            error: None,
+                        });
+                    }
+                    surface.turn_ended(end).await;
                     None
                 }
                 Err(error) => {
@@ -684,6 +768,21 @@ impl TurnRunner {
                             let _ = surface.say(&format!("Error: {message}")).await;
                         }
                         surface.turn_ended(TurnEnd::Failed).await;
+                    }
+                    if let Some(observer) = observer.as_ref() {
+                        observer.turn_finished(&TurnFinish {
+                            session_id: &session_id,
+                            turn: task_id,
+                            platform: surface.platform(),
+                            end: if message == CANCELLED {
+                                TurnEnd::Cancelled
+                            } else {
+                                TurnEnd::Failed
+                            },
+                            reply: "",
+                            handed_off: false,
+                            error: Some(&message),
+                        });
                     }
                     Some(message)
                 }
@@ -1139,6 +1238,7 @@ mod tests {
             sessions: Arc::new(NoSessions),
             task_registry: registry.clone(),
             watchdog_stale_threshold_secs: 0,
+            watch: TurnWatch::default(),
         });
         let surface = Arc::new(Said::default());
         let session = "test:mid-run";
@@ -1285,6 +1385,7 @@ mod tests {
             sessions: Arc::new(NoSessions),
             task_registry: registry.clone(),
             watchdog_stale_threshold_secs: 0,
+            watch: TurnWatch::default(),
         });
         let surface = Arc::new(Said::default());
         runner

@@ -486,6 +486,21 @@ record_decision_points = true
 max_events = 200
 include_raw_tool_args = false
 
+# The Client Gateway (/client/v1): lets your own apps (a terminal UI, a web
+# page) chat with the agent, watch every chat's turns and answer approvals.
+# Off by default; loopback only. Mint the local token with
+# `aidaemon client-token` (it prints the token once). Pair a phone or browser
+# with /pair_device in a chat or `aidaemon pair`; the web client is served
+# at /client/v1/app. /devices lists them, /revoke_device <id> cuts one off.
+# [client_gateway]
+# enabled = false
+# bind = "127.0.0.1"
+# port = 8788
+# retention_days = 7          # resume window; older clients get a snapshot
+# max_events = 100000
+# watch_risk_ceiling = "medium"
+# public_url = "https://aidaemon.example.ts.net"   # your HTTPS tunnel, for pairing links
+
 # Nodes are disabled by default. The Gateway binds only to loopback; publish
 # this narrow service through a separately managed HTTPS transport adapter.
 [nodes.gateway]

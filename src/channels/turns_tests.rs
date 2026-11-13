@@ -65,6 +65,7 @@ async fn stop_ends_finite_work_but_keeps_a_recurring_goal() {
             max_file_size_mb: 10,
             state: state.clone(),
             watchdog_stale_threshold_secs: 0,
+            watch: Default::default(),
         }
         .turn_deps(),
     );
@@ -154,6 +155,7 @@ async fn status_sent_before_the_reply_is_shown_before_the_reply() {
             max_file_size_mb: 10,
             state: harness.state.clone(),
             watchdog_stale_threshold_secs: 0,
+            watch: Default::default(),
         }
         .turn_deps(),
     );

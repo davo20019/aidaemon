@@ -7,7 +7,9 @@ use tracing::{info, warn};
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
 use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse};
 
-use super::{ApprovalRequest, HubChannel, MediaKind, MediaMessage};
+use super::{
+    ApprovalRequest, ApprovalTap, HubChannel, MediaKind, MediaMessage, TapClosed, TappedApproval,
+};
 #[cfg(test)]
 use crate::ports::SessionRouteLease;
 use crate::ports::{AssistantNoteSink, OutboundRouter};
@@ -59,6 +61,9 @@ pub struct ChannelHub {
     /// background job settling checklist steps edits it, so the card moves
     /// from "running in the background" to what happened.
     checklist_surfaces: RwLock<HashMap<String, String>>,
+    /// Sees every approval card and may answer it from elsewhere; set late,
+    /// once the Client Gateway starts.
+    approval_tap: std::sync::RwLock<Option<Arc<dyn ApprovalTap>>>,
 }
 
 impl ChannelHub {
@@ -74,7 +79,23 @@ impl ChannelHub {
             recent_media_deliveries: RwLock::new(HashMap::new()),
             background_status_surfaces: RwLock::new(HashMap::new()),
             checklist_surfaces: RwLock::new(HashMap::new()),
+            approval_tap: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Show every approval card to `tap` too, which may answer it.
+    pub fn set_approval_tap(&self, tap: Arc<dyn ApprovalTap>) {
+        *self
+            .approval_tap
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tap);
+    }
+
+    fn approval_tap(&self) -> Option<Arc<dyn ApprovalTap>> {
+        self.approval_tap
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Register the editable message id of a just-delivered background-handoff
@@ -440,111 +461,7 @@ impl ChannelHub {
             let hub = self.clone();
             tokio::spawn(async move {
                 let queue_telemetry = hub.queue_telemetry.clone();
-                let mut response_tx = request.response_tx;
-                let mut had_error = false;
-                // Whoever asked may stop waiting (its own timeout, a cancelled
-                // turn); the card is then dropped, which expires it on the
-                // channel instead of leaving live buttons that decide nothing.
-                let asked = async {
-                    let route = hub.routed_channel(&request.session_id).await;
-                    let mut had_error = false;
-                    let response = match route {
-                        Some((ch, routed_session)) => match request.kind {
-                            ApprovalKind::GoalConfirmation
-                            | ApprovalKind::AutopilotConfirmation => {
-                                let style = if matches!(
-                                    request.kind,
-                                    ApprovalKind::AutopilotConfirmation
-                                ) {
-                                    aidaemon_tools::semantics::GoalConfirmationStyle::Autopilot
-                                } else {
-                                    aidaemon_tools::semantics::GoalConfirmationStyle::Standard
-                                };
-                                match ch
-                                    .request_goal_confirmation(
-                                        &routed_session,
-                                        &request.command,
-                                        &request.warnings,
-                                        style,
-                                    )
-                                    .await
-                                {
-                                    Ok(true) => Some(ApprovalResponse::AllowOnce),
-                                    Ok(false) => Some(ApprovalResponse::Deny),
-                                    Err(e) => {
-                                        warn!("Goal confirmation failed on {}: {}", ch.name(), e);
-                                        had_error = true;
-                                        None
-                                    }
-                                }
-                            }
-                            ApprovalKind::Command | ApprovalKind::CommandOnce => {
-                                let one_time_only =
-                                    matches!(request.kind, ApprovalKind::CommandOnce);
-                                let ask = crate::approval_render::ApprovalAsk {
-                                    command: &request.command,
-                                    card: request.card.as_deref(),
-                                    risk_level: request.risk_level,
-                                    warnings: &request.warnings,
-                                    permission_mode: request.permission_mode,
-                                    one_time_only,
-                                };
-                                match ch.request_approval_ask(&routed_session, &ask).await {
-                                    Ok(resp) => Some(if one_time_only {
-                                        // Enforce the one-shot boundary even if an
-                                        // older or forged channel callback returns a
-                                        // broader choice that is no longer offered.
-                                        match resp {
-                                            ApprovalResponse::AllowSession
-                                            | ApprovalResponse::AllowAlways => {
-                                                ApprovalResponse::AllowOnce
-                                            }
-                                            other => other,
-                                        }
-                                    } else {
-                                        resp
-                                    }),
-                                    Err(e) => {
-                                        warn!("Approval request failed on {}: {}", ch.name(), e);
-                                        had_error = true;
-                                        None
-                                    }
-                                }
-                            }
-                        },
-                        None => {
-                            warn!(
-                                "No channel found for session {}; approval unavailable",
-                                request.session_id
-                            );
-                            had_error = true;
-                            None
-                        }
-                    };
-                    (response, had_error)
-                };
-                let response = tokio::select! {
-                    (response, failed) = asked => {
-                        had_error = failed;
-                        response
-                    }
-                    _ = response_tx.closed() => {
-                        info!(
-                            session_id = %request.session_id,
-                            "Approval requester stopped waiting; the card expires"
-                        );
-                        None
-                    }
-                };
-                if let Some(response) = response {
-                    if response_tx.send(response).is_err() {
-                        had_error = true;
-                        warn!(
-                            session_id = %request.session_id,
-                            "Approval response receiver dropped before response could be sent"
-                        );
-                    }
-                }
+                let had_error = hub.settle_approval(request).await;
                 if let Some(queue_telemetry) = queue_telemetry {
                     if had_error {
                         queue_telemetry.mark_approval_failed();
@@ -553,6 +470,164 @@ impl ChannelHub {
                 }
             });
         }
+    }
+
+    /// Ask `request` on the bot its session belongs to (and through the
+    /// approval tap, when one is set) and send the first answer back.
+    /// Returns whether something failed.
+    async fn settle_approval(&self, request: ApprovalRequest) -> bool {
+        let mut response_tx = request.response_tx;
+        let Some((ch, routed_session)) = self.routed_channel(&request.session_id).await else {
+            warn!(
+                "No channel found for session {}; approval unavailable",
+                request.session_id
+            );
+            return true;
+        };
+        let one_time_only = matches!(request.kind, ApprovalKind::CommandOnce);
+        let ask = crate::approval_render::ApprovalAsk {
+            command: &request.command,
+            card: request.card.as_deref(),
+            risk_level: request.risk_level,
+            warnings: &request.warnings,
+            permission_mode: request.permission_mode,
+            one_time_only,
+        };
+        let channel_name = ch.name();
+        // The tap sees the card and may answer it; its answer names who
+        // gave it, which the bot's card then shows instead of "expired".
+        let tap = self.approval_tap();
+        let tapped = tap.as_ref().map(|tap| {
+            tap.opened(&TappedApproval {
+                session_id: &request.session_id,
+                channel: channel_name.clone(),
+                ask,
+                kind: request.kind,
+                expires_at_ms: request.expires_at_ms,
+            })
+        });
+        let (tap_id, tap_answer) = match tapped {
+            Some((id, answer)) => (Some(id), Some(answer)),
+            None => (None, None),
+        };
+        let note = Arc::new(std::sync::Mutex::new(None::<String>));
+        let elsewhere = {
+            let note = note.clone();
+            async move {
+                let Some(answer) = tap_answer else {
+                    return std::future::pending().await;
+                };
+                match answer.await {
+                    Ok((response, by)) => {
+                        let (icon, label) = crate::approval_render::response_status(&response);
+                        if let Ok(mut note) = note.lock() {
+                            *note = Some(format!("{icon} {label}, {by}."));
+                        }
+                        (response, by)
+                    }
+                    // The tap went away: only the bot can answer now.
+                    Err(_) => std::future::pending().await,
+                }
+            }
+        };
+
+        let asked = async {
+            let response = match request.kind {
+                ApprovalKind::GoalConfirmation | ApprovalKind::AutopilotConfirmation => {
+                    let style = if matches!(request.kind, ApprovalKind::AutopilotConfirmation) {
+                        aidaemon_tools::semantics::GoalConfirmationStyle::Autopilot
+                    } else {
+                        aidaemon_tools::semantics::GoalConfirmationStyle::Standard
+                    };
+                    match ch
+                        .request_goal_confirmation(
+                            &routed_session,
+                            &request.command,
+                            &request.warnings,
+                            style,
+                        )
+                        .await
+                    {
+                        Ok(true) => Ok(ApprovalResponse::AllowOnce),
+                        Ok(false) => Ok(ApprovalResponse::Deny),
+                        Err(e) => {
+                            warn!("Goal confirmation failed on {}: {}", ch.name(), e);
+                            Err(())
+                        }
+                    }
+                }
+                ApprovalKind::Command | ApprovalKind::CommandOnce => {
+                    match ch.request_approval_ask(&routed_session, &ask).await {
+                        Ok(resp) => Ok(resp),
+                        Err(e) => {
+                            warn!("Approval request failed on {}: {}", ch.name(), e);
+                            Err(())
+                        }
+                    }
+                }
+            };
+            // A bot that could not ask leaves the card to the tap, when
+            // there is one.
+            if response.is_err() && tap_id.is_some() {
+                return std::future::pending().await;
+            }
+            response
+        };
+        // Dropped inside the scope, so a bot card closed by an answer from
+        // the tap reads that answer.
+        let asked = crate::prompts::ANSWERED_ELSEWHERE.scope(note.clone(), asked);
+
+        let mut had_error = false;
+        let outcome = tokio::select! {
+            response = asked => match response {
+                Ok(response) => Some((response, channel_name.clone())),
+                Err(()) => {
+                    had_error = true;
+                    None
+                }
+            },
+            (response, by) = elsewhere => Some((response, by)),
+            _ = response_tx.closed() => {
+                info!(
+                    session_id = %request.session_id,
+                    "Approval requester stopped waiting; the card expires"
+                );
+                None
+            }
+        };
+        // Enforce the one-shot boundary even if an older or forged callback
+        // returns a broader choice that is no longer offered.
+        let outcome = outcome.map(|(response, by)| {
+            let response = match response {
+                ApprovalResponse::AllowSession | ApprovalResponse::AllowAlways if one_time_only => {
+                    ApprovalResponse::AllowOnce
+                }
+                other => other,
+            };
+            (response, by)
+        });
+        if let (Some(tap), Some(id)) = (tap.as_ref(), tap_id.as_deref()) {
+            tap.closed(
+                id,
+                match &outcome {
+                    Some((response, by)) => TapClosed::Answered {
+                        response: response.clone(),
+                        by: by.clone(),
+                    },
+                    None => TapClosed::Unanswered,
+                },
+            );
+        }
+        if let Some((response, _)) = outcome {
+            if response_tx.send(response).is_err() {
+                had_error = true;
+                warn!(
+                    session_id = %request.session_id,
+                    "Approval response receiver dropped before response could be sent"
+                );
+            }
+        }
+        had_error
     }
 
     /// Route media messages from tools to the appropriate channel.
@@ -1304,6 +1379,7 @@ mod tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         approval_tx
             .send(ApprovalRequest {
+                expires_at_ms: None,
                 card: None,
                 command: "Navigate to public site".to_string(),
                 session_id: "specialist:browser:child".to_string(),
@@ -1325,6 +1401,7 @@ mod tests {
         let (unrouted_tx, unrouted_rx) = tokio::sync::oneshot::channel();
         approval_tx
             .send(ApprovalRequest {
+                expires_at_ms: None,
                 card: None,
                 command: "Navigate to public site".to_string(),
                 session_id: "specialist:browser:child".to_string(),

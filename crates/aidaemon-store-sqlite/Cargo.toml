@@ -20,6 +20,9 @@ publish = false
 [features]
 # `SqliteApprovalStore`, a durable `aidaemon_channels::ApprovalStore`.
 channels = ["dep:aidaemon-channels"]
+# `SqliteClientEventLog`, the Client Gateway's durable event log and
+# remembered replies.
+client-events = []
 
 [dependencies]
 aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels", optional = true }

@@ -153,6 +153,10 @@ pub struct AppConfig {
     /// Individually enrolled, policy-constrained Node participants.
     #[serde(default)]
     pub nodes: NodesConfig,
+    /// The Client Gateway (`/client/v1`) for the owner's own apps. Off by
+    /// default; loopback only.
+    #[serde(default)]
+    pub client_gateway: aidaemon_client_gateway::ClientGatewayConfig,
     #[serde(default)]
     pub path_aliases: PathAliasConfig,
     #[serde(default)]
@@ -2539,6 +2543,9 @@ impl AppConfig {
         config.provider.apply_model_defaults_recursive();
         config.daemon.queue_policy = config.daemon.queue_policy.normalized();
         config.resolve_secrets()?;
+        if config.client_gateway.enabled {
+            config.client_gateway.bind_addr()?;
+        }
         if config.nodes.gateway.enabled {
             let address: std::net::IpAddr = config
                 .nodes

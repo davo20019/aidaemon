@@ -1,0 +1,12 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "state": "completed",
+    "text": "Posted the report.",
+    "turn_id": "b9e1-4",
+    "type": "turn_completed"
+  },
+  "seq": 7,
+  "session_id": "app:6c1f",
+  "type": "event"
+}

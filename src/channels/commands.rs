@@ -80,6 +80,7 @@ impl CommandContext {
                     config_path: self.config_path.clone(),
                 }))),
                 Arc::new(CheckpointCommands),
+                Arc::new(crate::startup::client_gateway::DeviceCommands),
             ],
         }
     }

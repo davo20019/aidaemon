@@ -1,0 +1,9 @@
+{
+  "command": {
+    "approval_id": "a-7f3e-1",
+    "decision": "approve_once",
+    "type": "resolve_approval"
+  },
+  "request_id": "5d0c2b1e-0003",
+  "type": "command"
+}

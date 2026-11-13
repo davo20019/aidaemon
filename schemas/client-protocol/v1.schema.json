@@ -1,0 +1,2276 @@
+{
+  "$defs": {
+    "AccessGrant": {
+      "description": "A short-lived access token for one device.",
+      "properties": {
+        "access_token": {
+          "type": "string"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "expires_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "risk_ceiling": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Risk"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The highest risk this device may approve; `None`: no limit."
+        },
+        "scopes": {
+          "items": {
+            "$ref": "#/$defs/Scope"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "access_token",
+        "expires_at_ms",
+        "device_id",
+        "scopes"
+      ],
+      "type": "object"
+    },
+    "Approval": {
+      "description": "A question the owner must answer before work goes on. Pending until\nexactly one of: answered, expired (nobody answered in time: the call is\nnot run, and it is not a refusal) or withdrawn (its turn stopped, or the\ndaemon restarted).",
+      "properties": {
+        "card": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApprovalCard"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The card's typed facts, when the asker gave them. Left out in\ncompact frames."
+        },
+        "channel": {
+          "description": "The chat the card is also shown in (`telegram`...), if any besides\nthe app.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "description": "The exact command or arguments. Left out in compact frames.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expires_at_ms": {
+          "description": "When it expires unanswered; `None` when the asker set no deadline.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ApprovalKind"
+        },
+        "options": {
+          "description": "The answers offered, in display order.",
+          "items": {
+            "$ref": "#/$defs/ApprovalDecision"
+          },
+          "type": "array"
+        },
+        "requested_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "risk": {
+          "$ref": "#/$defs/Risk"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "summary": {
+          "description": "One plain sentence: what will happen.",
+          "type": "string"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "session_id",
+        "kind",
+        "risk",
+        "summary",
+        "options",
+        "requested_at_ms"
+      ],
+      "type": "object"
+    },
+    "ApprovalCard": {
+      "description": "An approval card's content as facts: who asks, what will happen, why the\nowner is asked and the one effect worth a warning. Plain words only;\nnever authority.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/CardAction"
+        },
+        "asked_by": {
+          "description": "The helper asking; `None` for the assistant itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "impact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Impact"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AskReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "ApprovalDecision": {
+      "description": "An answer to an approval.",
+      "oneOf": [
+        {
+          "enum": [
+            "approve_once",
+            "deny"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "approve_session",
+          "description": "Allow it for the rest of this session.",
+          "type": "string"
+        },
+        {
+          "const": "approve_always",
+          "description": "Allow this kind of call from now on.",
+          "type": "string"
+        }
+      ]
+    },
+    "ApprovalKind": {
+      "oneOf": [
+        {
+          "const": "command",
+          "description": "Allow a call (a command, a request, a tool use).",
+          "type": "string"
+        },
+        {
+          "const": "goal_confirmation",
+          "description": "Confirm a scheduled goal.",
+          "type": "string"
+        },
+        {
+          "const": "autopilot_confirmation",
+          "description": "Confirm an Autopilot posture.",
+          "type": "string"
+        }
+      ]
+    },
+    "ApprovalOutcome": {
+      "description": "How an approval ended.",
+      "oneOf": [
+        {
+          "enum": [
+            "approved_once",
+            "approved_session",
+            "approved_always",
+            "denied"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "Nobody answered in time. The call did not run; this is not a\nrefusal.",
+          "type": "string"
+        },
+        {
+          "const": "withdrawn",
+          "description": "The question went away unanswered: its turn was stopped, the card\ncould not be shown, or the daemon restarted.",
+          "type": "string"
+        }
+      ]
+    },
+    "AskReason": {
+      "oneOf": [
+        {
+          "description": "The work read content from outside and the clean check could not\nconfirm this step fits the request.",
+          "properties": {
+            "check_says": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "read_outside_content",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The owner said no to an earlier step of this run.",
+          "properties": {
+            "kind": {
+              "const": "after_a_decline",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AttachmentRef": {
+      "description": "A file a client uploaded before sending its message.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "mime": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "Capability": {
+      "description": "An optional feature, named instead of a version bump. A client lists the\nones it wants in `hello`; the server lists the ones it offers in\n`welcome`, and only those it offers apply.",
+      "oneOf": [
+        {
+          "const": "compact",
+          "description": "Short frames: an approval's summary without its detail or card, no\n`turn_delta` or `turn_status`. The default for a watch.",
+          "type": "string"
+        },
+        {
+          "const": "deltas",
+          "description": "Streaming `turn_delta` events.",
+          "type": "string"
+        },
+        {
+          "const": "goals",
+          "description": "`goal_updated` events.",
+          "type": "string"
+        },
+        {
+          "const": "attachments",
+          "description": "Files with messages, through upload slots.",
+          "type": "string"
+        },
+        {
+          "const": "push",
+          "description": "Push notifications through a relay.",
+          "type": "string"
+        }
+      ]
+    },
+    "CardAction": {
+      "oneOf": [
+        {
+          "description": "Run a command on the owner's computer.",
+          "properties": {
+            "kind": {
+              "const": "command",
+              "type": "string"
+            },
+            "line": {
+              "type": "string"
+            },
+            "looks_inside": {
+              "description": "Folders a read-only command only looks inside.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "line"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Let the browser open a site on this computer.",
+          "properties": {
+            "kind": {
+              "const": "open_local_site",
+              "type": "string"
+            },
+            "once_minutes": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "site": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "site",
+            "once_minutes"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Use a tool; `what` completes \"wants to …\".",
+          "properties": {
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "use",
+              "type": "string"
+            },
+            "what": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "what"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Challenge": {
+      "properties": {
+        "challenge_id": {
+          "type": "string"
+        },
+        "expires_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "nonce": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "challenge_id",
+        "nonce",
+        "expires_at_ms"
+      ],
+      "type": "object"
+    },
+    "ChallengeRequest": {
+      "description": "`POST /client/v1/sessions/challenge`.",
+      "properties": {
+        "device_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "device_id"
+      ],
+      "type": "object"
+    },
+    "ClientFrame": {
+      "description": "A frame from a client to the daemon.",
+      "oneOf": [
+        {
+          "description": "The first frame on a socket.",
+          "properties": {
+            "capabilities": {
+              "items": {
+                "$ref": "#/$defs/Capability"
+              },
+              "type": "array"
+            },
+            "client": {
+              "$ref": "#/$defs/ClientInfo"
+            },
+            "resume_from": {
+              "description": "The last `seq` the client applied; `None` for a client with no\ncache. Within the retention window the gateway replays every\nevent after it, otherwise it sends a snapshot.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "token": {
+              "description": "The access token, for clients that cannot set an\n`Authorization` header on a WebSocket (browsers).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "hello",
+              "type": "string"
+            },
+            "version": {
+              "$ref": "#/$defs/ProtocolVersion"
+            }
+          },
+          "required": [
+            "type",
+            "version",
+            "client"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A command. Answered by exactly one ack or error with the same\n`request_id`; a retried id gets the original answer.",
+          "properties": {
+            "command": {
+              "$ref": "#/$defs/Command"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "command",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "ping",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ClientInfo": {
+      "description": "What a client is.",
+      "properties": {
+        "device": {
+          "description": "The device's name as the owner knows it (\"Pixel 9\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/ClientKind"
+        },
+        "name": {
+          "description": "The client program's name (\"aidaemon-tui\").",
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "name"
+      ],
+      "type": "object"
+    },
+    "ClientKind": {
+      "description": "The kind of client, so the daemon can tailor what it sends and the owner\ncan see which device acted.",
+      "oneOf": [
+        {
+          "enum": [
+            "tui",
+            "web",
+            "desktop",
+            "mobile"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "watch",
+          "description": "A smartwatch: short actions, compact frames, a risk ceiling on what\nit may approve.",
+          "type": "string"
+        },
+        {
+          "const": "script",
+          "description": "A script or other program.",
+          "type": "string"
+        }
+      ]
+    },
+    "Command": {
+      "description": "What a client asks the daemon to do.",
+      "oneOf": [
+        {
+          "description": "Start a session (no `session_id`) or continue one.",
+          "properties": {
+            "attachments": {
+              "description": "Files uploaded beforehand; needs the `attachments` capability.",
+              "items": {
+                "$ref": "#/$defs/AttachmentRef"
+              },
+              "type": "array"
+            },
+            "session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "send_message",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Stop everything the session has running (`/cancel all`).",
+          "properties": {
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "stop_turn",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "approval_id": {
+              "type": "string"
+            },
+            "decision": {
+              "$ref": "#/$defs/ApprovalDecision"
+            },
+            "type": {
+              "const": "resolve_approval",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "approval_id",
+            "decision"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Stop one entry of the running-work list.",
+          "properties": {
+            "task_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "cancel_task",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "task_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "limit": {
+              "default": 50,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "list_sessions",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "before": {
+              "description": "Messages before this one (its id); `None` for the newest.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "limit": {
+              "default": 50,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "get_history",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Start the session afresh (`/clear`), keeping its history on record.",
+          "properties": {
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "clear_session",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An existing slash command, until it has a typed command of its own.",
+          "properties": {
+            "args": {
+              "type": "string"
+            },
+            "command": {
+              "description": "Without the slash (\"tasks\").",
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "run_slash",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Running tasks, pending approvals and the last reply, in one call.",
+          "properties": {
+            "type": {
+              "const": "get_glance",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The state a snapshot frame carries, on demand.",
+          "properties": {
+            "type": {
+              "const": "get_snapshot",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "CommandResult": {
+      "description": "The answer to a command.",
+      "oneOf": [
+        {
+          "description": "`send_message`: the message was taken; what happens next arrives as\nevents of `session_id`.",
+          "properties": {
+            "new_session": {
+              "default": false,
+              "description": "The message started a session.",
+              "type": "boolean"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "message_accepted",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`stop_turn` and `cancel_task`: what was stopped, in plain words, as\nread back afterwards.",
+          "properties": {
+            "report": {
+              "type": "string"
+            },
+            "type": {
+              "const": "stopped",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "report"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`resolve_approval`: this answer settled the approval.",
+          "properties": {
+            "approval_id": {
+              "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/$defs/ApprovalOutcome"
+            },
+            "type": {
+              "const": "approval_resolved",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "approval_id",
+            "outcome"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sessions": {
+              "items": {
+                "$ref": "#/$defs/SessionSummary"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "sessions",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "sessions"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "messages": {
+              "items": {
+                "$ref": "#/$defs/HistoryMessage"
+              },
+              "type": "array"
+            },
+            "more": {
+              "default": false,
+              "description": "More, older messages exist.",
+              "type": "boolean"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "history",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "messages"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`clear_session` and `run_slash`: the command's reply.",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "reply",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "glance": {
+              "$ref": "#/$defs/Glance"
+            },
+            "type": {
+              "const": "glance",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "glance"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "state": {
+              "$ref": "#/$defs/Snapshot"
+            },
+            "type": {
+              "const": "snapshot",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "seq",
+            "state"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DeviceInfo": {
+      "description": "A paired device (owner only: `GET /client/v1/devices`).",
+      "properties": {
+        "created_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ClientKind"
+        },
+        "last_seen_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "revoked": {
+          "default": false,
+          "type": "boolean"
+        },
+        "risk_ceiling": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Risk"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scopes": {
+          "items": {
+            "$ref": "#/$defs/Scope"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "device_id",
+        "name",
+        "kind",
+        "scopes",
+        "created_at_ms"
+      ],
+      "type": "object"
+    },
+    "Enrollment": {
+      "description": "Where a pairing stands (`GET /client/v1/enrollments/{offer_id}`, and\nthe owner's `GET /client/v1/pairing/offers/{offer_id}`).",
+      "properties": {
+        "device_id": {
+          "description": "Once approved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "device_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "device_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "offer_id": {
+          "type": "string"
+        },
+        "scopes": {
+          "items": {
+            "$ref": "#/$defs/Scope"
+          },
+          "type": "array"
+        },
+        "state": {
+          "$ref": "#/$defs/EnrollmentState"
+        }
+      },
+      "required": [
+        "offer_id",
+        "state",
+        "fingerprint"
+      ],
+      "type": "object"
+    },
+    "EnrollmentState": {
+      "oneOf": [
+        {
+          "enum": [
+            "approved",
+            "denied",
+            "expired"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "open",
+          "description": "Not redeemed yet.",
+          "type": "string"
+        },
+        {
+          "const": "pending",
+          "description": "Redeemed; waiting for the owner.",
+          "type": "string"
+        }
+      ]
+    },
+    "ErrorCode": {
+      "description": "The closed set of error codes.",
+      "oneOf": [
+        {
+          "enum": [
+            "unauthorized",
+            "version_unsupported",
+            "not_found",
+            "rate_limited",
+            "invalid",
+            "internal"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "forbidden",
+          "description": "Authenticated, but not allowed: an approval above this device's risk\nceiling, a post into another chat's session.",
+          "type": "string"
+        },
+        {
+          "const": "conflict",
+          "description": "The state moved on: an approval already resolved (the message names\nthe winning outcome).",
+          "type": "string"
+        }
+      ]
+    },
+    "Event": {
+      "description": "Something that happened. Durable unless noted.",
+      "oneOf": [
+        {
+          "properties": {
+            "session": {
+              "$ref": "#/$defs/SessionSummary"
+            },
+            "type": {
+              "const": "session_created",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "session": {
+              "$ref": "#/$defs/SessionSummary"
+            },
+            "type": {
+              "const": "session_updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The owner (or someone in a shared chat) said something.",
+          "properties": {
+            "attachments": {
+              "items": {
+                "$ref": "#/$defs/AttachmentRef"
+              },
+              "type": "array"
+            },
+            "origin": {
+              "description": "Where it was said: `app`, `telegram`, `slack`...",
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "user_message",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "text",
+            "origin"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A message from the daemon outside a turn's reply: a queued-message\nnotice, an answer about running work, a background job's report.",
+          "properties": {
+            "session_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "assistant_message",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "origin": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "turn_started",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "turn_id",
+            "session_id",
+            "origin"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Ephemeral: a chunk of the reply as it streams (capability `deltas`).",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "turn_delta",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "turn_id",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Ephemeral: what the turn is doing.",
+          "properties": {
+            "status": {
+              "$ref": "#/$defs/TurnStatus"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "turn_status",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "turn_id",
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The turn waits for the owner to do something outside the chat\n(finish an OAuth sign-in in a browser).",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "user_action_required",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "turn_id",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "attachments": {
+              "items": {
+                "$ref": "#/$defs/AttachmentRef"
+              },
+              "type": "array"
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "$ref": "#/$defs/TurnState"
+            },
+            "text": {
+              "description": "The final reply, as Markdown; empty when there was none.",
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "turn_completed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "turn_id",
+            "text",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "approval": {
+              "$ref": "#/$defs/Approval"
+            },
+            "type": {
+              "const": "approval_requested",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "approval"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "approval_id": {
+              "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/$defs/ApprovalOutcome"
+            },
+            "resolved_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ResolvedBy"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Who answered; `None` when nobody did (expired, withdrawn)."
+            },
+            "type": {
+              "const": "approval_resolved",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "approval_id",
+            "outcome"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "task": {
+              "$ref": "#/$defs/TaskSummary"
+            },
+            "type": {
+              "const": "task_updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "task"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Only with capability `goals`.",
+          "properties": {
+            "goal": {
+              "$ref": "#/$defs/GoalSummary"
+            },
+            "type": {
+              "const": "goal_updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "goal"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "EventsPage": {
+      "description": "`GET /client/v1/events` answers with this: the event frames after\n`since` (or a snapshot frame first, when `since` is out of the retention\nwindow), and the `since` to ask with next.",
+      "properties": {
+        "frames": {
+          "items": {
+            "$ref": "#/$defs/ServerFrame"
+          },
+          "type": "array"
+        },
+        "next_since": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "frames",
+        "next_since"
+      ],
+      "type": "object"
+    },
+    "Glance": {
+      "description": "A watch's one-call view.",
+      "properties": {
+        "last_reply": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LastReply"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pending_approvals": {
+          "items": {
+            "$ref": "#/$defs/Approval"
+          },
+          "type": "array"
+        },
+        "running_tasks": {
+          "items": {
+            "$ref": "#/$defs/TaskSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "running_tasks",
+        "pending_approvals"
+      ],
+      "type": "object"
+    },
+    "GoalSummary": {
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "description",
+        "status"
+      ],
+      "type": "object"
+    },
+    "HistoryMessage": {
+      "description": "One message of a session's transcript.",
+      "properties": {
+        "at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "role": {
+          "description": "`user` or `assistant`.",
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "role",
+        "text",
+        "at_ms"
+      ],
+      "type": "object"
+    },
+    "Impact": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "deletes",
+              "type": "string"
+            },
+            "targets": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "sends",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "spends",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "writes_outside_work_area",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "LastReply": {
+      "properties": {
+        "at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "turn_id",
+        "text",
+        "at_ms"
+      ],
+      "type": "object"
+    },
+    "OfferRequest": {
+      "description": "The owner's offer to pair a device (owner only:\n`POST /client/v1/pairing/offers`).",
+      "properties": {
+        "confirm_in_session": {
+          "description": "The chat where the owner confirms the device; `None` to confirm\nwith `POST /client/v1/pairing/offers/{id}/decision`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "OwnerInfo": {
+      "description": "The daemon's owner, as the gateway knows them.",
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PairingDecision": {
+      "description": "The owner's answer to a pending pairing made without a chat.",
+      "properties": {
+        "approve": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "approve"
+      ],
+      "type": "object"
+    },
+    "PairingOffer": {
+      "description": "A single-use pairing offer.",
+      "properties": {
+        "code": {
+          "description": "What the owner types on the device (\"K7Q2-9FZD\").",
+          "type": "string"
+        },
+        "expires_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fingerprint": {
+          "description": "Identifies this daemon; the device checks the redeem reply matches.",
+          "type": "string"
+        },
+        "link": {
+          "description": "The same as a link, for a QR code:\n`aidaemon-pair:?gateway=<url>&offer=<id>&code=<code>&fp=<fingerprint>`.",
+          "type": "string"
+        },
+        "offer_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "offer_id",
+        "code",
+        "expires_at_ms",
+        "link",
+        "fingerprint"
+      ],
+      "type": "object"
+    },
+    "ProtocolError": {
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "description": "Whether the same request may succeed later.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    },
+    "ProtocolVersion": {
+      "description": "A protocol version. Same major: compatible.",
+      "properties": {
+        "major": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minor": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ],
+      "type": "object"
+    },
+    "RedeemRequest": {
+      "description": "`POST /client/v1/enrollments/redeem`.",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "device_kind": {
+          "$ref": "#/$defs/ClientKind"
+        },
+        "device_name": {
+          "description": "The device as the owner will see it (\"Pixel 9\").",
+          "type": "string"
+        },
+        "offer_id": {
+          "type": "string"
+        },
+        "public_key": {
+          "description": "The device's P-256 public key, SEC1 uncompressed, base64url.",
+          "type": "string"
+        },
+        "scopes": {
+          "description": "The scopes asked for; empty: all of them.",
+          "items": {
+            "$ref": "#/$defs/Scope"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "offer_id",
+        "code",
+        "device_name",
+        "device_kind",
+        "public_key"
+      ],
+      "type": "object"
+    },
+    "ResolvedBy": {
+      "description": "Who answered an approval.",
+      "properties": {
+        "channel": {
+          "description": "`app` for a client of this protocol, else the chat (`telegram`...).",
+          "type": "string"
+        },
+        "device": {
+          "description": "The client's device, when `channel` is `app`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "channel"
+      ],
+      "type": "object"
+    },
+    "Risk": {
+      "description": "How much is at stake, from the daemon's typed rating. Ordered.",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "type": "string"
+    },
+    "Scope": {
+      "description": "What a device's token may do.",
+      "oneOf": [
+        {
+          "const": "observe",
+          "description": "Read sessions, history, events, tasks and approvals.",
+          "type": "string"
+        },
+        {
+          "const": "chat",
+          "description": "Send messages, stop and cancel work, run commands.",
+          "type": "string"
+        },
+        {
+          "const": "approve",
+          "description": "Answer approvals (within the device's risk ceiling).",
+          "type": "string"
+        }
+      ]
+    },
+    "ServerFrame": {
+      "description": "A frame from the daemon to a client.",
+      "oneOf": [
+        {
+          "description": "The answer to `hello`.",
+          "properties": {
+            "latest_seq": {
+              "description": "The newest `seq` in the log when the socket opened.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "owner": {
+              "$ref": "#/$defs/OwnerInfo"
+            },
+            "server_capabilities": {
+              "items": {
+                "$ref": "#/$defs/Capability"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "welcome",
+              "type": "string"
+            },
+            "version": {
+              "$ref": "#/$defs/ProtocolVersion"
+            }
+          },
+          "required": [
+            "type",
+            "version",
+            "owner",
+            "latest_seq"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Everything a client needs when it cannot resume: drop the cache and\nstart from this state. Events after `seq` follow.",
+          "properties": {
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "state": {
+              "$ref": "#/$defs/Snapshot"
+            },
+            "type": {
+              "const": "snapshot",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "seq",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "at_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "event": {
+              "$ref": "#/$defs/Event"
+            },
+            "seq": {
+              "description": "Per owner, gap-free; `None` for an ephemeral event.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "event",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "at_ms",
+            "event"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "request_id": {
+              "type": "string"
+            },
+            "result": {
+              "$ref": "#/$defs/CommandResult"
+            },
+            "type": {
+              "const": "ack",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "error": {
+              "$ref": "#/$defs/ProtocolError"
+            },
+            "request_id": {
+              "description": "`None` for an error that answers no command (a bad frame).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "error",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "error"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "pong",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SessionRequest": {
+      "description": "`POST /client/v1/sessions`.",
+      "properties": {
+        "challenge_id": {
+          "type": "string"
+        },
+        "signature": {
+          "description": "The signature as `r || s` (64 bytes), base64url.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "challenge_id",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "SessionSummary": {
+      "properties": {
+        "channel": {
+          "description": "The chat it belongs to: `app`, `telegram`...",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "last_activity_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "writable": {
+          "default": false,
+          "description": "Whether clients may post into it. Sessions of other chats are\nread-mostly in v1: watch, stop and answer approvals there, but post\nfrom that chat.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "channel"
+      ],
+      "type": "object"
+    },
+    "Snapshot": {
+      "description": "What a client needs when it cannot resume.",
+      "properties": {
+        "pending_approvals": {
+          "items": {
+            "$ref": "#/$defs/Approval"
+          },
+          "type": "array"
+        },
+        "running_tasks": {
+          "items": {
+            "$ref": "#/$defs/TaskSummary"
+          },
+          "type": "array"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "sessions",
+        "running_tasks",
+        "pending_approvals"
+      ],
+      "type": "object"
+    },
+    "StepState": {
+      "enum": [
+        "started",
+        "completed",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "TaskState": {
+      "enum": [
+        "running",
+        "cancelling",
+        "completed",
+        "failed",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "TaskSummary": {
+      "description": "One entry of a session's running-work list: a turn, a helper (sub-agent)\nor a background command.",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "finished_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Stable across the daemon's life; `cancel_task` takes it.",
+          "type": "string"
+        },
+        "number": {
+          "description": "The short number `/cancel <n>` takes in the chat.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "started_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/TaskState"
+        }
+      },
+      "required": [
+        "id",
+        "session_id",
+        "number",
+        "description",
+        "state",
+        "started_at_ms"
+      ],
+      "type": "object"
+    },
+    "TurnState": {
+      "description": "How a turn ended.",
+      "oneOf": [
+        {
+          "enum": [
+            "failed",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "completed",
+          "description": "The reply was delivered.",
+          "type": "string"
+        },
+        {
+          "const": "empty",
+          "description": "The agent had nothing to say.",
+          "type": "string"
+        },
+        {
+          "const": "handed_off",
+          "description": "The work goes on in the background; its report comes later.",
+          "type": "string"
+        }
+      ]
+    },
+    "TurnStatus": {
+      "description": "What a running turn is doing.",
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "thinking",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "tool_started",
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "chunk": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "tool_progress",
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name",
+            "chunk"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "tool_completed",
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "description": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "plan_step",
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/StepState"
+            },
+            "step": {
+              "description": "0-based.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step",
+            "total",
+            "description",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A rendered checklist of the turn's plan, as Markdown.",
+          "properties": {
+            "kind": {
+              "const": "checklist",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Anything else worth a line (\"helper started: …\").",
+          "properties": {
+            "kind": {
+              "const": "note",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$id": "https://aidaemon.ai/schemas/client-protocol/v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/ClientFrame"
+    },
+    {
+      "$ref": "#/$defs/ServerFrame"
+    }
+  ],
+  "title": "AIdaemon Client Protocol v1"
+}

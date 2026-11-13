@@ -1,0 +1,27 @@
+[package]
+name = "aidaemon-client-protocol"
+description = "Wire types of the AIdaemon Client Protocol v1 (/client/v1): the frames a TUI, web, desktop, mobile or watch client exchanges with the daemon's Client Gateway, with a generated JSON Schema"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-client-protocol"
+readme = "README.md"
+keywords = ["agent", "protocol", "websocket", "json-schema", "llm"]
+categories = ["network-programming", "encoding"]
+# Integration tests (golden fixtures, the schema staleness check) read files
+# outside the crate; they stay in the repository.
+exclude = ["tests/", "benches/"]
+publish = false
+
+[[bin]]
+name = "export-client-schema"
+path = "src/bin/export-client-schema.rs"
+
+[dependencies]
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

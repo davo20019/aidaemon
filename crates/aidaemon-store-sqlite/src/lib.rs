@@ -15,6 +15,10 @@
 //! restart (it is the crate that depends on `aidaemon-channels`, not the
 //! other way round, so channels stay free of SQL).
 //!
+//! With the `client-events` feature, [`SqliteClientEventLog`] is the Client
+//! Gateway's durable event log (resume by `seq`) and its remembered command
+//! replies, in the same database.
+//!
 //! [`maintenance`] keeps a long-lived database healthy: planner statistics
 //! ([`maintenance::optimize`]) and consistent live copies
 //! ([`maintenance::snapshot`]). Write transactions on a shared database
@@ -37,11 +41,15 @@
 
 #[cfg(feature = "channels")]
 mod approvals;
+#[cfg(feature = "client-events")]
+mod client_events;
 pub mod maintenance;
 mod migrations;
 
 #[cfg(feature = "channels")]
 pub use approvals::SqliteApprovalStore;
+#[cfg(feature = "client-events")]
+pub use client_events::{ClientEventRow, DeviceRow, PairingRow, SqliteClientEventLog};
 
 use std::path::Path;
 use std::str::FromStr;
