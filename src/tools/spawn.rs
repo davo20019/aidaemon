@@ -167,10 +167,13 @@ mod tests {
             8_000,
             false,
         );
+        // The outcome leads and the report follows; what only the report
+        // vouches for is said after it (live 2026-11-13: "Its report is the
+        // only record of 2 steps" was the result's first line).
         assert!(
             unconfirmed.starts_with(
-                "\u{2705} Finished in the background: Site install\n\
-                 Its report is the only record of one step: Capture the screenshot.\n\nDone."
+                "\u{2705} Finished in the background: Site install\n\nDone.\n\n\
+                 Only the report above confirms this step: Capture the screenshot."
             ),
             "{unconfirmed}"
         );
@@ -189,18 +192,25 @@ mod tests {
                 assert!(!message.contains(header), "{header:?} in {message:?}");
             }
             assert!(!message.contains("Slow count"), "{message}");
-            // A failed run's line is why it failed, from its record; any
-            // other's is what its report alone records.
-            let lead = match phase {
-                RunPhase::Failed => run.reason().expect("a failed run has its reason"),
-                _ => {
-                    "Its report is the only record of one step: Capture the screenshot.".to_string()
+            // A failed run leads with why it failed, from its record; any
+            // other's leads with its report, and what that report alone
+            // records follows it.
+            match phase {
+                RunPhase::Failed => {
+                    let reason = run.reason().expect("a failed run has its reason");
+                    assert!(
+                        message.starts_with(&format!("{reason}\n\nCounted to 30.")),
+                        "{message}"
+                    );
                 }
-            };
-            assert!(
-                message.starts_with(&format!("{lead}\n\nCounted to 30.")),
-                "{message}"
-            );
+                _ => assert!(
+                    message.starts_with(
+                        "Counted to 30.\n\nOnly the report above confirms this step: \
+                         Capture the screenshot."
+                    ),
+                    "{message}"
+                ),
+            }
             assert!(message.contains("Took 1m"), "{message}");
         }
     }

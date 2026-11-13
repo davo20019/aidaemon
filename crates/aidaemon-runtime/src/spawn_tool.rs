@@ -263,12 +263,14 @@ pub fn bounded_child_response(
     (shown, Some(info))
 }
 
-/// A background helper's result for the chat, rendered from its run record
-/// alone: the one evidence line names the typed action steps nothing
-/// verified, and the footer is the time the runtime measured. The helper's
-/// report is the body, never what decides the rest. How it ended is said
-/// once: when its card shows it (`on_card`), the result has no header of
-/// its own; else the header is its phase.
+/// A background helper's result for the chat, composed from its typed run
+/// record around the helper's report: the outcome line (its phase, and why
+/// it did not succeed), the report as the body, then what the record says
+/// of the work the report alone vouches for, what reached the owner, and
+/// the time the runtime measured. The helper's report is only the body:
+/// its words never decide the outcome, the deliveries or the time, and the
+/// text is never filtered. How it ended is said once: when its card shows
+/// it (`on_card`), the result has no header of its own.
 pub fn render_run_result(
     state: &crate::run_state::RunState,
     name: &str,
@@ -293,17 +295,28 @@ pub fn render_run_result(
     } else {
         format!("{}: {name}", state.phase.headline())
     };
-    if let Some(line) = state.line() {
+    if let Some(reason) = state.reason() {
         if !lead.is_empty() {
             lead.push('\n');
         }
-        lead.push_str(&line);
+        lead.push_str(&reason);
     }
     if !lead.is_empty() {
         parts.push(lead);
     }
-    if !body.trim().is_empty() {
+    let has_body = !body.trim().is_empty();
+    if has_body {
         parts.push(body.trim_end().to_string());
+    }
+    if state.reason().is_none() {
+        if let Some(evidence) = state.evidence.after_report(has_body) {
+            parts.push(evidence);
+        }
+    }
+    if let Some(delivered) =
+        crate::coordination::owner_delivery_lines(state.evidence.delivered.as_deref())
+    {
+        parts.push(delivered);
     }
     if let Some(footer) = background_timing(state) {
         parts.push(footer);

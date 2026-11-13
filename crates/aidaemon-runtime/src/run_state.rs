@@ -240,6 +240,26 @@ impl RunFailure {
 }
 
 impl RunEvidence {
+    /// The same steps, said after the report they rely on: the result
+    /// reads the report first, then which of its steps nothing but that
+    /// report confirms (`has_report`: there is a report above to point to).
+    pub fn after_report(&self, has_report: bool) -> Option<String> {
+        let source = if has_report {
+            "the report above"
+        } else {
+            "its report"
+        };
+        match self.unconfirmed.as_slice() {
+            [] => None,
+            [one] => Some(format!("Only {source} confirms this step: {one}.")),
+            many => Some(format!(
+                "Only {source} confirms these {} steps: {}.",
+                many.len(),
+                many.join("; ")
+            )),
+        }
+    }
+
     /// The typed steps left unconfirmed, in one plain line. They belong to
     /// a run that finished (its own verdict was done and nothing
     /// contradicts it), so the line says only what is true of them, in
@@ -1027,6 +1047,70 @@ mod tests {
             .expect("a card");
             assert!(card.contains(&reason), "{card}");
         }
+    }
+
+    /// Live 2026-11-13: the result led with "Its report is the only record
+    /// of 2 steps", and its deliveries were the helper's own claim. It is
+    /// composed from the record: outcome, the report, what only the report
+    /// vouches for, what the record says reached the owner, the measured
+    /// time last.
+    #[test]
+    fn a_result_is_composed_from_the_record_around_the_report() {
+        use crate::coordination::{RunDelivery, RunDeliveryOutcome};
+        let runs = RunStates::default();
+        runs.begin("run-1", "chat", "Install Drupal", None);
+        let page = aidaemon_tools::semantics::DeliverableKind::Screenshot {
+            page: "synthetic-drupal.ddev.site".to_string(),
+        };
+        let ended = runs
+            .finish(
+                "run-1",
+                RunEnd::Succeeded,
+                RunMeasure {
+                    ended_at: Utc::now(),
+                    work_began: Some(Utc::now() - chrono::Duration::seconds(196)),
+                    waited: Duration::ZERO,
+                },
+                RunEvidence {
+                    unconfirmed: vec!["Install Drupal".to_string(), "Enable a theme".to_string()],
+                    delivered: Some(vec![
+                        RunDelivery {
+                            kind: page.clone(),
+                            caption: "Drupal homepage".to_string(),
+                            outcome: RunDeliveryOutcome::Sent { at: Utc::now() },
+                        },
+                        RunDelivery {
+                            kind: page,
+                            caption: "Drupal homepage, styled".to_string(),
+                            outcome: RunDeliveryOutcome::Failed {
+                                reason: "no channel found for session".to_string(),
+                            },
+                        },
+                    ]),
+                },
+                report(),
+            )
+            .expect("it ends");
+        let result =
+            crate::spawn_tool::render_run_result(&ended, "Install Drupal", "Done.", 100, false);
+        let at = |needle: &str| {
+            result
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing from {result}"))
+        };
+        let outcome = at(ended.phase.headline());
+        let body = at("Done.");
+        let evidence =
+            at("Only the report above confirms these 2 steps: Install Drupal; Enable a theme.");
+        let sent = at("Sent you: Drupal homepage (at ");
+        let failed = at("Couldn't send you ");
+        assert!(
+            outcome < body && body < evidence && evidence < sent && sent < failed,
+            "{result}"
+        );
+        let measured = at(crate::turn::sliding_window::MEASURED_TIMING_MARK);
+        assert!(failed < measured, "{result}");
+        assert!(!result.starts_with("Its report"), "{result}");
     }
 
     /// The exit status of a program the runtime watched is how it ended:

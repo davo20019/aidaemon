@@ -606,6 +606,32 @@ impl RunDelivery {
     }
 }
 
+/// What a run's record says reached the owner, for the owner's own result
+/// message: one line per delivery, from the record alone (never from the
+/// helper's report). `None` when it declared nothing or no ledger recorded
+/// it.
+pub fn owner_delivery_lines(delivered: Option<&[RunDelivery]>) -> Option<String> {
+    let delivered = delivered.filter(|delivered| !delivered.is_empty())?;
+    let lines: Vec<String> = delivered
+        .iter()
+        .map(|delivery| match &delivery.outcome {
+            RunDeliveryOutcome::Sent { at } => format!(
+                "Sent you: {} (at {})",
+                delivery.caption.trim(),
+                at.with_timezone(&chrono::Local).format("%-I:%M:%S %p")
+            ),
+            RunDeliveryOutcome::AlreadySent { by } => format!(
+                "Not sent again: {by} had already sent you {}.",
+                delivery.kind.words()
+            ),
+            RunDeliveryOutcome::Failed { reason } => {
+                format!("Couldn't send you {}: {reason}.", delivery.kind.words())
+            }
+        })
+        .collect();
+    Some(lines.join("\n"))
+}
+
 /// The lines a run's deliveries give its result: each one, or that nothing
 /// was sent. `None` when no ledger recorded them.
 pub fn delivery_lines(delivered: Option<&[RunDelivery]>) -> Option<String> {
