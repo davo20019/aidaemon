@@ -624,6 +624,7 @@ dependencies = [
  "aidaemon-memory",
  "aidaemon-policies",
  "aidaemon-providers",
+ "aidaemon-secrets",
  "aidaemon-store-sqlite",
  "aidaemon-tools",
  "aidaemon-work",

@@ -20,6 +20,7 @@
 //! | [`channels`] | `channels` | The `Channel` contract and the runner that connects channels to agents |
 //! | [`channels::telegram`], [`channels::slack`], [`channels::discord`] | `telegram`, `slack`, `discord` | Built-in channel adapters |
 //! | `channels::conformance` | `conformance` | The channel conformance kit, for your own adapter's tests |
+//! | [`secrets`] | `secrets` | Where an agent keeps its secrets: the `SecretStore` trait, the OS keychain, an env file, an in-memory store |
 //! | [`testing`] | `testing` | Scripted provider for tests (and Tokio's `test-util`, for paused time); the shared behavior suite (`testing::behavior`) |
 //! | [`tool`] | `macros` (default) | `#[tool]`: a tool from a plain function, schema derived |
 //! | [`mod@preset`] | `providers` + `policies` (default) | A short start: provider, safeguards, store and default tools in a few lines |
@@ -183,6 +184,9 @@ pub use aidaemon_events as events;
 
 #[cfg(feature = "work")]
 pub use aidaemon_work as work;
+
+#[cfg(feature = "secrets")]
+pub use aidaemon_secrets as secrets;
 
 /// Chat channels: the contract, the runner, and the built-in adapters.
 #[cfg(feature = "channels")]
