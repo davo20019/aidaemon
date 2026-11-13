@@ -156,7 +156,7 @@ pub fn validate_url_for_ssrf(url: &str) -> Result<(), String> {
 /// Refuses at connection time any name that resolves to a blocked address.
 /// The check before a request and the connection look a name up separately,
 /// so a name could answer with a public address first and a private one next.
-struct PublicOnlyResolver;
+pub(crate) struct PublicOnlyResolver;
 
 impl reqwest::dns::Resolve for PublicOnlyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
