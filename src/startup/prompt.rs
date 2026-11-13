@@ -227,14 +227,9 @@ pub(crate) fn build_base_system_prompt(
     };
 
     let cli_agent_guidance = if config.cli_agents.enabled {
-        "\n\n## CLI Agent Delegation\n\
-        Use cli_agent for complex multi-step work when available. Always set working_dir.\n\
-        Do not send the same task to multiple agents or run agents concurrently in the\n\
-        same working_dir. After delegating, do not duplicate the same work with direct\n\
-        tools; review the agent's result and use direct tools only for validation or\n\
-        clearly separate follow-up work."
+        crate::tools::cli_agent::CLI_SANDBOX.delegation_section()
     } else {
-        ""
+        String::new()
     };
 
     let direct_mode_doc = if config.cli_agents.enabled {

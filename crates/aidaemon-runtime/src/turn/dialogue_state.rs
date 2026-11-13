@@ -241,6 +241,48 @@ pub fn owner_request_for_verifier(
     })
 }
 
+/// The request a continuation turn's calls are judged against: the
+/// owner's own unfinished requests in this conversation, oldest first. The
+/// continuation's text is the runtime's report of background work that
+/// ended, so it is never presented as something the owner said. `None` when
+/// nothing is owed.
+pub fn owner_requests_for_continuation(
+    state: &DialogueState,
+    now: chrono::DateTime<Utc>,
+) -> Option<String> {
+    let mut owed: Vec<&OpenRequest> = state
+        .open_request
+        .iter()
+        .chain(state.unfinished_requests.iter())
+        .filter(|request| {
+            request_is_owed(request)
+                && !request.text.trim().is_empty()
+                && !open_request_anchor_expired(request, now)
+        })
+        .collect();
+    owed.sort_by_key(|request| request.opened_at);
+    let mut listed: Vec<&str> = Vec::new();
+    for request in &owed {
+        let text = request.text.trim();
+        if !listed.contains(&text) {
+            listed.push(text);
+        }
+    }
+    if listed.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The owner's unfinished requests in this conversation, oldest first:\n{}\n\n\
+         This run continues them with the result of background work that ended; that result \
+         is not something the owner said.",
+        listed
+            .iter()
+            .map(|text| format!("- {}", serde_json::Value::from(*text)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ))
+}
+
 /// The owner's owed requests as continuation candidates for the relationship
 /// assessor, oldest first, each under its own stable message id. Continuations
 /// of unfinished work are otherwise invisible once the transcript window moves
@@ -1967,6 +2009,27 @@ mod owner_lineage_tests {
             .expect("unfinished request is the verifier's origin");
         assert!(origin.contains(EARLIER), "{origin}");
         assert!(origin.contains("Try again"), "{origin}");
+    }
+
+    /// Live 2026-11-13: a CLI agent's completion re-entered the chat as
+    /// "Delegated step: … Drupal …", and the verifier read it as the owner
+    /// narrowing "Drupal and WordPress" to Drupal. A continuation is judged
+    /// against the owner's own request alone.
+    #[test]
+    fn a_continuation_is_judged_against_the_owners_request_not_its_report() {
+        let both = "Have two helpers install Drupal and WordPress with ddev.";
+        let report = "[Background command completed]\nDelegated step: Install Drupal";
+        let state = state_with(
+            request(OpenRequestStatus::PartiallyAnswered, both),
+            "msg-2",
+            report,
+            UserTurnKind::Followup,
+        );
+        let origin = owner_requests_for_continuation(&state, Utc::now())
+            .expect("the owner's request is the continuation's origin");
+        assert!(origin.contains(both), "{origin}");
+        assert!(!origin.contains("Delegated step"), "{origin}");
+        assert!(!origin.contains("follow-up"), "{origin}");
     }
 
     #[test]

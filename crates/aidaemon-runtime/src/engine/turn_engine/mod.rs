@@ -158,6 +158,10 @@ pub struct SdkTurnSetup {
     /// an automatic re-run (`deferred_retry`). False for a continuation of
     /// another task, which that task's own recovery owns.
     pub defer_on_provider_failure: bool,
+    /// The turn re-enters the conversation with runtime-produced evidence
+    /// (a background command's or helper's result), not with words of the
+    /// owner's.
+    pub internal_continuation: bool,
 }
 
 /// What a turn's terminal canonicalizer reads (see [`terminal_canonicalizer`]).
@@ -493,6 +497,7 @@ impl TurnEngine<'_> {
             projected_source_message_ids,
             projected_source_turn_ids,
             defer_on_provider_failure,
+            internal_continuation,
         } = setup;
         let user_text = user_text.as_str();
         let model = engine.model_override.clone().unwrap_or(model);
@@ -1059,11 +1064,24 @@ impl TurnEngine<'_> {
             let dialogue =
                 crate::turn::dialogue_state::get_or_rebuild_dialogue_state(self.host, session_id)
                     .await;
-            crate::turn::dialogue_state::owner_request_for_verifier(
-                &dialogue,
-                user_text,
-                chrono::Utc::now(),
-            )
+            if internal_continuation {
+                // A continuation's text is the runtime's report of work that
+                // ended, never the owner's follow-up: the request is the
+                // owner's own unfinished one (live 2026-11-13: a CLI agent's
+                // "Delegated step: … Drupal …" read as the owner narrowing
+                // "Drupal and WordPress" to Drupal, and the WordPress install
+                // was refused as out of scope).
+                crate::turn::dialogue_state::owner_requests_for_continuation(
+                    &dialogue,
+                    chrono::Utc::now(),
+                )
+            } else {
+                crate::turn::dialogue_state::owner_request_for_verifier(
+                    &dialogue,
+                    user_text,
+                    chrono::Utc::now(),
+                )
+            }
         } else {
             None
         };

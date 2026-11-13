@@ -1331,7 +1331,9 @@ impl Tool for SpawnAgentTool {
          benefits from a fresh context window, or should keep running while you do other work (background=true: its result goes to the user's chat, not back to you, so never use it for work you need to combine). To run several sub-agents at the same time, give them all in one call as `tasks` (up to 6, 3 running at once); you receive every result, each with when it ran. Do NOT delegate \
          trivial one-shot reads (a single read_file, a single web_search) — handle those directly. \
          The sub-agent starts with a fresh context and the same tools unless its specialist narrows them (a named specialist delegates further only when its `tools` include spawn_agent), so reference files by path and \
-         do not paste prior tool output."
+         do not paste prior tool output. A sub-agent works with your own access on this computer: it can run \
+         the programs installed here and the services they start (containers, local dev sites), which a \
+         `cli_agent` run's sandbox cannot."
     }
 
     fn schema(&self) -> Value {
@@ -2225,11 +2227,26 @@ pub async fn settle_background_steps(
     };
     let Some(surface) = run_card(hub.as_ref(), runs, job_id, chat_session).await else {
         // Its turn kept no card it can be told by: the plan's card shows
-        // the plan and this run.
+        // the plan and this run, when that card is still the chat's card
+        // from before the run began. A card some later turn kept belongs to
+        // that turn and its own runs: drawing this run over it would hide
+        // them (live 2026-11-13: a shell loop's card was overwritten with
+        // "codex coding agent … Done 9m 40s" and stayed wrong). Its result
+        // then says how it ended itself.
         let this: Vec<_> = runs.get(job_id).into_iter().collect();
+        let began_on = match this.first().map(|run| &run.card) {
+            Some(crate::run_state::RunCard::Pending { before }) => before.clone(),
+            _ => None,
+        };
         runs.forget(job_id);
+        let current = hub.checklist_surface(chat_session).await;
+        let still_its_card = current.is_some()
+            && current == began_on
+            && current
+                .as_deref()
+                .is_some_and(|card| runs.on_card(chat_session, card).is_empty());
         return match kept_card(settled.as_ref(), &this) {
-            Some(card) if settled.is_some() => {
+            Some(card) if settled.is_some() && still_its_card => {
                 update_checklist_card(hub.as_ref(), chat_session, &card).await
             }
             _ => false,

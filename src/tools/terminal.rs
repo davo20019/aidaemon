@@ -5733,6 +5733,16 @@ impl TerminalTool {
                                 return;
                             }
 
+                            // The run ends now, the moment its process did:
+                            // its card settles to its final header at once,
+                            // before any result is worked out or delivered.
+                            // A continuation turn waits for its slot behind
+                            // other continuations and runs a whole turn, so an
+                            // end recorded after it left the card on the last
+                            // output line for minutes (live 2026-11-13: "last
+                            // output: 8" after the loop had ended).
+                            let ended = conclude(phase).await;
+
                             let stdout =
                                 String::from_utf8_lossy(&stdout_buf.lock().await).to_string();
                             let stderr =
@@ -5821,7 +5831,6 @@ impl TerminalTool {
                                         session_id = %session_for_notify,
                                         "Attributed a produced-output file; delivering it directly (no re-engagement)"
                                     );
-                                    conclude(phase).await;
                                     deliver_attributed_background_file(
                                         &backend_for_notify,
                                         path,
@@ -5840,7 +5849,6 @@ impl TerminalTool {
                                 }
                             }
                             if let Some(note) = deliverable_note {
-                                let ended = conclude(phase).await;
                                 deliver_background_text(
                                     hub_for_notify.as_ref(),
                                     state_for_notify.as_ref(),
@@ -5861,7 +5869,6 @@ impl TerminalTool {
                                     output_trimmed.is_empty() || output_trimmed == "(no output)";
                                 if is_trivial && agent_for_notify.is_none() {
                                     info!(pid, "No agent for empty background output");
-                                    conclude(phase).await;
                                 } else if !is_trivial
                                     && is_short_complete_output(output_trimmed)
                                     && owner_task_id_for_notify.is_none()
@@ -5906,7 +5913,6 @@ impl TerminalTool {
                                             Instant::now(),
                                         )
                                     };
-                                    let ended = conclude(phase).await;
                                     let message = present(&ended, &message);
                                     if delivery_allowed {
                                         deliver_background_text(
@@ -6005,7 +6011,6 @@ impl TerminalTool {
                                                             Instant::now(),
                                                         )
                                                     };
-                                                    let ended = conclude(phase).await;
                                                     let reply = present(&ended, &reply);
                                                     if !delivery_allowed {
                                                         formatted_delivered = true;
@@ -6112,7 +6117,6 @@ impl TerminalTool {
                                                 Instant::now(),
                                             )
                                         };
-                                        let ended = conclude(phase).await;
                                         let fallback = present(&ended, &fallback);
                                         if delivery_allowed {
                                             deliver_background_text(
