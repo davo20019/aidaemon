@@ -186,16 +186,14 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
         risk_score: f32,
         widen: bool,
     ) -> Vec<serde_json::Value>;
-    /// Stop the CLI agents running for the session (a stop command); the
-    /// tool's reply.
-    async fn cancel_cli_agents(
+    /// Run one tool call with the host's tool execution (its watchdog,
+    /// mandate validation and workspace scoping).
+    async fn execute_tool_with_watchdog_outcome(
         &self,
-        session_id: &str,
-        task_id: &str,
-        status_tx: Option<tokio::sync::mpsc::Sender<aidaemon_tools::status::StatusUpdate>>,
-        channel_ctx: &aidaemon_channels::context::ChannelContext,
-        user_role: aidaemon_tools::semantics::UserRole,
-    ) -> anyhow::Result<String>;
+        name: &str,
+        arguments: &str,
+        ctx: &crate::engine::tool_exec::ToolExecCtx<'_>,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome>;
     /// Cancel the finite work the session started (background task leads
     /// and executors); what was cancelled.
     async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String>;

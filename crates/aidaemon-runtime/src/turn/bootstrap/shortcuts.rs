@@ -48,8 +48,33 @@ pub async fn maybe_handle_stop_command(
     }
 
     let cancel_result = agent
-        .cancel_cli_agents(session_id, task_id, status_tx, channel_ctx, user_role)
-        .await;
+        .execute_tool_with_watchdog_outcome(
+            "cli_agent",
+            r#"{"action": "cancel_all"}"#,
+            &crate::engine::tool_exec::ToolExecCtx {
+                file_fence: None,
+                mcp_tool: None,
+                owner_approval_by_kernel: false,
+                session_id,
+                task_id: Some(task_id),
+                status_tx,
+                channel_visibility: channel_ctx.visibility,
+                channel_id: channel_ctx.channel_id.as_deref(),
+                project_scope: None,
+                trusted: channel_ctx.trusted,
+                user_role,
+                workspace_grant: channel_ctx.active_workspace_grant(user_role),
+                mandate_authority: None,
+                tool_call_id: None,
+                mutation_forbidden: false,
+                scope_escalation: None,
+                turn_authority: None,
+                trust_roots: None,
+                lone_root_call: false,
+            },
+        )
+        .await
+        .map(|outcome| outcome.output);
     let cli_cancel_msg = cancel_result.ok();
 
     // Also cancel the finite work this session started (background task
