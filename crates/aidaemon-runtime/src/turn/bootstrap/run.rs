@@ -972,14 +972,14 @@ pub async fn run_bootstrap(
     // Model selection: autonomous primary models interpret the request directly.
     // Lexical policy scoring remains available for guided/local-model support,
     // but must not silently swap a capable primary model based on user wording.
-    let (selected_model, routed) = agent
-        .select_turn_model(
-            &llm_runtime_snapshot,
-            llm_router.as_ref(),
-            policy_bundle.policy.model_profile,
-            session_id,
-        )
-        .await;
+    let (selected_model, routed) = crate::llm::turn_calls::select_turn_model(
+        agent,
+        &llm_runtime_snapshot,
+        llm_router.as_ref(),
+        policy_bundle.policy.model_profile,
+        session_id,
+    )
+    .await;
     if routed {
         if agent.turn_runtime().policy_config.policy_shadow_mode {
             info!(
@@ -1186,7 +1186,7 @@ pub async fn run_bootstrap(
                 && relationship_fallback.as_ref().is_none_or(|shape| {
                     shape.request_relationship.as_deref() == Some("new_request")
                 })
-                && !agent.model_override_active(session_id).await =>
+                && !crate::llm::turn_calls::model_override_active(agent, session_id).await =>
         {
             match outcome
                 .acted(crate::llm::decisions::digest_keys::TIER)

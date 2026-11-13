@@ -317,7 +317,8 @@ impl Agent {
         let result = match with_idle_timeout(
             idle_timeout,
             idle_timeout.max(STREAMING_MAX_MODEL_CALL),
-            self.call_llm_with_recovery(
+            crate::agent::llm::call_llm_with_recovery(
+                self,
                 snapshot.provider(),
                 snapshot.router(),
                 &request.model,

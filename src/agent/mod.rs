@@ -24,13 +24,9 @@ use crate::goal_tokens::GoalTokenRegistry;
 use crate::llm_runtime::side_calls::SideCall;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
-use crate::providers::{ProviderError, ProviderErrorKind, ProviderRecoveryRoute};
-use crate::router::Router;
 use crate::runtime_ports::OutboundRouter;
 use crate::skills;
-use crate::traits::{
-    AgentRole, ChatOptions, Message, StateStore, Tool, ToolCapabilities, ToolRole,
-};
+use crate::traits::{AgentRole, Message, StateStore, Tool, ToolCapabilities, ToolRole};
 use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
 #[cfg(test)]
@@ -258,9 +254,7 @@ pub use policy_metrics::{
 pub(in crate::agent) use policy_metrics::record_failed_task_tokens;
 #[allow(unused_imports)]
 pub use policy_metrics::PolicyAutotuneSnapshot;
-pub(in crate::agent) use policy_metrics::{
-    provider_kind_metric_label, record_llm_payload_invalid_metric, POLICY_METRICS,
-};
+pub(in crate::agent) use policy_metrics::POLICY_METRICS;
 
 // Free-function helpers (status, resume, project-scope cues, untrusted-reference
 // filtering, intent-gate merge). Implementation lives in `agent_helpers.rs`.
@@ -753,20 +747,6 @@ impl Agent {
     pub fn max_iterations(&self) -> usize {
         self.limits.max_iterations
     }
-
-    /// Maximum number of retries for transient LLM errors.
-    const MAX_LLM_RETRIES: u32 = 3;
-    /// Transient-error retries when the request has committed no tool work.
-    const MAX_LLM_RETRIES_UNCOMMITTED: u32 = 5;
-    /// Cap on a single transient-error backoff sleep.
-    const TRANSIENT_RETRY_MAX_DELAY_SECS: u64 = 30;
-    /// Base delay for exponential backoff on transient errors (seconds).
-    const RETRY_BASE_DELAY_SECS: u64 = 2;
-    /// Single retry budget for malformed payloads that are likely deterministic
-    /// (shape/unknown). Parse errors use transient retry + fallback recovery.
-    const MAX_MALFORMED_PAYLOAD_RETRIES: u32 = 1;
-    /// Small delay before malformed-payload retry to smooth transient gateway glitches.
-    const MALFORMED_PAYLOAD_RETRY_DELAY_SECS: u64 = 1;
 
     // ==================== Orchestration Methods ====================
 

@@ -7,6 +7,7 @@ pub mod decide;
 pub mod decisions;
 pub mod gateway;
 pub mod side_calls;
+pub mod turn_calls;
 
 /// A model backend: any SDK provider.
 pub type ModelBackend = Arc<dyn aidaemon_core::Provider>;

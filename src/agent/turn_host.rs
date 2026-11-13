@@ -208,18 +208,23 @@ impl TurnHost for Agent {
         &self.model
     }
 
-    async fn model_override_active(&self, session_id: &str) -> bool {
-        Agent::model_override_active(self, session_id).await
+    fn model_override_lock(&self) -> &tokio::sync::RwLock<bool> {
+        &self.model_override
     }
 
-    async fn select_turn_model(
+    fn fallback_model_lock(&self) -> &tokio::sync::RwLock<String> {
+        &self.fallback_model
+    }
+
+    fn billing_failed_models(
         &self,
-        snapshot: &crate::llm_runtime::LlmRuntimeSnapshot,
-        router: Option<&crate::router::Router>,
-        profile: crate::execution_policy::ModelProfile,
-        session_id: &str,
-    ) -> (String, bool) {
-        Agent::select_turn_model(self, snapshot, router, profile, session_id).await
+    ) -> &std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, std::time::Instant>>>
+    {
+        &self.billing_failed_models
+    }
+
+    async fn stamp_lastgood(&self) {
+        Agent::stamp_lastgood(self).await;
     }
 
     fn message_log(&self) -> std::sync::Arc<dyn MessageStore> {

@@ -56,7 +56,8 @@ impl Agent {
         let response = with_idle_timeout(
             idle,
             idle.max(STREAMING_MAX_MODEL_CALL),
-            self.call_llm_with_recovery(
+            crate::agent::llm::call_llm_with_recovery(
+                self,
                 snapshot.provider(),
                 snapshot.router(),
                 model,

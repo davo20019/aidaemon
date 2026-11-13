@@ -141,16 +141,17 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
     fn side_calls(&self) -> &crate::llm::gateway::SideCallGateway;
     /// The model this agent runs on.
     fn model_lock(&self) -> &tokio::sync::RwLock<String>;
-    /// Whether the owner pinned the model (`/model`), so routing leaves it.
-    async fn model_override_active(&self, session_id: &str) -> bool;
-    /// The model for this turn and whether routing chose it.
-    async fn select_turn_model(
+    /// Set when the owner pinned the model (`/model`), so routing leaves it.
+    fn model_override_lock(&self) -> &tokio::sync::RwLock<bool>;
+    /// The stored fallback model, tried first when a call fails.
+    fn fallback_model_lock(&self) -> &tokio::sync::RwLock<String>;
+    /// Models that recently answered with a billing error, and when; shared
+    /// across the agent tree.
+    fn billing_failed_models(
         &self,
-        snapshot: &crate::llm::LlmRuntimeSnapshot,
-        router: Option<&aidaemon_providers::routing::Router>,
-        profile: crate::policy::execution::ModelProfile,
-        session_id: &str,
-    ) -> (String, bool);
+    ) -> &std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, std::time::Instant>>>;
+    /// Record the configuration as last known good (a model call succeeded).
+    async fn stamp_lastgood(&self);
     /// A shared handle to the message store, for spawned work.
     fn message_log(&self) -> std::sync::Arc<dyn MessageStore>;
     /// A shared handle to what conversation compaction reads and writes.
