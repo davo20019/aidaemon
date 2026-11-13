@@ -576,7 +576,24 @@ impl TaskPlan {
     /// "Report each helper's measured time" step held a card on "Working ·
     /// step 4 of 4" for 14 minutes after both helpers ended). Returns
     /// whether anything changed.
+    ///
+    /// While a job a launch handed a step to has not ended (it is still
+    /// listed on the step), the plan's work is still going and nothing
+    /// settles: that job's own end settles its step
+    /// ([`Self::settle_background_job`]) and then the rest, however the
+    /// card's runs were counted when this settle ran. Live 2026-11-13: the
+    /// first helper's end settled the card while the second, launched for
+    /// the WordPress step, was not yet counted on it; the card read
+    /// "Stopped short · 1 of 3 (not done: nothing was left working on it)",
+    /// then "Continuing", then "Stopped".
     pub fn settle_open_steps(&mut self) -> bool {
+        if self
+            .steps
+            .iter()
+            .any(|step| step.status == StepStatus::Background && !step.background_jobs.is_empty())
+        {
+            return false;
+        }
         let now = Utc::now();
         let mut changed = false;
         for step in &mut self.steps {
@@ -1309,6 +1326,38 @@ mod tests {
             plan.render_compact_checklist()
                 .contains("nothing was left working on it")
         );
+    }
+
+    /// Live 2026-11-13: two helpers launched, one per site. The first one's
+    /// end settled the card before the second was counted on it, and its
+    /// step read "nothing was left working on it" while it ran. A step a
+    /// launch took on waits for that launch's own end.
+    #[test]
+    fn a_step_a_launch_took_on_is_never_left_open() {
+        let mut plan = TaskPlan::new(
+            "session_123",
+            "test",
+            "Two screenshots",
+            vec![
+                "Drupal homepage screenshot".into(),
+                "WordPress homepage screenshot".into(),
+                "Report each time".into(),
+            ],
+            "test",
+        );
+        assert!(plan.link_background_job(&[0], "job-drupal"));
+        assert!(plan.link_background_job(&[1], "job-wordpress"));
+        assert!(plan.settle_background_job("job-drupal", JobEnd::Succeeded));
+        assert!(!plan.settle_open_steps());
+        assert_eq!(plan.steps[1].status, StepStatus::Background);
+        assert_eq!(plan.steps[2].not_done, None);
+        assert_eq!(plan.steps[1].not_done, None);
+        assert!(!plan.is_finished());
+        let card = plan.render_compact_checklist();
+        assert!(!card.contains("Stopped short"), "{card}");
+        assert!(!card.contains("nothing was left working on it"), "{card}");
+        assert!(plan.settle_background_job("job-wordpress", JobEnd::Succeeded));
+        assert_eq!(plan.steps[1].status, StepStatus::Completed);
     }
 
     #[test]
