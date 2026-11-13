@@ -52,7 +52,7 @@ impl CardView<'_> {
 pub fn render_card(view: &CardView<'_>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(plan) = view.plan {
-        parts.push(plan_with_run_header(plan.text.trim_end(), &view.helpers));
+        parts.push(plan_with_run_header(plan, &view.helpers));
     }
     for (helper, elapsed) in &view.helpers {
         parts.push(helper_block(helper, *elapsed));
@@ -77,36 +77,31 @@ pub fn render_card(view: &CardView<'_>) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
-/// The plan's card under a header that agrees with its helpers' run
-/// records. A plan whose steps all read done, on a card where a helper
-/// ended without doing its work, is not "Done": the header says how that
-/// helper ended instead (live 2026-11-13: "Done · 3 of 3 steps" above "A
-/// helper didn't finish"). The plan's own step marks stay as its records
-/// set them.
-fn plan_with_run_header(plan: &str, helpers: &[(HelperView, Option<Duration>)]) -> String {
-    let worst = helpers
-        .iter()
-        .map(|(helper, _)| helper.phase)
-        .filter(|phase| matches!(phase, RunPhase::Failed | RunPhase::Stopped))
-        .max_by_key(|phase| matches!(phase, RunPhase::Failed));
-    let Some(worst) = worst.filter(|_| is_completed_checklist(plan)) else {
-        return plan.to_string();
+/// The plan's card under the header its steps and the card's runs give
+/// together ([`PlanCard::header_with_runs`]): the plan's own step marks stay
+/// as its records set them, only the header line is the card's.
+fn plan_with_run_header(plan: &PlanCard, helpers: &[(HelperView, Option<Duration>)]) -> String {
+    let text = plan.text.trim_end();
+    let phases: Vec<RunPhase> = helpers.iter().map(|(helper, _)| helper.phase).collect();
+    let Some(header) = plan.header_with_runs(&phases) else {
+        // A one-step plan is its step: a run that failed or stopped changes
+        // only its done mark.
+        let worst = phases
+            .iter()
+            .filter(|phase| matches!(phase, RunPhase::Failed | RunPhase::Stopped))
+            .max_by_key(|phase| matches!(phase, RunPhase::Failed));
+        return match worst {
+            Some(worst) if plan.steps < 2 && is_completed_checklist(text) => {
+                let headline = worst.helper_headline(false);
+                let mark = headline.split(' ').next().unwrap_or_default();
+                format!("{mark}{}", text.trim_start().trim_start_matches('✅'))
+            }
+            _ => text.to_string(),
+        };
     };
-    let (header, body) = plan.split_once('\n').unwrap_or((plan, ""));
-    let headline = worst.helper_headline(false);
-    let header = match header.split_once(" · ") {
-        // "✅ Done · 3 of 3 steps": the count stays, the verdict is the run's.
-        Some((_, count)) => format!("{headline} · {count}"),
-        // A one-step plan is its step: only its mark changes.
-        None => {
-            let mark = headline.split(' ').next().unwrap_or_default();
-            format!("{mark}{}", header.trim_start_matches('✅'))
-        }
-    };
-    if body.is_empty() {
-        header
-    } else {
-        format!("{header}\n{body}")
+    match text.split_once('\n') {
+        Some((_, body)) => format!("{header}\n{body}"),
+        None => header,
     }
 }
 
@@ -554,6 +549,14 @@ mod tests {
         PlanCard {
             text: text.to_string(),
             steps,
+            // Its step lines (after the header) marked done.
+            done: text
+                .lines()
+                .skip(1)
+                .filter(|line| line.starts_with('✅'))
+                .count(),
+            // A plan still being worked through says so in its header.
+            settled: !text.starts_with("📋") && !text.starts_with("⚙️") && !text.starts_with("🧭"),
         }
     }
 
@@ -692,6 +695,53 @@ mod tests {
     /// The live turn (2026-11-13): two helpers installed a site each. The
     /// header agrees with how each helper's run ended, and once both ended
     /// the card says how long after the owner's request the last one did.
+    /// Live 2026-11-13: a plan set aside its two helper steps ("⚠️ Stopped
+    /// short · 2 of 4 done") while both helpers still ran, then both
+    /// succeeded. The header is drawn from the plan's counts and the runs'
+    /// phases together: while a run runs, the work continues; once the plan
+    /// and the runs agree it is done, the header says so as the total does.
+    #[test]
+    fn a_settled_plans_header_never_contradicts_its_runs() {
+        let running = |label: &str| HelperView::running(label, true, None);
+        let succeeded = |label: &str| HelperView {
+            since_request: Some(aidaemon_core::card::SinceRequest {
+                secs: 213,
+                words: "3m 33s after your request (7:31:01 AM to 7:34:34 AM ET)".to_string(),
+            }),
+            ..ended(label, RunPhase::Succeeded, true)
+        };
+        let stopped_short = plan(
+            "⚠️ Stopped short · 2 of 4 done\n\n✅ Check\n\n⏭️ Drupal (not done)\n\n\
+             ⏭️ WordPress (not done)\n\n✅ Report",
+            4,
+        );
+        let card = render_card(&CardView {
+            plan: Some(&stopped_short),
+            helpers: vec![(running("Drupal"), None), (running("WordPress"), None)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            card.starts_with("⏳ Continuing in the background · 2 of 4 done"),
+            "{card}"
+        );
+        let done = plan(
+            "✅ Done · 4 of 4 steps\n\n✅ Check\n\n✅ Drupal\n\n✅ WordPress\n\n✅ Report",
+            4,
+        );
+        let card = render_card(&CardView {
+            plan: Some(&done),
+            helpers: vec![(succeeded("Drupal"), None), (succeeded("WordPress"), None)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(card.starts_with("✅ Done · 4 of 4 steps"), "{card}");
+        assert!(
+            card.ends_with("All 2 done 3m 33s after your request (7:31:01 AM to 7:34:34 AM ET)."),
+            "{card}"
+        );
+    }
+
     #[test]
     fn the_header_and_the_total_follow_the_helpers_run_records() {
         let plan = plan("✅ Done · 3 of 3 steps\n\n✅ a\n\n✅ b\n\n✅ c", 3);
@@ -748,7 +798,7 @@ mod tests {
         })
         .unwrap();
         assert!(
-            one_stopped.starts_with("⚠️ A helper didn't finish · 3 of 3 steps"),
+            one_stopped.starts_with("⚠️ A helper didn't finish · 3 of 3 done"),
             "{one_stopped}"
         );
         assert!(!one_stopped.contains("✅ Done"), "{one_stopped}");

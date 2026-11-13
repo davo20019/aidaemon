@@ -336,6 +336,8 @@ mod tests {
             &StatusUpdate::Checklist(aidaemon_core::card::PlanCard {
                 text: "☑ one\n☐ two".into(),
                 steps: 2,
+                done: 1,
+                settled: false,
             }),
         );
         // A late update from an earlier turn changes nothing.

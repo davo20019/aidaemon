@@ -1847,6 +1847,17 @@ impl SpawnAgentTool {
         let runs = agent.helper_runs();
         let (ended_tx, ended_rx) = mpsc::unbounded_channel();
         runs.begin(&background_id, &session_id, &helper_label, Some(ended_tx));
+        // The runs one chat turn starts are one group: once the last of them
+        // ends, the turn's request is answered once, from all their results
+        // ([`answer_group`]). A sub-agent's own helpers answer to it, not to
+        // the chat, so only the chat's own turn groups them.
+        let parent_task_id = facts
+            .task_id
+            .clone()
+            .filter(|_| plan_session.as_deref() == Some(session_id.as_str()));
+        if let Some(task) = parent_task_id.as_deref() {
+            runs.join_group(&background_id, &format!("{session_id}#{task}"));
+        }
         tokio::spawn(deliver_when_run_ends(
             ended_rx,
             ResultRoute {
@@ -1860,6 +1871,7 @@ impl SpawnAgentTool {
                 name: name.clone(),
                 max_response_chars,
                 turn: aidaemon_channels::turns::TurnOver::current(),
+                parent_task_id,
             },
         ));
         let at_start = match hub.as_ref() {
@@ -2087,6 +2099,8 @@ pub struct ResultRoute {
     /// The turn that started the run, when one did: the run's end waits
     /// until it is over.
     pub turn: Option<aidaemon_channels::turns::TurnOver>,
+    /// The chat turn's task, when the run is one of that turn's group.
+    pub parent_task_id: Option<String>,
 }
 
 /// The subscriber on one run's terminal transition: when the run ends it
@@ -2108,11 +2122,6 @@ pub async fn deliver_when_run_ends(
         turn.wait().await;
     }
     let state = ended.state;
-    let trust = if ended.report.untrusted {
-        SourceTrust::Untrusted
-    } else {
-        SourceTrust::Trusted
-    };
     // The card settles to its final header first; the result follows,
     // without saying again how it ended.
     let on_card = settle_background_steps(
@@ -2132,6 +2141,36 @@ pub async fn deliver_when_run_ends(
         route.max_response_chars,
         on_card,
     );
+    // One answer per request: a run alone is answered by its own result; the
+    // runs a turn started together are answered once, when the last ends,
+    // with all their results. Until then the card shows each one's end.
+    let end = crate::run_state::GroupEnd {
+        state: state.clone(),
+        report: ended.report.clone(),
+        message,
+    };
+    match route.runs.group_end(&state.id, end.clone()) {
+        crate::run_state::GroupTurn::Alone => deliver_run_message(&route, &end).await,
+        crate::run_state::GroupTurn::Waiting => {
+            info!(
+                session_id = %state.chat,
+                job_id = %state.id,
+                "A helper's result waits for the rest of its group"
+            );
+        }
+        crate::run_state::GroupTurn::Complete(ends) => answer_group(&route, ends).await,
+    }
+}
+
+/// Send one run's own result message to its chat (queued when it cannot be
+/// sent now).
+async fn deliver_run_message(route: &ResultRoute, end: &crate::run_state::GroupEnd) {
+    let state = &end.state;
+    let trust = if end.report.untrusted {
+        SourceTrust::Untrusted
+    } else {
+        SourceTrust::Trusted
+    };
     let notification_type = run_notification_type(state.phase);
     let delivery = BackgroundDelivery {
         agent: route.agent.as_ref(),
@@ -2141,7 +2180,7 @@ pub async fn deliver_when_run_ends(
         goal_id: &route.goal_id,
     };
     let delivered =
-        std::panic::AssertUnwindSafe(delivery.deliver(notification_type, &message, trust))
+        std::panic::AssertUnwindSafe(delivery.deliver(notification_type, &end.message, trust))
             .catch_unwind()
             .await;
     if delivered.is_err() {
@@ -2151,12 +2190,108 @@ pub async fn deliver_when_run_ends(
             &route.goal_id,
             &state.chat,
             notification_type,
-            &message,
+            &end.message,
             "spawn_agent background completion notifier",
-            ended.report.untrusted,
+            end.report.untrusted,
         )
         .await;
     }
+}
+
+/// The last run of a turn's group ended: the turn's request gets its one
+/// answer, written by the parent from every run's typed result
+/// ([`group_followup`]). When no answer can be written, each run's own
+/// result goes to the chat instead, so nothing is lost.
+async fn answer_group(route: &ResultRoute, ends: Vec<crate::run_state::GroupEnd>) {
+    let Some(chat) = ends.first().map(|end| end.state.chat.clone()) else {
+        return;
+    };
+    let answered = route
+        .agent
+        .answer_after_runs(crate::spawn::RunsAnswer {
+            hub: route.hub.clone(),
+            chat: chat.clone(),
+            parent_task_id: route.parent_task_id.clone(),
+            followup: group_followup(&ends, route.max_response_chars),
+        })
+        .await;
+    match answered {
+        Ok(true) => {
+            info!(session_id = %chat, runs = ends.len(), "Answered a request once its helpers all ended");
+        }
+        Ok(false) | Err(_) => {
+            if let Err(error) = answered {
+                warn!(session_id = %chat, %error, "Could not answer a request from its helpers' results; sending each result");
+            }
+            for end in &ends {
+                deliver_run_message(route, end).await;
+            }
+        }
+    }
+}
+
+/// The continuation a turn's group of runs gets once the last of them
+/// ended: each run's name, how it ended and the times the runtime measured
+/// (from its record, never from its report), then its report. The parent
+/// answers the owner's request once from this. The card already shows each
+/// run's end and the group's total, so the answer is told not to list them
+/// again; a request that asked how long gets these measurements as given.
+pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usize) -> String {
+    let mut out = String::from(
+        "[Background helpers finished]\n\
+         Every helper this request started has ended. Their run records follow \
+         (authoritative: how each ended and its times are the daemon's measurements).\n",
+    );
+    for (index, end) in ends.iter().enumerate() {
+        let state = &end.state;
+        let ended = match state.phase {
+            RunPhase::Succeeded => "finished",
+            RunPhase::Stopped => "didn't finish",
+            RunPhase::Failed => "failed",
+            RunPhase::Running => "still running",
+        };
+        out.push_str(&format!(
+            "\n{}. {} ({ended})\n",
+            index + 1,
+            state.label.trim()
+        ));
+        if let Some(span) = state.span() {
+            out.push_str(&format!("Measured: {}", took_line(span, state.waited)));
+            if let Some(requested) = state.requested_at {
+                out.push_str(&since_request(requested, span.to));
+            }
+            out.push('\n');
+        }
+        if let Some(line) = state.evidence.line() {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        let (report, _) = bounded_child_response(end.report.text.trim(), max_report_chars);
+        let report = if end.report.untrusted {
+            aidaemon_tools::sanitize::wrap_untrusted_output("spawn_agent", report)
+        } else {
+            report.to_string()
+        };
+        out.push_str(&format!("Its report:\n{}\n", report.trim()));
+    }
+    let last = ends
+        .iter()
+        .filter_map(|end| end.state.requested_at.zip(end.state.ended_at))
+        .max_by_key(|(_, ended)| *ended);
+    if let (true, Some((requested, ended))) = (ends.len() > 1, last) {
+        out.push_str(&format!(
+            "\nThe last of them ended {}.\n",
+            since_request_view(requested, ended).words
+        ));
+    }
+    out.push_str(
+        "\nAnswer the owner's original request now, once, from these results. The chat's card \
+         already shows how each helper ended and its time, and each helper already sent what it \
+         delivered: don't list them again line by line or resend anything. When the request asked \
+         how long something took, answer with these measurements exactly as given; never work out \
+         a time yourself. Don't call tools to re-check this work.",
+    );
+    out
 }
 
 /// What the runtime measured of a background run as it ends: now, its
@@ -2643,5 +2778,200 @@ impl SpawnAgentTool {
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use crate::run_state::{GroupEnd, GroupTurn, RunMeasure, RunReport, RunStates};
+    use crate::spawn::{ChildAgentRequest, ChildAgentRun, ChildAgentRuntime, RunsAnswer};
+
+    /// A parent that records the group answers it is asked to write.
+    #[derive(Default)]
+    struct Parent {
+        answers: std::sync::Mutex<Vec<RunsAnswer>>,
+        runs: Arc<RunStates>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChildAgentRuntime for Parent {
+        fn depth(&self) -> usize {
+            0
+        }
+        fn max_depth(&self) -> usize {
+            3
+        }
+        fn role(&self) -> AgentRole {
+            AgentRole::Orchestrator
+        }
+        fn specialist_descriptions(&self) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        async fn validate_executor_task_for_spawn(
+            &self,
+            _task_id: &str,
+            _expected_goal_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn run_child(&self, _request: ChildAgentRequest) -> anyhow::Result<ChildAgentRun> {
+            anyhow::bail!("not used")
+        }
+        async fn salvage_executor_task_outcome(
+            &self,
+            _task_id: &str,
+            _timeout_secs: u64,
+        ) -> Option<crate::spawn::SalvagedTaskOutcome> {
+            None
+        }
+        async fn mark_executor_task_timeout(&self, _task_id: &str, _timeout_secs: u64) {}
+        async fn answer_after_runs(&self, answer: RunsAnswer) -> anyhow::Result<bool> {
+            self.answers.lock().unwrap().push(answer);
+            Ok(true)
+        }
+        async fn deliver_background_child_result(
+            &self,
+            _router: Option<&Weak<dyn OutboundRouter>>,
+            _parent_session_id: &str,
+            _text: &str,
+            _trust: SourceTrust,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn helper_runs(&self) -> Arc<RunStates> {
+            self.runs.clone()
+        }
+    }
+
+    fn route(parent: &Arc<Parent>, name: &str) -> ResultRoute {
+        ResultRoute {
+            agent: parent.clone(),
+            runs: parent.runs.clone(),
+            hub: None,
+            state: None,
+            plans: None,
+            plan_session: None,
+            goal_id: "global".to_string(),
+            name: name.to_string(),
+            max_response_chars: 8_000,
+            turn: None,
+            parent_task_id: Some("task-1".to_string()),
+        }
+    }
+
+    fn finish(runs: &RunStates, id: &str, report: &str) {
+        let now = chrono::Utc::now();
+        runs.finish(
+            id,
+            RunPhase::Succeeded,
+            RunMeasure {
+                ended_at: now,
+                work_began: Some(now - chrono::Duration::seconds(185)),
+                waited: Duration::from_secs(84),
+            },
+            Default::default(),
+            RunReport {
+                text: report.to_string(),
+                untrusted: false,
+            },
+        );
+    }
+
+    /// Live 2026-11-13: two helpers one turn started each sent a result
+    /// of their own, and the owner's "tell me how long it takes" got no
+    /// answer. The runs a turn starts are one group: the first to end waits
+    /// for the rest, and the last one's end asks the parent for one answer
+    /// with every run's result and measured time, once.
+    #[tokio::test]
+    async fn one_group_answer_after_the_last_run() {
+        let parent = Arc::new(Parent::default());
+        let runs = parent.runs.clone();
+        let (drupal_tx, drupal_rx) = mpsc::unbounded_channel();
+        let (wordpress_tx, wordpress_rx) = mpsc::unbounded_channel();
+        runs.begin(
+            "job-drupal",
+            "chat",
+            "Finish Drupal DDEV site",
+            Some(drupal_tx),
+        );
+        runs.begin(
+            "job-wordpress",
+            "chat",
+            "Finish WordPress DDEV site",
+            Some(wordpress_tx),
+        );
+        runs.join_group("job-drupal", "chat#task-1");
+        runs.join_group("job-wordpress", "chat#task-1");
+
+        finish(&runs, "job-drupal", "Drupal is up.");
+        deliver_when_run_ends(drupal_rx, route(&parent, "Finish Drupal DDEV site")).await;
+        assert!(
+            parent.answers.lock().unwrap().is_empty(),
+            "the first run's end waits for the rest of its group"
+        );
+
+        finish(&runs, "job-wordpress", "WordPress is up.");
+        deliver_when_run_ends(wordpress_rx, route(&parent, "Finish WordPress DDEV site")).await;
+        let answers = parent.answers.lock().unwrap();
+        assert_eq!(answers.len(), 1, "one answer for the group");
+        let answer = &answers[0];
+        assert_eq!(answer.chat, "chat");
+        assert_eq!(answer.parent_task_id.as_deref(), Some("task-1"));
+        let followup = &answer.followup;
+        let drupal = followup
+            .find("1. Finish Drupal DDEV site (finished)")
+            .expect(followup);
+        let wordpress = followup
+            .find("2. Finish WordPress DDEV site (finished)")
+            .expect(followup);
+        assert!(drupal < wordpress, "in start order: {followup}");
+        assert_eq!(
+            followup.matches("Measured: Took 3m 5s").count(),
+            2,
+            "{followup}"
+        );
+        assert!(followup.contains("It waited 1m 24s of that"), "{followup}");
+        assert!(followup.contains("Drupal is up.") && followup.contains("WordPress is up."));
+        assert!(followup.contains("don't list them again"), "{followup}");
+    }
+
+    /// A run alone in its group, or in none, is its own answer; a group's
+    /// ends are handed over once.
+    #[test]
+    fn a_group_is_handed_over_once_when_its_last_run_ends() {
+        let runs = RunStates::default();
+        let end = |id: &str| GroupEnd {
+            state: runs.get(id).unwrap(),
+            report: RunReport {
+                text: String::new(),
+                untrusted: false,
+            },
+            message: String::new(),
+        };
+        runs.begin("solo", "chat", "Solo", None);
+        assert!(matches!(
+            runs.group_end("solo", end("solo")),
+            GroupTurn::Alone
+        ));
+        runs.join_group("solo", "chat#one");
+        assert!(matches!(
+            runs.group_end("solo", end("solo")),
+            GroupTurn::Alone
+        ));
+
+        runs.begin("a", "chat", "A", None);
+        runs.begin("b", "chat", "B", None);
+        runs.join_group("a", "chat#two");
+        runs.join_group("b", "chat#two");
+        assert!(matches!(runs.group_end("b", end("b")), GroupTurn::Waiting));
+        match runs.group_end("a", end("a")) {
+            GroupTurn::Complete(ends) => {
+                let ids: Vec<_> = ends.iter().map(|end| end.state.id.as_str()).collect();
+                assert_eq!(ids, ["a", "b"]);
+            }
+            other => panic!("expected the group: {other:?}"),
+        }
+        assert!(matches!(runs.group_end("b", end("b")), GroupTurn::Alone));
     }
 }
