@@ -64,6 +64,12 @@ impl CommandContext {
         reload_config(self.agent.as_ref(), &self.config_path).await
     }
 
+    /// The menu and `/help` entries of the daemon's own shared commands
+    /// (devices, exposure).
+    pub(crate) fn extension_commands(&self) -> Vec<aidaemon_channels::slash::CommandDef> {
+        self.shared().extension_commands()
+    }
+
     fn shared(&self) -> SharedCommands {
         SharedCommands {
             agent: self.agent.clone(),

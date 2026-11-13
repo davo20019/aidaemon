@@ -576,6 +576,11 @@ pub trait SlashCommand: Send + Sync {
     /// Whether this handles `cmd` (with its `/`).
     fn handles(&self, cmd: &str) -> bool;
     async fn run(&self, cmd: &str, args: &str, call: &SlashCall<'_>) -> String;
+    /// The commands this handles, for the platform's command menu and
+    /// `/help`. Every name here must be one [`Self::handles`] accepts.
+    fn commands(&self) -> Vec<CommandDef> {
+        Vec::new()
+    }
 }
 
 /// Shared command dispatcher for commands that behave identically across
@@ -589,6 +594,14 @@ pub struct SharedCommands {
 }
 
 impl SharedCommands {
+    /// The menu and `/help` entries of the host's own commands.
+    pub fn extension_commands(&self) -> Vec<CommandDef> {
+        self.extensions
+            .iter()
+            .flat_map(|extension| extension.commands())
+            .collect()
+    }
+
     /// Try to handle a shared command. Returns `Some(reply)` if the command was
     /// recognised, `None` if the channel should handle it itself.
     pub async fn dispatch(

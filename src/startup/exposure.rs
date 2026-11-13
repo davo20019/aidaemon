@@ -156,6 +156,15 @@ impl aidaemon_channels::slash::SlashCommand for ExposureCommand {
         cmd == "/exposure"
     }
 
+    fn commands(&self) -> Vec<aidaemon_channels::slash::CommandDef> {
+        vec![aidaemon_channels::slash::CommandDef {
+            name: "exposure",
+            description: "Show the tunnels publishing the gateways",
+            usage: None,
+            category: aidaemon_channels::slash::CommandCategory::Core,
+        }]
+    }
+
     async fn run(
         &self,
         _cmd: &str,
@@ -179,6 +188,28 @@ impl aidaemon_channels::slash::SlashCommand for ExposureCommand {
 mod tests {
     use super::*;
     use aidaemon_exposure::{ServiceState, ServiceStatus};
+
+    /// Every command the device and exposure handlers list in the menu and
+    /// `/help` is one they handle.
+    #[test]
+    fn listed_commands_are_handled() {
+        use aidaemon_channels::slash::SlashCommand;
+        let handlers: [&dyn SlashCommand; 2] = [
+            &ExposureCommand,
+            &crate::startup::client_gateway::DeviceCommands,
+        ];
+        for handler in handlers {
+            let commands = handler.commands();
+            assert!(!commands.is_empty());
+            for command in commands {
+                assert!(
+                    handler.handles(&format!("/{}", command.name)),
+                    "{}",
+                    command.name
+                );
+            }
+        }
+    }
 
     #[test]
     fn status_text_names_state_origin_and_failure() {

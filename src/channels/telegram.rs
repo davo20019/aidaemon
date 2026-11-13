@@ -284,7 +284,9 @@ fn daemon_commands() -> Vec<CommandDef> {
 #[async_trait]
 impl TelegramHost for DaemonTelegramHost {
     fn commands(&self) -> Vec<CommandDef> {
-        daemon_commands()
+        let mut commands = daemon_commands();
+        commands.extend(self.command_context().extension_commands());
+        commands
     }
 
     async fn dispatch_shared(

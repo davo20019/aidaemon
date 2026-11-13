@@ -256,6 +256,30 @@ impl aidaemon_channels::slash::SlashCommand for DeviceCommands {
         matches!(cmd, "/pair_device" | "/devices" | "/revoke_device")
     }
 
+    fn commands(&self) -> Vec<aidaemon_channels::slash::CommandDef> {
+        use aidaemon_channels::slash::{CommandCategory, CommandDef};
+        vec![
+            CommandDef {
+                name: "pair_device",
+                description: "Pair a phone or browser with the app",
+                usage: None,
+                category: CommandCategory::Core,
+            },
+            CommandDef {
+                name: "devices",
+                description: "List paired devices",
+                usage: None,
+                category: CommandCategory::Core,
+            },
+            CommandDef {
+                name: "revoke_device",
+                description: "Unpair a device",
+                usage: Some("/revoke_device <id>"),
+                category: CommandCategory::Core,
+            },
+        ]
+    }
+
     async fn run(
         &self,
         cmd: &str,
