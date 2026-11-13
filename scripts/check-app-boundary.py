@@ -84,9 +84,6 @@ PENDING = {
     "state": "9.3/9.6: the SQLite store behind the facade traits",
     "memory": "9.1/9.6: memory host adapters, procedures, task learning, retention",
     "nodes": "9.6: nodes host",
-    "terminal_bridge.rs": "9.6: terminal bridge host",
-    "agent_handoff.rs": "9.5: terminal attach handoff",
-    "terminal_lite.rs": "9.5: chat terminal mode",
 }
 
 # Directories whose step is done: only adapters and tests may stay.

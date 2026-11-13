@@ -1,9 +1,7 @@
 #![recursion_limit = "256"]
 
 mod agent;
-mod agent_handoff;
 mod channels;
-use aidaemon_tools::cli_agent_flags;
 mod config;
 mod context_budget;
 mod conversation;
@@ -57,9 +55,6 @@ mod skills;
 mod startup;
 mod state;
 use aidaemon_channels::tasks;
-#[cfg(feature = "terminal-bridge")]
-mod terminal_bridge;
-mod terminal_lite;
 mod tools;
 #[cfg(feature = "computer_use")]
 pub use config::ComputerUseConfig;
@@ -638,7 +633,7 @@ fn handle_agent_command(args: &[String]) -> anyhow::Result<()> {
             };
             #[cfg(feature = "terminal-bridge")]
             {
-                crate::terminal_bridge::run_local_attach_cli(code)
+                crate::startup::terminal_bridge::run_local_attach_cli(code)
             }
             #[cfg(not(feature = "terminal-bridge"))]
             {
@@ -665,7 +660,7 @@ fn handle_agent_command(args: &[String]) -> anyhow::Result<()> {
             #[cfg(feature = "terminal-bridge")]
             {
                 let explicit_session_id = args.get(1).map(|v| v.as_str());
-                crate::terminal_bridge::run_local_share_cli(explicit_session_id)
+                crate::startup::terminal_bridge::run_local_share_cli(explicit_session_id)
             }
             #[cfg(not(feature = "terminal-bridge"))]
             {
@@ -1148,7 +1143,7 @@ fn launch_terminal_agent(agent: &str, raw_args: &[String]) -> anyhow::Result<()>
     let (launch_args, _) = normalize_terminal_agent_permission_aliases(Some(agent), launch_args);
     #[cfg(feature = "terminal-bridge")]
     {
-        crate::terminal_bridge::run_local_start_cli(agent, cwd.as_deref(), &launch_args)
+        crate::startup::terminal_bridge::run_local_start_cli(agent, cwd.as_deref(), &launch_args)
     }
     #[cfg(not(feature = "terminal-bridge"))]
     {

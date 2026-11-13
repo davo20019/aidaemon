@@ -22,6 +22,8 @@ mod channel;
 pub mod format;
 mod mapping;
 mod plain;
+#[cfg(feature = "terminal")]
+pub mod terminal;
 #[cfg(feature = "webhook")]
 mod webhook;
 

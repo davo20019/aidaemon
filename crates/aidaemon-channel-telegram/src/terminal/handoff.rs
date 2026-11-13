@@ -1,8 +1,11 @@
+//! One-time handoff codes and relay-session bindings between the Telegram
+//! `/agent` command and the terminal bridge's local `attach`/`share`
+//! commands, kept in the host's settings store.
+
+use aidaemon_tools::services::SettingsStore;
 use chrono::Utc;
 use rand::{rng as thread_rng, RngExt};
 use serde::{Deserialize, Serialize};
-
-use crate::traits::StateStore;
 
 const HANDOFF_KEY_PREFIX: &str = "terminal_attach_handoff:";
 const LAST_ACTIVE_RELAY_SESSION_KEY_PREFIX: &str = "terminal_last_active_relay_session:";
@@ -12,6 +15,7 @@ const HANDOFF_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const TELEGRAM_RELAY_BINDING_KEY_PREFIX: &str = "terminal_attach_telegram_session:";
 const TELEGRAM_RELAY_BINDING_MAX_AGE_SECS: i64 = 6 * 60 * 60;
 
+/// A one-time code that attaches a computer to a relay session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalAttachHandoff {
     pub code: String,
@@ -81,7 +85,7 @@ fn parse_entry(raw: &str) -> anyhow::Result<TerminalAttachHandoff> {
 }
 
 pub async fn create_handoff_code(
-    state: &dyn StateStore,
+    state: &dyn SettingsStore,
     relay_session_id: &str,
     owner_user_id: u64,
 ) -> anyhow::Result<TerminalAttachHandoff> {
@@ -116,7 +120,7 @@ pub async fn create_handoff_code(
 }
 
 pub async fn resolve_handoff_code(
-    state: &dyn StateStore,
+    state: &dyn SettingsStore,
     raw_code: &str,
 ) -> anyhow::Result<TerminalAttachHandoff> {
     let code = normalize_code(raw_code).ok_or_else(|| anyhow::anyhow!("invalid handoff code"))?;
@@ -137,7 +141,7 @@ pub async fn resolve_handoff_code(
 }
 
 pub async fn consume_handoff_code(
-    state: &dyn StateStore,
+    state: &dyn SettingsStore,
     raw_code: &str,
 ) -> anyhow::Result<TerminalAttachHandoff> {
     let code = normalize_code(raw_code).ok_or_else(|| anyhow::anyhow!("invalid handoff code"))?;
@@ -164,7 +168,7 @@ pub async fn consume_handoff_code(
 }
 
 pub async fn set_last_active_relay_session_id(
-    state: &dyn StateStore,
+    state: &dyn SettingsStore,
     owner_user_id: u64,
     relay_session_id: &str,
 ) -> anyhow::Result<()> {
@@ -177,7 +181,7 @@ pub async fn set_last_active_relay_session_id(
 }
 
 pub async fn get_last_active_relay_session_id(
-    state: &dyn StateStore,
+    state: &dyn SettingsStore,
     owner_user_id: u64,
 ) -> anyhow::Result<Option<String>> {
     let key = last_active_relay_session_key(owner_user_id);
@@ -188,7 +192,7 @@ pub async fn get_last_active_relay_session_id(
 }
 
 pub async fn bind_telegram_session_to_relay(
-    state: &dyn StateStore,
+    state: &dyn SettingsStore,
     raw_telegram_session_id: &str,
     relay_session_id: &str,
 ) -> anyhow::Result<()> {
@@ -210,7 +214,7 @@ pub async fn bind_telegram_session_to_relay(
 }
 
 pub async fn resolve_relay_for_telegram_session(
-    state: &dyn StateStore,
+    state: &dyn SettingsStore,
     raw_telegram_session_id: &str,
 ) -> anyhow::Result<Option<String>> {
     let Some(key) = telegram_relay_binding_key(raw_telegram_session_id) else {
@@ -246,26 +250,30 @@ pub async fn resolve_relay_for_telegram_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
-    use crate::memory::embeddings::EmbeddingService;
-    use crate::state::SqliteStateStore;
-    use crate::traits::SettingsStore;
-    use tempfile::tempdir;
+    #[derive(Default)]
+    struct MemSettings(Mutex<HashMap<String, String>>);
 
-    async fn make_test_state(name: &str) -> (tempfile::TempDir, SqliteStateStore) {
-        let dir = tempdir().expect("tempdir");
-        let db = dir.path().join(name);
-        let embeddings = Arc::new(EmbeddingService::new().expect("embeddings"));
-        let state = SqliteStateStore::new(db.to_str().expect("utf8 path"), 100, None, embeddings)
-            .await
-            .expect("state");
-        (dir, state)
+    #[async_trait::async_trait]
+    impl SettingsStore for MemSettings {
+        async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+
+        async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
     }
 
     #[tokio::test]
     async fn handoff_create_and_consume_once() {
-        let (_dir, state) = make_test_state("test.db").await;
+        let state = MemSettings::default();
 
         let created = create_handoff_code(&state, "relay_abc", 1234)
             .await
@@ -288,13 +296,13 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_rejects_invalid_code_format() {
-        let (_dir, state) = make_test_state("test2.db").await;
+        let state = MemSettings::default();
         assert!(resolve_handoff_code(&state, "bad-code!!").await.is_err());
     }
 
     #[tokio::test]
     async fn telegram_relay_binding_round_trip() {
-        let (_dir, state) = make_test_state("test3.db").await;
+        let state = MemSettings::default();
         bind_telegram_session_to_relay(&state, "telegrambot:12345", "relay_abc")
             .await
             .expect("bind");
@@ -306,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_relay_binding_ignores_stale_entries() {
-        let (_dir, state) = make_test_state("test4.db").await;
+        let state = MemSettings::default();
         let key = format!(
             "{}{}",
             TELEGRAM_RELAY_BINDING_KEY_PREFIX, "telegrambot:12345"

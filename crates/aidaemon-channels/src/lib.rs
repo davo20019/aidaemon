@@ -50,6 +50,7 @@ pub mod slash;
 pub mod split;
 pub mod stop;
 pub mod tasks;
+pub mod terminal_lite;
 pub mod turns;
 
 #[cfg(feature = "testing")]

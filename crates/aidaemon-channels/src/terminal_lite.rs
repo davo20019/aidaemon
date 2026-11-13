@@ -1,6 +1,6 @@
-//! Chat-based "terminal lite" — a lightweight shell mode that runs single
-//! commands without interactive TUIs. Extracted from `channels/telegram.rs`
-//! so that any channel can reuse the session management and command execution.
+//! Chat-based "terminal lite": a lightweight shell mode that runs single
+//! commands without interactive TUIs, for any channel's owner chat (the
+//! Telegram bot's `/terminal lite`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -10,27 +10,28 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-use crate::types::UserRole;
+use aidaemon_core::UserRole;
+use aidaemon_tools::cli_agent_flags::normalize_terminal_agent_name;
 
 /// Maximum characters returned from a single command's output.
-pub(crate) const TERMINAL_LITE_MAX_OUTPUT_CHARS: usize = 12_000;
+pub const TERMINAL_LITE_MAX_OUTPUT_CHARS: usize = 12_000;
 
 /// Per-command timeout in seconds.
-pub(crate) const TERMINAL_LITE_TIMEOUT_SECS: u64 = 90;
+pub const TERMINAL_LITE_TIMEOUT_SECS: u64 = 90;
 
 /// A single terminal-lite session, keyed by chat / conversation id.
 #[derive(Debug, Clone)]
-pub(crate) struct TerminalLiteSession {
-    pub(crate) owner_user_id: u64,
-    pub(crate) cwd: PathBuf,
-    pub(crate) shell: String,
-    pub(crate) preferred_agent: Option<String>,
-    pub(crate) started_at: Instant,
-    pub(crate) busy: bool,
+pub struct TerminalLiteSession {
+    pub owner_user_id: u64,
+    pub cwd: PathBuf,
+    pub shell: String,
+    pub preferred_agent: Option<String>,
+    pub started_at: Instant,
+    pub busy: bool,
 }
 
 /// Manages terminal-lite sessions for a single channel instance.
-pub(crate) struct TerminalLiteManager {
+pub struct TerminalLiteManager {
     sessions: Mutex<HashMap<i64, TerminalLiteSession>>,
     allowed_prefixes: HashSet<String>,
 }
@@ -41,7 +42,7 @@ pub(crate) struct TerminalLiteManager {
 
 /// Returns `true` if `token` looks like a shell environment variable
 /// assignment (e.g. `FOO=bar`).
-pub(crate) fn is_shell_env_assignment(token: &str) -> bool {
+pub fn is_shell_env_assignment(token: &str) -> bool {
     let Some((name, _)) = token.split_once('=') else {
         return false;
     };
@@ -63,7 +64,7 @@ pub(crate) fn is_shell_env_assignment(token: &str) -> bool {
 
 /// Returns `true` if `text` contains un-quoted shell control operators
 /// (`;`, `|`, `&`, `>`, `<`, newlines, backticks, `$()`).
-pub(crate) fn contains_shell_control_operators(text: &str) -> bool {
+pub fn contains_shell_control_operators(text: &str) -> bool {
     let mut chars = text.chars().peekable();
     let mut in_single = false;
     let mut in_double = false;
@@ -112,16 +113,13 @@ pub(crate) fn contains_shell_control_operators(text: &str) -> bool {
 }
 
 /// Resolve the initial working directory for a new terminal-lite session.
-pub(crate) fn resolve_terminal_lite_cwd(raw: Option<&str>) -> anyhow::Result<PathBuf> {
+pub fn resolve_terminal_lite_cwd(raw: Option<&str>) -> anyhow::Result<PathBuf> {
     let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     resolve_terminal_lite_cwd_from_base(&base, raw.unwrap_or("").trim())
 }
 
 /// Resolve a path relative to `base`, expanding `~` and canonicalizing.
-pub(crate) fn resolve_terminal_lite_cwd_from_base(
-    base: &Path,
-    raw: &str,
-) -> anyhow::Result<PathBuf> {
+pub fn resolve_terminal_lite_cwd_from_base(base: &Path, raw: &str) -> anyhow::Result<PathBuf> {
     let resolved = if raw.is_empty() || raw == "~" {
         dirs::home_dir().unwrap_or_else(|| base.to_path_buf())
     } else if let Some(rest) = raw.strip_prefix("~/") {
@@ -146,7 +144,7 @@ pub(crate) fn resolve_terminal_lite_cwd_from_base(
 }
 
 /// Read $SHELL (or fall back to `/bin/bash`).
-pub(crate) fn default_terminal_lite_shell() -> String {
+pub fn default_terminal_lite_shell() -> String {
     std::env::var("SHELL")
         .ok()
         .map(|v| v.trim().to_string())
@@ -156,7 +154,7 @@ pub(crate) fn default_terminal_lite_shell() -> String {
 
 /// Extract the first "real" command name from `text`, skipping leading
 /// environment variable assignments like `FOO=bar`.
-pub(crate) fn extract_terminal_lite_command_name(text: &str) -> Option<String> {
+pub fn extract_terminal_lite_command_name(text: &str) -> Option<String> {
     let parts = shell_words::split(text).unwrap_or_else(|_| {
         text.split_whitespace()
             .map(std::string::ToString::to_string)
@@ -177,20 +175,17 @@ pub(crate) fn extract_terminal_lite_command_name(text: &str) -> Option<String> {
 
 /// Returns `Some(agent_name)` if `text` starts with a known interactive
 /// terminal agent name (codex, claude, gemini, opencode).
-pub(crate) fn is_terminal_lite_interactive_agent_command(text: &str) -> Option<String> {
+pub fn is_terminal_lite_interactive_agent_command(text: &str) -> Option<String> {
     let parts = shell_words::split(text).unwrap_or_else(|_| {
         text.split_whitespace()
             .map(std::string::ToString::to_string)
             .collect()
     });
-    parts
-        .first()
-        .and_then(|v| crate::normalize_terminal_agent_name(v))
-        .map(|s| s.to_string())
+    parts.first().and_then(|v| normalize_terminal_agent_name(v))
 }
 
 /// Static help text for the `/terminal lite` command.
-pub(crate) fn terminal_lite_help_text() -> String {
+pub fn terminal_lite_help_text() -> String {
     "Terminal lite mode (owner only, chat-based)\n\n\
      Commands:\n\
      /terminal lite start [working_dir]\n\
@@ -308,7 +303,7 @@ async fn run_terminal_lite_command(session: &TerminalLiteSession, command_text: 
 
 impl TerminalLiteManager {
     /// Create a new manager from the set of allowed command prefixes.
-    pub(crate) fn new(allowed_prefixes: HashSet<String>) -> Self {
+    pub fn new(allowed_prefixes: HashSet<String>) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             allowed_prefixes,
@@ -317,25 +312,20 @@ impl TerminalLiteManager {
 
     /// Return the allowed command prefixes as a sorted `Vec<String>`.
     /// Useful when constructing a new channel that needs the same prefixes.
-    pub(crate) fn allowed_prefixes(&self) -> Vec<String> {
+    pub fn allowed_prefixes(&self) -> Vec<String> {
         self.allowed_prefixes.iter().cloned().collect()
     }
 
     /// Returns `true` if there is an active terminal-lite session for the
     /// given chat id.
     #[allow(dead_code)]
-    pub(crate) async fn has_active_session(&self, chat_id: i64) -> bool {
+    pub async fn has_active_session(&self, chat_id: i64) -> bool {
         self.sessions.lock().await.contains_key(&chat_id)
     }
 
     /// Start (or restart) a terminal-lite session.  Returns a human-readable
     /// status string suitable for sending back to the user.
-    pub(crate) async fn start_session(
-        &self,
-        chat_id: i64,
-        user_id: u64,
-        args: Vec<String>,
-    ) -> String {
+    pub async fn start_session(&self, chat_id: i64, user_id: u64, args: Vec<String>) -> String {
         let mut args = args;
 
         let subcommand = args
@@ -361,8 +351,7 @@ impl TerminalLiteManager {
 
         let preferred_agent = args
             .first()
-            .and_then(|value| crate::normalize_terminal_agent_name(value))
-            .map(|s| s.to_string());
+            .and_then(|value| normalize_terminal_agent_name(value));
         if preferred_agent.is_some() && !args.is_empty() {
             args.remove(0);
         }
@@ -403,7 +392,7 @@ impl TerminalLiteManager {
     }
 
     /// Stop the terminal-lite session for the given chat id.
-    pub(crate) async fn stop_session(&self, chat_id: i64) -> String {
+    pub async fn stop_session(&self, chat_id: i64) -> String {
         let mut sessions = self.sessions.lock().await;
         if sessions.remove(&chat_id).is_some() {
             "Terminal lite stopped for this chat.".to_string()
@@ -413,7 +402,7 @@ impl TerminalLiteManager {
     }
 
     /// Return a human-readable status line for the session.
-    pub(crate) async fn get_status(&self, chat_id: i64) -> String {
+    pub async fn get_status(&self, chat_id: i64) -> String {
         let sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get(&chat_id) {
             let elapsed = session.started_at.elapsed().as_secs();
@@ -432,7 +421,7 @@ impl TerminalLiteManager {
     }
 
     /// Validate a command against the allowed prefixes.
-    pub(crate) fn validate_terminal_lite_command(&self, text: &str) -> Result<(), String> {
+    pub fn validate_terminal_lite_command(&self, text: &str) -> Result<(), String> {
         if self.allowed_prefixes.contains("*") {
             return Ok(());
         }
@@ -482,7 +471,7 @@ impl TerminalLiteManager {
     /// Handle a line of user input for an active terminal-lite session.
     /// Returns `Some(reply)` if the chat has an active session (or an error
     /// message), `None` if there is no session for this chat.
-    pub(crate) async fn handle_input(
+    pub async fn handle_input(
         &self,
         chat_id: i64,
         user_id: u64,

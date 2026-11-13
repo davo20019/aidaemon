@@ -15,7 +15,6 @@ pub(crate) mod set_key;
 pub(crate) mod slack;
 pub(crate) mod telegram;
 pub(crate) use aidaemon_channel_telegram::bot_api as telegram_api;
-mod telegram_bootstrap_signing;
 #[cfg(test)]
 pub(crate) use aidaemon_channels::turns;
 #[cfg(test)]

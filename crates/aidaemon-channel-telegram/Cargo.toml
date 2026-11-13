@@ -30,6 +30,17 @@ bot = [
     "dep:anyhow",
     "dep:uuid",
 ]
+## The terminal surface (`terminal::TelegramTerminal`): `/agent` and
+## `/terminal` with the terminal Mini App, share and resume codes, and
+## terminal lite.
+terminal = [
+    "bot",
+    "dep:base64",
+    "dep:hmac",
+    "dep:rand",
+    "dep:sha2",
+    "dep:shell-words",
+]
 
 [dependencies]
 aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels", features = ["http"] }
@@ -40,6 +51,10 @@ anyhow = { version = "1", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "tokio"] }
 rand = { version = "0.10", optional = true }
+base64 = { version = "0.23", optional = true }
+hmac = { version = "0.13", optional = true }
+sha2 = { version = "0.11", optional = true }
+shell-words = { version = "1.1", optional = true }
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "rustls"] }

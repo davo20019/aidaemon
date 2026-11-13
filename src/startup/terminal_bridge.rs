@@ -1,20 +1,60 @@
 //! The daemon's side of the terminal bridge (`aidaemon-terminal-bridge`):
-//! its settings from `AppConfig`, and the host backed by the state store
-//! (runtime bots, the relay handoff records in `agent_handoff`).
+//! its settings from `AppConfig`, its host on the state store (runtime bots,
+//! and the relay handoff records the Telegram `/agent` command shares,
+//! `aidaemon_channel_telegram::terminal::handoff`), and the local session
+//! start the Telegram terminal surface uses.
 
 use std::sync::Arc;
 
+use aidaemon_channel_telegram::terminal::LocalAgentStart;
+#[cfg(feature = "terminal-bridge")]
 pub use aidaemon_terminal_bridge::{
-    request_local_start_session, run_local_attach_cli, run_local_share_cli, run_local_start_cli,
+    run_local_attach_cli, run_local_share_cli, run_local_start_cli,
 };
+#[cfg(feature = "terminal-bridge")]
 use aidaemon_terminal_bridge::{
     AttachHandoff, BridgeHost, BridgeSettings, ReviewAgentSettings, RuntimeBot,
 };
+#[cfg(feature = "terminal-bridge")]
 use async_trait::async_trait;
 
+#[cfg(feature = "terminal-bridge")]
 use crate::config::AppConfig;
+#[cfg(feature = "terminal-bridge")]
 use crate::traits::StateStore;
+#[cfg(feature = "terminal-bridge")]
+use aidaemon_channel_telegram::terminal::handoff::{self, TerminalAttachHandoff};
 
+/// Pre-starts `/agent` sessions on this computer when the bridge is built in.
+pub(crate) fn local_agent_start() -> Option<Arc<dyn LocalAgentStart>> {
+    #[cfg(feature = "terminal-bridge")]
+    {
+        Some(Arc::new(BridgeLocalStart))
+    }
+    #[cfg(not(feature = "terminal-bridge"))]
+    {
+        None
+    }
+}
+
+/// The bridge's local start (over its local control socket).
+#[cfg(feature = "terminal-bridge")]
+struct BridgeLocalStart;
+
+#[cfg(feature = "terminal-bridge")]
+#[async_trait]
+impl LocalAgentStart for BridgeLocalStart {
+    async fn start_session(
+        &self,
+        agent: &str,
+        cwd: Option<&str>,
+        args: &[String],
+    ) -> anyhow::Result<String> {
+        aidaemon_terminal_bridge::request_local_start_session(agent, cwd, args).await
+    }
+}
+
+#[cfg(feature = "terminal-bridge")]
 /// Starts the bridge when the config allows it (see
 /// [`aidaemon_terminal_bridge::spawn_if_configured`]).
 pub fn spawn_if_configured(config: &AppConfig, state: Arc<dyn StateStore>) -> bool {
@@ -25,6 +65,7 @@ pub fn spawn_if_configured(config: &AppConfig, state: Arc<dyn StateStore>) -> bo
     )
 }
 
+#[cfg(feature = "terminal-bridge")]
 fn bridge_settings(config: &AppConfig) -> BridgeSettings {
     BridgeSettings {
         enabled: config.terminal.effective_bridge_enabled(),
@@ -56,6 +97,7 @@ fn bridge_settings(config: &AppConfig) -> BridgeSettings {
     }
 }
 
+#[cfg(feature = "terminal-bridge")]
 /// The configured daemon user id, else the first numeric Telegram owner id,
 /// else the first allowed user of a configured Telegram bot.
 fn resolve_daemon_user_id(config: &AppConfig, explicit: Option<u64>) -> Option<u64> {
@@ -77,6 +119,7 @@ fn resolve_daemon_user_id(config: &AppConfig, explicit: Option<u64>) -> Option<u
         .find_map(|bot| bot.allowed_user_ids.first().copied())
 }
 
+#[cfg(feature = "terminal-bridge")]
 fn resolve_daemon_bot_tokens(config: &AppConfig) -> Vec<String> {
     let mut out = Vec::new();
     for bot in config.all_telegram_bots() {
@@ -91,12 +134,14 @@ fn resolve_daemon_bot_tokens(config: &AppConfig) -> Vec<String> {
     out
 }
 
+#[cfg(feature = "terminal-bridge")]
 /// The bridge's host on the daemon's state store.
 struct StateBridgeHost {
     state: Arc<dyn StateStore>,
 }
 
-fn attach_handoff(handoff: crate::agent_handoff::TerminalAttachHandoff) -> AttachHandoff {
+#[cfg(feature = "terminal-bridge")]
+fn attach_handoff(handoff: TerminalAttachHandoff) -> AttachHandoff {
     AttachHandoff {
         code: handoff.code,
         relay_session_id: handoff.relay_session_id,
@@ -104,6 +149,7 @@ fn attach_handoff(handoff: crate::agent_handoff::TerminalAttachHandoff) -> Attac
     }
 }
 
+#[cfg(feature = "terminal-bridge")]
 #[async_trait]
 impl BridgeHost for StateBridgeHost {
     async fn runtime_bots(&self) -> anyhow::Result<Vec<RuntimeBot>> {
@@ -125,23 +171,19 @@ impl BridgeHost for StateBridgeHost {
         relay_session_id: &str,
         owner_user_id: u64,
     ) -> anyhow::Result<AttachHandoff> {
-        crate::agent_handoff::create_handoff_code(
-            self.state.as_ref(),
-            relay_session_id,
-            owner_user_id,
-        )
-        .await
-        .map(attach_handoff)
+        handoff::create_handoff_code(self.state.as_ref(), relay_session_id, owner_user_id)
+            .await
+            .map(attach_handoff)
     }
 
     async fn resolve_handoff_code(&self, code: &str) -> anyhow::Result<AttachHandoff> {
-        crate::agent_handoff::resolve_handoff_code(self.state.as_ref(), code)
+        handoff::resolve_handoff_code(self.state.as_ref(), code)
             .await
             .map(attach_handoff)
     }
 
     async fn consume_handoff_code(&self, code: &str) -> anyhow::Result<AttachHandoff> {
-        crate::agent_handoff::consume_handoff_code(self.state.as_ref(), code)
+        handoff::consume_handoff_code(self.state.as_ref(), code)
             .await
             .map(attach_handoff)
     }
@@ -151,7 +193,7 @@ impl BridgeHost for StateBridgeHost {
         owner_user_id: u64,
         relay_session_id: &str,
     ) -> anyhow::Result<()> {
-        crate::agent_handoff::set_last_active_relay_session_id(
+        handoff::set_last_active_relay_session_id(
             self.state.as_ref(),
             owner_user_id,
             relay_session_id,
@@ -163,8 +205,7 @@ impl BridgeHost for StateBridgeHost {
         &self,
         owner_user_id: u64,
     ) -> anyhow::Result<Option<String>> {
-        crate::agent_handoff::get_last_active_relay_session_id(self.state.as_ref(), owner_user_id)
-            .await
+        handoff::get_last_active_relay_session_id(self.state.as_ref(), owner_user_id).await
     }
 
     async fn bind_telegram_session_to_relay(
@@ -172,7 +213,7 @@ impl BridgeHost for StateBridgeHost {
         telegram_session_id: &str,
         relay_session_id: &str,
     ) -> anyhow::Result<()> {
-        crate::agent_handoff::bind_telegram_session_to_relay(
+        handoff::bind_telegram_session_to_relay(
             self.state.as_ref(),
             telegram_session_id,
             relay_session_id,
@@ -184,10 +225,6 @@ impl BridgeHost for StateBridgeHost {
         &self,
         telegram_session_id: &str,
     ) -> anyhow::Result<Option<String>> {
-        crate::agent_handoff::resolve_relay_for_telegram_session(
-            self.state.as_ref(),
-            telegram_session_id,
-        )
-        .await
+        handoff::resolve_relay_for_telegram_session(self.state.as_ref(), telegram_session_id).await
     }
 }

@@ -540,7 +540,7 @@ pub async fn run(
         });
     }
     #[cfg(feature = "terminal-bridge")]
-    crate::terminal_bridge::spawn_if_configured(&config, state.clone());
+    crate::startup::terminal_bridge::spawn_if_configured(&config, state.clone());
 
     // Wait for shutdown signal (ctrl+c), then gracefully pause plans
     info!("All subsystems started, waiting for a shutdown signal");
