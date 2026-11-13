@@ -7867,6 +7867,12 @@ impl Tool for TerminalTool {
                     "pid": {
                         "type": "integer",
                         "description": "Process ID for check/kill"
+                    },
+                    "checklist_items": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 0 },
+                        "uniqueItems": true,
+                        "description": "The indices of your checklist items this command carries out, so a change it makes settles them."
                     }
                 },
                 "required": ["action"],
@@ -7882,8 +7888,22 @@ impl Tool for TerminalTool {
     ) -> anyhow::Result<crate::tools::traits::ToolCallOutcome> {
         let status_tx = aidaemon_tools::status::status_sender(facts);
         let exec_ctx = facts.clone();
+        // The checklist items the command said it carries out: its typed
+        // link to the declared work, on its receipt.
+        let checklist_items: Vec<usize> = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| value.get("checklist_items").cloned())
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
 
-        self.execute_terminal(arguments, status_tx, &exec_ctx).await
+        self.execute_terminal(arguments, status_tx, &exec_ctx)
+            .await
+            .map(|mut outcome| {
+                if outcome.metadata.checklist_items.is_empty() {
+                    outcome.metadata.checklist_items = checklist_items;
+                }
+                outcome
+            })
     }
 }
 

@@ -912,6 +912,8 @@ impl RunAggregate {
             collection_observations: Vec<ToolCollectionObservation>,
             revision: u64,
             sequence: u64,
+            /// The declared items the call said it carries out.
+            checklist_items: Vec<usize>,
         }
         let mut receipts: Vec<RecordedReceipt> = self
             .operations
@@ -952,6 +954,7 @@ impl RunAggregate {
                     collection_observations: operation.collection_observations.clone(),
                     revision: operation.result_revision.unwrap_or(self.effect_revision),
                     sequence: operation.receipt_sequence.unwrap_or(0),
+                    checklist_items: operation.checklist_items.clone(),
                 }
             })
             .collect();
@@ -1028,6 +1031,28 @@ impl RunAggregate {
                     })?;
                     proof.push(observed);
                     Some(proof)
+                });
+                // A call that said it carries this item out (its typed
+                // `checklist_items`), finished, and changed something is the
+                // item's proof, even when the effect it could type is less
+                // specific than the item's (a shell command's start of a
+                // service). Live 2026-11-13: `ddev start` ran for "Start the
+                // WordPress project only if it is stopped" and the card
+                // still listed the step undone.
+                let index: Option<usize> = id
+                    .rsplit_once("/obligation:checklist:")
+                    .and_then(|(_, index)| index.parse().ok());
+                let proof = proof.or_else(|| {
+                    let index = index?;
+                    receipts
+                        .iter()
+                        .find(|receipt| {
+                            receipt.succeeded
+                                && receipt.dispatched
+                                && !receipt.proven_effects.is_empty()
+                                && receipt.checklist_items.contains(&index)
+                        })
+                        .map(|receipt| vec![receipt])
                 });
                 let Some(proof) = proof else {
                     continue;
@@ -7073,6 +7098,71 @@ mod tests {
         ));
         renumber(&mut events);
         assert!(!RunAggregate::replay("task-1", &events).declared_work_unattempted());
+    }
+
+    /// Live 2026-11-13: `ddev start` ran for "Start the WordPress project
+    /// only if it is stopped" (a process-state step), and the card listed
+    /// the step undone beside the started project: a shell command's effect
+    /// types as unspecified, which never proves a specific one. A call that
+    /// names the item it carries out and changed something proves it.
+    #[test]
+    fn a_change_that_names_its_item_settles_it() {
+        let start = checklist_item(0, ToolMutationEffects::PROCESS_STATE, false, &[], "pending");
+        let unspecified =
+            || ToolCallSemantics::observation_and_mutation_with(ToolMutationEffects::UNSPECIFIED);
+        let mut events = vec![
+            declared_with_outcome(vec![start.clone()], None),
+            call("start", "terminal"),
+            result(
+                "start",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                unspecified(),
+            ),
+        ];
+        renumber(&mut events);
+        let id = "task:task-1/obligation:checklist:0";
+        assert_eq!(
+            RunAggregate::replay("task-1", &events).obligations[id].state,
+            RunObligationState::Pending
+        );
+        let mut named = result(
+            "start-2",
+            "terminal",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            unspecified(),
+        );
+        named.data["receipt"]["checklist_items"] = serde_json::json!([0]);
+        events.push(call("start-2", "terminal"));
+        events.push(named);
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations[id].state,
+            RunObligationState::Satisfied
+        );
+        // A call that failed, or changed nothing, proves nothing however it
+        // is named.
+        let mut failed = vec![
+            declared_with_outcome(vec![start], None),
+            call("start-3", "terminal"),
+        ];
+        let mut refused = result(
+            "start-3",
+            "terminal",
+            ToolOutcomeStatus::FailedPermanent,
+            1,
+            unspecified(),
+        );
+        refused.data["receipt"]["checklist_items"] = serde_json::json!([0]);
+        failed.push(refused);
+        renumber(&mut failed);
+        assert_eq!(
+            RunAggregate::replay("task-1", &failed).obligations[id].state,
+            RunObligationState::Pending
+        );
     }
 
     /// The compiled contract carrying the owner's units (what, asks for
