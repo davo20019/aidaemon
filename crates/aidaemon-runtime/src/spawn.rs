@@ -3,13 +3,18 @@
 //! child had done, and the plain child's prompt. Building and running the
 //! child itself is the host's.
 
-use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use aidaemon_agents::specialist::SpecialistKind;
+use aidaemon_channels::context::ChannelContext;
+use aidaemon_channels::ports::{AgentResponseEnvelope, OutboundRouter};
 use aidaemon_events::traits::AgentRole;
 use aidaemon_events::{EventType, TaskEndData, TaskOutcome};
+use aidaemon_tools::semantics::UserRole;
 use aidaemon_tools::status::StatusUpdate;
+use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -707,4 +712,259 @@ pub fn task_lead_execution_mode(is_scheduled: bool) -> &'static str {
          (cli_agent errors, spawn_agent blocked, executor failures), switch to direct \
          execution with your own tools rather than retrying broken delegation paths."
     }
+}
+
+// ---- The child-agent and conversation ports ----
+//
+// What `spawn_agent` and background completions need from the agent that
+// runs them, so those tools need no concrete agent.
+
+/// Result returned by a delegated child-agent run.
+#[derive(Debug)]
+pub struct ChildAgentRun {
+    /// The child's own session.
+    pub session: String,
+    pub response: String,
+    pub outcome: TaskOutcome,
+    /// `Untrusted` when the child's run read (or started with) content
+    /// someone other than the owner wrote.
+    pub trust: aidaemon_core::SourceTrust,
+}
+
+/// How long a child may go without progress (no model or tool call running
+/// and no event of its own) before it is stopped. Never a limit on how long
+/// it runs: a child that keeps working is bounded by its budgets.
+#[derive(Debug, Clone, Copy)]
+pub struct ChildTimeLimit {
+    pub limit: std::time::Duration,
+}
+
+/// The child was stopped by the owner from the chat (`/cancel`, or a stop
+/// request read as one).
+#[derive(Debug)]
+pub struct ChildStoppedByOwner;
+
+impl std::fmt::Display for ChildStoppedByOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stopped by the owner")
+    }
+}
+
+impl std::error::Error for ChildStoppedByOwner {}
+
+/// A child made no progress for its idle limit and was stopped.
+#[derive(Debug)]
+pub struct ChildTimedOut {
+    pub limit_secs: u64,
+    pub report: ChildWorkReport,
+}
+
+impl std::fmt::Display for ChildTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Specialist timed out: no progress for {} seconds",
+            self.limit_secs
+        )
+    }
+}
+
+impl std::error::Error for ChildTimedOut {}
+
+impl ChildTimedOut {
+    /// What the parent needs to decide whether running it again is safe.
+    pub fn render(&self) -> String {
+        if !self.report.may_have_changed_something() {
+            return format!(
+                "The sub-agent made no progress for {} seconds and was stopped. It only \
+                 used read-only tools, so running it again is safe.",
+                self.limit_secs
+            );
+        }
+        let mut text = format!(
+            "The sub-agent made no progress for {} seconds and was stopped, but some of its \
+             work may already have taken effect. Do NOT run it again until you have checked \
+             the state of the items below: repeating them could duplicate side effects.",
+            self.limit_secs
+        );
+        if self.report.unknown {
+            text.push_str("\n\nIts action records could not be read in full.");
+        }
+        if !self.report.changed.is_empty() {
+            text.push_str("\n\nActions it completed:");
+            for item in &self.report.changed {
+                text.push_str("\n- ");
+                text.push_str(item);
+            }
+        }
+        if !self.report.unfinished.is_empty() {
+            text.push_str("\n\nStill running when it was stopped (outcome unknown):");
+            for item in &self.report.unfinished {
+                text.push_str("\n- ");
+                text.push_str(item);
+            }
+        }
+        text
+    }
+}
+
+/// Owned input for a child-agent run. Using an owned request keeps the port
+/// object-safe and safe to move into background tasks.
+pub struct ChildAgentRequest {
+    pub mission: String,
+    pub task: String,
+    pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    pub channel_ctx: ChannelContext,
+    pub user_role: UserRole,
+    pub child_role: Option<AgentRole>,
+    pub goal_id: Option<String>,
+    pub task_id: Option<String>,
+    pub project_scope: Option<String>,
+    pub specialist: Option<String>,
+    pub approval_session_id: Option<String>,
+    /// The spawning turn's actual authority, taint and root request
+    /// (dispatcher-injected; `None` falls back to re-resolution).
+    pub parent_authority: Option<crate::authority::InheritedAuthority>,
+    /// `None` leaves the child unlimited.
+    pub time_limit: Option<ChildTimeLimit>,
+    pub model_tier: Option<aidaemon_providers::routing::Tier>,
+}
+
+/// Child-delegation capability required by `spawn_agent`.
+#[async_trait]
+pub trait ChildAgentRuntime: Send + Sync {
+    fn depth(&self) -> usize;
+    fn max_depth(&self) -> usize;
+    fn role(&self) -> AgentRole;
+    fn specialist_descriptions(&self) -> Vec<(String, String)>;
+
+    /// The names of the tools this agent has, which bound what it can grant
+    /// a child. `None`: not known (the grant is then checked only against
+    /// the agent's own authority).
+    fn tool_names(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    async fn validate_executor_task_for_spawn(
+        &self,
+        task_id: &str,
+        expected_goal_id: Option<&str>,
+    ) -> anyhow::Result<()>;
+
+    async fn run_child(&self, request: ChildAgentRequest) -> anyhow::Result<ChildAgentRun>;
+
+    /// The paths a child's declared scope names, as the file tools resolve
+    /// them.
+    async fn resolve_child_scope(&self, scope: Vec<String>) -> Vec<String> {
+        scope
+    }
+
+    /// A token that stops the background child `id` when the owner cancels.
+    async fn background_cancel_token(
+        &self,
+        _id: &str,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        None
+    }
+
+    /// Forget the token of a background child that has ended.
+    async fn release_background_cancel_token(&self, _id: &str) {}
+
+    /// The session a background child's result belongs to, given the session
+    /// of the call that spawned it.
+    fn background_delivery_session(&self, call_session: &str) -> String {
+        call_session.to_string()
+    }
+
+    async fn salvage_executor_task_outcome(
+        &self,
+        task_id: &str,
+        timeout_secs: u64,
+    ) -> Option<SalvagedTaskOutcome>;
+
+    async fn mark_executor_task_timeout(&self, task_id: &str, timeout_secs: u64);
+
+    async fn deliver_background_child_result(
+        &self,
+        router: Option<&Weak<dyn OutboundRouter>>,
+        parent_session_id: &str,
+        text: &str,
+        trust: aidaemon_core::SourceTrust,
+    ) -> anyhow::Result<bool>;
+}
+
+/// Owned input for re-entering an existing conversation.
+pub struct ConversationRequest {
+    pub session_id: String,
+    pub user_text: String,
+    pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    pub user_role: UserRole,
+    pub channel_ctx: ChannelContext,
+    pub heartbeat: Option<Arc<AtomicU64>>,
+    /// Typed lifecycle edge back to the task whose background receipt caused
+    /// this continuation.
+    pub parent_task_id: Option<String>,
+    pub parent_tool_call_id: Option<String>,
+    pub parent_result_id: Option<String>,
+}
+
+/// Minimal agent surface needed by background command/CLI completion paths.
+#[async_trait]
+pub trait ConversationRuntime: Send + Sync {
+    async fn continue_conversation(
+        &self,
+        request: ConversationRequest,
+    ) -> anyhow::Result<AgentResponseEnvelope>;
+
+    async fn record_continuation_delivery(
+        &self,
+        session_id: &str,
+        delivery: aidaemon_events::ResponseDeliveryData,
+    ) -> anyhow::Result<()>;
+}
+
+// ---- Building a child ----
+
+/// What a parent asks its host to build for one child: its tools, model and
+/// prompt, where it stands in the tree, and what it inherited.
+pub struct ChildSpec {
+    /// The child's tools (the host adds `spawn_agent` when `add_spawn_tool`).
+    pub tools: Vec<Arc<dyn aidaemon_tools::OutcomeTool>>,
+    pub model: String,
+    pub system_prompt: String,
+    pub depth: usize,
+    pub role: AgentRole,
+    pub task_id: Option<String>,
+    pub goal_id: Option<String>,
+    pub mandate_execution: Option<crate::turn_runtime::MandateExecutionFence>,
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// The root agent's full tool list, for a task lead's executors.
+    pub root_tools: Option<Vec<Arc<dyn aidaemon_tools::OutcomeTool>>>,
+    pub add_spawn_tool: bool,
+    pub inherited_project_scope: Option<String>,
+    pub approval_session_id: Option<String>,
+    pub max_iterations_override: Option<usize>,
+    pub timeout_secs_override: Option<u64>,
+    pub inherited_authority: crate::authority::InheritedAuthority,
+    /// The child's progress clock: what keeps it from being stopped as idle.
+    pub child_progress: Option<aidaemon_channels::owner_wait::ProgressClock>,
+}
+
+/// A child agent its host built: a turn host of its own that runs turns.
+#[async_trait]
+pub trait ChildAgent: crate::host::TurnHost {
+    /// Run one turn of the child.
+    async fn handle_message(
+        &self,
+        session_id: &str,
+        user_text: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        user_role: UserRole,
+        channel_ctx: ChannelContext,
+        heartbeat: Option<Arc<AtomicU64>>,
+    ) -> anyhow::Result<String>;
+
+    /// Set once any turn of the child read (or started with) untrusted
+    /// content, even when the taint could not be recorded.
+    fn read_untrusted(&self) -> Arc<std::sync::atomic::AtomicBool>;
 }

@@ -196,6 +196,12 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
     /// Cancel the finite work the session started (background task leads
     /// and executors); what was cancelled.
     async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String>;
+    /// Build a child of this agent: a fresh agent sharing this one's model
+    /// runtime, stores, hub, approvals and sub-agent registry.
+    async fn create_child(
+        &self,
+        spec: crate::spawn::ChildSpec,
+    ) -> std::sync::Arc<dyn crate::spawn::ChildAgent>;
     /// The agent's tools (their task-end hooks run when a task ends).
     fn tools(&self) -> &[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>];
 }

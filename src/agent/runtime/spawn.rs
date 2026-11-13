@@ -1302,27 +1302,28 @@ impl Agent {
         }))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn create_child_agent(
-        &self,
-        mut tools: Vec<Arc<dyn Tool>>,
-        model: String,
-        system_prompt: String,
-        child_depth: usize,
-        role: AgentRole,
-        task_id: Option<String>,
-        goal_id: Option<String>,
-        mandate_execution: Option<super::MandateExecutionFence>,
-        cancel_token: Option<tokio_util::sync::CancellationToken>,
-        root_tools: Option<Vec<Arc<dyn Tool>>>,
-        add_spawn_tool: bool,
-        inherited_project_scope: Option<String>,
-        approval_session_id: Option<String>,
-        max_iterations_override: Option<usize>,
-        timeout_secs_override: Option<u64>,
-        inherited_authority: crate::agent::authority::InheritedAuthority,
-        child_progress: Option<crate::tools::ProgressClock>,
-    ) -> Arc<Agent> {
+    /// Build a child of this agent from `spec` (the host side of
+    /// [`aidaemon_runtime::host::TurnHost::create_child`]).
+    pub(in crate::agent) async fn create_child_agent(&self, spec: ChildSpec) -> Arc<Agent> {
+        let ChildSpec {
+            mut tools,
+            model,
+            system_prompt,
+            depth: child_depth,
+            role,
+            task_id,
+            goal_id,
+            mandate_execution,
+            cancel_token,
+            root_tools,
+            add_spawn_tool,
+            inherited_project_scope,
+            approval_session_id,
+            max_iterations_override,
+            timeout_secs_override,
+            inherited_authority,
+            child_progress,
+        } = spec;
         let hub = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
             Ok(guard) => guard.clone(),
             Err(_) => {
@@ -2437,12 +2438,13 @@ impl Agent {
             let declaration = parent_authority.child_declaration.clone()?;
             Some((family.coordination(), declaration))
         });
-        let child = self
-            .create_child_agent(
-                scoped_tools,
+        let child = aidaemon_runtime::host::TurnHost::create_child(
+            self,
+            ChildSpec {
+                tools: scoped_tools,
                 model,
                 system_prompt,
-                child_depth,
+                depth: child_depth,
                 role,
                 task_id,
                 goal_id,
@@ -2450,16 +2452,17 @@ impl Agent {
                 cancel_token,
                 root_tools,
                 add_spawn_tool,
-                effective_project_scope,
-                effective_approval_session_id.clone(),
+                inherited_project_scope: effective_project_scope,
+                approval_session_id: effective_approval_session_id.clone(),
                 max_iterations_override,
                 timeout_secs_override,
-                parent_authority,
-                progress.clone(),
-            )
-            .await;
+                inherited_authority: parent_authority,
+                child_progress: progress.clone(),
+            },
+        )
+        .await;
         let child_session_for_events = child_session.clone();
-        let child_read_untrusted = child.read_untrusted.clone();
+        let child_read_untrusted = child.read_untrusted();
         let outcome_coordination = roster_coordination
             .as_ref()
             .map(|(coordination, _)| coordination.clone());

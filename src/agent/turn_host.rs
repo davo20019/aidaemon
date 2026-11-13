@@ -309,7 +309,42 @@ impl TurnHost for Agent {
         Agent::cancel_active_finite_work_for_session(self, session_id).await
     }
 
+    async fn create_child(
+        &self,
+        spec: aidaemon_runtime::spawn::ChildSpec,
+    ) -> std::sync::Arc<dyn aidaemon_runtime::spawn::ChildAgent> {
+        self.create_child_agent(spec).await
+    }
+
     fn tools(&self) -> &[std::sync::Arc<dyn crate::traits::Tool>] {
         &self.tools
+    }
+}
+
+#[async_trait::async_trait]
+impl aidaemon_runtime::spawn::ChildAgent for Agent {
+    async fn handle_message(
+        &self,
+        session_id: &str,
+        user_text: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        user_role: crate::types::UserRole,
+        channel_ctx: crate::types::ChannelContext,
+        heartbeat: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    ) -> anyhow::Result<String> {
+        Agent::handle_message(
+            self,
+            session_id,
+            user_text,
+            status_tx,
+            user_role,
+            channel_ctx,
+            heartbeat,
+        )
+        .await
+    }
+
+    fn read_untrusted(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.read_untrusted.clone()
     }
 }
