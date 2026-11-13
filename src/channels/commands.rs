@@ -173,11 +173,27 @@ impl CommandHost for DaemonCommandHost {
                 };
                 let at = at.with_timezone(&Utc);
                 if next.as_ref().is_none_or(|(earliest, _)| at < *earliest) {
-                    // The owner's name for it reads better than the instruction.
-                    let what =
-                        aidaemon_work::automations::name_from_context(goal.context.as_deref())
-                            .unwrap_or_else(|| goal.description.clone());
-                    next = Some((at, what));
+                    // The owner's name for it: an automation's, else its
+                    // mandate's, else what `scheduled_name` allows.
+                    let name = match aidaemon_work::automations::name_from_context(
+                        goal.context.as_deref(),
+                    ) {
+                        Some(name) => Some(name),
+                        None => self
+                            .state
+                            .get_mandate_for_goal(&goal.id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|mandate| mandate.name),
+                    };
+                    next = Some((
+                        at,
+                        aidaemon_channels::slash::scheduled_name(
+                            name.as_deref(),
+                            &goal.description,
+                        ),
+                    ));
                 }
             }
         }

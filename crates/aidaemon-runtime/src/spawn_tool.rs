@@ -1220,17 +1220,17 @@ impl Tool for SpawnAgentTool {
                 "properties": {
                     "mission": {
                         "type": "string",
-                        "description": "Optional: high-level mission or role for the sub-agent \
-                            (e.g. 'Research assistant focused on Python packaging'). Left out, \
-                            it is the title."
+                        "description": "Optional: the wider goal this work serves, for the \
+                            sub-agent's own context. Left out, it is the title."
                     },
                     "title": {
                         "type": "string",
-                        "description": "A short name for this sub-agent that the owner reads on its \
-                            status lines and approval cards: a few plain words naming its job and, \
-                            when the work creates or works in a folder, that folder's name, so the \
-                            owner sees where it goes from the start (e.g. 'Drupal install in \
-                            claude-drupal-6', 'Price research'), never a sentence."
+                        "description": "What this sub-agent does, in a few plain words the owner \
+                            reads on its card and approval cards: the task itself, as the owner \
+                            would say it, and, when the work creates or works in a folder, that \
+                            folder's name, so the owner sees where it goes from the start (e.g. \
+                            'Count the lines in numbers.txt', 'Install Drupal in claude-drupal-6'). \
+                            It names the work, not the sub-agent doing it, and is never a sentence."
                     },
                     "task": {
                         "type": "string",

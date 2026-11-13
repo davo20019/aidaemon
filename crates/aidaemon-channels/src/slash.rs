@@ -134,7 +134,7 @@ pub fn shared_commands() -> Vec<CommandDef> {
         },
         CommandDef {
             name: "work",
-            description: "View and manage durable work",
+            description: "See and manage longer work that waits or runs on its own",
             usage: Some("/work [ready|running|blocked|show|comment|unblock|retry]"),
             category: CommandCategory::Core,
         },
@@ -261,10 +261,28 @@ pub trait CommandHost: Send + Sync {
 /// One scheduled item as `/status` shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledItem {
-    /// What runs, in the owner's words (`/status` cuts it at a word).
+    /// What runs, as [`scheduled_name`] names it.
     pub what: String,
     /// When, already in the owner's local time ("2:39 PM ET").
     pub when: String,
+}
+
+/// The most a scheduled item's description may run to and still stand as
+/// its name on `/status`.
+const SCHEDULED_NAME_MAX: usize = 60;
+
+/// What `/status` calls a scheduled item: the name its owner gave it, else
+/// its description when that fits whole, else that it has no name. Never a
+/// sentence cut short (live 2026-11-13: "…blog at…").
+pub fn scheduled_name(name: Option<&str>, description: &str) -> String {
+    if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
+        return name.to_string();
+    }
+    let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !description.is_empty() && description.chars().count() <= SCHEDULED_NAME_MAX {
+        return description;
+    }
+    "An automation without a name (see /work)".to_string()
 }
 
 /// What `/status` reports, read from typed state.
@@ -324,7 +342,8 @@ pub fn render_tasks(
     let stamp = stamp.as_deref().unwrap_or("");
     if running.entries.is_empty() && failed.is_empty() {
         return format!(
-            "{stamp}Nothing is running in this chat right now. Use /work to see durable work items."
+            "{stamp}Nothing is running in this chat right now. Use /work for longer work that \
+             waits or runs on its own."
         );
     }
     let mut sections = Vec::new();
@@ -352,7 +371,7 @@ pub fn render_tasks(
             .collect();
         sections.push(format!("Recently failed:\n{}", lines.join("\n")));
     }
-    sections.push("Use /work for durable work items.".to_string());
+    sections.push("Use /work for longer work that waits or runs on its own.".to_string());
     format!("{stamp}{}", sections.join("\n\n"))
 }
 
@@ -377,11 +396,7 @@ pub fn render_status(view: &StatusView, now: DateTime<Utc>) -> String {
         }
     }
     lines.push(match &view.next_scheduled {
-        Some(item) => format!(
-            "Next scheduled: {} – {}",
-            crate::presentation::word_preview(&item.what, 80),
-            item.when
-        ),
+        Some(item) => format!("Next scheduled: {} – {}", item.what, item.when),
         None => "Next scheduled: nothing.".to_string(),
     });
     lines.join("\n")
@@ -1251,19 +1266,22 @@ mod help_and_status_tests {
             status.ends_with("Next scheduled: Check disk space – 2:39 PM ET"),
             "{status}"
         );
+    }
 
-        // A long description is cut at a word, never mid-word.
-        let long = StatusView {
-            next_scheduled: Some(ScheduledItem {
-                what: "Every day, independently manage and publish to the synthetic blog at https://blog.example.test following the editorial plan".to_string(),
-                when: "Fri, Nov 13, 6:00 AM ET".to_string(),
-            }),
-            ..busy
-        };
-        let status = render_status(&long, now);
-        let next = status.lines().last().unwrap();
-        assert!(next.contains("… – Fri, Nov 13, 6:00 AM ET"), "{next}");
-        assert!(next.contains("Every day, independently manage"), "{next}");
+    /// A scheduled item is named by a rule, never by a sentence cut short:
+    /// its owner's name for it, else a description that fits whole, else
+    /// that it has no name.
+    #[test]
+    fn a_scheduled_item_is_named_never_cut() {
+        let long = "Every day, independently manage and publish to the synthetic blog at \
+                    https://blog.example.test following the editorial plan";
+        assert_eq!(scheduled_name(Some(" Daily blog "), long), "Daily blog");
+        assert_eq!(scheduled_name(None, "Check disk space"), "Check disk space");
+        let unnamed = scheduled_name(None, long);
+        assert_eq!(unnamed, "An automation without a name (see /work)");
+        for name in [unnamed, scheduled_name(Some("Daily blog"), long)] {
+            assert!(!name.contains('…') && !name.contains("..."), "{name}");
+        }
     }
 }
 
