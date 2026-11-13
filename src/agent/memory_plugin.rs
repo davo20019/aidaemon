@@ -37,7 +37,9 @@ pub(crate) use opt_out::{
 };
 pub(crate) use recall::DaemonRecall;
 pub(crate) use system_memory::SystemMemory;
-pub(in crate::agent) use tool_facts::{memory_tool_facts, register_memory_system_tool};
+#[cfg(test)]
+pub(in crate::agent) use tool_facts::memory_tool_facts;
+pub(in crate::agent) use tool_facts::register_memory_system_tool;
 pub(crate) use writer::{DaemonMemoryWriter, MemoryWrites, WriterSettings};
 
 /// The daemon's built-in memory tools. Offered only while the active plugin

@@ -17,6 +17,10 @@ impl TurnStores for Agent {
         &*self.state
     }
 
+    fn goals(&self) -> &dyn aidaemon_work::stores::GoalStore {
+        &*self.state
+    }
+
     fn events(&self) -> &EventStore {
         &self.event_store
     }
@@ -62,6 +66,26 @@ impl TurnHost for Agent {
 
     fn is_worker(&self) -> bool {
         self.depth > 0 || self.mandate_execution.is_some()
+    }
+
+    fn works_for_mandate(&self) -> bool {
+        self.mandate_execution.is_some()
+    }
+
+    fn role(&self) -> crate::traits::AgentRole {
+        Agent::role(self)
+    }
+
+    fn goal_id(&self) -> Option<&str> {
+        self.goal_id.as_deref()
+    }
+
+    fn inherited_project_scope(&self) -> Option<&str> {
+        self.inherited_project_scope.as_deref()
+    }
+
+    fn inbox_dir(&self) -> Option<&std::path::Path> {
+        self.inbox_dir.as_deref()
     }
 
     fn inherited_authority(&self) -> Option<&aidaemon_runtime::authority::InheritedAuthority> {

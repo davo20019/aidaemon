@@ -21,6 +21,8 @@ pub trait TurnStores: Send + Sync {
     fn dialogue_states(&self) -> &dyn DialogueStateStore;
     /// The conversation's messages and its durable context boundary.
     fn messages(&self) -> &dyn MessageStore;
+    /// Goals (a goal's bound workspace scopes its tasks' turns).
+    fn goals(&self) -> &dyn aidaemon_work::stores::GoalStore;
     /// The event log.
     fn events(&self) -> &EventStore;
 }
@@ -58,9 +60,20 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
     /// worker): its transcript is an authority envelope, not a conversation
     /// with the user.
     fn is_worker(&self) -> bool;
+    /// Whether this agent is a mandate's worker (bound to one decision
+    /// cycle's run).
+    fn works_for_mandate(&self) -> bool;
     /// What a spawned child inherited from the turn that spawned it; `None`
     /// for a root agent.
     fn inherited_authority(&self) -> Option<&crate::authority::InheritedAuthority>;
+    /// The agent's role in its tree.
+    fn role(&self) -> aidaemon_events::traits::AgentRole;
+    /// The goal a task lead works for.
+    fn goal_id(&self) -> Option<&str>;
+    /// The project scope a spawned child was handed.
+    fn inherited_project_scope(&self) -> Option<&str>;
+    /// Where received attachments are saved: daemon storage, never a project.
+    fn inbox_dir(&self) -> Option<&std::path::Path>;
     /// The agent's tools (their task-end hooks run when a task ends).
     fn tools(&self) -> &[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>];
 }

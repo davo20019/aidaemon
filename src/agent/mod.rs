@@ -15,7 +15,7 @@ use crate::config::{IterationLimitConfig, PathAliasConfig};
 use crate::events::{
     AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
     SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData, TaskStatus,
-    ThinkingStartData, ToolCallInfo, ToolResultData,
+    ThinkingStartData, ToolResultData,
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
@@ -28,10 +28,14 @@ use crate::runtime_ports::OutboundRouter;
 use crate::skills;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{
-    AgentRole, ChatOptions, Message, StateStore, Tool, ToolCall, ToolCapabilities, ToolRole,
+    AgentRole, ChatOptions, Message, StateStore, Tool, ToolCapabilities, ToolRole,
 };
 use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
+#[cfg(test)]
+use crate::events::ToolCallInfo;
+#[cfg(test)]
+use crate::traits::ToolCall;
 pub use crate::types::StatusUpdate;
 // `Task` is consumed only by in-tree `#[cfg(test)]` modules that import the
 // agent namespace via `use super::*` (e.g. `runtime/goal_failure_tests.rs`).
@@ -214,6 +218,8 @@ mod spawn;
 mod turn_host;
 /// What the owner reads for a helper on cards, status lines and timing.
 pub(crate) use aidaemon_runtime::spawn::child_status_label as helper_card_label;
+/// The session history appends and turn-context assembly, on any TurnHost.
+pub(in crate::agent) use aidaemon_runtime::turn::turn_context::TurnHistory;
 /// The speech-to-text fallback lives in `aidaemon-runtime`.
 pub(crate) mod stt {
     pub(crate) use aidaemon_runtime::media::stt::*;
