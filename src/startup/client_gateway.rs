@@ -25,6 +25,74 @@ pub(crate) fn token_file(config: &ClientGatewayConfig) -> PathBuf {
     }
 }
 
+/// Where the owner's own copy of the local token is kept, next to its hash,
+/// readable by the owner only, so `aidaemon tui` and `aidaemon web` need no
+/// flags. Same trust as the config and the database beside it.
+pub(crate) fn client_token_file(config: &ClientGatewayConfig) -> PathBuf {
+    token_file(config).with_file_name("client-token")
+}
+
+/// The `[client_gateway]` table of the config file, read without resolving
+/// the rest (which would touch the keychain). Missing or invalid: defaults.
+pub(crate) fn settings_from_file(config_path: &std::path::Path) -> ClientGatewayConfig {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("client_gateway").cloned())
+        .and_then(|value| value.try_into().ok())
+        .unwrap_or_default()
+}
+
+/// Mint a new local token (revoking the old one at once), keep its hash for
+/// the gateway and the owner's copy in [`client_token_file`]. Returns the
+/// copy's path; the token itself is never printed or returned.
+pub(crate) fn mint_local_token(config: &ClientGatewayConfig) -> std::io::Result<PathBuf> {
+    let token = aidaemon_client_gateway::token::mint(&token_file(config))?;
+    let path = client_token_file(config);
+    write_owner_only(&path, &format!("{token}\n"))?;
+    Ok(path)
+}
+
+/// The local token: `AIDAEMON_CLIENT_TOKEN`, else the owner's copy. A copy
+/// that no longer matches the gateway's hash (minted elsewhere) is `None`.
+pub(crate) fn local_token(config: &ClientGatewayConfig) -> Option<String> {
+    if let Ok(token) = std::env::var("AIDAEMON_CLIENT_TOKEN") {
+        if !token.trim().is_empty() {
+            return Some(token.trim().to_string());
+        }
+    }
+    let token = std::fs::read_to_string(client_token_file(config)).ok()?;
+    let token = token.trim().to_string();
+    aidaemon_client_gateway::token::verify(&token_file(config), &token).then_some(token)
+}
+
+/// The local token, minting one when there is none that still works.
+pub(crate) fn local_token_or_mint(config: &ClientGatewayConfig) -> anyhow::Result<String> {
+    if let Some(token) = local_token(config) {
+        return Ok(token);
+    }
+    let path = mint_local_token(config)?;
+    eprintln!(
+        "Minted a local Client Gateway token (saved to {}).",
+        path.display()
+    );
+    local_token(config).ok_or_else(|| anyhow::anyhow!("the token just minted does not verify"))
+}
+
+fn write_owner_only(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
 /// The daemon as the gateway's host.
 pub(crate) struct DaemonClientHost {
     pub state: Arc<dyn StateStore>,

@@ -488,8 +488,10 @@ include_raw_tool_args = false
 
 # The Client Gateway (/client/v1): lets your own apps (a terminal UI, a web
 # page) chat with the agent, watch every chat's turns and answer approvals.
-# Off by default; loopback only. Mint the local token with
-# `aidaemon client-token` (it prints the token once). Pair a phone or browser
+# Off by default; loopback only. Turn it on here or ask the agent to "enable
+# the client gateway", restart, then run `aidaemon tui` (terminal) or
+# `aidaemon web` (browser); the local token is minted on first use and saved
+# at ~/.aidaemon/client-token. Pair a phone or another browser
 # with /pair_device in a chat or `aidaemon pair`; the web client is served
 # at /client/v1/app. /devices lists them, /revoke_device <id> cuts one off.
 # [client_gateway]

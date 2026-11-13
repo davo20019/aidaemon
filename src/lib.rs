@@ -295,7 +295,13 @@ pub fn run() -> anyhow::Result<()> {
                 return handle_client_token_command(&args[2..], config_path.as_path());
             }
             "pair" => {
-                return handle_pair_command(&args[2..], config_path.as_path());
+                return handle_pair_command(&args[2..], config_path.as_path(), false);
+            }
+            "web" => {
+                return handle_pair_command(&args[2..], config_path.as_path(), true);
+            }
+            "tui" => {
+                return handle_tui_command(&args[2..], config_path.as_path());
             }
             other => {
                 if let Some(agent) = normalize_terminal_agent_name(other) {
@@ -693,67 +699,124 @@ fn handle_agent_command(args: &[String]) -> anyhow::Result<()> {
     }
 }
 
-/// `aidaemon client-token [--path FILE]`: mint the local token the Client
-/// Gateway accepts (its hash goes to the gateway's token file; the token is
-/// printed once). Minting again revokes the previous token.
+/// `aidaemon client-token [--print]`: mint the local token the Client
+/// Gateway accepts. Its hash goes to the gateway's token file and the
+/// owner's copy to `~/.aidaemon/client-token` (owner-only), which
+/// `aidaemon tui`, `aidaemon web` and `aidaemon pair` read; `--print` also
+/// writes it to stdout for scripts. Minting again revokes the previous token.
 fn handle_client_token_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
-    let mut path: Option<PathBuf> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--path" => {
-                let Some(value) = args.get(i + 1) else {
-                    anyhow::bail!("Missing value for --path");
-                };
-                path = Some(PathBuf::from(value));
-                i += 2;
-            }
+    let mut print = false;
+    for arg in args {
+        match arg.as_str() {
+            "--print" => print = true,
             "-h" | "--help" => {
-                println!("Usage: aidaemon client-token [--path FILE]");
+                println!("Usage: aidaemon client-token [--print]");
                 println!();
                 println!("Mint the token local apps use with the Client Gateway");
-                println!("([client_gateway] in config.toml). The old token stops working.");
+                println!("([client_gateway] in config.toml) and save it for `aidaemon tui`");
+                println!("and `aidaemon web`. The old token stops working. --print also");
+                println!("writes it to stdout, for scripts (Authorization: Bearer <token>).");
                 return Ok(());
             }
             other => anyhow::bail!("Unknown client-token option: {other}"),
         }
     }
-    let path = match path {
-        Some(path) => path,
-        None => {
-            // Read only the gateway's table: loading the whole config would
-            // resolve secrets from the keychain.
-            crate::startup::client_gateway::token_file(&client_gateway_settings(config_path))
-        }
-    };
-    let token = aidaemon_client_gateway::token::mint(&path)?;
-    println!("{token}");
+    // Read only the gateway's table: loading the whole config would
+    // resolve secrets from the keychain.
+    let settings = crate::startup::client_gateway::settings_from_file(config_path);
+    let path = crate::startup::client_gateway::mint_local_token(&settings)?;
+    if print {
+        println!("{}", std::fs::read_to_string(&path)?.trim());
+    }
     eprintln!(
-        "Client Gateway token minted (hash kept at {}). Use it as `Authorization: Bearer <token>`; \
-         it is not shown again.",
+        "Client Gateway token minted and saved to {} (owner-only). The old token stops working.",
         path.display()
     );
     Ok(())
 }
 
-/// The `[client_gateway]` table of the config file, read without resolving
-/// the rest (which would touch the keychain).
-fn client_gateway_settings(config_path: &Path) -> aidaemon_client_gateway::ClientGatewayConfig {
-    std::fs::read_to_string(config_path)
-        .ok()
-        .and_then(|text| text.parse::<toml::Table>().ok())
-        .and_then(|table| table.get("client_gateway").cloned())
-        .and_then(|value| value.try_into().ok())
-        .unwrap_or_default()
+/// The gateway's settings for a client command, or the steps to turn it on.
+fn client_gateway_ready(
+    config_path: &Path,
+) -> anyhow::Result<aidaemon_client_gateway::ClientGatewayConfig> {
+    let settings = crate::startup::client_gateway::settings_from_file(config_path);
+    anyhow::ensure!(
+        settings.enabled,
+        "The Client Gateway is off. Ask the agent to \"enable the client gateway\", or add\n\n\
+         [client_gateway]\nenabled = true\n\n\
+         to {} and restart the daemon (/restart in a chat).",
+        config_path.display()
+    );
+    Ok(settings)
 }
 
-/// `aidaemon pair [--token-file FILE]`: make a pairing offer on the running
-/// daemon's Client Gateway, show its code and a QR code of the web client's
-/// link, and confirm the device here when it redeems the offer. Uses the
-/// owner's local token (`AIDAEMON_CLIENT_TOKEN`, or `--token-file`).
-fn handle_pair_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
+/// `aidaemon tui [--device NAME]`: the terminal client on the running
+/// daemon's Client Gateway, with the gateway's own address and the local
+/// token (minted on first use).
+fn handle_tui_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
+    let mut device = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--device" => {
+                let Some(value) = args.get(i + 1) else {
+                    anyhow::bail!("Missing value for --device");
+                };
+                device = Some(value.clone());
+                i += 2;
+            }
+            "-h" | "--help" => {
+                println!("Usage: aidaemon tui [--device NAME]");
+                println!();
+                println!("Chat with the daemon, watch every chat's turns and answer approvals");
+                println!("in this terminal. Needs [client_gateway] enabled.");
+                return Ok(());
+            }
+            other => anyhow::bail!("Unknown tui option: {other}"),
+        }
+    }
+    let settings = client_gateway_ready(config_path)?;
+    let token = crate::startup::client_gateway::local_token_or_mint(&settings)?;
+    let url = format!("ws://{}/client/v1/ws", settings.bind_addr()?);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(aidaemon_tui::run(aidaemon_tui::link::LinkConfig {
+            url,
+            token,
+            device,
+            capabilities: Vec::new(),
+        }))
+}
+
+/// Open `url` in the default browser.
+fn open_in_browser(url: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    let status = std::process::Command::new("open").arg(url).status()?;
+    #[cfg(target_os = "linux")]
+    let status = std::process::Command::new("xdg-open").arg(url).status()?;
+    #[cfg(target_os = "windows")]
+    let status = std::process::Command::new("rundll32")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(url)
+        .status()?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    anyhow::bail!("Opening a browser is not supported on this platform");
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    anyhow::ensure!(status.success(), "Could not open a browser");
+    Ok(())
+}
+
+/// `aidaemon pair [--token-file FILE]` / `aidaemon web`: make a pairing
+/// offer on the running daemon's Client Gateway, show its code and a QR
+/// code of the web client's link (`web` also opens it in this machine's
+/// browser), and confirm the device here when it redeems the offer. Uses
+/// the owner's local token (`AIDAEMON_CLIENT_TOKEN`, `--token-file`, or the
+/// saved copy, minted on first use).
+fn handle_pair_command(args: &[String], config_path: &Path, open_web: bool) -> anyhow::Result<()> {
     use aidaemon_client_protocol::{Enrollment, EnrollmentState, PairingDecision, PairingOffer};
-    let mut token = std::env::var("AIDAEMON_CLIENT_TOKEN").ok();
+    let command = if open_web { "web" } else { "pair" };
+    let mut token = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -765,23 +828,29 @@ fn handle_pair_command(args: &[String], config_path: &Path) -> anyhow::Result<()
                 i += 2;
             }
             "-h" | "--help" => {
-                println!("Usage: aidaemon pair [--token-file FILE]");
-                println!();
-                println!("Pair a phone or browser with the Client Gateway. Needs the daemon");
-                println!("running with [client_gateway] enabled, and the local token from");
-                println!("`aidaemon client-token` (AIDAEMON_CLIENT_TOKEN or --token-file).");
+                if open_web {
+                    println!("Usage: aidaemon web [--token-file FILE]");
+                    println!();
+                    println!("Open the web client in this machine's browser and pair it with the");
+                    println!("Client Gateway. Needs [client_gateway] enabled.");
+                } else {
+                    println!("Usage: aidaemon pair [--token-file FILE]");
+                    println!();
+                    println!(
+                        "Pair a phone or browser with the Client Gateway (scan the QR code or"
+                    );
+                    println!("enter the code). Needs [client_gateway] enabled.");
+                }
                 return Ok(());
             }
-            other => anyhow::bail!("Unknown pair option: {other}"),
+            other => anyhow::bail!("Unknown {command} option: {other}"),
         }
     }
-    let Some(token) = token.filter(|t| !t.trim().is_empty()) else {
-        anyhow::bail!(
-            "Give the local token: AIDAEMON_CLIENT_TOKEN=... or --token-file (mint one with \
-             `aidaemon client-token`)"
-        );
+    let settings = client_gateway_ready(config_path)?;
+    let token = match token.filter(|t| !t.trim().is_empty()) {
+        Some(token) => token,
+        None => crate::startup::client_gateway::local_token_or_mint(&settings)?,
     };
-    let settings = client_gateway_settings(config_path);
     let address = settings.bind_addr()?;
     let base = format!("http://{address}");
     let http = reqwest::blocking::Client::new();
@@ -804,7 +873,10 @@ fn handle_pair_command(args: &[String], config_path: &Path) -> anyhow::Result<()
         offer.code,
         offer.fingerprint
     );
-    if let Ok(code) = qrcode::QrCode::new(link.as_bytes()) {
+    if let Some(code) = (!open_web)
+        .then(|| qrcode::QrCode::new(link.as_bytes()).ok())
+        .flatten()
+    {
         println!(
             "{}",
             code.render::<qrcode::render::unicode::Dense1x2>()
@@ -812,7 +884,19 @@ fn handle_pair_command(args: &[String], config_path: &Path) -> anyhow::Result<()
                 .build()
         );
     }
-    println!("Open {link}");
+    if open_web {
+        let local = format!(
+            "http://{address}/client/v1/app#offer={}&code={}&fp={}",
+            offer.offer_id, offer.code, offer.fingerprint
+        );
+        match open_in_browser(&local) {
+            Ok(()) => println!("Opened the web client in your browser."),
+            Err(error) => println!("Could not open a browser ({error}); open {local}"),
+        }
+        println!("Elsewhere: open {link}");
+    } else {
+        println!("Open {link}");
+    }
     println!(
         "or enter the code {} on the device (valid 10 minutes).",
         offer.code
@@ -863,7 +947,7 @@ fn handle_pair_command(args: &[String], config_path: &Path) -> anyhow::Result<()
                 return Ok(());
             }
             EnrollmentState::Expired => {
-                anyhow::bail!("The offer expired; run `aidaemon pair` again")
+                anyhow::bail!("The offer expired; run `aidaemon {command}` again")
             }
             other => {
                 println!("Pairing ended: {other:?}");

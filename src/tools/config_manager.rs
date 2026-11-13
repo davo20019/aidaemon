@@ -404,6 +404,18 @@ impl ConfigManagerTool {
                 }
                 Ok(Some(Self::set_summary(args)))
             }
+            "enable_client_gateway" => {
+                let content = tokio::fs::read_to_string(&self.config_path).await?;
+                let settings = Self::client_gateway_settings(&content);
+                Ok(Some(format!(
+                    "Turn on the Client Gateway: local apps (terminal UI, web client) can chat, \
+                     watch every chat's turns and answer approvals over {}:{} (loopback only), \
+                     and the local token is saved to {} (minted if none works). Applies after a restart.",
+                    settings.bind,
+                    settings.port,
+                    crate::startup::client_gateway::client_token_file(&settings).display()
+                )))
+            }
             "switch_provider" => Ok(Self::resolve_provider_selection(args, "switch_provider")
                 .ok()
                 .map(|selection| Self::switch_provider_summary(&selection))),
@@ -1530,6 +1542,70 @@ impl ConfigManagerTool {
             crate::stt_setup::format_stt_probe_report(&probe)
         ))
     }
+
+    /// The `[client_gateway]` table of `content`, defaults where unset.
+    fn client_gateway_settings(content: &str) -> aidaemon_client_gateway::ClientGatewayConfig {
+        content
+            .parse::<toml::Table>()
+            .ok()
+            .and_then(|table| table.get("client_gateway").cloned())
+            .and_then(|value| value.try_into().ok())
+            .unwrap_or_default()
+    }
+
+    /// Turn on the Client Gateway (keeping its other settings) and mint the
+    /// local token into the owner's copy, so `aidaemon tui` and
+    /// `aidaemon web` work with no flags. The token never enters the reply.
+    async fn enable_client_gateway(&self, args: &ConfigArgs) -> anyhow::Result<ConfigReply> {
+        Self::require_kernel_approval(args)?;
+        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let mut doc: toml::Table = content.parse()?;
+        let already_on = Self::client_gateway_settings(&content).enabled;
+        let table = doc
+            .entry("client_gateway")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let Some(table) = table.as_table_mut() else {
+            return Ok(ConfigReply::refused(
+                "Refused: `client_gateway` in config.toml is not a table. The config was NOT \
+                 modified."
+                    .to_string(),
+            ));
+        };
+        table.insert("enabled".to_string(), toml::Value::Boolean(true));
+        let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
+        if let Err(e) = Self::validate_config(&new_content) {
+            return Ok(ConfigReply::refused(format!(
+                "Refused to enable the Client Gateway: {e}.\n\nThe config was NOT modified."
+            )));
+        }
+        if !already_on {
+            if let Err(e) = self.create_backup().await {
+                warn!("Failed to create backup: {}", e);
+            }
+            tokio::fs::write(&self.config_path, &new_content).await?;
+            set_owner_only_permissions(&self.config_path);
+        }
+        let settings = Self::client_gateway_settings(&new_content);
+        let token_path = match crate::startup::client_gateway::local_token(&settings) {
+            Some(_) => crate::startup::client_gateway::client_token_file(&settings),
+            None => crate::startup::client_gateway::mint_local_token(&settings)?,
+        };
+        let apply = if already_on {
+            "It was already on in config.toml; if `aidaemon tui` cannot connect, restart \
+             aidaemon (`/restart`)."
+        } else {
+            "Restart aidaemon (`/restart`) to apply: the gateway starts with the daemon."
+        };
+        Ok(ConfigReply::done(format!(
+            "Client Gateway enabled ([client_gateway] enabled = true, loopback {}:{}). The local \
+             token is saved to {} (owner-only; not shown here).\n\n{apply}\n\nThen, on this \
+             machine:\n- `aidaemon tui` for the terminal client\n- `aidaemon web` to open and \
+             pair the web client\n- `/pair_device` here to pair a phone or another browser",
+            settings.bind,
+            settings.port,
+            token_path.display()
+        )))
+    }
 }
 
 #[derive(Deserialize)]
@@ -1597,7 +1673,7 @@ fn manage_config_schema() -> Value {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["read", "get", "set", "unset", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider", "enable_stt"]
+                    "enum": ["read", "get", "set", "unset", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider", "enable_stt", "enable_client_gateway"]
                 },
                 "key": { "type": "string" },
                 "value": { "type": "string" },
@@ -1694,6 +1770,7 @@ impl ConfigManagerTool {
             "add_failover_provider" => self.add_failover_provider(&args).await.map(Into::into),
             "remove_failover_provider" => self.remove_failover_provider(&args).await.map(Into::into),
             "enable_stt" => self.enable_stt(&args).await.map(Into::into),
+            "enable_client_gateway" => self.enable_client_gateway(&args).await,
             "read" => {
                 let content = tokio::fs::read_to_string(&self.config_path).await?;
                 let mut doc: toml::Value = toml::from_str(&content)?;
@@ -1712,7 +1789,7 @@ impl ConfigManagerTool {
                 Err(e) => Ok(ConfigReply::refused(format!("Restore failed: {}", e))),
             },
             _ => Ok(ConfigReply::refused(format!(
-                "Unknown action: {}. Use 'read', 'get', 'set', 'unset', 'restore', 'list_provider_presets', 'switch_provider', 'list_failover_providers', 'add_failover_provider', 'remove_failover_provider', or 'enable_stt'.",
+                "Unknown action: {}. Use 'read', 'get', 'set', 'unset', 'restore', 'list_provider_presets', 'switch_provider', 'list_failover_providers', 'add_failover_provider', 'remove_failover_provider', 'enable_stt', or 'enable_client_gateway'.",
                 args.action
             ))),
         }
@@ -1875,6 +1952,11 @@ impl ConfigManagerTool {
     /// A change needs the owner when it names a security-sensitive key, or
     /// replaces a table or list entry that holds one.
     fn change_needs_approval(args: &ConfigArgs) -> bool {
+        // The Client Gateway opens a way to chat and answer approvals from
+        // outside a channel: every key of its table is the owner's call.
+        if args.key.split(['.', '[']).next().map(str::trim) == Some("client_gateway") {
+            return true;
+        }
         let Ok(path) = ConfigPath::parse(&args.key) else {
             return Self::requires_approval(&args.key);
         };
@@ -2628,5 +2710,100 @@ primary = "gpt-4o"
 
         let reply = tool.enable_stt(&args).await.unwrap();
         assert!(reply.contains("Cannot enable STT"));
+    }
+
+    fn gateway_config(dir: &std::path::Path, extra: &str) -> String {
+        format!(
+            r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+
+[provider.models]
+primary = "gpt-4o"
+
+[client_gateway]
+token_file = "{}"
+{extra}
+"#,
+            dir.join("client-gateway-token.sha256").display()
+        )
+    }
+
+    #[tokio::test]
+    async fn client_gateway_changes_ask_the_owner() {
+        let tokens = tempfile::tempdir().unwrap();
+        let (_dir, path) = write_temp_config(&gateway_config(tokens.path(), ""));
+        let tool = ConfigManagerTool::new(path);
+        for call in [
+            json!({"action": "set", "key": "client_gateway.enabled", "value": "true"}),
+            json!({"action": "set", "key": "client_gateway.port", "value": "9000"}),
+            json!({"action": "unset", "key": "client_gateway"}),
+            json!({"action": "enable_client_gateway"}),
+        ] {
+            assert!(
+                matches!(tool.owner_approval(&call).await, OwnerApprovalNeed::Ask(_)),
+                "{call} must ask"
+            );
+        }
+        let other = json!({"action": "set", "key": "provider.models.primary", "value": "\"m\""});
+        assert!(matches!(
+            tool.owner_approval(&other).await,
+            OwnerApprovalNeed::NotNeeded
+        ));
+    }
+
+    #[tokio::test]
+    async fn enable_client_gateway_turns_it_on_and_saves_a_working_token() {
+        let tokens = tempfile::tempdir().unwrap();
+        let (_dir, path) = write_temp_config(&gateway_config(tokens.path(), "port = 9123"));
+        let tool = approving_tool(path.clone());
+        let mut args = test_args();
+        args.action = "enable_client_gateway".to_string();
+
+        let reply = tool.enable_client_gateway(&args).await.unwrap();
+        assert!(reply.text.contains("aidaemon tui"), "{}", reply.text);
+        assert!(reply.text.contains("/restart"));
+
+        let saved: AppConfig = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.client_gateway.enabled);
+        assert_eq!(saved.client_gateway.port, 9123, "other settings are kept");
+
+        let copy = tokens.path().join("client-token");
+        let token = fs::read_to_string(&copy).unwrap();
+        let token = token.trim();
+        assert!(aidaemon_client_gateway::token::verify(
+            &tokens.path().join("client-gateway-token.sha256"),
+            token
+        ));
+        assert!(
+            !reply.text.contains(token),
+            "the token never enters the reply"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // Again: nothing changes and the working token is kept.
+        let again = tool.enable_client_gateway(&args).await.unwrap();
+        assert!(again.text.contains("already on"));
+        assert_eq!(fs::read_to_string(&copy).unwrap().trim(), token);
+    }
+
+    #[tokio::test]
+    async fn enable_client_gateway_needs_the_kernel_approval() {
+        let tokens = tempfile::tempdir().unwrap();
+        let (_dir, path) = write_temp_config(&gateway_config(tokens.path(), ""));
+        let tool = approving_tool(path.clone());
+        let mut args = test_args();
+        args.action = "enable_client_gateway".to_string();
+        args.kernel_approved = false;
+        assert!(tool.enable_client_gateway(&args).await.is_err());
+        let saved: AppConfig = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!saved.client_gateway.enabled);
+        assert!(!tokens.path().join("client-token").exists());
     }
 }
