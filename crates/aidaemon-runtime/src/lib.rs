@@ -37,6 +37,8 @@
 //! - [`spawn`]: the running sub-agents registry, a child's progress and
 //!   end as its parent sees them, and the plain child's prompt.
 //! - [`turn_runtime`]: one agent's turn settings and caches.
+//! - [`specialists`]: the specialist registry (bundled and owner-overridden
+//!   expert profiles a child is made from).
 //! - [`spawn_tool`]: the `spawn_agent` tool.
 //! - [`untrusted`]: the untrusted-content rule's taint facts and verifier.
 
@@ -60,6 +62,7 @@ pub mod run_state;
 pub mod settings;
 pub mod spawn;
 pub mod spawn_tool;
+pub mod specialists;
 pub mod turn;
 pub mod turn_runtime;
 pub mod untrusted;

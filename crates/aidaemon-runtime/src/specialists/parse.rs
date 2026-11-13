@@ -1,4 +1,4 @@
-use crate::traits::SpecialistKind;
+use aidaemon_agents::specialist::SpecialistKind;
 use serde::Deserialize;
 use tracing::warn;
 
@@ -111,7 +111,7 @@ fn split_frontmatter(content: &str) -> anyhow::Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::SpecialistKind;
+    use aidaemon_agents::specialist::SpecialistKind;
 
     #[test]
     fn parses_minimal_valid_file() {

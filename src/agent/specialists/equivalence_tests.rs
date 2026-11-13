@@ -243,7 +243,7 @@ fn a_specialist_that_can_spawn_is_not_told_it_cannot() {
     for (can_spawn, says) in [
         (
             true,
-            crate::agent::specialists::render::delegation_rule(true),
+            aidaemon_runtime::specialists::render::delegation_rule(true),
         ),
         (false, "- Do NOT spawn sub-agents."),
     ] {

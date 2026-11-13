@@ -3,7 +3,7 @@
 //! These helpers clamp untrusted/declared specialist parameters into the
 //! ranges enforced by the spawn flow in `agent/runtime/spawn.rs`.
 
-use crate::traits::SpecialistKind;
+use aidaemon_agents::specialist::SpecialistKind;
 use tracing::{debug, warn};
 
 /// Intersect a specialist's tool allowlist with the set of tools its role is
@@ -81,7 +81,8 @@ mod tests {
     /// a dropped tool at spawn means "not available here", never a typo.
     #[test]
     fn bundled_specialists_name_only_real_tools() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // The workspace root: this crate sits at `crates/aidaemon-runtime`.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut sources = String::new();
         let mut stack = vec![root.join("src"), root.join("crates")];
         while let Some(dir) = stack.pop() {
