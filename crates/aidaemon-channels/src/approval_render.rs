@@ -355,6 +355,13 @@ fn card_why(card: &ApprovalCard) -> Option<String> {
             lines.push(format!("_Safety check: {says}_"));
         }
     }
+    if let Some(AskReason::AfterADecline) = &card.reason {
+        lines.push(
+            "You said no to a step earlier in this task, so I'm checking with you before \
+             steps whose effects I can't fully tell."
+                .to_string(),
+        );
+    }
     if let CardAction::OpenLocalSite { once_minutes, .. } = &card.action {
         lines.push(format!(
             "Allow only if you asked for it. Allow covers the next {once_minutes} minutes; \

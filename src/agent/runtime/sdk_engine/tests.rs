@@ -2037,9 +2037,15 @@ async fn bridged_terminal_ls_is_read_only_rm_is_not() {
     assert!(rm.egress && rm.destructive && !rm.read_only);
     let ls = bridged.annotations_for(&run("ls /tmp"));
     assert!(ls.read_only && !ls.egress);
+    // The network capability is never read-only; a run that reaches only
+    // this computer is still not outbound (4b6148d6), one that leaves is.
     let networked =
         bridged.annotations_for(&serde_json::json!({"action":"run","command":"ls","network":true}));
-    assert!(!networked.read_only && networked.egress);
+    assert!(!networked.read_only && !networked.egress);
+    let outbound = bridged.annotations_for(
+        &serde_json::json!({"action":"run","command":"curl -s https://example.invalid/","network":true}),
+    );
+    assert!(!outbound.read_only && outbound.egress);
     // The kernel's AuthorityHook refuses non-read-only calls under /readonly,
     // so process control and the standing-rule change are refused too, and a
     // redirecting or env-prefixed run is refused while a plain `ls` passes.
@@ -4964,8 +4970,18 @@ async fn the_owner_can_allow_a_call_the_check_refused() {
         refused_send_put_to_owner(crate::types::ApprovalResponse::AllowOnce).await;
     let cards = approver.cards.lock().unwrap().clone();
     assert!(!cards.is_empty());
-    assert!(cards[0].command.contains("jordan@example.invalid"));
-    assert!(cards[0].warnings[0].contains("not requested"));
+    // The exact call is the card's collapsed detail; why it is asked is a
+    // typed fact, not a raw reason string.
+    let card = cards[0].card.clone().expect("a typed card");
+    assert!(matches!(
+        card.action,
+        aidaemon_core::CardAction::Use { detail: Some(ref detail), .. }
+            if detail.contains("jordan@example.invalid")
+    ));
+    assert!(matches!(
+        card.reason,
+        Some(aidaemon_core::AskReason::ReadOutsideContent { .. })
+    ));
     assert!(sent.load(Ordering::SeqCst) >= 1, "the owner allowed it");
 }
 

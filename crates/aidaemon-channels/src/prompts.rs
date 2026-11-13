@@ -18,6 +18,12 @@ use aidaemon_tools::semantics::{ApprovalResponse, GoalConfirmationStyle};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const GOAL_TIMEOUT: Duration = Duration::from_secs(1800);
+/// How long before an approval card expires the owner is reminded of it
+/// (at most a fifth of its wait).
+const APPROVAL_REMINDER_BEFORE: Duration = Duration::from_secs(60);
+/// The reminder sent while an approval card still waits.
+const APPROVAL_REMINDER: &str = "⏳ Still waiting for your answer on the card above. It \
+expires in about a minute; then that step is skipped, not refused.";
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -238,7 +244,29 @@ impl Prompts {
                 anyhow::bail!("the prompt could not be delivered: {error}");
             }
         }
-        let outcome = tokio::time::timeout(timeout, answered).await;
+        let mut answered = answered;
+        // An approval card nobody has answered gets one reminder shortly
+        // before it expires: a helper working in the background may have
+        // asked while the owner looked elsewhere.
+        let remind_at = matches!(kind, Kind::Approval)
+            .then(|| timeout.checked_sub(APPROVAL_REMINDER_BEFORE.min(timeout / 5)))
+            .flatten()
+            .filter(|at| !at.is_zero());
+        let outcome = match remind_at {
+            Some(at) => match tokio::time::timeout(at, &mut answered).await {
+                Ok(answer) => Ok(answer),
+                Err(_) => {
+                    if let Err(error) = channel
+                        .send(conversation, &OutboundMessage::text(APPROVAL_REMINDER))
+                        .await
+                    {
+                        warn!(%error, prompt = %id, "Failed to remind about a waiting card");
+                    }
+                    tokio::time::timeout(timeout - at, &mut answered).await
+                }
+            },
+            None => tokio::time::timeout(timeout, &mut answered).await,
+        };
         // An answer already took the prompt out of the book and replaced its
         // message; anything else leaves it to `unanswered`, which expires it.
         unanswered.done = matches!(outcome, Ok(Ok(_)));
@@ -414,6 +442,36 @@ mod tests {
             assert!(edit.text.contains("Expired"), "{}", edit.text);
             assert!(!prompts.is_open(&channel.prompts()[0].id).await);
         }
+    }
+
+    /// A waiting approval card gets one reminder before it expires.
+    #[tokio::test]
+    async fn a_waiting_approval_card_is_reminded_once_before_it_expires() {
+        use crate::testing::{direct, TestChannel};
+        let channel = Arc::new(
+            TestChannel::new("synthetic")
+                .with_buttons(true)
+                .with_edits(true),
+        );
+        let prompts = Prompts::default();
+        let conversation = direct("synthetic-user-1");
+        let pages = ["Your assistant wants to run a command on your computer.".to_string()];
+        let ask = prompts.ask(
+            channel.clone(),
+            &conversation,
+            Kind::Approval,
+            &pages,
+            approval_choices(false, true),
+            Duration::from_millis(300),
+        );
+        assert!(ask.await.is_err(), "nobody answered");
+        let reminders: Vec<String> = channel
+            .sent()
+            .into_iter()
+            .map(|sent| sent.message.text)
+            .filter(|text| text.contains("Still waiting"))
+            .collect();
+        assert_eq!(reminders.len(), 1, "{reminders:?}");
     }
 
     fn labels(choices: Vec<ApprovalChoice>) -> Vec<String> {

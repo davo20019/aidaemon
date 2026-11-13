@@ -44,6 +44,11 @@ pub enum Resolution {
         request: crate::approval::OwnerApprovalRequest,
         reason: String,
     },
+    /// Nobody answered the owner's card: it expired, could not be
+    /// delivered, or the turn was cancelled while it waited. The call is
+    /// not run, but nothing is remembered as declined, and the reason goes
+    /// back to the model marked as no answer, never as the owner's refusal.
+    Unanswered { reason: String },
 }
 
 #[derive(Clone)]

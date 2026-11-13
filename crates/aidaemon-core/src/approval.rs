@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 /// Prefix of the reason recorded when the owner declines an approval.
 pub const OWNER_DECLINED: &str = "[OWNER DECLINED]";
 
+/// Prefix of the reason for a call whose owner card got no answer (it
+/// expired, could not be delivered, or the turn was cancelled). Not a
+/// refusal: nothing is remembered as declined.
+pub const OWNER_UNANSWERED: &str = "[NO ANSWER]";
+
 /// Prefix of the reason an outbound secret scan (the
 /// [`crate::Safeguard::Egress`] hook) gives when it refuses a call.
 pub const EGRESS_BLOCKED: &str = "[EGRESS BLOCKED]";
@@ -303,6 +308,9 @@ pub enum AskReason {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         check_says: Option<String>,
     },
+    /// The owner said no to a step earlier in this run, and what this call
+    /// does cannot be fully told, so it is not run unasked.
+    AfterADecline,
 }
 
 /// An effect that deserves a warning on the card.

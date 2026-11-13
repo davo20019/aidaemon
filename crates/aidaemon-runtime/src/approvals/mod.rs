@@ -921,8 +921,8 @@ impl OwnerApprovalResolver<'_> {
             Some(RUN_ABANDONED),
         )
         .await;
-        sdk::Resolution::Deny {
-            reason: RUN_ABANDONED.to_string(),
+        sdk::Resolution::Unanswered {
+            reason: unanswered_reason(tool, RUN_ABANDONED),
         }
     }
 
@@ -947,9 +947,11 @@ impl OwnerApprovalResolver<'_> {
     }
 
     /// Put a call the clean check would not pass to the owner, for this one
-    /// call only. The owner's Deny binds the run like any other decline. A
-    /// card nobody answered leaves the check's own refusal standing: no owner
-    /// declined anything.
+    /// call only. The owner's Deny binds the run like any other decline; a
+    /// card nobody answered leaves the check's own refusal standing, which
+    /// is not a decline either.
+    /// An Allow covers this exact call through the later approval rules
+    /// too (`SessionGrants::allow_call_once`), so one answer is enough.
     async fn ask_about_refused_call(
         &self,
         state: &sdk::RunState,
@@ -982,8 +984,14 @@ impl OwnerApprovalResolver<'_> {
             sdk::Resolution::Deny { reason } if reason == DECLINED_BY_OWNER => {
                 sdk::Resolution::OwnerDeclined { request, reason }
             }
-            sdk::Resolution::Deny { .. } => {
+            sdk::Resolution::Deny { .. } | sdk::Resolution::Unanswered { .. } => {
                 crate::untrusted::verdict_resolution(&call.name, verdict)
+            }
+            sdk::Resolution::Approve => {
+                self.approvals
+                    .grants_for(&self.grant_session)
+                    .allow_call_once(&request.subject);
+                sdk::Resolution::Approve
             }
             other => other,
         }
@@ -1039,10 +1047,27 @@ impl OwnerApprovalResolver<'_> {
                 }
                 self.record("owner_approval_declined", tool, request, Some(&reason))
                     .await;
-                sdk::Resolution::Deny { reason }
+                if reason == DECLINED_BY_OWNER {
+                    sdk::Resolution::Deny { reason }
+                } else {
+                    sdk::Resolution::Unanswered {
+                        reason: unanswered_reason(tool, &reason),
+                    }
+                }
             }
         }
     }
+}
+
+/// What the model is told about a card nobody answered: not run, and not
+/// refused either, so it neither claims the owner said no nor tries the
+/// step another way.
+fn unanswered_reason(tool: &str, why: &str) -> String {
+    format!(
+        "`{tool}` was not run: the owner's approval card got no answer ({why}). The owner did \
+         not refuse it. If the step is still needed, tell the owner it is waiting for their OK \
+         and ask again; do not describe it as declined."
+    )
 }
 
 /// Settles a run the daemon left unfinished, ahead of the owner's new message.

@@ -7629,7 +7629,14 @@ fn terminal_run_annotations(
         .iter()
         .chain(args.write_roots.iter())
         .any(|path| !path.trim().is_empty());
-    let read_only = !has_write_targets && !args.network && effects.observation_only;
+    // A read of this computer alone (observations, a local project's own
+    // query, a check of a dev site the work set up) is read-only; a run
+    // given the network capability never is, since nothing in a sandbox
+    // with network keeps it to this computer.
+    let read_only = !has_write_targets
+        && !args.network
+        && (effects.observation_only
+            || crate::tools::command_effects::only_reads_this_computer(text));
     // Writing into git configuration changes what later git commands run:
     // a declared target that is git configuration, a declared root holding a
     // repository, or a command word naming git configuration.
@@ -7955,6 +7962,13 @@ fn terminal_call_effects_on(arguments: &str, local: bool) -> aidaemon_core::Call
             }
             effects.complete = false;
             if local {
+                // A site on this computer is not outbound: the owner's
+                // declines and re-asks are about what leaves the machine.
+                effects.keys.retain(|key| {
+                    key.class != aidaemon_core::EffectClass::Egress
+                        || aidaemon_tools::web::local_site_key(&format!("https://{}/", key.target))
+                            .is_none()
+                });
                 effects
             } else {
                 without_local_paths(effects)
@@ -10609,6 +10623,23 @@ mod tests {
             assert!(!ann(&host, command, false).egress, "host: {command}");
             assert!(!ann(&sandboxed, command, true).egress, "sandbox: {command}");
         }
+        // Checking a dev site is a read, and its address is not outbound:
+        // after a decline it is not asked about again (live 2026-11-12).
+        let check = "curl -s -o /dev/null -w '%{http_code}' http://shop-synthetic.localhost/";
+        assert!(ann(&host, check, false).read_only);
+        assert!(!ann(&host, "curl -s -o page.html http://shop-synthetic.localhost/", false).read_only);
+        assert!(!ann(&sandboxed, check, true).read_only, "network is never read-only");
+        let effects = terminal_call_effects_on(
+            &serde_json::json!({"action":"run","command":check,"network":true}).to_string(),
+            true,
+        );
+        assert!(
+            !effects
+                .keys
+                .iter()
+                .any(|key| key.class == aidaemon_core::EffectClass::Egress),
+            "{effects:?}"
+        );
         let outbound = [
             "curl -s https://example.invalid/",
             "curl -s http://localhost:5173/ https://example.invalid/",

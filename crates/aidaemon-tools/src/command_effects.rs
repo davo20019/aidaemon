@@ -728,6 +728,80 @@ pub fn reaches_only_this_computer(command: &str) -> bool {
     })
 }
 
+/// Whether every command only reads or reports on this computer and
+/// writes nothing: observations, `cd`, a local `ddev` project's own query,
+/// and `curl` reads of sites on this computer that save nothing (no output,
+/// header, cookie or trace file). Checking the dev site the work set up is
+/// a read, like listing its folder. Fail closed like the other shapes:
+/// `wget` saves by default, and redirects into files, deletes and writes to
+/// a site are excluded.
+pub fn only_reads_this_computer(command: &str) -> bool {
+    if command_effects(command).deletes
+        || scan(command).writes_file
+        || sends_remote_write(command)
+    {
+        return false;
+    }
+    every_segment(command, &|program, args| match program {
+        "cd" => true,
+        "ddev" => ddev_query_ok(args),
+        "curl" => !curl_saves_files(args) && reads_only_local_sites(program, args),
+        _ => OBSERVATION_PROGRAMS.contains(&program) && observation_args_ok(program, args),
+    })
+}
+
+/// Whether a `curl` call saves something to a file: an output, header,
+/// cookie or trace file. Output sent to `/dev/null` saves nothing.
+fn curl_saves_files(args: &[String]) -> bool {
+    const LONG: &[&str] = &[
+        "--output",
+        "--remote-name",
+        "--remote-name-all",
+        "--dump-header",
+        "--cookie-jar",
+        "--trace",
+        "--trace-ascii",
+        "--stderr",
+        "--libcurl",
+        "--etag-save",
+        "--hsts",
+        "--alt-svc",
+        "--create-dirs",
+        "--output-dir",
+    ];
+    let to_null = |value: Option<&String>| value.is_some_and(|value| value == "/dev/null");
+    args.iter().enumerate().any(|(index, arg)| {
+        let next = args.get(index + 1);
+        if arg == "--output" || arg == "-o" {
+            return !to_null(next);
+        }
+        if let Some(value) = arg.strip_prefix("--output=") {
+            return value != "/dev/null";
+        }
+        if LONG
+            .iter()
+            .any(|option| arg == *option || arg.starts_with(&format!("{option}=")))
+        {
+            return true;
+        }
+        if short_cluster_has(arg, &['O', 'D', 'c']) {
+            return true;
+        }
+        // `-so FILE`: the cluster's last letter takes the next word; an
+        // `o` inside a cluster takes the rest of it.
+        if arg.starts_with('-') && !arg.starts_with("--") {
+            if let Some(at) = arg.find('o') {
+                return if at + 1 == arg.len() {
+                    !to_null(next)
+                } else {
+                    &arg[at + 1..] != "/dev/null"
+                };
+            }
+        }
+        false
+    })
+}
+
 /// What a command runs, in a word or two for the owner: "a shell loop" for
 /// a `for`/`while`/`until` loop, else its first program's name ("ddev"),
 /// "a command" when neither can be read. Never the raw line.
@@ -3873,6 +3947,33 @@ mod tests {
             command_card("curl -X POST https://example.invalid/hook", None).impact,
             Some(HighImpact::Sends)
         );
+    }
+
+    /// Checking a dev site this work set up is a read; saving its page,
+    /// writing to it or reaching anything else is not.
+    #[test]
+    fn a_local_site_check_only_reads_this_computer() {
+        for read in [
+            "curl -s -o /dev/null -w '%{http_code}' https://shop-synthetic.localhost/",
+            "curl -sI https://127.0.0.1:8443/ | head -5",
+            "cd /tmp/site && ddev describe && curl -s http://localhost:5173/ | grep -c title",
+            INSPECT_SITES,
+        ] {
+            assert!(only_reads_this_computer(read), "{read}");
+        }
+        for not_a_read in [
+            "curl -s -o page.html https://shop-synthetic.localhost/",
+            "curl -sSo page.html http://localhost:5173/",
+            "curl -s -c jar http://localhost:5173/",
+            "curl -s https://example.invalid/",
+            "curl -s -X POST http://localhost:5173/x",
+            "curl -s http://localhost:5173/ > page.html",
+            "wget http://localhost:5173/",
+            "ddev start",
+            "cargo build",
+        ] {
+            assert!(!only_reads_this_computer(not_a_read), "{not_a_read}");
+        }
     }
 
     #[test]
