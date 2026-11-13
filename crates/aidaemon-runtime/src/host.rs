@@ -115,6 +115,8 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
     fn depth(&self) -> usize;
     /// Settings: default alert sessions, goal budget overrides.
     fn settings(&self) -> &dyn aidaemon_tools::services::SettingsStore;
+    /// Goals' daily token counters.
+    fn goal_budgets(&self) -> &dyn aidaemon_work::stores::GoalBudgetStore;
     /// The notification queue token alerts go through.
     fn notifications(&self) -> &dyn aidaemon_work::stores::NotificationStore;
     /// The goals' shared token budgets, when the agent tracks them.

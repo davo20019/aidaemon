@@ -64,8 +64,8 @@ use crate::tools::ProgressClock;
 use crate::traits::{AttachmentProvenance, Message, MessageAttachment};
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
 use aidaemon_runtime::engine::calls::{
-    AfterCallCheck, BudgetCheck, GateRequest, HostCall as DaemonCall, KernelCall, KernelNotice,
-    ModelErrorCheck, StopCheck, ToolRequest,
+    AfterCallCheck, GateRequest, HostCall as DaemonCall, KernelCall, KernelNotice, ModelErrorCheck,
+    StopCheck, ToolRequest,
 };
 
 #[path = "sdk_engine/budgets.rs"]
@@ -1500,7 +1500,7 @@ impl Agent {
                         in_flight.push(self.serve_sdk_model_error(&scope, check).boxed());
                     }
                     DaemonCall::Budget(check) => {
-                        in_flight.push(self.serve_sdk_budget(&scope, check).boxed());
+                        in_flight.push(serve_sdk_budget(self, &scope, check).boxed());
                     }
                 },
                 Some(notice) = refusals_rx.recv() => {

@@ -165,6 +165,10 @@ impl TurnHost for Agent {
         &*self.state
     }
 
+    fn goal_budgets(&self) -> &dyn aidaemon_work::stores::GoalBudgetStore {
+        &*self.state
+    }
+
     fn notifications(&self) -> &dyn aidaemon_work::stores::NotificationStore {
         &*self.state
     }

@@ -75,7 +75,7 @@ impl Agent {
                     // Real spend: it counts toward the run's budgets. A stop
                     // it triggers is enforced by the next model call.
                     let iteration = scope.model_calls.load(Ordering::Relaxed) as usize;
-                    let _ = self.sdk_charge_budgets(scope, usage, iteration).await;
+                    let _ = sdk_charge_budgets(self, scope, usage, iteration).await;
                 }
                 response.content.unwrap_or_default()
             }
