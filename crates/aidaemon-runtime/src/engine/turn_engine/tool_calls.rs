@@ -765,6 +765,11 @@ impl TurnEngine<'_> {
                         != Some(aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent)
                 {
                     scope.open_background_jobs.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(mut ack) = scope.background_ack.lock() {
+                        *ack = Some(crate::turn::tool_dispatch::build_background_detach_ack(
+                            &output,
+                        ));
+                    }
                 }
                 if outcome.metadata.background_settled {
                     let jobs = &scope.open_background_jobs;
@@ -804,20 +809,14 @@ impl TurnEngine<'_> {
                         && !outcome.metadata.detached;
                     handed_off = hands_off;
                     let directive = if hands_off {
-                        // With notifications on, the result follows by
-                        // itself: a plain handoff, no pid or tool jargon.
-                        // Without them, the ack says how to check on it.
-                        let reply = if outcome.metadata.completion_notifications_enabled {
+                        // The reply is the call's own first line, which names
+                        // the run ("Started in the background: …"); the run
+                        // itself is on the turn's card.
+                        if outcome.metadata.completion_notifications_enabled {
                             scope.background_handoff.store(true, Ordering::Relaxed);
-                            crate::turn::post_task::build_friendly_background_handoff(
-                                scope.user_text,
-                            )
-                        } else {
-                            crate::turn::tool_dispatch::build_background_detach_ack(
-                                &output,
-                                &outcome.metadata,
-                            )
-                        };
+                        }
+                        let reply =
+                            crate::turn::tool_dispatch::build_background_detach_ack(&output);
                         if let Some(finish) = finish.as_mut() {
                             finish.reply = Some(reply);
                         }
@@ -917,6 +916,16 @@ impl TurnEngine<'_> {
             .unwrap_or(true);
         if let Ok(mut latest) = scope.latest_tool_output.lock() {
             *latest = Some(output.clone());
+        }
+        // A helper the run waited on failed: the work it was given is the
+        // run's own from here, and its end is measured when the run ends.
+        let handed_on = metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.background_handoff || metadata.background_started);
+        if failed && facts.spawns_child_agents && !handed_on {
+            if let Ok(mut since) = scope.own_work_since.lock() {
+                since.get_or_insert_with(chrono::Utc::now);
+            }
         }
         // Budget progress counts distinct successful operations: repeating
         // an identical call is not new evidence.

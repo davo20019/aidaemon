@@ -309,8 +309,6 @@ pub trait OutboundRouter: Send + Sync {
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()>;
     async fn send_media_strict(&self, session_id: &str, media: &MediaMessage)
         -> anyhow::Result<()>;
-    async fn background_status_surface(&self, session_id: &str) -> Option<String>;
-    async fn take_background_status_surface(&self, session_id: &str) -> Option<String>;
     /// Delete a message this daemon sent. `Ok(false)` when the channel
     /// cannot delete it; the default suits routers that never can.
     async fn delete_message(&self, _session_id: &str, _message_id: &str) -> anyhow::Result<bool> {

@@ -32,6 +32,9 @@ pub struct CardView<'a> {
     pub helpers: Vec<(HelperView, Option<Duration>)>,
     /// The turn's own current step and how long it has run.
     pub activity: Option<(&'a Step, Duration)>,
+    /// The turn finished itself work a failed helper left: its measured
+    /// time.
+    pub own_work: Option<&'a str>,
 }
 
 impl CardView<'_> {
@@ -53,6 +56,12 @@ pub fn render_card(view: &CardView<'_>) -> Option<String> {
     }
     for (helper, elapsed) in &view.helpers {
         parts.push(helper_block(helper, *elapsed));
+    }
+    if let Some(took) = view.own_work {
+        parts.push(format!(
+            "✅ Finished here after the helper failed\n{}",
+            took.trim()
+        ));
     }
     let done = view
         .plan
@@ -124,10 +133,11 @@ pub struct LiveStatus {
     /// Each helper's record, in the order they started, and when its
     /// latest step began.
     helpers: Vec<(HelperView, std::time::Instant)>,
+    /// The measured time of work the turn finished itself after a helper
+    /// failed.
+    own_work: Option<String>,
     /// What the surface shows now, so an unchanged card is never re-sent.
     shown: Option<String>,
-    /// The surface was edited into the turn's reply.
-    finalized: bool,
     edit_supported: bool,
 }
 
@@ -156,8 +166,8 @@ impl LiveStatus {
             checklist: None,
             activity: None,
             helpers: Vec::new(),
+            own_work: None,
             shown: None,
-            finalized: false,
             edit_supported: true,
         }
     }
@@ -175,6 +185,7 @@ impl LiveStatus {
                 .then_some(self.activity.as_ref())
                 .flatten()
                 .map(|(step, since)| (step, since.elapsed())),
+            own_work: self.own_work.as_deref(),
         }
     }
 
@@ -213,6 +224,10 @@ impl LiveStatus {
                 true
             }
             StatusUpdate::Helper(helper) => self.note_helper(helper.clone()),
+            StatusUpdate::OwnWork { took } => {
+                self.own_work = Some(took.clone());
+                true
+            }
             _ => false,
         }
     }
@@ -263,7 +278,7 @@ impl LiveStatus {
     /// Send the card when what it would show changed since it was last
     /// sent (a step's elapsed time included); `true` when it was sent.
     pub async fn flush_if_changed(&mut self, sink: &dyn SurfaceSink) -> bool {
-        if self.finalized || self.render().is_none() || self.render() == self.shown {
+        if self.render().is_none() || self.render() == self.shown {
             return false;
         }
         self.flush(sink).await;
@@ -312,25 +327,6 @@ impl LiveStatus {
         self.flush(sink).await;
     }
 
-    /// Edit the card into the turn's reply, when the card collapses
-    /// ([`Self::end`]) and can be edited. Returns the message that now holds
-    /// the reply; `None` when the caller sends the reply itself (a card
-    /// that is kept never becomes the reply).
-    pub async fn become_reply(&mut self, sink: &dyn SurfaceSink, reply: &str) -> Option<String> {
-        if reply.trim().is_empty() || self.end() == CardEnd::Keep {
-            return None;
-        }
-        if let (Some(id), true) = (&self.message_id, self.edit_supported) {
-            if matches!(sink.edit(id, reply).await, Ok(true)) {
-                // The surface is the reply now: no later refresh may turn
-                // it back into the card.
-                self.finalized = true;
-                return Some(id.clone());
-            }
-        }
-        None
-    }
-
     /// End the card with its turn, by the one rule ([`Self::end`]). The
     /// turn's own step always goes. A card that is kept (a helper on it, or
     /// a plan of more than one step) is settled to its final state and
@@ -338,9 +334,6 @@ impl LiveStatus {
     /// settles it again when it ends. Any other card is removed: the reply
     /// says what was done. Safe to call more than once.
     pub async fn close(&mut self, sink: &dyn SurfaceSink) {
-        if self.finalized {
-            return;
-        }
         self.activity = None;
         match self.end() {
             CardEnd::Keep => {
@@ -380,7 +373,7 @@ impl LiveStatus {
     /// and still editable, so work that outlives the turn (a background
     /// job settling its steps, a helper ending) can update the card.
     pub fn kept_card_message_id(&self) -> Option<String> {
-        if self.finalized || self.end() == CardEnd::Collapse {
+        if self.end() == CardEnd::Collapse {
             return None;
         }
         self.surface_message_id()
@@ -596,7 +589,6 @@ mod tests {
             ..ended("Count lines", RunPhase::Succeeded, false)
         });
         live.note_helper(ended("Count words", RunPhase::Failed, false));
-        assert!(live.become_reply(&sink, "Lines: 12").await.is_none());
         live.close(&sink).await;
         assert!(sink.deletes.lock().unwrap().is_empty());
         assert_eq!(
@@ -607,28 +599,15 @@ mod tests {
         assert_eq!(live.kept_card_message_id().as_deref(), Some("m1"));
     }
 
-    /// A single-step card with no helper is only progress: it collapses,
-    /// into the reply when it may become it, else it is removed.
+    /// A single-step card with no helper is only progress: it is removed
+    /// once the reply is out, never turned into a message of its own.
     #[tokio::test]
     async fn a_single_step_card_collapses() {
         let sink = FakeSink::new(true);
         let mut live = LiveStatus::new();
         live.set_activity(&sink, doing(ActivityKind::Check)).await;
-        assert_eq!(
-            live.become_reply(&sink, "Done — results attached.")
-                .await
-                .as_deref(),
-            Some("m1")
-        );
-        assert_eq!(
-            sink.edits.lock().unwrap().last().unwrap().1,
-            "Done — results attached."
-        );
         live.close(&sink).await;
-        assert!(
-            sink.deletes.lock().unwrap().is_empty(),
-            "it is the reply now"
-        );
+        assert_eq!(*sink.deletes.lock().unwrap(), vec!["m1".to_string()]);
 
         let sink = FakeSink::new(true);
         let mut live = LiveStatus::new();
@@ -678,7 +657,7 @@ mod tests {
         let drawn_after_the_turn = render_card(&CardView {
             plan: Some(&plan),
             helpers: vec![(record.clone(), None)],
-            activity: None,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(kept, drawn_after_the_turn);
@@ -729,6 +708,7 @@ mod tests {
             lines.push(Step::HandedOff(kind).words());
         }
         lines.push(Step::Output("42".into()).words());
+        lines.push(Step::Reporting.words());
         for phase in [
             RunPhase::Running,
             RunPhase::Succeeded,
@@ -829,21 +809,6 @@ mod tests {
             sink.edits.lock().unwrap().len(),
             1,
             "edit attempted once, then disabled"
-        );
-    }
-
-    #[tokio::test]
-    async fn become_reply_none_when_no_surface_or_edit_fails() {
-        let sink = FakeSink::new(true);
-        let mut s = LiveStatus::new();
-        assert!(s.become_reply(&sink, "Answer").await.is_none());
-
-        let sink = FakeSink::new(false); // edit always returns Ok(false)
-        let mut s = LiveStatus::new();
-        s.set_activity(&sink, doing(ActivityKind::Check)).await;
-        assert!(
-            s.become_reply(&sink, "huge reply").await.is_none(),
-            "edit failed -> the caller sends normally"
         );
     }
 

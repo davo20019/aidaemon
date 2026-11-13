@@ -94,6 +94,10 @@ pub enum StatusUpdate {
     /// view is the runtime's record of it, so the live card and the card a
     /// turn leaves behind show the same thing.
     Helper(aidaemon_core::card::HelperView),
+    /// The turn finished itself work a helper it waited on failed to do:
+    /// `took` is that work's measured time, already worded for the owner
+    /// ("Took 1m 4s (2:21:16 PM to 2:22:20 PM ET).").
+    OwnWork { took: String },
     /// A step ended by handing its work to something that keeps running: a
     /// helper (`ActivityKind::Delegate`) or a background job. The work has
     /// not finished, so the step must never read as finished.

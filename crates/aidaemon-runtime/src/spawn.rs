@@ -135,11 +135,15 @@ pub fn run_phase(
                     && !obligation.required_effect.is_empty()
             })
             .map(|(id, obligation)| {
+                // The step in its own words: never the internal demand text
+                // (live 2026-11-13: "checklist item 2 … needs a succeeded
+                // receipt carrying local_workspace_write|process_state").
                 (
                     id,
                     obligation
-                        .summary
-                        .clone()
+                        .step
+                        .as_deref()
+                        .map(plain_step)
                         .unwrap_or_else(|| "a step it listed".to_string()),
                 )
             })
@@ -156,6 +160,13 @@ pub fn run_phase(
             failure: None,
         },
     )
+}
+
+/// A step's own words as the owner reads them: one line, without a
+/// trailing period.
+fn plain_step(step: &str) -> String {
+    let line = step.split_whitespace().collect::<Vec<_>>().join(" ");
+    line.trim_end_matches('.').to_string()
 }
 
 /// A run that did none of its work, from its typed records: it did not
@@ -195,8 +206,9 @@ fn nothing_done(
             (
                 &obligation.id,
                 obligation
-                    .summary
-                    .clone()
+                    .step
+                    .as_deref()
+                    .map(plain_step)
                     .unwrap_or_else(|| "a step it listed".to_string()),
             )
         })
@@ -626,11 +638,29 @@ pub fn child_status_label(mission: &str) -> String {
     const MAX_CHARS: usize = 60;
     let line = mission.lines().next().unwrap_or("").trim();
     let line = if line.is_empty() { "Sub-agent" } else { line };
-    if line.chars().count() <= MAX_CHARS {
+    let is_path = |word: &str| word.contains('/') || word.contains('\\') || word.starts_with('~');
+    if line.chars().count() <= MAX_CHARS && !line.split_whitespace().any(is_path) {
         return line.to_string();
     }
-    let cut: String = line.chars().take(MAX_CHARS - 1).collect();
-    format!("{}…", cut.trim_end())
+    // Whole words up to the limit, stopping before a path: a label never
+    // ends mid-word or mid-path (live 2026-11-13: "… in exactly
+    // /Users/davidloor/projects/cla").
+    let mut label = String::new();
+    for word in line.split_whitespace() {
+        let longer = label.chars().count() + usize::from(!label.is_empty()) + word.chars().count();
+        if is_path(word) || longer > MAX_CHARS - 1 {
+            break;
+        }
+        if !label.is_empty() {
+            label.push(' ');
+        }
+        label.push_str(word);
+    }
+    if label.is_empty() {
+        let cut: String = line.chars().take(MAX_CHARS - 1).collect();
+        return format!("{}…", cut.trim_end());
+    }
+    format!("{label}…")
 }
 
 /// What a stopped child had done, from its typed tool records: every call to
@@ -1157,7 +1187,12 @@ mod tests {
                         "class": if *effect == 0 { "observe" } else { "achieve" },
                         "state": state,
                         "required_effect": effect,
-                        "summary": format!("step {index}"),
+                        "summary": format!(
+                            "checklist item {}: step {index} — needs a succeeded receipt \
+                             carrying local_workspace_write|process_state",
+                            index + 1
+                        ),
+                        "step": format!("step {index}"),
                     }),
                 )
             })
@@ -1239,5 +1274,49 @@ mod tests {
             nothing_done(TaskOutcome::Succeeded, &checklist(&undone), &undone),
             None
         );
+    }
+
+    /// A run whose steps no receipt confirmed names them in their own
+    /// words: the owner never reads the internal demand ("needs a succeeded
+    /// receipt carrying local_workspace_write|process_state").
+    #[test]
+    fn unconfirmed_steps_are_named_in_their_own_words() {
+        let run = aggregate(&[("pending", 2), ("pending", 64)], &[("succeeded", 2)]);
+        let mut run = run;
+        run.executor_claimed_outcome = Some(aidaemon_events::ExecutorClaimedOutcome::Done);
+        let end: aidaemon_events::TaskEndData = serde_json::from_value(serde_json::json!({
+            "task_id": "t",
+            "status": "completed",
+            "duration_secs": 1,
+            "iterations": 1,
+            "tool_calls_count": 1,
+        }))
+        .unwrap();
+        let (phase, evidence) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run));
+        assert_eq!(phase, crate::run_state::RunPhase::Succeeded);
+        let line = evidence.line().expect("an evidence line");
+        assert_eq!(line, "I couldn't verify 2 of its steps: step 0; step 1.");
+        for internal in [
+            "receipt",
+            "local_workspace_write",
+            "process_state",
+            "checklist item",
+        ] {
+            assert!(!line.contains(internal), "{line}");
+        }
+    }
+
+    /// A long label stops at a whole word, before any path: never a cut
+    /// path or a cut word.
+    #[test]
+    fn a_label_never_ends_in_a_cut_path() {
+        let label = child_status_label(
+            "Install a fresh Drupal site with demo content in exactly /Users/someone/projects/claude",
+        );
+        assert_eq!(
+            label,
+            "Install a fresh Drupal site with demo content in exactly…"
+        );
+        assert_eq!(child_status_label("Count to 30"), "Count to 30");
     }
 }

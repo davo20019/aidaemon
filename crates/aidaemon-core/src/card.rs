@@ -110,6 +110,8 @@ pub enum Step {
     /// A command is running, and this is the latest line it printed
     /// (secrets redacted): shown as its output, never as a label.
     Output(String),
+    /// Its work ended and its result is being written up for the chat.
+    Reporting,
 }
 
 impl Step {
@@ -125,6 +127,7 @@ impl Step {
                 "" => ActivityKind::Run.words().to_string(),
                 line => format!("{} · last output: {line}", ActivityKind::Run.words()),
             },
+            Self::Reporting => "Writing up the result".to_string(),
         }
     }
 }

@@ -448,8 +448,8 @@ impl TaskPlan {
     }
 
     /// The turn handed its work to background jobs `job_ids` without naming
-    /// the steps they do (`checklist_items`): every step still open waits on
-    /// them, so the card reads "continuing in the background", never
+    /// the steps they do (`checklist_items`): every step still open (or
+    /// already waiting on an earlier job) waits on them, so the card reads "continuing in the background", never
     /// "stopped short", while they run. Their end does not complete such a
     /// step ([`PlanStep::waits_on_jobs`]). Returns whether anything changed.
     pub fn wait_on_background_jobs(&mut self, job_ids: &[String]) -> bool {
@@ -458,8 +458,13 @@ impl TaskPlan {
         }
         let mut changed = false;
         for step in &mut self.steps {
+            // A step already waiting on an earlier job waits on this one too
+            // (live 2026-11-13: two helpers started by one turn; the second
+            // was never on the plan, so the first's end settled the steps
+            // while the second still ran, and its own end found no plan).
             let open = matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
-                || (step.status == StepStatus::Deferred && step.not_done.is_none());
+                || (step.status == StepStatus::Deferred && step.not_done.is_none())
+                || (step.status == StepStatus::Background && step.waits_on_jobs);
             if !open {
                 continue;
             }
@@ -535,6 +540,37 @@ impl TaskPlan {
             } else {
                 self.sync_active_step();
             }
+            self.updated_at = now;
+        }
+        changed
+    }
+
+    /// Its turn is over and nothing it handed work to is still running: a
+    /// step still open (pending, in progress, or waiting on a job no longer
+    /// running) can no longer be done by anything, so it settles as not done
+    /// ([`NotDoneReason::LeftOpen`]) and the plan resolves. A card never
+    /// stays "working" on a step nothing is working on (live 2026-11-13: a
+    /// "Report each helper's measured time" step held a card on "Working ·
+    /// step 4 of 4" for 14 minutes after both helpers ended). Returns
+    /// whether anything changed.
+    pub fn settle_open_steps(&mut self) -> bool {
+        let now = Utc::now();
+        let mut changed = false;
+        for step in &mut self.steps {
+            if matches!(
+                step.status,
+                StepStatus::Pending | StepStatus::InProgress | StepStatus::Background
+            ) {
+                step.status = StepStatus::Deferred;
+                step.waits_on_jobs = false;
+                step.background_jobs.clear();
+                step.not_done = Some(NotDoneReason::LeftOpen);
+                step.completed_at = Some(now);
+                changed = true;
+            }
+        }
+        if changed {
+            self.status = self.resolved_status();
             self.updated_at = now;
         }
         changed
@@ -1023,6 +1059,8 @@ pub enum NotDoneReason {
     /// The background helper it was handed ended before finishing it (its
     /// run record says stopped: not a failure).
     HelperStopped,
+    /// Its turn ended and nothing was left working on it.
+    LeftOpen,
 }
 
 impl NotDoneReason {
@@ -1030,6 +1068,7 @@ impl NotDoneReason {
         match self {
             Self::ChangesOff => "read-only is on",
             Self::HelperStopped => "its helper stopped before it finished",
+            Self::LeftOpen => "nothing was left working on it",
         }
     }
 }
@@ -1135,6 +1174,43 @@ mod tests {
         assert_eq!(plan.ready_step_indices().unwrap(), vec![1]);
         plan.steps[1].status = StepStatus::Completed;
         assert_eq!(plan.ready_step_indices().unwrap(), vec![2]);
+    }
+
+    /// A second job a turn starts joins the steps already waiting on the
+    /// first; once both ended, a step left open settles as not done and the
+    /// plan resolves: nothing reads "working" with nothing working.
+    #[test]
+    fn open_steps_settle_once_nothing_runs() {
+        let mut plan = TaskPlan::new(
+            "session_123",
+            "test",
+            "Two installs",
+            vec!["Install one".into(), "Install two".into()],
+            "test",
+        );
+        for step in &mut plan.steps {
+            step.status = StepStatus::Pending;
+        }
+        assert!(plan.wait_on_background_jobs(&["job-1".to_string()]));
+        assert!(plan.wait_on_background_jobs(&["job-2".to_string()]));
+        assert_eq!(plan.steps[0].background_jobs, vec!["job-1", "job-2"]);
+        plan.settle_background_job("job-1", JobEnd::Succeeded);
+        assert_eq!(plan.steps[0].status, StepStatus::Background);
+        plan.steps.push(PlanStep {
+            status: StepStatus::InProgress,
+            description: "Report each time".into(),
+            background_jobs: Vec::new(),
+            waits_on_jobs: false,
+            ..plan.steps[0].clone()
+        });
+        plan.settle_background_job("job-2", JobEnd::Succeeded);
+        assert!(!plan.is_finished());
+        assert!(plan.settle_open_steps());
+        assert!(plan.is_finished());
+        assert_eq!(plan.steps[2].not_done, Some(NotDoneReason::LeftOpen));
+        assert!(plan
+            .render_compact_checklist()
+            .contains("nothing was left working on it"));
     }
 
     #[test]

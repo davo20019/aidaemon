@@ -42,6 +42,7 @@
 
 pub mod approvals;
 pub mod authority;
+pub mod background_run;
 pub mod chat_bridge;
 pub mod context_budget;
 pub mod coordination;

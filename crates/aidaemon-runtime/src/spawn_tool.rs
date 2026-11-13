@@ -50,11 +50,6 @@ pub struct SpawnAgentTool {
     pub plan_store: OnceLock<Arc<aidaemon_work::plans::PlanStore>>,
 }
 
-#[cfg(any(test, feature = "testing"))]
-pub const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 1;
-#[cfg(not(any(test, feature = "testing")))]
-pub const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 20;
-
 /// Fallback description used when the parent runtime isn't wired yet
 /// (early bootstrap) or when the registry is empty.
 pub const STATIC_SPECIALIST_ARG_DESCRIPTION: &str =
@@ -334,24 +329,35 @@ pub fn job_end(phase: RunPhase) -> aidaemon_work::plans::JobEnd {
     }
 }
 
-/// The card a turn leaves in the chat, drawn from the records: the plan (as
-/// it renders itself) and each of the chat's helper runs, running or just
-/// ended, by the same renderer as the live card.
+/// A kept card, drawn from the records: the plan (as it renders itself) and
+/// each run drawn on that card, running or ended, by the same renderer as
+/// the live card.
 pub fn kept_card(
     plan: Option<&aidaemon_work::plans::TaskPlan>,
-    runs: &crate::run_state::RunStates,
-    chat: &str,
+    runs: &[crate::run_state::RunState],
 ) -> Option<String> {
     let plan = plan.map(aidaemon_work::plans::TaskPlan::card);
     aidaemon_channels::live_status::render_card(&aidaemon_channels::live_status::CardView {
         plan: plan.as_ref(),
-        helpers: runs
-            .for_chat(chat)
-            .iter()
-            .map(|run| (run.view(), None))
-            .collect(),
-        activity: None,
+        helpers: runs.iter().map(|run| (run.view(), None)).collect(),
+        ..Default::default()
     })
+}
+
+/// The runs drawn on card `card` in `chat`: each run whose own card it is
+/// (a run still waiting to learn its card is resolved first).
+pub async fn runs_on_card(
+    hub: &dyn OutboundRouter,
+    runs: &crate::run_state::RunStates,
+    chat: &str,
+    card: &str,
+) -> Vec<crate::run_state::RunState> {
+    for run in runs.for_chat(chat) {
+        if matches!(run.card, crate::run_state::RunCard::Pending { .. }) {
+            run_card(hub, runs, &run.id, chat).await;
+        }
+    }
+    runs.on_card(chat, card)
 }
 
 /// One writer at a time for a chat's kept card. A helper's step redraw and
@@ -381,9 +387,9 @@ pub struct HelperCard {
     pub chat: String,
     pub job: String,
     pub label: String,
-    /// The chat's kept card and background message when the helper
-    /// started: one that differs later is the card its own turn left.
-    pub at_start: (Option<String>, Option<String>),
+    /// The chat's kept card when the helper started: one that differs
+    /// later is the card its own turn left.
+    pub at_start: Option<String>,
     /// What this helper last drew, so an unchanged card is not sent again.
     pub drawn: std::sync::Mutex<Option<String>>,
 }
@@ -416,27 +422,22 @@ impl HelperCard {
         {
             return;
         }
-        let now = (
-            hub.checklist_surface(&self.chat).await,
-            hub.background_status_surface(&self.chat).await,
-        );
+        let now = hub.checklist_surface(&self.chat).await;
         if now == self.at_start {
             return;
         }
         let plan = job_plan(self.plans.as_ref(), self.plan_session.as_deref(), &self.job).await;
         // Without a plan the card is the helpers' own: the one the turn that
-        // started this helper kept, never a later turn's. A background status
-        // message is the turn's reply and is never drawn over.
-        let surface = match (&plan, now.0, now.1) {
-            (None, _, _) => match run_card(hub.as_ref(), &self.runs, &self.job, &self.chat).await {
-                Some(card) => card,
-                None => return,
+        // started this helper kept, never a later turn's.
+        let surface = match run_card(hub.as_ref(), &self.runs, &self.job, &self.chat).await {
+            Some(card) => card,
+            None => match (&plan, now) {
+                (Some(_), Some(card)) => card,
+                _ => return,
             },
-            (Some(_), Some(card), _) => card,
-            (Some(_), None, Some(status)) => status,
-            _ => return,
         };
-        let Some(card) = kept_card(plan.as_ref(), &self.runs, &self.chat) else {
+        let on_card = runs_on_card(hub.as_ref(), &self.runs, &self.chat, &surface).await;
+        let Some(card) = kept_card(plan.as_ref(), &on_card) else {
             return;
         };
         let unchanged = self
@@ -834,15 +835,16 @@ pub fn run_window(name: &str, run: &MeasuredRun) -> String {
 /// A failed child's measured run, for the parent: how long it ran before it
 /// failed, which is never a time to finish its work. Its work's time to
 /// finish exists only once something finishes it: quote a later helper's
-/// measured time, or say no time to finish was measured.
+/// measured time, or the run's own measured end when it does the work itself.
 pub fn failed_run_window(name: &str, run: &MeasuredRun) -> String {
     let took = run.took();
     format!(
         "{MEASURED_TIMING_MARK}{name} ran {} ({}s), {}, and failed.{}\n\
          These are the daemon's measurements: it failed after this long, so this is not how \
-         long its work takes. Report what was measured: if you start another helper for this \
-         work, its own measured time is the time to finish; if you do the work yourself, say \
-         that no time to finish was measured. Never estimate one.",
+         long its work takes. If you start another helper for this work, its own measured time \
+         is the time to finish; if you do the work yourself, the daemon measures it from this \
+         failure to the end of your turn and puts that time under your reply. Never estimate \
+         one.",
         compact(took),
         took.num_seconds(),
         run.range(),
@@ -869,11 +871,32 @@ pub fn owner_wait_note(waited: Duration) -> String {
 /// one duration, from its first step to its end, and the times it spans
 /// (live 2026-11-13: "Ran 2m 44s (8:34 PM ET to 8:37 PM ET)" read as the
 /// whole run, but was its first to last tool call). `None` while it runs.
+/// When the owner's request that started it is on record, the line also
+/// says how long after that request it was done, so "how long did it take"
+/// is answered from the record, request to finish.
 pub fn background_timing(run: &crate::run_state::RunState) -> Option<String> {
+    let span = run.span()?;
     Some(format!(
-        "{MEASURED_TIMING_MARK}{}",
-        took_line(run.span()?, run.waited)
+        "{MEASURED_TIMING_MARK}{}{}",
+        took_line(span, run.waited),
+        run.requested_at
+            .map(|requested| since_request(requested, span.to))
+            .unwrap_or_default()
     ))
+}
+
+/// " Done 4m 10s after your request (4:25:46 AM ET)." from the measured
+/// request time and end.
+pub fn since_request(
+    requested: chrono::DateTime<chrono::Utc>,
+    done: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let span = crate::run_state::measured_span(requested, done);
+    format!(
+        " Done {} after your request ({}).",
+        compact(span.took()),
+        owner_clock_range(span.from, span.to)
+    )
 }
 
 /// How long a helper took and when, for the owner, from what the runtime
@@ -1324,7 +1347,10 @@ impl Tool for SpawnAgentTool {
                         "description": "The specific task or question the sub-agent should accomplish. \
                             Keep it self-contained but concise: state the goal, success criteria, and any \
                             non-obvious constraints. Do NOT paste file contents, prior tool output, or \
-                            conversation excerpts — give file paths and let the sub-agent read them itself."
+                            conversation excerpts — give file paths and let the sub-agent read them itself. \
+                            Ask only for the work and what it found: the daemon measures every \
+                            helper's time (start, finish, and since the owner's request) on its own \
+                            record, so a helper never times itself or reports a duration."
                     },
                     "background": {
                         "type": "boolean",
@@ -1745,7 +1771,6 @@ impl SpawnAgentTool {
         let executor_task_runs = Arc::clone(&self.executor_task_runs);
         let executor_task_id_for_bg = executor_task_id;
         let notify_goal_id = goal_id_ref.clone().unwrap_or_else(|| "global".to_string());
-        let notify_status_tx = status_tx.clone();
         let tree_for_bg = tree.clone();
 
         let background_id = format!("background_spawn:{}", uuid::Uuid::new_v4());
@@ -1823,13 +1848,10 @@ impl SpawnAgentTool {
             },
         ));
         let at_start = match hub.as_ref() {
-            Some(hub) => (
-                hub.checklist_surface(&session_id).await,
-                hub.background_status_surface(&session_id).await,
-            ),
-            None => (None, None),
+            Some(hub) => hub.checklist_surface(&session_id).await,
+            None => None,
         };
-        runs.card_before(&background_id, at_start.0.clone());
+        runs.card_before(&background_id, at_start.clone());
         let status_tx = show_helper_steps_on_card(
             status_tx,
             HelperCard {
@@ -1854,10 +1876,6 @@ impl SpawnAgentTool {
             // A panic in the child must not skip the cleanup below, and the
             // run still ends (failed), which tells the chat.
             let finished = std::panic::AssertUnwindSafe(async {
-                let started_at = std::time::Instant::now();
-                let mut progress_interval =
-                    tokio::time::interval(Duration::from_secs(BACKGROUND_PROGRESS_INTERVAL_SECS));
-                progress_interval.tick().await; // consume immediate tick
                 let mut cancelled_by_owner = false;
                 // Scoped so that leaving it drops the child's future, which stops
                 // the child.
@@ -1894,25 +1912,11 @@ impl SpawnAgentTool {
                         }
                     };
                     tokio::pin!(owner_cancelled);
-                    loop {
-                        tokio::select! {
-                            res = &mut result_fut => break res,
-                            _ = &mut owner_cancelled => {
-                                cancelled_by_owner = true;
-                                break Err(anyhow::anyhow!("cancelled by the owner"));
-                            }
-                            _ = progress_interval.tick() => {
-                                let elapsed_secs = started_at.elapsed().as_secs();
-                                if let Some(ref tx) = notify_status_tx {
-                                    let _ = tx.try_send(StatusUpdate::ToolProgress {
-                                        name: "spawn_agent".to_string(),
-                                        chunk: format!(
-                                            "Background sub-agent still running ({}s): {}",
-                                            elapsed_secs, name
-                                        ),
-                                    });
-                                }
-                            }
+                    tokio::select! {
+                        res = &mut result_fut => res,
+                        _ = &mut owner_cancelled => {
+                            cancelled_by_owner = true;
+                            Err(anyhow::anyhow!("cancelled by the owner"))
                         }
                     }
                 };
@@ -2137,7 +2141,6 @@ pub async fn deliver_when_run_ends(
         )
         .await;
     }
-    route.runs.forget(&state.id);
 }
 
 /// What the runtime measured of a background run as it ends: now, its
@@ -2158,13 +2161,16 @@ pub fn coordination_trailer(tree: Option<&crate::authority::SpawnFamily>, sessio
         .unwrap_or_default()
 }
 
-/// A background job ended: settle the checklist steps it was given and
-/// settle the card to its final state, drawn from the records: the plan (when
-/// the job had steps) and each helper, the one that ended under its final
-/// header. A card with a plan edits the card the turn left (or the session's
-/// background status message) in place, else is sent fresh; a helper's own
-/// card is the one the turn kept. The result message follows on its own.
-/// `true` when a card now shows how the job ended.
+/// A background run ended: settle the checklist steps it was given, then
+/// redraw its own card (the one its starting turn kept) from the records:
+/// the plan and every run drawn on that card. Once nothing on the card is
+/// still running, the plan's steps still open settle as not done (nothing
+/// is left to do them) and the card settles to its final state, by the same
+/// rule as a turn's card ([`aidaemon_core::card::CardEnd::of`]); the
+/// records of its runs are then let go. A run whose card is unknown edits
+/// the chat's plan card (or sends it fresh) when it had a plan. `true` when
+/// a card now shows how the run ended; the result message follows on its
+/// own and never says it again.
 pub async fn settle_background_steps(
     runs: &crate::run_state::RunStates,
     plan_store: Option<&Arc<aidaemon_work::plans::PlanStore>>,
@@ -2178,7 +2184,10 @@ pub async fn settle_background_steps(
     // now draws nothing; this waits for any still in flight.
     let writer = card_writer(chat_session);
     let _turn = writer.lock().await;
-    let plan = match (plan_store, plan_session) {
+    let plan_id = job_plan(plan_store, plan_session, job_id)
+        .await
+        .map(|plan| plan.id);
+    let settled = match (plan_store, plan_session) {
         (Some(plans), Some(plan_session)) => {
             match plans.settle_background_job(plan_session, job_id, end).await {
                 Ok(plan) => plan,
@@ -2190,30 +2199,59 @@ pub async fn settle_background_steps(
         }
         _ => None,
     };
+    let plan_id = plan_id.or_else(|| settled.as_ref().map(|plan| plan.id.clone()));
     // A sub-agent's own checklist is not the card in the chat.
     if plan_session.is_some_and(|plan_session| plan_session != chat_session) {
+        runs.forget(job_id);
         return false;
     }
     let Some(hub) = hub.and_then(Weak::upgrade) else {
+        runs.forget(job_id);
         return false;
     };
-    let Some(card) = kept_card(plan.as_ref(), runs, chat_session) else {
-        return false;
-    };
-    if plan.is_some() {
-        return update_checklist_card(hub.as_ref(), chat_session, &card).await;
-    }
-    // The card the run's own turn kept: a later turn's card is that turn's.
     let Some(surface) = run_card(hub.as_ref(), runs, job_id, chat_session).await else {
-        return false;
+        // Its turn kept no card it can be told by: the plan's card shows
+        // the plan and this run.
+        let this: Vec<_> = runs.get(job_id).into_iter().collect();
+        runs.forget(job_id);
+        return match kept_card(settled.as_ref(), &this) {
+            Some(card) if settled.is_some() => {
+                update_checklist_card(hub.as_ref(), chat_session, &card).await
+            }
+            _ => false,
+        };
     };
-    match hub.edit_text(chat_session, &surface, &card).await {
-        Ok(edited) => edited,
-        Err(error) => {
-            warn!(session_id = %chat_session, %error, "Could not settle a helper's card");
-            false
+    let on_card = runs_on_card(hub.as_ref(), runs, chat_session, &surface).await;
+    let all_ended = on_card.iter().all(|run| run.phase.is_terminal());
+    let mut plan = settled;
+    if let (Some(plans), Some(plan_id)) = (plan_store, plan_id.as_deref()) {
+        let latest = if all_ended {
+            plans.settle_open_steps(plan_id).await
+        } else {
+            plans.get(plan_id).await
+        };
+        match latest {
+            Ok(Some(latest)) => plan = Some(latest),
+            Ok(None) => {}
+            Err(error) => warn!(%error, job_id, "Could not read a background run's plan"),
         }
     }
+    let shown = match kept_card(plan.as_ref(), &on_card) {
+        Some(card) => match hub.edit_text(chat_session, &surface, &card).await {
+            Ok(edited) => edited,
+            Err(error) => {
+                warn!(session_id = %chat_session, %error, "Could not settle a run's card");
+                false
+            }
+        },
+        None => false,
+    };
+    if all_ended {
+        for run in &on_card {
+            runs.forget(&run.id);
+        }
+    }
+    shown
 }
 
 /// The card run `job` is drawn on: the one its run record names, else the
@@ -2236,15 +2274,10 @@ pub async fn run_card(
     }
 }
 
-/// Show `card` in the session's chat: edit the plan card the turn left (or
-/// the background status message) in place, else send it as a new card.
-/// `true` when the chat shows it.
+/// Show `card` in the session's chat: edit the plan card the turn left in
+/// place, else send it as a new card. `true` when the chat shows it.
 pub async fn update_checklist_card(hub: &dyn OutboundRouter, session_id: &str, card: &str) -> bool {
-    let surface = match hub.checklist_surface(session_id).await {
-        Some(id) => Some(id),
-        None => hub.background_status_surface(session_id).await,
-    };
-    if let Some(id) = surface {
+    if let Some(id) = hub.checklist_surface(session_id).await {
         if matches!(hub.edit_text(session_id, &id, card).await, Ok(true)) {
             return true;
         }
@@ -2268,10 +2301,7 @@ pub async fn update_checklist_card(hub: &dyn OutboundRouter, session_id: &str, c
 /// as its reply, so it is one plain line naming the helper.
 pub fn background_spawn_outcome(name: &str) -> ToolCallOutcome {
     reported(
-        format!(
-            "Started in the background: {name}. Its result will come to this chat when it \
-             finishes."
-        ),
+        crate::background_run::started_in_background(name),
         SourceTrust::Trusted,
     )
     .handed_to_background()

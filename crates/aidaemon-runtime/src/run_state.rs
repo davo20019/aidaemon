@@ -102,6 +102,10 @@ pub struct RunState {
     /// The name the owner reads for it.
     pub label: String,
     pub phase: RunPhase,
+    /// When the owner's request that started it reached the runner, when a
+    /// chat turn started it: a time "since your request" is measured from
+    /// here.
+    pub requested_at: Option<DateTime<Utc>>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
     /// Its first tool step, when it took one: how long it took is measured
@@ -221,6 +225,8 @@ impl RunStates {
             chat: chat.to_string(),
             label: label.to_string(),
             phase: RunPhase::Running,
+            requested_at: aidaemon_channels::turns::TurnOver::current()
+                .map(|turn| turn.requested_at()),
             started_at: Utc::now(),
             ended_at: None,
             work_began: None,
@@ -322,6 +328,15 @@ impl RunStates {
             .collect();
         listed.sort_by_key(|(seq, _)| *seq);
         listed.into_iter().map(|(_, state)| state).collect()
+    }
+
+    /// The runs drawn on card `card` (the card their starting turn kept),
+    /// oldest first.
+    pub fn on_card(&self, chat: &str, card: &str) -> Vec<RunState> {
+        self.for_chat(chat)
+            .into_iter()
+            .filter(|state| matches!(&state.card, RunCard::Kept(kept) if kept == card))
+            .collect()
     }
 
     /// The chat's runs still running, oldest first.

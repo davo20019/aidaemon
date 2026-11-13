@@ -212,4 +212,11 @@ pub struct TurnScope<'a> {
     /// stop is a handoff: the job's result reaches the session through its
     /// notifier, so the run must not close the request on its own.
     pub open_background_jobs: AtomicUsize,
+    /// The first line of the latest call that left a job running for this
+    /// run ("Started in the background: …"): the reply of a run that stops
+    /// while the job runs.
+    pub background_ack: std::sync::Mutex<Option<String>>,
+    /// When the run took over a helper's work after the helper it waited on
+    /// failed: from here to the run's end is the run's own work, measured.
+    pub own_work_since: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
 }

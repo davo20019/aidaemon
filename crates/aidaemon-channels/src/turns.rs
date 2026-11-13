@@ -122,10 +122,6 @@ pub trait TurnSurface: Send + Sync + 'static {
         None
     }
 
-    /// The turn's card became its reply (a background handoff whose card
-    /// collapsed): message `message_id` now holds the reply.
-    async fn card_became_reply(&self, _message_id: &str) {}
-
     /// The turn kept its card: message `message_id` stays as the record of
     /// the work, for what outlives the turn (a helper ending) to settle.
     async fn card_kept(&self, _message_id: &str) {}
@@ -173,10 +169,34 @@ tokio::task_local! {
 /// (its reply and the card it kept). Work the turn started that outlives it
 /// (a background helper) waits on this before it touches the chat, so the
 /// turn's reply always comes before the work's own end.
-#[derive(Clone, Default)]
-pub struct TurnOver(CancellationToken);
+#[derive(Clone)]
+pub struct TurnOver {
+    over: CancellationToken,
+    /// When the owner's request reached the runner: what a time "since your
+    /// request" is measured from.
+    requested_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for TurnOver {
+    fn default() -> Self {
+        Self {
+            over: CancellationToken::new(),
+            requested_at: chrono::Utc::now(),
+        }
+    }
+}
 
 impl TurnOver {
+    /// When the owner's request that started this turn reached the runner.
+    pub fn requested_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.requested_at
+    }
+
+    /// The turn is over: everything it shows is out.
+    pub fn end(&self) {
+        self.over.cancel();
+    }
+
     /// The turn running this task, if any (scheduled work has none).
     pub fn current() -> Option<Self> {
         TURN_OVER.try_with(Clone::clone).ok()
@@ -184,12 +204,12 @@ impl TurnOver {
 
     /// Wait until that turn is over.
     pub async fn wait(&self) {
-        self.0.cancelled().await;
+        self.over.cancelled().await;
     }
 
     /// Whether that turn is over.
     pub fn is_over(&self) -> bool {
-        self.0.is_cancelled()
+        self.over.is_cancelled()
     }
 
     /// Run `future` as part of the turn this marks.
@@ -214,32 +234,14 @@ impl TurnCard {
         }
     }
 
-    /// Deliver the reply. A background handoff whose card collapses
-    /// becomes that card; any other reply goes out on its own, and the card
-    /// ends after it ([`Self::close`]).
+    /// Deliver the reply, always on its own: the card is the state, and it
+    /// ends after the reply ([`Self::close`]).
     async fn deliver(
         &self,
         surface: &dyn TurnSurface,
         envelope: &AgentResponseEnvelope,
         reply: &str,
     ) -> Delivered {
-        if envelope.disposition == aidaemon_events::AssistantResponseDisposition::BackgroundHandoff
-        {
-            let became = self
-                .live
-                .lock()
-                .await
-                .become_reply(self.sink.as_ref(), reply)
-                .await;
-            if let Some(id) = became {
-                surface.card_became_reply(&id).await;
-                return Delivered {
-                    state: ResponseDeliveryState::Edited,
-                    message_ids: vec![id],
-                    error: None,
-                };
-            }
-        }
         surface.deliver(envelope, reply).await
     }
 
@@ -768,7 +770,7 @@ impl TurnRunner {
             // Marked once everything the turn shows is out, however this
             // iteration ends.
             let turn_over = TurnOver::default();
-            let over_when_dropped = turn_over.0.clone().drop_guard();
+            let over_when_dropped = turn_over.over.clone().drop_guard();
             if let Some(timing) = timing.as_mut() {
                 timing.mark_dispatched_now();
             }
@@ -1241,6 +1243,9 @@ pub fn status_text(update: &StatusUpdate) -> Option<String> {
         }
         StatusUpdate::StepHandedOff { kind } => progress(Step::HandedOff(*kind).words()),
         StatusUpdate::CommandOutput { line, .. } => progress(Step::Output(line.clone()).words()),
+        StatusUpdate::OwnWork { took } => {
+            progress(format!("✅ Finished here after the helper failed\n{took}"))
+        }
     })
 }
 
@@ -1691,13 +1696,6 @@ mod tests {
         fn card_sink(&self) -> Option<Arc<dyn crate::live_status::SurfaceSink>> {
             Some(self.0.clone())
         }
-        async fn card_became_reply(&self, id: &str) {
-            self.0
-                .log
-                .lock()
-                .unwrap()
-                .push(format!("card became reply {id}"));
-        }
         async fn card_kept(&self, id: &str) {
             self.0.log.lock().unwrap().push(format!("card kept {id}"));
         }
@@ -1797,9 +1795,10 @@ mod tests {
         assert!(!log.iter().any(|e| e.starts_with("card kept")), "{log:#?}");
     }
 
-    /// A background handoff with a helper on its card keeps the card: the
-    /// ack goes out as its own message, before anything the background work
-    /// does when it ends. One with nothing kept collapses into the ack.
+    /// A background handoff with a run on its card keeps the card: the ack
+    /// goes out as its own message, before anything the background work does
+    /// when it ends. One with nothing kept is removed after the ack: the
+    /// card never becomes a message of its own.
     #[tokio::test]
     async fn a_handoffs_ack_comes_before_the_work_ends() {
         use aidaemon_core::card::HelperView;
@@ -1833,11 +1832,17 @@ mod tests {
             BackgroundHandoff,
         )
         .await;
-        let became = log.iter().position(|e| e == "card became reply card-1");
+        let ack = log
+            .iter()
+            .position(|e| e == "say:Started the install in the background.");
+        let deleted = log.iter().position(|e| e == "card deleted");
         let ended = log.iter().position(|e| e == "background work ended");
-        assert!(became.is_some() && ended > became, "{log:#?}");
         assert!(
-            log.contains(&"card:Started the install in the background.".to_string()),
+            ack.is_some() && deleted > ack && ended > deleted,
+            "{log:#?}"
+        );
+        assert!(
+            !log.contains(&"card:Started the install in the background.".to_string()),
             "{log:#?}"
         );
     }

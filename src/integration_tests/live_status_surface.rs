@@ -136,12 +136,8 @@ mod live_status_surface_tests {
             },
         )
         .await;
-        // A plan of two steps is the record of the work: it never becomes
-        // the reply, and the turn's end keeps it.
-        assert!(live
-            .become_reply(sink_ref, "Done — result file attached.")
-            .await
-            .is_none());
+        // A plan of two steps is the record of the work: the turn's end
+        // keeps it.
         live.close(sink_ref).await;
 
         assert_eq!(
@@ -170,86 +166,94 @@ mod live_status_surface_tests {
         }
     }
 
-    /// Background progress and completion EDIT the registered handoff bubble
-    /// in place. Progress preserves the surface for later updates; completion
-    /// consumes it. When no surface remains, delivery falls back to a fresh
-    /// message. Exercises the real ChannelHub registry + terminal helpers.
+    /// Two runs a turn left running share its one card. When the first
+    /// ends, the card shows it ended and the other still running; when the
+    /// last ends, nothing on the card is running: the plan step the turn
+    /// left open settles as not done, and the card settles to its final
+    /// state (live 2026-11-13: the card stayed "Working · step 4 of 4" with
+    /// two "Running in the background" rows 14 minutes after both ended).
     #[tokio::test]
-    async fn background_completion_ping_edits_registered_handoff_bubble() {
-        let channel = Arc::new(EditableChannel {
-            messages: Mutex::new(vec![]),
-            edits: Mutex::new(vec![]),
-        });
-        let session_map: SessionMap = Arc::new(RwLock::new(HashMap::new()));
-        session_map.write().await.insert(
-            "telegram:synthetic-user-1".to_string(),
-            "editable-test".to_string(),
-        );
-        let hub = Arc::new(ChannelHub::new(
-            vec![channel.clone() as Arc<dyn HubChannel>],
-            session_map,
-        ));
-        let outbound: Arc<dyn crate::runtime_ports::OutboundRouter> = hub.clone();
-
-        // The delivered handoff reply registered its message id ("m1").
-        hub.register_background_status_surface("telegram:synthetic-user-1", "m1")
+    async fn a_card_settles_once_nothing_on_it_runs() {
+        use aidaemon_runtime::background_run::{BackgroundRun, RunHome, RunStart};
+        use aidaemon_runtime::run_state::RunPhase;
+        let session = "telegram:synthetic-two-runs";
+        let chat = crate::testing::CardChat::new(session).await;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(&format!("sqlite://{}?mode=rwc", db.path().display()))
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(pool).await.unwrap());
+        let plan = plans
+            .upsert_checklist(
+                session,
+                Some("turn-1"),
+                "test",
+                &[
+                    ("Install site one".to_string(), crate::plans::StepStatus::InProgress),
+                    ("Install site two".to_string(), crate::plans::StepStatus::Pending),
+                    ("Report each time".to_string(), crate::plans::StepStatus::Pending),
+                ],
+            )
+            .await
+            .unwrap();
+        let home = RunHome {
+            runs: Arc::default(),
+            hub: Some(chat.outbound()),
+            plans: Some(plans.clone()),
+        };
+        let (first, second) = chat
+            .turn(
+                |tx| {
+                    let home = home.clone();
+                    let plans = plans.clone();
+                    let plan_id = plan.id.clone();
+                    async move {
+                        if let Ok(Some(plan)) = plans.get(&plan_id).await {
+                            let _ = tx.try_send(crate::types::StatusUpdate::Checklist(plan.card()));
+                        }
+                        let start = |id: &'static str, label: &'static str| RunStart {
+                            id,
+                            chat: session,
+                            label,
+                            task_id: Some("turn-1"),
+                            status_tx: Some(tx.clone()),
+                            work_began: chrono::Utc::now(),
+                        };
+                        let first =
+                            BackgroundRun::start(home.clone(), start("job-1", "Install site one"))
+                                .await;
+                        let second =
+                            BackgroundRun::start(home.clone(), start("job-2", "Install site two"))
+                                .await;
+                        (first, second)
+                    }
+                },
+                |_| "Started in the background: Install site one.".to_string(),
+            )
             .await;
 
-        let progress = "⏳ **Still working** · 35s\n\nOutput is still arriving.\n\n_12 lines received so far._";
-        crate::tools::terminal::deliver_background_progress_update(
-            Some(&outbound),
-            None,
-            "telegram:synthetic-user-1",
-            "goal-1",
-            progress,
-            4241,
-        )
-        .await;
+        let (_, on_card) = first.finish(RunPhase::Succeeded, Default::default()).await;
+        assert!(on_card);
+        let card = chat.shown().await[0].clone();
+        assert!(card.contains("✅ Finished in the background: Install site one"), "{card}");
+        assert!(card.contains("⏳ Running in the background: Install site two"), "{card}");
 
-        // Completion can still reuse the same surface because progress did not
-        // consume its registry entry.
-        let ping = "⏳ **Preparing your result**\n\nThe background step finished in 1m 3s.";
-        crate::tools::terminal::deliver_background_completion_ping(
-            Some(&outbound),
-            None,
-            "telegram:synthetic-user-1",
-            "goal-1",
-            ping,
-            4242,
-        )
-        .await;
-
-        {
-            let edits = channel.edits.lock().await;
-            let messages = channel.messages.lock().await;
-            assert_eq!(edits.len(), 2, "progress and completion must edit in place");
-            assert_eq!(edits[0].0, "m1");
-            assert!(edits[0].1.contains("Still working"));
-            assert_eq!(edits[1].0, "m1");
-            assert!(edits[1].1.contains("background step finished in"));
-            assert!(!edits[1].1.contains("Done"));
-            assert!(messages.is_empty(), "no fresh message when the edit works");
-        }
-
-        // The registry entry is consumed: a second ping (e.g. another
-        // background command whose handoff was never registered) falls back
-        // to a fresh message, whose id is returned so it can be resolved later.
-        let fresh_surface = crate::tools::terminal::deliver_background_completion_ping(
-            Some(&outbound),
-            None,
-            "telegram:synthetic-user-1",
-            "goal-1",
-            ping,
-            4243,
-        )
-        .await;
-        let edits = channel.edits.lock().await;
-        let messages = channel.messages.lock().await;
-        assert_eq!(edits.len(), 2, "no third edit — registry entry consumed");
-        assert_eq!(messages.len(), 1, "fallback fresh message delivered");
-        assert!(
-            fresh_surface.is_some(),
-            "a fresh completion ping must be returned as a resolvable surface"
-        );
+        let (_, on_card) = second.finish(RunPhase::Succeeded, Default::default()).await;
+        assert!(on_card);
+        let shown = chat.shown().await;
+        let card = &shown[0];
+        assert!(card.contains("✅ Finished in the background: Install site one"), "{card}");
+        assert!(card.contains("✅ Finished in the background: Install site two"), "{card}");
+        assert!(!card.contains("Running"), "{card}");
+        assert!(!card.contains("Working"), "{card}");
+        assert!(card.contains("Report each time"), "{card}");
+        assert!(card.contains("Report each time (not done)"), "{card}");
+        let cards = shown
+            .iter()
+            .filter(|text| text.contains("in the background:") && !text.starts_with("Started"))
+            .count();
+        assert_eq!(cards, 1, "{shown:#?}");
+        assert!(home.runs.for_chat(session).is_empty(), "records let go once settled");
     }
 }

@@ -99,9 +99,13 @@ impl TurnEngine<'_> {
         }
         scope.background_handoff.store(true, Ordering::Relaxed);
         scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
-        scope.verdict.record_handoff_reply(
-            crate::turn::post_task::build_friendly_background_handoff(scope.user_text),
-        );
+        let ack = scope
+            .background_ack
+            .lock()
+            .ok()
+            .and_then(|ack| ack.clone())
+            .unwrap_or_else(|| "The task is running in the background.".to_string());
+        scope.verdict.record_handoff_reply(ack);
         self.emit_decision_point(
             scope.emitter,
             scope.task_id,

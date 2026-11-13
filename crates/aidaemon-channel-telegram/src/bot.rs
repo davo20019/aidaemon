@@ -24,7 +24,7 @@ use aidaemon_channels::turns::{repeat_while_working, Delivered, Turn, TurnRunner
 use aidaemon_channels::Channel as _;
 use aidaemon_core::ChannelVisibility;
 use aidaemon_events::conversation::MessageAttachment;
-use aidaemon_events::payloads::{AssistantResponseDisposition, ResponseDeliveryState};
+use aidaemon_events::payloads::ResponseDeliveryState;
 use aidaemon_tools::semantics::{
     ApprovalResponse, GoalConfirmationStyle, PermissionMode, RiskLevel, UserRole,
 };
@@ -1590,14 +1590,6 @@ impl TurnSurface for TelegramSurface {
         self.card.clone().map(|sink| sink as Arc<dyn SurfaceSink>)
     }
 
-    /// The handoff's reply is on the card: a later completion can edit it.
-    async fn card_became_reply(&self, message_id: &str) {
-        if let Some(hub) = &self.hub {
-            hub.register_background_status_surface(&self.session_id, message_id)
-                .await;
-        }
-    }
-
     /// A card that stays in the chat can still change after the turn: a
     /// background job settles the steps it was handed, a helper its header.
     async fn card_kept(&self, message_id: &str) {
@@ -1623,24 +1615,14 @@ impl TurnSurface for TelegramSurface {
 
     /// Final answers are new messages: a progress edit is not a delivery
     /// (Telegram can acknowledge editMessageText while a client delays
-    /// showing it). A background handoff's reply may follow up later.
-    async fn deliver(&self, envelope: &AgentResponseEnvelope, reply: &str) -> Delivered {
-        let background_handoff =
-            envelope.disposition == AssistantResponseDisposition::BackgroundHandoff;
+    /// showing it).
+    async fn deliver(&self, _envelope: &AgentResponseEnvelope, reply: &str) -> Delivered {
         match send_full_or_expandable_reply(&self.bot, self.chat_id, reply).await {
-            Ok(message_ids) => {
-                if background_handoff {
-                    if let (Some(hub), Some(id)) = (&self.hub, message_ids.last()) {
-                        hub.register_background_status_surface(&self.session_id, id)
-                            .await;
-                    }
-                }
-                Delivered {
-                    state: ResponseDeliveryState::PlatformAcknowledged,
-                    message_ids,
-                    error: None,
-                }
-            }
+            Ok(message_ids) => Delivered {
+                state: ResponseDeliveryState::PlatformAcknowledged,
+                message_ids,
+                error: None,
+            },
             Err(e) => {
                 warn!("Failed to send Telegram message: {}", e);
                 Delivered {
@@ -2176,13 +2158,6 @@ mod tests {
         assert_eq!(
             hub.checklist_surface("telegram:synthetic").await.as_deref(),
             Some("41")
-        );
-        with_card.card_became_reply("42").await;
-        assert_eq!(
-            hub.background_status_surface("telegram:synthetic")
-                .await
-                .as_deref(),
-            Some("42")
         );
     }
 

@@ -402,6 +402,18 @@ impl PlanStore {
         Ok(None)
     }
 
+    /// Settle plan `plan_id`'s open steps as not done
+    /// ([`TaskPlan::settle_open_steps`]). Returns the plan as it now stands.
+    pub async fn settle_open_steps(&self, plan_id: &str) -> anyhow::Result<Option<TaskPlan>> {
+        let Some(mut plan) = self.get(plan_id).await? else {
+            return Ok(None);
+        };
+        if plan.settle_open_steps() {
+            self.update(&plan).await?;
+        }
+        Ok(Some(plan))
+    }
+
     /// Update just the status of a plan.
     pub async fn set_status(&self, plan_id: &str, status: PlanStatus) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();

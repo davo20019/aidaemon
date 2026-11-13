@@ -89,6 +89,10 @@ pub struct RunObligation {
     /// (executor-declared items carry their own description).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// The step in the executor's own words, for the owner: an executor
+    /// checklist item's description, never the demand text in `summary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
     /// A checklist observation that a later item depends on (`depends_on`):
     /// it is satisfied by having happened before that work, so mutations
     /// made for the dependent work do not make it stale.
@@ -575,6 +579,7 @@ impl RunAggregate {
                 required_target: None,
                 observation_targets: Vec::new(),
                 summary: None,
+                step: None,
                 prerequisite: false,
             });
         }
@@ -618,6 +623,7 @@ impl RunAggregate {
                 required_target: None,
                 observation_targets: Vec::new(),
                 summary: None,
+                step: None,
                 prerequisite: false,
             });
         }
@@ -645,6 +651,7 @@ impl RunAggregate {
                 required_target: None,
                 observation_targets: Vec::new(),
                 summary: None,
+                step: None,
                 prerequisite: false,
             });
         }
@@ -668,6 +675,7 @@ impl RunAggregate {
                 required_target: None,
                 observation_targets: Vec::new(),
                 summary: None,
+                step: None,
                 prerequisite: false,
             });
         }
@@ -685,6 +693,7 @@ impl RunAggregate {
                 required_target: None,
                 observation_targets: Vec::new(),
                 summary: None,
+                step: None,
                 prerequisite: false,
             });
         }
@@ -822,6 +831,7 @@ impl RunAggregate {
                     required_effect,
                     required_target.as_ref(),
                 )),
+                step: Some(item.description.clone()),
                 required_target,
                 observation_targets,
                 prerequisite: class == RunObligationClass::Observe
