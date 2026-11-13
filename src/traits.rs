@@ -102,22 +102,7 @@ mod state_store;
 pub use state_store::*;
 
 /// Import this in modules that call store-trait methods on concrete types.
-///
-/// `StateStore` is a facade (supertrait) used for trait objects, but Rust still
-/// requires the defining trait to be in scope for method-call syntax.
-pub mod store_prelude {
-    #![allow(unused_imports)]
-    pub use super::{
-        ConversationSummaryStore, DialogueStateStore, DynamicBotStore, DynamicCliAgentStore,
-        DynamicMcpServerStore, EpisodeStore, FactStore, GoalBudgetStore, GoalNotificationStore,
-        GoalScheduleStore, GoalStore, GoalTraceStore, HealthCheckStore, HistorySearchStore,
-        LearningStore, MandateStore, MandateToolStore, McpRegistryStore, MessageStore,
-        NotificationStore, OAuthGatewayStore, OAuthStore, PeopleStore, PromptSnapshotStore,
-        ReportBlockerStore, ScheduledGoalRunsStore, ScheduledRunStore, SessionChannelStore,
-        SettingsStore, SkillStore, SkillsStore, StateStore, TaskDispatchStore, TaskStore,
-        TokenUsageStore, WorkCoordinationStore,
-    };
-}
+pub use aidaemon_runtime::stores::prelude as store_prelude;
 
 #[cfg(test)]
 mod tests {
