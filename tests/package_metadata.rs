@@ -4,10 +4,9 @@ use std::path::Path;
 #[test]
 fn db_probe_is_feature_gated_for_binary_installers() {
     let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-    let manifest: toml::Value = fs::read_to_string(&manifest_path)
-        .expect("read Cargo.toml")
-        .parse()
-        .expect("parse Cargo.toml");
+    let manifest: toml::Value =
+        toml::from_str(&fs::read_to_string(&manifest_path).expect("read Cargo.toml"))
+            .expect("parse Cargo.toml");
 
     let db_probe = manifest
         .get("bin")
