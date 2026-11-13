@@ -69,38 +69,74 @@ pub struct SpawnChildResult {
     /// `Untrusted` when the child's run read (or started with) untrusted
     /// content: its result carries that taint back to the parent.
     pub trust: aidaemon_core::SourceTrust,
-    /// The child's own typed verdict was `done`, and its outcome is partial
-    /// only because no receipt confirmed some of its listed steps
-    /// ([`reported_done_unconfirmed`]).
-    pub reported_done: bool,
+    /// How its run ended, as the run-state record holds it ([`run_phase`]).
+    pub phase: crate::run_state::RunPhase,
+    /// Its typed steps no receipt confirmed.
+    pub evidence: crate::run_state::RunEvidence,
 }
 
-/// Whether a child's partial outcome is only for want of receipts: it
-/// ended its run normally with its own typed verdict `done`, nothing it
-/// started still runs, the owner declined nothing, and it set none of its
-/// listed steps aside (failed, skipped or deferred); only some steps were
-/// never matched by a receipt. The owner is then told it finished.
-pub fn reported_done_unconfirmed(
+/// How a child's run ended, the one place that decides it, from typed facts
+/// only: its end record's outcome, and its run aggregate. A run whose
+/// outcome is partial only for want of receipts (it ended normally with its
+/// own typed verdict `done`, nothing it started still runs, the owner
+/// declined nothing, and it set none of its steps aside) succeeded; the
+/// typed steps no receipt matched are its evidence, listed only when it
+/// declared more than one (a one-step run's step is the run itself).
+pub fn run_phase(
     outcome: TaskOutcome,
-    end: &TaskEndData,
-    aggregate: &aidaemon_events::RunAggregate,
-) -> bool {
+    end: Option<&TaskEndData>,
+    aggregate: Option<&aidaemon_events::RunAggregate>,
+) -> (crate::run_state::RunPhase, crate::run_state::RunEvidence) {
+    use crate::run_state::{RunEvidence, RunPhase};
     use aidaemon_events::RunObligationState;
-    outcome == TaskOutcome::Partial
+    let (Some(end), Some(aggregate)) = (end, aggregate) else {
+        return (RunPhase::ended(outcome), RunEvidence::default());
+    };
+    let checklist: Vec<&aidaemon_events::RunObligation> = aggregate
+        .obligations
+        .iter()
+        .filter(|(id, _)| id.contains("/obligation:checklist:"))
+        .map(|(_, obligation)| obligation)
+        .collect();
+    let only_receipts_missing = outcome == TaskOutcome::Partial
         && end.status == aidaemon_events::TaskStatus::Completed
-        && aggregate.executor_claimed_outcome == Some(aidaemon_events::ExecutorClaimedOutcome::Done)
+        && aggregate.executor_claimed_outcome
+            == Some(aidaemon_events::ExecutorClaimedOutcome::Done)
         && !aggregate.has_background_in_flight()
         && !aggregate.owner_declined()
-        && aggregate
+        && checklist.iter().all(|obligation| {
+            matches!(
+                obligation.state,
+                RunObligationState::Satisfied | RunObligationState::Pending
+            )
+        });
+    if !only_receipts_missing {
+        return (RunPhase::ended(outcome), RunEvidence::default());
+    }
+    let unconfirmed = if checklist.len() > 1 {
+        let mut pending: Vec<(&String, String)> = aggregate
             .obligations
             .iter()
-            .filter(|(id, _)| id.contains("/obligation:checklist:"))
-            .all(|(_, obligation)| {
-                matches!(
-                    obligation.state,
-                    RunObligationState::Satisfied | RunObligationState::Pending
+            .filter(|(id, obligation)| {
+                id.contains("/obligation:checklist:")
+                    && obligation.state == RunObligationState::Pending
+            })
+            .map(|(id, obligation)| {
+                (
+                    id,
+                    obligation
+                        .summary
+                        .clone()
+                        .unwrap_or_else(|| "a step it listed".to_string()),
                 )
             })
+            .collect();
+        pending.sort_by(|a, b| a.0.cmp(b.0));
+        pending.into_iter().map(|(_, summary)| summary).collect()
+    } else {
+        Vec::new()
+    };
+    (RunPhase::Succeeded, RunEvidence { unconfirmed })
 }
 
 #[derive(Debug)]
@@ -161,6 +197,8 @@ pub struct RunningChildren {
     /// Each chat's running turn (its task id), so a child is listed under
     /// the request that started it.
     requests: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// The tree's background helper runs.
+    runs: Arc<crate::run_state::RunStates>,
 }
 
 /// One running child as listed: its chat, its title and the task it was
@@ -179,6 +217,9 @@ pub struct ListedChild {
     stop: tokio_util::sync::CancellationToken,
     /// Its latest step, as its progress line says it.
     step: ChildStep,
+    /// The background run it is, when it is one: its record gives its
+    /// step and start.
+    run: Option<String>,
 }
 
 /// A running child's latest step, written by its status channel.
@@ -235,12 +276,18 @@ impl RunningChildEntry {
 }
 
 impl RunningChildren {
+    /// The tree's background helper runs.
+    pub fn runs(&self) -> Arc<crate::run_state::RunStates> {
+        self.runs.clone()
+    }
+
     pub fn enter(
         self: &Arc<Self>,
         session_id: &str,
         mission: &str,
         task: &str,
         child_session: &str,
+        run: Option<&str>,
     ) -> RunningChildEntry {
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let request = self
@@ -264,6 +311,7 @@ impl RunningChildren {
                 request,
                 stop: stop.clone(),
                 step: step.clone(),
+                run: run.map(str::to_string),
             });
         RunningChildEntry {
             registry: self.clone(),
@@ -348,18 +396,24 @@ impl RunningChildren {
                     Some(detail) => format!("{} ({detail})", child.title),
                     None => child.title.clone(),
                 };
-                ListedChildView {
-                    key: child_key(child.id),
-                    child: aidaemon_channels::ports::RunningChild {
-                        label,
-                        started_at: child.started_at,
-                    },
-                    request: child.request.clone(),
-                    step: child
+                // A background helper is shown from its run record.
+                let run = child.run.as_deref().and_then(|id| self.runs.get(id));
+                let step = match run.as_ref() {
+                    Some(run) => run.step.clone(),
+                    None => child
                         .step
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone(),
+                };
+                ListedChildView {
+                    key: child_key(child.id),
+                    child: aidaemon_channels::ports::RunningChild {
+                        label,
+                        started_at: run.map_or(child.started_at, |run| run.started_at),
+                    },
+                    request: child.request.clone(),
+                    step,
                 }
             })
             .collect()
@@ -519,15 +573,6 @@ pub fn child_status_sender(
         }
     });
     Some(tx)
-}
-
-/// How a child's progress line on the parent's card reads once it ended.
-pub fn child_end_progress(outcome: TaskOutcome) -> &'static str {
-    match outcome {
-        TaskOutcome::Succeeded => "done",
-        TaskOutcome::Partial => "stopped short",
-        TaskOutcome::Failed => "didn't finish",
-    }
 }
 
 /// A short name for a child on the parent's status card: its mission's first
@@ -799,10 +844,10 @@ pub struct ChildAgentRun {
     /// `Untrusted` when the child's run read (or started with) content
     /// someone other than the owner wrote.
     pub trust: aidaemon_core::SourceTrust,
-    /// The child's own typed verdict was `done`, and its outcome is partial
-    /// only because no receipt confirmed some of its listed steps: the owner
-    /// is told it finished, and that its tools did not confirm every step.
-    pub reported_done: bool,
+    /// How its run ended ([`run_phase`]): what every surface shows.
+    pub phase: crate::run_state::RunPhase,
+    /// Its typed steps no receipt confirmed.
+    pub evidence: crate::run_state::RunEvidence,
 }
 
 /// How long a child may go without progress (no model or tool call running
@@ -965,6 +1010,9 @@ pub trait ChildAgentRuntime: Send + Sync {
         text: &str,
         trust: aidaemon_core::SourceTrust,
     ) -> anyhow::Result<bool>;
+
+    /// The run-state records of this agent tree's background helpers.
+    fn helper_runs(&self) -> Arc<crate::run_state::RunStates>;
 }
 
 /// Owned input for re-entering an existing conversation.

@@ -30,6 +30,8 @@ Rules:
 - NEVER return just "I researched X" or "Generated a report about Y". Return the actual content.
 - Include specific outputs (file paths, data retrieved, commands run).
 - A time or duration you report is one this task measured. An earlier run's measurement, from history or memory, is never this task's result; if you mention one, say which run it was.
+- Don't state how long your own run took: the daemon measures it and puts the time under your result, so a number of your own would only disagree with it.
+- When your task is to make something new (a fresh install, a new project or folder), something already in its place is not yours to reuse: leave it untouched, never report it as new, and finish not done (outcome blocked), saying what was there.
 - If you create or write a file, include its FULL ABSOLUTE PATH in your result text.
 - Format the result for a small chat screen: lead with the outcome, use short paragraphs or bullets, and label links, paths, verification results, versions, and IDs. Do not repeat the original request or task instructions, and do not dump the execution chronology.
 - Do NOT claim the overall goal is complete. You may only finish this single task.

@@ -98,6 +98,7 @@ mod client_gateway {
                     enabled: true,
                     ..Default::default()
                 },
+                endpoints: aidaemon_core::EndpointSource::fixed(Vec::new()),
                 token_file,
                 approvals: Some(approval_tx),
             })

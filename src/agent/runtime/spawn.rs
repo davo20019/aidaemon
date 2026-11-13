@@ -2386,9 +2386,10 @@ impl Agent {
         // (the specialist's tools, its route, its event) is the child's own
         // time, and a status read during it must not say no helper runs
         // (live 2026-11-12). Dropped however this call ends.
+        let run = aidaemon_runtime::run_state::take_current_run();
         let listed = effective_approval_session_id.as_deref().map(|chat| {
             self.running_children
-                .enter(chat, &card_name, task, &child_session)
+                .enter(chat, &card_name, task, &child_session, run.as_deref())
         });
         // Each helper gets its own start line on the chat's card.
         if let Some(tx) = status_tx.as_ref() {
@@ -2657,25 +2658,24 @@ impl Agent {
             resolve_child_outcome(result.is_ok(), &child_end_record),
             unlanded_write,
         );
-        let reported_done = match child_end_record.as_ref() {
-            Ok(Some(end)) if result.is_ok() && !unlanded_write => self
-                .event_store
-                .task_run_aggregate(&child_session_for_events, &end.task_id)
-                .await
-                .is_ok_and(|aggregate| reported_done_unconfirmed(child_outcome, end, &aggregate)),
-            _ => false,
+        // How the run ended, decided once from typed facts.
+        let (phase, evidence) = match child_end_record.as_ref() {
+            Ok(Some(end)) if result.is_ok() && !unlanded_write => {
+                let aggregate = self
+                    .event_store
+                    .task_run_aggregate(&child_session_for_events, &end.task_id)
+                    .await
+                    .ok();
+                aidaemon_runtime::spawn::run_phase(child_outcome, Some(end), aggregate.as_ref())
+            }
+            _ => aidaemon_runtime::spawn::run_phase(child_outcome, None, None),
         };
         // The child's progress line on the parent's card ends with how the
         // child ended, not with the last step it reported.
         if let Some(tx) = &parent_status_tx {
-            let ended = if reported_done {
-                crate::events::TaskOutcome::Succeeded
-            } else {
-                child_outcome
-            };
             let _ = tx.try_send(StatusUpdate::SubAgentProgress {
                 label: child_status_label(&card_name),
-                progress: child_end_progress(ended).to_string(),
+                progress: phase.card_word().to_string(),
             });
         }
         let child_task_end = match child_end_record {
@@ -2818,7 +2818,8 @@ impl Agent {
             response,
             outcome: child_outcome,
             trust,
-            reported_done,
+            phase,
+            evidence,
         })
     }
 
@@ -3065,6 +3066,8 @@ impl Agent {
              - NEVER return just \"I researched X\" or \"Generated a report about Y\". Return the actual content.\n\
              - Include specific outputs (file paths, data retrieved, commands run).\n\
              - A time or duration you report is one this task measured. An earlier run's measurement, from history or memory, is never this task's result; if you mention one, say which run it was.\n\
+             - Don't state how long your own run took: the daemon measures it and puts the time under your result, so a number of your own would only disagree with it.\n\
+             - When your task is to make something new (a fresh install, a new project or folder), something already in its place is not yours to reuse: leave it untouched, never report it as new, and finish not done (outcome blocked), saying what was there.\n\
              - If you create or write a file, include its FULL ABSOLUTE PATH in your result text.\n\
              - Format the result for a small chat screen: lead with the outcome, use short paragraphs or bullets, and label links, paths, verification results, versions, and IDs. Do not repeat the original request or task instructions, and do not dump the execution chronology.\n\
              - Do NOT claim the overall goal is complete. You may only finish this single task.\n\
@@ -3237,14 +3240,16 @@ mod tests {
             mission,
             "Run this exact shell command: sleep 120 && echo alpha-test . Report the output.",
             "child-alpha",
+            None,
         );
         let _beta = registry.enter(
             "chat-1",
             mission,
             "Run this exact shell command: sleep 120 && echo beta-test . Report the output.",
             "child-beta",
+            None,
         );
-        let _other_chat = registry.enter("chat-2", mission, "Run: date", "child-other");
+        let _other_chat = registry.enter("chat-2", mission, "Run: date", "child-other", None);
         let labels: Vec<String> = registry
             .for_session("chat-1")
             .into_iter()
@@ -3269,9 +3274,9 @@ mod tests {
     fn a_listed_child_carries_its_request_and_can_be_stopped() {
         let registry = Arc::new(RunningChildren::default());
         let turn = registry.begin_request("chat-1", "task-a");
-        let child = registry.enter("chat-1", "Counting agent A", "count", "child-a");
+        let child = registry.enter("chat-1", "Counting agent A", "count", "child-a", None);
         drop(turn);
-        let later = registry.enter("chat-1", "Counting agent B", "count", "child-b");
+        let later = registry.enter("chat-1", "Counting agent B", "count", "child-b", None);
         let listed = registry.listed("chat-1");
         assert_eq!(listed[0].request.as_deref(), Some("task-a"));
         assert_eq!(listed[1].request, None);

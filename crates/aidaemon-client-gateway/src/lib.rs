@@ -96,6 +96,25 @@ impl Publisher {
     }
 }
 
+/// The gateway's address as pairing links name it: the first origin of
+/// `endpoints`, else `fallback` (config `public_url` or loopback).
+#[derive(Clone)]
+pub(crate) struct PublicUrl {
+    pub endpoints: aidaemon_core::EndpointSource,
+    pub fallback: String,
+}
+
+impl PublicUrl {
+    pub fn get(&self) -> String {
+        self.endpoints
+            .current()
+            .into_iter()
+            .next()
+            .map(|origin| origin.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| self.fallback.clone())
+    }
+}
+
 /// Everything the gateway runs on.
 pub struct GatewayDeps {
     /// The turn runner's services (the same the bots run on).
@@ -105,6 +124,10 @@ pub struct GatewayDeps {
     /// The log, on the daemon's database.
     pub log: SqliteClientEventLog,
     pub config: ClientGatewayConfig,
+    /// Where devices reach the gateway: a live tunnel origin, then
+    /// `config.public_url`. `EndpointSource::fixed(vec![])` serves the
+    /// configured or loopback address only.
+    pub endpoints: aidaemon_core::EndpointSource,
     /// The local token's hash.
     pub token_file: PathBuf,
     /// Where pairing confirmations go: the hub's approval queue (the same
@@ -150,6 +173,7 @@ pub struct ClientGateway {
     host: Arc<dyn ClientHost>,
     active: Arc<Mutex<HashSet<String>>>,
     pub(crate) config: ClientGatewayConfig,
+    endpoints: aidaemon_core::EndpointSource,
     pub(crate) token_file: PathBuf,
     pub(crate) pairing: Arc<Pairing>,
     pub(crate) views: Arc<ViewTargets>,
@@ -209,7 +233,10 @@ impl ClientGateway {
         let pairing = Arc::new(Pairing::new(
             bus.log().clone(),
             deps.approvals,
-            deps.config.public_url(),
+            PublicUrl {
+                endpoints: deps.endpoints.clone(),
+                fallback: deps.config.public_url(),
+            },
             deps.config.watch_risk_ceiling,
         ));
         let gateway = Arc::new(Self {
@@ -223,6 +250,7 @@ impl ClientGateway {
             host: deps.host,
             active,
             config: deps.config,
+            endpoints: deps.endpoints,
             token_file: deps.token_file,
             views: Arc::default(),
             in_flight: Mutex::default(),
@@ -280,9 +308,14 @@ impl ClientGateway {
         &self.views
     }
 
-    /// Where devices reach the gateway.
+    /// Where devices reach the gateway now: the live tunnel origin, else
+    /// `public_url` from config, else the loopback address.
     pub fn public_url(&self) -> String {
-        self.config.public_url()
+        PublicUrl {
+            endpoints: self.endpoints.clone(),
+            fallback: self.config.public_url(),
+        }
+        .get()
     }
 
     /// Who `token` belongs to: the owner's local token, or a paired
@@ -734,4 +767,23 @@ fn internal(error: anyhow::Error) -> ProtocolError {
         ErrorCode::Internal,
         "The daemon could not complete the command",
     )
+}
+
+#[cfg(test)]
+mod public_url_tests {
+    use super::PublicUrl;
+
+    #[test]
+    fn live_origin_then_config_then_loopback() {
+        let (endpoints, publisher) = aidaemon_core::EndpointSource::live(Vec::new());
+        let url = PublicUrl {
+            endpoints,
+            fallback: "http://127.0.0.1:8788".into(),
+        };
+        assert_eq!(url.get(), "http://127.0.0.1:8788");
+        publisher.set(Some("https://app.example.com/".into()));
+        assert_eq!(url.get(), "https://app.example.com");
+        publisher.set(None);
+        assert_eq!(url.get(), "http://127.0.0.1:8788");
+    }
 }

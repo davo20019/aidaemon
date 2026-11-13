@@ -416,6 +416,9 @@ impl ConfigManagerTool {
                     crate::startup::client_gateway::client_token_file(&settings).display()
                 )))
             }
+            "enable_exposure" => Ok(Self::exposure_settings(args)
+                .ok()
+                .map(|(service, settings)| Self::exposure_summary(&service, &settings))),
             "switch_provider" => Ok(Self::resolve_provider_selection(args, "switch_provider")
                 .ok()
                 .map(|selection| Self::switch_provider_summary(&selection))),
@@ -488,6 +491,11 @@ impl ConfigManagerTool {
             "remove_failover_provider" => json!({
                 "action": args.action,
                 "failover_index": args.failover_index,
+            }),
+            "enable_exposure" => json!({
+                "action": args.action,
+                "key": args.key,
+                "value": args.value,
             }),
             _ => json!({
                 "action": args.action,
@@ -603,8 +611,49 @@ impl ConfigManagerTool {
             .agent
             .validated_name()
             .map_err(|e| format!("Invalid agent configuration: {}", e))?;
+        config
+            .exposure
+            .validate(config.client_gateway.enabled, config.nodes.gateway.enabled)?;
 
         Ok(())
+    }
+
+    /// Why a change may not be written: it would add or change an
+    /// `[exposure.*]` table that runs a `command` adapter. That adapter runs
+    /// any program, so only the owner configures it, by editing the file.
+    /// Judged on the parsed config before and after, whatever path the
+    /// change named.
+    fn writes_exposure_command(old: &str, new: &str) -> Option<String> {
+        let exposure = |text: &str| -> aidaemon_exposure::ExposureConfig {
+            text.parse::<toml::Table>()
+                .ok()
+                .and_then(|table| table.get("exposure").cloned())
+                .and_then(|value| value.try_into().ok())
+                .unwrap_or_default()
+        };
+        let (before, after) = (exposure(old), exposure(new));
+        let pairs = [
+            (
+                "client_gateway",
+                &before.client_gateway,
+                &after.client_gateway,
+            ),
+            ("node_gateway", &before.node_gateway, &after.node_gateway),
+        ];
+        for (service, before, after) in pairs {
+            if matches!(
+                after,
+                Some(aidaemon_exposure::ServiceExposureConfig::Command { .. })
+            ) && before != after
+            {
+                return Some(format!(
+                    "Refused: `exposure.{service}` with adapter = \"command\" runs an arbitrary \
+                     program, so only the owner sets it, by editing config.toml by hand. \
+                     The config was NOT modified."
+                ));
+            }
+        }
+        None
     }
 
     fn normalize_provider_key(raw: &str) -> String {
@@ -1606,6 +1655,123 @@ impl ConfigManagerTool {
             token_path.display()
         )))
     }
+
+    /// The service and adapter settings an `enable_exposure` call names:
+    /// `key` is `client_gateway` or `node_gateway`, `value` an inline table
+    /// such as `{ adapter = "tailscale", mode = "funnel" }` or
+    /// `{ adapter = "cloudflare", hostname = "app.example.com", tunnel = "t" }`.
+    /// `command` is never one of them: only the owner writes that, by hand.
+    fn exposure_settings(
+        args: &ConfigArgs,
+    ) -> Result<
+        (
+            aidaemon_exposure::ExposedService,
+            aidaemon_exposure::ServiceExposureConfig,
+        ),
+        String,
+    > {
+        use aidaemon_exposure::{ExposedService, ServiceExposureConfig};
+        let service = match args.key.trim().trim_start_matches("exposure.") {
+            "client_gateway" => ExposedService::ClientGateway,
+            "node_gateway" => ExposedService::NodeGateway,
+            other => {
+                return Err(format!(
+                    "`key` must be client_gateway or node_gateway, not `{other}`"
+                ))
+            }
+        };
+        let table: toml::Table = format!("v = {}", args.value.trim())
+            .parse::<toml::Table>()
+            .ok()
+            .and_then(|t| t.get("v").and_then(|v| v.as_table()).cloned())
+            .ok_or(
+                "`value` must be an inline table, e.g. { adapter = \"tailscale\" } or \
+                 { adapter = \"cloudflare\", hostname = \"app.example.com\", tunnel = \"name\" } \
+                 or { adapter = \"manual\", url = \"https://...\" }",
+            )?;
+        if table.get("adapter").and_then(toml::Value::as_str) == Some("command") {
+            return Err(
+                "the command adapter runs an arbitrary program, so only the owner \
+                        configures it, by editing `[exposure]` in config.toml by hand"
+                    .to_string(),
+            );
+        }
+        let settings: ServiceExposureConfig = toml::Value::Table(table)
+            .try_into()
+            .map_err(|e| format!("invalid exposure settings: {e}"))?;
+        settings.validate(&service)?;
+        Ok((service, settings))
+    }
+
+    /// The approval card: what is published, through what, and who can
+    /// reach it.
+    fn exposure_summary(
+        service: &aidaemon_exposure::ExposedService,
+        settings: &aidaemon_exposure::ServiceExposureConfig,
+    ) -> String {
+        let what = match service {
+            aidaemon_exposure::ExposedService::NodeGateway => "the Node Gateway (/node/v1)",
+            _ => "the Client Gateway (/client/v1: chat, watch turns, answer approvals)",
+        };
+        format!(
+            "Publish {what} through {} ({}): the daemon runs the tunnel while it runs. \
+             Paired devices still need their keys. Applies after a restart.",
+            settings.adapter_name(),
+            settings.audience().describe()
+        )
+    }
+
+    /// Write `[exposure.<service>]` for a stable, owner-approved adapter.
+    async fn enable_exposure(&self, args: &ConfigArgs) -> anyhow::Result<ConfigReply> {
+        Self::require_kernel_approval(args)?;
+        let (service, settings) = match Self::exposure_settings(args) {
+            Ok(found) => found,
+            Err(e) => {
+                return Ok(ConfigReply::refused(format!(
+                    "Refused: {e}. The config was NOT modified."
+                )))
+            }
+        };
+        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let mut doc: toml::Table = content.parse()?;
+        let value = toml::Value::try_from(&settings)?;
+        let exposure = doc
+            .entry("exposure")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let Some(exposure) = exposure.as_table_mut() else {
+            return Ok(ConfigReply::refused(
+                "Refused: `exposure` in config.toml is not a table. The config was NOT modified."
+                    .to_string(),
+            ));
+        };
+        exposure.insert(service.key(), value);
+        let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
+        if let Err(e) = Self::validate_config(&new_content) {
+            let hint = match service {
+                aidaemon_exposure::ExposedService::ClientGateway
+                    if e.contains("client_gateway.enabled") =>
+                {
+                    " Turn the gateway on first (action 'enable_client_gateway')."
+                }
+                _ => "",
+            };
+            return Ok(ConfigReply::refused(format!(
+                "Refused to enable exposure: {e}.{hint}\n\nThe config was NOT modified."
+            )));
+        }
+        if let Err(e) = self.create_backup().await {
+            warn!("Failed to create backup: {}", e);
+        }
+        tokio::fs::write(&self.config_path, &new_content).await?;
+        set_owner_only_permissions(&self.config_path);
+        Ok(ConfigReply::done(format!(
+            "Exposure saved: [exposure.{service}] adapter = \"{}\" ({}). Backup saved to \
+             config.toml.bak.\n\nRestart aidaemon (`/restart`) to apply: the tunnel starts with \
+             the daemon and stops with it. Then `/exposure` shows its state and address.",
+            settings.adapter_name(),
+            settings.audience().describe()
+        )))
+    }
 }
 
 #[derive(Deserialize)]
@@ -1673,7 +1839,7 @@ fn manage_config_schema() -> Value {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["read", "get", "set", "unset", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider", "enable_stt", "enable_client_gateway"]
+                    "enum": ["read", "get", "set", "unset", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider", "enable_stt", "enable_client_gateway", "enable_exposure"]
                 },
                 "key": { "type": "string" },
                 "value": { "type": "string" },
@@ -1771,6 +1937,7 @@ impl ConfigManagerTool {
             "remove_failover_provider" => self.remove_failover_provider(&args).await.map(Into::into),
             "enable_stt" => self.enable_stt(&args).await.map(Into::into),
             "enable_client_gateway" => self.enable_client_gateway(&args).await,
+            "enable_exposure" => self.enable_exposure(&args).await,
             "read" => {
                 let content = tokio::fs::read_to_string(&self.config_path).await?;
                 let mut doc: toml::Value = toml::from_str(&content)?;
@@ -1789,7 +1956,7 @@ impl ConfigManagerTool {
                 Err(e) => Ok(ConfigReply::refused(format!("Restore failed: {}", e))),
             },
             _ => Ok(ConfigReply::refused(format!(
-                "Unknown action: {}. Use 'read', 'get', 'set', 'unset', 'restore', 'list_provider_presets', 'switch_provider', 'list_failover_providers', 'add_failover_provider', 'remove_failover_provider', 'enable_stt', or 'enable_client_gateway'.",
+                "Unknown action: {}. Use 'read', 'get', 'set', 'unset', 'restore', 'list_provider_presets', 'switch_provider', 'list_failover_providers', 'add_failover_provider', 'remove_failover_provider', 'enable_stt', 'enable_client_gateway', or 'enable_exposure'.",
                 args.action
             ))),
         }
@@ -1870,6 +2037,9 @@ impl ConfigManagerTool {
                 "Refused to save: {}.\n\nThe config was NOT modified. Fix the value and try again.",
                 e
             )));
+        }
+        if let Some(refusal) = Self::writes_exposure_command(&content, &new_content) {
+            return Ok(ConfigReply::refused(refusal));
         }
         if let Some(value) = &new_value {
             if !path.ends_in_index() && !Self::config_reads(&doc, &path, value) {
@@ -1954,7 +2124,11 @@ impl ConfigManagerTool {
     fn change_needs_approval(args: &ConfigArgs) -> bool {
         // The Client Gateway opens a way to chat and answer approvals from
         // outside a channel: every key of its table is the owner's call.
-        if args.key.split(['.', '[']).next().map(str::trim) == Some("client_gateway") {
+        // Exposure publishes a gateway outside this machine: the same.
+        if matches!(
+            args.key.split(['.', '[']).next().map(str::trim),
+            Some("client_gateway" | "exposure")
+        ) {
             return true;
         }
         let Ok(path) = ConfigPath::parse(&args.key) else {
@@ -2791,6 +2965,110 @@ token_file = "{}"
         let again = tool.enable_client_gateway(&args).await.unwrap();
         assert!(again.text.contains("already on"));
         assert_eq!(fs::read_to_string(&copy).unwrap().trim(), token);
+    }
+
+    #[tokio::test]
+    async fn enable_exposure_writes_a_stable_adapter_and_asks_the_owner() {
+        let tokens = tempfile::tempdir().unwrap();
+        let (_dir, path) = write_temp_config(&gateway_config(tokens.path(), "enabled = true"));
+        let tool = approving_tool(path.clone());
+        let call = json!({"action": "enable_exposure", "key": "client_gateway", "value": r#"{ adapter = "tailscale" }"#});
+        match tool.owner_approval(&call).await {
+            OwnerApprovalNeed::Ask(request) => {
+                assert!(
+                    request.summary.contains("private to your tailnet"),
+                    "{}",
+                    request.summary
+                )
+            }
+            _ => panic!("enable_exposure must ask"),
+        }
+        let mut args = test_args();
+        args.action = "enable_exposure".into();
+        args.key = "client_gateway".into();
+        args.value = r#"{ adapter = "tailscale" }"#.into();
+        let reply = tool.enable_exposure(&args).await.unwrap();
+        assert!(reply.text.contains("/restart"), "{}", reply.text);
+        let saved: AppConfig = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved.exposure.client_gateway.unwrap().adapter_name(),
+            "tailscale"
+        );
+        assert!(saved.client_gateway.enabled, "other settings are kept");
+
+        args.kernel_approved = false;
+        assert!(tool.enable_exposure(&args).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn enable_exposure_refuses_command_ephemeral_nodes_and_an_off_gateway() {
+        let tokens = tempfile::tempdir().unwrap();
+        let (_dir, path) = write_temp_config(&gateway_config(tokens.path(), ""));
+        let before = fs::read_to_string(&path).unwrap();
+        let tool = approving_tool(path.clone());
+        let mut args = test_args();
+        args.action = "enable_exposure".into();
+        args.key = "client_gateway".into();
+        args.value = r#"{ adapter = "command", command = ["x"] }"#.into();
+        let reply = tool.enable_exposure(&args).await.unwrap();
+        assert!(reply.text.contains("by hand"), "{}", reply.text);
+        args.value = r#"{ adapter = "tailscale" }"#.into();
+        let reply = tool.enable_exposure(&args).await.unwrap();
+        assert!(
+            reply.text.contains("enable_client_gateway"),
+            "{}",
+            reply.text
+        );
+        args.key = "node_gateway".into();
+        args.value = r#"{ adapter = "cloudflare", mode = "quick" }"#.into();
+        let reply = tool.enable_exposure(&args).await.unwrap();
+        assert!(reply.text.contains("survives restarts"), "{}", reply.text);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn set_never_writes_a_command_exposure() {
+        let tokens = tempfile::tempdir().unwrap();
+        let owner_written = "enabled = true\n\n[exposure.client_gateway]\nadapter = \"command\"\ncommand = [\"my-tunnel\", \"{port}\"]\n";
+        let (_dir, path) = write_temp_config(&gateway_config(tokens.path(), owner_written));
+        let tool = approving_tool(path.clone());
+        let before = fs::read_to_string(&path).unwrap();
+        for (key, value) in [
+            ("exposure.client_gateway.command", r#"["other-program"]"#),
+            ("exposure.client_gateway.stable", "true"),
+        ] {
+            let mut args = test_args();
+            args.action = "set".into();
+            args.key = key.into();
+            args.value = value.into();
+            let reply = tool.change_value(&args).await.unwrap();
+            assert!(reply.text.contains("by hand"), "{key}: {}", reply.text);
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+
+        // A whole table, or switching an adapter to `command`: the same.
+        let (_dir2, path2) = write_temp_config(&gateway_config(
+            tokens.path(),
+            "enabled = true\n\n[exposure.client_gateway]\nadapter = \"manual\"\nurl = \"https://app.example.com\"\n",
+        ));
+        let tool = approving_tool(path2.clone());
+        let mut args = test_args();
+        args.action = "set".into();
+        args.key = "exposure.client_gateway".into();
+        args.value = r#"{ adapter = "command", command = ["x"] }"#.into();
+        let reply = tool.change_value(&args).await.unwrap();
+        assert!(reply.text.contains("by hand"), "{}", reply.text);
+        // Removing the owner's command table is fine.
+        let mut unset = test_args();
+        unset.action = "unset".into();
+        unset.key = "exposure.client_gateway".into();
+        let tool = approving_tool(path.clone());
+        let reply = tool.change_value(&unset).await.unwrap();
+        assert!(reply.text.starts_with("Removed"), "{}", reply.text);
+        assert!(matches!(
+            tool.owner_approval(&json!({"action": "set", "key": "exposure.client_gateway.url", "value": "\"https://a.example.com\""})).await,
+            OwnerApprovalNeed::Ask(_)
+        ));
     }
 
     #[tokio::test]

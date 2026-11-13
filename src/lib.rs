@@ -865,9 +865,16 @@ fn handle_pair_command(args: &[String], config_path: &Path, open_web: bool) -> a
         response.status()
     );
     let offer: PairingOffer = response.json()?;
+    // The daemon knows the live address (a tunnel's origin); an older
+    // daemon does not say, so fall back to the config file's.
+    let public_url = offer
+        .public_url
+        .clone()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| settings.public_url());
     let link = format!(
         "{}/client/v1/app#offer={}&code={}&fp={}",
-        settings.public_url(),
+        public_url.trim_end_matches('/'),
         offer.offer_id,
         offer.code,
         offer.fingerprint

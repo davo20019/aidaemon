@@ -14,13 +14,15 @@ pub async fn start(
     pool: sqlx::SqlitePool,
     agent: Arc<Agent>,
     hub: Arc<ChannelHub>,
+    endpoints: aidaemon_core::EndpointSource,
 ) -> anyhow::Result<()> {
     if !config.nodes.gateway.enabled {
         return Ok(());
     }
     let instance_key = auth::load_or_create_instance_key()?;
     let store = Arc::new(NodeStore::new(pool, instance_key));
-    let mut service_value = NodeService::new(store.clone(), config.nodes.clone());
+    let mut service_value =
+        NodeService::new(store.clone(), config.nodes.clone()).with_endpoints(endpoints);
     if config.nodes.ota.enabled {
         let release = crate::nodes::ota::FirmwareRelease::load(&config.nodes.ota)?;
         tracing::info!(

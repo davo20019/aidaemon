@@ -1,0 +1,8 @@
+2026-11-12T22:00:00Z INF Thank you for trying Cloudflare Tunnel. Doing so, without a Cloudflare account, is a quick way to experiment and try it out.
+2026-11-12T22:00:00Z INF Requesting new quick Tunnel on trycloudflare.com...
+2026-11-12T22:00:01Z INF +--------------------------------------------------------------------------------------------+
+2026-11-12T22:00:01Z INF |  Your quick Tunnel has been created! Visit it at (it may take some time to be reachable):  |
+2026-11-12T22:00:01Z INF |  https://synthetic-words-here.trycloudflare.com                                            |
+2026-11-12T22:00:01Z INF +--------------------------------------------------------------------------------------------+
+2026-11-12T22:00:01Z INF Version 2026.10.0 (Checksum synthetic)
+2026-11-12T22:00:02Z INF Registered tunnel connection connIndex=0 connection=00000000-0000-0000-0000-000000000000 event=0 ip=198.51.100.1 location=synthetic protocol=quic

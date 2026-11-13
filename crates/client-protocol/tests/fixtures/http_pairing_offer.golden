@@ -3,5 +3,6 @@
   "expires_at_ms": 1767226200000,
   "fingerprint": "3b1f",
   "link": "aidaemon-pair:?gateway=http%3A%2F%2F127.0.0.1%3A8788&offer=of-1&code=K7Q2-9FZD&fp=3b1f",
-  "offer_id": "of-1"
+  "offer_id": "of-1",
+  "public_url": "https://app.example.com"
 }

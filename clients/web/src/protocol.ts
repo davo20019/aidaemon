@@ -920,6 +920,11 @@ export interface PairingOffer {
    */
   link: string;
   offer_id: string;
+  /**
+   * Where devices reach the gateway now (a live tunnel origin, the
+   * configured address, or loopback). Absent from older daemons.
+   */
+  public_url?: string | null;
 }
 /**
  * `POST /client/v1/enrollments/redeem`.

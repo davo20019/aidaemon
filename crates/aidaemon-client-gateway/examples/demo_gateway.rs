@@ -244,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
         },
         token_file,
         approvals: Some(approvals_tx),
+        endpoints: aidaemon_core::EndpointSource::fixed(Vec::new()),
     })
     .await?;
     let _ = GATEWAY.set(gateway.clone());

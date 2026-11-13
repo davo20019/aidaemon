@@ -405,13 +405,22 @@ pub async fn run(
         plan_store.clone(),
     )
     .await?;
-    crate::startup::nodes::start(&config, pool.clone(), agent.clone(), hub.clone()).await?;
+    let mut gateway_endpoints = crate::startup::exposure::endpoints(&config);
+    crate::startup::nodes::start(
+        &config,
+        pool.clone(),
+        agent.clone(),
+        hub.clone(),
+        gateway_endpoints.node.clone(),
+    )
+    .await?;
     crate::startup::client_gateway::start(
         &config,
         pool.clone(),
         &channel_deps,
         hub.clone(),
         approval_tx.clone(),
+        gateway_endpoints.client.clone(),
     )
     .await?;
     // Give the agent its plan_store handle so the completion phase can read the
@@ -421,6 +430,9 @@ pub async fn run(
 
     // Start the heartbeat coordinator now that hub and agent are available.
     let shutdown = aidaemon_core::CancellationToken::new();
+    // Tunnels start after both gateways and stop with the daemon.
+    let exposure =
+        crate::startup::exposure::start(&config, &mut gateway_endpoints, shutdown.clone());
     let background =
         startup_runtime::start_heartbeat_coordinator(heartbeat_opt, &hub, &agent, shutdown.clone());
 
@@ -540,6 +552,9 @@ pub async fn run(
     shutdown.cancel();
     if let Some(background) = background {
         let _ = background.await;
+    }
+    if let Some(exposure) = exposure {
+        exposure.join().await;
     }
 
     // Shut down all MCP server processes

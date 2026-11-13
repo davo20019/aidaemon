@@ -487,11 +487,14 @@ impl TaskPlan {
         changed
     }
 
-    /// Record the end of background job `job_id`: a step it served is
-    /// completed once every job on it succeeded, and failed as soon as one
-    /// did not. The plan resolves once nothing is left to run. Returns
-    /// whether any step changed.
-    pub fn settle_background_job(&mut self, job_id: &str, succeeded: bool) -> bool {
+    /// Record the end of background job `job_id`, as its run record says.
+    /// A step handed to it is completed once every job on it succeeded,
+    /// failed only when one failed (a typed failure), and not done when one
+    /// stopped before finishing. A step that only waited on the job (nothing
+    /// handed it the step) is never done or failed by the job's end: once no
+    /// job is left on it, it is not done. The plan resolves once nothing is
+    /// left to run. Returns whether any step changed.
+    pub fn settle_background_job(&mut self, job_id: &str, end: JobEnd) -> bool {
         let now = Utc::now();
         let mut changed = false;
         for step in &mut self.steps {
@@ -501,24 +504,34 @@ impl TaskPlan {
                 continue;
             }
             changed = true;
-            if succeeded {
-                step.background_jobs.retain(|job| job != job_id);
-                if step.background_jobs.is_empty() && step.waits_on_jobs {
-                    // Nothing was handed this step: the jobs ending does not
-                    // do it.
+            step.background_jobs.retain(|job| job != job_id);
+            if step.waits_on_jobs {
+                if step.background_jobs.is_empty() {
                     step.waits_on_jobs = false;
                     step.status = StepStatus::Deferred;
-                } else if step.background_jobs.is_empty() {
-                    // The helper's own typed result completed it.
+                    step.completed_at = Some(now);
+                }
+                continue;
+            }
+            match end {
+                JobEnd::Succeeded if step.background_jobs.is_empty() => {
+                    // The helper's run record completed it.
                     step.status = StepStatus::Completed;
                     step.said_done = false;
                     step.completed_at = Some(now);
                 }
-            } else {
-                step.waits_on_jobs = false;
-                step.background_jobs.clear();
-                step.status = StepStatus::Failed;
-                step.completed_at = Some(now);
+                JobEnd::Succeeded => {}
+                JobEnd::Stopped => {
+                    step.background_jobs.clear();
+                    step.status = StepStatus::Deferred;
+                    step.not_done = Some(NotDoneReason::HelperStopped);
+                    step.completed_at = Some(now);
+                }
+                JobEnd::Failed => {
+                    step.background_jobs.clear();
+                    step.status = StepStatus::Failed;
+                    step.completed_at = Some(now);
+                }
             }
         }
         if changed {
@@ -585,12 +598,17 @@ impl TaskPlan {
     /// failure.
     pub fn render_compact_checklist(&self) -> String {
         let total = self.steps.len();
-        // Only steps typed evidence completed count as done; the ones only
-        // the model said were done are counted apart.
-        let done = self.confirmed_steps();
         let said = self.said_done_steps();
-        let said_note = if said > 0 {
-            format!(", {said} said done")
+        let in_background = self.has_background_steps();
+        let finished = !matches!(
+            self.status,
+            PlanStatus::Planning | PlanStatus::InProgress | PlanStatus::Paused
+        );
+        // Every completed step counts as done; which of them no tool
+        // confirmed is said once, in plain words, on the final card only.
+        let done = self.completed_steps();
+        let said_note = if said > 0 && finished && !in_background {
+            format!(", {said} not confirmed by a tool")
         } else {
             String::new()
         };
@@ -629,11 +647,6 @@ impl TaskPlan {
                 _ => format!("{mark} {}", step.description),
             };
         }
-        let in_background = self.has_background_steps();
-        let finished = !matches!(
-            self.status,
-            PlanStatus::Planning | PlanStatus::InProgress | PlanStatus::Paused
-        );
         let header = match self.status {
             // Work handed to a job that reports back is still being done:
             // never "stopped short" while it runs.
@@ -660,7 +673,7 @@ impl TaskPlan {
                 } else {
                     String::new()
                 };
-                format!("☑️ Finished · {done} of {total} confirmed{said_note}{needed_note}")
+                format!("☑️ Finished · {done} of {total} done{said_note}{needed_note}")
             }
             // The execution plan is resolved; the reply is still on its way,
             // which the typing indicator shows. Never claim the task is over.
@@ -983,7 +996,7 @@ impl StepStatus {
 }
 
 /// How the card marks a step only the model said was done.
-const SAID_DONE: &str = "said done; nothing confirmed it";
+const SAID_DONE: &str = "no tool confirmed it";
 /// How the card marks a step whose helper never started.
 const HELPER_NOT_STARTED: &str = "didn't run: its helper didn't start";
 
@@ -994,14 +1007,27 @@ pub enum NotDoneReason {
     /// The turn could not change anything (read-only access or a request
     /// that forbids changes), and this step needed a change.
     ChangesOff,
+    /// The background helper it was handed ended before finishing it (its
+    /// run record says stopped: not a failure).
+    HelperStopped,
 }
 
 impl NotDoneReason {
     fn plain(self) -> &'static str {
         match self {
             Self::ChangesOff => "read-only is on",
+            Self::HelperStopped => "its helper stopped before it finished",
         }
     }
+}
+
+/// How a background job ended, as its run record says: what its steps
+/// become. Only `Failed` marks a step as couldn't be done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobEnd {
+    Succeeded,
+    Stopped,
+    Failed,
 }
 
 /// Whether a card from [`TaskPlan::render_compact_checklist`] shows every
@@ -1014,6 +1040,11 @@ pub use aidaemon_channels::live_status::is_completed_checklist;
 pub fn checklist_progress(rendered: &str) -> Option<String> {
     let header = rendered.lines().next()?;
     let (_, progress) = header.split_once(" · ")?;
+    // The final card's confirmation note is for the final card, not a
+    // helper's one-line progress.
+    let progress = progress
+        .split_once(", ")
+        .map_or(progress, |(count, _)| count);
     Some(progress.trim().to_string())
 }
 
@@ -1269,7 +1300,7 @@ mod tests {
         assert!(!is_completed_checklist(&card));
 
         // One job done: its own step is done; the shared one waits for both.
-        assert!(plan.settle_background_job("job-a", true));
+        assert!(plan.settle_background_job("job-a", JobEnd::Succeeded));
         assert_eq!(plan.steps[1].status, StepStatus::Completed);
         assert_eq!(plan.steps[3].status, StepStatus::Background);
         assert!(plan
@@ -1277,7 +1308,7 @@ mod tests {
             .starts_with("⏳ Continuing in the background · 2 of 4 done"));
 
         // The other fails: its step and the shared one failed, never done.
-        assert!(plan.settle_background_job("job-b", false));
+        assert!(plan.settle_background_job("job-b", JobEnd::Failed));
         assert_eq!(plan.steps[2].status, StepStatus::Failed);
         assert_eq!(plan.steps[3].status, StepStatus::Failed);
         assert_eq!(plan.status, PlanStatus::Failed);
@@ -1285,7 +1316,7 @@ mod tests {
             .render_compact_checklist()
             .starts_with("❌ Stopped · 2 of 4 done"));
         // A job nothing waits on changes nothing.
-        assert!(!plan.settle_background_job("job-c", true));
+        assert!(!plan.settle_background_job("job-c", JobEnd::Succeeded));
     }
 
     /// A turn that hands work to background jobs without linking its open
@@ -1324,11 +1355,11 @@ mod tests {
             "{card}"
         );
 
-        assert!(plan.settle_background_job("job-a", true));
+        assert!(plan.settle_background_job("job-a", JobEnd::Succeeded));
         assert!(plan
             .render_compact_checklist()
             .starts_with("⏳ Continuing in the background"));
-        assert!(plan.settle_background_job("job-b", true));
+        assert!(plan.settle_background_job("job-b", JobEnd::Succeeded));
         assert_eq!(plan.steps[1].status, StepStatus::Deferred);
         assert_eq!(plan.steps[2].status, StepStatus::Deferred);
         assert_ne!(plan.status, PlanStatus::Completed);
@@ -1345,7 +1376,7 @@ mod tests {
         );
         plan.link_background_job(&[0, 1], "job-a");
         plan.status = PlanStatus::PartiallyCompleted;
-        assert!(plan.settle_background_job("job-a", true));
+        assert!(plan.settle_background_job("job-a", JobEnd::Succeeded));
         assert_eq!(plan.status, PlanStatus::Completed);
         assert!(is_completed_checklist(&plan.render_compact_checklist()));
     }

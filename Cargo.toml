@@ -51,6 +51,7 @@ members = [
     "crates/aidaemon-skills",
     "crates/aidaemon-secrets",
     "crates/aidaemon-nodes",
+    "crates/aidaemon-exposure",
     "crates/aidaemon-terminal-bridge",
     "crates/aidaemon-channels",
     "crates/aidaemon-channel-telegram",
@@ -136,6 +137,7 @@ aidaemon-secrets = { version = "=0.2.0", path = "crates/aidaemon-secrets" }
 aidaemon-nodes = { version = "=0.2.0", path = "crates/aidaemon-nodes" }
 # The Client Gateway (`/client/v1`) and its wire types, for the owner's apps.
 aidaemon-client-gateway = { version = "=0.2.0", path = "crates/aidaemon-client-gateway" }
+aidaemon-exposure = { version = "=0.2.0", path = "crates/aidaemon-exposure" }
 aidaemon-tui = { version = "=0.2.0", path = "crates/aidaemon-tui" }
 aidaemon-client-protocol = { version = "=0.2.0", path = "crates/client-protocol" }
 # The terminal bridge (`/agent` sessions and the local attach/share/start CLIs).

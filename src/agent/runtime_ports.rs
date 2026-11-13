@@ -80,7 +80,8 @@ impl ChildAgentRuntime for Agent {
             response: result.response,
             outcome: result.outcome,
             trust: result.trust,
-            reported_done: result.reported_done,
+            phase: result.phase,
+            evidence: result.evidence,
         })
     }
 
@@ -148,6 +149,10 @@ impl ChildAgentRuntime for Agent {
             .deliver_background_spawn_result(router, parent_session_id, text, trust)
             .await?
             .sent)
+    }
+
+    fn helper_runs(&self) -> std::sync::Arc<aidaemon_runtime::run_state::RunStates> {
+        self.running_children.runs()
     }
 }
 
