@@ -30,10 +30,9 @@ use crate::runtime_ports::{ChildAgentRuntime, ConversationRuntime, OutboundRoute
 
 /// Phase 1: wiring that only needs the constructed [`Agent`] (no hub yet).
 ///
-/// Must be called immediately after the agent is constructed, in the same
-/// order as the original inline calls:
-/// 1. give the spawn tool a weak child-runtime reference,
-/// 2. give the agent a weak self-reference for background task spawning.
+/// Must be called immediately after the agent is constructed: it gives the
+/// spawn tool a weak child-runtime reference, and checks the agent holds
+/// its weak self-reference (the runtime preset's `build` sets it).
 pub async fn wire_agent_cycles(
     agent: &Arc<Agent>,
     spawn_tool: Option<&Arc<crate::tools::SpawnAgentTool>>,
@@ -43,9 +42,6 @@ pub async fn wire_agent_cycles(
         let runtime: Arc<dyn ChildAgentRuntime> = agent.clone();
         st.set_agent(Arc::downgrade(&runtime));
     }
-
-    // Give the agent a weak self-reference for background task spawning.
-    agent.set_self_ref(Arc::downgrade(agent)).await;
 
     validate_components(&[
         ("agent.self_ref", agent.self_reference_ready().await),

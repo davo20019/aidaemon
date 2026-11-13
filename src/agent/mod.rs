@@ -276,9 +276,11 @@ pub(crate) use goal_dispatch::{
 #[path = "background_task_lead.rs"]
 mod background_task_lead;
 
-// `Agent` constructors (new / with_depth / set_test_*) live in `construct.rs`.
+// The daemon's host ports for the agent, and test construction, live in `construct.rs`.
 #[path = "construct.rs"]
 mod construct;
+pub(crate) use construct::host_ports;
+#[cfg(test)]
 pub(crate) use construct::new_agent;
 #[cfg(test)]
 pub(crate) use construct::set_context_compaction_tokens_for_test;

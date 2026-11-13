@@ -226,8 +226,7 @@ pub async fn run(
 
     let sdk_engine = crate::startup::engine::settings_from_config(&config, &*execution_backend);
 
-    #[allow(unused_mut)]
-    let mut agent = crate::agent::new_agent(crate::agent::AgentParts {
+    let parts = crate::agent::AgentParts {
         dependencies: crate::agent::AgentDependencies {
             memory_store: memory_store.clone(),
             llm_runtime: llm_runtime.clone(),
@@ -282,24 +281,27 @@ pub async fn run(
         audio_config: AudioConfig::from_files(&config.files),
         stt_config: SttConfig::from_files(&config.files),
         harness_eval_config: (&config.diagnostics.harness_eval).into(),
-    });
-    agent.set_sdk_engine(sdk_engine);
-    // The kernel's run store shares the daemon's pool, so runs inherit its
-    // encryption and WAL settings and live in the same database file.
-    agent.set_run_store(Arc::new(
-        aidaemon_store_sqlite::SqliteStore::from_pool(pool.clone())
-            .await
-            .map_err(|error| anyhow::anyhow!("kernel run store: {error}"))?,
-    ));
+    };
+    let ports = crate::agent::host_ports(&parts);
+    let own_memory = memory.own_memory();
+    let memory_services = memory.services;
+    // The daemon runs on the SDK's turn-runtime preset: the agent host and
+    // its turn engine, with the daemon's ports.
+    let agent = aidaemon_sdk::runtime::host(parts, ports)
+        .engine(sdk_engine)
+        // The kernel's run store shares the daemon's pool, so runs inherit
+        // its encryption and WAL settings and live in the same database file.
+        .run_store(Arc::new(
+            aidaemon_store_sqlite::SqliteStore::from_pool(pool.clone())
+                .await
+                .map_err(|error| anyhow::anyhow!("kernel run store: {error}"))?,
+        ))
+        .memory(memory.plugin)
+        .build()
+        .await;
     // Owner-approval cards from the kernel go out on the same channel the
     // tools' cards use.
     agent.owner_approvals().set_broker(approval_tx.clone());
-    let own_memory = memory.own_memory();
-    let memory_services = memory.services;
-    if let Some(plugin) = memory.plugin {
-        agent.set_memory_plugin(plugin);
-    }
-    let agent = Arc::new(agent);
 
     // Close the deferred Agent ↔ SpawnAgentTool + agent self-reference cycles.
     crate::startup::wiring::wire_agent_cycles(&agent, spawn_tool.as_ref()).await?;

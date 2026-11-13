@@ -41,8 +41,10 @@ telegram = ["channels", "dep:aidaemon-channel-telegram"]
 slack = ["channels", "dep:aidaemon-channel-slack"]
 discord = ["channels", "dep:aidaemon-channel-discord"]
 conformance = ["channels", "aidaemon-channels/conformance"]
+# aidaemon's own agent host and turn engine (`runtime::host`), as the daemon runs them.
+runtime = ["dep:aidaemon-runtime", "sqlite"]
 testing = ["aidaemon-core/testing", "aidaemon-channels?/testing", "dep:tokio", "tokio/test-util"]
-full = ["macros", "providers", "tools", "policies", "secrets", "keychain", "agents", "sqlite", "mcp", "eval", "testing", "memory", "events", "work", "telegram", "slack", "discord", "otel", "conformance"]
+full = ["macros", "providers", "tools", "policies", "secrets", "keychain", "agents", "sqlite", "mcp", "eval", "testing", "memory", "events", "work", "telegram", "slack", "discord", "otel", "conformance", "runtime"]
 
 [dependencies]
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
@@ -68,6 +70,7 @@ aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels", optional
 aidaemon-channel-telegram = { version = "0.2.0", path = "../aidaemon-channel-telegram", optional = true }
 aidaemon-channel-slack = { version = "0.2.0", path = "../aidaemon-channel-slack", optional = true }
 aidaemon-channel-discord = { version = "0.2.0", path = "../aidaemon-channel-discord", optional = true }
+aidaemon-runtime = { version = "0.2.0", path = "../aidaemon-runtime", optional = true }
 
 [dev-dependencies]
 axum = "0.8"
