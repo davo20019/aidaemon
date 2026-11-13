@@ -52,7 +52,8 @@ use crate::events::{
     map_events_api, map_interactive, map_slash_command, split_conversation_id, ApprovalValue,
     MapContext, SeenMessages, APPROVAL_ACTION_PREFIX,
 };
-use crate::format::{markdown_to_mrkdwn, split_mrkdwn, truncate_chars};
+use crate::format::{escape_mrkdwn, markdown_to_mrkdwn, split_mrkdwn, truncate_chars};
+use aidaemon_channels::approval_render::COLLAPSED_FENCE;
 
 /// Default Slack Web API base URL.
 pub const DEFAULT_API_BASE: &str = "https://slack.com/api";
@@ -60,6 +61,8 @@ pub const DEFAULT_API_BASE: &str = "https://slack.com/api";
 pub const MAX_MESSAGE_LEN: usize = 4000;
 /// Longest text a Block Kit section accepts; outbound chunks never exceed it.
 pub const SECTION_TEXT_LIMIT: usize = 3000;
+/// Most characters Slack accepts in a context block's text element.
+const CONTEXT_TEXT_LIMIT: usize = 3000;
 
 const BUTTON_LABEL_LIMIT: usize = 75;
 const BUTTON_VALUE_LIMIT: usize = 2000;
@@ -686,6 +689,36 @@ impl SlackChannel {
     fn section(text: &str) -> Value {
         json!({ "type": "section", "text": { "type": "mrkdwn", "text": text } })
     }
+
+    /// A card's collapsed detail (the exact command and any notes) as a
+    /// context block: Slack has no collapsible text, so the detail sits
+    /// under the summary in the small, grey secondary style, as code.
+    fn detail_context(detail: &str) -> Value {
+        // Room for the fence around the content.
+        let body = truncate_chars(&escape_mrkdwn(detail), CONTEXT_TEXT_LIMIT - 8);
+        json!({
+            "type": "context",
+            "elements": [{ "type": "mrkdwn", "text": format!("```\n{body}\n```") }],
+        })
+    }
+}
+
+/// `text` split into its summary and the content of a trailing collapsed
+/// block (a fence tagged [`COLLAPSED_FENCE`]), when it ends with one.
+fn split_collapsed_detail(text: &str) -> (&str, Option<&str>) {
+    let opening = format!("```{COLLAPSED_FENCE}\n");
+    let trimmed = text.trim_end();
+    let Some(start) = trimmed.rfind(&opening) else {
+        return (text, None);
+    };
+    let Some(inner) = trimmed[start + opening.len()..].strip_suffix("```") else {
+        return (text, None);
+    };
+    let inner = inner.strip_suffix('\n').unwrap_or(inner);
+    if inner.contains("```") || inner.trim().is_empty() {
+        return (text, None);
+    }
+    (trimmed[..start].trim_end(), Some(inner))
 }
 
 #[async_trait]
@@ -766,7 +799,8 @@ impl Channel for SlackChannel {
         }
         let (channel, thread_ts) = split_conversation_id(&prompt.conversation.id);
         self.clear_typing(&prompt.conversation.id).await;
-        let mrkdwn = truncate_chars(&markdown_to_mrkdwn(&prompt.text), SECTION_TEXT_LIMIT);
+        let (summary, detail) = split_collapsed_detail(&prompt.text);
+        let mrkdwn = truncate_chars(&markdown_to_mrkdwn(summary), SECTION_TEXT_LIMIT);
 
         let mut buttons = Vec::new();
         for (index, choice) in prompt.choices.iter().take(MAX_BUTTONS).enumerate() {
@@ -796,13 +830,17 @@ impl Channel for SlackChannel {
             buttons.push(button);
         }
 
+        let mut blocks = vec![Self::section(&mrkdwn)];
+        if let Some(detail) = detail {
+            blocks.push(Self::detail_context(detail));
+        }
+        blocks.push(
+            json!({ "type": "actions", "block_id": APPROVAL_ACTION_PREFIX, "elements": buttons }),
+        );
         let mut body = json!({
             "channel": channel,
             "text": mrkdwn,
-            "blocks": [
-                Self::section(&mrkdwn),
-                { "type": "actions", "block_id": APPROVAL_ACTION_PREFIX, "elements": buttons },
-            ],
+            "blocks": blocks,
         });
         if let Some(ts) = thread_ts {
             body["thread_ts"] = json!(ts);

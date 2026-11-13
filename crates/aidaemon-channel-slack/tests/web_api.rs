@@ -246,6 +246,38 @@ async fn ask_renders_buttons_with_encoded_values() {
     }
 }
 
+/// A prompt ending in a collapsed block shows that block's content as a
+/// secondary context block between the summary and the buttons.
+#[tokio::test]
+async fn ask_puts_a_collapsed_block_under_the_summary() {
+    let api = ok_api().await;
+    let prompt = ApprovalPrompt {
+        id: "prompt-43".into(),
+        conversation: thread(),
+        text: "**Your assistant wants to run a command on your computer.**\n\n\
+               ```details\nrm -rf build/ && echo <done>\n```"
+            .into(),
+        choices: vec![ApprovalChoice {
+            id: "once".into(),
+            label: "Allow".into(),
+        }],
+    };
+    channel(&api).ask(&prompt).await.unwrap();
+    let body = api.calls("chat.postMessage")[0].json();
+    let blocks = body["blocks"].as_array().unwrap();
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(
+        blocks[0]["text"]["text"],
+        "*Your assistant wants to run a command on your computer.*"
+    );
+    assert_eq!(blocks[1]["type"], "context");
+    assert_eq!(
+        blocks[1]["elements"][0]["text"],
+        "```\nrm -rf build/ &amp;&amp; echo &lt;done&gt;\n```"
+    );
+    assert_eq!(blocks[2]["type"], "actions");
+}
+
 #[tokio::test]
 async fn delete_calls_chat_delete() {
     let api = ok_api().await;
