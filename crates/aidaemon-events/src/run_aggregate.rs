@@ -1169,6 +1169,44 @@ impl RunAggregate {
             .is_some_and(super::ExecutorClaimedOutcome::unfinished)
     }
 
+    /// The executing model declared work (a checklist item that changes
+    /// something) and the run attempted none of it: no change was dispatched
+    /// or handed to a background job, none was refused by policy or declined
+    /// by the owner, no declared item is proven, and the model reported no
+    /// resource it ran out of. Read from receipts, never from the reply.
+    ///
+    /// Nothing stood between such a run and the work, so an unfinished
+    /// verdict or a deferral is no reason for it to stop: the request is
+    /// carried out anew, or the owner is asked
+    /// ([`super::ExecutorClaimedOutcome::NeedsOwner`]). Live 2026-11-13: an
+    /// instruction to install two sites was answered with the state of the
+    /// sites a past run had installed, and the run ended there.
+    pub fn declared_work_unattempted(&self) -> bool {
+        let declared_work: Vec<&RunObligation> = self
+            .obligations
+            .iter()
+            .filter(|(id, obligation)| {
+                id.contains("/obligation:checklist:")
+                    && obligation.class == RunObligationClass::Achieve
+            })
+            .map(|(_, obligation)| obligation)
+            .collect();
+        if declared_work.is_empty()
+            || declared_work
+                .iter()
+                .any(|obligation| obligation.state == RunObligationState::Satisfied)
+            || self.executor_short_of.is_some()
+        {
+            return false;
+        }
+        !self.operations.values().any(|operation| {
+            operation.mutating
+                || operation.policy_denied
+                || operation.owner_declined
+                || operation.is_background_in_flight()
+        })
+    }
+
     pub fn open_executor_expectations(&self) -> usize {
         self.obligations
             .iter()
@@ -6658,5 +6696,97 @@ mod tests {
             RunObligationState::Invalidated,
             "a plain delivery still stales an untargeted observation"
         );
+    }
+
+    fn declared_with_outcome(
+        items: Vec<ExecutorExpectationItem>,
+        outcome: Option<crate::ExecutorClaimedOutcome>,
+    ) -> Event {
+        event(
+            EventType::ExecutorExpectationsDeclared,
+            ExecutorExpectationsDeclaredData {
+                schema_version: ExecutorExpectationsDeclaredData::SCHEMA_VERSION,
+                task_id: "task-1".to_string(),
+                items,
+                outcome,
+                short_of: None,
+            },
+        )
+    }
+
+    /// Live 2026-11-13: "install Drupal and WordPress" was declared as two
+    /// installs, the run only listed the sites a past run had made, then
+    /// re-declared the installs deferred with a `blocked` verdict. Nothing
+    /// was attempted: the aggregate says so from receipts alone.
+    #[test]
+    fn declared_work_with_only_observations_is_unattempted() {
+        let install = |index, status: &str| {
+            checklist_item(
+                index,
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                false,
+                &[],
+                status,
+            )
+        };
+        let mut events = vec![
+            declared_with_outcome(vec![install(0, "pending"), install(1, "pending")], None),
+            call("list", "terminal"),
+            result(
+                "list",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                terminal_observation_semantics(None),
+            ),
+            declared_with_outcome(
+                vec![install(0, "deferred"), install(1, "deferred")],
+                Some(crate::ExecutorClaimedOutcome::Blocked),
+            ),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate.declared_work_unattempted());
+
+        // One attempted change, even a failed one, is an attempt.
+        events.push(call("install", "terminal"));
+        events.push(result(
+            "install",
+            "terminal",
+            ToolOutcomeStatus::FailedPermanent,
+            1,
+            workspace_write_semantics("/tmp/site"),
+        ));
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(!aggregate.declared_work_unattempted());
+    }
+
+    /// A request that only observes (a status question) declares no work,
+    /// so it is never held to work it did not ask for.
+    #[test]
+    fn an_observation_only_checklist_owes_no_work() {
+        let mut events = vec![
+            declared_with_outcome(
+                vec![checklist_item(
+                    0,
+                    ToolMutationEffects::NONE,
+                    true,
+                    &[],
+                    "pending",
+                )],
+                None,
+            ),
+            call("list", "terminal"),
+            result(
+                "list",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                terminal_observation_semantics(None),
+            ),
+        ];
+        renumber(&mut events);
+        assert!(!RunAggregate::replay("task-1", &events).declared_work_unattempted());
     }
 }

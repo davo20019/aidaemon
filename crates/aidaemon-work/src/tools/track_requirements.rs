@@ -315,6 +315,10 @@ impl Tool for TrackRequirementsTool {
          Before your final answer, pass the list once more with outcome: done, partial, or blocked; \
          the request is reported that way, and only receipts can confirm done. When it stopped \
          because this machine ran out of disk, Docker disk or memory, add short_of. \
+         Use needs_owner only when the work cannot start without the owner's choice (for \
+         example, earlier results exist and redoing the work would replace or duplicate them): \
+         your final answer is then that one question. Earlier results are never by themselves \
+         the answer to an instruction to do the work. \
          Skip this only for a single read-only lookup, a plain answer or conversation, or when \
          the user forbids it."
     }
@@ -420,8 +424,8 @@ impl Tool for TrackRequirementsTool {
                     },
                     "outcome": {
                         "type": "string",
-                        "description": "Your verdict on the whole request, set on your last call before the final answer.",
-                        "enum": ["done", "partial", "blocked"]
+                        "description": "Your verdict on the whole request, set on your last call before the final answer. needs_owner: the work waits on the owner's choice, and your final answer is that question.",
+                        "enum": aidaemon_events::ExecutorClaimedOutcome::PROTOCOL_NAMES
                     },
                     "short_of": {
                         "type": "string",
@@ -673,9 +677,10 @@ impl crate::traits::ToolSemantics for TrackRequirementsTool {
                 .and_then(aidaemon_events::ExecutorClaimedOutcome::from_protocol_name)
                 .is_none()
             {
-                return Err(ToolArgumentContractViolation::new(
-                    "outcome must be one of done, partial, blocked",
-                ));
+                return Err(ToolArgumentContractViolation::new(format!(
+                    "outcome must be one of {}",
+                    aidaemon_events::ExecutorClaimedOutcome::PROTOCOL_NAMES.join(", ")
+                )));
             }
         }
         if let Some(short_of) = value.get("short_of") {

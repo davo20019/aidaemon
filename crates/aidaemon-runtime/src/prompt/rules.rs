@@ -205,7 +205,18 @@ pub fn core_behavioral_rules() -> String {
         "7. **Don't repeat what the chat already shows.** \
          Photos and files sent during the work already carry their captions: the final reply does \
          not list them again or repeat their links or addresses. Say only what is new (the result, \
-         timings, anything that went wrong). Send each image once.",
+         timings, anything that went wrong). Send each image once.\n",
+    );
+
+    // Rule 8: an instruction is carried out anew; memory is the past
+    s.push_str(
+        "8. **An instruction to do something is carried out now, anew, unless the owner says \
+         otherwise.** What memory, history, earlier runs or existing files show was done before is \
+         the past: context for the work, never its result. When earlier results already exist, \
+         either do the work again alongside them under fresh names (rule 6), or, when redoing \
+         it would replace or duplicate something the owner may want kept, ask the owner once \
+         which they want. Never answer an instruction with only the state of earlier work. A \
+         question about that state (is it up, did it work) is answered directly.",
     );
 
     // Data integrity rule — applies to all visibility tiers.
@@ -689,6 +700,19 @@ mod environment_tests {
         assert!(rules.contains("in your first reply or plan, before the work starts"));
         assert!(rules.contains("Don't repeat what the chat already shows"));
         assert!(rules.contains("Send each image once"));
+    }
+
+    /// Live 2026-11-13: an instruction to install two sites was answered with
+    /// the state of sites a past run had made. The rule is a principle (do
+    /// the instruction anew; memory is the past), not a list of phrases.
+    #[test]
+    fn core_rules_carry_out_instructions_anew_and_treat_memory_as_the_past() {
+        let rules = super::core_behavioral_rules();
+        assert!(rules.contains("carried out now, anew, unless the owner says otherwise"));
+        assert!(rules.contains("the past: context for the work, never its result"));
+        assert!(rules.contains("Never answer an instruction with only the state of earlier work"));
+        assert!(rules.contains("ask the owner once"));
+        assert!(rules.contains("is answered directly"));
     }
 
     #[test]

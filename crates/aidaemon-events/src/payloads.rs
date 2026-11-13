@@ -1033,6 +1033,11 @@ pub enum ExecutorClaimedOutcome {
     Partial,
     /// It could not be done; something outside the run stands in the way.
     Blocked,
+    /// The work waits on the owner's choice, asked as the run's final reply
+    /// (for example: earlier results exist, and redoing the work would
+    /// replace or duplicate them). Nothing is done in the owner's name until
+    /// they answer.
+    NeedsOwner,
 }
 
 impl ExecutorClaimedOutcome {
@@ -1041,6 +1046,7 @@ impl ExecutorClaimedOutcome {
             "done" => Some(Self::Done),
             "partial" => Some(Self::Partial),
             "blocked" => Some(Self::Blocked),
+            "needs_owner" => Some(Self::NeedsOwner),
             _ => None,
         }
     }
@@ -1050,6 +1056,18 @@ impl ExecutorClaimedOutcome {
             Self::Done => "done",
             Self::Partial => "partial",
             Self::Blocked => "blocked",
+            Self::NeedsOwner => "needs_owner",
+        }
+    }
+
+    pub const PROTOCOL_NAMES: [&'static str; 4] = ["done", "partial", "blocked", "needs_owner"];
+
+    /// The unmet requirement a run ending on this verdict records, in words
+    /// the owner reads.
+    pub fn unmet_line(self) -> String {
+        match self {
+            Self::NeedsOwner => "the request waits on the owner's answer".to_string(),
+            other => format!("the agent reported the request as {}", other.as_str()),
         }
     }
 

@@ -51,6 +51,9 @@ pub struct TurnScope<'a> {
     /// The verify-once and failure-recovery passes have been used.
     pub verification_demanded: AtomicBool,
     pub recovery_demanded: AtomicBool,
+    /// The run was sent back once because it declared work and attempted
+    /// none of it (`RunAggregate::declared_work_unattempted`).
+    pub unattempted_work_demanded: AtomicBool,
     /// Extra passes the ledger demanded so far.
     pub closeout_demands: std::sync::atomic::AtomicU32,
     /// The latest closeout let the run stop after a demand while the ledger

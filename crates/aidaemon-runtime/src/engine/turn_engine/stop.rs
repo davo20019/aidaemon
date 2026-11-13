@@ -437,6 +437,51 @@ impl TurnEngine<'_> {
         }
     }
 
+    /// Send a run that declared work and attempted none of it back once:
+    /// do the work, or ask the owner the one question it waits on. Read from
+    /// the ledger's typed obligations and receipts, never from the reply.
+    async fn sdk_demand_unattempted_work(
+        &self,
+        scope: &TurnScope<'_>,
+        aggregate: &aidaemon_events::run_aggregate::RunAggregate,
+        iteration: usize,
+    ) -> sdk::StopDecision {
+        scope
+            .unattempted_work_demanded
+            .store(true, Ordering::Relaxed);
+        scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
+        let declared: Vec<String> = aggregate
+            .obligations
+            .iter()
+            .filter(|(id, obligation)| {
+                id.contains("/obligation:checklist:")
+                    && obligation.class
+                        == aidaemon_events::run_aggregate::RunObligationClass::Achieve
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            iteration,
+            aidaemon_events::payloads::DecisionType::PostExecutionValidation,
+            "Declared work was never attempted: one pass to do it or ask the owner".to_string(),
+            serde_json::json!({
+                "condition": "declared_work_unattempted",
+                "claimed_outcome": aggregate.executor_claimed_outcome.map(|claim| claim.as_str()),
+                "obligation_ids": declared,
+                "engine": "sdk",
+            }),
+        )
+        .await;
+        sdk::StopDecision::Continue {
+            message: crate::turn::system_directives::SystemDirective::DeclaredWorkUnattempted {
+                items: aggregate.expectation_summaries(&declared),
+            }
+            .render(),
+        }
+    }
+
     /// The ledger-first closeout: replay the run
     /// ledger, ask which expectations an admissible tool could still satisfy,
     /// and demand a bounded extra pass only when the receipts say so.
@@ -454,13 +499,31 @@ impl TurnEngine<'_> {
             return sdk::StopDecision::Accept;
         };
         let iteration = scope.model_calls.load(Ordering::Relaxed) as usize;
-        // The agent's own typed verdict: `partial` or `blocked` ends the run
-        // unmet. No more work is demanded (the agent said it cannot or will
-        // not finish), and nothing later turns it into a success.
+        let work_unattempted = aggregate.declared_work_unattempted();
+        let changes_permitted =
+            !scope.contract.forbids_mutation && !scope.contract.forbids_tool_use;
+        // The agent's own typed verdict: `partial`, `blocked` or
+        // `needs_owner` ends the run unmet, and nothing later turns it into
+        // a success. No more work is demanded (the agent said it cannot or
+        // will not finish, or asked the owner), unless it attempted none of
+        // the work it declared with nothing in its way: that run goes back
+        // once to do the work or ask.
         if let Some(claim) = aggregate
             .executor_claimed_outcome
             .filter(|claim| claim.unfinished())
         {
+            let unattempted = unattempted_work_verdict(
+                work_unattempted,
+                Some(claim),
+                true,
+                changes_permitted,
+                scope.unattempted_work_demanded.load(Ordering::Relaxed),
+            );
+            if unattempted == UnattemptedWorkVerdict::Demand {
+                return self
+                    .sdk_demand_unattempted_work(scope, &aggregate, iteration)
+                    .await;
+            }
             scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
             self.emit_decision_point(
                 scope.emitter,
@@ -471,16 +534,16 @@ impl TurnEngine<'_> {
                 serde_json::json!({
                     "condition": "executor_claimed_outcome",
                     "claimed_outcome": claim.as_str(),
+                    "work_unattempted": work_unattempted,
                     "engine": "sdk",
                 }),
             )
             .await;
-            return sdk::StopDecision::AcceptUnmet {
-                unmet: vec![format!(
-                    "the agent reported the request as {}",
-                    claim.as_str()
-                )],
-            };
+            let mut unmet = vec![claim.unmet_line()];
+            if unattempted == UnattemptedWorkVerdict::StopUnmet {
+                unmet.push(UNATTEMPTED_WORK_UNMET.to_string());
+            }
+            return sdk::StopDecision::AcceptUnmet { unmet };
         }
         let authority =
             crate::turn::closeout::ClosingAuthority::from_resolved(&scope.authority.authority)
@@ -530,6 +593,28 @@ impl TurnEngine<'_> {
             }),
         )
         .await;
+        // Every declared step deferred, skipped or dropped, with none of
+        // the work attempted: the same stop as an unfinished verdict.
+        match unattempted_work_verdict(
+            work_unattempted,
+            aggregate.executor_claimed_outcome,
+            !decision.work_reachable(),
+            changes_permitted,
+            scope.unattempted_work_demanded.load(Ordering::Relaxed),
+        ) {
+            UnattemptedWorkVerdict::Demand => {
+                return self
+                    .sdk_demand_unattempted_work(scope, &aggregate, iteration)
+                    .await;
+            }
+            UnattemptedWorkVerdict::StopUnmet => {
+                scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
+                return sdk::StopDecision::AcceptUnmet {
+                    unmet: vec![UNATTEMPTED_WORK_UNMET.to_string()],
+                };
+            }
+            UnattemptedWorkVerdict::NotApplicable => {}
+        }
         let demanded_at = scope.executor_demanded_at.load(Ordering::Relaxed);
         // Delivering a capture to the chat changes nothing an observation
         // could verify, so it does not earn the verify-once pass.
