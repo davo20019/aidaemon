@@ -6,9 +6,6 @@
 //! messages present when the intake began are read, because the system sees
 //! newer ones on its own turns. Privacy follows the rules a live turn has.
 
-// Only the `sdk-memory` backend starts an intake today.
-#![cfg_attr(not(feature = "sdk-memory"), allow(dead_code))]
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,14 +17,15 @@ use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 use tracing::info;
 
-use crate::traits::{SettingsStore, StateStore};
-use crate::types::ChannelVisibility;
-use aidaemon_runtime::history::EventHistory;
+use aidaemon_core::ChannelVisibility;
+
+use crate::history::EventHistory;
+use crate::stores::{SettingsStore, StateStore};
 
 const BATCH: i64 = 200;
 const INTERVAL: Duration = Duration::from_secs(60);
 
-pub(crate) struct HistoryIntake {
+pub struct HistoryIntake {
     system: Arc<dyn MemorySystem>,
     pool: SqlitePool,
     settings: Arc<dyn SettingsStore>,
@@ -39,7 +37,7 @@ pub(crate) struct HistoryIntake {
 
 impl HistoryIntake {
     /// `backend_id` names the memory system, so a later switch starts over.
-    pub(crate) fn new(
+    pub fn new(
         system: Arc<dyn MemorySystem>,
         pool: SqlitePool,
         state: Arc<dyn StateStore>,
@@ -56,7 +54,7 @@ impl HistoryIntake {
         }
     }
 
-    pub(crate) fn into_service(self) -> Arc<dyn Service> {
+    pub fn into_service(self) -> Arc<dyn Service> {
         let intake = Arc::new(self);
         Arc::new(FnService::new(
             "memory_history_intake",
@@ -258,7 +256,7 @@ mod tests {
         HistoryIntake,
     ) {
         let db = tempfile::NamedTempFile::new().unwrap();
-        let embeddings = Arc::new(super::super::embeddings::EmbeddingService::new().unwrap());
+        let embeddings = Arc::new(aidaemon_memory::embeddings::EmbeddingService::new().unwrap());
         let state = Arc::new(
             crate::state::SqliteStateStore::new(db.path().to_str().unwrap(), 100, None, embeddings)
                 .await
@@ -401,12 +399,16 @@ mod tests {
             }
         }
         let events = Arc::new(
-            <crate::events::EventStore as crate::events::EventStoreForTests>::new(state.pool())
-                .await
-                .unwrap(),
+            aidaemon_events::EventStore::on_paths(
+                state.pool(),
+                aidaemon_tools::LexicalPaths::daemon_host(),
+                Arc::new(crate::history::HistoryEventHost),
+            )
+            .await
+            .unwrap(),
         );
-        crate::agent::memory_plugin::mark_turn_opted_out(
-            &crate::events::EventEmitter::new(events, "owner-dm"),
+        crate::turn::opt_out::mark_turn_opted_out(
+            &aidaemon_events::EventEmitter::new(events, "owner-dm"),
             "private-task",
             "private-turn",
         )

@@ -14,7 +14,44 @@ use chrono::{Duration, Utc};
 use sqlx::SqlitePool;
 use tracing::warn;
 
-use crate::config::RetentionConfig;
+/// How many days each kind of row is kept; 0 keeps it forever.
+#[derive(Debug, Clone)]
+pub struct RetentionPolicy {
+    /// Consolidated conversation events.
+    pub messages_days: u32,
+    /// Consolidated diagnostic and tool events.
+    pub diagnostic_events_days: u32,
+    /// Superseded fact versions.
+    pub superseded_facts_days: u32,
+    /// Raw token usage, aggregated into daily rows first.
+    pub token_usage_aggregate_days: u32,
+    /// Episodes never recalled.
+    pub episodes_days: u32,
+    /// Behavior patterns at the confidence floor.
+    pub behavior_patterns_days: u32,
+    /// Completed or abandoned goals.
+    pub goals_days: u32,
+    /// Procedures that never succeeded.
+    pub procedures_days: u32,
+    /// Net-negative error solutions.
+    pub error_solutions_days: u32,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            messages_days: 90,
+            diagnostic_events_days: 7,
+            superseded_facts_days: 90,
+            token_usage_aggregate_days: 30,
+            episodes_days: 365,
+            behavior_patterns_days: 90,
+            goals_days: 180,
+            procedures_days: 180,
+            error_solutions_days: 90,
+        }
+    }
+}
 
 /// Per-table cleanup counts
 #[derive(Debug, Default)]
@@ -49,12 +86,12 @@ impl RetentionStats {
 
 pub struct RetentionManager {
     pool: SqlitePool,
-    config: RetentionConfig,
+    config: RetentionPolicy,
     own_memory: bool,
 }
 
 impl RetentionManager {
-    pub fn new(pool: SqlitePool, config: RetentionConfig) -> Self {
+    pub fn new(pool: SqlitePool, config: RetentionPolicy) -> Self {
         Self {
             pool,
             config,
@@ -120,9 +157,10 @@ impl RetentionManager {
                 error_solutions_days: self.config.error_solutions_days,
             },
         )
-        .with_message_log(std::sync::Arc::new(
-            aidaemon_runtime::history::EventHistory::new(self.pool.clone(), None),
-        ))
+        .with_message_log(std::sync::Arc::new(crate::history::EventHistory::new(
+            self.pool.clone(),
+            None,
+        )))
     }
 
     /// Delete the canonical history-bearing task envelope and exact messages.
@@ -156,7 +194,7 @@ impl RetentionManager {
         // Derived rows are harmless if temporarily orphaned because all reads
         // join back to events, but clean them promptly to reclaim FTS space.
         for _ in 0..100 {
-            match aidaemon_runtime::history::search::remove_orphans(&self.pool, 500).await {
+            match crate::history::search::remove_orphans(&self.pool, 500).await {
                 Ok(500) => tokio::task::yield_now().await,
                 Ok(_) => break,
                 Err(error) => {
@@ -263,8 +301,8 @@ impl RetentionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use aidaemon_memory::embeddings::EmbeddingService;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
@@ -438,7 +476,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mgr = RetentionManager::new(pool.clone(), RetentionConfig::default());
+        let mgr = RetentionManager::new(pool.clone(), RetentionPolicy::default());
         let deleted = mgr.cleanup_messages().await.unwrap();
         assert_eq!(deleted, 1);
 
@@ -488,10 +526,10 @@ mod tests {
 
         let manager = RetentionManager::new(
             pool.clone(),
-            RetentionConfig {
+            RetentionPolicy {
                 messages_days: 0,
                 diagnostic_events_days: 7,
-                ..RetentionConfig::default()
+                ..RetentionPolicy::default()
             },
         );
         assert_eq!(manager.cleanup_messages().await.unwrap(), 0);
@@ -521,7 +559,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let manager = RetentionManager::new(pool.clone(), RetentionConfig::default());
+        let manager = RetentionManager::new(pool.clone(), RetentionPolicy::default());
         assert_eq!(manager.cleanup_messages().await.unwrap(), 1_205);
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
             .fetch_one(&pool)
@@ -544,7 +582,7 @@ mod tests {
         sqlx::query("INSERT INTO facts (category, key, value, created_at, updated_at) VALUES ('user', 'name', 'new', ?, ?)")
             .bind(&now).bind(&now).execute(&pool).await.unwrap();
 
-        let mgr = RetentionManager::new(pool.clone(), RetentionConfig::default());
+        let mgr = RetentionManager::new(pool.clone(), RetentionPolicy::default());
         let deleted = mgr.memory().cleanup_superseded_facts().await.unwrap();
         assert_eq!(deleted, 1);
 
@@ -566,7 +604,7 @@ mod tests {
         sqlx::query("INSERT INTO token_usage (session_id, model, input_tokens, output_tokens, created_at) VALUES ('s2', 'gpt-4', 200, 100, ?)")
             .bind(old_date).execute(&pool).await.unwrap();
 
-        let mgr = RetentionManager::new(pool.clone(), RetentionConfig::default());
+        let mgr = RetentionManager::new(pool.clone(), RetentionPolicy::default());
         let (aggregated, deleted) = mgr.cleanup_token_usage().await.unwrap();
 
         assert!(aggregated > 0);
@@ -594,7 +632,7 @@ mod tests {
         sqlx::query("INSERT INTO episodes (session_id, summary, recall_count, created_at) VALUES ('s2', 'forgotten', 0, ?)")
             .bind(old_date).execute(&pool).await.unwrap();
 
-        let mgr = RetentionManager::new(pool.clone(), RetentionConfig::default());
+        let mgr = RetentionManager::new(pool.clone(), RetentionPolicy::default());
         let deleted = mgr.memory().cleanup_episodes().await.unwrap();
         assert_eq!(deleted, 1);
 
@@ -609,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn test_disabled_cleanup_returns_zero() {
         let pool = setup_test_db().await;
-        let config = RetentionConfig {
+        let config = RetentionPolicy {
             messages_days: 0,
             diagnostic_events_days: 0,
             superseded_facts_days: 0,
@@ -638,7 +676,7 @@ mod tests {
         sqlx::query("INSERT INTO goals (id, description, status, session_id, updated_at) VALUES ('g2', 'done task', 'completed', 'test-session', ?)")
             .bind(old_date).execute(&pool).await.unwrap();
 
-        let mgr = RetentionManager::new(pool.clone(), RetentionConfig::default());
+        let mgr = RetentionManager::new(pool.clone(), RetentionPolicy::default());
         let deleted = mgr.cleanup_goals().await.unwrap();
         assert_eq!(deleted, 1);
 
@@ -662,7 +700,7 @@ mod tests {
         sqlx::query("INSERT INTO procedures (name, trigger_pattern, steps, success_count, last_used_at, created_at) VALUES ('bad_proc', 'fail thing', '[]', 0, ?, ?)")
             .bind(old_date).bind(old_date).execute(&pool).await.unwrap();
 
-        let mgr = RetentionManager::new(pool.clone(), RetentionConfig::default());
+        let mgr = RetentionManager::new(pool.clone(), RetentionPolicy::default());
         let deleted = mgr.memory().cleanup_procedures().await.unwrap();
         assert_eq!(deleted, 1);
 
@@ -699,7 +737,7 @@ mod tests {
             .await
             .unwrap();
 
-        let manager = RetentionManager::new(pool.clone(), RetentionConfig::default());
+        let manager = RetentionManager::new(pool.clone(), RetentionPolicy::default());
         assert!(manager.memory().cleanup_derived_memory().await.unwrap() > 0);
         let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_claims")
             .fetch_one(&pool)
@@ -747,7 +785,7 @@ mod tests {
         .await
         .unwrap();
 
-        let manager = RetentionManager::new(pool.clone(), RetentionConfig::default());
+        let manager = RetentionManager::new(pool.clone(), RetentionPolicy::default());
         manager.memory().cleanup_derived_memory().await.unwrap();
 
         let remaining: i64 =

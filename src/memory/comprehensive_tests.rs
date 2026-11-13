@@ -1614,7 +1614,7 @@ async fn test_retention_superseded_facts_cleanup() {
         .unwrap();
 
     // Run cleanup with 90-day threshold
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool.clone(), config);
     let stats = retention.run_all().await.unwrap();
 
@@ -1657,7 +1657,7 @@ async fn test_retention_preserves_active_facts() {
         .await
         .unwrap();
 
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool.clone(), config);
     let _stats = retention.run_all().await.unwrap();
 
@@ -1704,7 +1704,7 @@ async fn test_retention_unreferenced_episodes_cleanup() {
         .await
         .unwrap();
 
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool.clone(), config);
     let stats = retention.run_all().await.unwrap();
 
@@ -1746,7 +1746,7 @@ async fn test_retention_preserves_recalled_episodes() {
         .await
         .unwrap();
 
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool.clone(), config);
     let _stats = retention.run_all().await.unwrap();
 
@@ -1788,7 +1788,7 @@ async fn test_retention_zero_success_procedures_cleanup() {
         .await
         .unwrap();
 
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool.clone(), config);
     let stats = retention.run_all().await.unwrap();
 
@@ -1828,7 +1828,7 @@ async fn test_retention_preserves_successful_procedures() {
         .await
         .unwrap();
 
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool.clone(), config);
     retention.run_all().await.unwrap();
 
@@ -2091,7 +2091,7 @@ async fn test_retention_empty_database() {
     let (store, _db) = setup_test_store().await;
 
     let pool = store.pool();
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool, config);
     let stats = retention.run_all().await.unwrap();
 

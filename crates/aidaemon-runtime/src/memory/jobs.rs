@@ -12,16 +12,15 @@ use chrono::Utc;
 use sqlx::{Row, SqlitePool};
 use tracing::info;
 
-use super::embeddings::EmbeddingService;
-use crate::events::Consolidator;
-use crate::llm_runtime::gateway::SideCallGateway;
-use crate::llm_runtime::side_calls::SideCall;
-use crate::llm_runtime::SharedLlmRuntime;
-use crate::traits::StateStore;
-use aidaemon_runtime::history::EventHistory;
+use crate::consolidation::Consolidator;
+use crate::history::EventHistory;
+use crate::llm::gateway::SideCallGateway;
+use crate::llm::side_calls::SideCall;
+use crate::llm::SharedLlmRuntime;
+use crate::stores::StateStore;
 
 /// The daemon's side of the memory jobs.
-pub(crate) struct DaemonJobsHost {
+pub struct DaemonJobsHost {
     pool: SqlitePool,
     llm_runtime: SharedLlmRuntime,
     /// Runs the background jobs' model calls.
@@ -32,11 +31,11 @@ pub(crate) struct DaemonJobsHost {
 /// The full memory system's background jobs over the daemon's store and
 /// event log. Consolidation runs every `consolidation_interval`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn memory_jobs(
+pub fn memory_jobs(
     pool: SqlitePool,
     state: Arc<dyn StateStore>,
     memory: Arc<dyn aidaemon_memory::stores::MemoryStores>,
-    embedding_service: Arc<EmbeddingService>,
+    embedder: Arc<dyn aidaemon_memory::Embedder>,
     llm_runtime: SharedLlmRuntime,
     side_calls: SideCallGateway,
     consolidation_interval: Duration,
@@ -50,7 +49,7 @@ pub(crate) fn memory_jobs(
         consolidator,
     });
     Arc::new(
-        MemoryJobs::new(memory, history, host, embedding_service).with_schedule(JobSchedule {
+        MemoryJobs::new(memory, history, host, embedder).with_schedule(JobSchedule {
             consolidation: consolidation_interval,
             ..JobSchedule::default()
         }),
@@ -178,7 +177,7 @@ impl DaemonJobsHost {
 /// Goal review, the daemon's weekly look at stale goals. Goals are work,
 /// not memory, so it runs whatever memory system is configured.
 /// Review and update stale goals.
-pub(crate) async fn review_goals(pool: &SqlitePool) -> anyhow::Result<()> {
+pub async fn review_goals(pool: &SqlitePool) -> anyhow::Result<()> {
     // Mark goals without progress in 14 days as potentially abandoned
     let two_weeks_ago = (Utc::now() - chrono::Duration::days(14)).to_rfc3339();
 
@@ -199,7 +198,3 @@ pub(crate) async fn review_goals(pool: &SqlitePool) -> anyhow::Result<()> {
 
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "jobs_tests.rs"]
-mod tests;

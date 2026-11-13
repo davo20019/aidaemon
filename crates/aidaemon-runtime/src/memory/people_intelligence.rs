@@ -3,8 +3,9 @@
 
 use std::sync::Arc;
 
-use crate::config::PeopleConfig;
-use crate::traits::StateStore;
+use aidaemon_memory::people_intelligence::PeopleIntelligenceConfig;
+
+use crate::stores::StateStore;
 
 pub struct PeopleIntelligence {
     state: Arc<dyn StateStore>,
@@ -15,15 +16,9 @@ impl PeopleIntelligence {
     pub fn new(
         state: Arc<dyn StateStore>,
         store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
-        config: PeopleConfig,
+        config: PeopleIntelligenceConfig,
     ) -> Self {
-        let upkeep = aidaemon_memory::people_intelligence::PeopleIntelligence::new(
-            store,
-            aidaemon_memory::people_intelligence::PeopleIntelligenceConfig {
-                fact_retention_days: config.fact_retention_days,
-                reconnect_reminder_days: config.reconnect_reminder_days,
-            },
-        );
+        let upkeep = aidaemon_memory::people_intelligence::PeopleIntelligence::new(store, config);
         Self { state, upkeep }
     }
 

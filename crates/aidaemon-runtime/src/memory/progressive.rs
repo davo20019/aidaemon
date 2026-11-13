@@ -11,14 +11,18 @@ use serde_json::json;
 
 use aidaemon_memory::full::writer::{ExtractionProvenance, ExtractionRecord, ExtractionRun};
 
-use crate::events::EventStore;
-use crate::types::UserRole;
+use aidaemon_core::ChannelVisibility;
+use aidaemon_events::{Event, EventStore, EventType};
+use aidaemon_tools::semantics::UserRole;
+
+use crate::llm::gateway::SideCallGateway;
+use crate::llm::side_calls::SideCall;
 
 /// Run progressive fact extraction in the background, with the daemon's
 /// event log as provenance.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_progressive_extraction(
-    side_calls: crate::llm_runtime::gateway::SideCallGateway,
+    side_calls: SideCallGateway,
     fast_model: String,
     store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     event_store: Arc<EventStore>,
@@ -26,7 +30,7 @@ pub fn spawn_progressive_extraction(
     user_text: String,
     assistant_response: String,
     channel_id: Option<String>,
-    visibility: crate::types::ChannelVisibility,
+    visibility: ChannelVisibility,
     user_role: UserRole,
     run_started_at: chrono::DateTime<chrono::Utc>,
 ) {
@@ -34,8 +38,7 @@ pub fn spawn_progressive_extraction(
         if !aidaemon_memory::progressive::may_extract(user_role, visibility) {
             return;
         }
-        let provider =
-            side_calls.provider(crate::llm_runtime::side_calls::SideCall::ProgressiveExtraction);
+        let provider = side_calls.provider(SideCall::ProgressiveExtraction);
         // The side-call gateway picks the model; `fast_model` is not sent.
         aidaemon_memory::full::writer::extract_progressive(
             provider,
@@ -71,9 +74,9 @@ impl ExtractionProvenance for EventProvenance {
     }
 
     async fn record(&self, record: ExtractionRecord) -> anyhow::Result<()> {
-        let event = crate::events::Event::new(
+        let event = Event::new(
             "background:progressive_extraction",
-            crate::events::EventType::DecisionPoint,
+            EventType::DecisionPoint,
             json!({
                 "code": "memory_write",
                 "decision_type": "memory_write",

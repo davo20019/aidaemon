@@ -367,6 +367,7 @@ mod messages;
 pub mod migrations;
 mod oauth;
 mod prompt_snapshots;
+pub mod retention;
 mod session_channels;
 mod settings;
 mod skills;

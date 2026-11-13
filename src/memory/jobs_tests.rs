@@ -1,9 +1,13 @@
 // The memory jobs over the daemon's store and event log.
 
-use super::*;
+use std::time::Duration;
+
+use crate::llm_runtime::gateway::SideCallGateway;
+use crate::memory::jobs_host::memory_jobs;
 use crate::traits::Message;
 use aidaemon_memory::full::MemoryJobs;
 use aidaemon_runtime::history::uncaptured_sessions_sql;
+use aidaemon_runtime::history::EventHistory;
 use sqlx::SqlitePool;
 
 use crate::config::ProviderKind;

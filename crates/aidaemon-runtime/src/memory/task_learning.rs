@@ -8,12 +8,16 @@ use std::sync::Arc;
 
 use tracing::info;
 
-use crate::traits::{StateStore, Task};
+use aidaemon_work::goals::Task;
+
+use crate::llm::gateway::SideCallGateway;
+use crate::llm::side_calls::SideCall;
+use crate::stores::StateStore;
 
 /// Maximum size of activity log text sent to the extraction prompt.
 const MAX_ACTIVITY_LOG_CHARS: usize = 4096;
 
-pub use aidaemon_runtime::turn::memory_writer::RunTaint;
+pub use crate::turn::memory_writer::RunTaint;
 
 /// Extract durable knowledge from a completed task's activity log.
 ///
@@ -25,7 +29,7 @@ pub use aidaemon_runtime::turn::memory_writer::RunTaint;
 pub async fn extract_task_knowledge(
     state: Arc<dyn StateStore>,
     store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
-    side_calls: crate::llm_runtime::gateway::SideCallGateway,
+    side_calls: SideCallGateway,
     model: String,
     task: Task,
     taint: RunTaint,
@@ -39,7 +43,7 @@ pub async fn extract_task_knowledge(
     let goal = state.get_goal(&task.goal_id).await.ok().flatten();
     let derived_channel_id: Option<String> = goal
         .as_ref()
-        .and_then(|g| crate::memory::derive_channel_id_from_session(&g.session_id));
+        .and_then(|g| aidaemon_events::session::derive_channel_id_from_session(&g.session_id));
     // A recurring goal re-runs the same brief on every fire, so its "facts"
     // are restatements of its own instructions and run state. Its procedures
     // and error solutions still carry over; owner facts do not.
@@ -62,7 +66,7 @@ pub async fn extract_task_knowledge(
                     .tool_args
                     .as_deref()
                     .map(|a| {
-                        let end = crate::utils::floor_char_boundary(a, 200);
+                        let end = aidaemon_tools::text::floor_char_boundary(a, 200);
                         &a[..end]
                     })
                     .unwrap_or("");
@@ -75,7 +79,7 @@ pub async fn extract_task_knowledge(
                     .result
                     .as_deref()
                     .map(|r| {
-                        let end = crate::utils::floor_char_boundary(r, 300);
+                        let end = aidaemon_tools::text::floor_char_boundary(r, 300);
                         &r[..end]
                     })
                     .unwrap_or("");
@@ -104,7 +108,7 @@ pub async fn extract_task_knowledge(
         activity_log.push_str(&line);
     }
 
-    let provider = side_calls.provider(crate::llm_runtime::side_calls::SideCall::TaskLearning);
+    let provider = side_calls.provider(SideCall::TaskLearning);
     aidaemon_memory::task_learning::TaskLearner::new(provider, model)
         .learn(
             store.as_ref(),
@@ -123,11 +127,11 @@ pub async fn extract_task_knowledge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_runtime::gateway::test_support::{
+    use crate::llm::gateway::test_support::{
         failed_calls, gateway_with, ok_calls, provider_answering, provider_failing,
     };
     use crate::state::SqliteStateStore;
-    use crate::traits::store_prelude::*;
+    use crate::stores::prelude::*;
 
     /// A state store holding one finished task with one activity, and its
     /// memory store.
@@ -141,19 +145,19 @@ mod tests {
         let path = file.path().to_str().unwrap().to_string();
         // The store keeps the file open; the file outlives the test.
         std::mem::forget(file);
-        let embeddings = Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap());
+        let embeddings = Arc::new(aidaemon_memory::embeddings::EmbeddingService::new().unwrap());
         let state = Arc::new(
             SqliteStateStore::new(&path, 100, None, embeddings)
                 .await
                 .unwrap(),
         );
-        let goal = crate::traits::Goal::new_finite("Ship the Acme Corp report", "session_1");
+        let goal = aidaemon_work::goals::Goal::new_finite("Ship the Acme Corp report", "session_1");
         state.create_goal(&goal).await.unwrap();
         let mut finished = task(task_id);
         finished.goal_id = goal.id.clone();
         state.create_task(&finished).await.unwrap();
         state
-            .log_task_activity(&crate::traits::TaskActivity {
+            .log_task_activity(&aidaemon_work::goals::TaskActivity {
                 id: 0,
                 task_id: task_id.to_string(),
                 activity_type: "tool_call".to_string(),

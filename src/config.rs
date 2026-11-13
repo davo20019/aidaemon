@@ -855,16 +855,34 @@ pub struct RetentionConfig {
 
 impl Default for RetentionConfig {
     fn default() -> Self {
+        let defaults = aidaemon_runtime::state::retention::RetentionPolicy::default();
         Self {
-            messages_days: 90,
-            diagnostic_events_days: 7,
-            superseded_facts_days: 90,
-            token_usage_aggregate_days: 30,
-            episodes_days: 365,
-            behavior_patterns_days: 90,
-            goals_days: 180,
-            procedures_days: 180,
-            error_solutions_days: 90,
+            messages_days: defaults.messages_days,
+            diagnostic_events_days: defaults.diagnostic_events_days,
+            superseded_facts_days: defaults.superseded_facts_days,
+            token_usage_aggregate_days: defaults.token_usage_aggregate_days,
+            episodes_days: defaults.episodes_days,
+            behavior_patterns_days: defaults.behavior_patterns_days,
+            goals_days: defaults.goals_days,
+            procedures_days: defaults.procedures_days,
+            error_solutions_days: defaults.error_solutions_days,
+        }
+    }
+}
+
+impl RetentionConfig {
+    /// The retention policy these settings give.
+    pub fn policy(&self) -> aidaemon_runtime::state::retention::RetentionPolicy {
+        aidaemon_runtime::state::retention::RetentionPolicy {
+            messages_days: self.messages_days,
+            diagnostic_events_days: self.diagnostic_events_days,
+            superseded_facts_days: self.superseded_facts_days,
+            token_usage_aggregate_days: self.token_usage_aggregate_days,
+            episodes_days: self.episodes_days,
+            behavior_patterns_days: self.behavior_patterns_days,
+            goals_days: self.goals_days,
+            procedures_days: self.procedures_days,
+            error_solutions_days: self.error_solutions_days,
         }
     }
 }
@@ -1755,6 +1773,16 @@ pub struct PeopleConfig {
     pub fact_retention_days: u32,
     #[serde(default = "default_people_reconnect_reminder_days")]
     pub reconnect_reminder_days: u32,
+}
+
+impl PeopleConfig {
+    /// The people upkeep's settings.
+    pub fn intelligence(&self) -> aidaemon_memory::people_intelligence::PeopleIntelligenceConfig {
+        aidaemon_memory::people_intelligence::PeopleIntelligenceConfig {
+            fact_retention_days: self.fact_retention_days,
+            reconnect_reminder_days: self.reconnect_reminder_days,
+        }
+    }
 }
 
 impl Default for PeopleConfig {

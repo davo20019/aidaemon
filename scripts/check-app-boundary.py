@@ -71,6 +71,7 @@ REEXPORTS = {
     "llm_runtime.rs",
     "llm_runtime",
     "mcp",
+    "memory",
     "oauth",
     "router.rs",
     "skills",
@@ -83,9 +84,7 @@ REEXPORTS = {
 }
 
 # Behavior still in the app, and the plan step that moves it.
-PENDING = {
-    "memory": "9.1/9.6: memory host adapters, procedures, task learning, retention",
-}
+PENDING: dict[str, str] = {}
 
 
 # The agent as the crates' host: the files that may hold non-test code.

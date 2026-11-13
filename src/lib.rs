@@ -49,7 +49,6 @@ use aidaemon_channels::queue::telemetry as queue_telemetry;
 use aidaemon_work::reminders;
 mod router;
 mod runtime_ports;
-pub(crate) use aidaemon_events::session;
 mod single_instance;
 mod skills;
 mod startup;
