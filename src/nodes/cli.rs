@@ -6,7 +6,7 @@ use crate::memory::embeddings::EmbeddingService;
 use crate::nodes::domain::{NodeAction, CHILD_COMPANION_POLICY};
 use crate::state::SqliteStateStore;
 use anyhow::Context;
-use sqlx::{Row, SqlitePool};
+use sqlx::SqlitePool;
 
 pub fn handle_node_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
     if matches!(
@@ -295,21 +295,8 @@ async fn resolve_monitor_owner_session(
         !allowed.is_empty(),
         "No Telegram owner is configured; pass --session explicitly"
     );
-    let rows = sqlx::query(
-        "SELECT session_id FROM session_channels
-         WHERE channel_name = 'telegram' OR channel_name LIKE 'telegram:%'
-         ORDER BY updated_at DESC",
-    )
-    .fetch_all(pool)
-    .await?;
-    let candidate = rows
-        .into_iter()
-        .map(|row| row.get::<String, _>("session_id"))
-        .find(|session| {
-            crate::session::telegram_chat_id_from_session(session)
-                .is_some_and(|chat_id| allowed.contains(&chat_id))
-        });
-    candidate
+    super::monitoring::latest_owner_telegram_session(pool, &allowed)
+        .await?
         .context("Could not resolve a private Telegram owner session; pass --session explicitly")
 }
 

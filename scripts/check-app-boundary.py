@@ -11,12 +11,14 @@ the parts already moved to that line:
   (modules whose behavior still waits to move, each with the plan step that
   moves it). A new module fails until it is put on a list. A listed module
   that is gone fails too, so the lists only shrink.
-- `src/agent/` is done: each of its files is either an adapter on
-  `AGENT_ADAPTERS` (the agent as the crates' host) or holds nothing but
-  tests and module plumbing once its `#[cfg(test)]` items are removed. A
-  function, impl, type or constant outside a test fails.
+- Directories on `MOVED` are done (`src/agent/`, `src/nodes/`): each of
+  their files is either an adapter on that directory's list (the app as the
+  crates' host) or holds nothing but tests and module plumbing once its
+  `#[cfg(test)]` items are removed. A function, impl, type or constant
+  outside a test fails.
 
-Add a directory to `MOVED` when its step lands, so it is held the same way.
+Add a directory to `MOVED`, with its adapter list, when its step lands, so
+it is held the same way.
 
 Usage: scripts/check-app-boundary.py [repo root]
 """
@@ -46,6 +48,7 @@ SHELL = {
     "otel_export.rs": "OTel export setup",
     "runtime_ports.rs": "the app's port traits onto crate parts",
     "agent": "the agent as the crates' host (held by MOVED and AGENT_ADAPTERS)",
+    "nodes": "the Node service's host adapters (held by MOVED and NODE_ADAPTERS)",
     "testing.rs": "the daemon's test harness",
     "integration_tests.rs": "tests of the assembled product",
     "integration_tests": "tests of the assembled product",
@@ -83,11 +86,8 @@ PENDING = {
     "tools": "9.4: spawn (tests only), file policy and the read/write/edit/search_files wrappers",
     "state": "9.3/9.6: the SQLite store behind the facade traits",
     "memory": "9.1/9.6: memory host adapters, procedures, task learning, retention",
-    "nodes": "9.6: nodes host",
 }
 
-# Directories whose step is done: only adapters and tests may stay.
-MOVED = ["agent"]
 
 # The agent as the crates' host: the files that may hold non-test code.
 AGENT_ADAPTERS = {
@@ -102,6 +102,16 @@ AGENT_ADAPTERS = {
     "memory_plugin/recall.rs": "recall over the daemon stores",
     "computer_use.rs": "computer_use pins as ComputerUseState",
 }
+
+# The Node service as the crates' host: the files that may hold non-test code.
+NODE_ADAPTERS = {
+    "mod.rs": "re-exports, and the instance key from the daemon's secret store",
+    "service.rs": "the agent behind Node turns (NodeConversationIngress)",
+    "cli.rs": "the `aidaemon node` CLI subcommand over the crate's services",
+}
+
+# Directories whose step is done, with the files that may hold non-test code.
+MOVED = {"agent": AGENT_ADAPTERS, "nodes": NODE_ADAPTERS}
 
 TEST_FILE = re.compile(r"(^|/)(tests?|[a-z0-9_]+_tests)\.rs$")
 
@@ -287,12 +297,12 @@ def main() -> int:
     for name in sorted(REEXPORTS - present):
         errors.append(f"src/{name}: gone; drop it from REEXPORTS in scripts/check-app-boundary.py.")
 
-    for moved in MOVED:
+    for moved, adapters in MOVED.items():
         base = src / moved
         test_only = test_only_files(base)
         for path in sorted(base.rglob("*.rs")):
             rel = path.relative_to(base).as_posix()
-            if rel in AGENT_ADAPTERS or TEST_FILE.search(rel) or path.resolve() in test_only:
+            if rel in adapters or TEST_FILE.search(rel) or path.resolve() in test_only:
                 continue
             offending = plumbing_only(non_test_code(path))
             if offending:
@@ -301,9 +311,9 @@ def main() -> int:
                     f"(first: `{offending[0][:80]}`). Move it into a crate behind the "
                     "host traits, or gate it with #[cfg(test)] if only tests use it."
                 )
-        for rel in sorted(AGENT_ADAPTERS):
+        for rel in sorted(adapters):
             if not (base / rel).exists():
-                errors.append(f"src/{moved}/{rel}: gone; drop it from AGENT_ADAPTERS.")
+                errors.append(f"src/{moved}/{rel}: gone; drop it from its adapter list.")
 
     for error in errors:
         print(f"error: {error}")

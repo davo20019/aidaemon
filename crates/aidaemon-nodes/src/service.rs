@@ -33,6 +33,26 @@ pub trait NodeConversationIngress: Send + Sync {
     }
 }
 
+/// The channel a Node turn arrives on: a public, untrusted companion, with
+/// the Node's own conversation and principal.
+pub fn node_channel_context(
+    context: &AuthenticatedNodeContext,
+) -> aidaemon_channels::context::ChannelContext {
+    aidaemon_channels::context::ChannelContext {
+        visibility: aidaemon_core::ChannelVisibility::PublicExternal,
+        platform: "node".to_string(),
+        channel_name: Some("Companion".to_string()),
+        channel_id: Some(format!("node:{}", context.node_channel_id)),
+        workspace_id: None,
+        sender_name: Some("Companion user".to_string()),
+        sender_id: Some(format!("node-principal:{}", context.node_id)),
+        channel_member_names: Vec::new(),
+        user_id_map: std::collections::HashMap::new(),
+        workspace_grant: None,
+        trusted: false,
+    }
+}
+
 fn validate_recovery_code(label: &str, value: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !value.is_empty()

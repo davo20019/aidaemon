@@ -14,6 +14,28 @@ pub enum MonitorComparison {
     Below,
 }
 
+/// The most recently active private Telegram session of one of
+/// `owner_chat_ids`: where a monitor created from the command line reports.
+pub async fn latest_owner_telegram_session(
+    pool: &SqlitePool,
+    owner_chat_ids: &std::collections::HashSet<i64>,
+) -> anyhow::Result<Option<String>> {
+    let rows = sqlx::query(
+        "SELECT session_id FROM session_channels
+         WHERE channel_name = 'telegram' OR channel_name LIKE 'telegram:%'
+         ORDER BY updated_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get::<String, _>("session_id"))
+        .find(|session| {
+            aidaemon_events::session::telegram_chat_id_from_session(session)
+                .is_some_and(|chat_id| owner_chat_ids.contains(&chat_id))
+        }))
+}
+
 impl MonitorComparison {
     pub fn parse(value: &str) -> anyhow::Result<Self> {
         match value {
