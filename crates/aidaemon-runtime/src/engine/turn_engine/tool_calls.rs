@@ -789,6 +789,27 @@ impl TurnEngine<'_> {
                 // model reports it. Work a tool handed to the background ends
                 // the run on the tool's finish.
                 let mut handed_off = false;
+                // The runs this turn leaves running: a call that left one
+                // there names it, and the turn's launch line names them all.
+                let launched = outcome
+                    .metadata
+                    .background_run_label
+                    .as_deref()
+                    .filter(|_| {
+                        !outcome.metadata.detached
+                            && outcome.metadata.outcome_status
+                                != Some(
+                                    aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent,
+                                )
+                    })
+                    .map(|label| {
+                        let mut runs = scope
+                            .background_runs
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        runs.push(label.to_string());
+                        crate::background_run::started_group_in_background(&runs)
+                    });
                 // Track the jobs this run left running whose result the
                 // daemon will deliver: a notifying, non-detached launch opens
                 // one; a receipt that observed a job's end closes one.
@@ -800,9 +821,9 @@ impl TurnEngine<'_> {
                 {
                     scope.open_background_jobs.fetch_add(1, Ordering::Relaxed);
                     if let Ok(mut ack) = scope.background_ack.lock() {
-                        *ack = Some(crate::turn::tool_dispatch::build_background_detach_ack(
-                            &output,
-                        ));
+                        *ack = Some(launched.clone().unwrap_or_else(|| {
+                            crate::turn::tool_dispatch::build_background_detach_ack(&output)
+                        }));
                     }
                 }
                 if outcome.metadata.background_settled {
@@ -849,8 +870,15 @@ impl TurnEngine<'_> {
                         if outcome.metadata.completion_notifications_enabled {
                             scope.background_handoff.store(true, Ordering::Relaxed);
                         }
-                        let reply =
-                            crate::turn::tool_dispatch::build_background_detach_ack(&output);
+                        let reply = launched.clone().unwrap_or_else(|| {
+                            crate::turn::tool_dispatch::build_background_detach_ack(&output)
+                        });
+                        // The kernel keeps the batch's first finish; the
+                        // turn's reply is the launch line naming every run it
+                        // left running, so the latest one is recorded.
+                        if launched.is_some() {
+                            scope.verdict.record_handoff_reply(reply.clone());
+                        }
                         if let Some(finish) = finish.as_mut() {
                             finish.reply = Some(reply);
                         }

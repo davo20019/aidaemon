@@ -1189,6 +1189,7 @@ impl TurnEngine<'_> {
             background_handoff: AtomicBool::new(false),
             open_background_jobs: AtomicUsize::new(0),
             background_ack: std::sync::Mutex::new(None),
+            background_runs: std::sync::Mutex::new(Vec::new()),
             own_work_since: std::sync::Mutex::new(None),
             emitter: &emitter,
             prefix,

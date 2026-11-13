@@ -5728,7 +5728,39 @@ impl TerminalTool {
                                     "Terminal background notifier suppressed (check/kill already handled notification)"
                                 );
                                 if let Some(run) = run {
-                                    run.finish(phase, Default::default()).await;
+                                    let (state, _) = run.finish(phase, Default::default()).await;
+                                    // Its end still counts for its turn's
+                                    // group: when it was the last, the others'
+                                    // results go out now.
+                                    if let Some(state) = state {
+                                        if let aidaemon_runtime::background_run::RunsTurn::Answer(
+                                            answer,
+                                        ) = run.end_in_group(
+                                            &state,
+                                            aidaemon_runtime::run_state::RunReport {
+                                                text: String::new(),
+                                                untrusted: false,
+                                            },
+                                            String::new(),
+                                            max_output_chars,
+                                        ) {
+                                            for message in answer
+                                                .messages
+                                                .iter()
+                                                .filter(|message| !message.trim().is_empty())
+                                            {
+                                                deliver_background_text(
+                                                    hub_for_notify.as_ref(),
+                                                    state_for_notify.as_ref(),
+                                                    &session_for_notify,
+                                                    &goal_id_for_notify,
+                                                    message,
+                                                    pid,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    }
                                 }
                                 return;
                             }
@@ -5848,7 +5880,44 @@ impl TerminalTool {
                                     .await;
                                 }
                             }
-                            if let Some(note) = deliverable_note {
+                            // The runs its turn left running are answered
+                            // together: until the last of them ends this
+                            // one's end is on the card only, and the last
+                            // one's end answers the turn once from all.
+                            let raw_result = format!(
+                                "Output from `{}`:\n\n```\n{}\n```",
+                                command_summary, output
+                            );
+                            let group = match (run, ended.as_ref()) {
+                                (Some(run), Some((Some(state), _))) => run.end_in_group(
+                                    state,
+                                    aidaemon_runtime::run_state::RunReport {
+                                        text: output.clone(),
+                                        untrusted: true,
+                                    },
+                                    present(&ended, &raw_result),
+                                    max_output_chars,
+                                ),
+                                _ => aidaemon_runtime::background_run::RunsTurn::Alone,
+                            };
+                            let group_waiting = matches!(
+                                group,
+                                aidaemon_runtime::background_run::RunsTurn::Waiting
+                            );
+                            let group_answer = match group {
+                                aidaemon_runtime::background_run::RunsTurn::Answer(answer) => {
+                                    Some(answer)
+                                }
+                                _ => None,
+                            };
+                            if group_waiting {
+                                info!(
+                                    pid,
+                                    session_id = %session_for_notify,
+                                    "A command's result waits for the rest of its turn's runs"
+                                );
+                            }
+                            if let Some(note) = deliverable_note.filter(|_| !group_waiting) {
                                 deliver_background_text(
                                     hub_for_notify.as_ref(),
                                     state_for_notify.as_ref(),
@@ -5859,7 +5928,9 @@ impl TerminalTool {
                                 )
                                 .await;
                             }
-                            if matches!(deliverable_attribution, DeliverableAttribution::None) {
+                            if matches!(deliverable_attribution, DeliverableAttribution::None)
+                                && !group_waiting
+                            {
                                 let output_trimmed = output.trim();
                                 // Only genuinely empty output is trivial. A short
                                 // result is often the whole answer (a `wc -l`
@@ -5870,6 +5941,7 @@ impl TerminalTool {
                                 if is_trivial && agent_for_notify.is_none() {
                                     info!(pid, "No agent for empty background output");
                                 } else if !is_trivial
+                                    && group_answer.is_none()
                                     && is_short_complete_output(output_trimmed)
                                     && owner_task_id_for_notify.is_none()
                                 {
@@ -5962,10 +6034,20 @@ impl TerminalTool {
                                     if let (true, Some(agent)) =
                                         (reengage_budget_ok, agent_for_notify.as_ref())
                                     {
-                                        let followup = build_background_reengagement_followup(
-                                            &command_summary,
-                                            &output,
-                                        );
+                                        let (followup, parent_task_id) = match group_answer.as_ref()
+                                        {
+                                            Some(answer) => (
+                                                answer.followup.clone(),
+                                                answer.parent_task_id.clone(),
+                                            ),
+                                            None => (
+                                                build_background_reengagement_followup(
+                                                    &command_summary,
+                                                    &output,
+                                                ),
+                                                owner_task_id_for_notify.clone(),
+                                            ),
+                                        };
                                         info!(
                                             pid,
                                             session_id = %session_for_notify,
@@ -5982,7 +6064,7 @@ impl TerminalTool {
                                                 channel_ctx: crate::types::ChannelContext::internal(
                                                 ),
                                                 heartbeat: None,
-                                                parent_task_id: owner_task_id_for_notify.clone(),
+                                                parent_task_id,
                                                 parent_tool_call_id: tool_call_id_for_notify
                                                     .clone(),
                                                 parent_result_id: completion_parent_result_id
@@ -6011,7 +6093,13 @@ impl TerminalTool {
                                                             Instant::now(),
                                                         )
                                                     };
-                                                    let reply = present(&ended, &reply);
+                                                    // A group's answer stands alone:
+                                                    // the card shows each run's end.
+                                                    let reply = if group_answer.is_some() {
+                                                        reply
+                                                    } else {
+                                                        present(&ended, &reply)
+                                                    };
                                                     if !delivery_allowed {
                                                         formatted_delivered = true;
                                                         let _ = agent
@@ -6098,7 +6186,9 @@ impl TerminalTool {
                                     // Fallback: no written answer reached the chat,
                                     // so the raw output goes out rather than nothing.
                                     if !formatted_delivered {
-                                        let fallback = if is_trivial {
+                                        let fallback = if let Some(answer) = group_answer.as_ref() {
+                                            answer.messages.join("\n\n")
+                                        } else if is_trivial {
                                             format_background_continuation_failure(&[])
                                         } else {
                                             format!(
@@ -6117,7 +6207,11 @@ impl TerminalTool {
                                                 Instant::now(),
                                             )
                                         };
-                                        let fallback = present(&ended, &fallback);
+                                        let fallback = if group_answer.is_some() {
+                                            fallback
+                                        } else {
+                                            present(&ended, &fallback)
+                                        };
                                         if delivery_allowed {
                                             deliver_background_text(
                                                 hub_for_notify.as_ref(),
@@ -6273,6 +6367,7 @@ impl TerminalTool {
                         detached: detach,
                         completion_notifications_enabled: notifier_started,
                         semantics: background_semantics,
+                        background_run_label: run_label.clone().filter(|_| notifier_started),
                         ..ToolCallMetadata::default()
                     },
                     output: msg,
@@ -7351,6 +7446,31 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
                 };
                 return ToolCallSemantics::observation_and_mutation_with(effects)
                     .with_verification_mode(ToolVerificationMode::ResultContent);
+            }
+            // What a run does comes from what it is given and what its
+            // command is, never from the paths the model declared it reads.
+            // Without write targets or the network, the sandbox keeps it from
+            // changing anything. With the network it reaches what the sandbox
+            // does not contain (the container engine, services): unless its
+            // command structurally only reads, it changes something there
+            // (`ddev exec drush site:install` installs a site, whatever its
+            // `read_paths`).
+            let has_network = args
+                .as_ref()
+                .and_then(|value| value.get("network"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !has_write_targets
+                && has_network
+                && command.is_some_and(|command| {
+                    !crate::tools::command_effects::command_effects(command).observation_only
+                        && !crate::tools::command_effects::only_reads(command)
+                })
+            {
+                return ToolCallSemantics::observation_and_mutation_with(
+                    ToolMutationEffects::UNSPECIFIED,
+                )
+                .with_verification_mode(ToolVerificationMode::ResultContent);
             }
             // Every process call observes its own typed receipt, and every run
             // crosses the native sandbox even when its task-data manifest is
@@ -9469,6 +9589,27 @@ mod tests {
             r#"{"action":"run","command":"opaque 'unterminated","working_dir":"/tmp","read_paths":[],"write_paths":["/tmp/synthetic-output"]}"#,
         );
         assert!(writable.mutates_state());
+    }
+
+    #[test]
+    fn a_run_with_the_network_changes_what_it_reaches_unless_it_only_reads() {
+        // Live 2026-11-13: an install through the container engine declared
+        // only read_paths, counted as a read, and never confirmed its step.
+        let install = terminal_call_semantics(
+            r#"{"action":"run","command":"ddev exec drush site:install -y","working_dir":"/tmp/site","read_paths":["/tmp/site"],"network":true}"#,
+        );
+        assert!(install.mutates_state());
+        assert!(install.observes_state());
+
+        let status = terminal_call_semantics(
+            r#"{"action":"run","command":"ddev describe","working_dir":"/tmp/site","read_paths":["/tmp/site"],"network":true}"#,
+        );
+        assert!(!status.mutates_state());
+
+        let fetch = terminal_call_semantics(
+            r#"{"action":"run","command":"curl -sSL https://example.invalid","network":true}"#,
+        );
+        assert!(!fetch.mutates_state());
     }
 
     #[test]
