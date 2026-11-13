@@ -8,7 +8,8 @@ use aidaemon_tools::ToolText;
 use crate::traits::{
     AttachmentProvenance, ReadFileResultMetadata, ReadFileSelectionMetadata, Tool,
 };
-pub(crate) use aidaemon_tools::render_read_file_output_within;
+#[cfg(test)]
+use aidaemon_tools::render_read_file_output_within;
 #[cfg(test)]
 use aidaemon_tools::{render_read_file_output, MAX_READ_CHARS};
 #[cfg(test)]

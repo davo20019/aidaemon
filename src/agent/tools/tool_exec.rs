@@ -263,40 +263,6 @@ async fn scoped_workspace_arguments(
 
 // impl-Agent justification: tool dispatch with watchdog over tools/state/event_store.
 impl Agent {
-    pub(super) async fn mandate_goal_id_for_tool_exec(
-        &self,
-        ctx: &ToolExecCtx<'_>,
-    ) -> anyhow::Result<Option<String>> {
-        // A run-bound child remains a mandate execution even if its controller
-        // record is concurrently removed or corrupted. Never downgrade that
-        // child into the ordinary owner/tool path.
-        if let Some(fence) = self.mandate_execution.as_ref() {
-            anyhow::ensure!(
-                self.goal_id.as_deref() == Some(fence.goal_id.as_str()),
-                "Mandate child goal identity is inconsistent."
-            );
-            return Ok(Some(fence.goal_id.clone()));
-        }
-        if let Some(goal_id) = self.goal_id.as_deref() {
-            if self.state.get_mandate_for_goal(goal_id).await?.is_some() {
-                return Ok(Some(goal_id.to_string()));
-            }
-        }
-        for task_id in [self.task_id.as_deref(), ctx.task_id].into_iter().flatten() {
-            if let Some(task) = self.state.get_task(task_id).await? {
-                if self
-                    .state
-                    .get_mandate_for_goal(&task.goal_id)
-                    .await?
-                    .is_some()
-                {
-                    return Ok(Some(task.goal_id));
-                }
-            }
-        }
-        Ok(None)
-    }
-
     pub(super) async fn semantics_for_exact_tool_call(
         &self,
         name: &str,
@@ -327,7 +293,13 @@ impl Agent {
         ctx: &ToolExecCtx<'_>,
         claim_dispatch: bool,
     ) -> anyhow::Result<bool> {
-        let Some(goal_id) = self.mandate_goal_id_for_tool_exec(ctx).await? else {
+        let Some(goal_id) =
+            aidaemon_runtime::engine::work_scope::WorkScope::mandate_goal_id_for_tool_exec(
+                self,
+                ctx.task_id,
+            )
+            .await?
+        else {
             anyhow::ensure!(
                 ctx.mandate_authority.is_none(),
                 "Mandate authority is not valid outside its controller goal."
@@ -610,39 +582,6 @@ impl Agent {
         }
     }
 
-    /// Whether calls of this agent's turn on `task_id` run as a trusted
-    /// scheduled session: the channel says so, or the goal or task has
-    /// scheduled provenance. Callers exclude mandate runs, whose exact
-    /// action grants are their only authority.
-    pub(in crate::agent) async fn session_trusted(
-        &self,
-        channel_trusted: bool,
-        task_id: Option<&str>,
-    ) -> bool {
-        channel_trusted
-            || if let Some(goal_id) = self.goal_id.as_deref() {
-                // Scheduled goal runs are user-confirmed automation, so treat
-                // their tool calls as trusted even when the execution context
-                // was recreated later by heartbeat/orphan dispatch.
-                goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref()).await
-            } else if let Some(executor_task_id) = self.task_id.as_deref() {
-                if let Ok(Some(task)) = self.state.get_task(executor_task_id).await {
-                    goal_has_scheduled_provenance(
-                        &self.state,
-                        &task.goal_id,
-                        Some(executor_task_id),
-                    )
-                    .await
-                } else {
-                    task_has_scheduled_provenance(&self.state, Some(executor_task_id)).await
-                }
-            } else if let Some(task_id) = task_id {
-                task_has_scheduled_provenance(&self.state, Some(task_id)).await
-            } else {
-                false
-            }
-    }
-
     /// The dispatcher's typed facts about one call of `name`, taken from
     /// the turn (`ctx`), this agent, and the store, never from the call's
     /// arguments. `mandate_preapproved` is left false: the caller sets it
@@ -780,7 +719,13 @@ impl Agent {
         // A mandate-authorized call is never a trusted session, even if
         // ChannelContext.trusted is true or scheduled provenance would ordinarily
         // authorize it; the entire expression short-circuits to false.
-        let trusted = !under_mandate && self.session_trusted(ctx.trusted, task_id).await;
+        let trusted = !under_mandate
+            && aidaemon_runtime::engine::work_scope::WorkScope::session_trusted(
+                self,
+                ctx.trusted,
+                task_id,
+            )
+            .await;
         let user_role = ctx.user_role;
 
         let active_workspace_grant = match user_role {

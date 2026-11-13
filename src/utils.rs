@@ -8,34 +8,7 @@ pub use aidaemon_events::text::{truncate_str, truncate_with_note};
 
 pub use aidaemon_runtime::turn::helpers::render_truncation_notice;
 
-/// Losslessly compact a pretty-printed JSON block embedded in tool-result
-/// text (headers/prefix + JSON body + suffix). Pretty-printed JSON costs
-/// ~2.5-3x the tokens of its compact form with identical information — on a
-/// small-context local model that difference is the compose step timing out
-/// versus answering. Returns `Some(new_text)` only when a parseable JSON
-/// block was found AND compaction actually shrank the text; any doubt
-/// (unparseable, truncated, already compact) returns `None` and the caller
-/// keeps the original.
-pub fn compact_embedded_json(text: &str) -> Option<String> {
-    let start = text.find(['{', '['])?;
-    let open = text.as_bytes()[start] as char;
-    let close = if open == '{' { '}' } else { ']' };
-    let end = text.rfind(close)?;
-    if end <= start {
-        return None;
-    }
-    let candidate = &text[start..=end];
-    let value: serde_json::Value = serde_json::from_str(candidate).ok()?;
-    let compact = value.to_string();
-    if compact.chars().count() >= candidate.chars().count() {
-        return None;
-    }
-    let mut rebuilt = String::with_capacity(text.len() - candidate.len() + compact.len());
-    rebuilt.push_str(&text[..start]);
-    rebuilt.push_str(&compact);
-    rebuilt.push_str(&text[end + close.len_utf8()..]);
-    Some(rebuilt)
-}
+pub use aidaemon_runtime::context_budget::compact_embedded_json;
 
 pub use aidaemon_runtime::message_content::is_internal_scaffolding_line;
 

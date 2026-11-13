@@ -6,6 +6,8 @@
 // request assessment.
 // ==========================================================================
 
+use aidaemon_runtime::engine::work_scope::WorkScope as _;
+
 /// A fresh synthetic directory under `/tmp/aidaemon-test`.
 fn authority_test_dir() -> std::path::PathBuf {
     let dir = std::path::PathBuf::from("/tmp/aidaemon-test").join(uuid::Uuid::new_v4().to_string());

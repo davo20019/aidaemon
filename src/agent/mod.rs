@@ -207,6 +207,8 @@ mod runtime_ports;
 #[path = "runtime/spawn.rs"]
 mod spawn;
 mod turn_host;
+pub(crate) use aidaemon_runtime::engine::tool_result_fit::ToolResultFit;
+pub(crate) use aidaemon_runtime::engine::work_scope::WorkScope;
 /// Session notes and parent-visible deliveries, on any TurnHost.
 pub(crate) use aidaemon_runtime::turn::notes::TurnNotes;
 /// The session history appends and turn-context assembly, on any TurnHost.
