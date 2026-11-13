@@ -21,44 +21,33 @@ impl RunCommandTool {
         Self { backend }
     }
 }
-const SAFE_NPM_PREFIX_HINT: &str = "`npm test`, `npm ls`, `npm outdated`, `npm audit` (note: `npm run` and `npx` require `terminal` approval)";
+const SAFE_NPM_PREFIX_HINT: &str = "`npm ls`, `npm outdated`, `npm audit` (note: `npm test`, `npm run` and `npx` require `terminal` approval)";
 
-/// Safe command prefixes that don't require terminal approval flow.
+/// Command prefixes this tool runs without the terminal approval flow.
 ///
-/// Anything that executes arbitrary repo-defined scripts (Makefiles, npm
-/// `run`/`exec`, `cargo run`, `cargo bench`, `gradle`/`mvn` build files,
-/// `go generate`, `npx`-downloaded packages) is intentionally OMITTED. Such
-/// commands can run unbounded code from the working tree or the network and
-/// must go through the terminal approval flow instead.
+/// Every command runs in the confined sandbox (`access` decides read-only or
+/// workspace-write), with the allowlisted environment only. Build and lint
+/// commands below can still execute repository code inside that sandbox
+/// (Cargo build scripts and proc macros, linter config files and plugins).
+/// Commands whose purpose is to run repository code (test runners, `cargo
+/// run`/`bench`, npm/yarn/bun scripts, `npx`, `make`, `go generate`,
+/// Gradle/Maven) are omitted: they go through `terminal`, which asks the
+/// owner.
 const SAFE_PREFIXES: &[&str] = &[
-    // Build & test — only bounded sub-commands. `cargo run`, `cargo bench`,
-    // `go generate`, `npm run`/`npx`/`yarn run`/`bun run`,
-    // `make`/`cmake`/`gradle`/`mvn` are deliberately excluded — they execute
-    // arbitrary repo-defined code.
+    // Build & check
     "cargo build",
-    "cargo test",
     "cargo check",
     "cargo clippy",
     "cargo fmt",
     "cargo doc",
     "cargo tree",
     "cargo metadata",
-    "npm test",
     "npm ls",
     "npm outdated",
     "npm audit",
-    "yarn test",
-    "yarn lint",
-    "bun test",
-    "pytest",
-    "python -m pytest",
-    "python3 -m pytest",
-    "go test",
     "go build",
     "go vet",
     "go mod",
-    "jest",
-    "vitest",
     // Formatting & linting
     "rustfmt",
     "black",
@@ -101,8 +90,6 @@ const SAFE_PREFIXES: &[&str] = &[
     "whoami",
     "uname",
     "hostname",
-    "env",
-    "printenv",
     "date",
     "uptime",
     "pwd",
@@ -485,11 +472,84 @@ fn is_safe_command(cmd: &str) -> bool {
 /// Public (crate-visible) alias used by the correction-sandbox classifier.
 /// Returns true if `cmd` matches one of run_command's safe prefixes.
 pub(crate) fn is_run_command_safe(cmd: &str) -> bool {
-    SAFE_PREFIXES.iter().any(|prefix| {
+    let prefixed = SAFE_PREFIXES.iter().any(|prefix| {
         cmd == *prefix
             || cmd.starts_with(&format!("{} ", prefix))
             || cmd.starts_with(&format!("{}\t", prefix))
-    })
+    });
+    prefixed && git_ref_command_only_lists(cmd)
+}
+
+/// `git branch`, `git tag` and `git remote` also create, rename and delete.
+/// Only their listing forms are allowlisted: known listing flags, and a
+/// positional argument only where a listing takes one (a `--list` pattern,
+/// the commit after `--contains`, the remote name after `get-url`).
+fn git_ref_command_only_lists(cmd: &str) -> bool {
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    let (subcommand, args) = match words.as_slice() {
+        ["git", sub, args @ ..] => (*sub, args),
+        _ => return true,
+    };
+    const VALUE_FLAGS: &[&str] = &[
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+    ];
+    let listing_flag = |arg: &str| {
+        VALUE_FLAGS.contains(&arg)
+            || matches!(
+                arg,
+                "-a" | "--all"
+                    | "-r"
+                    | "--remotes"
+                    | "-l"
+                    | "--list"
+                    | "-v"
+                    | "-vv"
+                    | "--verbose"
+                    | "--show-current"
+                    | "-i"
+                    | "--ignore-case"
+                    | "--no-color"
+                    | "--no-column"
+            )
+            || ["--sort=", "--format=", "--color", "--column", "--abbrev"]
+                .iter()
+                .any(|prefix| arg.starts_with(prefix))
+            || (subcommand == "tag" && arg.starts_with("-n"))
+    };
+    match subcommand {
+        "branch" | "tag" => {
+            let lists_patterns = args.iter().any(|arg| matches!(*arg, "-l" | "--list"))
+                || (subcommand == "tag" && args.iter().any(|arg| arg.starts_with("-n")));
+            let mut takes_value = false;
+            for arg in args {
+                if takes_value {
+                    takes_value = false;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    if !listing_flag(arg) {
+                        return false;
+                    }
+                    takes_value = VALUE_FLAGS.contains(arg);
+                } else if !lists_patterns {
+                    return false;
+                }
+            }
+            true
+        }
+        "remote" => match args {
+            [] | ["-v"] | ["--verbose"] => true,
+            ["get-url", rest @ ..] => rest
+                .iter()
+                .all(|arg| matches!(*arg, "--all" | "--push") || !arg.starts_with('-')),
+            _ => false,
+        },
+        _ => true,
+    }
 }
 
 fn format_output(
@@ -634,13 +694,9 @@ mod tests {
     #[test]
     fn test_is_safe_command() {
         assert!(is_safe_command("cargo build"));
-        assert!(is_safe_command("cargo test --release"));
-        assert!(is_safe_command("npm test"));
         assert!(is_safe_command("git status"));
         assert!(is_safe_command("git log --oneline"));
         assert!(is_safe_command("ls -la"));
-        assert!(is_safe_command("pytest tests/"));
-        assert!(is_safe_command("go test ./..."));
         for command in [
             "printf synthetic-output",
             "/usr/bin/printf synthetic-output",
@@ -693,6 +749,59 @@ mod tests {
         assert!(!is_safe_command("cmake --build ."));
         assert!(!is_safe_command("gradle build"));
         assert!(!is_safe_command("mvn package"));
+    }
+
+    /// The allowlist as a table: test runners (whose job is running repo
+    /// code) and environment dumps are out; `git branch`/`tag`/`remote`
+    /// run only in their listing forms.
+    #[test]
+    fn allowlist_table() {
+        let cases: &[(&str, bool)] = &[
+            ("cargo test", false),
+            ("cargo test --release", false),
+            ("npm test", false),
+            ("yarn test", false),
+            ("bun test", false),
+            ("pytest tests/", false),
+            ("python3 -m pytest", false),
+            ("go test ./...", false),
+            ("jest", false),
+            ("vitest run", false),
+            ("env", false),
+            ("printenv", false),
+            ("printenv HOME", false),
+            ("git branch", true),
+            ("git branch -a", true),
+            ("git branch -vv --sort=-committerdate", true),
+            ("git branch --show-current", true),
+            ("git branch --contains abc123", true),
+            ("git branch --list feature/*", true),
+            ("git branch new-feature", false),
+            ("git branch -d old", false),
+            ("git branch -D old", false),
+            ("git branch -m old new", false),
+            ("git branch --set-upstream-to=origin/main", false),
+            ("git tag", true),
+            ("git tag -l v1.*", true),
+            ("git tag -n5", true),
+            ("git tag --points-at HEAD", true),
+            ("git tag v9.9.9", false),
+            ("git tag -d v1.0.0", false),
+            ("git tag -a v1 -m msg", false),
+            ("git remote", true),
+            ("git remote -v", true),
+            ("git remote get-url origin", true),
+            ("git remote add evil https://example.invalid/x", false),
+            ("git remote remove origin", false),
+            ("git remote set-url origin https://example.invalid/x", false),
+            ("cargo build --release", true),
+            ("cargo clippy", true),
+            ("npm ls", true),
+            ("go vet ./...", true),
+        ];
+        for (command, safe) in cases {
+            assert_eq!(is_safe_command(command), *safe, "{command}");
+        }
     }
 
     #[tokio::test]
