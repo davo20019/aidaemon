@@ -6,6 +6,7 @@
 //! project instructions found for a turn's scope.
 
 pub mod closeout;
+pub mod compaction;
 pub mod completion_checks;
 pub mod completion_contract;
 pub mod dialogue_state;
