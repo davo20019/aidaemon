@@ -83,18 +83,9 @@ pub fn create_procedure(name: String, trigger_pattern: String, steps: Vec<String
     create_procedure_with_outcome(name, trigger_pattern, steps, true)
 }
 
-/// Extract the recurrence pattern from an error message. Harness scaffolding
-/// (untrusted-data envelopes, truncation notices, coaching) is the daemon's
-/// own wrapper, not the error, so its lines are dropped first; keeping them
-/// made unrelated errors share a prefix and match each other.
-pub fn extract_error_pattern(error: &str) -> String {
-    let error = error
-        .lines()
-        .filter(|line| !crate::utils::is_internal_scaffolding_line(line))
-        .collect::<Vec<_>>()
-        .join("\n");
-    aidaemon_memory::error_pattern(&error)
-}
+/// The recurrence pattern of an error message (scaffolding lines dropped).
+#[cfg(test)]
+pub use aidaemon_runtime::history::error_pattern as extract_error_pattern;
 
 #[cfg(test)]
 mod tests {

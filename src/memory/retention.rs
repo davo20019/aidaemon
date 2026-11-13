@@ -121,7 +121,7 @@ impl RetentionManager {
             },
         )
         .with_message_log(std::sync::Arc::new(
-            super::history_source::EventHistory::new(self.pool.clone(), None),
+            aidaemon_runtime::history::EventHistory::new(self.pool.clone(), None),
         ))
     }
 

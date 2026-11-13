@@ -361,7 +361,7 @@ async fn selected_fact_projects_only_its_canonical_source_message() {
     .await
     .unwrap();
 
-    crate::memory::project_event_span(&store.pool, selected_event_id)
+    aidaemon_runtime::history::project_event_span(&store.pool, selected_event_id)
         .await
         .unwrap();
     store.project_fact_memory(fact_id).await.unwrap();

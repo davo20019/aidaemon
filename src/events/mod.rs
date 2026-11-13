@@ -1,17 +1,21 @@
 //! Event-sourced architecture for agent activity tracking.
 //!
-//! The store, its payloads and the run aggregate live in `aidaemon-events`.
-//! This module keeps their names stable for the daemon and holds what is
-//! the daemon's own: consolidation into long-term memory, and the event
-//! store's seams.
+//! The store, its payloads and the run aggregate live in `aidaemon-events`;
+//! consolidation into long-term memory and the event store's seams in
+//! `aidaemon-runtime` (`consolidation`, `history`). This module keeps their
+//! names stable for the daemon.
 
-mod consolidation;
+#[cfg(test)]
+#[path = "consolidation_golden_tests.rs"]
+mod consolidation_golden_tests;
+#[cfg(test)]
+mod consolidation_tests;
 #[cfg(test)]
 mod run_aggregate_checklist_tests;
 #[cfg(test)]
 mod store_host_tests;
 
-pub use consolidation::{Consolidator, Pruner};
+pub use aidaemon_runtime::consolidation::{Consolidator, Pruner};
 
 #[allow(unused_imports)]
 pub use aidaemon_events::conversation_turn::{
@@ -34,36 +38,14 @@ pub use aidaemon_events::store::{
 };
 #[allow(unused_imports)]
 pub use aidaemon_events::terminal_state::TerminalState;
+#[allow(unused_imports)]
 pub use aidaemon_events::{
     is_memory_isolated_worker_session, session_has_mandate_execution_provenance, Event, EventType,
     TaskOutcome, TaskStatus,
 };
 
 /// The daemon's end of the event store's seams.
-pub(crate) struct DaemonEventHost;
-
-#[async_trait::async_trait]
-impl EventHost for DaemonEventHost {
-    async fn project_history(
-        &self,
-        pool: &sqlx::SqlitePool,
-        event_id: i64,
-    ) -> anyhow::Result<bool> {
-        crate::state::sqlite::history_search::project_event(pool, event_id).await
-    }
-
-    async fn project_memory_span(
-        &self,
-        pool: &sqlx::SqlitePool,
-        event_id: i64,
-    ) -> anyhow::Result<()> {
-        crate::memory::project_event_span(pool, event_id).await
-    }
-
-    fn error_pattern(&self, error: &str) -> String {
-        crate::memory::procedures::extract_error_pattern(error)
-    }
-}
+pub(crate) use aidaemon_runtime::history::HistoryEventHost as DaemonEventHost;
 
 /// `EventStore::new` for the daemon's tests: its production seams, on the
 /// paths of the test process.
