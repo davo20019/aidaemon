@@ -12,6 +12,7 @@ pub mod budgets;
 pub mod calls;
 pub mod compaction;
 pub mod hooks;
+pub mod mandate_run;
 pub mod outcome;
 pub mod provider;
 pub mod recovery;
