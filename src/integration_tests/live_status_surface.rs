@@ -168,8 +168,9 @@ mod live_status_surface_tests {
 
     /// Two runs a turn left running share its one card. When the first
     /// ends, the card shows it ended and the other still running; when the
-    /// last ends, nothing on the card is running: the plan step the turn
-    /// left open settles as not done, and the card settles to its final
+    /// last ends, nothing on the card is running: the plan step that waited
+    /// on both runs settles from their ends (both succeeded: done), and the
+    /// card settles to its final
     /// state (live 2026-11-13: the card stayed "Working · step 4 of 4" with
     /// two "Running in the background" rows 14 minutes after both ended).
     #[tokio::test]
@@ -248,7 +249,8 @@ mod live_status_surface_tests {
         assert!(!card.contains("Running"), "{card}");
         assert!(!card.contains("Working"), "{card}");
         assert!(card.contains("Report each time"), "{card}");
-        assert!(card.contains("Report each time (not done)"), "{card}");
+        assert!(card.contains("✅ Report each time"), "{card}");
+        assert!(!card.contains("not done"), "{card}");
         let cards = shown
             .iter()
             .filter(|text| text.contains("in the background:") && !text.starts_with("Started"))
