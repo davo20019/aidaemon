@@ -105,10 +105,16 @@ impl RunState {
         self.work_began.unwrap_or(self.started_at)
     }
 
+    /// When its work began and ended and how long it took, once it ended
+    /// ([`measured_span`]).
+    pub fn span(&self) -> Option<MeasuredSpan> {
+        self.ended_at
+            .map(|ended| measured_span(self.began(), ended))
+    }
+
     /// How long it took, once it ended.
     pub fn took(&self) -> Option<chrono::Duration> {
-        self.ended_at
-            .map(|ended| (ended - self.began()).max(chrono::Duration::zero()))
+        self.span().map(|span| span.took())
     }
 
     /// The helper as every card shows it.
@@ -121,6 +127,9 @@ impl RunState {
                 RunPhase::Running => self.step.clone(),
                 _ => None,
             },
+            // Its measured time goes with its result, the parent's record
+            // of it: the card says only how it ended.
+            took: None,
         }
     }
 }
@@ -318,6 +327,33 @@ pub fn take_current_run() -> Option<String> {
         .try_with(|run| run.borrow_mut().take())
         .ok()
         .flatten()
+}
+
+/// A measured stretch of time as the owner reads it: both ends cut to the
+/// whole second first, so the duration is always the difference of the
+/// times shown (live 2026-11-13: a 20.4 s run read "20 seconds" beside
+/// 2:21:16 to 2:21:37, which is 21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeasuredSpan {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+}
+
+impl MeasuredSpan {
+    /// How long it took: `to - from`, never negative.
+    pub fn took(&self) -> chrono::Duration {
+        (self.to - self.from).max(chrono::Duration::zero())
+    }
+}
+
+/// `from` to `to`, measured to the whole second ([`MeasuredSpan`]).
+pub fn measured_span(from: DateTime<Utc>, to: DateTime<Utc>) -> MeasuredSpan {
+    use chrono::SubsecRound;
+    let from = from.trunc_subsecs(0);
+    MeasuredSpan {
+        from,
+        to: to.trunc_subsecs(0).max(from),
+    }
 }
 
 /// What the runtime measured of a run when it ended.

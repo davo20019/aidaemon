@@ -87,10 +87,9 @@ pub enum StatusUpdate {
         extension: usize,
         max_extensions: usize,
     },
-    /// A rendered task-plan checklist to display on the single live surface.
-    /// Replaces the separate checklist message previously posted by
-    /// `track_requirements` directly through the hub.
-    Checklist { text: String },
+    /// The task plan as the single live card shows it: its rendering and
+    /// its step count, which decides whether the card is kept.
+    Checklist(aidaemon_core::card::PlanCard),
     /// A helper's record changed: it started, took a step or ended. The
     /// view is the runtime's record of it, so the live card and the card a
     /// turn leaves behind show the same thing.

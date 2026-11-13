@@ -732,11 +732,9 @@ impl TrackRequirementsTool {
             }
         }
 
-        // The rendered checklist is returned to the agent loop, which surfaces it
-        // to the user via the single live status surface (StatusUpdate::Checklist).
-        // This tool no longer posts/edits channel messages directly. Anything
-        // meant only for the model goes before the "Checklist updated" header,
-        // which is where the loop starts reading the user-facing render.
+        // What the model reads. The owner's card is drawn by the agent loop
+        // from the stored plan (StatusUpdate::Checklist), never from this
+        // text.
         let mut output = String::new();
         if !dropped_targets.is_empty() {
             output.push_str(&self.vocabulary.render_notice(&dropped_targets));

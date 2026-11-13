@@ -325,6 +325,21 @@ impl PlanStore {
         Ok(Some(plan))
     }
 
+    /// The session's checklist for `task_id`: its latest plan, when that
+    /// plan belongs to the task.
+    pub async fn for_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<Option<TaskPlan>> {
+        Ok(self
+            .get_recent_for_session(session_id, 1)
+            .await?
+            .into_iter()
+            .next()
+            .filter(|plan| plan.task_id.as_deref() == Some(task_id)))
+    }
+
     /// The run's receipts proved the checklist items at `indices` of the
     /// session's checklist for `task_id` ([`TaskPlan::confirm_steps`]).
     /// Returns the updated plan, or `None` when nothing changed.
@@ -334,13 +349,7 @@ impl PlanStore {
         task_id: &str,
         indices: &std::collections::BTreeSet<usize>,
     ) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self
-            .get_recent_for_session(session_id, 1)
-            .await?
-            .into_iter()
-            .next()
-            .filter(|plan| plan.task_id.as_deref() == Some(task_id))
-        else {
+        let Some(mut plan) = self.for_task(session_id, task_id).await? else {
             return Ok(None);
         };
         if !plan.confirm_steps(indices) {

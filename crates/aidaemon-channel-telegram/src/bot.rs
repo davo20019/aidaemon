@@ -16,13 +16,11 @@ use aidaemon_channels::context::ChannelContext;
 use aidaemon_channels::hub::{
     ChannelCapabilities, ChannelHub, HubChannel, MediaKind, MediaMessage,
 };
-use aidaemon_channels::live_status::{HubSurfaceSink, LiveStatus, SurfaceSink};
+use aidaemon_channels::live_status::{HubSurfaceSink, SurfaceSink};
 use aidaemon_channels::ports::{AgentResponseEnvelope, InboundMessageTiming};
 use aidaemon_channels::prompts::Prompts;
 use aidaemon_channels::slash::{build_help_text, shared_commands, CommandCategory, CommandDef};
-use aidaemon_channels::turns::{
-    repeat_while_working, Delivered, Turn, TurnEnd, TurnRunner, TurnSurface,
-};
+use aidaemon_channels::turns::{repeat_while_working, Delivered, Turn, TurnRunner, TurnSurface};
 use aidaemon_channels::Channel as _;
 use aidaemon_core::ChannelVisibility;
 use aidaemon_events::conversation::MessageAttachment;
@@ -1502,16 +1500,16 @@ impl TelegramBot {
                 "Telegram status surface disabled: ChannelHub is not wired"
             );
         }
-        let live = hub.as_ref().map(|hub| LiveSurface {
-            owner: Arc::new(Mutex::new(LiveStatus::new())),
-            sink: Arc::new(HubSurfaceSink::new(hub.clone(), session_id.clone())),
-        });
+        // The turn's one status card, which the turn runner owns.
+        let card = hub
+            .as_ref()
+            .map(|hub| Arc::new(HubSurfaceSink::new(hub.clone(), session_id.clone())));
         let surface = TelegramSurface {
             bot,
             chat_id: msg.chat.id,
             session_id: session_id.clone(),
             hub,
-            live,
+            card,
         };
         self.runner
             .submit(
@@ -1532,29 +1530,15 @@ impl TelegramBot {
     }
 }
 
-struct LiveSurface {
-    owner: Arc<Mutex<LiveStatus>>,
-    sink: Arc<HubSurfaceSink>,
-}
-
-impl LiveSurface {
-    /// Resolve the status message so it doesn't stay on "⏳ Running…".
-    /// `reply_delivered`: a finished plan card is dropped only once a reply
-    /// says what was done.
-    async fn clear(&self, reply_delivered: bool) {
-        use SurfaceSink;
-        let sink: &dyn SurfaceSink = self.sink.as_ref();
-        self.owner.lock().await.clear(sink, reply_delivered).await;
-    }
-}
-
 /// One Telegram chat, as the turn runner shows it.
 struct TelegramSurface {
     bot: Bot,
     chat_id: ChatId,
     session_id: String,
     hub: Option<Arc<ChannelHub>>,
-    live: Option<LiveSurface>,
+    /// Where the turn's status card goes; `None` without the hub, when
+    /// status goes out as plain messages.
+    card: Option<Arc<HubSurfaceSink>>,
 }
 
 #[async_trait]
@@ -1602,74 +1586,49 @@ impl TurnSurface for TelegramSurface {
         );
     }
 
+    fn card_sink(&self) -> Option<Arc<dyn SurfaceSink>> {
+        self.card.clone().map(|sink| sink as Arc<dyn SurfaceSink>)
+    }
+
+    /// The handoff's reply is on the card: a later completion can edit it.
+    async fn card_became_reply(&self, message_id: &str) {
+        if let Some(hub) = &self.hub {
+            hub.register_background_status_surface(&self.session_id, message_id)
+                .await;
+        }
+    }
+
+    /// A card that stays in the chat can still change after the turn: a
+    /// background job settles the steps it was handed, a helper its header.
+    async fn card_kept(&self, message_id: &str) {
+        if let Some(hub) = &self.hub {
+            hub.register_checklist_surface(&self.session_id, message_id)
+                .await;
+        }
+    }
+
+    /// Without the hub there is no card: plain status messages.
     fn show_status(
         &self,
         updates: mpsc::Receiver<StatusUpdate>,
         private: bool,
     ) -> Result<tokio::task::JoinHandle<()>, mpsc::Receiver<StatusUpdate>> {
-        Ok(match &self.live {
-            Some(live) => {
-                let owner = live.owner.clone();
-                let sink = live.sink.clone();
-                let bot = self.bot.clone();
-                let chat_id = self.chat_id;
-                tokio::spawn(async move {
-                    owner.lock().await.reset();
-                    run_status_consumer(updates, owner, sink, bot, chat_id, private).await;
-                })
-            }
-            None => tokio::spawn(run_legacy_status_consumer(
-                updates,
-                self.bot.clone(),
-                self.chat_id,
-                private,
-            )),
-        })
+        Ok(tokio::spawn(run_legacy_status_consumer(
+            updates,
+            self.bot.clone(),
+            self.chat_id,
+            private,
+        )))
     }
 
-    /// The live card's closing checklist decides whether it stays.
-    fn status_settles_before_reply(&self) -> bool {
-        self.live.is_some()
-    }
-
+    /// Final answers are new messages: a progress edit is not a delivery
+    /// (Telegram can acknowledge editMessageText while a client delays
+    /// showing it). A background handoff's reply may follow up later.
     async fn deliver(&self, envelope: &AgentResponseEnvelope, reply: &str) -> Delivered {
         let background_handoff =
             envelope.disposition == AssistantResponseDisposition::BackgroundHandoff;
-        let mut message_ids = Vec::new();
-        // A progress edit is not a delivery: Telegram can acknowledge
-        // editMessageText while a client delays showing it. Final answers
-        // are therefore new messages; only a background handoff, which is
-        // not final, becomes the editable status message.
-        if background_handoff {
-            if let Some(live) = &self.live {
-                use SurfaceSink;
-                let sink: &dyn SurfaceSink = live.sink.as_ref();
-                let mut owner = live.owner.lock().await;
-                // A card with a helper still running stays the helper's
-                // card, settled to its final header when it ends; the reply
-                // goes out on its own.
-                if !owner.has_running_helpers() && owner.finalize_text(sink, reply).await {
-                    if let Some(id) = owner.surface_message_id() {
-                        if let Some(hub) = &self.hub {
-                            hub.register_background_status_surface(&self.session_id, &id)
-                                .await;
-                        }
-                        message_ids.push(id);
-                    }
-                    return Delivered {
-                        state: ResponseDeliveryState::Edited,
-                        message_ids,
-                        error: None,
-                    };
-                }
-            }
-        }
         match send_full_or_expandable_reply(&self.bot, self.chat_id, reply).await {
-            Ok(ids) => {
-                message_ids.extend(ids);
-                if let Some(live) = &self.live {
-                    live.clear(true).await;
-                }
+            Ok(message_ids) => {
                 if background_handoff {
                     if let (Some(hub), Some(id)) = (&self.hub, message_ids.last()) {
                         hub.register_background_status_surface(&self.session_id, id)
@@ -1686,27 +1645,11 @@ impl TurnSurface for TelegramSurface {
                 warn!("Failed to send Telegram message: {}", e);
                 Delivered {
                     state: ResponseDeliveryState::Failed,
-                    message_ids,
+                    message_ids: Vec::new(),
                     error: Some("telegram_send_failed".to_string()),
                 }
             }
         }
-    }
-
-    async fn turn_ended(&self, ended: TurnEnd) {
-        let Some(live) = &self.live else {
-            return;
-        };
-        if ended != TurnEnd::Delivered {
-            live.clear(false).await;
-        }
-        let mut owner = live.owner.lock().await;
-        // A card that stays in the chat can still change after the turn: a
-        // background job settles the steps it was handed.
-        if let (Some(hub), Some(id)) = (&self.hub, owner.kept_card_message_id()) {
-            hub.register_checklist_surface(&self.session_id, &id).await;
-        }
-        owner.reset();
     }
 }
 
@@ -2123,129 +2066,6 @@ fn is_indicator_only_status(update: &StatusUpdate) -> bool {
     matches!(update, StatusUpdate::Thinking(_))
 }
 
-/// Single status consumer used at both the primary and queue-drain sites.
-///
-/// Every progress event updates the `LiveStatus` card's state (one message
-/// created lazily and edited in place); the card is sent at most once per
-/// `min_interval`, and an update that arrives inside the interval is shown
-/// when it ends instead of being dropped (live 2026-11-12: a throttled
-/// step left the card stale through six minutes of helpers working). A
-/// long step's line says how long it has run, refreshed on a tick.
-/// BudgetExtended and explicitly typed user actions are must-deliver and
-/// sent as their own messages. Merely containing a URL does not make
-/// internal progress user-facing: task descriptions often contain URLs too.
-async fn run_status_consumer(
-    mut rx: tokio::sync::mpsc::Receiver<StatusUpdate>,
-    owner: std::sync::Arc<tokio::sync::Mutex<LiveStatus>>,
-    sink: std::sync::Arc<HubSurfaceSink>,
-    bot: Bot,
-    chat_id: ChatId,
-    is_dm: bool,
-) {
-    use SurfaceSink;
-    let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
-    let min_interval = Duration::from_secs(3);
-    let mut tick = tokio::time::interval(Duration::from_secs(5));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        let backlog = tokio::select! {
-            first = rx.recv() => {
-                let Some(first) = first else { break };
-                // Whatever piled up while the last edit was on its way is
-                // applied in order and shown in one edit.
-                let mut backlog = vec![first];
-                while let Ok(next) = rx.try_recv() {
-                    backlog.push(next);
-                }
-                backlog
-            }
-            // Nothing new: show what an interval held back, or a long step's
-            // new elapsed time.
-            _ = tick.tick() => Vec::new(),
-        };
-        let mut show_now = false;
-        let mut typing = false;
-        for update in backlog {
-            // Thinking shows as the typing indicator, and on the card as
-            // the turn's step between tool calls.
-            typing |= is_indicator_only_status(&update);
-            let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
-            // Non-DM channels: suppress progress except BudgetExtended (unchanged behaviour).
-            if !is_dm && !is_budget_ext {
-                continue;
-            }
-            // BudgetExtended and explicit user actions are must-deliver: send as
-            // their own message (never folded into the live surface).
-            if update.requires_immediate_delivery() {
-                let text = match &update {
-                    StatusUpdate::BudgetExtended {
-                        old_budget,
-                        new_budget,
-                        extension,
-                        max_extensions,
-                    } => format!(
-                        "💰 Auto-extended token budget {old_budget} → {new_budget} \
-                     ({extension}/{max_extensions}) — continuing."
-                    ),
-                    StatusUpdate::UserActionRequired { message } => message.clone(),
-                    _ => String::new(),
-                };
-                if !text.is_empty() {
-                    let _ = bot.send_message(chat_id, text).await;
-                }
-                continue;
-            }
-            // Single-writer invariant: exactly one consumer task touches `owner` per
-            // turn and turns are sequential (the previous task is aborted before the
-            // next is spawned), so holding the lock is safe.
-            show_now |= note_status(&mut *owner.lock().await, &update);
-        }
-        if !is_dm {
-            continue;
-        }
-        let now = tokio::time::Instant::now();
-        if show_now || now.duration_since(last_sent) >= min_interval {
-            let sink_ref: &dyn SurfaceSink = sink.as_ref();
-            if owner.lock().await.flush_if_changed(sink_ref).await {
-                last_sent = tokio::time::Instant::now();
-                typing = true;
-            }
-        }
-        if typing {
-            let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
-        }
-    }
-}
-
-/// Apply one progress update to the card's state; `true` when the card
-/// should show it at once, past the interval: the plan, a handoff and a
-/// helper's start or end are never held back. Each step is its typed kind; a
-/// tool ending is not a step.
-fn note_status(live: &mut LiveStatus, update: &StatusUpdate) -> bool {
-    use aidaemon_core::card::{ActivityKind, Step};
-    match update {
-        StatusUpdate::Checklist { text } => {
-            live.note_checklist(text.clone());
-            true
-        }
-        StatusUpdate::Thinking(_) => {
-            live.note_activity(Step::Doing(ActivityKind::Think));
-            false
-        }
-        StatusUpdate::ToolStart { kind, .. } => {
-            live.note_activity(Step::Doing(*kind));
-            false
-        }
-        StatusUpdate::StepHandedOff { kind } => {
-            live.note_activity(Step::HandedOff(*kind));
-            true
-        }
-        StatusUpdate::Helper(helper) => live.note_helper(helper.clone()),
-        // Other Plan*/tool-ending variants: no line of their own.
-        _ => false,
-    }
-}
-
 /// Legacy (pre-LiveStatus) status consumer used only when the `ChannelHub` is
 /// not wired and the single live surface is unavailable. Sends a fresh message
 /// per status update (the same plain text every channel's status line uses) with the historical
@@ -2329,48 +2149,40 @@ mod tests {
         assert_eq!(outbound_content_type(b"homepage.png but text"), None);
     }
 
-    /// Two helpers started together each get their own header on the card,
-    /// whatever order or batch their updates arrive in (live 2026-11-12:
-    /// only "Counter B" showed), and every line is a typed kind in plain
-    /// words: a tool ending adds nothing.
-    #[test]
-    fn parallel_helpers_each_get_their_own_line() {
-        use aidaemon_core::card::{ActivityKind, HelperView, Step};
-        let mut live = LiveStatus::new();
-        assert!(note_status(
-            &mut live,
-            &StatusUpdate::Helper(HelperView::running("Counter A", true, None))
-        ));
-        assert!(note_status(
-            &mut live,
-            &StatusUpdate::Helper(HelperView::running("Counter B", true, None))
-        ));
-        assert!(!note_status(
-            &mut live,
-            &StatusUpdate::Helper(HelperView::running(
-                "Counter B",
-                true,
-                Some(Step::Doing(ActivityKind::Run)),
-            ))
-        ));
-        assert!(!note_status(
-            &mut live,
-            &StatusUpdate::ToolComplete {
-                name: "reading a file".into(),
-                summary: "done".into(),
-            }
-        ));
-        assert!(note_status(
-            &mut live,
-            &StatusUpdate::StepHandedOff {
-                kind: ActivityKind::Delegate,
-            }
-        ));
-        let card = live.preview().unwrap();
+    /// Telegram's path: with the hub wired, a chat keeps one card and the
+    /// turn runner owns how it ends (the same rule as every path); a kept
+    /// card is registered for what outlives the turn to settle, and a card
+    /// that became a handoff's reply for its later follow-up. Without the
+    /// hub there is no card.
+    #[tokio::test]
+    async fn a_telegram_chat_hands_its_card_to_the_runner() {
+        let hub = Arc::new(ChannelHub::new(Vec::new(), Arc::default()));
+        let surface = |hub: Option<Arc<ChannelHub>>| TelegramSurface {
+            bot: Bot::new(Arc::new(crate::TelegramChannel::new("000000:SYNTHETIC"))),
+            chat_id: ChatId(1),
+            session_id: "telegram:synthetic".into(),
+            card: hub.as_ref().map(|hub| {
+                Arc::new(HubSurfaceSink::new(
+                    hub.clone(),
+                    "telegram:synthetic".into(),
+                ))
+            }),
+            hub,
+        };
+        assert!(surface(None).card_sink().is_none());
+        let with_card = surface(Some(hub.clone()));
+        assert!(with_card.card_sink().is_some());
+        with_card.card_kept("41").await;
         assert_eq!(
-            card,
-            "⏳ Running in the background: Counter A\n\n⏳ Running in the background: \
-             Counter B\nRunning a command\n\n⏳ Handed to a helper; it works in the background"
+            hub.checklist_surface("telegram:synthetic").await.as_deref(),
+            Some("41")
+        );
+        with_card.card_became_reply("42").await;
+        assert_eq!(
+            hub.background_status_surface("telegram:synthetic")
+                .await
+                .as_deref(),
+            Some("42")
         );
     }
 

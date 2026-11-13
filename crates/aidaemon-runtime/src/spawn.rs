@@ -500,7 +500,7 @@ pub const MAX_REPORT_TOOL_RECORDS: usize = 5_000;
 /// never reaches the parent's card (two parallel children used to overwrite
 /// it in turn, leaving whichever wrote last looking like the whole task).
 /// Each of the child's steps (a tool starting, a step handed on, the line its
-/// command printed, its thinking) becomes that child's [`HelperView`], so the
+/// command printed) becomes that child's [`HelperView`], so the
 /// parent's card and its status reply say what each helper is doing as a
 /// typed kind. A tool ending is not a step. Every other update passes
 /// through unchanged.
@@ -512,16 +512,19 @@ pub fn child_status_sender(
     background: bool,
     step: Option<ChildStep>,
 ) -> Option<mpsc::Sender<StatusUpdate>> {
-    use aidaemon_core::card::{ActivityKind, HelperView, Step};
+    use aidaemon_core::card::{HelperView, Step};
     let parent = parent?;
     let label = child_status_label(mission);
     let (tx, mut rx) = mpsc::channel::<StatusUpdate>(64);
     tokio::spawn(async move {
         while let Some(update) = rx.recv().await {
             let own_step = match &update {
-                StatusUpdate::Checklist { .. } | StatusUpdate::ToolComplete { .. } => continue,
+                // Between its steps the helper keeps its latest one: its
+                // thinking is no step of its own.
+                StatusUpdate::Checklist(_)
+                | StatusUpdate::ToolComplete { .. }
+                | StatusUpdate::Thinking(_) => continue,
                 StatusUpdate::ToolStart { kind, .. } => Some(Step::Doing(*kind)),
-                StatusUpdate::Thinking(_) => Some(Step::Doing(ActivityKind::Think)),
                 // A child's step that went on in the background is that
                 // child's progress, never the parent's own step (live
                 // 2026-11-13: "… goes on in the background" stood on the

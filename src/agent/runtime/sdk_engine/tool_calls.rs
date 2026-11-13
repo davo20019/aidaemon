@@ -938,8 +938,15 @@ impl Agent {
         }
         if let Some(status_tx) = &scope.status_tx {
             let update = if facts.requirement_checklist {
-                crate::agent::tool_execution::parse_checklist_from_result(&output)
-                    .map(|text| StatusUpdate::Checklist { text })
+                // The card is the plan as stored, with its step count: never
+                // read back out of the tool's text.
+                if failed {
+                    None
+                } else {
+                    self.plan_card(scope.session_id, scope.task_id)
+                        .await
+                        .map(StatusUpdate::Checklist)
+                }
             } else {
                 // A step that handed its work to a helper or a background
                 // job has not finished: its line says the work goes on
@@ -1068,12 +1075,12 @@ impl Agent {
                 }
                 // A step the model ticked shows as done only once receipts
                 // prove it: the card is redrawn with what they proved.
-                if let Some(text) = self
+                if let Some(plan) = self
                     .confirm_checklist_from_receipts(scope.session_id, scope.task_id)
                     .await
                 {
                     if let Some(status_tx) = &scope.status_tx {
-                        let _ = status_tx.try_send(StatusUpdate::Checklist { text });
+                        let _ = status_tx.try_send(StatusUpdate::Checklist(plan));
                     }
                 }
             }

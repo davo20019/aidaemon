@@ -127,6 +127,7 @@ mod tests {
             "WordPress install",
             "The site is running.",
             8_000,
+            false,
         );
         assert!(
             stopped.starts_with("\u{26a0}\u{fe0f} Didn't finish in the background: WordPress install\n\nThe site is running."),
@@ -139,6 +140,7 @@ mod tests {
             "Slow count",
             "Done.",
             8_000,
+            false,
         );
         assert!(
             succeeded.starts_with("\u{2705} Finished in the background: Slow count\n\nDone."),
@@ -158,6 +160,7 @@ mod tests {
             "Site install",
             "Done.",
             8_000,
+            false,
         );
         assert!(
             unconfirmed.starts_with(
@@ -166,6 +169,29 @@ mod tests {
             ),
             "{unconfirmed}"
         );
+    }
+
+    /// How a run ended is said once: when its card shows it, the result
+    /// carries the body and the measured time, never the card's header
+    /// again (live 2026-11-13: "Finished in the background: X" on the card
+    /// and again on the result).
+    #[test]
+    fn the_result_never_repeats_the_cards_header() {
+        for phase in [RunPhase::Succeeded, RunPhase::Stopped, RunPhase::Failed] {
+            let run = ended_run(phase, &["Capture the screenshot"], Some(2), 62, 0);
+            let message = render_run_result(&run, "Slow count", "Counted to 30.", 8_000, true);
+            for header in [phase.headline(), phase.helper_headline(false)] {
+                assert!(!message.contains(header), "{header:?} in {message:?}");
+            }
+            assert!(!message.contains("Slow count"), "{message}");
+            assert!(
+                message.starts_with(
+                    "I couldn't verify one of its steps: Capture the screenshot.\n\nCounted to 30."
+                ),
+                "{message}"
+            );
+            assert!(message.contains("Took 1m"), "{message}");
+        }
     }
 
     /// A helper's title, and each plan item, names the folder the work
@@ -857,9 +883,9 @@ mod child_runtime_tests {
         );
     }
 
-    /// The parent's final reply gives each helper's start, end and duration
-    /// from the daemon's measurement: a child's result leads with it, in the
-    /// owner's 12-hour clock, so a cut of a long report never drops it.
+    /// What the parent says of a helper's start, end and duration quotes the
+    /// daemon's measurement: a child's result leads with it, in the owner's
+    /// 12-hour clock, so a cut of a long report never drops it.
     #[tokio::test]
     async fn a_childs_result_leads_with_its_measured_run_in_the_owners_clock() {
         let report = "x".repeat(200_000);
@@ -1635,6 +1661,56 @@ mod child_runtime_tests {
         );
     }
 
+    /// Every duration the owner reads equals its run record's: the record's
+    /// start and end, cut to the whole second, and their difference (live
+    /// 2026-11-13: a 20.4 s run read "20 seconds" beside 2:21:16 to
+    /// 2:21:37). The parent's note, the card's line and the result's
+    /// footer all say 21s for that run.
+    #[test]
+    fn owner_facing_durations_equal_the_records() {
+        use chrono::TimeZone;
+        let started = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 13, 19, 21, 16)
+            .unwrap()
+            + chrono::Duration::milliseconds(800);
+        let finished = started + chrono::Duration::milliseconds(20_400);
+        let run = MeasuredRun {
+            started,
+            finished,
+            steps: None,
+            waited: Duration::ZERO,
+        };
+        let clock = |at: chrono::DateTime<chrono::Utc>| {
+            at.with_timezone(&chrono::Local)
+                .format("%-I:%M:%S %p")
+                .to_string()
+        };
+        let (from, to) = (clock(started), clock(finished));
+        assert!(
+            from.contains(":21:16 ") && to.contains(":21:37 "),
+            "{from} {to}"
+        );
+
+        let note = run_window("Count lines", &run);
+        assert!(
+            note.contains(&format!("Count lines took 21s (21s), {from} to {to} ")),
+            "{note}"
+        );
+        let card = aidaemon_runtime::spawn_tool::took_line(run.span(), run.waited);
+        assert!(
+            card.starts_with(&format!("Took 21s ({from} to {to} ")),
+            "{card}"
+        );
+
+        let mut record = super::tests::ended_run(RunPhase::Succeeded, &[], None, 0, 0);
+        record.started_at = started;
+        record.work_began = None;
+        record.ended_at = Some(finished);
+        assert_eq!(record.took(), Some(chrono::Duration::seconds(21)));
+        let footer = background_timing(&record).unwrap();
+        assert_eq!(footer, format!("{MEASURED_TIMING_MARK}{card}"));
+    }
+
     #[tokio::test]
     async fn a_background_childs_result_says_how_long_it_took() {
         let child = ScriptedChild::new("synthetic report", Duration::from_millis(50));
@@ -1726,6 +1802,7 @@ mod child_runtime_tests {
             "Report",
             &"x".repeat(500),
             100,
+            false,
         );
         assert!(message.contains("OUTPUT TRUNCATED"));
     }
@@ -2032,7 +2109,9 @@ mod child_runtime_tests {
         .expect("the kept card shows the helper's step");
         assert!(card.contains("Count slowly to 30"), "{card}");
         assert!(
-            card.contains("⏳ Running in the background: Slow count to 30\nRunning a command: 15"),
+            card.contains(
+                "⏳ Running in the background: Slow count to 30\nRunning a command · last output: 15"
+            ),
             "{card}"
         );
         assert_eq!(
@@ -2685,21 +2764,20 @@ mod child_runtime_tests {
                 "{case}"
             );
 
-            // Once it ended.
+            // Once it ended: how it ended is on the card, once; the result
+            // carries the body and the measured time.
             assert!(
-                seen.message
+                seen.final_card
                     .contains(&format!("{}: Site install", phase.headline())),
                 "{case}: {}",
-                seen.message
+                seen.final_card
             );
-            for other in [RunPhase::Succeeded, RunPhase::Failed, RunPhase::Stopped] {
-                if other != phase {
-                    assert!(
-                        !seen.message.contains(other.headline()),
-                        "{case}: {}",
-                        seen.message
-                    );
-                }
+            for any in [RunPhase::Succeeded, RunPhase::Failed, RunPhase::Stopped] {
+                assert!(
+                    !seen.message.contains(any.headline()),
+                    "{case}: {}",
+                    seen.message
+                );
             }
             assert!(seen.message.contains("Took "), "{case}: {}", seen.message);
             assert!(

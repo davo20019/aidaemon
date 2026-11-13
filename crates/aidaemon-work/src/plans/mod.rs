@@ -580,14 +580,23 @@ impl TaskPlan {
         reason
     }
 
+    /// The plan as the card shows it: [`Self::render_compact_checklist`] and
+    /// its step count, which decides whether the card is kept.
+    pub fn card(&self) -> aidaemon_core::card::PlanCard {
+        aidaemon_core::card::PlanCard {
+            text: self.render_compact_checklist(),
+            steps: self.steps.len(),
+        }
+    }
+
     /// Compact, channel-friendly checklist for the live status card.
     ///
     /// One header line carries the state and the count; the steps follow, a
     /// blank line apart so wrapped descriptions stay readable on a phone. A
     /// one-step plan is just that step (a header and a "1 of 1" would only
     /// repeat it). A fully completed card starts with ✅
-    /// ([`is_completed_checklist`]) so the channel can drop it once the reply,
-    /// which says what was done, lands. A step that turned out not to be
+    /// ([`is_completed_checklist`]), so the card drops the turn's own step
+    /// line. A step that turned out not to be
     /// needed, or that was held back for a known reason, is never shown as a
     /// failure.
     pub fn render_compact_checklist(&self) -> String {

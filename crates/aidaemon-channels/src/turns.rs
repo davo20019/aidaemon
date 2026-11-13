@@ -113,8 +113,26 @@ pub trait TurnSurface: Send + Sync + 'static {
     /// heartbeat has been quiet for `stale_secs` (0 = never), stop showing it.
     fn show_working(&self, stop: CancellationToken, heartbeat: Arc<AtomicU64>, stale_secs: u64);
 
+    /// Where this surface keeps a turn's one status card, when it keeps
+    /// one (a message it can create, edit and delete). The runner then owns
+    /// the card: what it shows and how it ends with the turn, by the one
+    /// rule ([`aidaemon_core::card::CardEnd`]). `None` (the default): the
+    /// turn's status goes to [`Self::show_status`].
+    fn card_sink(&self) -> Option<Arc<dyn crate::live_status::SurfaceSink>> {
+        None
+    }
+
+    /// The turn's card became its reply (a background handoff whose card
+    /// collapsed): message `message_id` now holds the reply.
+    async fn card_became_reply(&self, _message_id: &str) {}
+
+    /// The turn kept its card: message `message_id` stays as the record of
+    /// the work, for what outlives the turn (a helper ending) to settle.
+    async fn card_kept(&self, _message_id: &str) {}
+
     /// Show one turn's status updates. Handing them back (the default)
     /// uses throttled status messages, sent only in private conversations.
+    /// Not called for a surface with a [`Self::card_sink`].
     fn show_status(
         &self,
         updates: mpsc::Receiver<StatusUpdate>,
@@ -144,6 +162,96 @@ pub trait TurnSurface: Send + Sync + 'static {
     /// have narrowed while it waited.
     async fn before_queued(&self, queued: QueuedMessage) -> QueuedMessage {
         queued
+    }
+}
+
+tokio::task_local! {
+    static TURN_OVER: TurnOver;
+}
+
+/// Marks the end of the turn running this task: everything it shows is out
+/// (its reply and the card it kept). Work the turn started that outlives it
+/// (a background helper) waits on this before it touches the chat, so the
+/// turn's reply always comes before the work's own end.
+#[derive(Clone, Default)]
+pub struct TurnOver(CancellationToken);
+
+impl TurnOver {
+    /// The turn running this task, if any (scheduled work has none).
+    pub fn current() -> Option<Self> {
+        TURN_OVER.try_with(Clone::clone).ok()
+    }
+
+    /// Wait until that turn is over.
+    pub async fn wait(&self) {
+        self.0.cancelled().await;
+    }
+
+    /// Whether that turn is over.
+    pub fn is_over(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
+    /// Run `future` as part of the turn this marks.
+    pub async fn within<F: std::future::Future>(&self, future: F) -> F::Output {
+        TURN_OVER.scope(self.clone(), future).await
+    }
+}
+
+/// A turn's card on a surface that keeps one: its state and where it is
+/// drawn. The runner owns it for the turn.
+#[derive(Clone)]
+struct TurnCard {
+    live: Arc<tokio::sync::Mutex<crate::live_status::LiveStatus>>,
+    sink: Arc<dyn crate::live_status::SurfaceSink>,
+}
+
+impl TurnCard {
+    fn new(sink: Arc<dyn crate::live_status::SurfaceSink>) -> Self {
+        Self {
+            live: Arc::default(),
+            sink,
+        }
+    }
+
+    /// Deliver the reply. A background handoff whose card collapses
+    /// becomes that card; any other reply goes out on its own, and the card
+    /// ends after it ([`Self::close`]).
+    async fn deliver(
+        &self,
+        surface: &dyn TurnSurface,
+        envelope: &AgentResponseEnvelope,
+        reply: &str,
+    ) -> Delivered {
+        if envelope.disposition == aidaemon_events::AssistantResponseDisposition::BackgroundHandoff
+        {
+            let became = self
+                .live
+                .lock()
+                .await
+                .become_reply(self.sink.as_ref(), reply)
+                .await;
+            if let Some(id) = became {
+                surface.card_became_reply(&id).await;
+                return Delivered {
+                    state: ResponseDeliveryState::Edited,
+                    message_ids: vec![id],
+                    error: None,
+                };
+            }
+        }
+        surface.deliver(envelope, reply).await
+    }
+
+    /// End the card with the turn, once, by the one rule: kept and
+    /// settled (handed to the surface for what outlives the turn), or
+    /// removed.
+    async fn close(&self, surface: &dyn TurnSurface) {
+        let mut live = self.live.lock().await;
+        live.close(self.sink.as_ref()).await;
+        if let Some(id) = live.kept_card_message_id() {
+            surface.card_kept(&id).await;
+        }
     }
 }
 
@@ -641,15 +749,32 @@ impl TurnRunner {
                 });
             }
             let private = channel_ctx.visibility == ChannelVisibility::Private;
-            let status_task = surface
-                .show_status(status_rx, private)
-                .unwrap_or_else(|updates| throttled_status(surface.clone(), updates, private));
+            // A surface that keeps a card gets it from the runner, which
+            // owns how it ends; any other shows the updates its own way.
+            let card = surface.card_sink().map(TurnCard::new);
+            let settle = CancellationToken::new();
+            let status_task = match &card {
+                Some(card) => tokio::spawn(show_on_card(
+                    surface.clone(),
+                    card.clone(),
+                    status_rx,
+                    private,
+                    settle.clone(),
+                )),
+                None => surface
+                    .show_status(status_rx, private)
+                    .unwrap_or_else(|updates| throttled_status(surface.clone(), updates, private)),
+            };
+            // Marked once everything the turn shows is out, however this
+            // iteration ends.
+            let turn_over = TurnOver::default();
+            let over_when_dropped = turn_over.0.clone().drop_guard();
             if let Some(timing) = timing.as_mut() {
                 timing.mark_dispatched_now();
             }
 
             let result = tokio::select! {
-                result = OwnerWaitClock::within(
+                result = turn_over.within(OwnerWaitClock::within(
                     Some(owner_wait.clone()),
                     agent.handle_inbound_message(InboundMessageRequest {
                         session_id: session_id.clone(),
@@ -661,7 +786,7 @@ impl TurnRunner {
                         heartbeat: Some(heartbeat.clone()),
                         ingress_timing: timing.clone(),
                     }),
-                ) => result,
+                )) => result,
                 _ = cancel.cancelled() => Err(anyhow::anyhow!(CANCELLED)),
                 stale_mins = wait_for_stale_heartbeat(heartbeat.clone(), stale_secs, 4), if stale_secs > 0 => {
                     Err(anyhow::anyhow!(
@@ -673,18 +798,23 @@ impl TurnRunner {
             };
             working.cancel();
             self.live.end(&session_id, task_id);
-            // The run is over, so its status sender is gone and the surface
-            // finishes showing what it sent: the closing checklist must reach
-            // the card before the reply, or the card stays on "Working" above
-            // a reply. A background job may still hold a sender, so the wait
-            // is bounded and a handoff, whose job keeps running, skips it.
+            // The run is over: what it sent must reach the card before the
+            // reply, or the card stays on "Working" above a reply (and a
+            // helper it started is missing when the card's end is decided).
+            // The card shows what is queued and stops, whatever still holds
+            // a sender. Another surface finishes showing what it sent; a
+            // background job may still hold a sender, so that wait is
+            // bounded and a handoff, whose job keeps running, skips it.
             let mut status_task = status_task;
             let run_finished = matches!(
                 &result,
                 Ok(envelope) if envelope.disposition
                     != aidaemon_events::AssistantResponseDisposition::BackgroundHandoff
             );
-            if run_finished && surface.status_settles_before_reply() {
+            if card.is_some() {
+                settle.cancel();
+                let _ = tokio::time::timeout(STATUS_DRAIN, &mut status_task).await;
+            } else if run_finished && surface.status_settles_before_reply() {
                 let _ = tokio::time::timeout(STATUS_DRAIN, &mut status_task).await;
             }
             status_task.abort();
@@ -721,7 +851,10 @@ impl TurnRunner {
                             error: None,
                         }
                     } else {
-                        surface.deliver(&envelope, &reply).await
+                        match &card {
+                            Some(card) => card.deliver(surface.as_ref(), &envelope, &reply).await,
+                            None => surface.deliver(&envelope, &reply).await,
+                        }
                     };
                     let _ = agent
                         .record_response_delivery(
@@ -751,6 +884,9 @@ impl TurnRunner {
                             error: None,
                         });
                     }
+                    if let Some(card) = &card {
+                        card.close(surface.as_ref()).await;
+                    }
                     surface.turn_ended(end).await;
                     None
                 }
@@ -758,17 +894,23 @@ impl TurnRunner {
                     let message = error.to_string();
                     if message == CANCELLED {
                         info!("Task #{} cancelled", task_id);
-                        surface.turn_ended(TurnEnd::Cancelled).await;
+                    } else if message.starts_with(INACTIVITY_PREFIX) {
+                        info!("Task #{} auto-cancelled by stale watchdog", task_id);
+                        let _ = surface.say(&format!("⚠️ {message}")).await;
                     } else {
-                        if message.starts_with(INACTIVITY_PREFIX) {
-                            info!("Task #{} auto-cancelled by stale watchdog", task_id);
-                            let _ = surface.say(&format!("⚠️ {message}")).await;
-                        } else {
-                            warn!("Agent error: {}", error);
-                            let _ = surface.say(&format!("Error: {message}")).await;
-                        }
-                        surface.turn_ended(TurnEnd::Failed).await;
+                        warn!("Agent error: {}", error);
+                        let _ = surface.say(&format!("Error: {message}")).await;
                     }
+                    if let Some(card) = &card {
+                        card.close(surface.as_ref()).await;
+                    }
+                    surface
+                        .turn_ended(if message == CANCELLED {
+                            TurnEnd::Cancelled
+                        } else {
+                            TurnEnd::Failed
+                        })
+                        .await;
                     if let Some(observer) = observer.as_ref() {
                         observer.turn_finished(&TurnFinish {
                             session_id: &session_id,
@@ -787,6 +929,8 @@ impl TurnRunner {
                     Some(message)
                 }
             };
+
+            drop(over_when_dropped);
 
             if let Some(error) = error.as_ref() {
                 let status = if error == CANCELLED {
@@ -905,12 +1049,89 @@ fn throttled_status(
     })
 }
 
+/// A turn's status updates on its card. Every update notes the card's
+/// state ([`crate::live_status::LiveStatus::note`]); the card is sent at
+/// most once per [`STATUS_INTERVAL`], and an update that arrives inside the
+/// interval is shown when it ends instead of being dropped (live
+/// 2026-11-12: a throttled step left the card stale through six minutes of
+/// helpers working). A long step's line says how long it has run, refreshed
+/// on a tick. Updates that must be seen at once are their own messages.
+/// Outside private conversations only those are shown. When `settle` fires
+/// (the turn's run is over), whatever is queued is noted and shown, then
+/// this ends: the card is settled before the reply, without waiting on
+/// work (a background helper) that still holds a sender.
+async fn show_on_card(
+    surface: Arc<dyn TurnSurface>,
+    card: TurnCard,
+    mut updates: mpsc::Receiver<StatusUpdate>,
+    private: bool,
+    settle: CancellationToken,
+) {
+    let mut last_sent: Option<tokio::time::Instant> = None;
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let mut last = false;
+        let backlog = tokio::select! {
+            biased;
+            _ = settle.cancelled() => {
+                last = true;
+                let mut backlog = Vec::new();
+                while let Ok(next) = updates.try_recv() {
+                    backlog.push(next);
+                }
+                backlog
+            }
+            first = updates.recv() => {
+                let Some(first) = first else { break };
+                // Whatever piled up while the last edit was on its way is
+                // applied in order and shown in one edit.
+                let mut backlog = vec![first];
+                while let Ok(next) = updates.try_recv() {
+                    backlog.push(next);
+                }
+                backlog
+            }
+            // Nothing new: show what an interval held back, or a long
+            // step's new elapsed time.
+            _ = tick.tick() => Vec::new(),
+        };
+        let mut show_now = last;
+        for update in backlog {
+            if update.requires_immediate_delivery() {
+                if let Some(line) = status_line(&update) {
+                    let _ = surface.say(&line).await;
+                }
+                continue;
+            }
+            if private {
+                show_now |= card.live.lock().await.note(&update);
+            }
+        }
+        let due = last_sent.is_none_or(|at| at.elapsed() >= STATUS_INTERVAL);
+        if private && (show_now || due) {
+            let sent = card
+                .live
+                .lock()
+                .await
+                .flush_if_changed(card.sink.as_ref())
+                .await;
+            if sent {
+                last_sent = Some(tokio::time::Instant::now());
+            }
+        }
+        if last {
+            break;
+        }
+    }
+}
+
 /// The status line for one update, as Markdown, when it has one: progress
 /// in italics, a plan card or a needed action as they are.
 pub fn status_line(update: &StatusUpdate) -> Option<String> {
     let text = status_text(update)?;
     Some(match update {
-        StatusUpdate::UserActionRequired { .. } | StatusUpdate::Checklist { .. } => text,
+        StatusUpdate::UserActionRequired { .. } | StatusUpdate::Checklist(_) => text,
         _ => format!("_{text}_"),
     })
 }
@@ -918,10 +1139,11 @@ pub fn status_line(update: &StatusUpdate) -> Option<String> {
 /// The plain status text for one update, when it has one. A step reads as
 /// its typed kind in plain words; a tool ending is not a step.
 pub fn status_text(update: &StatusUpdate) -> Option<String> {
-    use aidaemon_core::card::{ActivityKind, Step};
+    use aidaemon_core::card::Step;
     let progress = |text: String| text;
     Some(match update {
-        StatusUpdate::Thinking(_) => progress(format!("{}…", ActivityKind::Think.words())),
+        // The working indicator says it; no line of its own.
+        StatusUpdate::Thinking(_) => return None,
         StatusUpdate::ToolStart { kind, .. } => progress(format!("{}…", kind.words())),
         StatusUpdate::ToolProgress { chunk, .. } => {
             let preview: String = chunk.chars().take(100).collect();
@@ -1010,7 +1232,7 @@ pub fn status_text(update: &StatusUpdate) -> Option<String> {
         } => progress(format!(
             "💰 Auto-extended token budget {old_budget} → {new_budget} ({extension}/{max_extensions}) — continuing."
         )),
-        StatusUpdate::Checklist { text } => text.clone(),
+        StatusUpdate::Checklist(plan) => plan.text.clone(),
         StatusUpdate::Helper(helper) => {
             progress(crate::live_status::render_card(&crate::live_status::CardView {
                 helpers: vec![(helper.clone(), None)],
@@ -1357,6 +1579,269 @@ mod tests {
         agent.release.notify_one();
     }
 
+    /// A turn that reports `updates`, starts work that outlives it (it
+    /// waits on [`TurnOver`], then notes its end in the chat's log) and
+    /// replies `reply`.
+    struct CardAgent {
+        updates: Vec<StatusUpdate>,
+        reply: &'static str,
+        disposition: aidaemon_events::AssistantResponseDisposition,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl crate::ports::AgentIngress for CardAgent {
+        async fn handle_inbound_message(
+            &self,
+            request: InboundMessageRequest,
+        ) -> anyhow::Result<AgentResponseEnvelope> {
+            if let Some(turn) = TurnOver::current() {
+                let log = self.log.clone();
+                tokio::spawn(async move {
+                    turn.wait().await;
+                    log.lock().unwrap().push("background work ended".into());
+                });
+            }
+            if let Some(status) = request.status_tx.as_ref() {
+                for update in &self.updates {
+                    let _ = status.send(update.clone()).await;
+                }
+            }
+            Ok(AgentResponseEnvelope {
+                response_id: "r".into(),
+                task_id: "t".into(),
+                turn_id: None,
+                text: self.reply.into(),
+                referenced_receipts: Vec::new(),
+                disposition: self.disposition,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ChannelAgentRuntime for CardAgent {
+        async fn terminalize_supervised_task(
+            &self,
+            _: &str,
+            _: aidaemon_events::TaskStatus,
+            _: String,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn cancel_active_finite_work_for_session(&self, _: &str) -> Vec<String> {
+            Vec::new()
+        }
+        async fn current_model(&self) -> String {
+            String::new()
+        }
+        async fn context_debug_settings(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> (bool, usize, usize, usize, Option<i64>) {
+            (false, 0, 0, 0, None)
+        }
+        async fn set_model(&self, _: String) {}
+        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn clear_model_override(&self) {}
+        async fn clear_session_context(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn clear_session(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A chat that keeps a card (as Telegram does): every message, card
+    /// change and hand-off lands in one log, in order.
+    struct CardChat {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl crate::live_status::SurfaceSink for CardChat {
+        async fn create(&self, text: &str) -> anyhow::Result<Option<String>> {
+            self.log.lock().unwrap().push(format!("card:{text}"));
+            Ok(Some("card-1".into()))
+        }
+        async fn edit(&self, _: &str, text: &str) -> anyhow::Result<bool> {
+            self.log.lock().unwrap().push(format!("card:{text}"));
+            Ok(true)
+        }
+        async fn delete(&self, _: &str) -> anyhow::Result<bool> {
+            self.log.lock().unwrap().push("card deleted".into());
+            Ok(true)
+        }
+    }
+
+    struct CardSurface(Arc<CardChat>);
+
+    #[async_trait]
+    impl TurnSurface for CardSurface {
+        fn platform(&self) -> &'static str {
+            "test"
+        }
+        async fn say(&self, text: &str) -> anyhow::Result<Vec<String>> {
+            self.0.log.lock().unwrap().push(format!("say:{text}"));
+            Ok(vec!["reply-1".into()])
+        }
+        fn show_working(&self, _: CancellationToken, _: Arc<AtomicU64>, _: u64) {}
+        fn card_sink(&self) -> Option<Arc<dyn crate::live_status::SurfaceSink>> {
+            Some(self.0.clone())
+        }
+        async fn card_became_reply(&self, id: &str) {
+            self.0
+                .log
+                .lock()
+                .unwrap()
+                .push(format!("card became reply {id}"));
+        }
+        async fn card_kept(&self, id: &str) {
+            self.0.log.lock().unwrap().push(format!("card kept {id}"));
+        }
+    }
+
+    /// Run one turn of `agent` on a chat that keeps a card; the chat's log.
+    async fn run_card_turn(
+        updates: Vec<StatusUpdate>,
+        reply: &'static str,
+        disposition: aidaemon_events::AssistantResponseDisposition,
+    ) -> Vec<String> {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = Arc::new(CardAgent {
+            updates,
+            reply,
+            disposition,
+            log: log.clone(),
+        });
+        let runner = TurnRunner::new(TurnDeps {
+            agent,
+            session_map: Arc::default(),
+            sessions: Arc::new(NoSessions),
+            task_registry: Arc::new(TaskRegistry::new(10)),
+            watchdog_stale_threshold_secs: 0,
+            watch: TurnWatch::default(),
+        });
+        let surface = Arc::new(CardSurface(Arc::new(CardChat { log: log.clone() })));
+        runner
+            .run(surface, owner_turn("Count both files", "m1"))
+            .await;
+        for _ in 0..200 {
+            if log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e == "background work ended")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let log = log.lock().unwrap().clone();
+        log
+    }
+
+    fn helper(label: &str, phase: aidaemon_core::card::RunPhase) -> StatusUpdate {
+        StatusUpdate::Helper(aidaemon_core::card::HelperView {
+            phase,
+            ..aidaemon_core::card::HelperView::running(label, false, None)
+        })
+    }
+
+    /// The runner's path: the same card state ends the same way as the
+    /// card's own rule says. Two helpers ran side by side, so the card is
+    /// kept and settled after the reply (live 2026-11-13: deleted at turn
+    /// end with no final header); a single step collapses.
+    #[tokio::test]
+    async fn the_runner_ends_each_card_by_its_typed_state() {
+        use aidaemon_core::card::{ActivityKind, RunPhase};
+        let log = run_card_turn(
+            vec![
+                StatusUpdate::ToolStart {
+                    name: "spawn".into(),
+                    summary: String::new(),
+                    kind: ActivityKind::Delegate,
+                },
+                helper("Count lines", RunPhase::Running),
+                helper("Count words", RunPhase::Running),
+                helper("Count lines", RunPhase::Succeeded),
+                helper("Count words", RunPhase::Succeeded),
+            ],
+            "Lines: 12. Words: 80.",
+            Default::default(),
+        )
+        .await;
+        let reply = log.iter().position(|e| e == "say:Lines: 12. Words: 80.");
+        let settled = log.iter().rposition(|e| {
+            e == "card:✅ A helper finished: Count lines\n\n✅ A helper finished: Count words"
+        });
+        assert!(reply.is_some() && settled > reply, "{log:#?}");
+        assert!(!log.contains(&"card deleted".to_string()), "{log:#?}");
+        assert!(log.contains(&"card kept card-1".to_string()), "{log:#?}");
+
+        let log = run_card_turn(
+            vec![StatusUpdate::ToolStart {
+                name: "read".into(),
+                summary: String::new(),
+                kind: ActivityKind::Read,
+            }],
+            "It says hello.",
+            Default::default(),
+        )
+        .await;
+        let reply = log.iter().position(|e| e == "say:It says hello.");
+        let deleted = log.iter().position(|e| e == "card deleted");
+        assert!(reply.is_some() && deleted > reply, "{log:#?}");
+        assert!(!log.iter().any(|e| e.starts_with("card kept")), "{log:#?}");
+    }
+
+    /// A background handoff with a helper on its card keeps the card: the
+    /// ack goes out as its own message, before anything the background work
+    /// does when it ends. One with nothing kept collapses into the ack.
+    #[tokio::test]
+    async fn a_handoffs_ack_comes_before_the_work_ends() {
+        use aidaemon_core::card::HelperView;
+        use aidaemon_events::AssistantResponseDisposition::BackgroundHandoff;
+        let log = run_card_turn(
+            vec![StatusUpdate::Helper(HelperView::running(
+                "Slow count",
+                true,
+                None,
+            ))],
+            "Started in the background: Slow count.",
+            BackgroundHandoff,
+        )
+        .await;
+        let ack = log
+            .iter()
+            .position(|e| e == "say:Started in the background: Slow count.");
+        let kept = log.iter().position(|e| e == "card kept card-1");
+        let ended = log.iter().position(|e| e == "background work ended");
+        assert!(ack.is_some() && kept > ack && ended > kept, "{log:#?}");
+        assert!(
+            !log.iter().any(|e| e.starts_with("card became")),
+            "{log:#?}"
+        );
+
+        let log = run_card_turn(
+            vec![StatusUpdate::StepHandedOff {
+                kind: aidaemon_core::card::ActivityKind::Run,
+            }],
+            "Started the install in the background.",
+            BackgroundHandoff,
+        )
+        .await;
+        let became = log.iter().position(|e| e == "card became reply card-1");
+        let ended = log.iter().position(|e| e == "background work ended");
+        assert!(became.is_some() && ended > became, "{log:#?}");
+        assert!(
+            log.contains(&"card:Started the install in the background.".to_string()),
+            "{log:#?}"
+        );
+    }
+
     #[test]
     fn cancel_words_are_whole_messages() {
         assert!(is_cancel_word("Stop"));
@@ -1585,7 +2070,7 @@ mod tests {
         let running = crate::stop::running_work(&registry, &agent, "s1").await;
         let tasks = crate::slash::render_tasks(&running, &[], chrono::Utc::now(), None);
         assert!(
-            tasks.contains("Sub-agent: Counting agent A – Running a command: 14 ("),
+            tasks.contains("Sub-agent: Counting agent A – Running a command · last output: 14 ("),
             "{tasks}"
         );
         assert!(
