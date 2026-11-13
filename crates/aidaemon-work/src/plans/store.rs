@@ -1357,8 +1357,7 @@ mod tests {
         );
         assert!(first.unwrap().is_some() && second.unwrap().is_some());
         let plan = store.for_task("chat", "t").await.unwrap().unwrap();
-        for index in 1..=3 {
-            let step = &plan.steps[index];
+        for (index, step) in plan.steps.iter().enumerate().skip(1) {
             assert_eq!(step.status, StepStatus::Background, "step {index}");
             assert_eq!(
                 step.background_jobs,
