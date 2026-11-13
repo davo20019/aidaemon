@@ -16,12 +16,17 @@ use crate::prompt::rules::format_goal_context;
 use crate::spawn::task_lead_execution_mode;
 use crate::turn::validation_state::ExecutorHandoff;
 
-/// Every helper's contract: its own run's duration is the daemon's to
-/// state. The owner reads only the run record's measured times, shown under
-/// the helper's result.
-pub const OWN_DURATION_RULE: &str = "Don't state how long your own run took, or when it \
-     started or ended: the daemon measures your run and puts the time under your result, so a \
-     number of your own would only disagree with it.";
+/// Every helper's contract: time is the daemon's to state. A helper's
+/// report says nothing about durations or timing at all, even when its task
+/// asks for them: the runtime measures the run and adds the time under the
+/// report from its record (live 2026-11-13: told only not to state its own
+/// run's time, a helper wrote "DDEV startup reported 97 seconds. The total
+/// task time wasn't measured", and another "I couldn't verify a measured
+/// elapsed time for this run").
+pub const OWN_DURATION_RULE: &str = "Your report says nothing about time: not how long your \
+     run or any step of it took, not when anything started or ended, and not whether a time was \
+     measured. Leave it out even when your task asks for it: the daemon measures your run and \
+     adds the time under your report.";
 
 pub fn bounded_completed_task_results_context(
     ctx_json: &str,
@@ -626,7 +631,6 @@ pub mod legacy {
              - Return the FULL content you produced — not a meta-description of what you did.\n\
              - NEVER return just \"I researched X\" or \"Generated a report about Y\". Return the actual content.\n\
              - Include specific outputs (file paths, data retrieved, commands run).\n\
-             - A time or duration you report is one this task measured. An earlier run's measurement, from history or memory, is never this task's result; if you mention one, say which run it was.\n\
              - {OWN_DURATION_RULE}\n\
              - When your task is to make something new (a fresh install, a new project or folder), something already in its place is not yours to reuse: leave it untouched, never report it as new, and finish not done (outcome blocked), saying what was there.\n\
              - If you create or write a file, include its FULL ABSOLUTE PATH in your result text.\n\

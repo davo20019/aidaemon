@@ -106,20 +106,25 @@ impl TurnEngine<'_> {
         let Some(plan_store) = self.plan_store().await else {
             return;
         };
-        let Some(mut plan) = plan_store
-            .get_recent_for_session(session_id, 1)
+        let Some(plan_id) = plan_store
+            .for_task(session_id, task_id)
             .await
             .ok()
-            .and_then(|plans| plans.into_iter().next())
-            .filter(|plan| plan.task_id.as_deref() == Some(task_id))
+            .flatten()
+            .map(|plan| plan.id)
         else {
             return;
         };
-        if reconcile_plan_projection(&mut plan) {
-            if let Err(error) = plan_store.update(&plan).await {
+        // Changed under the plan write lock: a helper's launch or end may
+        // be changing the same plan now.
+        let plan = match plan_store.modify(&plan_id, reconcile_plan_projection).await {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return,
+            Err(error) => {
                 warn!(task_id, %error, "SDK engine: could not reconcile the checklist");
+                return;
             }
-        }
+        };
         let unchecked = plan.unchecked_steps().len();
         let deferred = plan
             .steps

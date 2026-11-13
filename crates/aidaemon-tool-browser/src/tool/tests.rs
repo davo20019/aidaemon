@@ -744,7 +744,7 @@ async fn screenshot_with_selector_records_element_target() {
     // Channel ACCEPTS the delivery → the tool reports honest success.
     let media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot", "selector": "#hero"});
+    let args = json!({ "action": "screenshot", "deliver": true, "selector": "#hero"});
     let out = tool
         .call_with(
             &args.to_string(),
@@ -929,7 +929,7 @@ async fn screenshot_without_selector_defaults_to_viewport() {
     let (tool, backend, rx) = mock_tool();
     let media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot"});
+    let args = json!({ "action": "screenshot", "deliver": true});
     let out = tool
         .call_with(
             &args.to_string(),
@@ -970,7 +970,7 @@ async fn screenshot_full_page_true_passes_through() {
     let (tool, backend, rx) = mock_tool();
     let _media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot", "full_page": true});
+    let args = json!({ "action": "screenshot", "deliver": true, "full_page": true});
     let out = tool
         .call_with(
             &args.to_string(),
@@ -997,7 +997,7 @@ async fn screenshot_delivery_failure_is_reported_honestly() {
     // Channel REJECTS the delivery.
     let _media = spawn_media_responder(rx, Err("PHOTO_INVALID_DIMENSIONS".to_string()));
 
-    let args = json!({ "action": "screenshot"});
+    let args = json!({ "action": "screenshot", "deliver": true});
     // The Tool::call wrapper surfaces an internal Err(String) as Ok("Error: ..").
     let msg = tool
         .call_with(
@@ -1024,6 +1024,48 @@ async fn screenshot_delivery_failure_is_reported_honestly() {
     );
 }
 
+/// Live 2026-11-13: a helper checked a WordPress site, its capture caught
+/// the install page, and that capture reached the owner beside the
+/// homepage they asked for. A capture is kept, not sent, unless the call
+/// declares it the deliverable: the agent looks first, then delivers the
+/// one asked for.
+#[tokio::test]
+async fn only_the_declared_deliverable_is_sent() {
+    let (tool, _backend, rx) = mock_tool();
+    let media = spawn_media_responder(rx, Ok(()));
+
+    let kept = tool
+        .call_with_execution_context(
+            &json!({ "action": "screenshot" }).to_string(),
+            None,
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
+        .await
+        .unwrap();
+    assert!(kept.output.contains("kept, not sent"), "{}", kept.output);
+    assert_eq!(kept.metadata.attachments.len(), 1, "the capture is saved");
+    assert!(
+        !kept
+            .metadata
+            .semantics
+            .mutation_effects
+            .contains(aidaemon_tools::semantics::ToolMutationEffects::EXTERNAL_DELIVERY),
+        "a kept capture delivered nothing"
+    );
+    tokio::task::yield_now().await;
+    assert!(media.messages.lock().await.is_empty(), "nothing was sent");
+
+    let sent = tool
+        .call_with(
+            &json!({ "action": "screenshot", "deliver": true }).to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
+        .await
+        .unwrap();
+    assert!(sent.contains("delivered to chat"), "{sent}");
+    assert_eq!(media.messages.lock().await.len(), 1, "only the deliverable");
+}
+
 /// HONEST-SUCCESS: when the channel ACCEPTS the delivery, the tool reports a
 /// success string and a Photo was enqueued.
 #[tokio::test]
@@ -1031,7 +1073,7 @@ async fn screenshot_delivery_success_is_reported() {
     let (tool, _backend, rx) = mock_tool();
     let media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot"});
+    let args = json!({ "action": "screenshot", "deliver": true});
     let out = tool
         .call_with(
             &args.to_string(),
@@ -1056,7 +1098,7 @@ async fn screenshot_call_with_status_outcome_includes_vision_attachment() {
     let (tool, _backend, rx) = mock_tool();
     let _media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot"});
+    let args = json!({ "action": "screenshot", "deliver": true});
     let outcome: ToolCallOutcome = tool
         .call_with_execution_context(
             &args.to_string(),
@@ -1081,7 +1123,7 @@ async fn delivered_screenshot_receipt_is_a_delivery_of_the_saved_capture() {
     let (tool, _backend, rx) = mock_tool();
     let _media = spawn_media_responder(rx, Ok(()));
 
-    let arguments = json!({ "action": "screenshot" }).to_string();
+    let arguments = json!({ "action": "screenshot", "deliver": true }).to_string();
     assert!(
         super::browser_call_semantics(Some("screenshot"), "", "", "", "")
             .mutation_effects
@@ -1119,7 +1161,7 @@ async fn screenshot_oversized_delivered_as_document() {
     let (tool, _backend, rx) = mock_tool_with(backend);
     let media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot", "full_page": true});
+    let args = json!({ "action": "screenshot", "deliver": true, "full_page": true});
     let out = tool
         .call_with(
             &args.to_string(),
@@ -1163,7 +1205,7 @@ async fn screenshot_document_delivery_failure_is_reported_and_inbox_persists() {
     let (tool, _backend, rx) = mock_tool_with(backend);
     let media = spawn_media_responder(rx, Err("file too large".to_string()));
 
-    let args = json!({ "action": "screenshot", "full_page": true});
+    let args = json!({ "action": "screenshot", "deliver": true, "full_page": true});
     let msg = tool
         .call_with(
             &args.to_string(),
@@ -1236,7 +1278,7 @@ async fn screenshot_empty_session_id_refused() {
     let (tool, backend, rx) = mock_tool();
     let media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot"});
+    let args = json!({ "action": "screenshot", "deliver": true});
     let msg = tool
         .call_with(&args.to_string(), aidaemon_tools::testing::call_facts(""))
         .await
@@ -1265,7 +1307,7 @@ async fn screenshot_caption_redacts_query_and_fragment() {
     let (tool, _backend, rx) = mock_tool_with(backend);
     let media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot"});
+    let args = json!({ "action": "screenshot", "deliver": true});
     let out = tool
         .call_with(
             &args.to_string(),
@@ -3211,7 +3253,7 @@ async fn observation_actions_refuse_on_blocked_current_url() {
         );
         let out = tool
             .call_with(
-                &json!({ "action": "screenshot"}).to_string(),
+                &json!({ "action": "screenshot", "deliver": true}).to_string(),
                 aidaemon_tools::testing::call_facts("sess-a"),
             )
             .await
@@ -3370,7 +3412,7 @@ async fn observation_actions_allowed_on_public_current_url() {
         let _media = spawn_media_responder(rx, Ok(()));
         let out = tool
             .call_with(
-                &json!({ "action": "screenshot"}).to_string(),
+                &json!({ "action": "screenshot", "deliver": true}).to_string(),
                 aidaemon_tools::testing::call_facts("sess-a"),
             )
             .await
@@ -5282,7 +5324,7 @@ async fn one_request_sends_a_pages_screenshot_once() {
             .insert(aidaemon_tools::semantics::CallFileFence(fence));
         facts
     };
-    let args = json!({ "action": "screenshot"}).to_string();
+    let args = json!({ "action": "screenshot", "deliver": true}).to_string();
 
     let first = tool
         .call_with(

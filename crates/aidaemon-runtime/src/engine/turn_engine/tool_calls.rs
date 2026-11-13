@@ -526,11 +526,40 @@ impl TurnEngine<'_> {
         // is the chat's). Never from a read of outside content (live
         // 2026-11-13: a WordPress helper was asked to approve opening the
         // site it had just set up in its own folder).
+        // A command that ran inside this run's own write scope reports the
+        // sites that folder serves: those are in the run's scope whoever
+        // set them up (live 2026-11-13: two helpers each asked to open the
+        // site their own scoped folder served, which existed before them).
+        let write_roots: Vec<String> = scope
+            .authority
+            .task_access
+            .as_ref()
+            .map(|access| {
+                access
+                    .write_targets
+                    .iter()
+                    .map(|target| target.value.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         let reports_sites = trust == sdk::SourceTrust::Trusted
             || matches!(
                 &executed,
                 ExecutedOutcome::Returned { outcome, status }
                     if aidaemon_tools::local_sites::set_up_locally(*status, &outcome.metadata.semantics)
+            )
+            || matches!(
+                &executed,
+                ExecutedOutcome::Returned { outcome, status }
+                    if !status.is_failure()
+                        && outcome
+                            .metadata
+                            .access_manifest
+                            .as_ref()
+                            .and_then(|access| access.execution_cwd.as_deref())
+                            .is_some_and(|cwd| {
+                                aidaemon_tools::local_sites::served_within(cwd, &write_roots)
+                            })
             );
         if reports_sites {
             if let ExecutedOutcome::Returned { outcome, .. } = &executed {

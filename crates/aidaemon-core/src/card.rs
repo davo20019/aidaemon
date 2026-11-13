@@ -196,12 +196,58 @@ impl HelperView {
     }
 }
 
-/// A plan as the card shows it: its own rendering and how many steps it
-/// has. The step count, not the text, decides how the card ends.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A plan as the card shows it: its own rendering, how many steps it has
+/// and how many of them are done. The step count, not the text, decides how
+/// the card ends; the counts, with the card's run records, decide its
+/// header ([`PlanCard::header_with_runs`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanCard {
     pub text: String,
     pub steps: usize,
+    /// Its steps done.
+    pub done: usize,
+    /// Its records say how it ended: no step is left for its turn to do
+    /// (each is done, set aside, failed, or handed to a run). Only a settled
+    /// plan's header is a verdict the card's runs could contradict; one
+    /// still being worked through keeps its own ("Working · step 2 of 4").
+    pub settled: bool,
+}
+
+impl PlanCard {
+    /// The header the card shows above this plan's steps, from the plan's
+    /// own state and the phases of the runs on the same card together, so
+    /// the header never says something the runs' lines (or the card's total)
+    /// contradict. While any run on the card still runs, the work goes on:
+    /// "continuing in the background", whatever the plan's own steps read
+    /// (live 2026-11-13: "Stopped short · 2 of 4 done" above two helpers that
+    /// were still working, then finished). Once all ended, a plan whose
+    /// steps all read done on a card where a run failed or stopped says how
+    /// that run ended. Otherwise the plan's own header. `None`: the plan's
+    /// own header stands (a one-step plan has none).
+    pub fn header_with_runs(&self, runs: &[RunPhase]) -> Option<String> {
+        if self.steps < 2 || runs.is_empty() || !self.settled {
+            return None;
+        }
+        if runs.iter().any(|phase| !phase.is_terminal()) {
+            return Some(format!(
+                "\u{23f3} Continuing in the background \u{b7} {} of {} done",
+                self.done, self.steps
+            ));
+        }
+        let worst = runs
+            .iter()
+            .copied()
+            .filter(|phase| matches!(phase, RunPhase::Failed | RunPhase::Stopped))
+            .max_by_key(|phase| matches!(phase, RunPhase::Failed))?;
+        (self.done == self.steps).then(|| {
+            format!(
+                "{} \u{b7} {} of {} done",
+                worst.helper_headline(false),
+                self.done,
+                self.steps
+            )
+        })
+    }
 }
 
 /// How a turn's card ends, decided once from its typed state for every

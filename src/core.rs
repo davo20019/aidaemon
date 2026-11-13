@@ -1069,9 +1069,10 @@ primary = "gpt-4o"
              otherwise."
         ));
         assert!(prompt.contains("never give an earlier run's measurement as this run's result"));
-        assert!(include_str!("../specialists/_executor_base.md").contains(
-            "An earlier run's measurement, from history or memory, is never this task's result"
-        ));
+        // A helper reports no time at all: its run's time is the daemon's
+        // measurement, added under its report.
+        assert!(include_str!("../specialists/_executor_base.md")
+            .contains(aidaemon_runtime::specialists::compose::OWN_DURATION_RULE));
     }
 
     /// Live 2026-11-13: a clear request for two fresh installs got "Did you
