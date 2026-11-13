@@ -56,6 +56,7 @@ pub mod coordination;
 pub mod engine;
 pub mod eval;
 pub mod goal_dispatch;
+pub mod helper_run;
 pub mod host;
 pub mod known_resources;
 pub mod llm;

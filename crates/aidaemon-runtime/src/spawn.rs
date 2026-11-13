@@ -162,60 +162,44 @@ pub fn run_phase(
     )
 }
 
-/// A step's own words as the owner reads them: one line, without a
-/// trailing period.
-fn plain_step(step: &str) -> String {
-    let line = step.split_whitespace().collect::<Vec<_>>().join(" ");
-    line.trim_end_matches('.').to_string()
-}
+use crate::helper_run::plain_step;
 
-/// A run that did none of its work, from its typed records: it did not
-/// succeed, it declared steps that need a change, none of them was done, no
-/// call of its changed anything, and neither the owner's answer nor work
-/// still running explains the stop. Such a run failed: whatever its reply
-/// says, nothing it was sent to do happened.
+/// A sub-agent's typed records as the one [`crate::helper_run::nothing_done`]
+/// rule reads them: its end outcome, its checklist steps that needed a
+/// change, and whether any call of its changed something.
 fn nothing_done(
     outcome: TaskOutcome,
     checklist: &[&aidaemon_events::RunObligation],
     aggregate: &aidaemon_events::RunAggregate,
 ) -> Option<crate::run_state::RunFailure> {
     use aidaemon_events::RunObligationState;
-    if outcome == TaskOutcome::Succeeded
-        || aggregate.owner_declined()
-        || aggregate.has_background_in_flight()
-    {
-        return None;
-    }
-    let effect_steps: Vec<&&aidaemon_events::RunObligation> = checklist
+    let mut steps: Vec<(&String, String, bool)> = checklist
         .iter()
         .filter(|obligation| !obligation.required_effect.is_empty())
-        .collect();
-    let a_step_done = effect_steps
-        .iter()
-        .any(|obligation| obligation.state == RunObligationState::Satisfied);
-    let changed_something = aggregate.operations.values().any(|operation| {
-        operation.outcome == Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded)
-            && !operation.mutation_effects.is_empty()
-    });
-    if effect_steps.is_empty() || a_step_done || changed_something {
-        return None;
-    }
-    let mut undone: Vec<(&String, String)> = effect_steps
-        .iter()
         .map(|obligation| {
             (
                 &obligation.id,
                 obligation
                     .step
-                    .as_deref()
-                    .map(plain_step)
+                    .clone()
                     .unwrap_or_else(|| "a step it listed".to_string()),
+                obligation.state == RunObligationState::Satisfied,
             )
         })
         .collect();
-    undone.sort_by(|a, b| a.0.cmp(b.0));
-    Some(crate::run_state::RunFailure::NothingDone {
-        undone: undone.into_iter().map(|(_, summary)| summary).collect(),
+    steps.sort_by(|a, b| a.0.cmp(b.0));
+    crate::helper_run::nothing_done(&crate::helper_run::WorkRecord {
+        succeeded: outcome == TaskOutcome::Succeeded,
+        owner_declined: aggregate.owner_declined(),
+        still_running: aggregate.has_background_in_flight(),
+        change_steps: steps
+            .into_iter()
+            .map(|(_, step, done)| (step, done))
+            .collect(),
+        changed_something: aggregate.operations.values().any(|operation| {
+            operation.outcome == Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded)
+                && !operation.mutation_effects.is_empty()
+        }),
     })
 }
 
@@ -636,8 +620,20 @@ pub fn child_status_sender(
 /// line, cut to a phone-width length.
 pub fn child_status_label(mission: &str) -> String {
     const MAX_CHARS: usize = 60;
-    let line = mission.lines().next().unwrap_or("").trim();
-    let line = if line.is_empty() { "Sub-agent" } else { line };
+    // A path reads as the name of what it points at.
+    let line = mission
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .map(crate::background_run::plain_word)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let line = if line.is_empty() {
+        "Sub-agent"
+    } else {
+        line.as_str()
+    };
     let is_path = |word: &str| word.contains('/') || word.contains('\\') || word.starts_with('~');
     if line.chars().count() <= MAX_CHARS && !line.split_whitespace().any(is_path) {
         return line.to_string();

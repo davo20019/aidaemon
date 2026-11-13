@@ -172,17 +172,14 @@ pub fn compose_task_lead_prompt_from_registry(
     }
 
     if has_cli_agent {
-        prompt.push_str(
-            "\n\n## CLI Agent Delegation\n\
-             You have direct access to `cli_agent` (a specialized coding/research agent running on this machine).\n\
-             Treat `cli_agent` as a delegation surface, not as a reason to skip task structure.\n\
-             If the work should stay tied to a claimed task with executor results or blocker handling, claim the task and use `spawn_agent`.\n\
-             Prefer direct `cli_agent` calls for focused execution-heavy work when you do not need aidaemon-only tools in the child.\n\
-             When calling `cli_agent`, use `action=\"run\"` and include a non-empty `prompt` describing the work.\n\
-             Pass `working_dir` whenever the task targets a specific repo or directory.\n\
-             Example: `cli_agent(action=\"run\", prompt=\"Inspect the latest service logs, patch the root cause, run cargo fmt, and run the narrowest relevant tests\", working_dir=\"/absolute/project/path\")`.\n\
-             Note: If cli_agent fails repeatedly (auth errors, timeouts, environment issues), do NOT keep retrying. Switch to using your direct tools (read_file, write_file, edit_file, terminal) to complete the work yourself.",
-        );
+        prompt.push_str(&format!(
+            "{}\n\
+                 If the work should stay tied to a claimed task with executor results or \
+                 blocker handling, claim the task and use `spawn_agent`.\n\
+                 When calling `cli_agent`, use `action=\"run\"` with a non-empty `prompt` \
+                 describing the work.",
+            crate::helper_run::DELEGATED_CLI_SANDBOX.delegation_section()
+        ));
     }
 
     if !prompt.ends_with('\n') {
@@ -528,17 +525,14 @@ pub mod legacy {
         }
 
         if has_cli_agent {
-            prompt.push_str(
-                "\n\n## CLI Agent Delegation\n\
-                 You have direct access to `cli_agent` (a specialized coding/research agent running on this machine).\n\
-                 Treat `cli_agent` as a delegation surface, not as a reason to skip task structure.\n\
-                 If the work should stay tied to a claimed task with executor results or blocker handling, claim the task and use `spawn_agent`.\n\
-                 Prefer direct `cli_agent` calls for focused execution-heavy work when you do not need aidaemon-only tools in the child.\n\
-                 When calling `cli_agent`, use `action=\"run\"` and include a non-empty `prompt` describing the work.\n\
-                 Pass `working_dir` whenever the task targets a specific repo or directory.\n\
-                 Example: `cli_agent(action=\"run\", prompt=\"Inspect the latest service logs, patch the root cause, run cargo fmt, and run the narrowest relevant tests\", working_dir=\"/absolute/project/path\")`.\n\
-                 Note: If cli_agent fails repeatedly (auth errors, timeouts, environment issues), do NOT keep retrying. Switch to using your direct tools (read_file, write_file, edit_file, terminal) to complete the work yourself.",
-            );
+            prompt.push_str(&format!(
+                "{}\n\
+                 If the work should stay tied to a claimed task with executor results or \
+                 blocker handling, claim the task and use `spawn_agent`.\n\
+                 When calling `cli_agent`, use `action=\"run\"` with a non-empty `prompt` \
+                 describing the work.",
+                crate::helper_run::DELEGATED_CLI_SANDBOX.delegation_section()
+            ));
         }
 
         if !prompt.ends_with('\n') {
@@ -928,11 +922,12 @@ mod tests {
         let prompt =
             legacy::build_task_lead_prompt("goal_2", "build release", None, 1, 3, true, false);
         assert!(prompt.contains("## CLI Agent Delegation"));
-        assert!(prompt.contains("Treat `cli_agent` as a delegation surface"));
+        assert!(prompt.contains("Its sandbox cannot reach the network"));
+        assert!(prompt.contains("goes to spawn_agent"));
         assert!(prompt.contains("claim the task and use `spawn_agent`"));
         assert!(prompt.contains("action=\"run\""));
         assert!(prompt.contains("working_dir"));
-        assert!(prompt.contains("do NOT keep retrying"));
+        assert!(prompt.contains("do not retry it unchanged"));
     }
 
     #[test]

@@ -1278,7 +1278,10 @@ enabled = true
         )
         .unwrap();
         assert!(prompt.contains("## CLI Agent Delegation"));
-        assert!(prompt.contains("Always set working_dir"));
+        // When to choose it comes from what its sandbox can do.
+        assert!(prompt.contains("Its sandbox cannot reach the network"));
+        assert!(prompt.contains("goes to spawn_agent"));
+        assert!(prompt.contains("`working_dir`"));
 
         let disabled = parse_config(
             r#"

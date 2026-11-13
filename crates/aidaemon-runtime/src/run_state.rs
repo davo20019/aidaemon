@@ -51,6 +51,8 @@ pub enum RunFailure {
     /// WordPress install helper looked at its folder, found it missing and
     /// stopped, reported "Blocked" in words, and its run read as finished).
     NothingDone { undone: Vec<String> },
+    /// Its program ended with an error status, or was stopped (`None`).
+    Exited { code: Option<i32> },
 }
 
 impl RunFailure {
@@ -69,6 +71,12 @@ impl RunFailure {
                 },
                 undone.join("; ")
             ),
+            Self::Exited { code: Some(code) } => {
+                format!("Its program stopped with an error (exit status {code}).")
+            }
+            Self::Exited { code: None } => {
+                "Its program was stopped before it finished.".to_string()
+            }
         }
     }
 }

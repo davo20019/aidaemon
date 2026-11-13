@@ -125,6 +125,15 @@ tokio::task_local! {
     /// returned its finished result, or a cancel), so the run knows the job
     /// it launched is no longer running.
     static BACKGROUND_SETTLED: std::cell::Cell<bool>;
+    /// Set by a run that finished in the call and whose change receipt
+    /// shows it changed its write roots: its outcome carries those typed
+    /// effects, so the dispatcher treats what it set up like any call's.
+    static RUN_CHANGED_LOCALLY: std::cell::Cell<bool>;
+}
+
+/// Record that this call's finished run changed its write roots.
+fn mark_run_changed_locally() {
+    let _ = RUN_CHANGED_LOCALLY.try_with(|flag| flag.set(true));
 }
 
 /// Record that this call left its work running in the background.
@@ -211,6 +220,12 @@ enum CliWorkspaceMode {
     #[default]
     ReadWrite,
 }
+
+/// What a delegated CLI agent's sandbox lets it do, as the adapters below
+/// enforce it ([`apply_read_only_cli_adapter`], [`apply_scoped_cli_adapter`]:
+/// the network off, only `:minimal` plus the run's own paths reachable).
+pub const CLI_SANDBOX: aidaemon_runtime::helper_run::CliSandbox =
+    aidaemon_runtime::helper_run::DELEGATED_CLI_SANDBOX;
 
 /// Convert a configured CLI launch into a provider-native, enforceable
 /// read-only invocation. Prompt text is deliberately not part of this
@@ -382,6 +397,28 @@ fn permission_profile_path_key(path: &str) -> Result<&str, String> {
         ))
     } else {
         Ok(path)
+    }
+}
+
+/// How a CLI agent's run ended, as the runtime decided it
+/// ([`aidaemon_runtime::helper_run::program_phase`]).
+#[derive(Debug, Clone)]
+struct CliRunEnd {
+    phase: aidaemon_runtime::run_state::RunPhase,
+    evidence: aidaemon_runtime::run_state::RunEvidence,
+    changed_something: bool,
+}
+
+/// A run's typed effects from its change receipt: local writes and the
+/// processes it started when its write roots changed, nothing otherwise.
+fn changed_locally_semantics(changed: bool) -> ToolCallSemantics {
+    if changed {
+        ToolCallSemantics::observation_and_mutation_with(
+            aidaemon_tools::semantics::ToolMutationEffects::LOCAL_WORKSPACE_WRITE
+                .union(aidaemon_tools::semantics::ToolMutationEffects::PROCESS_STATE),
+        )
+    } else {
+        ToolCallSemantics::observation()
     }
 }
 
@@ -630,6 +667,42 @@ async fn list_backend_files(
         }
     }
     files
+}
+
+/// Most entries a run's write roots are read for its change receipt.
+const CHANGE_RECEIPT_CAP: usize = 100_000;
+
+/// A receipt of what a run's write roots hold: how many entries, their
+/// total size and the newest change time. Two that differ show the run
+/// changed something there, whatever program it ran and whatever its reply
+/// says ([`aidaemon_runtime::helper_run::ProgramEnd`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TreeReceipt {
+    entries: usize,
+    bytes: u64,
+    newest: Option<std::time::SystemTime>,
+}
+
+async fn tree_receipt(backend: &SharedExecutionBackend, roots: &[String]) -> TreeReceipt {
+    let mut receipt = TreeReceipt::default();
+    let mut queue: VecDeque<BackendPath> = roots.iter().map(BackendPath::new).collect();
+    while let Some(directory) = queue.pop_front() {
+        let Ok(entries) = backend.read_dir(&directory).await else {
+            continue;
+        };
+        for entry in entries {
+            if receipt.entries >= CHANGE_RECEIPT_CAP {
+                return receipt;
+            }
+            receipt.entries += 1;
+            receipt.bytes = receipt.bytes.saturating_add(entry.metadata.len);
+            receipt.newest = receipt.newest.max(entry.metadata.modified);
+            if entry.metadata.file_type == BackendFileType::Directory {
+                queue.push_back(entry.path);
+            }
+        }
+    }
+    receipt
 }
 
 /// Default tool definitions when the user enables cli_agents but doesn't specify tools.
@@ -1070,7 +1143,7 @@ impl CliAgentTool {
              Delegated step: {task_context}\n\
              Exit status: {status}\n\
              Output:\n{output}\n\n\
-             This delegated step was part of the user's previous unfinished request. Check the session history for the requested outcome and continue from this evidence. Delegated work is progress, not automatically fulfillment: complete every remaining implementation, action, validation, or delivery step that the original request requires. Do not merely announce that the delegated step ended, and do not ask the user to repeat the request."
+             This delegated step was part of the user's previous unfinished request. Check the session history for the requested outcome and continue from this evidence. The exit status above is the runtime's verdict on the step; how long the step took is the runtime's to state on its card, so never repeat a time the agent reported for its own run. Delegated work is progress, not automatically fulfillment: complete every remaining implementation, action, validation, or delivery step that the original request requires. Do not merely announce that the delegated step ended, and do not ask the user to repeat the request."
         )
     }
 
@@ -2184,7 +2257,8 @@ impl CliAgentTool {
         enforce_native_access: bool,
         async_mode: bool,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        title: Option<&str>,
+        spec: &aidaemon_runtime::helper_run::HelperSpec,
+        grant_session: &str,
     ) -> anyhow::Result<String> {
         // Get entry from the tools map (clone what we need, release lock)
         let (mut command, mut args, timeout, max_output, is_dynamic) = {
@@ -2420,6 +2494,22 @@ impl CliAgentTool {
             ));
         }
 
+        // Every helper's mission carries the same rules, whichever program
+        // runs it: the folders made for it and that its own duration is the
+        // daemon's to state.
+        // Only a coding agent reads a mission: any other program is given
+        // its prompt as is.
+        let prompt_with_rules =
+            if known_launch_arguments(launched_agent(&command, &args, tool_name)).is_some() {
+                format!(
+                    "{}\n\n{}",
+                    prompt.trim_end(),
+                    aidaemon_runtime::helper_run::mission_rules(&spec.new_folders).trim()
+                )
+            } else {
+                prompt.to_string()
+            };
+        let prompt = prompt_with_rules.as_str();
         // Build the enriched prompt if system_instruction is provided
         let final_prompt = if let Some(instruction) = system_instruction {
             self.build_enriched_prompt(
@@ -2432,6 +2522,14 @@ impl CliAgentTool {
         } else {
             prompt.to_string()
         };
+        // What its write roots hold now: its end is judged by whether they
+        // changed. A read-only run changes nothing by contract.
+        let watched_roots = if workspace_mode == CliWorkspaceMode::ReadWrite {
+            canonical_write_paths.clone()
+        } else {
+            Vec::new()
+        };
+        let receipt_before = tree_receipt(&self.backend, &watched_roots).await;
 
         let slot_permit = match self.concurrency_limiter.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -2591,8 +2689,12 @@ impl CliAgentTool {
         let status_tx_clone = status_tx.clone();
         let tool_name_owned = tool_name.to_string();
 
-        // For question detection (kill process if it asks a question we can't answer)
-        let task_context = prompt_summary.clone();
+        // What it was sent to do, as the owner and the parent read it: its
+        // label, never a cut prompt (live 2026-11-13: "Delegated step: …
+        // /Users/davidloor/projects/claude-wordpre" made the verifier judge
+        // the next call against a folder that does not exist).
+        let run_label = spec.label(&format!("{tool_name} coding agent"));
+        let task_context = run_label.clone();
 
         // Create completion channel - includes loop detection info
         // Result: (exit_code, was_killed_for_loop, loop_repetition_count)
@@ -2627,10 +2729,14 @@ impl CliAgentTool {
         // runtime's records, on its turn's card (see `start_background_run`).
         let run_slot: Arc<std::sync::OnceLock<Arc<BackgroundRun>>> = Arc::default();
         let run_for_task = run_slot.clone();
-        let run_label = aidaemon_runtime::background_run::plain_label(
-            title,
-            &format!("{tool_name} coding agent"),
-        );
+        let end_record: Arc<OnceLock<CliRunEnd>> = Arc::default();
+        let end_record_for_task = end_record.clone();
+        let backend_for_receipt = self.backend.clone();
+        let watched_for_task = watched_roots.clone();
+        let expects_change = !watched_roots.is_empty();
+        let grant_session_for_task = grant_session.to_string();
+        let folders_for_task = spec.new_folders.clone();
+        let receipt_before_for_task = receipt_before.clone();
         let run_began = chrono::Utc::now();
         if async_mode {
             self.start_background_run(
@@ -2891,6 +2997,56 @@ impl CliAgentTool {
                     Err(_) => None,
                 }
             };
+            // How the run ended, from what the runtime observed of it (its
+            // exit status, whether the runtime stopped it, whether its write
+            // roots changed), by the rule every helper run is judged by. Its
+            // reply never decides it.
+            let changed_something = tree_receipt(&backend_for_receipt, &watched_for_task).await
+                != receipt_before_for_task;
+            let auth_failed =
+                CliAgentTool::detect_auth_error(&display_buf_writer.lock().await, &tool_name_owned)
+                    .is_some();
+            let (run_phase, run_evidence) = aidaemon_runtime::helper_run::program_phase(
+                &aidaemon_runtime::helper_run::ProgramEnd {
+                    exit_code,
+                    stopped: loop_detected || auth_failed,
+                    expects_change,
+                    changed_something,
+                    step: task_context.clone(),
+                },
+            );
+            let _ = end_record_for_task.set(CliRunEnd {
+                phase: run_phase,
+                evidence: run_evidence.clone(),
+                changed_something,
+            });
+            // The local sites a run set up within its own write roots are
+            // part of its work, by the same rule as any call's
+            // (`local_sites::set_up_locally`).
+            {
+                let status = if loop_detected || auth_failed || exit_code.is_none() {
+                    aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent
+                } else if exit_code == Some(0) {
+                    aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded
+                } else {
+                    aidaemon_tools::semantics::ToolOutcomeStatus::CompletedWithNegativeResult
+                };
+                if aidaemon_tools::local_sites::set_up_locally(
+                    status,
+                    &changed_locally_semantics(changed_something),
+                ) {
+                    let said = format!(
+                        "{}\n{}",
+                        stdout_buf_writer.lock().await,
+                        display_buf_writer.lock().await
+                    );
+                    aidaemon_tools::local_sites::note_sites_in(&grant_session_for_task, &said)
+                        .await;
+                }
+            }
+            if run_phase != aidaemon_runtime::run_state::RunPhase::Succeeded {
+                aidaemon_runtime::spawn_tool::release_new_folders(&folders_for_task);
+            }
             // Persist completion even if the caller timed out and moved the task to background.
             if invocation_id != 0 {
                 let duration = invocation_started_at.elapsed().as_secs_f64();
@@ -2914,7 +3070,8 @@ impl CliAgentTool {
                         max_output_for_log,
                     )
                 };
-                let success = completion.success;
+                let success = completion.success
+                    && run_phase == aidaemon_runtime::run_state::RunPhase::Succeeded;
                 if completion.authentication_failed {
                     CliAgentTool::quarantine_unavailable_tool(
                         &tools_for_completion,
@@ -2924,8 +3081,19 @@ impl CliAgentTool {
                     );
                 }
                 let persisted_output = completion.persisted_output;
-                let structured_response = completion.response;
-                let structured_error = completion.error;
+                let (structured_response, structured_error) = if success {
+                    (completion.response, completion.error)
+                } else {
+                    let why = run_evidence.line().unwrap_or_default();
+                    (
+                        None,
+                        Some(
+                            completion
+                                .error
+                                .unwrap_or_else(|| format!("{why}\n\n{persisted_output}")),
+                        ),
+                    )
+                };
 
                 let _ = state_for_completion
                     .log_cli_agent_complete(
@@ -2956,12 +3124,17 @@ impl CliAgentTool {
                 // for completion (async_mode or sync->timeout moved to background).
                 if notify_async || should_notify_for_task.load(Ordering::Relaxed) {
                     let run = run_for_task.get().cloned();
-                    let phase = if success {
-                        aidaemon_runtime::run_state::RunPhase::Succeeded
-                    } else {
-                        aidaemon_runtime::run_state::RunPhase::Failed
-                    };
+                    let phase = run_phase;
                     let status_word = if success { "completed" } else { "failed" };
+                    // The run ends now, the moment its program did: its card
+                    // settles to its final header before anything else (a
+                    // continuation turn can wait minutes for its slot; live
+                    // 2026-11-13: a finished run read "Done 9m 40s" because
+                    // its end was recorded after the parent's next turn).
+                    let ended = match run.as_ref() {
+                        Some(run) => Some(run.finish(phase, run_evidence.clone()).await),
+                        None => None,
+                    };
                     let notification_summary: String = persisted_output.chars().take(500).collect();
                     let diff_section = if let Some(ref dir) = notify_working_dir {
                         CliAgentTool::capture_git_diff(&backend_for_completion, dir)
@@ -3031,11 +3204,15 @@ impl CliAgentTool {
                                 "cli_agent completion re-engagement budget exhausted; delivering raw result"
                             );
                         } else if let Some(ref agent) = agent_for_completion {
+                            let ending = match run_evidence.line() {
+                                Some(why) => format!("{status_word}. {why}"),
+                                None => status_word.to_string(),
+                            };
                             let followup = CliAgentTool::build_background_reengagement_followup(
                                 &tool_name_owned,
                                 &task_id_for_notify,
                                 &task_context,
-                                status_word,
+                                &ending,
                                 &persisted_output,
                             );
                             info!(
@@ -3083,12 +3260,8 @@ impl CliAgentTool {
                         }
                     }
 
-                    // The run ends first: its card settles to its final
-                    // header, then the result follows without repeating it.
-                    let ended = match run.as_ref() {
-                        Some(run) => Some(run.finish(phase, Default::default()).await),
-                        None => None,
-                    };
+                    // The run ended above: its card shows how; the result
+                    // follows without repeating it.
                     let present = |body: &str| match (run.as_ref(), ended.as_ref()) {
                         (Some(run), Some((state, on_card))) => {
                             run.result(state.as_ref(), body, *on_card)
@@ -3171,13 +3344,8 @@ impl CliAgentTool {
             // However it ended, its run ends with it (a second end is a
             // no-op).
             if let Some(run) = run_for_task.get().cloned() {
-                let phase = if exit_code == Some(0) && !loop_detected {
-                    aidaemon_runtime::run_state::RunPhase::Succeeded
-                } else {
-                    aidaemon_runtime::run_state::RunPhase::Failed
-                };
                 tokio::spawn(async move {
-                    run.finish(phase, Default::default()).await;
+                    run.finish(run_phase, run_evidence).await;
                 });
             }
             // Publish completion only after durable invocation/task state has
@@ -3360,6 +3528,26 @@ impl CliAgentTool {
                     }
 
                     return Ok(error_msg);
+                }
+
+                // A run that did not do its work failed, whatever it said,
+                // by the rule every helper run is judged by.
+                if let Some(end) = end_record.get() {
+                    if end.changed_something {
+                        mark_run_changed_locally();
+                    }
+                    if end.phase != aidaemon_runtime::run_state::RunPhase::Succeeded {
+                        let why = end.evidence.line().unwrap_or_default();
+                        let error_msg = format!(
+                            "ERROR: CLI agent '{tool_name}' did not do its work. {why}\n\n\
+                             Its report:\n{result_text}"
+                        );
+                        if let Some(task_id) = delegated_task_id {
+                            self.persist_delegated_cli_result(task_id, None, Some(&error_msg))
+                                .await;
+                        }
+                        return Ok(error_msg);
+                    }
                 }
 
                 // Success path
@@ -3801,6 +3989,18 @@ struct CliAgentArgs {
     command: Option<String>,
     /// Optional description paired with `command`.
     description: Option<String>,
+    /// What the work is, in a few plain words: the name the owner reads
+    /// for the run on every card ([`aidaemon_runtime::helper_run`]).
+    #[serde(default)]
+    title: Option<String>,
+    /// Folders made fresh for this run (a new install or project), exactly
+    /// as `spawn_agent` takes them: each must not exist yet, and the call
+    /// creates it empty for the agent to work in.
+    #[serde(default)]
+    new_folders: Vec<String>,
+    /// Files or directories the run will change.
+    #[serde(default)]
+    scope: Vec<String>,
     working_dir: Option<String>,
     /// Additional readable paths for a split access manifest. The working
     /// directory is always readable context.
@@ -3855,6 +4055,59 @@ fn compose_delegated_prompt(mission: Option<String>, task: Option<String>) -> Op
         parts.push(format!("Task: {}", task));
     }
     Some(parts.join("\n"))
+}
+
+/// Whether a run's call output says it never started (a refusal before
+/// launch, typed by this tool's own prefixes).
+fn run_did_not_start(output: &str) -> bool {
+    let output = output.trim_start();
+    output.starts_with("Blocked:")
+        || output.starts_with("BLOCKED:")
+        || output.starts_with("ERROR: CLI agent recovery exhausted")
+        || output.starts_with("Maximum ")
+}
+
+/// Where a CLI agent's run may write: what its call named, plus its
+/// declared scope and new folders, all within the parent turn's authority
+/// narrowed by that declaration ([`aidaemon_runtime::helper_run::helper_authority`],
+/// the same narrowing a sub-agent gets). Without an inherited authority (a
+/// call outside a turn) the named paths stand as given.
+fn helper_write_paths(
+    args: &CliAgentArgs,
+    spec: &aidaemon_runtime::helper_run::HelperSpec,
+    session_id: &str,
+    facts: &ToolCallContext,
+) -> Vec<String> {
+    let declared = !spec.new_folders.is_empty() || !spec.scope.is_empty();
+    let mut paths = args.write_paths.clone();
+    for path in spec.new_folders.iter().chain(&spec.scope) {
+        if !paths.contains(path) {
+            paths.push(path.clone());
+        }
+    }
+    let Some(parent) = aidaemon_runtime::authority::parent_authority(facts) else {
+        return paths;
+    };
+    let narrowed =
+        aidaemon_runtime::helper_run::helper_authority(parent, spec.declaration(session_id), None);
+    let Some(roots) = aidaemon_runtime::helper_run::write_roots(&narrowed) else {
+        return paths;
+    };
+    let within = |path: &String| {
+        !std::path::Path::new(path).is_absolute()
+            || roots
+                .iter()
+                .any(|root| std::path::Path::new(path).starts_with(root))
+    };
+    paths.retain(within);
+    if declared {
+        for root in roots {
+            if !paths.contains(&root) {
+                paths.push(root);
+            }
+        }
+    }
+    paths
 }
 
 impl CliAgentArgs {
@@ -4315,8 +4568,9 @@ impl Tool for CliAgentTool {
             "name": "cli_agent",
             "description": format!(
                 "Delegate coding or research to an installed CLI agent. Available agents: {}. \
-                 Runs can be checked or cancelled.",
-                tools_help
+                 Runs can be checked or cancelled. {}",
+                tools_help,
+                CLI_SANDBOX.describe()
             ),
             "parameters": {
                 "type": "object",
@@ -4331,9 +4585,23 @@ impl Tool for CliAgentTool {
                         "enum": names_vec,
                         "description": "Agent name"
                     },
+                    "title": {
+                        "type": "string",
+                        "description": "For run: what the work is in a few plain words, e.g. 'Refactor the parser'. The owner sees it on the run's card."
+                    },
                     "prompt": {
                         "type": "string",
                         "description": "Task prompt"
+                    },
+                    "new_folders": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Absolute folders that don't exist yet, created empty for this run to work in (a new project)."
+                    },
+                    "scope": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Files or directories this run will change."
                     },
                     "working_dir": {
                         "type": "string",
@@ -4477,6 +4745,10 @@ impl crate::traits::ToolSemantics for CliAgentTool {
             // The owner's approval of a daemonizing run is kept for that
             // run alone (`record_owner_answer`), never as a session grant.
             keeps_own_grants: true,
+            // A CLI agent's run is a helper run like a sub-agent's: it
+            // inherits the turn's authority, narrowed by its declaration
+            // ([`aidaemon_runtime::helper_run::helper_authority`]).
+            spawns_child_agents: true,
             ..Default::default()
         }
     }
@@ -4766,28 +5038,36 @@ impl CliAgentTool {
                 || parsed
                     .as_ref()
                     .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
-        let (output, left_in_background, settled) = BACKGROUND_SETTLED
+        let (output, left_in_background, settled, changed) = RUN_CHANGED_LOCALLY
             .scope(
                 std::cell::Cell::new(false),
-                LEFT_IN_BACKGROUND.scope(std::cell::Cell::new(false), async {
-                    let output = self
-                        .call_with_status_under_contract(
-                            arguments,
-                            status_tx,
-                            read_only_run,
-                            enforce_native_access,
-                            facts,
-                        )
-                        .await?;
-                    anyhow::Ok((
-                        output,
-                        LEFT_IN_BACKGROUND.with(std::cell::Cell::get),
-                        BACKGROUND_SETTLED.with(std::cell::Cell::get),
-                    ))
-                }),
+                BACKGROUND_SETTLED.scope(
+                    std::cell::Cell::new(false),
+                    LEFT_IN_BACKGROUND.scope(std::cell::Cell::new(false), async {
+                        let output = self
+                            .call_with_status_under_contract(
+                                arguments,
+                                status_tx,
+                                read_only_run,
+                                enforce_native_access,
+                                facts,
+                            )
+                            .await?;
+                        anyhow::Ok((
+                            output,
+                            LEFT_IN_BACKGROUND.with(std::cell::Cell::get),
+                            BACKGROUND_SETTLED.with(std::cell::Cell::get),
+                            RUN_CHANGED_LOCALLY.with(std::cell::Cell::get),
+                        ))
+                    }),
+                ),
             )
             .await?;
         let mut outcome = cli_agent_outcome(&action, output, read_only_run, left_in_background);
+        if changed && outcome.metadata.outcome_status == Some(ToolOutcomeStatus::Succeeded) {
+            outcome.metadata.semantics = changed_locally_semantics(true)
+                .with_verification_mode(ToolVerificationMode::ResultContent);
+        }
         outcome.metadata.background_settled = settled && !left_in_background;
         Ok(outcome)
     }
@@ -4939,13 +5219,44 @@ impl CliAgentTool {
                     args.async_mode.unwrap_or(false)
                 };
 
+                // The run is a helper run: declared, named and given its
+                // authority exactly as a sub-agent is.
+                let made_folders = if args.new_folders.is_empty() {
+                    Vec::new()
+                } else {
+                    match aidaemon_runtime::spawn_tool::claim_new_folders(&args.new_folders) {
+                        Ok(made) => made,
+                        Err(error) => return Ok(format!("Blocked: {error}")),
+                    }
+                };
+                let spec = aidaemon_runtime::helper_run::HelperSpec {
+                    title: args
+                        .title
+                        .clone()
+                        .or_else(|| args.description.clone())
+                        .filter(|title| !title.trim().is_empty()),
+                    mission: String::new(),
+                    new_folders: made_folders.clone(),
+                    scope: args.scope.clone(),
+                };
+                let write_paths = helper_write_paths(&args, &spec, &session_id, facts);
+                let working_dir = args
+                    .working_dir
+                    .clone()
+                    .or_else(|| made_folders.first().cloned());
+                let grant_session = if facts.grant_session.trim().is_empty() {
+                    session_id.clone()
+                } else {
+                    facts.grant_session.clone()
+                };
+
                 let mut unavailable = Vec::new();
-                loop {
+                let output = loop {
                     match self
                         .handle_run(
                             &tool,
                             &prompt,
-                            args.working_dir.as_deref(),
+                            working_dir.as_deref(),
                             &session_id,
                             args.call_goal_id.as_deref(),
                             args.call_task_id.as_deref(),
@@ -4956,19 +5267,20 @@ impl CliAgentTool {
                                 CliWorkspaceMode::ReadWrite
                             },
                             &args.read_paths,
-                            &args.write_paths,
+                            &write_paths,
                             enforce_native_access,
                             async_mode,
                             status_tx.clone(),
-                            args.description.as_deref(),
+                            &spec,
+                            &grant_session,
                         )
                         .await
                     {
-                        Ok(output) => return Ok(output),
+                        Ok(output) => break Ok(output),
                         Err(error) => {
                             let Some(failure) = error.downcast_ref::<CliAgentUnavailableError>()
                             else {
-                                return Err(error);
+                                break Err(error);
                             };
                             unavailable.push((failure.tool_name.clone(), failure.message.clone()));
 
@@ -4990,7 +5302,7 @@ impl CliAgentTool {
                                     )
                                     .await;
                                 }
-                                return Ok(message);
+                                break Ok(message);
                             };
 
                             info!(
@@ -5001,7 +5313,14 @@ impl CliAgentTool {
                             tool = next_tool;
                         }
                     }
+                };
+                // Folders made for a run that never started are given back
+                // (only while still empty), as for a sub-agent.
+                let started = matches!(&output, Ok(text) if !run_did_not_start(text));
+                if !started {
+                    aidaemon_runtime::spawn_tool::release_new_folders(&made_folders);
                 }
+                output
             }
             "check" => {
                 let task_id = args.task_id.as_ref().ok_or_else(|| {
@@ -7720,6 +8039,159 @@ mod tests {
                 "the prompt is never echoed: {text}"
             );
         }
+    }
+
+    /// A continuation that never gets its slot (another one holds it, as
+    /// live 2026-11-13).
+    struct PendingRuntime;
+
+    #[async_trait::async_trait]
+    impl ConversationRuntime for PendingRuntime {
+        async fn continue_conversation(
+            &self,
+            _request: ConversationRequest,
+        ) -> anyhow::Result<crate::runtime_ports::AgentResponseEnvelope> {
+            std::future::pending().await
+        }
+
+        async fn record_continuation_delivery(
+            &self,
+            _session_id: &str,
+            _delivery: crate::events::ResponseDeliveryData,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Live 2026-11-13: two codex runs, one refused `ddev` by its sandbox,
+    /// both read "Done" under "All 2 done". A run that changed nothing it
+    /// was sent to change ends Failed with a typed reason; the card's
+    /// header and total come from the runs' phases; each is named from its
+    /// task; and the card settles the moment the programs end, though the
+    /// parent's continuation turn never gets its slot.
+    #[tokio::test]
+    async fn a_refused_cli_run_ends_failed_and_the_card_agrees_at_once() {
+        let (tool, _db) = setup_bash_tool().await;
+        let chat = crate::testing::CardChat::new("telegram:synthetic-refused").await;
+        tool.set_hub(chat.outbound());
+        let runtime: Arc<dyn ConversationRuntime> = Arc::new(PendingRuntime);
+        tool.set_agent(Arc::downgrade(&runtime));
+        let projects = tempfile::TempDir::new().unwrap();
+        let drupal = projects.path().join("claude-drupal-7");
+        let wordpress = projects.path().join("claude-wordpress-7");
+        let facts = crate::testing::call_facts("telegram:synthetic-refused");
+        let installs = json!({
+            "action": "run",
+            "tool": "bash-agent",
+            "title": format!("Install Drupal in {}", drupal.display()),
+            "prompt": "echo '<h1>Claude</h1>' > index.html; echo installed",
+            "new_folders": [drupal.display().to_string()],
+            "async_mode": true
+        })
+        .to_string();
+        let refused = json!({
+            "action": "run",
+            "tool": "bash-agent",
+            "title": "Install WordPress",
+            "prompt": "echo 'zsh:1: operation not permitted: ddev'; echo 'Installation blocked.'",
+            "new_folders": [wordpress.display().to_string()],
+            "async_mode": true
+        })
+        .to_string();
+        let outputs = chat
+            .turn(
+                |tx| async {
+                    let first = tool
+                        .call_with_status_under_contract(
+                            &installs,
+                            Some(tx.clone()),
+                            false,
+                            false,
+                            &facts,
+                        )
+                        .await
+                        .unwrap();
+                    let second = tool
+                        .call_with_status_under_contract(&refused, Some(tx), false, false, &facts)
+                        .await
+                        .unwrap();
+                    (first, second)
+                },
+                |_| "Both are running.".to_string(),
+            )
+            .await;
+        assert!(
+            outputs
+                .0
+                .starts_with("Started in the background: Install Drupal in claude-drupal-7."),
+            "{outputs:?}"
+        );
+        assert!(
+            outputs
+                .1
+                .starts_with("Started in the background: Install WordPress."),
+            "{outputs:?}"
+        );
+        let settled = |text: &str| {
+            text.contains("✅ Finished in the background: Install Drupal in claude-drupal-7")
+                && text.contains("❌ Failed in the background: Install WordPress")
+                && text.contains("The last of them ended")
+                && text.contains("1 failed")
+        };
+        assert!(
+            chat.wait_for(Duration::from_secs(20), settled).await,
+            "{:#?}",
+            chat.shown().await
+        );
+        for text in chat.shown().await {
+            assert!(!text.contains("All 2 done"), "{text}");
+            assert!(!text.contains("coding agent"), "{text}");
+        }
+        // The run worked in the folder made for it; the refused run's
+        // folder, still empty, was given back.
+        assert!(drupal.join("index.html").exists());
+        assert!(!wordpress.exists());
+        drop(runtime);
+    }
+
+    /// A finished sync run that did not do its work is a failed call.
+    #[tokio::test]
+    async fn a_sync_cli_run_that_changed_nothing_is_a_failed_call() {
+        let (tool, _db) = setup_bash_tool().await;
+        let projects = tempfile::TempDir::new().unwrap();
+        let site = projects.path().join("site");
+        let args = json!({
+            "action": "run",
+            "tool": "bash-agent",
+            "title": "Install the site",
+            "prompt": "echo 'Installation blocked by the sandbox.'",
+            "new_folders": [site.display().to_string()]
+        })
+        .to_string();
+        let outcome = tool.call_with_status_outcome(&args, None).await.unwrap();
+        assert!(
+            outcome
+                .output
+                .starts_with("ERROR: CLI agent 'bash-agent' did not do its work."),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains("nothing was changed"),
+            "{}",
+            outcome.output
+        );
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::FailedPermanent)
+        );
+    }
+
+    #[test]
+    fn the_cli_agent_description_states_what_its_sandbox_cannot_do() {
+        let described = CLI_SANDBOX.describe();
+        assert!(described.contains("reach the network"), "{described}");
+        assert!(described.contains("spawn_agent"), "{described}");
     }
 
     // -----------------------------------------------------------------------

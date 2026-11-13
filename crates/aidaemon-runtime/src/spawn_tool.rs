@@ -1331,7 +1331,9 @@ impl Tool for SpawnAgentTool {
          benefits from a fresh context window, or should keep running while you do other work (background=true: its result goes to the user's chat, not back to you, so never use it for work you need to combine). To run several sub-agents at the same time, give them all in one call as `tasks` (up to 6, 3 running at once); you receive every result, each with when it ran. Do NOT delegate \
          trivial one-shot reads (a single read_file, a single web_search) — handle those directly. \
          The sub-agent starts with a fresh context and the same tools unless its specialist narrows them (a named specialist delegates further only when its `tools` include spawn_agent), so reference files by path and \
-         do not paste prior tool output."
+         do not paste prior tool output. A sub-agent works with your own access on this computer: it can run \
+         the programs installed here and the services they start (containers, local dev sites), which a \
+         `cli_agent` run's sandbox cannot."
     }
 
     fn schema(&self) -> Value {

@@ -36,25 +36,56 @@ pub fn started_in_background(label: &str) -> String {
 pub const LABEL_CHARS: usize = 60;
 
 /// The name the owner reads for a run: the title its call gave the work,
-/// in plain words, when it is one short line with no path in it; else
-/// `fallback` (what the work is: "a shell loop", "Codex coding agent"). A
-/// title is never cut, so a label never ends mid-word or mid-path (live
-/// 2026-11-13: "Install a fresh Drupal site … in exactly
+/// in plain words, when it is one short line; a path in it reads as the
+/// folder or file it names (live 2026-11-13: "Install a Drupal site in
+/// /Users/davidloor/projects/claude-drupal-7" was shown as "codex coding
+/// agent"). Else `fallback` (what the work is: "a shell loop", "Codex
+/// coding agent"). A title is never cut, so a label never ends mid-word or
+/// mid-path (live 2026-11-13: "Install a fresh Drupal site … in exactly
 /// /Users/davidloor/projects/cla").
 pub fn plain_label(title: Option<&str>, fallback: &str) -> String {
     let title = title
-        .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+        .map(|title| {
+            title
+                .split_whitespace()
+                .map(plain_word)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
         .unwrap_or_default();
-    let plain = !title.is_empty()
-        && title.chars().count() <= LABEL_CHARS
-        && !title
-            .split_whitespace()
-            .any(|word| word.contains('/') || word.contains('\\') || word.starts_with('~'));
+    let plain = !title.is_empty() && title.chars().count() <= LABEL_CHARS;
     if plain {
         aidaemon_tools::sanitize::redact_secrets(&title)
     } else {
         fallback.trim().to_string()
     }
+}
+
+/// A word of a title as the owner reads it: a path is the name of what it
+/// points at.
+pub fn plain_word(word: &str) -> String {
+    let looks_like_path = word.starts_with('/')
+        || word.starts_with('~')
+        || word.matches('/').count() > 1
+        || word.contains('\\');
+    if !looks_like_path {
+        return word.to_string();
+    }
+    let trail: String = word
+        .chars()
+        .rev()
+        .take_while(|c| matches!(c, '.' | ',' | ';' | ':' | ')' | '"' | '\''))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let core = &word[..word.len() - trail.len()];
+    let name = core
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty() && *part != "~")
+        .unwrap_or(core);
+    format!("{name}{trail}")
 }
 
 /// Where a background run reports: the runtime's run records, the chat's
@@ -257,7 +288,11 @@ mod tests {
                 Some("Install a fresh Drupal site in exactly /Users/someone/projects/claude-test"),
                 "Codex coding agent"
             ),
-            "Codex coding agent"
+            "Install a fresh Drupal site in exactly claude-test"
+        );
+        assert_eq!(
+            plain_label(Some("Fix ~/src/app/main.rs."), "a shell loop"),
+            "Fix main.rs."
         );
         assert_eq!(
             plain_label(Some(&"word ".repeat(30)), "a shell loop"),

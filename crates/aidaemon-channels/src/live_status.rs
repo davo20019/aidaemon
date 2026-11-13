@@ -127,14 +127,31 @@ fn since_request_total(helpers: &[(HelperView, Option<Duration>)]) -> Option<Str
         .collect::<Option<Vec<_>>>()?
         .into_iter()
         .max_by_key(|since| since.secs)?;
-    let all_done = helpers
-        .iter()
-        .all(|(helper, _)| helper.phase == RunPhase::Succeeded);
-    Some(if all_done {
-        format!("All {} done {}.", helpers.len(), last.words.trim())
-    } else {
-        format!("The last of them ended {}.", last.words.trim())
-    })
+    // Counted from the runs' phases: a run that failed or stopped is never
+    // "done" (live 2026-11-13: "All 2 done" over a CLI run its sandbox had
+    // refused).
+    let count = |phase: RunPhase| {
+        helpers
+            .iter()
+            .filter(|(helper, _)| helper.phase == phase)
+            .count()
+    };
+    let (failed, stopped) = (count(RunPhase::Failed), count(RunPhase::Stopped));
+    if failed == 0 && stopped == 0 {
+        return Some(format!("All {} done {}.", helpers.len(), last.words.trim()));
+    }
+    let mut ended = Vec::new();
+    if failed > 0 {
+        ended.push(format!("{failed} failed"));
+    }
+    if stopped > 0 {
+        ended.push(format!("{stopped} didn't finish"));
+    }
+    Some(format!(
+        "The last of them ended {}; {}.",
+        last.words.trim(),
+        ended.join(", ")
+    ))
 }
 
 /// Where a helper stands, in a few plain words: its latest step while it
@@ -737,9 +754,35 @@ mod tests {
         assert!(!one_stopped.contains("✅ Done"), "{one_stopped}");
         assert!(
             one_stopped.ends_with(
-                "The last of them ended 310s after your request (5:37:00 AM to 5:42:10 AM ET)."
+                "The last of them ended 310s after your request (5:37:00 AM to 5:42:10 AM ET); \
+                 1 didn't finish."
             ),
             "{one_stopped}"
+        );
+
+        // A failed run is never counted as done: the header and the total
+        // both say it failed.
+        let one_failed = render_card(&CardView {
+            helpers: vec![
+                (
+                    helper("Install Drupal", RunPhase::Succeeded, 310, "5:42:10"),
+                    None,
+                ),
+                (
+                    helper("Install WordPress", RunPhase::Failed, 30, "5:37:30"),
+                    None,
+                ),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!one_failed.contains("All 2 done"), "{one_failed}");
+        assert!(
+            one_failed.ends_with(
+                "The last of them ended 310s after your request (5:37:00 AM to 5:42:10 AM ET); \
+                 1 failed."
+            ),
+            "{one_failed}"
         );
 
         // While one still runs there is no total yet.

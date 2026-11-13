@@ -1141,6 +1141,7 @@ impl TurnEngine<'_> {
                 })
                 .collect();
             let setup = SdkTurnSetup {
+                internal_continuation,
                 user_text: user_text.to_string(),
                 task_id: task_id.clone(),
                 emitter: emitter.clone(),
