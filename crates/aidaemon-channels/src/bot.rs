@@ -10,7 +10,7 @@ use aidaemon_tools::semantics::UserRole;
 use crate::hub::{SessionChannelStore, SessionMap};
 use crate::ports::ChannelAgentRuntime;
 use crate::tasks::TaskRegistry;
-use crate::turns::TurnDeps;
+use crate::turns::{TurnDeps, TurnWatch};
 
 /// The services and settings every bot takes, so adding one does not
 /// change each bot's constructor.
@@ -31,6 +31,8 @@ pub struct BotDeps {
     /// Heartbeat silence (seconds) after which a turn is cancelled as hung;
     /// 0 never cancels.
     pub watchdog_stale_threshold_secs: u64,
+    /// Who sees every turn (empty by default).
+    pub watch: TurnWatch,
 }
 
 impl BotDeps {
@@ -42,6 +44,7 @@ impl BotDeps {
             sessions: self.sessions.clone(),
             task_registry: self.task_registry.clone(),
             watchdog_stale_threshold_secs: self.watchdog_stale_threshold_secs,
+            watch: self.watch.clone(),
         }
     }
 }

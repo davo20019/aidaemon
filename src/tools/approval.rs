@@ -56,6 +56,7 @@ mod tests {
 
         broker
             .send(ApprovalRequest {
+                expires_at_ms: None,
                 card: None,
                 command: "deploy release-42".to_string(),
                 session_id: "session-approval".to_string(),
@@ -107,6 +108,7 @@ mod tests {
 
         let result = broker
             .send(ApprovalRequest {
+                expires_at_ms: None,
                 card: None,
                 command: "deploy release-42".to_string(),
                 session_id: "session-approval".to_string(),
@@ -135,6 +137,7 @@ mod tests {
 
         broker
             .send(ApprovalRequest {
+                expires_at_ms: None,
                 card: None,
                 command: "deploy release-42".to_string(),
                 session_id: "session-approval".to_string(),
@@ -228,6 +231,7 @@ mod tests {
 
         broker
             .send(ApprovalRequest {
+                expires_at_ms: None,
                 card: None,
                 command: "activate a goal".to_string(),
                 session_id: "session-abandoned".to_string(),

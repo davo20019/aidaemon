@@ -671,8 +671,21 @@ impl OwnerApprovals {
             .unwrap_or_else(|e| e.into_inner())
             .insert(card, abandon_tx);
         let (response_tx, response_rx) = oneshot::channel();
+        let wait = if matches!(
+            kind,
+            ApprovalKind::GoalConfirmation | ApprovalKind::AutopilotConfirmation
+        ) {
+            self.goal_timeout
+        } else {
+            self.timeout
+        };
+        let expires_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|now| u64::try_from((now + wait).as_millis()).ok());
         let sent = broker
             .send(ApprovalRequest {
+                expires_at_ms,
                 command: request.summary.clone(),
                 session_id: card_session.to_string(),
                 risk_level: card_risk(request.risk),
@@ -683,14 +696,6 @@ impl OwnerApprovals {
                 card: request.card.clone(),
             })
             .await;
-        let wait = if matches!(
-            kind,
-            ApprovalKind::GoalConfirmation | ApprovalKind::AutopilotConfirmation
-        ) {
-            self.goal_timeout
-        } else {
-            self.timeout
-        };
         let answer = if sent.is_err() {
             Answer::Declined(COULD_NOT_REACH.to_string())
         } else {

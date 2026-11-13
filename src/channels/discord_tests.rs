@@ -182,6 +182,7 @@ async fn channel(
             max_file_size_mb: 10,
             state: harness.state.clone(),
             watchdog_stale_threshold_secs: 0,
+            watch: Default::default(),
         },
     ));
     channel.use_transport(mock.transport());

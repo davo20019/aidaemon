@@ -54,6 +54,48 @@ pub struct ApprovalRequest {
     pub kind: ApprovalKind,
     /// The card's typed facts, when the asker gave them.
     pub card: Option<Box<aidaemon_core::ApprovalCard>>,
+    /// When the asker stops waiting, in milliseconds since the Unix epoch;
+    /// `None` when it set no deadline. Shown to approval taps.
+    pub expires_at_ms: Option<u64>,
+}
+
+/// One approval card as an [`ApprovalTap`] sees it when it opens.
+pub struct TappedApproval<'a> {
+    /// The session the card was asked for.
+    pub session_id: &'a str,
+    /// The bot the card is shown on.
+    pub channel: String,
+    pub ask: crate::approval_render::ApprovalAsk<'a>,
+    pub kind: ApprovalKind,
+    pub expires_at_ms: Option<u64>,
+}
+
+/// How a tapped card ended.
+#[derive(Debug, Clone)]
+pub enum TapClosed {
+    /// Answered, on the bot (`by` is its name) or through the tap.
+    Answered {
+        response: ApprovalResponse,
+        by: String,
+    },
+    /// Whoever asked stopped waiting: the card expired, its turn stopped,
+    /// or the daemon is going away.
+    Unanswered,
+}
+
+/// Where an answer given through a tap arrives: the answer and who gave it
+/// (shown on the bot's card, "from the app").
+pub type TapAnswer = tokio::sync::oneshot::Receiver<(ApprovalResponse, String)>;
+
+/// Sees every approval card the hub routes and may answer it from
+/// elsewhere (the Client Gateway). The first answer wins: the bot's card is
+/// closed when the tap answers, and the tap is told when the bot does.
+pub trait ApprovalTap: Send + Sync {
+    /// A card opened; returns its id and where an answer from the tap
+    /// arrives.
+    fn opened(&self, approval: &TappedApproval<'_>) -> (String, TapAnswer);
+    /// The card with `id` ended.
+    fn closed(&self, id: &str, how: TapClosed);
 }
 
 /// Capabilities that vary by channel (Telegram, WhatsApp, SMS, Web, etc.).

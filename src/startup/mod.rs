@@ -1,4 +1,5 @@
 pub mod channels;
+pub mod client_gateway;
 pub mod db_security;
 pub mod db_upkeep;
 pub mod mcp;

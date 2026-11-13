@@ -372,21 +372,20 @@ pub async fn run(
 
     // 11. Channels
     let channel_agent: Arc<dyn crate::runtime_ports::DaemonAgentRuntime> = agent.clone();
-    let channel_bundle = startup_channels::build_channels(
-        &config,
-        crate::channels::ChannelRuntimeDeps {
-            agent: channel_agent,
-            config_path: config_path.clone(),
-            session_map: session_map.clone(),
-            task_registry: task_registry.clone(),
-            files_enabled: config.files.enabled,
-            inbox_dir: std::path::PathBuf::from(&inbox_dir),
-            max_file_size_mb: config.files.max_file_size_mb,
-            state: state.clone() as Arc<dyn crate::traits::StateStore>,
-            watchdog_stale_threshold_secs,
-        },
-    )
-    .await;
+    let channel_deps = crate::channels::ChannelRuntimeDeps {
+        agent: channel_agent,
+        config_path: config_path.clone(),
+        session_map: session_map.clone(),
+        task_registry: task_registry.clone(),
+        files_enabled: config.files.enabled,
+        inbox_dir: std::path::PathBuf::from(&inbox_dir),
+        max_file_size_mb: config.files.max_file_size_mb,
+        state: state.clone() as Arc<dyn crate::traits::StateStore>,
+        watchdog_stale_threshold_secs,
+        // Empty until the Client Gateway (when enabled) starts watching.
+        watch: Default::default(),
+    };
+    let channel_bundle = startup_channels::build_channels(&config, channel_deps.clone()).await;
 
     // 12. Channel Hub — routes approvals, media, and notifications
     let hub = Arc::new(
@@ -407,6 +406,8 @@ pub async fn run(
     )
     .await?;
     crate::startup::nodes::start(&config, pool.clone(), agent.clone(), hub.clone()).await?;
+    crate::startup::client_gateway::start(&config, pool.clone(), &channel_deps, hub.clone())
+        .await?;
     // Give the agent its plan_store handle so the completion phase can read the
     // active checklist for soft verification + recap (deferred to avoid touching
     // the large Agent::new signature and all subagent spawn call sites).

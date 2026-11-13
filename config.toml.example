@@ -486,6 +486,18 @@ record_decision_points = true
 max_events = 200
 include_raw_tool_args = false
 
+# The Client Gateway (/client/v1): lets your own apps (a terminal UI, a web
+# page) chat with the agent, watch every chat's turns and answer approvals.
+# Off by default; loopback only. Mint the local token with
+# `aidaemon client-token` (it prints the token once).
+# [client_gateway]
+# enabled = false
+# bind = "127.0.0.1"
+# port = 8788
+# retention_days = 7          # resume window; older clients get a snapshot
+# max_events = 100000
+# watch_risk_ceiling = "medium"
+
 # Nodes are disabled by default. The Gateway binds only to loopback; publish
 # this narrow service through a separately managed HTTPS transport adapter.
 [nodes.gateway]

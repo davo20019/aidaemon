@@ -594,6 +594,29 @@ pub struct TestHarness {
     _skills_dir: tempfile::TempDir,
 }
 
+/// What keeps a [`TestHarness`]'s database and skills directory alive after
+/// its agent is taken out with [`TestHarness::into_agent`].
+pub struct HarnessFiles {
+    pub state: Arc<SqliteStateStore>,
+    _db_file: tempfile::NamedTempFile,
+    _skills_dir: tempfile::TempDir,
+}
+
+impl TestHarness {
+    /// The agent, to hand to something that owns it, and the files that must
+    /// outlive it.
+    pub fn into_agent(self) -> (Agent, HarnessFiles) {
+        (
+            self.agent,
+            HarnessFiles {
+                state: self.state,
+                _db_file: self._db_file,
+                _skills_dir: self._skills_dir,
+            },
+        )
+    }
+}
+
 /// Build a fully-wired agent with mock provider and temp-file SQLite DB.
 ///
 /// Each call creates an isolated database, so tests can run in parallel.

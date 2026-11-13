@@ -186,6 +186,7 @@ impl Updater {
         let send_result = self
             .approval_tx
             .send(ApprovalRequest {
+                expires_at_ms: None,
                 card: None,
                 command: description,
                 session_id,

@@ -25,6 +25,22 @@ const APPROVAL_REMINDER_BEFORE: Duration = Duration::from_secs(60);
 const APPROVAL_REMINDER: &str = "⏳ Still waiting for your answer on the card above. It \
 expires in about a minute; then that step is skipped, not refused.";
 
+tokio::task_local! {
+    /// Set by the hub around a card it may close because the card was
+    /// answered elsewhere (the Client Gateway): the closing line to show
+    /// on the card instead of "expired".
+    pub(crate) static ANSWERED_ELSEWHERE: Arc<std::sync::Mutex<Option<String>>>;
+}
+
+/// The closing line set for the card being dropped, if it was answered
+/// elsewhere.
+fn answered_elsewhere() -> Option<String> {
+    ANSWERED_ELSEWHERE
+        .try_with(|note| note.lock().ok().and_then(|note| note.clone()))
+        .ok()
+        .flatten()
+}
+
 #[derive(Clone, Copy)]
 enum Kind {
     Approval,
@@ -61,6 +77,7 @@ impl Drop for Unanswered {
             return;
         }
         let (id, open, channel) = (self.id.clone(), self.open.clone(), self.channel.clone());
+        let elsewhere = answered_elsewhere();
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -69,10 +86,14 @@ impl Drop for Unanswered {
                 return; // answered meanwhile
             };
             if let Some((message, text)) = prompt.shown {
-                if let Err(error) = channel
-                    .edit(&message, &expired_text(prompt.kind, &text))
-                    .await
-                {
+                let closed = match elsewhere {
+                    Some(line) => format!(
+                        "{}\n\n{line}",
+                        approval_render::strip_approval_footer(&text).trim_end()
+                    ),
+                    None => expired_text(prompt.kind, &text),
+                };
+                if let Err(error) = channel.edit(&message, &closed).await {
                     warn!(%error, prompt = %id, "Failed to mark an unanswered prompt expired");
                 }
             }
@@ -442,6 +463,46 @@ mod tests {
             assert!(edit.text.contains("Expired"), "{}", edit.text);
             assert!(!prompts.is_open(&channel.prompts()[0].id).await);
         }
+    }
+
+    /// A card closed because it was answered elsewhere (the hub sets the
+    /// line around the ask) says that answer, not "expired".
+    #[tokio::test]
+    async fn a_card_answered_elsewhere_says_so() {
+        use crate::testing::{direct, TestChannel};
+        let channel = Arc::new(
+            TestChannel::new("synthetic")
+                .with_buttons(true)
+                .with_edits(true),
+        );
+        let prompts = Prompts::default();
+        let conversation = direct("synthetic-user-1");
+        let pages = ["Your assistant wants to run a command on your computer.".to_string()];
+        let note = Arc::new(std::sync::Mutex::new(None));
+        let mut ask = Box::pin(ANSWERED_ELSEWHERE.scope(
+            note.clone(),
+            prompts.ask(
+                channel.clone(),
+                &conversation,
+                Kind::Approval,
+                &pages,
+                approval_choices(false, true),
+                Duration::from_secs(60),
+            ),
+        ));
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut ask)
+            .await
+            .is_err());
+        *note.lock().unwrap() = Some("✅ Allowed this once, from the app.".to_string());
+        drop(ask);
+        assert!(
+            channel
+                .wait_for(Duration::from_secs(2), |c| !c.edits().is_empty())
+                .await
+        );
+        let edit = &channel.edits()[0];
+        assert!(edit.text.contains("from the app"), "{}", edit.text);
+        assert!(!edit.text.contains("Expired"), "{}", edit.text);
     }
 
     /// A waiting approval card gets one reminder before it expires.

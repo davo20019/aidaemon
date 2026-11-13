@@ -98,6 +98,7 @@ impl ApprovalBroker {
             response_tx,
             kind,
             card,
+            expires_at_ms,
         } = req;
 
         let (broker_response_tx, broker_response_rx) = tokio::sync::oneshot::channel();
@@ -110,6 +111,7 @@ impl ApprovalBroker {
             response_tx: broker_response_tx,
             kind,
             card,
+            expires_at_ms,
         };
         if let Err(error) = self.tx.send(forwarded).await {
             if let Err(persist_error) =

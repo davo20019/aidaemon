@@ -224,6 +224,9 @@ pub fn run() -> anyhow::Result<()> {
                 println!("  dashboard             Open the authenticated local dashboard");
                 println!("  dashboard login-url   Print a local dashboard login URL");
                 println!("  node <command>        Pair, inspect, authorize, or revoke Nodes");
+                println!(
+                    "  client-token          Mint the local Client Gateway token (revokes the old)"
+                );
                 println!("  keychain set <key>    Store a secret in the OS keychain");
                 println!("  keychain get <key>    Retrieve a secret from the OS keychain");
                 println!("  keychain delete <key> Remove a secret from the OS keychain");
@@ -290,6 +293,9 @@ pub fn run() -> anyhow::Result<()> {
             }
             "node" => {
                 return nodes::cli::handle_node_command(&args[2..], config_path.as_path());
+            }
+            "client-token" => {
+                return handle_client_token_command(&args[2..], config_path.as_path());
             }
             other => {
                 if let Some(agent) = normalize_terminal_agent_name(other) {
@@ -685,6 +691,55 @@ fn handle_agent_command(args: &[String]) -> anyhow::Result<()> {
         }
         other => anyhow::bail!("Unknown agent command: {other}"),
     }
+}
+
+/// `aidaemon client-token [--path FILE]`: mint the local token the Client
+/// Gateway accepts (its hash goes to the gateway's token file; the token is
+/// printed once). Minting again revokes the previous token.
+fn handle_client_token_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
+    let mut path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--path" => {
+                let Some(value) = args.get(i + 1) else {
+                    anyhow::bail!("Missing value for --path");
+                };
+                path = Some(PathBuf::from(value));
+                i += 2;
+            }
+            "-h" | "--help" => {
+                println!("Usage: aidaemon client-token [--path FILE]");
+                println!();
+                println!("Mint the token local apps use with the Client Gateway");
+                println!("([client_gateway] in config.toml). The old token stops working.");
+                return Ok(());
+            }
+            other => anyhow::bail!("Unknown client-token option: {other}"),
+        }
+    }
+    let path = match path {
+        Some(path) => path,
+        None => {
+            // Read only the gateway's table: loading the whole config would
+            // resolve secrets from the keychain.
+            let settings = std::fs::read_to_string(config_path)
+                .ok()
+                .and_then(|text| text.parse::<toml::Table>().ok())
+                .and_then(|table| table.get("client_gateway").cloned())
+                .and_then(|value| value.try_into().ok())
+                .unwrap_or_default();
+            crate::startup::client_gateway::token_file(&settings)
+        }
+    };
+    let token = aidaemon_client_gateway::token::mint(&path)?;
+    println!("{token}");
+    eprintln!(
+        "Client Gateway token minted (hash kept at {}). Use it as `Authorization: Bearer <token>`; \
+         it is not shown again.",
+        path.display()
+    );
+    Ok(())
 }
 
 /// `aidaemon auth …` — manage subscription-based model logins.
