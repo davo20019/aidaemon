@@ -48,6 +48,10 @@
           ],
           "type": "string"
         },
+        "deliver": {
+          "description": "For 'screenshot': true sends this capture to the owner now, as the deliverable their request asked for. Default false: the capture is saved and kept for you to look at, not sent. Leave it false for any capture that checks a page (it may have redirected or not be ready); set it only when you know the page is the one asked for, or send a kept capture later with send_file.",
+          "type": "boolean"
+        },
         "direction": {
           "description": "Direction for 'scroll' (default: down)",
           "enum": [
