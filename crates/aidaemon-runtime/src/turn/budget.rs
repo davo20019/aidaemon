@@ -13,7 +13,6 @@ use tracing::{info, warn};
 
 use crate::host::TurnHost;
 use crate::turn::completion_contract::{CompletionContract, CompletionProgress};
-use crate::turn::helpers::send_status;
 use crate::turn::loop_utils::MAX_CONSECUTIVE_SAME_TOOL;
 use crate::turn::post_task::{self, LearningContext};
 use crate::turn::system_directives::SystemDirective;
@@ -463,17 +462,6 @@ pub async fn enforce_goal_daily_budget_control(
                 extension: *ctx.budget_extensions_count,
                 max_extensions: ctx.max_budget_extensions,
             });
-        if !ctx.is_scheduled_goal {
-            send_status(
-                ctx.status_tx,
-                StatusUpdate::BudgetExtended {
-                    old_budget: old_gbudget,
-                    new_budget: new_gbudget,
-                    extension: *ctx.budget_extensions_count,
-                    max_extensions: ctx.max_budget_extensions,
-                },
-            );
-        }
         crate::turn::task_end::emit_decision_point(
             host,
             ctx.emitter,

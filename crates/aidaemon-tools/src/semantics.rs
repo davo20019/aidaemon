@@ -2539,14 +2539,6 @@ pub trait ToolSemantics: Send + Sync {
         None
     }
 
-    /// Whether what this exact call returns is a local tool's own report of
-    /// the sites it serves on this computer (a `ddev` project's report), so
-    /// a local site it names is one this work set up even when the output
-    /// as a whole is not trusted. Default: false.
-    fn output_reports_local_sites(&self, _arguments: &str) -> bool {
-        false
-    }
-
     /// Whether this tool is currently operational.
     ///
     /// Default: true. Override for tools with dynamic backends that may be

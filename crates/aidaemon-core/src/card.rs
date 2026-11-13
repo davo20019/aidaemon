@@ -114,7 +114,27 @@ pub enum Step {
     Reporting,
 }
 
+impl ActivityKind {
+    /// Whether its words say what is being done. `Check` and `Change` are
+    /// the kinds of a tool without one of its own: "Checking things" says
+    /// nothing, so a card shows no step rather than that filler.
+    pub fn says_what(self) -> bool {
+        !matches!(self, Self::Check | Self::Change)
+    }
+}
+
 impl Step {
+    /// Whether a card shows this step: a typed step that says what is being
+    /// done. A generic kind of work ([`ActivityKind::says_what`]) is shown
+    /// as nothing.
+    pub fn is_shown(&self) -> bool {
+        match self {
+            Self::Doing(kind) => kind.says_what(),
+            // Work that goes on elsewhere says so, whatever its kind.
+            Self::HandedOff(_) | Self::Output(_) | Self::Reporting => true,
+        }
+    }
+
     /// The plain words the owner reads for it.
     pub fn words(&self) -> String {
         match self {
@@ -146,6 +166,20 @@ pub struct HelperView {
     /// and already worded for the owner ("Took 21s (2:21:16 PM to 2:21:37 PM
     /// ET)."). Never worked out from anything a model wrote.
     pub took: Option<String>,
+    /// Once it ended, how long after the owner's request that started it,
+    /// as the runtime measured it: what "how long did it take" means to the
+    /// owner, request to finish.
+    pub since_request: Option<SinceRequest>,
+}
+
+/// How long after the owner's request a helper ended, measured by the
+/// runtime: the seconds (so a card with several helpers knows which ended
+/// last) and the same span already worded for the owner ("4m 10s after
+/// your request (5:37:57 AM to 5:42:07 AM ET)").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinceRequest {
+    pub secs: u64,
+    pub words: String,
 }
 
 impl HelperView {
@@ -157,6 +191,7 @@ impl HelperView {
             background,
             step,
             took: None,
+            since_request: None,
         }
     }
 }

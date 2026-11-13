@@ -169,8 +169,14 @@ impl RunState {
                 _ => None,
             },
             // Its measured time goes with its result, the parent's record
-            // of it: the card says only how it ended.
+            // of it: the card says how it ended and, when a request started
+            // it, how long after that request it ended, so a card of
+            // several runs can say when the last one did.
             took: None,
+            since_request: self
+                .requested_at
+                .zip(self.ended_at)
+                .map(|(requested, ended)| crate::spawn_tool::since_request_view(requested, ended)),
         }
     }
 }

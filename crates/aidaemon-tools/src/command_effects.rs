@@ -951,50 +951,6 @@ fn folder_name(operand: &str) -> Option<String> {
     (!matches!(name, "" | "." | "..")).then(|| name.to_string())
 }
 
-/// `ddev` subcommands whose output is ddev's own report of a local project,
-/// with the addresses it serves the project on.
-const DDEV_PROJECT_REPORTS: &[&str] = &[
-    "start", "restart", "describe", "status", "st", "list", "config",
-];
-
-/// Whether `command`'s output is a local `ddev` project's own report: at
-/// least one `ddev` project report (start, describe, ...), and otherwise only
-/// `cd`, filters that read nothing but that output (`head`, `tail`, `grep`
-/// or `jq` with no file operand) and `echo` lines that name no address. The
-/// sites such output names are ones this work set up, even when the run as
-/// a whole is not trusted output (ddev needs the network capability in the
-/// sandbox). No file or other program can add an address to it.
-pub fn reports_ddev_sites(command: &str) -> bool {
-    let reports = std::cell::Cell::new(false);
-    let shaped = every_segment(command, &|program, args| match program {
-        "ddev" => {
-            let report = !args.iter().any(|arg| {
-                DDEV_TOOL_CODE_OPTIONS
-                    .iter()
-                    .any(|option| arg == option || arg.starts_with(&format!("{option}=")))
-            }) && args
-                .iter()
-                .find(|arg| !arg.starts_with('-'))
-                .is_some_and(|sub| DDEV_PROJECT_REPORTS.contains(&sub.as_str()));
-            if report {
-                reports.set(true);
-            }
-            report
-        }
-        "cd" => true,
-        "echo" => !args.iter().any(|arg| arg.contains(':')),
-        "head" | "tail" => args
-            .iter()
-            .all(|arg| arg.starts_with('-') || arg.chars().all(|c| c.is_ascii_digit())),
-        "grep" | "jq" => {
-            observation_args_ok(program, args)
-                && args.iter().filter(|arg| !arg.starts_with('-')).count() <= 1
-        }
-        _ => false,
-    });
-    shaped && reports.get()
-}
-
 /// A `curl` or `wget` call in a shape the option tables understand whose
 /// every address (operands and `--url`) points at this computer alone.
 fn reads_only_local_sites(program: &str, args: &[String]) -> bool {
@@ -3817,34 +3773,6 @@ mod tests {
             "python3"
         );
         assert_eq!(program_label(""), "a command");
-    }
-
-    /// A ddev project report names the sites it serves; filters over it
-    /// keep that, but a file, another program or an echoed address could
-    /// add one, so they do not count.
-    #[test]
-    fn ddev_project_reports_are_recognised_by_shape() {
-        for report in [
-            "ddev start",
-            "cd /srv/demo && ddev start 2>&1; echo ---; ddev describe 2>&1 | head -30",
-            "ddev describe -j | jq -r .raw.primary_url",
-            "ddev status | grep -i url",
-            "ddev config --project-type=drupal11 --docroot=web && ddev start",
-        ] {
-            assert!(reports_ddev_sites(report), "{report}");
-        }
-        for other in [
-            "ddev drush uli",
-            "ddev describe; cat notes.txt",
-            "ddev describe; echo http://other.localhost",
-            "ddev describe | grep url notes.txt",
-            "ddev exec cat /etc/hosts",
-            "curl -s http://claude-drupal-2.ddev.site",
-            "echo ---",
-            "ddev describe $(cat x)",
-        ] {
-            assert!(!reports_ddev_sites(other), "{other}");
-        }
     }
 
     /// A local project's own status queries (a project report, read-only

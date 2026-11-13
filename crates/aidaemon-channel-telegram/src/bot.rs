@@ -2069,20 +2069,15 @@ async fn run_legacy_status_consumer(
             continue;
         }
         // In non-DM channels, suppress progress chatter.
-        if !is_dm {
-            if matches!(&update, StatusUpdate::BudgetExtended { .. }) {
-                // Fall through — cost notifications must reach the user
-            } else {
-                continue;
-            }
+        if !is_dm && !update.requires_immediate_delivery() {
+            continue;
         }
         let now = tokio::time::Instant::now();
-        // Explicit user actions and BudgetExtended notifications must always be
-        // delivered. Ordinary progress remains rate-limited even when the task
+        // Explicit user actions must always be delivered. Ordinary progress remains rate-limited even when the task
         // description happens to include a URL.
         let is_immediate = update.requires_immediate_delivery();
         // Hard cap on DM status messages to prevent notification spam.
-        // BudgetExtended and explicit user actions always bypass the cap.
+        // Explicit user actions always bypass the cap.
         if !is_immediate && dm_status_count >= MAX_DM_STATUS_MESSAGES {
             // After the cap, just send typing indicator instead
             let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;

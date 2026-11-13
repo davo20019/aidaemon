@@ -5,12 +5,16 @@
 //! work set up itself (a dev server it started, a `ddev` project it created)
 //! or one the owner's request names is part of what was asked, so it needs
 //! no card. The runtime notes such sites here, keyed by the session whose
-//! approvals cover the work (the chat, shared by its sub-agents), from two
-//! typed sources only: the owner's own request, and the output of a tool
-//! call the run made whose output is typed as trusted (local, not content
-//! from outside). Each site is kept by the key the browser approves sites
-//! under ([`crate::web::local_site_key`]), so only names that resolve to
-//! this computer alone are ever noted.
+//! approvals cover the work (the chat, shared by its sub-agents), from
+//! typed sources only: the owner's own request, the output of a tool call
+//! the run made whose output is typed as trusted (local, not content from
+//! outside), and the output of a call that set something up on this
+//! computer within the run's authority ([`set_up_locally`]): what a run
+//! created within its scope is in its scope, whatever program it used. A
+//! call that only read (a page, a file, a status query) adds nothing. Each
+//! site is kept by the key the browser approves sites under
+//! ([`crate::web::local_site_key`]), so only names that resolve to this
+//! computer alone are ever noted; any other host stays gated.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -68,6 +72,29 @@ pub fn local_sites_in(text: &str) -> Vec<String> {
     keys
 }
 
+/// The effects of work that stays on this computer: writing its files and
+/// starting or changing its processes.
+const LOCAL_SETUP: crate::semantics::ToolMutationEffects =
+    crate::semantics::ToolMutationEffects::LOCAL_SOURCE_WRITE
+        .union(crate::semantics::ToolMutationEffects::LOCAL_WORKSPACE_WRITE)
+        .union(crate::semantics::ToolMutationEffects::LOCAL_DERIVED_WRITE)
+        .union(crate::semantics::ToolMutationEffects::PROCESS_STATE);
+
+/// Whether a call set something up on this computer, so the local sites
+/// its output names are ones the run created: it ran (it did not fail or
+/// get refused; a launch still running counts, a non-zero exit after it
+/// ran does too) and its typed effects are local changes only, at least
+/// one of them. Any effect beyond this computer (a delivery, a remote
+/// change, an unspecified one) or no effect at all: its output may carry
+/// content from elsewhere, so it sets nothing up.
+pub fn set_up_locally(
+    status: crate::semantics::ToolOutcomeStatus,
+    semantics: &crate::semantics::ToolCallSemantics,
+) -> bool {
+    let effects = semantics.mutation_effects;
+    !status.is_failure() && !effects.is_empty() && LOCAL_SETUP.contains(effects)
+}
+
 /// Note `keys` as sites the work in `grant_session` set up or was asked for.
 pub fn note(grant_session: &str, keys: &[String]) {
     if grant_session.trim().is_empty() || keys.is_empty() {
@@ -123,6 +150,47 @@ pub fn is_noted(grant_session: &str, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run may open a local site it set up itself (its own install
+    /// command printed it), never one a read, a page or a delivery named.
+    #[test]
+    fn only_a_call_that_set_something_up_locally_brings_its_sites() {
+        use crate::semantics::{ToolCallSemantics, ToolMutationEffects, ToolOutcomeStatus};
+        let changed = |effects| ToolCallSemantics::observation_and_mutation_with(effects);
+        let install = changed(
+            ToolMutationEffects::LOCAL_WORKSPACE_WRITE.union(ToolMutationEffects::PROCESS_STATE),
+        );
+        for status in [
+            ToolOutcomeStatus::Succeeded,
+            ToolOutcomeStatus::CompletedWithNegativeResult,
+            ToolOutcomeStatus::Backgrounded,
+        ] {
+            assert!(set_up_locally(status, &install), "{status:?}");
+        }
+        for status in [
+            ToolOutcomeStatus::FailedPermanent,
+            ToolOutcomeStatus::FailedRetryable,
+            ToolOutcomeStatus::Blocked,
+        ] {
+            assert!(!set_up_locally(status, &install), "{status:?}");
+        }
+        let succeeded = ToolOutcomeStatus::Succeeded;
+        assert!(!set_up_locally(
+            succeeded,
+            &ToolCallSemantics::observation()
+        ));
+        for elsewhere in [
+            ToolMutationEffects::EXTERNAL_DELIVERY,
+            ToolMutationEffects::REMOTE_MUTATION,
+            ToolMutationEffects::UNSPECIFIED,
+            ToolMutationEffects::PROCESS_STATE.union(ToolMutationEffects::EXTERNAL_DELIVERY),
+        ] {
+            assert!(
+                !set_up_locally(succeeded, &changed(elsewhere)),
+                "{elsewhere:?}"
+            );
+        }
+    }
 
     #[test]
     fn addresses_are_read_out_of_command_output() {

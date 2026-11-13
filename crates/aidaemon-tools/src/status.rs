@@ -80,13 +80,6 @@ pub enum StatusUpdate {
         reason: String,
         new_total_steps: usize,
     },
-    /// Token budget was auto-extended due to productive progress.
-    BudgetExtended {
-        old_budget: i64,
-        new_budget: i64,
-        extension: usize,
-        max_extensions: usize,
-    },
     /// The task plan as the single live card shows it: its rendering and
     /// its step count, which decides whether the card is kept.
     Checklist(aidaemon_core::card::PlanCard),
@@ -114,10 +107,11 @@ impl StatusUpdate {
     /// Whether a channel must deliver this update immediately instead of
     /// treating it as optional, rate-limited progress.
     pub fn requires_immediate_delivery(&self) -> bool {
-        matches!(
-            self,
-            Self::UserActionRequired { .. } | Self::BudgetExtended { .. }
-        )
+        // A token budget extended on productive progress is the run's own
+        // bookkeeping, never a status of its own: the owner acts on nothing
+        // (live 2026-11-13: seven "Auto-extended token budget" lines in one
+        // turn). It stays in the logs and the run's decision records.
+        matches!(self, Self::UserActionRequired { .. })
     }
 }
 

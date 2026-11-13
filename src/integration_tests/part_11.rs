@@ -342,19 +342,22 @@ async fn test_task_budget_auto_extends_on_progress() {
         "Agent should return a non-empty response"
     );
 
-    // BudgetExtended may or may not be emitted depending on whether the
-    // stopping_phase's stall-with-progress path fires before the budget check.
-    // We only verify if the agent completed successfully (reached final text).
+    // The extension is the run's own bookkeeping: whether or not it
+    // happened, nothing about the budget reaches the chat.
     let updates = collect_status_updates(status_rx).await;
-    if response.contains("Task completed successfully.") {
-        let budget_extended = updates
-            .iter()
-            .any(|u| matches!(u, StatusUpdate::BudgetExtended { .. }));
-        assert!(
-            budget_extended,
-            "Expected BudgetExtended status update when agent completes normally"
-        );
-    }
+    assert!(
+        !budget_reaches_chat(&updates),
+        "a budget extension is never a chat status"
+    );
+}
+
+/// Whether any status update would put a line about the token budget in
+/// the chat.
+fn budget_reaches_chat(updates: &[StatusUpdate]) -> bool {
+    updates.iter().any(|update| {
+        aidaemon_channels::turns::status_text(update)
+            .is_some_and(|text| text.to_lowercase().contains("budget"))
+    })
 }
 
 /// Short productive runs should also auto-extend once they have concrete
@@ -429,14 +432,10 @@ async fn test_task_budget_stops_when_not_productive() {
     // (stall_count > 0 makes is_productive=false)
     assert_ne!(response, "Should not reach this.");
 
-    // Verify NO BudgetExtended was emitted
     let updates = collect_status_updates(status_rx).await;
-    let budget_extended = updates
-        .iter()
-        .any(|u| matches!(u, StatusUpdate::BudgetExtended { .. }));
     assert!(
-        !budget_extended,
-        "BudgetExtended should NOT be emitted when agent is stalling"
+        !budget_reaches_chat(&updates),
+        "nothing about the budget reaches the chat when the agent is stalling"
     );
 }
 
@@ -887,10 +886,8 @@ async fn test_scheduled_goal_daily_budget_is_backstop_only_during_active_run() {
 
     let updates = collect_status_updates(status_rx).await;
     assert!(
-        !updates
-            .iter()
-            .any(|u| matches!(u, StatusUpdate::BudgetExtended { .. })),
-        "Daily backstop should not trigger an in-run budget extension for scheduled goals"
+        !budget_reaches_chat(&updates),
+        "a scheduled goal's budget is never a chat status"
     );
 
     let updated_goal = harness.state.get_goal(&goal.id).await.unwrap().unwrap();
@@ -1032,10 +1029,7 @@ async fn test_scheduled_goal_run_budget_auto_extends_once_on_progress() {
 
     assert_eq!(response, "Scheduled task completed autonomously.");
     assert!(
-        collect_status_updates(status_rx)
-            .await
-            .iter()
-            .all(|update| !matches!(update, StatusUpdate::BudgetExtended { .. })),
+        !budget_reaches_chat(&collect_status_updates(status_rx).await),
         "scheduled budget adaptation should remain an internal event, not an owner interruption"
     );
 

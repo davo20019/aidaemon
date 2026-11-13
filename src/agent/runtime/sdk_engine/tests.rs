@@ -5088,9 +5088,16 @@ impl crate::traits::Tool for SiteReportProbe {
             .lock()
             .unwrap()
             .push(facts.grants_session().to_string());
-        Ok(crate::traits::ToolCallOutcome::from_output(
-            self.output.to_string(),
-        ))
+        let mut outcome = crate::traits::ToolCallOutcome::from_output(self.output.to_string());
+        if self.reports {
+            // It set the site up here: a local install and start.
+            outcome.metadata.semantics =
+                crate::traits::ToolCallSemantics::observation_and_mutation_with(
+                    crate::traits::ToolMutationEffects::LOCAL_WORKSPACE_WRITE
+                        .union(crate::traits::ToolMutationEffects::PROCESS_STATE),
+                );
+        }
+        Ok(outcome)
     }
 }
 
@@ -5104,15 +5111,13 @@ impl crate::traits::ToolSemantics for SiteReportProbe {
             high_impact_write: false,
         }
     }
-    fn output_reports_local_sites(&self, _arguments: &str) -> bool {
-        self.reports
-    }
 }
 
-/// A sub-agent's `ddev` report names the site it set up: the site is noted
-/// under the chat's grant session (the one the browser checks for the
-/// sub-agent and the parent alike), though the report is untrusted output.
-/// A site named in other untrusted output is not.
+/// A sub-agent's call that set a site up on this computer names it: the
+/// site is in the run's scope and noted under the chat's grant session (the
+/// one the browser checks for the sub-agent and the parent alike), though
+/// the output is untrusted. A site named in a read of other untrusted output
+/// is not: the run did not create it.
 #[tokio::test]
 async fn a_sub_agents_local_site_report_covers_the_whole_chat() {
     use crate::testing::MockProvider;

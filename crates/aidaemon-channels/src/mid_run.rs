@@ -118,7 +118,9 @@ impl LiveWork {
             return;
         };
         let step = match update {
-            StatusUpdate::ToolStart { kind, .. } => Some(kind.words().to_string()),
+            StatusUpdate::ToolStart { kind, .. } => {
+                kind.says_what().then(|| kind.words().to_string())
+            }
             StatusUpdate::ProgressSummary { summary, .. } => Some(summary.clone()),
             StatusUpdate::PlanStepStart {
                 step_index,

@@ -6286,6 +6286,58 @@ mod tests {
         );
     }
 
+    /// The live Drupal helper (2026-11-13): it launched `ddev start`, looked
+    /// at it while it ran, and the launch's completion ended it. The check
+    /// is a finished observation, so nothing is left in flight once the
+    /// launch ended, and the run reads as having finished its work.
+    #[test]
+    fn checking_a_running_launch_leaves_nothing_in_flight_once_it_ends() {
+        let mut events = vec![
+            executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::PROCESS_STATE,
+                false,
+                &[],
+                "completed",
+            )]),
+            call("start", "terminal"),
+            result(
+                "start",
+                "terminal",
+                ToolOutcomeStatus::Backgrounded,
+                0,
+                effect_semantics(ToolMutationEffects::PROCESS_STATE, None),
+            ),
+            call("check", "terminal"),
+            result(
+                "check",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                terminal_observation_semantics(None),
+            ),
+        ];
+        renumber(&mut events);
+        assert!(
+            RunAggregate::replay("task-1", &events).has_background_in_flight(),
+            "the launch runs until its completion"
+        );
+        events.push(result(
+            "start",
+            "terminal",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            effect_semantics(ToolMutationEffects::PROCESS_STATE, None),
+        ));
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(!aggregate.has_background_in_flight());
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Satisfied
+        );
+    }
+
     /// An effect whose receipts do not touch the item's target is credited
     /// only when the target was observed after the work, never by an
     /// observation that predates it or by one of another target.

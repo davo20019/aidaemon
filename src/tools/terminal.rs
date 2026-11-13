@@ -84,25 +84,72 @@ const PARTIAL_OUTPUT_TAIL_BYTES: usize = 1500;
 /// How often a running command's latest output line is sent as its progress.
 const COMMAND_OUTPUT_PROGRESS_EVERY: Duration = Duration::from_secs(3);
 
-/// The last non-empty line a command printed so far (a carriage return
-/// starts a new line, as a progress bar redraws), secrets redacted, cut to
-/// a card's width. `None` before it printed anything.
+/// The last line a command printed so far that says something (a carriage
+/// return starts a new line, as a progress bar redraws), as text: terminal
+/// escape sequences (colours, cursor moves, titles) and control characters
+/// removed, secrets redacted, cut to a card's width. A line with no letter
+/// or digit (a bar of `=`, a spinner) says nothing and is skipped. `None`
+/// before it printed anything that does (live 2026-11-13: "last output: For
+/// full details use 'ddev describe'.[0m").
 pub(crate) fn latest_output_line(output: &[u8]) -> Option<String> {
     const MAX_CHARS: usize = 100;
     let start = output.len().saturating_sub(4096);
-    let tail = String::from_utf8_lossy(&output[start..]);
+    let tail = strip_terminal_controls(&String::from_utf8_lossy(&output[start..]));
     let line = tail
         .split(['\n', '\r'])
         .map(|line| line.trim())
-        .rfind(|line| !line.is_empty())?;
-    let line: String = line.chars().filter(|c| !c.is_control()).collect();
-    let line = crate::tools::sanitize::redact_secrets_only(&line);
+        .rfind(|line| line.chars().any(char::is_alphanumeric))?;
+    let line = crate::tools::sanitize::redact_secrets_only(line);
     Some(if line.chars().count() > MAX_CHARS {
         let cut: String = line.chars().take(MAX_CHARS - 1).collect();
         format!("{}\u{2026}", cut.trim_end())
     } else {
         line
     })
+}
+
+/// `text` without terminal escape sequences or control characters, line
+/// breaks kept: CSI sequences (`ESC [ … final`, colours and cursor moves),
+/// OSC strings (`ESC ] … BEL` or `ESC \\`, window titles and links), and
+/// the short `ESC x` / `ESC ( x` forms.
+fn strip_terminal_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                Some('(' | ')' | '*' | '+' | '#' | '%') => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            '\u{9b}' => {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            '\n' | '\r' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// A disowned background process (notifier-active, non-detached) that makes no
@@ -832,9 +879,6 @@ pub struct TerminalTool {
     /// by pid: `check` and `kill` output carries it; an unknown pid is
     /// untrusted. Daemon-held; the model can only name a pid.
     launch_trust: Arc<std::sync::Mutex<HashMap<u32, aidaemon_core::SourceTrust>>>,
-    /// Background processes whose output is a local `ddev` project's own
-    /// report (see `command_effects::reports_ddev_sites`), by pid.
-    site_report_pids: Arc<std::sync::Mutex<HashSet<u32>>>,
     initial_timeout: Duration,
     max_output_chars: usize,
     pool: Option<SqlitePool>,
@@ -3314,7 +3358,6 @@ impl TerminalTool {
             task_processes: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             launch_trust: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            site_report_pids: Arc::new(std::sync::Mutex::new(HashSet::new())),
             initial_timeout: Duration::from_secs(initial_timeout_secs),
             max_output_chars,
             pool: Some(pool),
@@ -5414,12 +5457,6 @@ impl TerminalTool {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(pid, launch_trust);
-                if crate::tools::command_effects::reports_ddev_sites(command) {
-                    self.site_report_pids
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(pid);
-                }
                 self.running.lock().await.insert(pid, proc);
                 self.insert_indexes_for_process(
                     pid,
@@ -6331,12 +6368,21 @@ impl TerminalTool {
                 "\n\nUse action=\"check\" pid={} to check again, or action=\"kill\" pid={} to stop.",
                 pid, pid
             ));
+            // Looking at a running process starts nothing: the check is a
+            // finished observation of it ("still running"). The invocation
+            // still in flight is the launch, whose own receipt is the
+            // provisional one and whose completion ends it. Typed as a
+            // `Backgrounded` handoff carrying the launch's effects, each
+            // check read as one more launch that never ended, and the run
+            // that made it as never finished (live 2026-11-13: a Drupal
+            // helper that checked its `ddev start` while it ran was judged
+            // "didn't finish" though its site was up).
             let mut metadata = background_observation_metadata(
-                ToolOutcomeStatus::Backgrounded,
+                ToolOutcomeStatus::Succeeded,
                 proc.detached,
                 proc.notifier_active && !proc.detached,
             );
-            metadata.semantics = proc.semantics.clone();
+            metadata.semantics = terminal_call_semantics(r#"{"action":"check"}"#);
             Ok(ToolCallOutcome {
                 output,
                 metadata,
@@ -7855,27 +7901,6 @@ impl crate::traits::ToolSemantics for TerminalTool {
         .flatten()
     }
 
-    fn output_reports_local_sites(&self, arguments: &str) -> bool {
-        let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
-            return false;
-        };
-        match TerminalAction::parse(&args.action) {
-            // A background process's output: the shape judged at launch.
-            TerminalAction::Check | TerminalAction::Kill => args.pid.is_some_and(|pid| {
-                self.site_report_pids
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains(&pid)
-            }),
-            TerminalAction::Run | TerminalAction::Unrecognized => args
-                .command
-                .as_deref()
-                .or(args.script.as_deref())
-                .is_some_and(crate::tools::command_effects::reports_ddev_sites),
-            TerminalAction::TrustAll => false,
-        }
-    }
-
     fn call_access_manifest(&self, arguments: &str) -> crate::traits::ToolCallAccessManifest {
         terminal_access_manifest(arguments)
     }
@@ -8050,6 +8075,29 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// A command's latest line on a card is text: colour codes, cursor
+    /// moves and titles are gone, and a line that says nothing is skipped
+    /// (live 2026-11-13: "last output: For full details use 'ddev
+    /// describe'.[0m").
+    #[test]
+    fn a_commands_latest_line_is_plain_text() {
+        let ddev = b"\x1b[32mSuccessfully started demo\x1b[0m\nFor full details use 'ddev describe'.\x1b[0m\n";
+        assert_eq!(
+            latest_output_line(ddev).as_deref(),
+            Some("For full details use 'ddev describe'.")
+        );
+        let titled = b"\x1b]0;window title\x07Building \x1b[1;34mstep 3\x1b[K\r\x1b(B";
+        assert_eq!(
+            latest_output_line(titled).as_deref(),
+            Some("Building step 3")
+        );
+        assert_eq!(
+            latest_output_line(b"Downloading\n[=====>     ]\r\x1b[2K|\n").as_deref(),
+            Some("Downloading")
+        );
+        assert_eq!(latest_output_line(b"\x1b[0m\n----\n"), None);
+    }
 
     /// The dispatcher's context for an owner's call the kernel approved.
     fn kernel_owner_ctx() -> ToolCallContext {
@@ -10109,26 +10157,6 @@ mod tests {
         assert!(ann("ddev wp plugin install akismet").egress);
     }
 
-    /// A `ddev` project report run in the sandbox needs the network
-    /// capability, so its output is untrusted; it is still typed as the
-    /// project's own report of its sites, and a background report keeps
-    /// that for its `check`.
-    #[tokio::test]
-    async fn a_ddev_report_is_typed_as_a_local_site_report() {
-        let (_, sandboxed) = host_and_sandboxed_terminals().await;
-        let run = |command: &str| {
-            serde_json::json!({"action":"run","command":command,"network":true}).to_string()
-        };
-        let report = run("cd /tmp/synthetic-site && ddev start 2>&1; ddev describe | head -30");
-        assert!(sandboxed.output_reports_local_sites(&report));
-        assert!(!sandboxed.output_reports_local_sites(&run("ddev drush uli")));
-        assert!(!sandboxed.output_reports_local_sites(&run("cat site-url.txt")));
-        sandboxed.site_report_pids.lock().unwrap().insert(4242);
-        let check = |pid: u32| serde_json::json!({"action":"check","pid":pid}).to_string();
-        assert!(sandboxed.output_reports_local_sites(&check(4242)));
-        assert!(!sandboxed.output_reports_local_sites(&check(4243)));
-    }
-
     /// A command reads to the owner by the title its call gave it, else by
     /// its program, never by its raw line; the title also feeds the
     /// status line.
@@ -11788,16 +11816,18 @@ mod tests {
             .unwrap();
         let pid = extract_pid_from_background_message(&outcome.output);
 
-        // Observing a still-running process is an observation, not a fresh
-        // detach: only the launch receipt carries background_started.
+        // Observing a still-running process is a finished observation, not
+        // a fresh detach or a second in-flight launch: only the launch
+        // receipt is provisional, and the check changes nothing.
         let check = tool.handle_check(pid).await.unwrap();
         assert!(check.output.contains("still running"), "{}", check.output);
         assert!(!check.metadata.background_started);
         assert!(!check.metadata.timed_out);
         assert_eq!(
             check.metadata.outcome_status,
-            Some(ToolOutcomeStatus::Backgrounded)
+            Some(ToolOutcomeStatus::Succeeded)
         );
+        assert!(!check.metadata.semantics.mutates_state());
 
         let kill = tool.handle_kill(pid).await.unwrap();
         assert!(

@@ -891,12 +891,25 @@ pub fn since_request(
     requested: chrono::DateTime<chrono::Utc>,
     done: chrono::DateTime<chrono::Utc>,
 ) -> String {
+    format!(" Done {}.", since_request_view(requested, done).words)
+}
+
+/// How long after the owner's request `done` was, for a card: its seconds
+/// and its words ("4m 10s after your request (5:37:57 AM to 5:42:07 AM
+/// ET)"), measured to the whole second like every span the owner reads.
+pub fn since_request_view(
+    requested: chrono::DateTime<chrono::Utc>,
+    done: chrono::DateTime<chrono::Utc>,
+) -> aidaemon_core::card::SinceRequest {
     let span = crate::run_state::measured_span(requested, done);
-    format!(
-        " Done {} after your request ({}).",
-        compact(span.took()),
-        owner_clock_range(span.from, span.to)
-    )
+    aidaemon_core::card::SinceRequest {
+        secs: u64::try_from(span.took().num_seconds()).unwrap_or_default(),
+        words: format!(
+            "{} after your request ({})",
+            compact(span.took()),
+            owner_clock_range(span.from, span.to)
+        ),
+    }
 }
 
 /// How long a helper took and when, for the owner, from what the runtime
@@ -2441,6 +2454,8 @@ impl SpawnAgentTool {
         tree: Option<&crate::authority::SpawnFamily>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let started = chrono::Utc::now();
+        let requested_at =
+            aidaemon_channels::turns::TurnOver::current().map(|turn| turn.requested_at());
         // The name its timing line gives it: the title the owner sees on
         // the card, else its mission.
         let helper_name = crate::spawn::child_status_label(
@@ -2480,11 +2495,23 @@ impl SpawnAgentTool {
             Ok(run) => run.phase == RunPhase::Failed,
             Err(error) => error.downcast_ref::<ChildTimedOut>().is_none(),
         };
-        let window = if failed {
+        // How long after the owner's request it ended: what the owner means
+        // by "how long did it take", on the card and for the parent to
+        // quote. Several helpers of one request each carry theirs, and the
+        // card says when the last one ended.
+        let since = requested_at.map(|requested| since_request_view(requested, measured.finished));
+        let mut window = if failed {
             failed_run_window(&helper_name, &measured)
         } else {
             run_window(&helper_name, &measured)
         };
+        if let Some(since) = since.as_ref() {
+            window.push_str(&format!(
+                "\nIt ended {} (measured from the owner's request; the last helper of a \
+                 request to end gives the whole request's time).",
+                since.words
+            ));
+        }
         // Its header on the turn's card ends with how it ended and the time
         // the runtime measured: the owner reads the time there, never as
         // the parent's arithmetic.
@@ -2500,6 +2527,7 @@ impl SpawnAgentTool {
                 background: false,
                 step: None,
                 took: Some(took_line(measured.span(), measured.waited)),
+                since_request: since,
             }));
         }
 

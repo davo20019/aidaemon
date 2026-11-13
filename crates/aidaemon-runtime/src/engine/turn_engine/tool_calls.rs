@@ -516,17 +516,21 @@ impl TurnEngine<'_> {
         let failed = executed.failed();
         let trust =
             self.call_output_trust(scope, &request.name, arguments, Some(executed.metadata()));
-        // A site on this computer named in a trusted result (a dev server
-        // or `ddev` project this work started), or in a local tool's own
-        // report of the sites it serves (a `ddev` project report, untrusted
-        // as a whole because ddev needs the network capability), is one the
-        // work set up: the browser opens it without a card, here and in
-        // every sub-agent of the chat (the grant session is the chat's).
-        // Never from outside content.
+        // A site on this computer named in a trusted result, or in the
+        // output of a call that set something up here within this run's
+        // authority (its own install or start command, whatever program;
+        // untrusted as a whole when it needed the network), is one the work
+        // created: in the run's scope, so the browser opens it without a
+        // card, here and in every sub-agent of the chat (the grant session
+        // is the chat's). Never from a read of outside content (live
+        // 2026-11-13: a WordPress helper was asked to approve opening the
+        // site it had just set up in its own folder).
         let reports_sites = trust == sdk::SourceTrust::Trusted
-            || self
-                .turn_tool(scope, &request.name)
-                .is_some_and(|tool| tool.output_reports_local_sites(arguments));
+            || matches!(
+                &executed,
+                ExecutedOutcome::Returned { outcome, status }
+                    if aidaemon_tools::local_sites::set_up_locally(*status, &outcome.metadata.semantics)
+            );
         if reports_sites {
             if let ExecutedOutcome::Returned { outcome, .. } = &executed {
                 let grant =

@@ -1146,6 +1146,8 @@ pub fn status_text(update: &StatusUpdate) -> Option<String> {
     Some(match update {
         // The working indicator says it; no line of its own.
         StatusUpdate::Thinking(_) => return None,
+        // A generic kind of work ("Checking things") says nothing.
+        StatusUpdate::ToolStart { kind, .. } if !kind.says_what() => return None,
         StatusUpdate::ToolStart { kind, .. } => progress(format!("{}…", kind.words())),
         StatusUpdate::ToolProgress { chunk, .. } => {
             let preview: String = chunk.chars().take(100).collect();
@@ -1190,7 +1192,10 @@ pub fn status_text(update: &StatusUpdate) -> Option<String> {
             summary,
             ..
         } => {
-            let base = format!("✅ Step {}/{total_steps} done: {description}", step_index + 1);
+            let base = format!(
+                "✅ Step {}/{total_steps} done: {description}",
+                step_index + 1
+            );
             match summary {
                 Some(summary) => progress(format!("{base} - {summary}")),
                 None => progress(base),
@@ -1226,21 +1231,13 @@ pub fn status_text(update: &StatusUpdate) -> Option<String> {
         } => progress(format!(
             "🔄 Plan revised: {description} ({new_total_steps} steps) - {reason}"
         )),
-        StatusUpdate::BudgetExtended {
-            old_budget,
-            new_budget,
-            extension,
-            max_extensions,
-        } => progress(format!(
-            "💰 Auto-extended token budget {old_budget} → {new_budget} ({extension}/{max_extensions}) — continuing."
-        )),
         StatusUpdate::Checklist(plan) => plan.text.clone(),
-        StatusUpdate::Helper(helper) => {
-            progress(crate::live_status::render_card(&crate::live_status::CardView {
+        StatusUpdate::Helper(helper) => progress(crate::live_status::render_card(
+            &crate::live_status::CardView {
                 helpers: vec![(helper.clone(), None)],
                 ..Default::default()
-            })?)
-        }
+            },
+        )?),
         StatusUpdate::StepHandedOff { kind } => progress(Step::HandedOff(*kind).words()),
         StatusUpdate::CommandOutput { line, .. } => progress(Step::Output(line.clone()).words()),
         StatusUpdate::OwnWork { took } => {

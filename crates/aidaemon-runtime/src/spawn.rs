@@ -1306,6 +1306,46 @@ mod tests {
         }
     }
 
+    /// The live Drupal helper (2026-11-13): every step done, its own verdict
+    /// "done", the outcome only "partial" for want of receipts. Its checks
+    /// of a running command used to leave `Backgrounded` receipts that no
+    /// completion ever ended, which read as work still in flight and the run
+    /// as "didn't finish". With every receipt terminal it succeeded; work
+    /// truly still in flight keeps it from success.
+    #[test]
+    fn a_helper_whose_receipts_all_ended_succeeded() {
+        let end: aidaemon_events::TaskEndData = serde_json::from_value(serde_json::json!({
+            "task_id": "t",
+            "status": "completed",
+            "duration_secs": 217,
+            "iterations": 36,
+            "tool_calls_count": 32,
+        }))
+        .unwrap();
+        let shape = |check: &str| {
+            let mut run = aggregate(
+                &[
+                    ("satisfied", 0),
+                    ("satisfied", 2),
+                    ("satisfied", 130),
+                    ("satisfied", 0),
+                    ("pending", 68),
+                ],
+                &[("succeeded", 128), (check, 0), ("succeeded", 2)],
+            );
+            run.executor_claimed_outcome = Some(aidaemon_events::ExecutorClaimedOutcome::Done);
+            run
+        };
+        let (phase, _) = run_phase(TaskOutcome::Partial, Some(&end), Some(&shape("succeeded")));
+        assert_eq!(phase, crate::run_state::RunPhase::Succeeded);
+        let (phase, _) = run_phase(
+            TaskOutcome::Partial,
+            Some(&end),
+            Some(&shape("backgrounded")),
+        );
+        assert_eq!(phase, crate::run_state::RunPhase::Stopped);
+    }
+
     /// A long label stops at a whole word, before any path: never a cut
     /// path or a cut word.
     #[test]

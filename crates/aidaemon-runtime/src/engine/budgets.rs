@@ -33,7 +33,6 @@ use aidaemon_core as sdk;
 use aidaemon_events::conversation::Message;
 use aidaemon_events::TaskOutcome;
 use aidaemon_tools::semantics::UserRole;
-use aidaemon_tools::status::StatusUpdate;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -221,14 +220,6 @@ pub async fn sdk_task_budget(
                 max_extensions: TASK_MAX_BUDGET_EXTENSIONS,
             },
         );
-        if let Some(status_tx) = &scope.status_tx {
-            let _ = status_tx.try_send(StatusUpdate::BudgetExtended {
-                old_budget: budget as i64,
-                new_budget: proposed as i64,
-                extension,
-                max_extensions: TASK_MAX_BUDGET_EXTENSIONS,
-            });
-        }
         info!(
             task_id = scope.task_id,
             old_budget = budget,
