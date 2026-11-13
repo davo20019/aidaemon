@@ -157,6 +157,10 @@ pub struct AppConfig {
     /// default; loopback only.
     #[serde(default)]
     pub client_gateway: aidaemon_client_gateway::ClientGatewayConfig,
+    /// Tunnels the daemon runs to publish the gateways (`[exposure.*]`).
+    /// None: nothing is exposed. Read at startup.
+    #[serde(default)]
+    pub exposure: aidaemon_exposure::ExposureConfig,
     #[serde(default)]
     pub path_aliases: PathAliasConfig,
     #[serde(default)]
@@ -2134,6 +2138,10 @@ impl AppConfig {
                 );
             }
         }
+        config
+            .exposure
+            .validate(config.client_gateway.enabled, config.nodes.gateway.enabled)
+            .map_err(|error| anyhow::anyhow!(error))?;
         if config.nodes.ota.enabled {
             anyhow::ensure!(
                 config.nodes.gateway.enabled,

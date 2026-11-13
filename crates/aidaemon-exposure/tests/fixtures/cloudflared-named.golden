@@ -1,0 +1,6 @@
+2026-11-12T22:00:00Z INF Starting tunnel tunnelID=00000000-0000-0000-0000-000000000000
+2026-11-12T22:00:00Z INF Version 2026.10.0 (Checksum synthetic)
+2026-11-12T22:00:00Z INF Settings: map[config:/tmp/cloudflare-node_gateway.yml no-autoupdate:true]
+2026-11-12T22:00:01Z INF Initial protocol quic
+2026-11-12T22:00:02Z INF Registered tunnel connection connIndex=0 connection=00000000-0000-0000-0000-000000000000 event=0 ip=198.51.100.1 location=synthetic protocol=quic
+2026-11-12T22:00:02Z INF Registered tunnel connection connIndex=1 connection=00000000-0000-0000-0000-000000000001 event=0 ip=198.51.100.2 location=synthetic protocol=quic

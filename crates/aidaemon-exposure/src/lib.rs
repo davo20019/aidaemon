@@ -18,10 +18,14 @@ use std::net::SocketAddr;
 use async_trait::async_trait;
 use tokio::sync::watch;
 
+pub mod adapters;
+pub mod config;
+mod process;
 pub mod supervisor;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
+pub use config::{Audience, CloudflareMode, ExposureConfig, ServiceExposureConfig, TailscaleMode};
 pub use supervisor::{Backoff, ExposurePlan, ExposureSupervisor, ServiceState, ServiceStatus};
 
 /// A service an adapter can publish.

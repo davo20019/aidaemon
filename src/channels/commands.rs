@@ -81,6 +81,7 @@ impl CommandContext {
                 }))),
                 Arc::new(CheckpointCommands),
                 Arc::new(crate::startup::client_gateway::DeviceCommands),
+                Arc::new(crate::startup::exposure::ExposureCommand),
             ],
         }
     }
