@@ -32,6 +32,8 @@ export interface Platform {
   /** A pairing offer handed over by the link that opened this page. */
   pairingLink(): Partial<PairRequest>;
   forgetPairingLink(): void;
+  /** Start the local daemon through its service manager (desktop only). */
+  startDaemon?(): Promise<string>;
 }
 
 const SEQ_KEY = "aidaemon.lastSeq";
@@ -226,6 +228,10 @@ class DesktopPlatform implements Platform {
   }
 
   forgetPairingLink() {}
+
+  startDaemon() {
+    return this.bridge.core.invoke<string>("start_daemon");
+  }
 }
 
 /** The platform this page runs on. */

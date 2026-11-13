@@ -60,6 +60,9 @@ members = [
     "crates/aidaemon-macros",
     "examples/parity-agent",
 ]
+# The desktop app is its own Cargo workspace (Tauri's dependencies stay out
+# of the daemon's builds, tests, clippy and publish).
+exclude = ["clients/desktop"]
 resolver = "2"
 
 [[bin]]

@@ -1,0 +1,16 @@
+{
+  "name": "aidaemon-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "The AIdaemon desktop app: a Tauri 2 shell around the web client",
+  "license": "MIT",
+  "scripts": {
+    "build:web": "npm --prefix ../web ci && npm --prefix ../web run build && node scripts/copy-web.mjs",
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

@@ -173,6 +173,9 @@ class DesktopPlatform {
         return {};
     }
     forgetPairingLink() { }
+    startDaemon() {
+        return this.bridge.core.invoke("start_daemon");
+    }
 }
 /** The platform this page runs on. */
 export function detect() {

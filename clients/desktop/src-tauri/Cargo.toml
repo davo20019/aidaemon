@@ -1,0 +1,33 @@
+[package]
+name = "aidaemon-desktop"
+description = "The AIdaemon desktop app: a Tauri 2 shell around the web client that holds the one connection to the daemon, keeps the device key in the OS keychain, and shows approvals in the tray and as native notifications"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/davo20019/aidaemon"
+publish = false
+
+# Its own workspace: the root workspace excludes clients/desktop, so Tauri's
+# dependencies stay out of the daemon's builds, tests, clippy and publish.
+[workspace]
+
+[lib]
+name = "aidaemon_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+aidaemon-client-core = { path = "../../../crates/aidaemon-client-core" }
+aidaemon-client-protocol = { path = "../../../crates/client-protocol" }
+anyhow = "1"
+dirs = "7"
+keyring = "4"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+toml = "1"

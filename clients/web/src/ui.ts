@@ -365,6 +365,14 @@ export class Screen {
       { label: "New session", hint: "Alt+N", run: () => this.newSession() },
       { label: "Stop this session's work", hint: "Esc", run: () => void (this.stop() || this.say("Nothing is running in this session.")) },
     ];
+    const start = this.platform.startDaemon?.bind(this.platform);
+    if (start && this.link.phase === "reconnecting" && this.link.kind === "daemon_not_running") {
+      items.unshift({
+        label: "Start the daemon",
+        hint: "service manager",
+        run: () => void start().then((text) => this.say(text), (error) => this.say(String(error))),
+      });
+    }
     const approval = nextApproval(this.state);
     if (approval) {
       items.push({
@@ -677,7 +685,9 @@ export class Screen {
         return "Not paired";
       case "reconnecting": {
         const seconds = Math.max(1, Math.round(link.retryInMs / 1000));
-        if (link.kind === "daemon_not_running") return `Daemon not running · retrying in ${seconds} s`;
+        if (link.kind === "daemon_not_running") {
+          return `Daemon not running · retrying in ${seconds} s${this.platform.startDaemon ? " · Ctrl+K to start it" : ""}`;
+        }
         if (link.kind === "unauthorized") return `Signed out: ${link.reason}`;
         if (link.kind === "version_unsupported") return `Daemon too new or too old: ${link.reason}`;
         return `Reconnecting in ${seconds} s · ${link.reason}`;
