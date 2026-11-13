@@ -61,4 +61,6 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
     /// What a spawned child inherited from the turn that spawned it; `None`
     /// for a root agent.
     fn inherited_authority(&self) -> Option<&crate::authority::InheritedAuthority>;
+    /// The agent's tools (their task-end hooks run when a task ends).
+    fn tools(&self) -> &[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>];
 }

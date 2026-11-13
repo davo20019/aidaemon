@@ -10,6 +10,7 @@
 //!   ([`llm::decide`]).
 //! - [`engine`]: the boundary between a turn's kernel run and its host:
 //!   the host calls, the forwarding hooks and the host provider.
+//! - [`eval`]: the per-task harness effectiveness evaluation.
 //! - [`chat_bridge`]: calling an SDK provider with chat-completions JSON,
 //!   and the classified provider errors recovery decisions read.
 //! - [`prompt`]: the system prompt's cacheable core, its fixed rule blocks
@@ -41,6 +42,7 @@ pub mod chat_bridge;
 pub mod context_budget;
 pub mod coordination;
 pub mod engine;
+pub mod eval;
 pub mod host;
 pub mod known_resources;
 pub mod llm;

@@ -366,7 +366,7 @@ async fn build_isolated_mandate_bootstrap(
         durable_task_id: agent.task_id.clone(),
         completion_task_kind: "mandate_protocol".to_string(),
         followup_mode: None,
-        config: agent.harness_eval_config.clone(),
+        config: agent.runtime.harness_eval_config.clone(),
     });
     harness_eval.record_bootstrap(
         "isolated_mandate_continue",
@@ -1439,7 +1439,7 @@ pub(in crate::agent) async fn run_bootstrap(
         durable_task_id: agent.task_id.clone(),
         completion_task_kind: "conversational".to_string(),
         followup_mode: None,
-        config: agent.harness_eval_config.clone(),
+        config: agent.runtime.harness_eval_config.clone(),
     });
     harness_eval.record_bootstrap(
         "default_continue",

@@ -156,7 +156,7 @@ pub(super) async fn emit_bootstrap_direct_reply(
             durable_task_id: agent.task_id.clone(),
             completion_task_kind: "conversational".to_string(),
             followup_mode: None,
-            config: agent.harness_eval_config.clone(),
+            config: agent.runtime.harness_eval_config.clone(),
         });
         harness_eval.record_bootstrap("bootstrap_direct_return", vec![], None);
         agent.install_harness_eval(harness_eval).await;

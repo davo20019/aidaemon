@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::eval::{HarnessEvalAccumulator, HarnessEvalConfig};
 use crate::policy::trust_tier::{classify_model_trust, ModelTrustTier, TrustTierSetting};
 use crate::prompt::core::CachedCore;
 use crate::settings::{AudioConfig, ContextWindowConfig, PolicyConfig, SttConfig, VisionConfig};
@@ -56,6 +57,11 @@ pub struct TurnRuntime {
     pub turn_anchors: TurnAnchorMemory,
     /// See [`CurrentTurnIds`].
     pub current_turn_ids: CurrentTurnIds,
+    /// The running task's harness effectiveness accumulator (taken at
+    /// task end).
+    pub harness_eval: Arc<RwLock<Option<HarnessEvalAccumulator>>>,
+    /// Harness eval scoring settings.
+    pub harness_eval_config: HarnessEvalConfig,
 }
 
 impl TurnRuntime {
@@ -67,6 +73,7 @@ impl TurnRuntime {
         audio_config: AudioConfig,
         stt_config: SttConfig,
         record_decision_points: bool,
+        harness_eval_config: HarnessEvalConfig,
     ) -> Self {
         Self {
             context_window_config,
@@ -79,7 +86,27 @@ impl TurnRuntime {
             turn_renders: Arc::default(),
             turn_anchors: Arc::default(),
             current_turn_ids: Arc::default(),
+            harness_eval: Arc::default(),
+            harness_eval_config,
         }
+    }
+
+    /// Start evaluating the running task with `accumulator`.
+    pub async fn install_harness_eval(&self, accumulator: HarnessEvalAccumulator) {
+        *self.harness_eval.write().await = Some(accumulator);
+    }
+
+    /// Apply `f` to the running task's accumulator, if one is installed.
+    pub async fn with_harness_eval<R>(
+        &self,
+        f: impl FnOnce(&mut HarnessEvalAccumulator) -> R,
+    ) -> Option<R> {
+        self.harness_eval.write().await.as_mut().map(f)
+    }
+
+    /// Whether tasks are evaluated.
+    pub fn harness_eval_enabled(&self) -> bool {
+        self.harness_eval_config.enabled
     }
 
     /// How turns render for `model`.

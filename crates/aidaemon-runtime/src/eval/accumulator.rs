@@ -1,9 +1,9 @@
-use crate::agent::CompletionContract;
-use crate::events::{
+use crate::policy::execution::ModelProfile;
+use crate::turn::completion_contract::CompletionContract;
+use aidaemon_events::{
     HarnessEvalSnapshot, HarnessScoresPayload, QualityEvalPayload, RoutingEvalPayload,
     TaskEfficiencyData, TaskOutcome,
 };
-use crate::execution_policy::ModelProfile;
 
 use super::scoring::{
     build_scores, contract_is_fulfilled, weighted_tokens_from_raw, HarnessEvalConfig,
@@ -418,7 +418,7 @@ fn model_profile_label(profile: ModelProfile) -> String {
     }
 }
 
-impl From<ProgressSnapshot> for crate::events::ProgressEvalPayload {
+impl From<ProgressSnapshot> for aidaemon_events::ProgressEvalPayload {
     fn from(value: ProgressSnapshot) -> Self {
         Self {
             iterations: value.iterations,
@@ -439,7 +439,7 @@ impl From<ProgressSnapshot> for crate::events::ProgressEvalPayload {
     }
 }
 
-impl From<ContractSnapshot> for crate::events::ContractFulfillmentPayload {
+impl From<ContractSnapshot> for aidaemon_events::ContractFulfillmentPayload {
     fn from(value: ContractSnapshot) -> Self {
         Self {
             expects_mutation: value.expects_mutation,
@@ -460,7 +460,7 @@ impl From<ContractSnapshot> for crate::events::ContractFulfillmentPayload {
     }
 }
 
-impl From<CostSnapshot> for crate::events::CostEvalPayload {
+impl From<CostSnapshot> for aidaemon_events::CostEvalPayload {
     fn from(value: CostSnapshot) -> Self {
         Self {
             total_input_tokens: value.total_input_tokens,
@@ -480,7 +480,7 @@ impl From<CostSnapshot> for crate::events::CostEvalPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{
+    use aidaemon_events::{
         ContractFulfillmentPayload, CostEvalPayload, HarnessScoresPayload, ProgressEvalPayload,
         QualityEvalPayload, RoutingEvalPayload,
     };

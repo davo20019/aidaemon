@@ -428,10 +428,6 @@ pub struct Agent {
     /// applied to the main-loop `ChatOptions.id_slot` so the interactive
     /// conversation pins a dedicated slot that background tasks cannot evict.
     interactive_slot: Option<u32>,
-    /// Per-task harness effectiveness accumulator (cleared after TaskEnd).
-    harness_eval: Arc<RwLock<Option<HarnessEvalAccumulator>>>,
-    /// Harness eval scoring configuration.
-    harness_eval_config: HarnessEvalConfig,
 }
 
 pub(in crate::agent) use system_directives::SystemDirective;
@@ -691,18 +687,18 @@ impl Agent {
     }
 
     pub(in crate::agent) async fn install_harness_eval(&self, accumulator: HarnessEvalAccumulator) {
-        *self.harness_eval.write().await = Some(accumulator);
+        self.runtime.install_harness_eval(accumulator).await;
     }
 
     pub(in crate::agent) async fn with_harness_eval<R>(
         &self,
         f: impl FnOnce(&mut HarnessEvalAccumulator) -> R,
     ) -> Option<R> {
-        self.harness_eval.write().await.as_mut().map(f)
+        self.runtime.with_harness_eval(f).await
     }
 
     pub(in crate::agent) fn harness_eval_enabled(&self) -> bool {
-        self.harness_eval_config.enabled
+        self.runtime.harness_eval_enabled()
     }
 
     /// Maximum recursion depth allowed.

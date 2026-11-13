@@ -67,4 +67,8 @@ impl TurnHost for Agent {
     fn inherited_authority(&self) -> Option<&aidaemon_runtime::authority::InheritedAuthority> {
         self.inherited_authority.as_ref()
     }
+
+    fn tools(&self) -> &[std::sync::Arc<dyn crate::traits::Tool>] {
+        &self.tools
+    }
 }

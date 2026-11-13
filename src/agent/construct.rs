@@ -214,6 +214,7 @@ impl Agent {
                 audio_config,
                 stt_config,
                 record_decision_points,
+                harness_eval_config,
             ),
             llm_runtime,
             side_calls,
@@ -275,8 +276,6 @@ impl Agent {
             execution_budget_override: None,
             specialists,
             interactive_slot,
-            harness_eval: Arc::new(RwLock::new(None)),
-            harness_eval_config,
         }
     }
 
@@ -480,6 +479,7 @@ impl Agent {
                 audio_config,
                 stt_config,
                 record_decision_points,
+                harness_eval_config,
             ),
             llm_runtime,
             side_calls,
@@ -543,8 +543,6 @@ impl Agent {
             // Sub-agents never pin the interactive slot — only the root agent's
             // main generation loop does. They default to the background slot.
             interactive_slot: None,
-            harness_eval: Arc::new(RwLock::new(None)),
-            harness_eval_config,
         }
     }
 }

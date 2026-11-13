@@ -1415,7 +1415,7 @@ impl Agent {
             self.runtime.vision_config.clone(),
             self.runtime.audio_config.clone(),
             self.runtime.stt_config.clone(),
-            self.harness_eval_config.clone(),
+            self.runtime.harness_eval_config.clone(),
         );
         #[cfg(test)]
         crate::agent::authority::CREATED_CHILD_INHERITANCE
