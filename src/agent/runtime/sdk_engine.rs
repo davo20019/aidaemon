@@ -51,11 +51,7 @@ use uuid::Uuid;
 
 use super::agent_helpers::touch_heartbeat;
 use super::memory_plugin::{daemon_tool_offer, memory_parts, DaemonToolOffer, MemoryTurn};
-use super::sdk_provider::{
-    fit_run_values, from_provider_response, prefix_with_notes, split_injected_notes,
-    to_chat_options, to_daemon_messages_from, to_daemon_tools, values_to_sdk, DaemonProvider,
-    ModelCall,
-};
+use super::sdk_provider::{values_to_sdk, DaemonProvider};
 use super::tool_exec::ToolExecCtx;
 use super::Agent;
 use super::TurnHistory;
@@ -67,9 +63,10 @@ use crate::tools::ProgressClock;
 use crate::traits::{AttachmentProvenance, Message, MessageAttachment};
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
 use aidaemon_runtime::engine::calls::{
-    AfterCallCheck, GateRequest, HostCall as DaemonCall, KernelCall, KernelNotice, ModelErrorCheck,
-    StopCheck, ToolRequest,
+    AfterCallCheck, GateRequest, HostCall as DaemonCall, KernelCall, KernelNotice, StopCheck,
+    ToolRequest,
 };
+use aidaemon_runtime::host::EngineHostOps;
 
 pub(crate) use aidaemon_runtime::engine::settings::{
     log_configured_trust_roots, turn_cwd, turn_trust_roots, SdkEngineSettings, TrustRootSources,
@@ -77,24 +74,18 @@ pub(crate) use aidaemon_runtime::engine::settings::{
 };
 #[path = "sdk_engine/budgets.rs"]
 mod budgets;
-#[path = "sdk_engine/compaction.rs"]
-mod compaction;
 #[path = "sdk_engine/hooks.rs"]
 mod hooks;
-#[path = "sdk_engine/model_call.rs"]
-mod model_call;
-#[path = "sdk_engine/outcome.rs"]
-mod outcome;
 use aidaemon_runtime::engine::recovery;
+#[cfg(test)]
+use aidaemon_runtime::engine::turn_engine::{compaction, model_call, outcome};
 #[path = "sdk_engine/stop.rs"]
 mod stop;
 #[path = "sdk_engine/tool_calls.rs"]
 mod tool_calls;
 
 pub(crate) use aidaemon_runtime::engine::outcome::TurnVerdict;
-pub(in crate::agent) use aidaemon_runtime::engine::scope::{
-    AbsorbedSteering, BudgetGoal, TurnScope,
-};
+pub(in crate::agent) use aidaemon_runtime::engine::scope::{BudgetGoal, TurnScope};
 use budgets::*;
 use hooks::*;
 #[cfg(test)]
@@ -429,19 +420,20 @@ impl Agent {
                         .await;
                 }
             } else if egress_blocked {
-                self.emit_decision_point(
-                    scope.emitter,
-                    scope.task_id,
-                    scope.model_calls.load(Ordering::Relaxed) as usize,
-                    crate::events::DecisionType::GateTelemetry,
-                    format!("outbound secret blocked in `{}`", receipt.tool),
-                    serde_json::json!({
-                        "condition": "egress_secret_blocked",
-                        "tool": receipt.tool,
-                        "reason": reason,
-                    }),
-                )
-                .await;
+                self.engine()
+                    .emit_decision_point(
+                        scope.emitter,
+                        scope.task_id,
+                        scope.model_calls.load(Ordering::Relaxed) as usize,
+                        crate::events::DecisionType::GateTelemetry,
+                        format!("outbound secret blocked in `{}`", receipt.tool),
+                        serde_json::json!({
+                            "condition": "egress_secret_blocked",
+                            "tool": receipt.tool,
+                            "reason": reason,
+                        }),
+                    )
+                    .await;
             } else if !untrusted_denial && !owner_declined && !coordination_stop {
                 self.with_harness_eval(|eval| eval.record_repetition_guard())
                     .await;
@@ -537,6 +529,7 @@ impl Agent {
         channel_ctx: ChannelContext,
         heartbeat: Option<Arc<AtomicU64>>,
     ) -> anyhow::Result<String> {
+        let turn_engine = self.engine();
         let started = Instant::now();
         let SdkTurnSetup {
             user_text,
@@ -955,6 +948,7 @@ impl Agent {
             },
             model_pin: ModelPin {
                 task_id: task_id.clone(),
+                computer_use: self.computer_use(),
             },
             cutoff: CutoffAdjust::default(),
             retry: ModelRetry {
@@ -1344,13 +1338,13 @@ impl Agent {
                         in_flight.push(self.serve_sdk_gate(&scope, request).boxed());
                     }
                     DaemonCall::Model(call) => {
-                        in_flight.push(self.serve_sdk_model_call(&scope, call).boxed());
+                        in_flight.push(turn_engine.serve_sdk_model_call(&scope, call).boxed());
                     }
                     DaemonCall::Stop(check) => {
                         in_flight.push(self.serve_sdk_stop(&scope, check).boxed());
                     }
                     DaemonCall::ModelError(check) => {
-                        in_flight.push(self.serve_sdk_model_error(&scope, check).boxed());
+                        in_flight.push(turn_engine.serve_sdk_model_error(&scope, check).boxed());
                     }
                     DaemonCall::Budget(check) => {
                         in_flight.push(serve_sdk_budget(self, &scope, check).boxed());
@@ -1365,7 +1359,7 @@ impl Agent {
             }
         };
         end_if_dropped.disarm();
-        self.sdk_return_unanswered_steering(&scope).await;
+        self.engine().sdk_return_unanswered_steering(&scope).await;
         // The run is over: record the notices still queued and finish every
         // ledger write before the task end is computed and appended.
         while let Ok(notice) = refusals_rx.try_recv() {
@@ -1444,7 +1438,8 @@ impl Agent {
                 }
                 let run_failure = scope.verdict.run_failure();
                 if status == TaskStatus::Completed {
-                    self.reconcile_checklist_projection(&emitter, session_id, &task_id)
+                    self.engine()
+                        .reconcile_checklist_projection(&emitter, session_id, &task_id)
                         .await;
                 }
                 info!(
@@ -1507,18 +1502,19 @@ impl Agent {
         };
         let (error, iterations, tool_calls_count) = error;
         // The replayed run ledger has the final say on the outcome.
-        self.emit_task_end(
-            &emitter,
-            &task_id,
-            status,
-            task_outcome,
-            started,
-            iterations as usize,
-            tool_calls_count as usize,
-            error,
-            None,
-        )
-        .await;
+        self.engine()
+            .emit_task_end(
+                &emitter,
+                &task_id,
+                status,
+                task_outcome,
+                started,
+                iterations as usize,
+                tool_calls_count as usize,
+                error,
+                None,
+            )
+            .await;
         // Post-turn memory and learning run in the memory plugin's run-end
         // hook.
         for tool in &self.tools {

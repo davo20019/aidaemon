@@ -5,8 +5,8 @@
 pub(crate) mod factory;
 
 #[cfg(test)]
+pub(crate) use aidaemon_runtime::chat_bridge::streaming;
+#[cfg(test)]
 pub use aidaemon_runtime::chat_bridge::ModelFailure;
-pub(crate) use aidaemon_runtime::chat_bridge::{
-    build_http_client, context_overflow, describe_reset, sdk_backed, streaming,
-};
+pub(crate) use aidaemon_runtime::chat_bridge::{build_http_client, describe_reset, sdk_backed};
 pub use aidaemon_runtime::chat_bridge::{ProviderError, ProviderErrorKind};

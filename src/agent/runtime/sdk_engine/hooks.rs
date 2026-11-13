@@ -95,19 +95,17 @@ impl TurnHooks {
 /// request by its model see the one that will answer.
 pub(super) struct ModelPin {
     pub(super) task_id: String,
+    pub(super) computer_use: Option<Arc<dyn aidaemon_runtime::host::ComputerUseState>>,
 }
 
 #[async_trait]
 impl sdk::Hook for ModelPin {
     async fn before_model(&self, _ctx: &sdk::HookContext<'_>, request: &mut sdk::ModelRequest) {
-        #[cfg(feature = "computer_use")]
-        {
-            request.model =
-                crate::agent::computer_use::resolve_model_for_task(&self.task_id, &request.model)
-                    .await;
+        if let Some(computer_use) = &self.computer_use {
+            if let Some(model) = computer_use.pinned_model(&self.task_id).await {
+                request.model = model;
+            }
         }
-        #[cfg(not(feature = "computer_use"))]
-        let _ = (&self.task_id, request);
     }
 }
 

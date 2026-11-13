@@ -3882,6 +3882,7 @@ async fn hook_order_is_pinned() {
         },
         model_pin: ModelPin {
             task_id: "synthetic-task".into(),
+            computer_use: None,
         },
         cutoff: CutoffAdjust::default(),
         retry: ModelRetry {

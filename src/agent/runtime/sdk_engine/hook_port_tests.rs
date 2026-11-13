@@ -258,6 +258,7 @@ async fn a_task_without_a_pinned_model_keeps_its_model() {
     let agent = builder(provider.clone())
         .hook(ModelPin {
             task_id: "synthetic-task".into(),
+            computer_use: None,
         })
         .build()
         .unwrap();
@@ -279,6 +280,7 @@ async fn a_pinned_task_uses_its_pinned_model() {
     let agent = builder(provider.clone())
         .hook(ModelPin {
             task_id: task.into(),
+            computer_use: Some(Arc::new(crate::agent::computer_use::ComputerUsePins)),
         })
         .build()
         .unwrap();

@@ -11,6 +11,13 @@ use super::Agent;
 use crate::events::EventStore;
 use crate::execution::ExecutionBackend;
 
+impl Agent {
+    /// The turn engine on this agent.
+    pub(crate) fn engine(&self) -> aidaemon_runtime::engine::turn_engine::TurnEngine<'_> {
+        aidaemon_runtime::engine::turn_engine::TurnEngine::new(self)
+    }
+}
+
 impl TurnStores for Agent {
     fn dialogue_states(&self) -> &dyn DialogueStateStore {
         &*self.state
@@ -82,15 +89,16 @@ impl DecisionRecorder for Agent {
         summary: String,
         metadata: serde_json::Value,
     ) {
-        self.emit_decision_point(
-            emitter,
-            task_id,
-            iteration,
-            decision_type,
-            summary,
-            metadata,
-        )
-        .await;
+        self.engine()
+            .emit_decision_point(
+                emitter,
+                task_id,
+                iteration,
+                decision_type,
+                summary,
+                metadata,
+            )
+            .await;
     }
 }
 
@@ -186,6 +194,23 @@ impl EngineHostOps for Agent {
             error,
         )
         .await
+    }
+
+    fn trace_sink(&self) -> Option<std::sync::Arc<dyn aidaemon_core::EventSink>> {
+        crate::otel_export::sink()
+    }
+
+    fn observe_sent(&self, run: aidaemon_core::RunId, messages: &[serde_json::Value]) {
+        crate::otel_export::observe_sent(run, messages);
+    }
+
+    fn computer_use(&self) -> Option<std::sync::Arc<dyn aidaemon_runtime::host::ComputerUseState>> {
+        #[cfg(feature = "computer_use")]
+        {
+            Some(std::sync::Arc::new(super::computer_use::ComputerUsePins))
+        }
+        #[cfg(not(feature = "computer_use"))]
+        None
     }
 }
 

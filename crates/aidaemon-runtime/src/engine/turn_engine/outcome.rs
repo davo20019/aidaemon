@@ -1,16 +1,16 @@
 //! How a finished run becomes the turn's reply and task outcome.
 
 use super::*;
-#[cfg(test)]
-pub(super) use aidaemon_runtime::engine::outcome::*;
+#[cfg(any(test, feature = "testing"))]
+pub use crate::engine::outcome::*;
 
 /// Defer the checklist's advisory steps once the run is done: a step with
 /// no typed mutation effect and no observation requirement is display only,
 /// and left pending it would make restart recovery pause the plan and ask to
 /// resume work that is finished. Typed steps keep their state. Returns
 /// whether anything changed.
-pub(super) fn reconcile_plan_projection(plan: &mut crate::plans::TaskPlan) -> bool {
-    use crate::plans::StepStatus;
+pub fn reconcile_plan_projection(plan: &mut aidaemon_work::plans::TaskPlan) -> bool {
+    use aidaemon_work::plans::StepStatus;
     let mut changed = false;
     for step in &mut plan.steps {
         // Marked as handed to the background, but no launch took it: nothing
@@ -40,18 +40,18 @@ pub(super) fn reconcile_plan_projection(plan: &mut crate::plans::TaskPlan) -> bo
     changed
 }
 
-impl Agent {
+impl TurnEngine<'_> {
     /// Mark the steps of this task's checklist that the run's receipts
     /// proved as confirmed (no longer only the model's word). Returns the
     /// card to show when anything changed.
     /// The card for this task's checklist as stored now. A one-step plan
     /// gets no card (`track_requirements`): the step is the request.
-    pub(super) async fn plan_card(
+    pub async fn plan_card(
         &self,
         session_id: &str,
         task_id: &str,
     ) -> Option<aidaemon_core::card::PlanCard> {
-        let plan_store = self.plan_store.read().await.clone()?;
+        let plan_store = self.plan_store().await?;
         match plan_store.for_task(session_id, task_id).await {
             Ok(plan) => plan
                 .filter(|plan| plan.steps.len() > 1)
@@ -63,14 +63,14 @@ impl Agent {
         }
     }
 
-    pub(super) async fn confirm_checklist_from_receipts(
+    pub async fn confirm_checklist_from_receipts(
         &self,
         session_id: &str,
         task_id: &str,
     ) -> Option<aidaemon_core::card::PlanCard> {
-        let plan_store = self.plan_store.read().await.clone()?;
+        let plan_store = self.plan_store().await?;
         let proven = self
-            .event_store
+            .events()
             .task_run_aggregate(session_id, task_id)
             .await
             .ok()?
@@ -92,7 +92,7 @@ impl Agent {
 
     /// Reconcile this task's checklist after a completed run (see
     /// [`reconcile_plan_projection`]) and record its final shape.
-    pub(super) async fn reconcile_checklist_projection(
+    pub async fn reconcile_checklist_projection(
         &self,
         emitter: &EventEmitter,
         session_id: &str,
@@ -103,7 +103,7 @@ impl Agent {
         let _ = self
             .confirm_checklist_from_receipts(session_id, task_id)
             .await;
-        let Some(plan_store) = self.plan_store.read().await.clone() else {
+        let Some(plan_store) = self.plan_store().await else {
             return;
         };
         let Some(mut plan) = plan_store
@@ -124,13 +124,13 @@ impl Agent {
         let deferred = plan
             .steps
             .iter()
-            .filter(|step| step.status == crate::plans::StepStatus::Deferred)
+            .filter(|step| step.status == aidaemon_work::plans::StepStatus::Deferred)
             .count();
         self.emit_decision_point(
             emitter,
             task_id,
             0,
-            crate::events::DecisionType::GateTelemetry,
+            aidaemon_events::payloads::DecisionType::GateTelemetry,
             "checklist turn completed",
             serde_json::json!({
                 "event": "checklist_complete",

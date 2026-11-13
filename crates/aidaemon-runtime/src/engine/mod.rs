@@ -23,6 +23,7 @@ pub mod tool_calls;
 pub mod tool_exec;
 pub mod tool_gate;
 pub mod tool_result_fit;
+pub mod turn_engine;
 pub mod work_scope;
 
 /// Host tools enforce their own timeouts (terminal backgrounding, CLI

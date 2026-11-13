@@ -9,12 +9,12 @@
 
 use super::model_call::{with_idle_timeout, STREAMING_MAX_MODEL_CALL};
 use super::*;
-pub(super) use aidaemon_runtime::engine::compaction::*;
+pub use crate::engine::compaction::*;
 
-impl Agent {
+impl TurnEngine<'_> {
     /// The run view to send: compacted when the run outgrows `budget`. A
     /// failed summary leaves the view uncompacted and quota fitting applies.
-    pub(super) async fn sdk_compacted_run(
+    pub async fn sdk_compacted_run(
         &self,
         scope: &TurnScope<'_>,
         model: &str,
@@ -27,7 +27,7 @@ impl Agent {
         let view_tokens = crate::context_budget::estimate_multimodal_message_tokens(&view);
         // Mandate runs spend a durable shared balance through a lease; the
         // summarizer would bypass it, so they keep quota fitting.
-        if self.mandate_execution.is_some()
+        if self.mandate_execution().is_some()
             || prefix_tokens + view_tokens <= budget * COMPACT_AT_PERCENT / 100
         {
             return view;
@@ -45,19 +45,19 @@ impl Agent {
             current.as_ref().map(|c| c.summary.as_str()),
             &run[covered..cut],
         );
-        let options = crate::traits::ChatOptions {
-            tool_choice: crate::traits::ToolChoiceMode::None,
+        let options = aidaemon_events::provider::ChatOptions {
+            tool_choice: aidaemon_events::provider::ToolChoiceMode::None,
             max_tokens_override: Some(SUMMARY_MAX_OUTPUT_TOKENS),
-            ..crate::traits::ChatOptions::default()
+            ..aidaemon_events::provider::ChatOptions::default()
         };
-        let snapshot = self.llm_runtime.snapshot();
-        let mut telemetry = crate::agent::llm::LlmCallTelemetry::default();
+        let snapshot = self.llm_runtime().snapshot();
+        let mut telemetry = crate::llm::turn_calls::LlmCallTelemetry::default();
         let idle = self.sdk_model_call_timeout();
         let response = with_idle_timeout(
             idle,
             idle.max(STREAMING_MAX_MODEL_CALL),
-            crate::agent::llm::call_llm_with_recovery(
-                self,
+            crate::llm::turn_calls::call_llm_with_recovery(
+                self.host,
                 snapshot.provider(),
                 snapshot.router(),
                 model,
@@ -76,7 +76,7 @@ impl Agent {
                     // Real spend: it counts toward the run's budgets. A stop
                     // it triggers is enforced by the next model call.
                     let iteration = scope.model_calls.load(Ordering::Relaxed) as usize;
-                    let _ = sdk_charge_budgets(self, scope, usage, iteration).await;
+                    let _ = sdk_charge_budgets(self.host, scope, usage, iteration).await;
                 }
                 response.content.unwrap_or_default()
             }

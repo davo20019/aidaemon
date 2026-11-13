@@ -12,12 +12,13 @@ use uuid::Uuid;
 
 use crate::config::{IterationLimitConfig, PathAliasConfig};
 #[cfg(test)]
+use crate::events::TaskStatus;
+#[cfg(test)]
 use crate::events::{
     AssistantResponseData, TaskEndData, TaskStartData, ThinkingStartData, ToolResultData,
 };
 use crate::events::{
-    DecisionPointData, DecisionType, EventStore, EventType, SubAgentCompleteData,
-    SubAgentSpawnData, TaskStatus,
+    DecisionPointData, DecisionType, EventStore, EventType, SubAgentCompleteData, SubAgentSpawnData,
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;

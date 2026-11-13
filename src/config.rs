@@ -1905,7 +1905,6 @@ fn default_people_reconnect_reminder_days() -> u32 {
 
 pub use aidaemon_tools::http_request::{HttpAuthProfile, HttpAuthType};
 
-pub(crate) use aidaemon_runtime::settings::record_context_overflow;
 pub use aidaemon_runtime::settings::ContextWindowConfig;
 
 fn default_heartbeat_tick() -> u64 {
@@ -2558,10 +2557,16 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
         let model = "gpt-6-synthetic-overflow";
         assert_eq!(config.context_budget_for(model), 231_200);
         // No stated window: three quarters of the rejected attempt.
-        assert_eq!(record_context_overflow(model, None, 200_000), 150_000);
+        assert_eq!(
+            aidaemon_runtime::settings::record_context_overflow(model, None, 200_000),
+            150_000
+        );
         assert_eq!(config.context_budget_for(model), 150_000);
         // A larger stated window cannot raise it back.
-        assert_eq!(record_context_overflow(model, Some(400_000), 0), 150_000);
+        assert_eq!(
+            aidaemon_runtime::settings::record_context_overflow(model, Some(400_000), 0),
+            150_000
+        );
         assert_eq!(config.context_budget_for(model), 150_000);
     }
 

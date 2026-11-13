@@ -102,19 +102,20 @@ impl Agent {
         scope.verdict.record_handoff_reply(
             crate::agent::post_task::build_friendly_background_handoff(scope.user_text),
         );
-        self.emit_decision_point(
-            scope.emitter,
-            scope.task_id,
-            scope.model_calls.load(Ordering::Relaxed) as usize,
-            crate::events::DecisionType::PostExecutionValidation,
-            "Stop with a background job still running: handed off".to_string(),
-            serde_json::json!({
-                "condition": "background_job_running_at_stop",
-                "open_jobs": scope.open_background_jobs.load(Ordering::Relaxed),
-                "engine": "sdk",
-            }),
-        )
-        .await;
+        self.engine()
+            .emit_decision_point(
+                scope.emitter,
+                scope.task_id,
+                scope.model_calls.load(Ordering::Relaxed) as usize,
+                crate::events::DecisionType::PostExecutionValidation,
+                "Stop with a background job still running: handed off".to_string(),
+                serde_json::json!({
+                    "condition": "background_job_running_at_stop",
+                    "open_jobs": scope.open_background_jobs.load(Ordering::Relaxed),
+                    "engine": "sdk",
+                }),
+            )
+            .await;
         true
     }
 
@@ -154,19 +155,20 @@ impl Agent {
             }
             if !waited {
                 waited = true;
-                self.emit_decision_point(
-                    scope.emitter,
-                    scope.task_id,
-                    scope.model_calls.load(Ordering::Relaxed) as usize,
-                    crate::events::DecisionType::PostExecutionValidation,
-                    "Stop held until the run's unreported jobs end".to_string(),
-                    serde_json::json!({
-                        "condition": "unreported_job_running_at_stop",
-                        "open_jobs": open,
-                        "engine": "sdk",
-                    }),
-                )
-                .await;
+                self.engine()
+                    .emit_decision_point(
+                        scope.emitter,
+                        scope.task_id,
+                        scope.model_calls.load(Ordering::Relaxed) as usize,
+                        crate::events::DecisionType::PostExecutionValidation,
+                        "Stop held until the run's unreported jobs end".to_string(),
+                        serde_json::json!({
+                            "condition": "unreported_job_running_at_stop",
+                            "open_jobs": open,
+                            "engine": "sdk",
+                        }),
+                    )
+                    .await;
             }
             tokio::time::sleep(UNREPORTED_JOB_POLL).await;
         }
@@ -177,13 +179,20 @@ impl Agent {
     /// only a follow-up observation (which clears the flag) can confirm it
     /// (2026-07-12: an unverified click at a guessed position was reported as
     /// a successful Like). Bounded, so a model that never looks cannot loop.
-    #[cfg(feature = "computer_use")]
     pub(super) async fn sdk_gui_click_check(&self, scope: &TurnScope<'_>) -> sdk::StopDecision {
         use crate::agent::closeout::{StopDemand, StopDemandVerdict};
-        if self.depth != 0
-            || !crate::agent::computer_use::task_has_unverified_coordinate_click(scope.task_id)
-                .await
-        {
+        if self.depth != 0 {
+            return sdk::StopDecision::Accept;
+        }
+        let unverified = match self.computer_use() {
+            Some(computer_use) => {
+                computer_use
+                    .has_unverified_coordinate_click(scope.task_id)
+                    .await
+            }
+            None => false,
+        };
+        if !unverified {
             return sdk::StopDecision::Accept;
         }
         let demand = StopDemand::GuiClickVerification;
@@ -192,7 +201,7 @@ impl Agent {
             return sdk::StopDecision::Accept;
         }
         scope.gui_verify_demands.fetch_add(1, Ordering::Relaxed);
-        self.emit_warning_decision_point(
+        self.engine().emit_warning_decision_point(
             scope.emitter,
             scope.task_id,
             scope.model_calls.load(Ordering::Relaxed) as usize,
@@ -205,11 +214,6 @@ impl Agent {
             message: crate::agent::system_directives::SystemDirective::GuiCoordinateClickUnverified
                 .render(),
         }
-    }
-
-    #[cfg(not(feature = "computer_use"))]
-    pub(super) async fn sdk_gui_click_check(&self, _scope: &TurnScope<'_>) -> sdk::StopDecision {
-        sdk::StopDecision::Accept
     }
 
     /// A file more than one agent changed is checked once before the
@@ -279,20 +283,21 @@ impl Agent {
                 match self.sdk_stop_demand_verdict(scope, demand, used).await {
                     StopDemandVerdict::Demand => {
                         scope.mandate_commit_retries.fetch_add(1, Ordering::Relaxed);
-                        self.emit_warning_decision_point(
-                            scope.emitter,
-                            scope.task_id,
-                            scope.model_calls.load(Ordering::Relaxed) as usize,
-                            crate::events::DecisionType::PostExecutionValidation,
-                            "Blocked mandate prose completion without a durable decision"
-                                .to_string(),
-                            serde_json::json!({
-                                "condition": demand.condition(),
-                                "retry": used + 1,
-                                "engine": "sdk",
-                            }),
-                        )
-                        .await;
+                        self.engine()
+                            .emit_warning_decision_point(
+                                scope.emitter,
+                                scope.task_id,
+                                scope.model_calls.load(Ordering::Relaxed) as usize,
+                                crate::events::DecisionType::PostExecutionValidation,
+                                "Blocked mandate prose completion without a durable decision"
+                                    .to_string(),
+                                serde_json::json!({
+                                    "condition": demand.condition(),
+                                    "retry": used + 1,
+                                    "engine": "sdk",
+                                }),
+                            )
+                            .await;
                         return sdk::StopDecision::Continue {
                             message:
                                 crate::agent::system_directives::SystemDirective::MandateDecisionCommitRequired
@@ -346,23 +351,24 @@ impl Agent {
                 find(name).is_some_and(|tool| tool.owner_control_plane_call(arguments))
             },
         );
-        self.emit_decision_point(
-            scope.emitter,
-            scope.task_id,
-            scope.model_calls.load(Ordering::Relaxed) as usize,
-            crate::events::DecisionType::PostExecutionValidation,
-            format!("Stop demand {}: {}", demand.condition(), verdict.as_str()),
-            serde_json::json!({
-                "condition": "stop_demand",
-                "demand": demand.condition(),
-                "verdict": verdict.as_str(),
-                "used": used,
-                "budget": demand.budget(),
-                "authoritative": true,
-                "engine": "sdk",
-            }),
-        )
-        .await;
+        self.engine()
+            .emit_decision_point(
+                scope.emitter,
+                scope.task_id,
+                scope.model_calls.load(Ordering::Relaxed) as usize,
+                crate::events::DecisionType::PostExecutionValidation,
+                format!("Stop demand {}: {}", demand.condition(), verdict.as_str()),
+                serde_json::json!({
+                    "condition": "stop_demand",
+                    "demand": demand.condition(),
+                    "verdict": verdict.as_str(),
+                    "used": used,
+                    "budget": demand.budget(),
+                    "authoritative": true,
+                    "engine": "sdk",
+                }),
+            )
+            .await;
         verdict
     }
 
@@ -460,19 +466,20 @@ impl Agent {
             .filter(|claim| claim.unfinished())
         {
             scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
-            self.emit_decision_point(
-                scope.emitter,
-                scope.task_id,
-                iteration,
-                crate::events::DecisionType::PostExecutionValidation,
-                format!("Agent reported the request as {}", claim.as_str()),
-                serde_json::json!({
-                    "condition": "executor_claimed_outcome",
-                    "claimed_outcome": claim.as_str(),
-                    "engine": "sdk",
-                }),
-            )
-            .await;
+            self.engine()
+                .emit_decision_point(
+                    scope.emitter,
+                    scope.task_id,
+                    iteration,
+                    crate::events::DecisionType::PostExecutionValidation,
+                    format!("Agent reported the request as {}", claim.as_str()),
+                    serde_json::json!({
+                        "condition": "executor_claimed_outcome",
+                        "claimed_outcome": claim.as_str(),
+                        "engine": "sdk",
+                    }),
+                )
+                .await;
             return sdk::StopDecision::AcceptUnmet {
                 unmet: vec![format!(
                     "the agent reported the request as {}",
@@ -507,7 +514,7 @@ impl Agent {
             crate::events::CloseoutDecision::Reachable { obligation_ids } => obligation_ids.clone(),
             _ => Vec::new(),
         };
-        self.emit_decision_point(
+        self.engine().emit_decision_point(
             scope.emitter,
             scope.task_id,
             iteration,
@@ -596,20 +603,21 @@ impl Agent {
                 .executor_demanded_at
                 .store(completed_results as u64, Ordering::Relaxed);
         }
-        self.emit_decision_point(
-            scope.emitter,
-            scope.task_id,
-            iteration,
-            crate::events::DecisionType::IntentGate,
-            "Ledger expectations still reachable: bounded evidence pass requested",
-            serde_json::json!({
-                "condition": "ledger_expectations_required",
-                "reachable_obligation_ids": reachable,
-                "demands": demands,
-                "engine": "sdk",
-            }),
-        )
-        .await;
+        self.engine()
+            .emit_decision_point(
+                scope.emitter,
+                scope.task_id,
+                iteration,
+                crate::events::DecisionType::IntentGate,
+                "Ledger expectations still reachable: bounded evidence pass requested",
+                serde_json::json!({
+                    "condition": "ledger_expectations_required",
+                    "reachable_obligation_ids": reachable,
+                    "demands": demands,
+                    "engine": "sdk",
+                }),
+            )
+            .await;
         sdk::StopDecision::Continue {
             message: crate::agent::system_directives::SystemDirective::LedgerExpectationsRequired {
                 expectations: aggregate.expectation_summaries(&reachable),

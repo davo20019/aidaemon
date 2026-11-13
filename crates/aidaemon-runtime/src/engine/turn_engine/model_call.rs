@@ -2,29 +2,29 @@
 //! router, fallbacks, telemetry and the mandate token lease.
 
 use super::*;
-#[cfg(test)]
-pub(super) use aidaemon_runtime::engine::hooks::{
+#[cfg(any(test, feature = "testing"))]
+pub use crate::engine::hooks::{
     raised_output_ceiling, thinking_cutoff_effort, MAX_RAISED_OUTPUT_TOKENS,
 };
 
 /// Per-call ceilings: the default, a foreground turn's, a mandate run's.
-pub(super) const DEFAULT_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(360);
-pub(super) const FOREGROUND_MAX_MODEL_CALL: Duration = Duration::from_secs(90);
-pub(super) const MANDATE_MAX_MODEL_CALL: Duration = Duration::from_secs(840);
+pub const DEFAULT_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(360);
+pub const FOREGROUND_MAX_MODEL_CALL: Duration = Duration::from_secs(90);
+pub const MANDATE_MAX_MODEL_CALL: Duration = Duration::from_secs(840);
 /// Total time a call may take while its stream keeps delivering chunks; the
 /// per-call ceiling above bounds silence, not progress.
-pub(super) const STREAMING_MAX_MODEL_CALL: Duration = Duration::from_secs(600);
+pub const STREAMING_MAX_MODEL_CALL: Duration = Duration::from_secs(600);
 /// A timed-out call is retried: the ceiling bounds a call so the turn
 /// regains control, not so it ends.
-pub(super) const MAX_MODEL_CALL_TIMEOUT_RETRIES: u32 = 2;
+pub const MAX_MODEL_CALL_TIMEOUT_RETRIES: u32 = 2;
 
 /// Retries after a context-overflow rejection, each with a smaller budget.
-pub(super) const MAX_CONTEXT_OVERFLOW_RETRIES: u32 = 2;
+pub const MAX_CONTEXT_OVERFLOW_RETRIES: u32 = 2;
 
 /// Heads a user message taken into a running turn. It joins the request
 /// the turn serves rather than replacing it: several questions sent back to
 /// back all arrive this way, and each still needs its answer.
-pub(super) const STEERING_MARKER: &str =
+pub const STEERING_MARKER: &str =
     "[The user sent this while you were working. It adds to the current request: \
      still answer or finish everything they asked before it, unless this message \
      changes or cancels that.]";
@@ -32,7 +32,7 @@ pub(super) const STEERING_MARKER: &str =
 /// Follows [`STEERING_MARKER`] once the run has declared a checklist. Only
 /// the model can tell whether a message changes the work, and the checklist
 /// is its own statement of that work, so this asks and nothing enforces it.
-pub(super) const STEERING_CHECKLIST_NOTE: &str =
+pub const STEERING_CHECKLIST_NOTE: &str =
     "[You declared a checklist for this request. If this message adds, changes or cancels \
      work, call track_requirements with the full revised list before continuing. If it only \
      clarifies or grants permission, leave the list as it is.]";
@@ -46,19 +46,19 @@ pub(super) const STEERING_CHECKLIST_NOTE: &str =
 /// `idle`: a little shorter, so a hung primary hands over to the fallback
 /// chain (whose switch event counts as progress) instead of the watchdog
 /// cancelling the whole call.
-pub(super) fn first_attempt_deadline(idle: Duration) -> Duration {
+pub fn first_attempt_deadline(idle: Duration) -> Duration {
     idle.saturating_sub(Duration::from_secs(2))
         .max(Duration::from_secs(10))
 }
 
-pub(super) async fn with_idle_timeout<F: std::future::Future>(
+pub async fn with_idle_timeout<F: std::future::Future>(
     idle: Duration,
     hard: Duration,
     call: F,
 ) -> Result<F::Output, Duration> {
-    let progress = crate::providers::streaming::StreamProgress::new();
+    let progress = crate::chat_bridge::streaming::StreamProgress::new();
     let started = Instant::now();
-    let call = crate::providers::streaming::with_stream_progress(progress.clone(), call);
+    let call = crate::chat_bridge::streaming::with_stream_progress(progress.clone(), call);
     tokio::pin!(call);
     loop {
         let idle_deadline = progress.last_activity() + idle;
@@ -81,7 +81,7 @@ pub(super) async fn with_idle_timeout<F: std::future::Future>(
 /// `run` with each placed message (a system directive, or a user message
 /// taken mid-turn) inserted before the run message at its position (after
 /// the last one when it is at the end).
-pub(super) fn interleave_directives(run: Vec<Value>, directives: &[(usize, Value)]) -> Vec<Value> {
+pub fn interleave_directives(run: Vec<Value>, directives: &[(usize, Value)]) -> Vec<Value> {
     if directives.is_empty() {
         return run;
     }
@@ -103,7 +103,7 @@ pub(super) fn interleave_directives(run: Vec<Value>, directives: &[(usize, Value
 
 /// A model call that ran past its per-call ceiling.
 #[derive(Debug)]
-pub(super) struct ModelCallTimedOut(Duration);
+pub struct ModelCallTimedOut(Duration);
 
 impl std::fmt::Display for ModelCallTimedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -113,11 +113,11 @@ impl std::fmt::Display for ModelCallTimedOut {
 
 impl std::error::Error for ModelCallTimedOut {}
 
-impl Agent {
+impl TurnEngine<'_> {
     /// Make one model call for the SDK run through the daemon's provider
     /// stack: billing-aware retries, the fallback cascade and failover
     /// providers all apply.
-    pub(super) async fn serve_sdk_model_call(&self, scope: &TurnScope<'_>, call: ModelCall) {
+    pub async fn serve_sdk_model_call(&self, scope: &TurnScope<'_>, call: ModelCall) {
         let reply = self.sdk_model_call(scope, &call.request).await;
         if reply.is_ok() {
             // Every message taken so far rode in this call (placed messages
@@ -134,17 +134,13 @@ impl Agent {
 
     /// Whether to try a failed model call again. The kernel runs the retry
     /// as a new turn, so `before_model` hooks shape it afresh.
-    pub(super) async fn serve_sdk_model_error(
-        &self,
-        scope: &TurnScope<'_>,
-        check: ModelErrorCheck,
-    ) {
+    pub async fn serve_sdk_model_error(&self, scope: &TurnScope<'_>, check: ModelErrorCheck) {
         let _ = check
             .reply
             .send(self.model_error_decision(scope, check.timed_out));
     }
 
-    fn model_error_decision(
+    pub fn model_error_decision(
         &self,
         scope: &TurnScope<'_>,
         timed_out: bool,
@@ -177,7 +173,7 @@ impl Agent {
         );
         if let Ok(mut extra) = scope.extra_system.lock() {
             extra.push(
-                crate::agent::system_directives::SystemDirective::ModelCallTimedOut {
+                crate::turn::system_directives::SystemDirective::ModelCallTimedOut {
                     timeout_secs: self.sdk_model_call_timeout().as_secs(),
                 }
                 .render(),
@@ -187,31 +183,31 @@ impl Agent {
     }
 
     /// The per-call ceiling: a hung provider must not hold the turn.
-    pub(super) fn sdk_model_call_timeout(&self) -> Duration {
-        let ceiling = if self.mandate_execution.is_some() {
+    pub fn sdk_model_call_timeout(&self) -> Duration {
+        let ceiling = if self.mandate_execution().is_some() {
             MANDATE_MAX_MODEL_CALL
         } else {
             FOREGROUND_MAX_MODEL_CALL
         };
-        self.limits
+        self.turn_limits()
             .llm_call_timeout
             .unwrap_or(DEFAULT_MODEL_CALL_TIMEOUT)
             .min(ceiling)
     }
 
-    pub(super) async fn sdk_model_call(
+    pub async fn sdk_model_call(
         &self,
         scope: &TurnScope<'_>,
         request: &sdk::ModelRequest,
     ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
         let iteration = scope.model_calls.fetch_add(1, Ordering::Relaxed) + 1;
-        let snapshot = self.llm_runtime.snapshot();
+        let snapshot = self.llm_runtime().snapshot();
         let tools = to_daemon_tools(&request.tools);
         let budget = crate::context_budget::compute_available_budget_precomputed(
             &request.model,
             0,
             &tools,
-            &self.runtime.context_window_config,
+            &self.turn_runtime().context_window_config,
         );
         // Hook notes (recalled memory) ride in the wire prefix; the rest of
         // the kernel transcript after the starting prefix is this run's.
@@ -268,13 +264,13 @@ impl Agent {
             .sdk_compacted_run(scope, &request.model, prefix_tokens, &run, budget)
             .await;
         let messages = fit_run_values(&prefix, run, budget);
-        crate::otel_export::observe_sent(scope.run_id, &messages);
+        self.observe_sent(scope.run_id, &messages);
         let mut options = to_chat_options(request);
         options.cache_key = Some(scope.session_id.to_string());
         // llama.cpp slot pinning (opt-in): the root interactive agent carries
         // `Some(interactive_slot)` to keep its KV cache warm; sub-agents carry
         // `None` and use the provider's background slot.
-        options.id_slot = self.interactive_slot;
+        options.id_slot = self.interactive_slot();
         // Before any tool work a provider blip gets the long retry ladder: a
         // failure there loses the whole turn.
         options.uncommitted_work = scope
@@ -283,7 +279,7 @@ impl Agent {
             .map(|learning| learning.tool_calls.is_empty())
             .unwrap_or(true);
         let est_input_tokens = crate::context_budget::estimate_multimodal_message_tokens(&messages);
-        let mut telemetry = crate::agent::llm::LlmCallTelemetry::default();
+        let mut telemetry = crate::llm::turn_calls::LlmCallTelemetry::default();
         // Mandate runs share one durable token balance across the task lead
         // and its executors: reserve before the call, settle after it.
         let lease = match self
@@ -298,7 +294,8 @@ impl Agent {
                 // closes as failed: retried with backoff, owner told.
                 if error.to_string().contains(MANDATE_BUDGET_EXHAUSTED) {
                     if let Some(summary) =
-                        crate::agent::mandate_run::committed_non_action_mandate_summary(self).await
+                        crate::engine::mandate_run::committed_non_action_mandate_summary(self.host)
+                            .await
                     {
                         info!(
                             task_id = scope.task_id,
@@ -317,8 +314,8 @@ impl Agent {
         let result = match with_idle_timeout(
             idle_timeout,
             idle_timeout.max(STREAMING_MAX_MODEL_CALL),
-            crate::agent::llm::call_llm_with_recovery(
-                self,
+            crate::llm::turn_calls::call_llm_with_recovery(
+                self.host,
                 snapshot.provider(),
                 snapshot.router(),
                 &request.model,
@@ -349,7 +346,7 @@ impl Agent {
                                 .saturating_sub(lease.tokens_used_before)
                         });
                     if let Err(error) = self
-                        .state
+                        .token_usage()
                         .settle_mandate_run_token_lease(
                             &lease.goal_run_id,
                             &lease.lease_token,
@@ -364,7 +361,7 @@ impl Agent {
                 // spent, so nothing is charged.
                 Err(error) if spent_nothing(error) => {
                     if let Err(error) = self
-                        .state
+                        .token_usage()
                         .settle_mandate_run_token_lease(&lease.goal_run_id, &lease.lease_token, 0)
                         .await
                     {
@@ -372,8 +369,8 @@ impl Agent {
                     }
                 }
                 Err(_) => {
-                    crate::agent::mandate_run::exhaust_mandate_run_token_lease_after_ambiguous_call(
-                        self,
+                    crate::engine::mandate_run::exhaust_mandate_run_token_lease_after_ambiguous_call(
+                        self.host,
                         Some(lease),
                         scope.session_id,
                     )
@@ -393,7 +390,7 @@ impl Agent {
             .unwrap_or_default();
         let failure = result.as_ref().err();
         let provider_error =
-            failure.and_then(|error| error.downcast_ref::<crate::providers::ProviderError>());
+            failure.and_then(|error| error.downcast_ref::<crate::chat_bridge::ProviderError>());
         let chosen_tools: Vec<String> = result
             .as_ref()
             .map(|response| {
@@ -404,15 +401,15 @@ impl Agent {
                     .collect()
             })
             .unwrap_or_default();
-        crate::events::record_model_call_telemetry(
+        aidaemon_events::model_call_telemetry::record_model_call_telemetry(
             scope.emitter,
-            self.state.as_ref(),
-            crate::events::ModelCallTelemetryInput {
+            self.token_usage(),
+            aidaemon_events::model_call_telemetry::ModelCallTelemetryInput {
                 session_id: scope.session_id.to_string(),
                 task_id: scope.task_id.to_string(),
                 call_purpose: None,
                 iteration: Some(iteration as u32),
-                llm_call: crate::events::LlmCallData {
+                llm_call: aidaemon_events::payloads::LlmCallData {
                     call_id: None,
                     call_purpose: None,
                     task_id: scope.task_id.to_string(),
@@ -456,7 +453,8 @@ impl Agent {
                     projected_source_turn_ids: scope.projected_source_turn_ids.clone(),
                     force_text: false,
                     token_usage_present: usage.is_some(),
-                    token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
+                    token_usage_evidence:
+                        aidaemon_events::payloads::TokenUsageEvidence::Unavailable,
                     failed: failure.is_some(),
                     error: failure.map(|error| error.to_string()),
                     provider_error_kind: provider_error.map(|error| error.kind),
@@ -471,7 +469,7 @@ impl Agent {
                 .emitter
                 .emit(
                     EventType::Error,
-                    crate::events::ErrorData::llm_error(
+                    aidaemon_events::payloads::ErrorData::llm_error(
                         error.to_string(),
                         Some(scope.task_id.to_string()),
                     )
@@ -499,8 +497,8 @@ impl Agent {
                 if error.is::<ModelCallTimedOut>() {
                     return Err(sdk::ProviderError::Transient(error.to_string()));
                 }
-                if let Some(stated) = crate::providers::context_overflow(&error.to_string()) {
-                    let budget = crate::config::record_context_overflow(
+                if let Some(stated) = crate::chat_bridge::context_overflow(&error.to_string()) {
+                    let budget = crate::settings::record_context_overflow(
                         &request.model,
                         stated,
                         est_input_tokens,
@@ -517,7 +515,7 @@ impl Agent {
                     scope.context_overflowed.store(true, Ordering::Relaxed);
                 }
                 if let (Some(typed), Ok(mut slot)) = (
-                    error.downcast_ref::<crate::providers::ProviderError>(),
+                    error.downcast_ref::<crate::chat_bridge::ProviderError>(),
                     scope.provider_failure.lock(),
                 ) {
                     *slot = Some(typed.clone());
@@ -525,8 +523,8 @@ impl Agent {
                 // A used-up quota stays typed: the reply names it and its
                 // reset instead of a generic provider error.
                 if let Some(quota) = error
-                    .downcast_ref::<crate::providers::ProviderError>()
-                    .filter(|e| e.kind == crate::providers::ProviderErrorKind::QuotaExhausted)
+                    .downcast_ref::<crate::chat_bridge::ProviderError>()
+                    .filter(|e| e.kind == crate::chat_bridge::ProviderErrorKind::QuotaExhausted)
                 {
                     return Err(sdk::ProviderError::QuotaExhausted {
                         message: error.to_string(),
@@ -557,15 +555,15 @@ impl Agent {
     /// (`notices_turn_context`), raised as context so the reply never
     /// contradicts what the owner was just told. Only the turn serving the
     /// chat reads them: children and mandate runs have sessions of their own.
-    async fn sdk_note_delivered_notices(&self, scope: &TurnScope<'_>) {
-        if self.depth > 0 || self.mandate_execution.is_some() {
+    pub async fn sdk_note_delivered_notices(&self, scope: &TurnScope<'_>) {
+        if self.depth() > 0 || self.mandate_execution().is_some() {
             return;
         }
         let Ok(since) = scope.notices_seen.lock().map(|seen| seen.0) else {
             return;
         };
         let notices = match self
-            .state
+            .notifications()
             .notices_delivered_since(scope.session_id, since)
             .await
         {
@@ -595,14 +593,14 @@ impl Agent {
     /// recorded in the conversation history, and returned as user messages
     /// for the run. Mandate runs and agents without a channel queue take
     /// none.
-    pub(super) async fn sdk_take_steering(&self, scope: &TurnScope<'_>) -> Vec<Value> {
+    pub async fn sdk_take_steering(&self, scope: &TurnScope<'_>) -> Vec<Value> {
         // The queue is keyed by the chat's session, which only the turn
         // serving that chat runs in: children and goal runs have sessions of
         // their own. Mandate runs never take user input.
-        if self.mandate_execution.is_some() {
+        if self.mandate_execution().is_some() {
             return Vec::new();
         }
-        let Some(registry) = self.task_registry.get() else {
+        let Some(registry) = self.task_registry() else {
             return Vec::new();
         };
         let taken = registry
@@ -654,8 +652,8 @@ impl Agent {
     /// answered (the call that carried it failed and the run ended) back to
     /// the channel queue, so it runs as its own turn right after this one
     /// instead of being dropped.
-    pub(super) async fn sdk_return_unanswered_steering(&self, scope: &TurnScope<'_>) {
-        let unanswered: Vec<crate::tasks::QueuedMessage> = scope
+    pub async fn sdk_return_unanswered_steering(&self, scope: &TurnScope<'_>) {
+        let unanswered: Vec<aidaemon_channels::tasks::QueuedMessage> = scope
             .absorbed_steering
             .lock()
             .map(|mut absorbed| {
@@ -669,7 +667,7 @@ impl Agent {
         if unanswered.is_empty() {
             return;
         }
-        let Some(registry) = self.task_registry.get() else {
+        let Some(registry) = self.task_registry() else {
             return;
         };
         warn!(
@@ -685,19 +683,19 @@ impl Agent {
     /// Admit a mandate run's model call against its durable balance. Returns
     /// the lease to settle, or an error that ends the run when the balance
     /// cannot admit the call.
-    pub(super) async fn sdk_mandate_token_lease(
+    pub async fn sdk_mandate_token_lease(
         &self,
-        options: &mut crate::traits::ChatOptions,
+        options: &mut aidaemon_events::provider::ChatOptions,
         est_input_tokens: u32,
-    ) -> Result<Option<crate::agent::mandate_run::MandateRunTokenLease>, sdk::ProviderError> {
-        use crate::agent::mandate_run::{
+    ) -> Result<Option<crate::engine::mandate_run::MandateRunTokenLease>, sdk::ProviderError> {
+        use crate::engine::mandate_run::{
             acquire_mandate_run_token_lease, mandate_output_token_ceiling,
             release_mandate_run_token_lease_without_dispatch, MandateRunTokenAdmission,
         };
         let lease_secs = i64::try_from(MANDATE_MAX_MODEL_CALL.as_secs())
             .unwrap_or(900)
             .saturating_add(30);
-        let admission = acquire_mandate_run_token_lease(self, lease_secs, &None)
+        let admission = acquire_mandate_run_token_lease(self.host, lease_secs, &None)
             .await
             .map_err(|error| sdk::ProviderError::Other(error.to_string()))?;
         match admission {
@@ -711,7 +709,8 @@ impl Agent {
                     .saturating_sub(lease.tokens_used_before);
                 let Some(ceiling) = mandate_output_token_ceiling(remaining, est_input_tokens)
                 else {
-                    release_mandate_run_token_lease_without_dispatch(self, Some(&lease), "").await;
+                    release_mandate_run_token_lease_without_dispatch(self.host, Some(&lease), "")
+                        .await;
                     return Err(sdk::ProviderError::Other(MANDATE_BUDGET_EXHAUSTED.into()));
                 };
                 options.max_tokens_override = Some(
@@ -726,11 +725,10 @@ impl Agent {
                 // Durably mark the reservation dispatched before the provider
                 // sees the request, so an interrupted call settles fail-closed.
                 let fence = self
-                    .mandate_execution
-                    .as_ref()
+                    .mandate_execution()
                     .ok_or_else(|| sdk::ProviderError::Other("mandate fence missing".into()))?;
                 let dispatched = self
-                    .state
+                    .token_usage()
                     .mark_mandate_run_token_lease_dispatched(
                         &lease.goal_run_id,
                         &fence.mandate_id,
@@ -740,7 +738,8 @@ impl Agent {
                     .await
                     .unwrap_or(false);
                 if !dispatched {
-                    release_mandate_run_token_lease_without_dispatch(self, Some(&lease), "").await;
+                    release_mandate_run_token_lease_without_dispatch(self.host, Some(&lease), "")
+                        .await;
                     return Err(sdk::ProviderError::Other(
                         "mandate model call was not durably reserved before provider dispatch"
                             .into(),
@@ -758,6 +757,6 @@ impl Agent {
 fn spent_nothing(error: &anyhow::Error) -> bool {
     error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<crate::providers::ProviderError>())
+        .find_map(|cause| cause.downcast_ref::<crate::chat_bridge::ProviderError>())
         .is_some_and(|error| error.spent_nothing)
 }

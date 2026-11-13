@@ -17,9 +17,6 @@ pub use consolidation::{Consolidator, Pruner};
 pub use aidaemon_events::conversation_turn::{
     turn_from_event, ConversationTurn, ConversationTurnRole, FetchedTurn,
 };
-pub use aidaemon_events::model_call_telemetry::{
-    record_model_call_telemetry, ModelCallTelemetryInput,
-};
 pub use aidaemon_events::payloads::*;
 #[cfg(test)]
 pub(crate) use aidaemon_events::run_aggregate::RunAggregate;

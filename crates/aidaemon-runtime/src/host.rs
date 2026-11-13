@@ -146,6 +146,25 @@ pub trait EngineHostOps: Send + Sync {
         channel_ctx: &aidaemon_channels::context::ChannelContext,
         error: &anyhow::Error,
     ) -> Option<u16>;
+    /// Where kernel runs are traced (an OTLP export), if anywhere.
+    fn trace_sink(&self) -> Option<std::sync::Arc<dyn aidaemon_core::EventSink>>;
+    /// Report the messages actually sent for a model call of `run` to the
+    /// trace export: only these show what the model received.
+    fn observe_sent(&self, run: aidaemon_core::RunId, messages: &[serde_json::Value]);
+    /// Computer use's per-task state, when the host runs computer use.
+    fn computer_use(&self) -> Option<std::sync::Arc<dyn ComputerUseState>>;
+}
+
+/// What a computer-use GUI loop records per task, as the turn engine reads
+/// it: the vision model the task is pinned to, and whether its last
+/// coordinate click is still unconfirmed.
+#[async_trait::async_trait]
+pub trait ComputerUseState: Send + Sync {
+    /// The model the task is pinned to, if a GUI loop pinned one.
+    async fn pinned_model(&self, task_id: &str) -> Option<String>;
+    /// A coordinate click of the task landed and no follow-up observation
+    /// has confirmed it yet.
+    async fn has_unverified_coordinate_click(&self, task_id: &str) -> bool;
 }
 
 /// The host a turn runs on: its stores, workspace and decision record, the

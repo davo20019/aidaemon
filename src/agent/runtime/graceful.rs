@@ -1,7 +1,6 @@
 use super::*;
 #[cfg(test)]
 use aidaemon_runtime::turn::budget;
-use aidaemon_runtime::turn::task_end;
 pub(in crate::agent) use aidaemon_runtime::turn::task_end::emit_decision_point_event;
 #[cfg(test)]
 use aidaemon_runtime::turn::task_end::task_end_decision_and_outcome;
@@ -20,85 +19,6 @@ impl Agent {
             DEFERRED_NO_TOOL_ERROR_MARKER,
             &empty_tool_failure_count,
         )
-    }
-
-    /// Emit a TaskEnd event. Called from every exit path in the agent loop.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn emit_task_end(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        task_id: &str,
-        status: TaskStatus,
-        outcome: crate::events::TaskOutcome,
-        task_start: Instant,
-        iteration: usize,
-        tool_calls_count: usize,
-        error: Option<String>,
-        summary: Option<String>,
-    ) {
-        task_end::emit_task_end(
-            self,
-            emitter,
-            task_id,
-            status,
-            outcome,
-            task_start,
-            iteration,
-            tool_calls_count,
-            error,
-            summary,
-        )
-        .await;
-    }
-
-    /// This task's model-call cost and efficiency.
-    pub(in crate::agent) async fn task_efficiency_data(
-        &self,
-        task_id: &str,
-    ) -> Option<crate::events::TaskEfficiencyData> {
-        task_end::task_efficiency_data(self, task_id).await
-    }
-
-    pub(in crate::agent) async fn emit_decision_point(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        task_id: &str,
-        iteration: usize,
-        decision_type: DecisionType,
-        summary: impl Into<String>,
-        metadata: Value,
-    ) {
-        task_end::emit_decision_point(
-            self,
-            emitter,
-            task_id,
-            iteration,
-            decision_type,
-            summary,
-            metadata,
-        )
-        .await;
-    }
-
-    pub(super) async fn emit_warning_decision_point(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        task_id: &str,
-        iteration: usize,
-        decision_type: DecisionType,
-        summary: impl Into<String>,
-        metadata: Value,
-    ) {
-        task_end::emit_warning_decision_point(
-            self,
-            emitter,
-            task_id,
-            iteration,
-            decision_type,
-            summary,
-            metadata,
-        )
-        .await;
     }
 }
 

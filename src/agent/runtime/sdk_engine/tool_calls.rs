@@ -275,18 +275,19 @@ impl Agent {
         if !egress {
             return;
         }
-        self.emit_decision_point(
-            scope.emitter,
-            scope.task_id,
-            0,
-            crate::events::DecisionType::GateTelemetry,
-            "unrestricted owner: egress after untrusted content ran unchecked",
-            serde_json::json!({
-                "condition": "untrusted_egress_unrestricted",
-                "tool": tool_name,
-            }),
-        )
-        .await;
+        self.engine()
+            .emit_decision_point(
+                scope.emitter,
+                scope.task_id,
+                0,
+                crate::events::DecisionType::GateTelemetry,
+                "unrestricted owner: egress after untrusted content ran unchecked",
+                serde_json::json!({
+                    "condition": "untrusted_egress_unrestricted",
+                    "tool": tool_name,
+                }),
+            )
+            .await;
     }
 
     /// What a child spawned from this turn inherits: the turn's resolved
@@ -943,7 +944,8 @@ impl Agent {
                 if failed {
                     None
                 } else {
-                    self.plan_card(scope.session_id, scope.task_id)
+                    self.engine()
+                        .plan_card(scope.session_id, scope.task_id)
                         .await
                         .map(StatusUpdate::Checklist)
                 }
@@ -1076,6 +1078,7 @@ impl Agent {
                 // A step the model ticked shows as done only once receipts
                 // prove it: the card is redrawn with what they proved.
                 if let Some(plan) = self
+                    .engine()
                     .confirm_checklist_from_receipts(scope.session_id, scope.task_id)
                     .await
                 {
@@ -1479,26 +1482,27 @@ impl Agent {
         };
         if let Some((operation_id, result_id, reason)) = &preflight.replay_invalidation {
             // The earlier effect no longer holds, so the call runs again.
-            self.emit_decision_point(
-                scope.emitter,
-                scope.task_id,
-                scope.model_calls.load(Ordering::Relaxed) as usize,
-                crate::events::DecisionType::IdempotencyReceiptInvalidated,
-                format!(
-                    "Reconciled durable receipt for {} is no longer authoritative",
-                    request.name
-                ),
-                serde_json::json!({
-                    "condition": "idempotency_receipt_invalidated",
-                    "tool": request.name,
-                    "tool_call_id": request.call_id,
-                    "operation_id": operation_id,
-                    "result_id": result_id,
-                    "reason": reason,
-                    "engine": "sdk",
-                }),
-            )
-            .await;
+            self.engine()
+                .emit_decision_point(
+                    scope.emitter,
+                    scope.task_id,
+                    scope.model_calls.load(Ordering::Relaxed) as usize,
+                    crate::events::DecisionType::IdempotencyReceiptInvalidated,
+                    format!(
+                        "Reconciled durable receipt for {} is no longer authoritative",
+                        request.name
+                    ),
+                    serde_json::json!({
+                        "condition": "idempotency_receipt_invalidated",
+                        "tool": request.name,
+                        "tool_call_id": request.call_id,
+                        "operation_id": operation_id,
+                        "result_id": result_id,
+                        "reason": reason,
+                        "engine": "sdk",
+                    }),
+                )
+                .await;
         }
         if let Some(reason) = &preflight.block_reason {
             if let Err(error) = self
@@ -1524,7 +1528,7 @@ impl Agent {
             return Some(sdk::ToolOutput::error(format!("Error: {reason}")));
         }
         let previous = preflight.replayed_result.as_ref()?;
-        self.emit_decision_point(
+        self.engine().emit_decision_point(
             scope.emitter,
             scope.task_id,
             scope.model_calls.load(Ordering::Relaxed) as usize,
@@ -1637,21 +1641,22 @@ impl Agent {
                 instructions.render_for_prompt()
             ));
         }
-        self.emit_decision_point(
-            scope.emitter,
-            scope.task_id,
-            scope.model_calls.load(Ordering::Relaxed) as usize,
-            crate::events::DecisionType::InstructionsSnapshot,
-            format!("Loaded nested project instructions before {}", request.name),
-            serde_json::json!({
-                "condition": "jit_project_instructions_discovered",
-                "tool": request.name,
-                "targets": &targets,
-                "sources": &sources,
-                "action_executed": false,
-            }),
-        )
-        .await;
+        self.engine()
+            .emit_decision_point(
+                scope.emitter,
+                scope.task_id,
+                scope.model_calls.load(Ordering::Relaxed) as usize,
+                crate::events::DecisionType::InstructionsSnapshot,
+                format!("Loaded nested project instructions before {}", request.name),
+                serde_json::json!({
+                    "condition": "jit_project_instructions_discovered",
+                    "tool": request.name,
+                    "targets": &targets,
+                    "sources": &sources,
+                    "action_executed": false,
+                }),
+            )
+            .await;
         let notice = crate::agent::ToolResultNotice::ProjectInstructionsDiscovered {
             tool_name: request.name.clone(),
             sources: sources.join(", "),

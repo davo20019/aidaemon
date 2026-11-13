@@ -7,19 +7,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::events::{ExecutorExpectationItem, ExecutorExpectationsDeclaredData};
 use crate::plans::{ChecklistItem, PlanStatus, PlanStore, StepStatus};
 use crate::traits::{
-    RequestObservationTarget, RequestVerificationTargetKind, StableObservationSubject, Tool,
-    ToolArgumentContractViolation, ToolCallContext, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects, ToolSemanticFacet,
+    RequestVerificationTargetKind, StableObservationSubject, Tool, ToolArgumentContractViolation,
+    ToolCallContext, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolSemanticFacet,
 };
 
-/// Item-level key under which canonicalization records resource-ID targets
-/// that no registered tool advertises. Kept on the canonical arguments so the
-/// persisted checklist and the durable expectation event see the same drop.
-pub const UNBOUND_TARGETS_KEY: &str = "_unbound_targets";
-
+pub use aidaemon_work::plans::checklist_args::{
+    executor_expectations_from_checklist_arguments, parse_expectation_target,
+    parse_expectation_targets, unbound_targets_of, UNBOUND_TARGETS_KEY,
+};
 pub use aidaemon_work::plans::CHECKLIST_HEADER;
 
 /// Union of the exact receipt subjects every registered tool advertises via
@@ -222,19 +219,6 @@ fn parse_status(s: &str) -> StepStatus {
     StepStatus::from_str(s).unwrap_or(StepStatus::Pending)
 }
 
-fn unbound_targets_of(item: &Value) -> Vec<String> {
-    item.get(UNBOUND_TARGETS_KEY)
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Rewrite checklist arguments so every resource-ID target is one a registered
 /// tool can report. Unbound values move from `targets` into
 /// `_unbound_targets` on the same item; paths, URLs, structurally invalid
@@ -297,113 +281,6 @@ pub(crate) fn bind_checklist_targets(
     serde_json::to_string(&value).map_err(|error| {
         ToolArgumentContractViolation::new(format!("failed to re-serialize arguments: {error}"))
     })
-}
-
-/// Project a `track_requirements` call into the executor's typed expectation
-/// declaration. Only typed content survives: effects, the observation flag,
-/// exact targets, the recorded unbound targets, and the declared status.
-pub(crate) fn executor_expectations_from_checklist_arguments(
-    task_id: &str,
-    arguments: &str,
-) -> Option<ExecutorExpectationsDeclaredData> {
-    let value: Value = serde_json::from_str(arguments).ok()?;
-    let raw_items = value.get("items")?.as_array()?;
-    let mut items = Vec::with_capacity(raw_items.len());
-    for (index, item) in raw_items.iter().enumerate() {
-        let description = item.get("text")?.as_str()?.to_string();
-        let mut mutation_effects = ToolMutationEffects::NONE;
-        if let Some(effects) = item.get("mutation_effects").and_then(Value::as_array) {
-            for effect in effects.iter().filter_map(Value::as_str) {
-                if let Some(effect) = ToolMutationEffects::from_protocol_name(effect) {
-                    mutation_effects = mutation_effects.union(effect);
-                }
-            }
-        }
-        let (targets, observation_targets) = parse_expectation_targets(item.get("targets")).ok()?;
-        items.push(ExecutorExpectationItem {
-            index,
-            description,
-            requires_observation: item
-                .get("requires_observation")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            mutation_effects,
-            targets,
-            observation_targets,
-            unbound_targets: unbound_targets_of(item),
-            depends_on: item
-                .get("depends_on")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(|value| value.as_u64().and_then(|n| usize::try_from(n).ok()))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            status: item
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("pending")
-                .to_string(),
-        });
-    }
-    (!items.is_empty()).then(|| ExecutorExpectationsDeclaredData {
-        schema_version: ExecutorExpectationsDeclaredData::SCHEMA_VERSION,
-        task_id: task_id.to_string(),
-        items,
-        outcome: value
-            .get("outcome")
-            .and_then(Value::as_str)
-            .and_then(crate::events::ExecutorClaimedOutcome::from_protocol_name),
-    })
-}
-
-/// Decode checklist evidence targets once for both persistence and the durable
-/// executor-expectation event. String targets retain the original path/URL
-/// behavior; every other string is an exact opaque resource ID and therefore
-/// cannot silently degrade into an untargeted observation.
-pub(crate) fn parse_expectation_targets(
-    raw_targets: Option<&Value>,
-) -> Result<(Vec<String>, Vec<RequestObservationTarget>), String> {
-    let Some(raw_targets) = raw_targets else {
-        return Ok((Vec::new(), Vec::new()));
-    };
-    let values = raw_targets
-        .as_array()
-        .ok_or_else(|| "targets must be an array".to_string())?;
-    let mut legacy_targets = Vec::with_capacity(values.len());
-    let mut observation_targets = Vec::with_capacity(values.len());
-    for value in values {
-        let target = parse_expectation_target(value)?;
-        legacy_targets.push(target.subject.value.clone());
-        observation_targets.push(target);
-    }
-    Ok((legacy_targets, observation_targets))
-}
-
-fn parse_expectation_target(value: &Value) -> Result<RequestObservationTarget, String> {
-    let target = if let Some(value) = value.as_str() {
-        RequestObservationTarget::from_legacy_exact(value)
-            .ok_or_else(|| "target strings must not be empty".to_string())?
-    } else {
-        serde_json::from_value::<RequestObservationTarget>(value.clone())
-            .map_err(|error| format!("invalid structured target: {error}"))?
-    };
-    if target.subject.value.trim().is_empty() {
-        return Err("target subject must not be empty".to_string());
-    }
-    if let Some(coverage) = target.collection_coverage.as_ref() {
-        if coverage.collection.value.trim().is_empty() {
-            return Err("collection target must not be empty".to_string());
-        }
-        if target.facets.is_empty() {
-            return Err(
-                "collection-backed targets must declare at least one semantic facet".to_string(),
-            );
-        }
-    }
-    Ok(target)
 }
 
 #[async_trait]

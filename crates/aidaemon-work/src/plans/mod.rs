@@ -7,6 +7,7 @@
 //! - Provides explicit step-by-step progress tracking
 //! - Supports resume capability for long-running tasks
 
+pub mod checklist_args;
 pub mod detection;
 mod store;
 #[allow(dead_code)]

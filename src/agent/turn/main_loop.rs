@@ -592,7 +592,7 @@ impl Agent {
                 }
                 task_context_tail.push_str(&projection.rendered);
                 exact_context_projected = !projection.truncated;
-                self.emit_decision_point(
+                self.engine().emit_decision_point(
                     &emitter,
                     &task_id,
                     0,
@@ -640,7 +640,7 @@ impl Agent {
                 &turn_context.assessment_recent_messages,
                 antecedent_user_message_id,
             ) {
-                self.emit_decision_point(
+                self.engine().emit_decision_point(
                     &emitter,
                     &task_id,
                     0,
@@ -753,7 +753,7 @@ impl Agent {
                     }
                 }
             }
-            self.emit_decision_point(
+            self.engine().emit_decision_point(
                 &emitter,
                 &task_id,
                 0,
@@ -821,7 +821,7 @@ impl Agent {
                     false,
                 );
             }
-            self.emit_decision_point(
+            self.engine().emit_decision_point(
                 &emitter,
                 &task_id,
                 0,
@@ -910,7 +910,7 @@ impl Agent {
             execution_state.persistence = ExecutionPersistence::Durable;
         }
         execution_state.mark_persisted_now();
-        self.emit_decision_point(
+        self.engine().emit_decision_point(
             &emitter,
             &task_id,
             0,
@@ -926,7 +926,7 @@ impl Agent {
             }),
         )
         .await;
-        self.emit_decision_point(
+        self.engine().emit_decision_point(
             &emitter,
             &task_id,
             0,
@@ -1382,7 +1382,11 @@ impl Agent {
         // If an earlier phase already emitted TaskEnd, its accounting has
         // already happened; this pass only repairs the missing response.
         if !terminal_boundary_already_closed && status == crate::events::TaskStatus::Failed {
-            if let Some(efficiency) = self.task_efficiency_data(&unhandled_error_task_id).await {
+            if let Some(efficiency) = self
+                .engine()
+                .task_efficiency_data(&unhandled_error_task_id)
+                .await
+            {
                 crate::agent::record_failed_task_tokens(
                     efficiency
                         .input_tokens
@@ -1391,37 +1395,39 @@ impl Agent {
             }
         }
         if !terminal_boundary_already_closed {
-            self.emit_task_end(
-                &unhandled_error_emitter,
-                &unhandled_error_task_id,
-                status,
-                outcome,
-                task_start,
-                0,
-                tool_call_count as usize,
-                Some(error.to_string()),
-                Some(reply.clone()),
-            )
-            .await;
+            self.engine()
+                .emit_task_end(
+                    &unhandled_error_emitter,
+                    &unhandled_error_task_id,
+                    status,
+                    outcome,
+                    task_start,
+                    0,
+                    tool_call_count as usize,
+                    Some(error.to_string()),
+                    Some(reply.clone()),
+                )
+                .await;
         } else {
             // Keep the repair visible without appending a second terminal
             // transition (the lifecycle projection intentionally permits only
             // one). The response event is now the authoritative missing
             // delivery edge for the already-closed task.
-            self.emit_decision_point(
-                &unhandled_error_emitter,
-                &unhandled_error_task_id,
-                0,
-                crate::events::DecisionType::GateTelemetry,
-                "Attached lifecycle recovery response after terminal boundary".to_string(),
-                json!({
-                    "condition": "task_response_attached_after_terminal",
-                    "terminal_boundary_already_closed": true,
-                    "response_message_count_before": response_message_count,
-                    "receipt_backed": latest_result.is_some(),
-                }),
-            )
-            .await;
+            self.engine()
+                .emit_decision_point(
+                    &unhandled_error_emitter,
+                    &unhandled_error_task_id,
+                    0,
+                    crate::events::DecisionType::GateTelemetry,
+                    "Attached lifecycle recovery response after terminal boundary".to_string(),
+                    json!({
+                        "condition": "task_response_attached_after_terminal",
+                        "terminal_boundary_already_closed": true,
+                        "response_message_count_before": response_message_count,
+                        "receipt_backed": latest_result.is_some(),
+                    }),
+                )
+                .await;
         }
         Ok(reply)
     }
