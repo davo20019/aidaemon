@@ -11,7 +11,7 @@ use serde_json::Value;
 use super::contains_keyword_as_words;
 use super::execution_state::StepExecutionOutcome;
 
-pub use aidaemon_runtime::turn::helpers::{send_status, touch_heartbeat};
+pub use aidaemon_runtime::turn::helpers::touch_heartbeat;
 
 pub(in crate::agent) use aidaemon_runtime::turn::tool_summary::summarize_tool_args;
 

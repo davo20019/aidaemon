@@ -59,6 +59,7 @@ impl DecisionRecorder for Agent {
     }
 }
 
+#[async_trait::async_trait]
 impl TurnHost for Agent {
     fn turn_runtime(&self) -> &TurnRuntime {
         &self.runtime
@@ -90,6 +91,37 @@ impl TurnHost for Agent {
 
     fn inherited_authority(&self) -> Option<&aidaemon_runtime::authority::InheritedAuthority> {
         self.inherited_authority.as_ref()
+    }
+
+    fn depth(&self) -> usize {
+        self.depth
+    }
+
+    fn settings(&self) -> &dyn aidaemon_tools::services::SettingsStore {
+        &*self.state
+    }
+
+    fn notifications(&self) -> &dyn aidaemon_work::stores::NotificationStore {
+        &*self.state
+    }
+
+    fn goal_tokens(&self) -> Option<&aidaemon_work::goal_tokens::GoalTokenRegistry> {
+        self.goal_token_registry.as_ref()
+    }
+
+    fn hub(
+        &self,
+    ) -> &tokio::sync::RwLock<Option<std::sync::Weak<dyn aidaemon_channels::ports::OutboundRouter>>>
+    {
+        &self.hub
+    }
+
+    async fn persist_scheduled_run_state(
+        &self,
+        goal_id: &str,
+        status: &aidaemon_work::goal_tokens::GoalRunBudgetStatus,
+    ) {
+        super::goal_dispatch::persist_scheduled_run_state(&self.state, goal_id, None, status).await;
     }
 
     fn tools(&self) -> &[std::sync::Arc<dyn crate::traits::Tool>] {

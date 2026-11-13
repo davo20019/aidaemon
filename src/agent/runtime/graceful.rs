@@ -1,791 +1,15 @@
 use super::*;
+#[cfg(test)]
+use aidaemon_runtime::turn::budget;
 use aidaemon_runtime::turn::task_end;
 pub(in crate::agent) use aidaemon_runtime::turn::task_end::emit_decision_point_event;
 #[cfg(test)]
 use aidaemon_runtime::turn::task_end::task_end_decision_and_outcome;
 
-#[derive(Debug, Clone, Copy)]
-pub(super) enum GoalBudgetCheckSource {
-    PostLlm,
-}
-
-pub(super) struct GoalBudgetControlCtx<'a> {
-    pub emitter: &'a crate::events::EventEmitter,
-    pub task_id: &'a str,
-    pub session_id: &'a str,
-    pub iteration: usize,
-    pub goal_id: &'a str,
-    pub status: &'a crate::traits::GoalTokenBudgetStatus,
-    pub user_role: UserRole,
-    pub learning_ctx: &'a LearningContext,
-    pub evidence_gain_count: usize,
-    pub stall_count: usize,
-    pub consecutive_same_tool_count: usize,
-    pub consecutive_same_tool_unique_args: usize,
-    pub total_successful_tool_calls: usize,
-    pub pending_system_messages: &'a mut Vec<SystemDirective>,
-    pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
-    pub is_scheduled_goal: bool,
-    pub effective_goal_daily_budget: &'a mut Option<i64>,
-    pub budget_extensions_count: &'a mut usize,
-    pub max_budget_extensions: usize,
-    pub hard_token_cap: i64,
-    pub source: GoalBudgetCheckSource,
-}
-
-pub(super) enum GoalBudgetControlOutcome {
-    Continue,
-    Exhausted {
-        tokens_used_today: i64,
-        budget_daily: i64,
-    },
-}
-
-pub(super) struct ScheduledRunBudgetControlCtx<'a> {
-    pub emitter: &'a crate::events::EventEmitter,
-    pub task_id: &'a str,
-    pub session_id: &'a str,
-    pub iteration: usize,
-    pub goal_id: &'a str,
-    pub status: &'a crate::goal_tokens::GoalRunBudgetStatus,
-    pub pending_system_messages: &'a mut Vec<SystemDirective>,
-    pub max_budget_extensions: usize,
-    pub hard_token_cap: i64,
-}
-
-pub(super) enum ScheduledRunBudgetControlOutcome {
-    Continue,
-    Exhausted {
-        tokens_used: i64,
-        budget_per_check: i64,
-    },
-}
-
-pub(super) struct ScheduledRunActivityMetrics {
-    pub evidence_gain_count: usize,
-    pub stall_count: usize,
-    pub consecutive_same_tool_count: usize,
-    pub consecutive_same_tool_unique_args: usize,
-    pub total_successful_tool_calls: usize,
-}
-
 // impl-Agent justification: graceful shutdown, budget progress, and task-end hooks over state/event_store.
 impl Agent {
-    pub(super) fn has_meaningful_budget_progress(
-        evidence_gain_count: usize,
-        _total_successful_tool_calls: usize,
-    ) -> bool {
-        // Transport-level success and administrative calls are not progress.
-        // Only a mutation receipt or result-content verification can justify
-        // spending the run's single autonomous extension.
-        evidence_gain_count > 0
-    }
-
-    pub(super) fn scheduled_run_health_snapshot(
-        learning_ctx: &LearningContext,
-        metrics: ScheduledRunActivityMetrics,
-        completion_contract: &CompletionContract,
-        completion_progress: &CompletionProgress,
-    ) -> crate::traits::ScheduledRunHealth {
-        let required_mutation_progress = completion_contract.expects_mutation
-            && completion_progress.mutation_count > 0
-            && (completion_contract.required_mutation_effects.is_empty()
-                || completion_progress
-                    .observed_mutation_effects
-                    .intersects(completion_contract.required_mutation_effects));
-        crate::traits::ScheduledRunHealth {
-            evidence_gain_count: metrics.evidence_gain_count,
-            total_successful_tool_calls: metrics.total_successful_tool_calls,
-            completion_requires_mutation: completion_contract.expects_mutation,
-            required_mutation_progress,
-            completion_requires_observation: completion_contract.requires_observation,
-            verification_progress: completion_progress.verification_count > 0,
-            stall_count: metrics.stall_count,
-            consecutive_same_tool_count: metrics.consecutive_same_tool_count,
-            consecutive_same_tool_unique_args: metrics.consecutive_same_tool_unique_args,
-            unrecovered_error_count: learning_ctx
-                .errors
-                .iter()
-                .filter(|(_, recovered)| !recovered)
-                .count(),
-        }
-    }
-
-    pub(super) fn scheduled_run_has_structural_progress(
-        health: &crate::traits::ScheduledRunHealth,
-    ) -> bool {
-        if health.completion_requires_mutation {
-            return health.required_mutation_progress;
-        }
-        if health.completion_requires_observation {
-            return health.verification_progress;
-        }
-        // Text-only scheduled work has no mutation/verification receipt to
-        // satisfy, so bounded result evidence remains its progress signal.
-        health.evidence_gain_count > 0
-    }
-
-    pub(super) fn scheduled_run_metrics_are_clearly_unproductive(
-        health: &crate::traits::ScheduledRunHealth,
-    ) -> bool {
-        if health.stall_count > 1 {
-            return true;
-        }
-
-        let diverse_limit = MAX_CONSECUTIVE_SAME_TOOL + 4;
-        if health.consecutive_same_tool_count >= diverse_limit {
-            return true;
-        }
-        if health.consecutive_same_tool_count >= MAX_CONSECUTIVE_SAME_TOOL {
-            let is_diverse =
-                health.consecutive_same_tool_unique_args * 2 > health.consecutive_same_tool_count;
-            if !is_diverse {
-                return true;
-            }
-        }
-
-        if health.total_successful_tool_calls == 0 {
-            return health.unrecovered_error_count > 0 && health.evidence_gain_count == 0;
-        }
-
-        health.unrecovered_error_count >= health.total_successful_tool_calls
-    }
-
-    pub(super) fn scheduled_run_auto_extension_candidate(
-        status: &crate::goal_tokens::GoalRunBudgetStatus,
-        max_budget_extensions: usize,
-        hard_token_cap: i64,
-    ) -> Option<i64> {
-        let old_budget = status.effective_budget_per_check;
-        let new_budget = old_budget
-            .saturating_mul(2)
-            .max(status.tokens_used.saturating_add(old_budget / 2))
-            .min(hard_token_cap);
-
-        let has_meaningful_progress = Self::scheduled_run_has_structural_progress(&status.health);
-        let clearly_unproductive =
-            Self::scheduled_run_metrics_are_clearly_unproductive(&status.health);
-
-        if status.budget_extensions_count < max_budget_extensions
-            && old_budget < hard_token_cap
-            && new_budget > status.tokens_used
-            && has_meaningful_progress
-            && !clearly_unproductive
-        {
-            Some(new_budget)
-        } else {
-            None
-        }
-    }
-
-    /// The percentage to warn at once a scheduled run has used 80% of its
-    /// per-run budget (not yet exhausted, not already warned).
-    pub(super) fn scheduled_run_budget_pressure_pct(
-        status: &crate::goal_tokens::GoalRunBudgetStatus,
-        warning_already_sent: bool,
-    ) -> Option<i64> {
-        let budget = status.effective_budget_per_check;
-        if warning_already_sent || budget <= 0 || status.tokens_used >= budget {
-            return None;
-        }
-        let warning_threshold = budget.saturating_mul(80) / 100;
-        (status.tokens_used >= warning_threshold)
-            .then(|| status.tokens_used.saturating_mul(100) / budget)
-    }
-
     pub(super) async fn run_task_end_tool_hooks(&self, task_id: &str, session_id: &str) {
         task_end::run_task_end_tool_hooks(self, task_id, session_id).await;
-    }
-
-    /// Ask the owner to approve a one-time budget extension for the current run.
-    ///
-    /// Returns true only when the owner explicitly approves.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn request_budget_continue_approval(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        task_id: &str,
-        iteration: usize,
-        session_id: &str,
-        user_role: UserRole,
-        scope_label: &str,
-        used_tokens: i64,
-        current_budget: i64,
-        proposed_budget: i64,
-    ) -> bool {
-        if user_role != UserRole::Owner {
-            return false;
-        }
-        if proposed_budget <= current_budget {
-            return false;
-        }
-
-        let hub_weak = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
-            Ok(guard) => guard.clone(),
-            Err(_) => {
-                warn!(
-                    session_id,
-                    scope = scope_label,
-                    "Timed out acquiring hub lock for budget extension approval"
-                );
-                return false;
-            }
-        };
-        let Some(hub_weak) = hub_weak else {
-            return false;
-        };
-        let Some(hub_arc) = hub_weak.upgrade() else {
-            return false;
-        };
-
-        let approval_request = build_needs_approval_request(
-            format!(
-                "extend the {} token budget from {} to {} and continue execution",
-                scope_label, current_budget, proposed_budget
-            ),
-            Some(format!("{} token budget", scope_label)),
-            format!(
-                "Current usage is {} tokens, which exhausted the {} budget.",
-                used_tokens, scope_label
-            ),
-            "Explicit owner approval is required before spending more tokens on this run.",
-            format!(
-                "If approved, I will continue the current work inside the extended {} budget.",
-                scope_label
-            ),
-            None,
-        );
-        let (approval_desc, warnings) = approval_request.to_inline_approval_prompt();
-        self.emit_decision_point(
-            emitter,
-            task_id,
-            iteration,
-            DecisionType::BudgetAutoExtension,
-            format!(
-                "Requested owner approval for {} budget extension",
-                scope_label
-            ),
-            json!({
-                "condition": "budget_extension_manual_request",
-                "scope_label": scope_label,
-                "approval_state": ApprovalState::Requested,
-                "used_tokens": used_tokens,
-                "current_budget": current_budget,
-                "proposed_budget": proposed_budget,
-            }),
-        )
-        .await;
-
-        match hub_arc
-            .request_inline_approval(
-                session_id,
-                &approval_desc,
-                RiskLevel::High,
-                &warnings,
-                PermissionMode::Cautious,
-            )
-            .await
-        {
-            Ok(ApprovalResponse::AllowOnce)
-            | Ok(ApprovalResponse::AllowSession)
-            | Ok(ApprovalResponse::AllowAlways) => true,
-            Ok(ApprovalResponse::Deny) => {
-                self.emit_warning_decision_point(
-                    emitter,
-                    task_id,
-                    iteration,
-                    DecisionType::BudgetAutoExtension,
-                    format!("Owner denied {} budget extension", scope_label),
-                    json!({
-                        "condition": "budget_extension_manual_denied",
-                        "scope_label": scope_label,
-                        "approval_state": ApprovalState::Denied,
-                        "used_tokens": used_tokens,
-                        "current_budget": current_budget,
-                        "proposed_budget": proposed_budget,
-                    }),
-                )
-                .await;
-                false
-            }
-            Err(e) => {
-                self.emit_warning_decision_point(
-                    emitter,
-                    task_id,
-                    iteration,
-                    DecisionType::BudgetAutoExtension,
-                    format!("Approval unavailable for {} budget extension", scope_label),
-                    json!({
-                        "condition": "budget_extension_manual_unavailable",
-                        "scope_label": scope_label,
-                        "approval_state": ApprovalState::Denied,
-                        "used_tokens": used_tokens,
-                        "current_budget": current_budget,
-                        "proposed_budget": proposed_budget,
-                        "error": e.to_string(),
-                    }),
-                )
-                .await;
-                warn!(
-                    session_id,
-                    scope = scope_label,
-                    error = %e,
-                    "Budget extension approval unavailable"
-                );
-                false
-            }
-        }
-    }
-
-    pub(super) async fn enforce_goal_daily_budget_control(
-        &self,
-        ctx: &mut GoalBudgetControlCtx<'_>,
-    ) -> GoalBudgetControlOutcome {
-        let Some(db_budget_daily) = ctx.status.budget_daily else {
-            return GoalBudgetControlOutcome::Continue;
-        };
-        let shared_budget_daily = if let Some(registry) = &self.goal_token_registry {
-            registry.get_effective_daily_budget(ctx.goal_id).await
-        } else {
-            None
-        };
-        let durable_override = crate::goal_tokens::load_goal_daily_budget_override(
-            self.state.as_ref(),
-            ctx.goal_id,
-            db_budget_daily,
-            ctx.hard_token_cap,
-        )
-        .await;
-        if let Some(durable) = durable_override.as_ref() {
-            *ctx.budget_extensions_count = (*ctx.budget_extensions_count)
-                .max(durable.extensions_count.min(ctx.max_budget_extensions));
-            if let Some(registry) = &self.goal_token_registry {
-                registry
-                    .set_effective_daily_budget(ctx.goal_id, durable.budget_daily)
-                    .await;
-            }
-        }
-        let budget_daily = [
-            Some(db_budget_daily),
-            *ctx.effective_goal_daily_budget,
-            shared_budget_daily,
-            durable_override.map(|value| value.budget_daily),
-        ]
-        .into_iter()
-        .flatten()
-        .max()
-        .unwrap_or(db_budget_daily);
-        *ctx.effective_goal_daily_budget = Some(budget_daily);
-        if budget_daily <= 0 || ctx.status.tokens_used_today < budget_daily {
-            return GoalBudgetControlOutcome::Continue;
-        }
-
-        let old_gbudget = budget_daily;
-        let new_gbudget = old_gbudget
-            .saturating_mul(2)
-            .max(ctx.status.tokens_used_today.saturating_add(old_gbudget / 2))
-            .min(ctx.hard_token_cap);
-
-        let productive = if ctx.is_scheduled_goal {
-            // Active scheduled runs are governed by their shared per-run
-            // budget above. Keep this fail-closed for any legacy caller that
-            // reaches daily control directly.
-            false
-        } else {
-            Self::has_meaningful_budget_progress(
-                ctx.evidence_gain_count,
-                ctx.total_successful_tool_calls,
-            ) && post_task::is_productive(
-                ctx.learning_ctx,
-                ctx.stall_count,
-                ctx.consecutive_same_tool_count,
-                ctx.consecutive_same_tool_unique_args,
-                ctx.total_successful_tool_calls,
-            )
-        };
-
-        let (auto_condition, manual_condition, source_label) = match ctx.source {
-            GoalBudgetCheckSource::PostLlm => (
-                "goal_daily_budget_extension_post_llm",
-                "goal_daily_budget_extension_manual_post_llm",
-                "post-LLM",
-            ),
-        };
-
-        if *ctx.budget_extensions_count < ctx.max_budget_extensions
-            && old_gbudget < ctx.hard_token_cap
-            && new_gbudget > ctx.status.tokens_used_today
-            && productive
-        {
-            *ctx.budget_extensions_count += 1;
-            *ctx.effective_goal_daily_budget = Some(new_gbudget);
-            if let Some(registry) = &self.goal_token_registry {
-                registry
-                    .set_effective_daily_budget(ctx.goal_id, new_gbudget)
-                    .await;
-            }
-            if let Err(error) = crate::goal_tokens::persist_goal_daily_budget_override(
-                self.state.as_ref(),
-                ctx.goal_id,
-                new_gbudget,
-                *ctx.budget_extensions_count,
-            )
-            .await
-            {
-                warn!(
-                    goal_id = %ctx.goal_id,
-                    %error,
-                    "Failed to persist same-day goal budget extension"
-                );
-            }
-            info!(
-                ctx.session_id,
-                goal_id = %ctx.goal_id,
-                old_budget = old_gbudget,
-                new_budget = new_gbudget,
-                extension = *ctx.budget_extensions_count,
-                source = source_label,
-                "Auto-extended goal daily token budget in-memory"
-            );
-            ctx.pending_system_messages
-                .push(SystemDirective::GoalDailyBudgetAutoExtended {
-                    old_budget: old_gbudget,
-                    new_budget: new_gbudget,
-                    extension: *ctx.budget_extensions_count,
-                    max_extensions: ctx.max_budget_extensions,
-                });
-            if !ctx.is_scheduled_goal {
-                send_status(
-                    ctx.status_tx,
-                    StatusUpdate::BudgetExtended {
-                        old_budget: old_gbudget,
-                        new_budget: new_gbudget,
-                        extension: *ctx.budget_extensions_count,
-                        max_extensions: ctx.max_budget_extensions,
-                    },
-                );
-            }
-            self.emit_decision_point(
-                ctx.emitter,
-                ctx.task_id,
-                ctx.iteration,
-                DecisionType::BudgetAutoExtension,
-                "Auto-extended goal daily token budget on productive progress".to_string(),
-                json!({
-                    "condition": auto_condition,
-                    "goal_id": ctx.goal_id,
-                    "old_budget": old_gbudget,
-                    "new_budget": new_gbudget,
-                    "extension": *ctx.budget_extensions_count,
-                    "max_extensions": ctx.max_budget_extensions,
-                }),
-            )
-            .await;
-            return GoalBudgetControlOutcome::Continue;
-        }
-
-        // Scheduled work has an owner-confirmed unattended authority envelope.
-        // It may use the bounded autonomous extension above, but it must never
-        // convert resource management into a live approval interruption. Once
-        // that envelope is spent, stop this cycle cleanly at the hard boundary.
-        if ctx.is_scheduled_goal {
-            return GoalBudgetControlOutcome::Exhausted {
-                tokens_used_today: ctx.status.tokens_used_today,
-                budget_daily,
-            };
-        }
-
-        let approved_extension =
-            if old_gbudget < ctx.hard_token_cap && new_gbudget > ctx.status.tokens_used_today {
-                self.request_budget_continue_approval(
-                    ctx.emitter,
-                    ctx.task_id,
-                    ctx.iteration,
-                    ctx.session_id,
-                    ctx.user_role,
-                    "goal daily",
-                    ctx.status.tokens_used_today,
-                    old_gbudget,
-                    new_gbudget,
-                )
-                .await
-            } else {
-                false
-            };
-
-        if approved_extension {
-            *ctx.effective_goal_daily_budget = Some(new_gbudget);
-            if let Some(registry) = &self.goal_token_registry {
-                registry
-                    .set_effective_daily_budget(ctx.goal_id, new_gbudget)
-                    .await;
-            }
-            if let Err(error) = crate::goal_tokens::persist_goal_daily_budget_override(
-                self.state.as_ref(),
-                ctx.goal_id,
-                new_gbudget,
-                (*ctx.budget_extensions_count).saturating_add(1),
-            )
-            .await
-            {
-                warn!(
-                    goal_id = %ctx.goal_id,
-                    %error,
-                    "Failed to persist owner-approved same-day goal budget extension"
-                );
-            }
-            ctx.pending_system_messages
-                .push(SystemDirective::GoalDailyBudgetExtensionApproved {
-                    old_budget: old_gbudget,
-                    new_budget: new_gbudget,
-                });
-            self.emit_decision_point(
-                ctx.emitter,
-                ctx.task_id,
-                ctx.iteration,
-                DecisionType::BudgetAutoExtension,
-                "Extended goal daily token budget via owner approval".to_string(),
-                json!({
-                    "condition": manual_condition,
-                    "goal_id": ctx.goal_id,
-                    "approval_state": ApprovalState::Granted,
-                    "old_budget": old_gbudget,
-                    "new_budget": new_gbudget,
-                    "tokens_used_today": ctx.status.tokens_used_today,
-                }),
-            )
-            .await;
-            return GoalBudgetControlOutcome::Continue;
-        }
-
-        GoalBudgetControlOutcome::Exhausted {
-            tokens_used_today: ctx.status.tokens_used_today,
-            budget_daily,
-        }
-    }
-
-    pub(super) async fn enforce_scheduled_run_budget_control(
-        &self,
-        ctx: &mut ScheduledRunBudgetControlCtx<'_>,
-    ) -> ScheduledRunBudgetControlOutcome {
-        let budget_per_check = ctx.status.effective_budget_per_check;
-        if budget_per_check <= 0 || ctx.status.tokens_used < budget_per_check {
-            return ScheduledRunBudgetControlOutcome::Continue;
-        }
-
-        let old_budget = budget_per_check;
-        if let Some(new_budget) = Self::scheduled_run_auto_extension_candidate(
-            ctx.status,
-            ctx.max_budget_extensions,
-            ctx.hard_token_cap,
-        ) {
-            if let Some(registry) = &self.goal_token_registry {
-                let updated = registry
-                    .auto_extend_run_budget(ctx.goal_id, new_budget)
-                    .await;
-                if let Some(status) = updated.as_ref() {
-                    persist_scheduled_run_state(&self.state, ctx.goal_id, None, status).await;
-                }
-                let extension = updated
-                    .as_ref()
-                    .map(|status| status.budget_extensions_count)
-                    .unwrap_or_else(|| ctx.status.budget_extensions_count.saturating_add(1));
-                info!(
-                    ctx.session_id,
-                    goal_id = %ctx.goal_id,
-                    old_budget,
-                    new_budget,
-                    extension,
-                    "Auto-extended scheduled run budget"
-                );
-                // This is routine internal adaptation, not an owner-attention
-                // event. Keep it in the directive/event ledger instead of the
-                // channel status stream so an unattended run cannot wake the
-                // owner merely because it resized its own budget.
-                ctx.pending_system_messages.push(
-                    SystemDirective::ScheduledRunBudgetAdaptationRequired {
-                        old_budget,
-                        new_budget,
-                        extension,
-                        max_extensions: ctx.max_budget_extensions,
-                    },
-                );
-                self.emit_decision_point(
-                    ctx.emitter,
-                    ctx.task_id,
-                    ctx.iteration,
-                    DecisionType::BudgetAutoExtension,
-                    "Auto-extended scheduled run budget on continued progress".to_string(),
-                    json!({
-                        "condition": "scheduled_run_budget_extension",
-                        "goal_id": ctx.goal_id,
-                        "old_budget": old_budget,
-                        "new_budget": new_budget,
-                        "extension": extension,
-                        "max_extensions": ctx.max_budget_extensions,
-                        "tokens_used": ctx.status.tokens_used,
-                    }),
-                )
-                .await;
-                return ScheduledRunBudgetControlOutcome::Continue;
-            }
-        }
-
-        ScheduledRunBudgetControlOutcome::Exhausted {
-            tokens_used: ctx.status.tokens_used,
-            budget_per_check,
-        }
-    }
-
-    fn dedupe_alert_sessions(sessions: Vec<String>) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for session in sessions {
-            let trimmed = session.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if seen.insert(trimmed.to_string()) {
-                out.push(trimmed.to_string());
-            }
-        }
-        out
-    }
-
-    fn sanitize_alert_scope(scope: &str) -> String {
-        scope
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    }
-
-    async fn load_default_alert_sessions(&self) -> Vec<String> {
-        match self.state.get_setting("default_alert_sessions").await {
-            Ok(Some(raw)) => match serde_json::from_str::<Vec<String>>(&raw) {
-                Ok(sessions) => Self::dedupe_alert_sessions(sessions),
-                Err(e) => {
-                    warn!(error = %e, "Invalid default_alert_sessions setting");
-                    Vec::new()
-                }
-            },
-            Ok(None) => Vec::new(),
-            Err(e) => {
-                warn!(error = %e, "Failed to read default_alert_sessions setting");
-                Vec::new()
-            }
-        }
-    }
-
-    fn same_alert_destination(left: &str, right: &str) -> bool {
-        if left == right {
-            return true;
-        }
-        let is_non_telegram = |value: &str| {
-            value.contains("slack:")
-                || value.contains("discord:")
-                || value.starts_with("specialist:")
-        };
-        if is_non_telegram(left) || is_non_telegram(right) {
-            return false;
-        }
-        match (
-            crate::session::telegram_chat_id_from_session(left),
-            crate::session::telegram_chat_id_from_session(right),
-        ) {
-            (Some(left), Some(right)) => left == right,
-            _ => false,
-        }
-    }
-
-    /// Fan-out token alerts to owner sessions plus the triggering session.
-    pub(super) async fn fanout_token_alert(
-        &self,
-        goal_id: Option<&str>,
-        trigger_session_id: &str,
-        message: &str,
-        suppress_session_id: Option<&str>,
-    ) {
-        // Background goal runs deliver one consolidated terminal outcome from
-        // the task lead. Child and task-lead budget checks can fire at nearly
-        // the same instant; fanning out here produced duplicate alerts, often
-        // addressed to internal specialist sessions. Defer those alerts to the
-        // run finalizer, which has the originating user session and full task
-        // outcome.
-        if goal_id.is_some() && self.depth > 0 {
-            info!(
-                depth = self.depth,
-                goal_id = goal_id.unwrap_or_default(),
-                "Deferring background goal budget alert to terminal run notification"
-            );
-            return;
-        }
-
-        let mut targets = self.load_default_alert_sessions().await;
-        let goal_session = if let Some(goal_id) = goal_id {
-            self.state
-                .get_goal(goal_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|goal| goal.session_id)
-        } else {
-            None
-        };
-        let primary_session = goal_session.as_deref().unwrap_or(trigger_session_id);
-        targets.retain(|target| !Self::same_alert_destination(target, primary_session));
-        targets.push(primary_session.to_string());
-        targets = Self::dedupe_alert_sessions(targets);
-
-        let goal_ref = goal_id.map(ToString::to_string).unwrap_or_else(|| {
-            format!(
-                "token-budget:{}",
-                Self::sanitize_alert_scope(trigger_session_id)
-            )
-        });
-
-        let hub = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
-            Ok(guard) => guard.clone(),
-            Err(_) => {
-                warn!(
-                    trigger_session_id,
-                    "Timed out acquiring hub lock while faning out token alert"
-                );
-                None
-            }
-        };
-        for target in targets {
-            let entry =
-                crate::traits::NotificationEntry::new(&goal_ref, &target, "token_alert", message);
-
-            if let Err(e) = self.state.enqueue_notification(&entry).await {
-                warn!(
-                    session_id = %target,
-                    goal_id = %goal_ref,
-                    error = %e,
-                    "Failed to enqueue token alert"
-                );
-                continue;
-            }
-
-            if suppress_session_id == Some(target.as_str()) {
-                let _ = self.state.mark_notification_delivered(&entry.id).await;
-                continue;
-            }
-
-            if let Some(hub_weak) = &hub {
-                if let Some(hub_arc) = hub_weak.upgrade() {
-                    if hub_arc.send_text(&target, message).await.is_ok() {
-                        let _ = self.state.mark_notification_delivered(&entry.id).await;
-                    }
-                }
-            }
-        }
     }
 
     /// Test-only wrapper around `post_task::classify_stall`.
@@ -919,22 +143,22 @@ mod tests {
 
     #[test]
     fn meaningful_budget_progress_accepts_evidence_gain() {
-        assert!(Agent::has_meaningful_budget_progress(1, 0));
+        assert!(budget::has_meaningful_budget_progress(1, 0));
     }
 
     #[test]
     fn meaningful_budget_progress_rejects_transport_success_without_evidence() {
-        assert!(!Agent::has_meaningful_budget_progress(0, 30));
+        assert!(!budget::has_meaningful_budget_progress(0, 30));
     }
 
     #[test]
     fn meaningful_budget_progress_rejects_shallow_runs_without_evidence() {
-        assert!(!Agent::has_meaningful_budget_progress(0, 2));
+        assert!(!budget::has_meaningful_budget_progress(0, 2));
     }
 
     #[test]
     fn scheduled_run_metrics_detect_unproductive_snapshot() {
-        assert!(Agent::scheduled_run_metrics_are_clearly_unproductive(
+        assert!(budget::scheduled_run_metrics_are_clearly_unproductive(
             &crate::traits::ScheduledRunHealth {
                 evidence_gain_count: 0,
                 total_successful_tool_calls: 0,
@@ -950,7 +174,7 @@ mod tests {
     #[test]
     fn scheduled_run_auto_extension_candidate_requires_health() {
         assert_eq!(
-            Agent::scheduled_run_auto_extension_candidate(
+            budget::scheduled_run_auto_extension_candidate(
                 &crate::goal_tokens::GoalRunBudgetStatus {
                     effective_budget_per_check: 100,
                     tokens_used: 100,
@@ -967,7 +191,7 @@ mod tests {
     #[test]
     fn scheduled_run_auto_extension_candidate_accepts_required_mutation_receipt() {
         assert_eq!(
-            Agent::scheduled_run_auto_extension_candidate(
+            budget::scheduled_run_auto_extension_candidate(
                 &crate::goal_tokens::GoalRunBudgetStatus {
                     effective_budget_per_check: 100,
                     tokens_used: 100,
@@ -1011,7 +235,7 @@ mod tests {
         };
 
         assert_eq!(
-            Agent::scheduled_run_auto_extension_candidate(&status, 1, 2_000_000),
+            budget::scheduled_run_auto_extension_candidate(&status, 1, 2_000_000),
             None
         );
     }
@@ -1032,7 +256,7 @@ mod tests {
         };
 
         assert_eq!(
-            Agent::scheduled_run_auto_extension_candidate(&status, 1, 1_000),
+            budget::scheduled_run_auto_extension_candidate(&status, 1, 1_000),
             Some(200)
         );
     }
@@ -1040,7 +264,7 @@ mod tests {
     #[test]
     fn scheduled_run_auto_extension_candidate_respects_autonomous_extension_limit() {
         assert_eq!(
-            Agent::scheduled_run_auto_extension_candidate(
+            budget::scheduled_run_auto_extension_candidate(
                 &crate::goal_tokens::GoalRunBudgetStatus {
                     effective_budget_per_check: 200,
                     tokens_used: 200,
@@ -1073,11 +297,11 @@ mod tests {
             health: crate::traits::ScheduledRunHealth::default(),
         };
         assert_eq!(
-            Agent::scheduled_run_budget_pressure_pct(&status, false),
+            budget::scheduled_run_budget_pressure_pct(&status, false),
             Some(80)
         );
         assert_eq!(
-            Agent::scheduled_run_budget_pressure_pct(&status, true),
+            budget::scheduled_run_budget_pressure_pct(&status, true),
             None
         );
 
@@ -1086,18 +310,18 @@ mod tests {
             ..status
         };
         assert_eq!(
-            Agent::scheduled_run_budget_pressure_pct(&exhausted, false),
+            budget::scheduled_run_budget_pressure_pct(&exhausted, false),
             None
         );
     }
 
     #[test]
     fn alert_destination_dedupes_legacy_and_namespaced_telegram_sessions() {
-        assert!(Agent::same_alert_destination(
+        assert!(budget::same_alert_destination(
             "301753035",
             "aidaemon_coding_bot:301753035"
         ));
-        assert!(!Agent::same_alert_destination(
+        assert!(!budget::same_alert_destination(
             "slack:U018EAFV5QR",
             "aidaemon_coding_bot:301753035"
         ));

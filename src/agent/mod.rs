@@ -26,11 +26,10 @@ use crate::providers::{ProviderError, ProviderErrorKind, ProviderRecoveryRoute};
 use crate::router::Router;
 use crate::runtime_ports::OutboundRouter;
 use crate::skills;
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{
     AgentRole, ChatOptions, Message, StateStore, Tool, ToolCapabilities, ToolRole,
 };
-use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
+use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
 #[cfg(test)]
 use crate::events::ToolCallInfo;
@@ -43,12 +42,6 @@ pub use crate::types::StatusUpdate;
 use crate::traits::Task;
 
 const DEFERRED_NO_TOOL_ERROR_MARKER: &str = "deferred-action no-tool loop";
-/// If the same tool NAME is called this many consecutive iterations (even with
-/// different arguments), treat it as a loop.  This catches the case where the
-/// LLM keeps calling e.g. `terminal` with varied commands without progress.
-/// Set high enough to allow complex multi-step investigations from mobile,
-/// and to leave room for follow-up work after cli_agent returns.
-use aidaemon_runtime::turn::loop_utils::MAX_CONSECUTIVE_SAME_TOOL;
 #[path = "response_analysis.rs"]
 mod response_analysis;
 #[cfg(test)]
@@ -82,7 +75,6 @@ use policy_signals::{build_policy_bundle, detect_explicit_outcome_signal};
 mod validation_state {
     pub(crate) use aidaemon_runtime::turn::validation_state::*;
 }
-pub(in crate::agent) use validation_state::ApprovalState;
 pub(crate) use validation_state::{
     build_needs_approval_request, derive_executor_step_result, extract_executor_handoff_context,
     persist_executor_handoff_context, persist_executor_result_context, ExecutorHandoff,
@@ -271,6 +263,7 @@ pub(in crate::agent) use policy_metrics::{
 // filtering, intent-gate merge). Implementation lives in `agent_helpers.rs`.
 #[path = "agent_helpers.rs"]
 mod agent_helpers;
+pub use agent_helpers::touch_heartbeat;
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::IntentGateDecision;
 pub(in crate::agent) use agent_helpers::{
@@ -278,7 +271,6 @@ pub(in crate::agent) use agent_helpers::{
     is_untrusted_external_reference_blocked_tool, truncate_for_resume, ResumeCheckpoint,
     ResumeExecutionSnapshot,
 };
-pub use agent_helpers::{send_status, touch_heartbeat};
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::{
     user_explicitly_requests_local_file_inspection, user_text_references_filesystem_path,

@@ -280,9 +280,12 @@ pub(in crate::agent) fn auto_dispatch_scheduled_run_extension_budget(
         .max(status.tokens_used.saturating_add(old_budget / 2))
         .min(hard_token_cap);
 
-    let has_meaningful_progress = Agent::scheduled_run_has_structural_progress(&status.health);
+    let has_meaningful_progress =
+        aidaemon_runtime::turn::budget::scheduled_run_has_structural_progress(&status.health);
     let clearly_unproductive =
-        Agent::scheduled_run_metrics_are_clearly_unproductive(&status.health);
+        aidaemon_runtime::turn::budget::scheduled_run_metrics_are_clearly_unproductive(
+            &status.health,
+        );
 
     if status.budget_extensions_count < max_budget_extensions
         && old_budget < hard_token_cap

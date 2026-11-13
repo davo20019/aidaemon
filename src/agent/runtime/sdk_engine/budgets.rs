@@ -150,7 +150,8 @@ impl Agent {
             {
                 true
             } else {
-                self.request_budget_continue_approval(
+                aidaemon_runtime::turn::budget::request_budget_continue_approval(
+                    self,
                     scope.emitter,
                     scope.task_id,
                     iteration,
@@ -204,8 +205,14 @@ impl Agent {
              The run was stopped to prevent overspending.",
             scope.session_id, used, budget
         );
-        self.fanout_token_alert(None, scope.session_id, &alert, Some(scope.session_id))
-            .await;
+        aidaemon_runtime::turn::budget::fanout_token_alert(
+            self,
+            None,
+            scope.session_id,
+            &alert,
+            Some(scope.session_id),
+        )
+        .await;
         Some(crate::agent::post_task::graceful_budget_response(
             learning, used,
         ))
@@ -234,7 +241,7 @@ impl Agent {
                 return None;
             }
         };
-        let metrics = || crate::agent::graceful::ScheduledRunActivityMetrics {
+        let metrics = || aidaemon_runtime::turn::budget::ScheduledRunActivityMetrics {
             evidence_gain_count: successes,
             stall_count: usize::from(scope.repeating.load(Ordering::Relaxed)),
             consecutive_same_tool_count: 0,
@@ -252,7 +259,7 @@ impl Agent {
             let run_status = registry
                 .update_run_health(
                     &goal.goal_id,
-                    Agent::scheduled_run_health_snapshot(
+                    aidaemon_runtime::turn::budget::scheduled_run_health_snapshot(
                         learning,
                         metrics(),
                         scope.contract,
@@ -269,7 +276,7 @@ impl Agent {
             .await;
             // One warning at 80% of the per-run budget, so the run can wrap
             // up before it is stopped.
-            if let Some(pct) = Agent::scheduled_run_budget_pressure_pct(
+            if let Some(pct) = aidaemon_runtime::turn::budget::scheduled_run_budget_pressure_pct(
                 &run_status,
                 scope.budget_warning_sent.load(Ordering::Relaxed),
             ) {
@@ -298,7 +305,7 @@ impl Agent {
                 )
                 .await;
             }
-            let mut ctx = crate::agent::graceful::ScheduledRunBudgetControlCtx {
+            let mut ctx = aidaemon_runtime::turn::budget::ScheduledRunBudgetControlCtx {
                 emitter: scope.emitter,
                 task_id: scope.task_id,
                 session_id: scope.session_id,
@@ -309,17 +316,20 @@ impl Agent {
                 max_budget_extensions: SCHEDULED_MAX_BUDGET_EXTENSIONS,
                 hard_token_cap: SCHEDULED_HARD_TOKEN_CAP,
             };
-            if let crate::agent::graceful::ScheduledRunBudgetControlOutcome::Exhausted {
+            if let aidaemon_runtime::turn::budget::ScheduledRunBudgetControlOutcome::Exhausted {
                 tokens_used,
                 budget_per_check,
-            } = self.enforce_scheduled_run_budget_control(&mut ctx).await
+            } =
+                aidaemon_runtime::turn::budget::enforce_scheduled_run_budget_control(self, &mut ctx)
+                    .await
             {
                 let alert = format!(
                     "Token alert: scheduled run for goal '{}' hit its per-run budget (used {} / \
                      limit {}). The run stopped safely before completion.",
                     goal.goal_id, tokens_used, budget_per_check
                 );
-                self.fanout_token_alert(
+                aidaemon_runtime::turn::budget::fanout_token_alert(
+                    self,
                     Some(goal.goal_id.as_str()),
                     scope.session_id,
                     &alert,
@@ -343,7 +353,7 @@ impl Agent {
             .unwrap_or(None);
         let mut extensions = scope.goal_budget_extensions.load(Ordering::Relaxed) as usize;
         let outcome = {
-            let mut ctx = crate::agent::graceful::GoalBudgetControlCtx {
+            let mut ctx = aidaemon_runtime::turn::budget::GoalBudgetControlCtx {
                 emitter: scope.emitter,
                 task_id: scope.task_id,
                 session_id: scope.session_id,
@@ -364,9 +374,9 @@ impl Agent {
                 budget_extensions_count: &mut extensions,
                 max_budget_extensions: TASK_MAX_BUDGET_EXTENSIONS,
                 hard_token_cap: TASK_HARD_TOKEN_CAP as i64,
-                source: crate::agent::graceful::GoalBudgetCheckSource::PostLlm,
+                source: aidaemon_runtime::turn::budget::GoalBudgetCheckSource::PostLlm,
             };
-            self.enforce_goal_daily_budget_control(&mut ctx).await
+            aidaemon_runtime::turn::budget::enforce_goal_daily_budget_control(self, &mut ctx).await
         };
         if let Ok(mut budget) = scope.goal_daily_budget.lock() {
             *budget = effective_daily;
@@ -374,7 +384,7 @@ impl Agent {
         scope
             .goal_budget_extensions
             .store(extensions as u32, Ordering::Relaxed);
-        if let crate::agent::graceful::GoalBudgetControlOutcome::Exhausted {
+        if let aidaemon_runtime::turn::budget::GoalBudgetControlOutcome::Exhausted {
             tokens_used_today,
             budget_daily,
         } = outcome
@@ -384,7 +394,8 @@ impl Agent {
                  was stopped to prevent overspending.",
                 goal.goal_id, tokens_used_today, budget_daily
             );
-            self.fanout_token_alert(
+            aidaemon_runtime::turn::budget::fanout_token_alert(
+                self,
                 Some(goal.goal_id.as_str()),
                 scope.session_id,
                 &alert,

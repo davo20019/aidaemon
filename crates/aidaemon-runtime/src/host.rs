@@ -53,6 +53,7 @@ pub trait DecisionRecorder: Send + Sync {
 
 /// The host a turn runs on: its stores, workspace and decision record, the
 /// agent's [`TurnRuntime`] and where the agent stands in its tree.
+#[async_trait::async_trait]
 pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
     /// The agent's turn settings and caches.
     fn turn_runtime(&self) -> &crate::turn_runtime::TurnRuntime;
@@ -74,6 +75,25 @@ pub trait TurnHost: TurnStores + TurnWorkspace + DecisionRecorder {
     fn inherited_project_scope(&self) -> Option<&str>;
     /// Where received attachments are saved: daemon storage, never a project.
     fn inbox_dir(&self) -> Option<&std::path::Path>;
+    /// How deep this agent is in its tree (0 is the root agent).
+    fn depth(&self) -> usize;
+    /// Settings: default alert sessions, goal budget overrides.
+    fn settings(&self) -> &dyn aidaemon_tools::services::SettingsStore;
+    /// The notification queue token alerts go through.
+    fn notifications(&self) -> &dyn aidaemon_work::stores::NotificationStore;
+    /// The goals' shared token budgets, when the agent tracks them.
+    fn goal_tokens(&self) -> Option<&aidaemon_work::goal_tokens::GoalTokenRegistry>;
+    /// The chat hub: notices to the owner and inline approval cards. Set
+    /// after the agent is built, so it may be empty.
+    fn hub(
+        &self,
+    ) -> &tokio::sync::RwLock<Option<std::sync::Weak<dyn aidaemon_channels::ports::OutboundRouter>>>;
+    /// Record a scheduled run's budget state after an extension.
+    async fn persist_scheduled_run_state(
+        &self,
+        goal_id: &str,
+        status: &aidaemon_work::goal_tokens::GoalRunBudgetStatus,
+    );
     /// The agent's tools (their task-end hooks run when a task ends).
     fn tools(&self) -> &[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>];
 }
