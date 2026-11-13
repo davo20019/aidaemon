@@ -57,6 +57,7 @@ pub mod coordination;
 pub mod engine;
 pub mod eval;
 pub mod goal_dispatch;
+pub mod heartbeat;
 pub mod history;
 pub mod host;
 pub mod known_resources;

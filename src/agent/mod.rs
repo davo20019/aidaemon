@@ -429,18 +429,18 @@ impl AgentLimits {
 #[path = "goal_dispatch.rs"]
 mod goal_dispatch;
 #[cfg(test)]
-pub(crate) use goal_dispatch::{build_goal_failure_summary, extract_file_paths_from_text};
 pub(crate) use goal_dispatch::{
-    build_goal_task_results_summary, SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS,
-    SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
+    build_goal_failure_summary, build_goal_task_results_summary, extract_file_paths_from_text,
 };
 #[cfg(test)]
 pub(in crate::agent) use goal_dispatch::{parse_wait_task_seconds, user_facing_task_description};
+pub(crate) use goal_dispatch::{
+    SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS, SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
+};
 
 // A goal's background task lead lives in `aidaemon_runtime::background_task_lead`.
 #[path = "background_task_lead.rs"]
 mod background_task_lead;
-pub use background_task_lead::spawn_background_task_lead;
 
 // `Agent` constructors (new / with_depth / set_test_*) live in `construct.rs`.
 #[path = "construct.rs"]
@@ -449,11 +449,6 @@ pub(crate) use construct::{AgentConstruction, AgentRuntimeDependencies};
 
 // impl-Agent justification: public entry surface (handle_message, hub/self-ref wiring, role/depth accessors, goal cancellation) — Agent's API to channels and core.
 impl Agent {
-    /// When some configured model can next answer, if none can now.
-    pub(crate) fn next_model_answer_at(&self) -> Option<std::time::SystemTime> {
-        self.llm_runtime.snapshot().next_answer_at()
-    }
-
     /// Set the ChannelHub reference (called after hub creation in core.rs).
     pub(crate) async fn set_hub(&self, hub: Weak<dyn OutboundRouter>) {
         *self.hub.write().await = Some(hub);

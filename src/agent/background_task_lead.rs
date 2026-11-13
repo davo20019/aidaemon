@@ -1,8 +1,6 @@
 //! A goal's background task lead lives in
 //! `aidaemon_runtime::background_task_lead`.
 
-pub use aidaemon_runtime::background_task_lead::spawn_background_task_lead;
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

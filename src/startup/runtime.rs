@@ -553,7 +553,8 @@ pub(crate) fn start_heartbeat_coordinator(
     heartbeat_opt.map(|mut heartbeat| {
         let outbound: Arc<dyn crate::runtime_ports::OutboundRouter> = hub.clone();
         heartbeat.set_hub(Arc::downgrade(&outbound));
-        heartbeat.set_agent(Arc::downgrade(agent));
+        let agent: std::sync::Weak<crate::agent::Agent> = Arc::downgrade(agent);
+        heartbeat.set_agent(agent);
         info!("Heartbeat coordinator starting with hub and agent references");
         heartbeat.start(shutdown)
     })

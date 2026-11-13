@@ -859,7 +859,8 @@ async fn queued_background_result(
         None,
         None,
     );
-    coordinator.set_agent(Arc::downgrade(&agent));
+    let weak: std::sync::Weak<_> = Arc::downgrade(&agent);
+    coordinator.set_agent(weak);
     coordinator
         .record_delivered_notification(&queued, &queued.message)
         .await;

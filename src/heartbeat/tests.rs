@@ -1,10 +1,17 @@
 use super::*;
+use crate::goal_tokens::GoalTokenRegistry;
 use crate::memory::embeddings::EmbeddingService;
+use crate::runtime_ports::OutboundRouter;
 use crate::state::SqliteStateStore;
+use crate::traits::StateStore;
 use crate::traits::{Goal, GoalSchedule, Mandate, MandateAuthority, Task, TaskActivity};
+use aidaemon_core::CancellationToken;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+use tokio::sync::mpsc;
 
 fn synthetic_task(desc: &str, status: &str) -> Task {
     Task {
@@ -192,7 +199,10 @@ async fn queued_notices_reach_owner_history_and_timeouts_stay_answerable() {
     let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
     let mut coordinator =
         HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
-    coordinator.set_agent(Arc::downgrade(&agent));
+    coordinator.set_agent({
+        let weak: Weak<_> = Arc::downgrade(&agent);
+        weak
+    });
 
     // A routine queued notice: visible to the agent, but not a question.
     let stalled = NotificationEntry::new(
