@@ -44,6 +44,7 @@ impl AgentIngress for Agent {
                 .send(StatusUpdate::ToolStart {
                     name: "terminal".into(),
                     summary: "reading the synthetic notes".into(),
+                    kind: aidaemon_core::card::ActivityKind::Read,
                 })
                 .await;
             tokio::time::sleep(Duration::from_millis(600)).await;
