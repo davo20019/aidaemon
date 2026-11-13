@@ -2519,7 +2519,10 @@ mod tests {
             card.contains("Started in the background: Counter A"),
             "{card}"
         );
-        assert!(card.contains("🤖 Counter B: running a command"), "{card}");
+        assert!(
+            card.contains("Started in the background: Counter B\n🤖 running a command"),
+            "{card}"
+        );
         assert!(
             card.contains("Handed off to a helper; it's working in the background"),
             "{card}"

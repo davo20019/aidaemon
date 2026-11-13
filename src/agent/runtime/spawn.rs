@@ -387,8 +387,9 @@ const MAX_REPORT_TOOL_RECORDS: usize = 5_000;
 /// turn, leaving whichever wrote last looking like the whole task). Each of
 /// the child's steps (a tool starting or ending) is likewise that child's
 /// progress line, so the parent's card and its status reply say what each
-/// helper is doing ("Drupal install: running the site installer"). Every
-/// other update passes through unchanged.
+/// helper is doing ("Drupal install: running the site installer"), and so
+/// is a step of the child's that goes on in the background. Every other
+/// update passes through unchanged.
 fn child_status_sender(
     parent: Option<mpsc::Sender<StatusUpdate>>,
     mission: &str,
@@ -419,6 +420,16 @@ fn child_status_sender(
                 StatusUpdate::ToolComplete { name, .. } => StatusUpdate::SubAgentProgress {
                     label: label.clone(),
                     progress: aidaemon_channels::live_status::step_ended_line(&name),
+                },
+                // A child's step that went on in the background is that
+                // child's progress, never the parent's own step (live
+                // 2026-11-13: "… goes on in the background" stood on the
+                // card as if the turn itself had handed off).
+                StatusUpdate::StepHandedOff { name, to_helper } => StatusUpdate::SubAgentProgress {
+                    label: label.clone(),
+                    progress: aidaemon_channels::live_status::helper_step_handed_off(
+                        &name, to_helper,
+                    ),
                 },
                 other => other,
             };
@@ -3755,7 +3766,8 @@ mod tests {
 
     /// Two parallel children each declare a checklist. Neither reaches the
     /// parent's card as a checklist (which would replace the parent's plan);
-    /// each becomes a progress line naming its own child.
+    /// each becomes a progress line naming its own child, and so does a
+    /// child's step handed to the background.
     #[tokio::test]
     async fn a_childs_checklist_never_replaces_the_parents_plan() {
         let (parent_tx, mut parent_rx) = mpsc::channel(16);
@@ -3793,6 +3805,13 @@ mod tests {
             })
             .await
             .unwrap();
+        drupal
+            .send(StatusUpdate::StepHandedOff {
+                name: "Counting 1 to 60 slowly".into(),
+                to_helper: false,
+            })
+            .await
+            .unwrap();
         drupal.send(StatusUpdate::Thinking(2)).await.unwrap();
         drop((wordpress, drupal));
 
@@ -3812,6 +3831,9 @@ mod tests {
         assert_eq!(
             lines,
             vec![
+                "Build the Drupal demo site for Acme Corp: counting 1 to 60 slowly goes on in \
+                 the background"
+                    .to_string(),
                 "Build the Drupal demo site for Acme Corp: finished running the site installer"
                     .to_string(),
                 "Build the Drupal demo site for Acme Corp: running the site installer".to_string(),
