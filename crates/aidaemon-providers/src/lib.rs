@@ -60,6 +60,7 @@ mod chatgpt;
 pub mod chatgpt_login;
 mod errors;
 mod google;
+pub mod key_check;
 mod openai;
 pub mod routing;
 mod sse;

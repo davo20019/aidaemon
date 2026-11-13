@@ -11,7 +11,7 @@ the parts already moved to that line:
   (modules whose behavior still waits to move, each with the plan step that
   moves it). A new module fails until it is put on a list. A listed module
   that is gone fails too, so the lists only shrink.
-- Directories on `MOVED` are done (`src/agent/`, `src/nodes/`): each of
+- Directories on `MOVED` are done (`src/agent/`, `src/nodes/`, `src/channels/`): each of
   their files is either an adapter on that directory's list (the app as the
   crates' host) or holds nothing but tests and module plumbing once its
   `#[cfg(test)]` items are removed. A function, impl, type or constant
@@ -49,6 +49,7 @@ SHELL = {
     "runtime_ports.rs": "the app's port traits onto crate parts",
     "agent": "the agent as the crates' host (held by MOVED and AGENT_ADAPTERS)",
     "nodes": "the Node service's host adapters (held by MOVED and NODE_ADAPTERS)",
+    "channels": "the daemon's channel hosts (held by MOVED and CHANNEL_ADAPTERS)",
     "testing.rs": "the daemon's test harness",
     "integration_tests.rs": "tests of the assembled product",
     "integration_tests": "tests of the assembled product",
@@ -82,7 +83,6 @@ REEXPORTS = {
 
 # Behavior still in the app, and the plan step that moves it.
 PENDING = {
-    "channels": "9.5: the daemon's channel hosts",
     "tools": "9.4: spawn (tests only), file policy and the read/write/edit/search_files wrappers",
     "state": "9.3/9.6: the SQLite store behind the facade traits",
     "memory": "9.1/9.6: memory host adapters, procedures, task learning, retention",
@@ -110,8 +110,21 @@ NODE_ADAPTERS = {
     "cli.rs": "the `aidaemon node` CLI subcommand over the crate's services",
 }
 
+# The daemon's channel hosts: the bots in the adapter crates on the daemon's
+# stores, config file and process. The files that may hold non-test code.
+CHANNEL_ADAPTERS = {
+    "mod.rs": "ChannelRuntimeDeps: the daemon's services as the bots' BotDeps",
+    "commands.rs": "the shared slash commands on the daemon's stores, /reload on its config",
+    "connect.rs": "/connect token checks by platform, as this build has them",
+    "discord.rs": "builds the Discord bot on the daemon's services",
+    "slack.rs": "the Slack bot's host: workspace grants from the config, /restart",
+    "set_key.rs": "/setkey: which config entries take a key, saving one to the config",
+    "telegram.rs": "the Telegram bot's host: config-file commands (/setkey, /connect, "
+    "/bots, /restart, owner claim), /setup over the setup wizard, the terminal surface",
+}
+
 # Directories whose step is done, with the files that may hold non-test code.
-MOVED = {"agent": AGENT_ADAPTERS, "nodes": NODE_ADAPTERS}
+MOVED = {"agent": AGENT_ADAPTERS, "nodes": NODE_ADAPTERS, "channels": CHANNEL_ADAPTERS}
 
 TEST_FILE = re.compile(r"(^|/)(tests?|[a-z0-9_]+_tests)\.rs$")
 
