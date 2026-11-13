@@ -982,6 +982,7 @@ impl crate::traits::ToolSemantics for EffectsProbe {
                 sdk::EffectKey::named(sdk::EffectClass::Credential, "acme"),
             ],
             complete: true,
+            understood: false,
         }
     }
 }

@@ -87,6 +87,30 @@ fn foreground_wait(initial: Duration, backgrounded: bool, notifications_reach: b
 /// Per-stream tail of startup output returned with a background launch.
 const PARTIAL_OUTPUT_TAIL_BYTES: usize = 1500;
 
+/// How often a running command's latest output line is sent as its progress.
+const COMMAND_OUTPUT_PROGRESS_EVERY: Duration = Duration::from_secs(3);
+
+/// The last non-empty line a command printed so far (a carriage return
+/// starts a new line, as a progress bar redraws), secrets redacted, cut to
+/// a card's width. `None` before it printed anything.
+pub(crate) fn latest_output_line(output: &[u8]) -> Option<String> {
+    const MAX_CHARS: usize = 100;
+    let start = output.len().saturating_sub(4096);
+    let tail = String::from_utf8_lossy(&output[start..]);
+    let line = tail
+        .split(['\n', '\r'])
+        .map(|line| line.trim())
+        .rfind(|line| !line.is_empty())?;
+    let line: String = line.chars().filter(|c| !c.is_control()).collect();
+    let line = crate::tools::sanitize::redact_secrets_only(&line);
+    Some(if line.chars().count() > MAX_CHARS {
+        let cut: String = line.chars().take(MAX_CHARS - 1).collect();
+        format!("{}\u{2026}", cut.trim_end())
+    } else {
+        line
+    })
+}
+
 /// A disowned background process (notifier-active, non-detached) that makes no
 /// progress (no CPU time, disk I/O, output growth, or process-tree change) for
 /// this long is treated as a stall candidate by the heartbeat reaper. The
@@ -5431,12 +5455,40 @@ impl TerminalTool {
             detach || background,
             notifications_reach,
         );
+        // While it runs, the latest line it printed is its progress, at
+        // most every few seconds: a helper's card line shows it (live
+        // 2026-11-13: a 60 s count showed nothing until it ended).
+        let output_progress = status_tx.clone();
+        let (progress_stdout, progress_stderr) = (stdout_buf.clone(), stderr_buf.clone());
         let poll_finished = async {
+            let mut shown = String::new();
+            let mut last_check = tokio::time::Instant::now();
             loop {
                 if reader_handle.is_finished() {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
+                let Some(tx) = output_progress.as_ref() else {
+                    continue;
+                };
+                if last_check.elapsed() < COMMAND_OUTPUT_PROGRESS_EVERY {
+                    continue;
+                }
+                last_check = tokio::time::Instant::now();
+                let line = {
+                    let stdout = progress_stdout.lock().await;
+                    match latest_output_line(&stdout) {
+                        Some(line) => Some(line),
+                        None => latest_output_line(&progress_stderr.lock().await),
+                    }
+                };
+                if let Some(line) = line.filter(|line| *line != shown) {
+                    let _ = tx.try_send(StatusUpdate::CommandOutput {
+                        name: "terminal".to_string(),
+                        line: line.clone(),
+                    });
+                    shown = line;
+                }
             }
         };
 
@@ -7978,10 +8030,13 @@ fn terminal_call_effects_on(arguments: &str, local: bool) -> aidaemon_core::Call
             let mut effects = shell_call_effects(text, cwd);
             // Declared write targets are what a confined run may change.
             for target in args.write_paths.iter().chain(args.write_roots.iter()) {
-                if let Some(key) = path_effect(aidaemon_core::EffectClass::Write, target, cwd) {
-                    if !effects.keys.contains(&key) {
-                        effects.keys.push(key);
+                match path_effect(aidaemon_core::EffectClass::Write, target, cwd) {
+                    Some(key) => {
+                        if !effects.keys.contains(&key) {
+                            effects.keys.push(key);
+                        }
                     }
+                    None => effects.understood = false,
                 }
             }
             effects.complete = false;
@@ -14649,6 +14704,31 @@ mod call_effects_tests {
         let effects = run("curl https://h.example.invalid/x");
         assert_eq!(effects.keys, vec![egress("h.example.invalid:443")]);
         assert!(!effects.complete);
+    }
+
+    /// Live 2026-11-13: a copy into the work area followed by `ls` and
+    /// `date +%s` is read in full (`understood`): its one effect is the
+    /// copy's destination. A script it cannot read stays not understood.
+    #[test]
+    fn a_copy_with_observations_is_read_in_full() {
+        let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        let effects = run(&format!(
+            "cp {dir}/inbox/5b9944c7_screenshot.png {dir}/site/homepage.png; \
+             ls -l {dir}/site/homepage.png; date +%s"
+        ));
+        assert!(effects.understood, "{effects:?}");
+        assert!(!effects.complete);
+        assert_eq!(
+            effects.keys,
+            vec![crate::tools::command_effects::path_effect(
+                EffectClass::Write,
+                &format!("{dir}/site/homepage.png"),
+                None
+            )
+            .unwrap()]
+        );
+        assert!(!run("bash run.sh").understood);
+        assert!(!run(&format!("cp $(ls {dir}) {dir}/b")).understood);
     }
 
     #[test]

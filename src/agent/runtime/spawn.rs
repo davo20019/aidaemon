@@ -431,6 +431,12 @@ fn child_status_sender(
                         &name, to_helper,
                     ),
                 },
+                // What the child's running command printed last is that
+                // child's progress line, as it runs.
+                StatusUpdate::CommandOutput { line, .. } => StatusUpdate::SubAgentProgress {
+                    label: label.clone(),
+                    progress: format!("running a command: {line}"),
+                },
                 other => other,
             };
             if parent.send(update).await.is_err() {
@@ -452,7 +458,7 @@ fn child_end_progress(outcome: TaskOutcome) -> &'static str {
 
 /// A short name for a child on the parent's status card: its mission's first
 /// line, cut to a phone-width length.
-fn child_status_label(mission: &str) -> String {
+pub(crate) fn child_status_label(mission: &str) -> String {
     const MAX_CHARS: usize = 60;
     let line = mission.lines().next().unwrap_or("").trim();
     let line = if line.is_empty() { "Sub-agent" } else { line };
@@ -3762,6 +3768,40 @@ mod tests {
             plan.current_step = done;
         }
         plan.render_compact_checklist()
+    }
+
+    /// Live 2026-11-13: "the whole count ran as a single command" and the
+    /// card showed nothing for 60 s. The line a helper's running command
+    /// printed last (secrets redacted) is that helper's progress line.
+    #[tokio::test]
+    async fn a_helpers_command_output_is_its_progress_line() {
+        let printed = b"1\n2\nTOKEN=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789\r42\n\n";
+        let line = crate::tools::terminal::latest_output_line(printed).expect("a line");
+        assert_eq!(line, "42");
+        let secret = crate::tools::terminal::latest_output_line(
+            b"export API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789\n",
+        )
+        .expect("a line");
+        assert!(!secret.contains("abcdefghijklmnop"), "{secret}");
+        assert_eq!(crate::tools::terminal::latest_output_line(b"\n \n"), None);
+
+        let (parent_tx, mut parent_rx) = mpsc::channel(4);
+        let counter = child_status_sender(Some(parent_tx), "Slow counter").unwrap();
+        counter
+            .send(StatusUpdate::CommandOutput {
+                name: "terminal".into(),
+                line,
+            })
+            .await
+            .unwrap();
+        drop(counter);
+        match parent_rx.recv().await {
+            Some(StatusUpdate::SubAgentProgress { label, progress }) => {
+                assert_eq!(label, "Slow counter");
+                assert_eq!(progress, "running a command: 42");
+            }
+            other => panic!("expected the helper's progress line, got {other:?}"),
+        }
     }
 
     /// Two parallel children each declare a checklist. Neither reaches the

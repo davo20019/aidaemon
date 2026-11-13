@@ -24,6 +24,17 @@ struct OwnerWaitState {
     since: Option<Instant>,
     /// Waits already finished.
     waited: Duration,
+    /// When the first step (a tool call) began.
+    first_step: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the last step to finish ended.
+    last_step_end: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Marks one step (a tool call) as running until dropped, on this clock
+/// and the clocks it is nested in.
+pub struct StepRunning {
+    clock: OwnerWaitClock,
+    _parent: Option<Box<StepRunning>>,
 }
 
 /// Ends one card's wait when dropped, however the wait ends.
@@ -59,6 +70,30 @@ impl OwnerWaitClock {
     /// are measured apart from its siblings', and count on this clock too.
     pub fn nested(&self) -> Self {
         Self(Arc::default(), Some(Box::new(self.clone())))
+    }
+
+    /// When this part of the turn's steps ran: the start of its first tool
+    /// call and the end of its last finished one. `None` before any step
+    /// ended. A helper's own work, apart from its start-up and its report.
+    pub fn steps(&self) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Some((state.first_step?, state.last_step_end?))
+    }
+
+    /// Mark a step (a tool call) as running in the current turn.
+    pub fn begin_step() -> Option<StepRunning> {
+        Some(Self::current()?.step())
+    }
+
+    fn step(&self) -> StepRunning {
+        {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.first_step.get_or_insert_with(chrono::Utc::now);
+        }
+        StepRunning {
+            clock: self.clone(),
+            _parent: self.1.as_ref().map(|parent| Box::new(parent.step())),
+        }
     }
 
     /// Mark a card as waiting on the owner in the current turn.
@@ -215,6 +250,16 @@ impl Drop for InFlight {
     }
 }
 
+impl Drop for StepRunning {
+    fn drop(&mut self) {
+        let now = chrono::Utc::now();
+        let mut state = self.clock.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.last_step_end.is_none_or(|end| end < now) {
+            state.last_step_end = Some(now);
+        }
+    }
+}
+
 impl Drop for OwnerWaiting {
     fn drop(&mut self) {
         let mut state = self.clock.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -265,6 +310,33 @@ mod progress_tests {
         assert!(helper.waited() >= STEP * 2, "{:?}", helper.waited());
         assert!(turn.waited() >= STEP * 2, "{:?}", turn.waited());
         assert_eq!(sibling.waited(), Duration::ZERO);
+    }
+
+    /// A helper's steps are timed on its own clock: from its first tool
+    /// call's start to its last one's end, apart from its start-up and its
+    /// report, and they count on the turn's clock too.
+    #[tokio::test]
+    async fn a_nested_clock_times_its_own_steps() {
+        let turn = OwnerWaitClock::default();
+        let helper = turn.nested();
+        assert!(helper.steps().is_none());
+        let before = chrono::Utc::now();
+        OwnerWaitClock::within(Some(helper.clone()), async {
+            tokio::time::sleep(STEP).await; // start-up: not a step
+            let first = OwnerWaitClock::begin_step();
+            tokio::time::sleep(STEP).await;
+            drop(first);
+            let second = OwnerWaitClock::begin_step();
+            tokio::time::sleep(STEP).await;
+            drop(second);
+            tokio::time::sleep(STEP).await; // the report: not a step
+        })
+        .await;
+        let (first, last) = helper.steps().expect("timed steps");
+        let ran = (last - first).to_std().unwrap();
+        assert!(ran >= STEP * 2 && ran < STEP * 4, "{ran:?}");
+        assert!(first - before >= chrono::Duration::from_std(STEP).unwrap());
+        assert!(turn.steps().is_some());
     }
 
     #[tokio::test]

@@ -182,6 +182,14 @@ pub struct CallEffects {
     /// not tell (an opaque script), so policies must not read the list as
     /// exhaustive.
     pub complete: bool,
+    /// Every part of the call was read and `keys` name what it changes,
+    /// though the tool does not vouch for the list as `complete` (a shell
+    /// command made only of programs it models: a copy into the work area,
+    /// a listing, `date`). After the owner declines a step, such a call that
+    /// deletes nothing and reaches nothing outside is not taken for the
+    /// declined action by another route.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub understood: bool,
 }
 
 impl CallEffects {
@@ -190,6 +198,7 @@ impl CallEffects {
         Self {
             keys: Vec::new(),
             complete: false,
+            understood: false,
         }
     }
 
@@ -198,6 +207,7 @@ impl CallEffects {
         Self {
             keys: Vec::new(),
             complete: true,
+            understood: true,
         }
     }
 }
@@ -310,7 +320,12 @@ pub enum AskReason {
     },
     /// The owner said no to a step earlier in this run, and what this call
     /// does cannot be fully told, so it is not run unasked.
-    AfterADecline,
+    AfterADecline {
+        /// What the owner said no to, in a few plain words (the declined
+        /// step's own title, or what it would have changed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        declined: Option<String>,
+    },
 }
 
 /// An effect that deserves a warning on the card.

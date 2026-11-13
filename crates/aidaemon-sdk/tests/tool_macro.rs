@@ -51,6 +51,7 @@ fn refund_effects(args: &Refund) -> CallEffects {
     CallEffects {
         keys: vec![EffectKey::named(EffectClass::Credential, &args.order_id)],
         complete: true,
+        understood: false,
     }
 }
 

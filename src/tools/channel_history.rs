@@ -579,6 +579,7 @@ impl crate::traits::ToolSemantics for ReadChannelHistoryTool {
                 aidaemon_core::CallEffects {
                     keys: vec![key],
                     complete: true,
+                    understood: false,
                 }
             })
     }

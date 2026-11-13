@@ -97,6 +97,10 @@ pub enum StatusUpdate {
     /// helper (`to_helper`) or a background job. The work has not finished,
     /// so the step must never read as finished.
     StepHandedOff { name: String, to_helper: bool },
+    /// The latest line a long-running command printed (secrets redacted),
+    /// sent at most every few seconds while it runs. A helper's card line
+    /// shows it, so a long count or install visibly moves.
+    CommandOutput { name: String, line: String },
 }
 
 impl StatusUpdate {

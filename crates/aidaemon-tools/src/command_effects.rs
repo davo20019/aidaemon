@@ -2198,6 +2198,7 @@ pub fn without_local_paths(mut effects: CallEffects) -> CallEffects {
         )
     });
     effects.complete = false;
+    effects.understood = false;
     effects
 }
 
@@ -2226,6 +2227,7 @@ pub fn file_tool_write_effects(
         Some(key) => CallEffects {
             keys: vec![key],
             complete: true,
+            understood: false,
         },
         None => CallEffects::unknown(),
     }
@@ -2236,13 +2238,18 @@ pub fn file_tool_write_effects(
 /// deletes, and writes from output redirects, `tee`, `cp`/`mv`
 /// destinations, `touch` and `mkdir`. NEVER complete: a shell string cannot
 /// be proven fully described (every review round found another construct),
-/// and the keys bind the owner's declines either way. Incompleteness only
-/// means the owner is asked again after a decline.
+/// and the keys bind the owner's declines either way. It is `understood`
+/// when every segment is a program this scan models, with literal operands
+/// it resolved (no substitution, expansion, `cd` or unknown program): the
+/// owner is then asked again after a decline only for a call that deletes
+/// or reaches outside, not for a plain copy into the work area followed by
+/// `ls` and `date` (live 2026-11-13).
 pub fn shell_call_effects(command: &str, cwd: Option<&str>) -> CallEffects {
     let analysis = analyze_shell(command, cwd);
     CallEffects {
         keys: analysis.keys,
         complete: false,
+        understood: analysis.complete,
     }
 }
 
@@ -4669,13 +4676,18 @@ mod tests {
         let resolved = shell_call_effects("rm build", Some(&dir));
         assert!(!resolved.complete);
         assert_eq!(resolved.keys[0].target, canonical(&format!("{dir}/build")));
-        // Even a plain observation is never declared complete.
+        // Even a plain observation is never declared complete, though it
+        // is read in full.
         for observation in ["ls -la", "echo hi", "cat a | grep b"] {
-            assert_eq!(
-                shell_call_effects(observation, None),
-                CallEffects::unknown(),
+            let effects = shell_call_effects(observation, None);
+            assert!(
+                effects.keys.is_empty() && !effects.complete,
                 "{observation}"
             );
+            assert!(effects.understood, "{observation}");
+        }
+        for command in ["bash run.sh", "echo x > out.txt", "rm $TARGET"] {
+            assert!(!shell_call_effects(command, None).understood, "{command}");
         }
     }
 

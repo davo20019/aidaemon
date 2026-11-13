@@ -247,12 +247,31 @@ impl TurnRunner {
         let session_id = turn.session_id.clone();
         let dedup_key = turn.dedup_key.as_deref();
         if !registry.has_running_task(&session_id).await {
-            if let Some(request) = self.read_between_runs(&turn).await {
-                if registry.mark_seen(&session_id, &turn.text, dedup_key).await {
-                    let reply = self.cancel(&session_id, turn.user_role, request).await;
-                    let _ = surface.say(&reply).await;
+            match self.read_between_runs(&turn).await {
+                Some(BetweenRuns::Stop(request)) => {
+                    if registry.mark_seen(&session_id, &turn.text, dedup_key).await {
+                        let reply = self.cancel(&session_id, turn.user_role, request).await;
+                        let _ = surface.say(&reply).await;
+                    }
+                    return;
                 }
-                return;
+                // A question about the helpers and commands running for
+                // the chat: answered from their typed state, the same reply
+                // as mid-run, never a turn of its own that would time
+                // itself (live 2026-11-13: "Still working on \"how's it
+                // going?\" (1s so far)").
+                Some(BetweenRuns::Status) => {
+                    if registry.mark_seen(&session_id, &turn.text, dedup_key).await {
+                        let answer = crate::mid_run::running_work_reply(
+                            &self.running_work(&session_id).await,
+                        );
+                        let _ = surface
+                            .say(&crate::presentation::prepare_chat_message(&answer))
+                            .await;
+                    }
+                    return;
+                }
+                None => {}
             }
         }
         if registry.has_running_task(&session_id).await {
@@ -459,9 +478,10 @@ impl TurnRunner {
 
     /// Read a message sent while the chat has sub-agents or background
     /// commands running but no turn: a stop request stops them (the same
-    /// stop as `/cancel`); anything else runs as a turn. `None` when it is
-    /// not a stop request or nothing runs.
-    async fn read_between_runs(&self, turn: &Turn) -> Option<StopRequest> {
+    /// stop as `/cancel`), a question about them is answered from their
+    /// typed state; anything else runs as a turn. `None` when it is neither
+    /// or nothing runs.
+    async fn read_between_runs(&self, turn: &Turn) -> Option<BetweenRuns> {
         if turn.user_role != UserRole::Owner
             || !turn.attachments.is_empty()
             || turn.text.trim().is_empty()
@@ -495,7 +515,11 @@ impl TurnRunner {
             intent = ?reading.intent,
             "Read a message sent while background work runs"
         );
-        (reading.intent == MidRunIntent::StopsWork).then(|| stop_request(&reading))
+        match reading.intent {
+            MidRunIntent::StopsWork => Some(BetweenRuns::Stop(stop_request(&reading))),
+            MidRunIntent::AboutRunningWork => Some(BetweenRuns::Status),
+            MidRunIntent::ChangesWork | MidRunIntent::Unrelated => None,
+        }
     }
 
     /// Run `turn` and then each turn queued behind it.
@@ -737,6 +761,14 @@ pub fn is_cancel_word(text: &str) -> bool {
     )
 }
 
+/// What a message sent while only background work runs asks for.
+enum BetweenRuns {
+    /// Stop that work.
+    Stop(StopRequest),
+    /// Where that work stands.
+    Status,
+}
+
 /// The stop a reading names: its items, or what bare `/cancel` stops.
 fn stop_request(reading: &MidRunReading) -> StopRequest {
     if reading.stop.is_empty() {
@@ -887,6 +919,7 @@ pub fn status_line(update: &StatusUpdate) -> String {
         StatusUpdate::StepHandedOff { name, to_helper } => progress(
             crate::live_status::step_handed_off_line(name, *to_helper),
         ),
+        StatusUpdate::CommandOutput { name, line } => progress(format!("📤 {name}: {line}")),
     }
 }
 
@@ -1292,6 +1325,88 @@ mod tests {
             "{reply}"
         );
         assert!(agent.work.lock().unwrap().is_empty());
+    }
+
+    /// Only helpers and background commands run, no turn (live 2026-11-13:
+    /// "how's it going?" became a turn that said "Still working on
+    /// \"how's it going?\" (1s so far)"). A question about them is answered
+    /// from their typed state, each helper with the step it last reported
+    /// (a step from after the turn that started it ended) and the time
+    /// `/tasks` shows; no turn starts. Anything else still runs as a turn.
+    #[tokio::test]
+    async fn a_status_question_between_runs_gets_the_typed_status() {
+        let agent = Arc::new(ScriptedAgent {
+            release: tokio::sync::Notify::new(),
+            reading: std::sync::Mutex::new(Some(MidRunReading {
+                intent: MidRunIntent::AboutRunningWork,
+                stop: Vec::new(),
+            })),
+            work: std::sync::Mutex::new(two_counting_jobs()),
+        });
+        let registry = Arc::new(TaskRegistry::new(10));
+        let runner = TurnRunner::new(TurnDeps {
+            agent: agent.clone(),
+            session_map: Arc::default(),
+            sessions: Arc::new(NoSessions),
+            task_registry: registry.clone(),
+            watchdog_stale_threshold_secs: 0,
+        });
+        let session = "test:mid-run";
+        // The turn that started the helper has ended; the helper reports on.
+        runner.live.begin(session, 7);
+        runner.live.record(
+            session,
+            7,
+            &StatusUpdate::HelperStarted {
+                label: "Counting agent A".into(),
+            },
+        );
+        runner.live.end(session, 7);
+        runner.live.record(
+            session,
+            7,
+            &StatusUpdate::SubAgentProgress {
+                label: "Counting agent A".into(),
+                progress: "running a command".into(),
+            },
+        );
+
+        let surface = Arc::new(Said::default());
+        runner
+            .submit(surface.clone(), owner_turn("how's it going?", "b1"))
+            .await;
+        assert!(!registry.has_running_task(session).await);
+        let reply = surface.0.lock().unwrap().last().cloned().unwrap();
+        assert!(reply.starts_with("Working in the background:"), "{reply}");
+        assert!(
+            reply.contains("\n• Counting agent A: running a command (1m so far)"),
+            "{reply}"
+        );
+        assert!(
+            reply.contains("\n• Background command: count to 300 (50s so far)"),
+            "{reply}"
+        );
+        assert!(!reply.contains("how's it going"), "{reply}");
+
+        // A new request is not a status question: it runs as a turn.
+        *agent.reading.lock().unwrap() = Some(MidRunReading {
+            intent: MidRunIntent::Unrelated,
+            stop: Vec::new(),
+        });
+        runner
+            .submit(
+                surface.clone(),
+                owner_turn("What is the capital of Peru?", "b2"),
+            )
+            .await;
+        for _ in 0..200 {
+            if registry.has_running_task(session).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(registry.has_running_task(session).await);
+        agent.release.notify_one();
     }
 
     /// Work from two requests: a bare stop lists it to pick from and stops

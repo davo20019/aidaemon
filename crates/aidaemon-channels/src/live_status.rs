@@ -50,6 +50,23 @@ pub fn helper_started_line(label: &str) -> String {
     format!("Started in the background: {}", label.trim())
 }
 
+/// A plan card with a start line under it for each helper in `labels`,
+/// one per helper, in order.
+pub fn with_helper_start_lines<'a>(
+    card: &str,
+    labels: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut out = card.trim_end().to_string();
+    for label in labels {
+        let line = helper_started_line(label);
+        if !out.lines().any(|shown| shown == line) {
+            out.push_str("\n\n");
+            out.push_str(&line);
+        }
+    }
+    out
+}
+
 /// A helper's own step that went on in the background, as its progress
 /// line ("counting 1 to 60 goes on in the background").
 pub fn helper_step_handed_off(step: &str, to_helper: bool) -> String {
@@ -287,15 +304,23 @@ impl LiveStatus {
     pub async fn clear(&mut self, sink: &dyn SurfaceSink, reply_delivered: bool) {
         if let Some(checklist) = self.checklist.clone() {
             if !reply_delivered || !crate::live_status::is_completed_checklist(&checklist) {
-                // The card stays as the record of the plan: the step and
-                // helper lines were only live progress, so they go.
+                // The card stays as the record of the plan, with each
+                // helper's start line: helpers started from a plan go on
+                // after the turn (live 2026-11-13: two helpers started in
+                // parallel and the card kept only "Continuing in the
+                // background · 0 of 5 done"). Their latest steps and the
+                // turn's own step were only live progress, so they go.
+                let card = with_helper_start_lines(
+                    &checklist,
+                    self.helpers.iter().map(|(label, ..)| label.as_str()),
+                );
                 self.current_line = None;
                 self.helpers.clear();
-                if self.shown.as_deref() != Some(checklist.as_str()) {
+                if self.shown.as_deref() != Some(card.as_str()) {
                     if let (Some(id), true) = (&self.message_id, self.edit_supported) {
-                        let body = crate::presentation::render_internal_markers(&checklist);
+                        let body = crate::presentation::render_internal_markers(&card);
                         if matches!(sink.edit(id, &body).await, Ok(true)) {
-                            self.shown = Some(checklist);
+                            self.shown = Some(card);
                         }
                     }
                 }
@@ -484,9 +509,21 @@ mod tests {
         // Nothing changed: nothing is re-sent.
         assert!(!s.flush_if_changed(&sink).await);
         assert_eq!(sink.edits.lock().unwrap().len(), 1);
-        // The kept plan card loses the live lines when the turn ends.
-        s.clear(&sink, false).await;
-        assert_eq!(sink.edits.lock().unwrap().last().unwrap().1, "📋 Plan\n☐ a");
+        // The kept plan card loses the live lines when the turn ends, but
+        // each helper keeps its start line (live 2026-11-13: two helpers
+        // started in parallel from a plan, and the card kept only the plan).
+        s.clear(&sink, true).await;
+        assert_eq!(
+            sink.edits.lock().unwrap().last().unwrap().1,
+            "📋 Plan\n☐ a\n\nStarted in the background: Counter A\n\nStarted in the \
+             background: Counter B"
+        );
+        // Once one has finished, the card the plan is redrawn as keeps the
+        // other's.
+        assert_eq!(
+            with_helper_start_lines("📋 Plan\n✅ a", ["Counter B"]),
+            "📋 Plan\n✅ a\n\nStarted in the background: Counter B"
+        );
     }
 
     /// A long step says for how long it has run, in whole minutes, so the

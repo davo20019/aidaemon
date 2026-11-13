@@ -2444,6 +2444,7 @@ async fn run_legacy_status_consumer(
             StatusUpdate::StepHandedOff { name, to_helper } => {
                 aidaemon_channels::live_status::step_handed_off_line(name, *to_helper)
             }
+            StatusUpdate::CommandOutput { name, line } => format!("📤 {name}: {line}"),
         };
         let _ = bot.send_message(chat_id, text).await;
         dm_status_count += 1;

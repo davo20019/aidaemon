@@ -1080,6 +1080,7 @@ impl crate::traits::ToolSemantics for ManageApiTool {
         aidaemon_core::CallEffects {
             keys,
             complete: false,
+            understood: false,
         }
     }
 }

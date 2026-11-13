@@ -124,6 +124,7 @@ impl Tool for Sender {
         CallEffects {
             keys: vec![self.effect.clone()],
             complete: true,
+            understood: false,
         }
     }
     async fn call(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {

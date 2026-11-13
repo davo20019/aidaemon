@@ -19,28 +19,35 @@ use crate::ports::{ChatWorkKind, HelperProgress, RunningWork};
 /// How many helpers a reply lists.
 const MAX_HELPERS: usize = 6;
 
+/// How many helpers a session keeps the last step of.
+const MAX_TRACKED_HELPERS: usize = 32;
+
 #[derive(Debug, Default)]
 struct Progress {
     task_id: u64,
     last_step: Option<(String, Instant)>,
     plan: Option<String>,
-    /// Each helper: its label, latest progress, when that came, and when
-    /// it was first seen.
-    helpers: Vec<Helper>,
 }
 
 #[derive(Debug)]
 struct Helper {
+    /// The turn that started it.
+    task_id: u64,
     label: String,
     progress: String,
     at: Instant,
     started: Instant,
 }
 
-/// Each session's running work as its status updates showed it.
+/// Each session's running work as its status updates showed it: the
+/// running turn's own steps and plan, and every helper's latest step. A
+/// helper outlives the turn that started it (it runs in the background), so
+/// its steps are kept for the session, not the turn: a question asked while
+/// only helpers run is answered with where each one stands.
 #[derive(Clone, Default)]
 pub struct LiveWork {
     sessions: Arc<Mutex<HashMap<String, Progress>>>,
+    helpers: Arc<Mutex<HashMap<String, Vec<Helper>>>>,
 }
 
 impl LiveWork {
@@ -57,7 +64,7 @@ impl LiveWork {
         }
     }
 
-    /// Stop tracking `task_id` (its turn ended).
+    /// Stop tracking `task_id` (its turn ended). Its helpers' steps stay.
     pub fn end(&self, session_id: &str, task_id: u64) {
         if let Ok(mut sessions) = self.sessions.lock() {
             if sessions
@@ -69,8 +76,45 @@ impl LiveWork {
         }
     }
 
-    /// Note what `update` says about `task_id`'s work.
+    /// Note what `update` says about `task_id`'s work. A helper's start
+    /// and steps are noted whichever turn started it.
     pub fn record(&self, session_id: &str, task_id: u64, update: &StatusUpdate) {
+        let now = Instant::now();
+        let helper_line = match update {
+            StatusUpdate::HelperStarted { label } => Some((label, None)),
+            StatusUpdate::SubAgentProgress {
+                label,
+                progress: line,
+            } => Some((label, Some(line))),
+            _ => None,
+        };
+        if let Some((label, line)) = helper_line {
+            let Ok(mut helpers) = self.helpers.lock() else {
+                return;
+            };
+            let helpers = helpers.entry(session_id.to_string()).or_default();
+            match helpers.iter_mut().find(|h| h.label == *label) {
+                Some(helper) => {
+                    if let Some(line) = line {
+                        helper.progress = line.clone();
+                        helper.at = now;
+                    }
+                }
+                None => {
+                    helpers.push(Helper {
+                        task_id,
+                        label: label.clone(),
+                        progress: line.cloned().unwrap_or_else(|| "starting".to_string()),
+                        at: now,
+                        started: now,
+                    });
+                    if helpers.len() > MAX_TRACKED_HELPERS {
+                        helpers.remove(0);
+                    }
+                }
+            }
+            return;
+        }
         let Ok(mut sessions) = self.sessions.lock() else {
             return;
         };
@@ -80,7 +124,6 @@ impl LiveWork {
         else {
             return;
         };
-        let now = Instant::now();
         let step = match update {
             StatusUpdate::ToolStart { name, summary } => Some(if summary.trim().is_empty() {
                 name.clone()
@@ -101,35 +144,6 @@ impl LiveWork {
                 progress.plan = Some(text.clone());
                 None
             }
-            StatusUpdate::HelperStarted { label } => {
-                if !progress.helpers.iter().any(|h| h.label == *label) {
-                    progress.helpers.push(Helper {
-                        label: label.clone(),
-                        progress: "starting".to_string(),
-                        at: now,
-                        started: now,
-                    });
-                }
-                None
-            }
-            StatusUpdate::SubAgentProgress {
-                label,
-                progress: line,
-            } => {
-                match progress.helpers.iter_mut().find(|h| h.label == *label) {
-                    Some(helper) => {
-                        helper.progress = line.clone();
-                        helper.at = now;
-                    }
-                    None => progress.helpers.push(Helper {
-                        label: label.clone(),
-                        progress: line.clone(),
-                        at: now,
-                        started: now,
-                    }),
-                }
-                None
-            }
             _ => None,
         };
         if let Some(step) = step.filter(|step| !step.trim().is_empty()) {
@@ -137,31 +151,37 @@ impl LiveWork {
         }
     }
 
-    /// The session's running work: `request` started `elapsed` ago, plus
-    /// what its status updates showed.
+    /// The session's running work: `request` started `elapsed` ago (empty
+    /// when no turn runs), plus what its status updates showed. Helpers
+    /// started by an earlier turn are included; only the running turn's
+    /// own are marked as its.
     pub fn snapshot(&self, session_id: &str, request: &str, elapsed: Duration) -> RunningWork {
         let mut work = RunningWork {
             request: request.to_string(),
             elapsed,
             ..RunningWork::default()
         };
-        let Ok(sessions) = self.sessions.lock() else {
-            return work;
-        };
-        if let Some(progress) = sessions.get(session_id) {
-            work.last_step = progress
-                .last_step
-                .as_ref()
-                .map(|(step, at)| (step.clone(), at.elapsed()));
-            work.plan = progress.plan.clone();
-            work.helpers = progress
-                .helpers
-                .iter()
+        let turn = self.sessions.lock().ok().and_then(|sessions| {
+            sessions.get(session_id).map(|progress| {
+                work.last_step = progress
+                    .last_step
+                    .as_ref()
+                    .map(|(step, at)| (step.clone(), at.elapsed()));
+                work.plan = progress.plan.clone();
+                progress.task_id
+            })
+        });
+        if let Ok(helpers) = self.helpers.lock() {
+            work.helpers = helpers
+                .get(session_id)
+                .into_iter()
+                .flatten()
                 .map(|helper| HelperProgress {
                     label: helper.label.clone(),
                     progress: helper.progress.clone(),
                     since: helper.at.elapsed(),
                     running_for: helper.started.elapsed(),
+                    this_turn: turn == Some(helper.task_id),
                 })
                 .collect();
         }
@@ -195,11 +215,16 @@ fn helper_is(helper: &HelperProgress, title: &str) -> bool {
 /// list, the same clock and numbers `/tasks` shows. A helper that is no
 /// longer on that list keeps its last step, without a time.
 pub fn running_work_status(work: &RunningWork) -> String {
-    let mut lines = vec![format!(
-        "Still working on \"{}\" ({} so far).",
-        crate::presentation::word_preview(&work.request, 80),
-        ago(work.elapsed)
-    )];
+    let mut lines = vec![if work.request.trim().is_empty() {
+        // No turn runs: only helpers and background commands do.
+        "Working in the background:".to_string()
+    } else {
+        format!(
+            "Still working on \"{}\" ({} so far).",
+            crate::presentation::word_preview(&work.request, 80),
+            ago(work.elapsed)
+        )
+    }];
     if let Some((step, since)) = &work.last_step {
         lines.push(format!(
             "Latest step: {} ({} ago).",
@@ -235,11 +260,13 @@ pub fn running_work_status(work: &RunningWork) -> String {
             ),
         });
     }
+    // A helper of this turn that is no longer listed keeps its last step;
+    // one an earlier turn started and that is gone has finished.
     for (helper, _) in work
         .helpers
         .iter()
         .zip(&listed)
-        .filter(|(_, listed)| !**listed)
+        .filter(|(helper, listed)| !**listed && helper.this_turn)
     {
         items.push(format!(
             "• {}: {}",
@@ -370,6 +397,7 @@ mod tests {
                     // Its own first-progress clock, which the reply no
                     // longer reads for a listed helper.
                     running_for: Duration::from_secs(10),
+                    this_turn: true,
                 })
                 .collect(),
             running: list.items(now),

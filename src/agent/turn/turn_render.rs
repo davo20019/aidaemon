@@ -487,6 +487,21 @@ fn render_archived(
 
     let need_placeholder = last_substantive_assistant.is_none();
     let mut vision_skipped = false;
+    // The daemon's timing lines in the turn's assistant notes (a background
+    // helper's result): the winning reply carries them, so a later turn
+    // still reports the measured times (live 2026-11-13).
+    let turn_timing: String = turn_messages
+        .iter()
+        .filter(|m| m.role == "assistant")
+        .filter_map(|m| m.content.as_deref())
+        .flat_map(super::sliding_window::measured_timing_lines)
+        .fold(String::new(), |mut all, line| {
+            if !all.contains(line) {
+                all.push_str(line);
+                all.push('\n');
+            }
+            all
+        });
 
     let mut out: Vec<Value> = Vec::with_capacity(turn_messages.len());
 
@@ -552,6 +567,9 @@ fn render_archived(
                             } else {
                                 truncate_winning_assistant(content)
                             }
+                        })
+                        .map(|shown| {
+                            super::sliding_window::with_measured_timing(shown, &turn_timing)
                         })
                         .unwrap_or_default();
                     let mut obj = json!({

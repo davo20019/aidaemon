@@ -355,12 +355,16 @@ fn card_why(card: &ApprovalCard) -> Option<String> {
             lines.push(format!("_Safety check: {says}_"));
         }
     }
-    if let Some(AskReason::AfterADecline) = &card.reason {
-        lines.push(
-            "You said no to a step earlier in this task, so I'm checking with you before \
+    if let Some(AskReason::AfterADecline { declined }) = &card.reason {
+        let what = declined
+            .as_deref()
+            .map(str::trim)
+            .filter(|what| !what.is_empty())
+            .unwrap_or("a step");
+        lines.push(format!(
+            "You said no to {what} earlier in this task, so I'm checking with you before \
              steps whose effects I can't fully tell."
-                .to_string(),
-        );
+        ));
     }
     if let CardAction::OpenLocalSite { once_minutes, .. } = &card.action {
         lines.push(format!(

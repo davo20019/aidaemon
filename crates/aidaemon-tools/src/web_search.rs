@@ -864,6 +864,7 @@ impl crate::semantics::ToolSemantics for WebSearch {
         aidaemon_core::CallEffects {
             keys,
             complete: true,
+            understood: false,
         }
     }
 }

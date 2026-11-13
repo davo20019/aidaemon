@@ -2543,6 +2543,7 @@ fn browser_call_effects(arguments: &str) -> aidaemon_core::CallEffects {
                 aidaemon_core::CallEffects {
                     keys: vec![key],
                     complete: true,
+                    understood: false,
                 }
             }),
         // A blank tab.

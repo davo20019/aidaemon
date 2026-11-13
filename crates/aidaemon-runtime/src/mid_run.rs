@@ -218,6 +218,7 @@ mod tests {
                 progress: "step 2 of 4".into(),
                 since: Duration::from_secs(3),
                 running_for: Duration::from_secs(90),
+                this_turn: true,
             }],
             running: vec![RunningItem {
                 number: 4,

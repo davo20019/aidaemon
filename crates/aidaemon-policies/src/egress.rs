@@ -205,6 +205,7 @@ mod tests {
             CallEffects {
                 keys: vec![EffectKey::egress("https", "h.example.invalid", None)],
                 complete: true,
+                understood: false,
             },
         );
         blocked(
