@@ -5,11 +5,14 @@ use aidaemon_agents::specialist::SpecialistKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod compose;
 mod parse;
 mod registry;
 pub mod render;
 pub mod validation;
 
+#[cfg(test)]
+mod equivalence_tests;
 #[cfg(test)]
 mod override_tests;
 

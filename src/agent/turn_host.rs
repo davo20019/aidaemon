@@ -175,6 +175,9 @@ impl TurnServices for Agent {
             llm_call_timeout: self.limits.llm_call_timeout,
             task_token_budget: self.limits.task_token_budget,
             spawn_family: self.limits.spawn_family,
+            max_depth: self.limits.max_depth,
+            max_iterations_cap: self.limits.max_iterations_cap,
+            timeout_cap_secs: self.limits.timeout_cap(),
         }
     }
 }
@@ -457,6 +460,39 @@ impl TurnHost for Agent {
         spec: aidaemon_runtime::spawn::ChildSpec,
     ) -> std::sync::Arc<dyn aidaemon_runtime::spawn::ChildAgent> {
         self.create_child_agent(spec).await
+    }
+
+    fn root_tools(&self) -> Option<&[std::sync::Arc<dyn crate::traits::Tool>]> {
+        self.root_tools.as_deref()
+    }
+
+    fn specialists(&self) -> &std::sync::Arc<aidaemon_runtime::specialists::SpecialistRegistry> {
+        &self.specialists
+    }
+
+    fn goal_tasks_tool(
+        &self,
+        goal_id: &str,
+        goal_run_id: Option<String>,
+    ) -> std::sync::Arc<dyn crate::traits::Tool> {
+        std::sync::Arc::new(
+            crate::tools::ManageGoalTasksTool::new(goal_id.to_string(), self.state.clone())
+                .with_goal_run_id(goal_run_id),
+        )
+    }
+
+    fn report_blocker_tool(
+        &self,
+        task_id: &str,
+        attempt: crate::traits::TaskAttempt,
+        mandate: bool,
+    ) -> std::sync::Arc<dyn crate::traits::Tool> {
+        std::sync::Arc::new(crate::tools::ReportBlockerTool::for_attempt(
+            task_id.to_string(),
+            self.state.clone(),
+            attempt,
+            mandate,
+        ))
     }
 
     fn tools(&self) -> &[std::sync::Arc<dyn crate::traits::Tool>] {

@@ -9,13 +9,15 @@ use async_trait::async_trait;
 #[cfg(test)]
 pub(crate) use aidaemon_runtime::spawn::ChildWorkReport;
 pub(crate) use aidaemon_runtime::spawn::{
-    ChildAgentRequest, ChildAgentRun, ChildAgentRuntime, ChildStoppedByOwner, ChildTimeLimit,
-    ChildTimedOut, ConversationRequest, ConversationRuntime, SalvagedTaskOutcome,
+    ChildAgentRequest, ChildAgentRun, ChildAgentRuntime, ConversationRequest, ConversationRuntime,
+    SalvagedTaskOutcome,
 };
+#[cfg(test)]
+pub(crate) use aidaemon_runtime::spawn::{ChildTimeLimit, ChildTimedOut};
 
 pub(crate) use aidaemon_channels::ports::{
     AgentIngress, AgentResponseEnvelope, AssistantNoteSink, ChannelAgentRuntime,
-    InboundMessageRequest, InboundMessageTiming, OutboundRouter, SessionRouteLease,
+    InboundMessageRequest, InboundMessageTiming, OutboundRouter,
 };
 
 /// The daemon's additions to [`ChannelAgentRuntime`]: what its own chat

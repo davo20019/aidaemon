@@ -773,7 +773,7 @@ async fn test_executor_timeout_does_not_clobber_terminal_task_status() {
     };
     harness.state.create_task(&task).await.unwrap();
 
-    agent.mark_executor_task_timeout(&task.id, 300).await;
+    agent.engine().mark_executor_task_timeout(&task.id, 300).await;
 
     let updated = harness.state.get_task(&task.id).await.unwrap().unwrap();
     assert_eq!(

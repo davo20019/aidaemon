@@ -444,8 +444,11 @@ async fn execute_auto_dispatch_task(
         user_role,
         project_scope,
     } = context;
-    let specialist =
-        Agent::select_specialist_kind(AgentRole::Executor, &mission, &task.description);
+    let specialist = aidaemon_runtime::specialists::compose::select_specialist_kind(
+        AgentRole::Executor,
+        &mission,
+        &task.description,
+    );
     let profile_id = format!("profile-{}", specialist.as_str().replace('_', "-"));
     let attempt = match state
         .claim_task_with_lease(
@@ -520,23 +523,16 @@ async fn execute_auto_dispatch_task(
 
     let task_text = task.description.clone();
     let task_id = task.id.clone();
+    let mut request =
+        crate::runtime_ports::ChildAgentRequest::new(mission, task_text, channel_ctx, user_role);
+    request.child_role = Some(AgentRole::Executor);
+    request.goal_id = Some(goal_id);
+    request.task_id = Some(task_id);
+    request.project_scope = project_scope;
+    request.approval_session_id = Some(approval_session_id);
     let result = agent
-        .spawn_child_with_outcome(
-            &mission,
-            &task_text,
-            None,
-            channel_ctx,
-            user_role,
-            Some(AgentRole::Executor),
-            Some(&goal_id),
-            Some(&task_id),
-            project_scope.as_deref(),
-            None,
-            Some(&approval_session_id),
-            None,
-            None,
-            None,
-        )
+        .engine()
+        .spawn_child(request)
         .await
         .map(|run| run.response);
     Some((task, result))
@@ -1712,29 +1708,23 @@ pub fn spawn_background_task_lead(
                 effective_user_text = user_text.clone();
             }
 
-            let task_lead_run = agent
-                .spawn_child_with_outcome_and_attempt(
-                    &effective_mission,
-                    &effective_user_text,
-                    None,
-                    channel_ctx,
-                    fallback_user_role,
-                    Some(AgentRole::TaskLead),
-                    Some(goal_id.as_str()),
-                    dispatch_trigger_task_id.as_deref(),
-                    // The resolved/bound objective workspace is the lead's
-                    // project scope; its tools and every executor it spawns
-                    // inherit it. Without this the lead and its children ran
-                    // in the daemon's own checkout.
-                    dispatch_project_scope.as_deref(),
-                    None, // arg_specialist (task lead spawn — not LLM-tool-selectable)
-                    Some(&session_id),
-                    dispatch_attempt.clone(),
-                    None,
-                    None,
-                    None,
-                )
-                .await;
+            let mut request = crate::runtime_ports::ChildAgentRequest::new(
+                effective_mission.clone(),
+                effective_user_text.clone(),
+                channel_ctx,
+                fallback_user_role,
+            );
+            request.child_role = Some(AgentRole::TaskLead);
+            request.goal_id = Some(goal_id.clone());
+            request.task_id = dispatch_trigger_task_id.clone();
+            // The resolved/bound objective workspace is the lead's project
+            // scope; its tools and every executor it spawns inherit it.
+            // Without this the lead and its children ran in the daemon's own
+            // checkout.
+            request.project_scope = dispatch_project_scope.clone();
+            request.approval_session_id = Some(session_id.clone());
+            request.bound_task_attempt = dispatch_attempt.clone();
+            let task_lead_run = agent.engine().spawn_child(request).await;
 
             // A child can finish after its keepalive observed a revoked or
             // expired lease. Revalidate the exact attempt before consuming its
@@ -2933,24 +2923,19 @@ pub fn spawn_background_task_lead(
                 );
                 let fallback_result = match recovery_created {
                     Ok(()) => {
-                        agent
-                            .spawn_child_with_outcome(
-                                &user_text,
-                                &recovery_prompt,
-                                None,
-                                fallback_channel_ctx,
-                                fallback_user_role,
-                                Some(AgentRole::Executor),
-                                Some(&goal_id),
-                                Some(&recovery_task_id),
-                                dispatch_project_scope.as_deref(),
-                                Some("executor"),
-                                Some(&session_id),
-                                None,
-                                None,
-                                None,
-                            )
-                            .await
+                        let mut request = crate::runtime_ports::ChildAgentRequest::new(
+                            user_text.clone(),
+                            recovery_prompt,
+                            fallback_channel_ctx,
+                            fallback_user_role,
+                        );
+                        request.child_role = Some(AgentRole::Executor);
+                        request.goal_id = Some(goal_id.clone());
+                        request.task_id = Some(recovery_task_id.clone());
+                        request.project_scope = dispatch_project_scope.clone();
+                        request.specialist = Some("executor".to_string());
+                        request.approval_session_id = Some(session_id.clone());
+                        agent.engine().spawn_child(request).await
                     }
                     Err(error) => Err(error),
                 };

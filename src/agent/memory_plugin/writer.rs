@@ -47,6 +47,13 @@ pub(crate) mod tests {
         fn learn(&self, learning: LearningContext) {
             self.0.lock().unwrap().learned.push(learning);
         }
+        fn learn_from_task(
+            &self,
+            _task: crate::traits::Task,
+            _model: String,
+            _taint: crate::memory::task_learning::RunTaint,
+        ) {
+        }
     }
 
     /// Sends the first final answer back for another pass.

@@ -24,6 +24,16 @@ pub trait MemoryWrites: Send + Sync {
     fn summarize(&self, turn: &MemoryTurn);
     /// Post-task learning (procedures, expertise, failure patterns).
     fn learn(&self, learning: LearningContext);
+    /// Durable knowledge from a completed delegated task's activity log,
+    /// extracted with `model`; a tainted run teaches nothing.
+    fn learn_from_task(&self, task: aidaemon_work::traits::Task, model: String, taint: RunTaint);
+}
+
+/// Whether the run a task finished in read untrusted content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunTaint {
+    Clean,
+    Tainted,
 }
 
 /// Which writes a writer owns: the memory plugin owns fact extraction; the

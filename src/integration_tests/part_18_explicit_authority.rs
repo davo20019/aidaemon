@@ -699,7 +699,7 @@ async fn child_authority_is_the_narrower_of_parent_mode_and_inherited() {
 
     // Goal dispatch from the root ignores the chat's /readonly.
     let dispatched = agent
-        .authority_for_child(UserRole::Owner, &ctx, None)
+        .engine().authority_for_child(UserRole::Owner, &ctx, None)
         .await;
     assert_eq!(dispatched.authority, Authority::full());
     assert_eq!(dispatched.mode_session, None);
@@ -758,7 +758,7 @@ async fn child_authority_is_the_narrower_of_parent_mode_and_inherited() {
         parent_task: None,
     });
     let grandchild = child
-        .authority_for_child(UserRole::Owner, &ctx, None)
+        .engine().authority_for_child(UserRole::Owner, &ctx, None)
         .await;
     assert_eq!(grandchild.authority, Authority::read_only());
     assert_eq!(grandchild.mode_session.as_deref(), Some(session));
@@ -1184,14 +1184,14 @@ async fn spawn_uses_the_parent_turns_authority_not_a_re_resolution() {
     assert_eq!(
         harness
             .agent
-            .inherited_for_child(None, UserRole::Owner, &ctx, None)
+            .engine().inherited_for_child(None, UserRole::Owner, &ctx, None)
             .await
             .authority,
         Authority::full()
     );
     let child = harness
         .agent
-        .inherited_for_child(Some(parent.clone()), UserRole::Owner, &ctx, None)
+        .engine().inherited_for_child(Some(parent.clone()), UserRole::Owner, &ctx, None)
         .await;
     assert_eq!(child, parent);
     assert_eq!(child.authority, Authority::read_only());
@@ -1224,7 +1224,7 @@ async fn a_model_cannot_spoof_parent_authority() {
     assert_eq!(parent.mode_session.as_deref(), Some(session));
     let child = harness
         .agent
-        .inherited_for_child(
+        .engine().inherited_for_child(
             Some(parent),
             UserRole::Owner,
             &ChannelContext::private("telegram"),

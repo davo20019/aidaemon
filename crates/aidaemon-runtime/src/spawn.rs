@@ -986,12 +986,44 @@ pub struct ChildAgentRequest {
     pub project_scope: Option<String>,
     pub specialist: Option<String>,
     pub approval_session_id: Option<String>,
+    /// The durable task attempt a task lead or executor was already claimed
+    /// with; `None` lets the spawn find or claim its task's attempt.
+    pub bound_task_attempt: Option<aidaemon_work::traits::TaskAttempt>,
     /// The spawning turn's actual authority, taint and root request
     /// (dispatcher-injected; `None` falls back to re-resolution).
     pub parent_authority: Option<crate::authority::InheritedAuthority>,
     /// `None` leaves the child unlimited.
     pub time_limit: Option<ChildTimeLimit>,
     pub model_tier: Option<aidaemon_providers::routing::Tier>,
+}
+
+impl ChildAgentRequest {
+    /// A request for a child doing `task` within `mission`, with nothing
+    /// else set.
+    pub fn new(
+        mission: impl Into<String>,
+        task: impl Into<String>,
+        channel_ctx: ChannelContext,
+        user_role: UserRole,
+    ) -> Self {
+        Self {
+            mission: mission.into(),
+            task: task.into(),
+            status_tx: None,
+            channel_ctx,
+            user_role,
+            child_role: None,
+            goal_id: None,
+            task_id: None,
+            project_scope: None,
+            specialist: None,
+            approval_session_id: None,
+            bound_task_attempt: None,
+            parent_authority: None,
+            time_limit: None,
+            model_tier: None,
+        }
+    }
 }
 
 /// Child-delegation capability required by `spawn_agent`.

@@ -9,18 +9,17 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use crate::config::{IterationLimitConfig, PathAliasConfig};
+use crate::events::EventStore;
 #[cfg(test)]
 use crate::events::TaskStatus;
 #[cfg(test)]
 use crate::events::{
     AssistantResponseData, TaskEndData, TaskStartData, ThinkingStartData, ToolResultData,
 };
-use crate::events::{
-    DecisionPointData, DecisionType, EventStore, EventType, SubAgentCompleteData, SubAgentSpawnData,
-};
+#[cfg(test)]
+use crate::events::{DecisionPointData, DecisionType, EventType};
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
 use crate::llm_runtime::side_calls::SideCall;
@@ -30,7 +29,7 @@ use crate::runtime_ports::OutboundRouter;
 use crate::skills;
 #[cfg(test)]
 use crate::traits::Message;
-use crate::traits::{AgentRole, StateStore, Tool, ToolCapabilities, ToolRole};
+use crate::traits::{AgentRole, StateStore, Tool, ToolCapabilities};
 use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
 #[cfg(test)]
@@ -90,10 +89,6 @@ pub(crate) use execution_state::TargetScope;
 /// Tool-failure classification lives in `aidaemon-runtime`.
 mod loop_utils {
     pub(in crate::agent) use aidaemon_runtime::turn::loop_utils::*;
-}
-/// Recall guardrails live in `aidaemon-runtime`.
-mod recall_guardrails {
-    pub(super) use aidaemon_runtime::policy::recall_guardrails::*;
 }
 use loop_utils::is_trigger_session;
 /// The post-run learning context lives in `aidaemon-runtime`.
@@ -223,8 +218,7 @@ mod tool_exec;
 #[path = "turn/tool_execution/mod.rs"]
 mod tool_execution;
 
-pub(in crate::agent) use eval::{HarnessEvalAccumulator, HarnessEvalConfig};
-use system_prompt::format_goal_context;
+pub(in crate::agent) use eval::HarnessEvalConfig;
 
 /// Policy runtime metrics and bounded autotuning live in `aidaemon-runtime`.
 mod policy_metrics {
@@ -569,17 +563,6 @@ impl Agent {
     #[cfg(test)]
     pub(crate) fn event_store(&self) -> &Arc<EventStore> {
         &self.event_store
-    }
-
-    pub(in crate::agent) async fn with_harness_eval<R>(
-        &self,
-        f: impl FnOnce(&mut HarnessEvalAccumulator) -> R,
-    ) -> Option<R> {
-        self.runtime.with_harness_eval(f).await
-    }
-
-    pub(in crate::agent) fn harness_eval_enabled(&self) -> bool {
-        self.runtime.harness_eval_enabled()
     }
 
     /// Maximum recursion depth allowed.

@@ -9,11 +9,10 @@
 
 #![cfg(test)]
 
+use super::SpecialistRegistry;
 use super::SpecialistRenderContext;
-use crate::agent::spawn::task_lead_execution_mode;
-use crate::agent::specialists::SpecialistRegistry;
-use crate::agent::Agent;
-use crate::traits::SpecialistKind;
+use crate::spawn::task_lead_execution_mode;
+use aidaemon_agents::specialist::SpecialistKind;
 
 fn registry() -> SpecialistRegistry {
     SpecialistRegistry::load(None)
@@ -65,7 +64,7 @@ fn task_lead_md_renders_byte_equal_to_legacy_builder() {
     );
     for fx in fxs {
         let ctx = &fx.render;
-        let composed = Agent::compose_task_lead_prompt_from_registry(
+        let composed = super::compose::compose_task_lead_prompt_from_registry(
             &registry,
             &ctx.goal_id,
             &ctx.mission,
@@ -75,7 +74,7 @@ fn task_lead_md_renders_byte_equal_to_legacy_builder() {
             fx.has_cli_agent,
             ctx.is_scheduled,
         );
-        let legacy = Agent::build_task_lead_prompt(
+        let legacy = super::compose::legacy::build_task_lead_prompt(
             &ctx.goal_id,
             &ctx.mission,
             None, // goal_context — keep test grid simple
@@ -103,7 +102,7 @@ fn executor_md_renders_byte_equal_to_legacy_builder() {
     );
     for fx in fxs {
         let ctx = &fx.render;
-        let composed = Agent::compose_executor_prompt_from_registry(
+        let composed = super::compose::compose_executor_prompt_from_registry(
             &registry,
             SpecialistKind::Executor,
             &ctx.task,
@@ -115,7 +114,7 @@ fn executor_md_renders_byte_equal_to_legacy_builder() {
             None, // project_scope
             false,
         );
-        let legacy = Agent::build_executor_prompt(
+        let legacy = super::compose::legacy::build_executor_prompt(
             &ctx.task,
             &ctx.mission,
             ctx.depth,
@@ -181,7 +180,7 @@ fn executor_flavored_kinds_open_with_their_tagline_and_include_shared_base() {
     ];
 
     for (kind, tagline_prefix) in cases {
-        let prompt = Agent::compose_executor_prompt_from_registry(
+        let prompt = super::compose::compose_executor_prompt_from_registry(
             &registry,
             *kind,
             "list the largest files",
@@ -241,13 +240,10 @@ fn executor_flavored_kinds_open_with_their_tagline_and_include_shared_base() {
 fn a_specialist_that_can_spawn_is_not_told_it_cannot() {
     let registry = SpecialistRegistry::load(None);
     for (can_spawn, says) in [
-        (
-            true,
-            aidaemon_runtime::specialists::render::delegation_rule(true),
-        ),
+        (true, super::render::delegation_rule(true)),
         (false, "- Do NOT spawn sub-agents."),
     ] {
-        let prompt = Agent::compose_executor_prompt_from_registry(
+        let prompt = super::compose::compose_executor_prompt_from_registry(
             &registry,
             SpecialistKind::Research,
             "t",
