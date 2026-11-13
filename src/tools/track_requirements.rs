@@ -966,7 +966,8 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.contains("Done ·"), "{out}");
-        assert!(out.contains("2 of 3 done"), "{out}");
+        // Ticked on the model's word only: said done, not done.
+        assert!(out.contains("0 of 3 done, 2 said done"), "{out}");
 
         let partial = json!({
             "items": [
@@ -981,14 +982,20 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.contains("Done ·"), "{out}");
-        assert!(out.contains("Stopped short · 2 of 2 done"), "{out}");
+        assert!(
+            out.contains("Stopped short · 0 of 2 done, 2 said done"),
+            "{out}"
+        );
 
         let done = partial.replace("partial", "done");
         let out = tool
             .call_with(&done, crate::testing::call_facts("sess-done"))
             .await
             .unwrap();
-        assert!(out.contains("✅ Done · 2 of 2 steps"), "{out}");
+        assert!(
+            out.contains("☑️ Finished · 0 of 2 confirmed, 2 said done"),
+            "{out}"
+        );
     }
 
     /// Steps left open while the chat's background sub-agents run read as
@@ -1031,7 +1038,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out.contains("Continuing in the background · 1 of 2 done"),
+            out.contains("Continuing in the background · 0 of 2 done, 1 said done"),
             "{out}"
         );
         assert!(
@@ -1065,7 +1072,10 @@ mod tests {
             .call_with(&args, crate::testing::call_facts("sess-skip"))
             .await
             .unwrap();
-        assert!(out.contains("✅ Done · 1 done, 1 not needed"), "{out}");
+        assert!(
+            out.contains("☑️ Finished · 0 of 2 confirmed, 1 said done, 1 not needed"),
+            "{out}"
+        );
         assert!(
             out.contains("➖ Cancel the open orders (not needed)"),
             "{out}"
@@ -1090,7 +1100,7 @@ mod tests {
         facts.mutation_forbidden = true;
         let out = tool.call_with(&args, facts).await.unwrap();
         assert!(
-            out.contains("⏭️ Not done: read-only is on · 1 of 2 done"),
+            out.contains("⏭️ Not done: read-only is on · 0 of 2 done, 1 said done"),
             "{out}"
         );
         assert!(

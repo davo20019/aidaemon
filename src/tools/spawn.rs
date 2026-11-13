@@ -395,6 +395,33 @@ fn helper_ended(chat: &str, job_id: &str) -> Vec<String> {
     left
 }
 
+/// Whether the chat's helper `job_id` is still running (its start line is
+/// on the card).
+fn helper_running(chat: &str, job_id: &str) -> bool {
+    RUNNING_HELPERS.lock().is_ok_and(|running| {
+        running
+            .get(chat)
+            .is_some_and(|helpers| helpers.iter().any(|helper| helper.job == job_id))
+    })
+}
+
+/// One writer at a time for a chat's kept card. A helper's step redraw and
+/// the redraw its end makes take turns, and a redraw that starts after the
+/// helper ended draws nothing: a step edit still in flight (a slow or
+/// rate-limited Telegram edit) can never land after the finished card and
+/// leave a stale step on it (live 2026-11-13: the card stayed on "running a
+/// command: 13" after the count ended).
+fn card_writer(chat: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static WRITERS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut writers = WRITERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    writers.retain(|_, writer| Arc::strong_count(writer) > 1);
+    writers.entry(chat.to_string()).or_default().clone()
+}
+
 /// The card a background helper's turn leaves in the chat, for showing
 /// the helper's steps after that turn ended.
 struct HelperCard {
@@ -407,6 +434,8 @@ struct HelperCard {
     /// The chat's kept card and background message when the helper
     /// started: one that differs later is the card its own turn left.
     at_start: (Option<String>, Option<String>),
+    /// What this helper last drew, so an unchanged card is not sent again.
+    drawn: std::sync::Mutex<Option<String>>,
 }
 
 /// How often a helper's steps may edit its card after its turn.
@@ -417,6 +446,12 @@ impl HelperCard {
     /// helper's start line and latest step), when that turn has ended and
     /// left one. While the turn runs, its own live card shows the steps.
     async fn refresh(&self) {
+        let writer = card_writer(&self.chat);
+        let _turn = writer.lock().await;
+        // Ended meanwhile: its end drew the finished card.
+        if !helper_running(&self.chat, &self.job) {
+            return;
+        }
         let (Some(hub), Some(plans), Some(plan_session)) = (
             self.hub.as_ref().and_then(Weak::upgrade),
             self.plans.as_ref(),
@@ -457,7 +492,27 @@ impl HelperCard {
                 .iter()
                 .map(|(label, step)| (label.as_str(), step.as_deref())),
         );
-        let _ = hub.edit_text(&self.chat, &surface, &card).await;
+        let unchanged = self
+            .drawn
+            .lock()
+            .is_ok_and(|drawn| drawn.as_deref() == Some(card.as_str()));
+        if unchanged {
+            return;
+        }
+        match hub.edit_text(&self.chat, &surface, &card).await {
+            Ok(true) => {
+                if let Ok(mut drawn) = self.drawn.lock() {
+                    *drawn = Some(card);
+                }
+            }
+            Ok(false) => {}
+            Err(error) => warn!(
+                session_id = %self.chat,
+                job_id = %self.job,
+                %error,
+                "Could not show a background helper's step on its card"
+            ),
+        }
     }
 }
 
@@ -471,11 +526,15 @@ fn show_helper_steps_on_card(
     card: HelperCard,
 ) -> Option<mpsc::Sender<StatusUpdate>> {
     let parent = parent?;
+    let card = Arc::new(card);
     let (tx, mut rx) = mpsc::channel::<StatusUpdate>(64);
     tokio::spawn(async move {
         let mut redraw = tokio::time::interval(HELPER_CARD_EVERY);
         redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut changed = false;
+        // The redraw runs beside the updates: a slow edit never holds up
+        // the helper's steps, and the next redraw shows the latest one.
+        let mut drawing: Option<tokio::task::JoinHandle<()>> = None;
         loop {
             tokio::select! {
                 update = rx.recv() => {
@@ -489,8 +548,12 @@ fn show_helper_steps_on_card(
                     let _ = parent.send(update).await;
                 }
                 _ = redraw.tick(), if changed => {
+                    if drawing.as_ref().is_some_and(|draw| !draw.is_finished()) {
+                        continue;
+                    }
                     changed = false;
-                    card.refresh().await;
+                    let card = card.clone();
+                    drawing = Some(tokio::spawn(async move { card.refresh().await }));
                 }
             }
         }
@@ -878,7 +941,12 @@ fn combine_batch(
 
 #[derive(Deserialize)]
 struct SpawnArgs {
-    /// High-level mission / role description for the sub-agent.
+    /// High-level mission / role description for the sub-agent. Optional:
+    /// a call that gives a title and a task has said what the child is for
+    /// (live 2026-11-13: two models gave `title` and `task` without
+    /// `mission`, and the spawn failed on the missing field), so it
+    /// defaults to the title, else the task.
+    #[serde(default)]
     mission: String,
     /// A short name the owner reads for this sub-agent on its cards and
     /// status lines ("Drupal install").
@@ -918,6 +986,40 @@ struct SpawnArgs {
     /// Who wins where that scope overlaps a running sibling's.
     #[serde(default)]
     precedence: Option<crate::agent::coordination::Precedence>,
+}
+
+impl SpawnArgs {
+    /// Parse a single spawn's arguments, filling `mission` from the title
+    /// (else the task) when the call left it out.
+    fn parse(arguments: &str) -> anyhow::Result<Self> {
+        let mut args: SpawnArgs = serde_json::from_str(arguments).map_err(|error| {
+            anyhow::anyhow!("{error}. Give a title and a task, or several sub-agents as `tasks`.")
+        })?;
+        anyhow::ensure!(
+            !args.task.trim().is_empty(),
+            "`task` is empty. Say what the sub-agent should do in `task`."
+        );
+        if args.mission.trim().is_empty() {
+            args.mission = args
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| args.task.trim())
+                .to_string();
+        }
+        Ok(args)
+    }
+
+    /// The one name the owner reads for this child, from its start line to
+    /// its result: its title, else its mission.
+    fn name(&self) -> &str {
+        self.title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .unwrap_or(self.mission.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1053,8 +1155,9 @@ impl Tool for SpawnAgentTool {
                 "properties": {
                     "mission": {
                         "type": "string",
-                        "description": "High-level mission or role for the sub-agent \
-                            (e.g. 'Research assistant focused on Python packaging')"
+                        "description": "Optional: high-level mission or role for the sub-agent \
+                            (e.g. 'Research assistant focused on Python packaging'). Left out, \
+                            it is the title."
                     },
                     "title": {
                         "type": "string",
@@ -1149,12 +1252,74 @@ impl Tool for SpawnAgentTool {
         if let Some(tasks) = batch_tasks(arguments)? {
             return self.execute_batch(tasks, facts).await;
         }
+        match self.execute_one(arguments, facts).await {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Err(self.steps_not_started(arguments, facts, error).await),
+        }
+    }
+}
+
+impl SpawnAgentTool {
+    /// A `spawn_agent` call that failed started no helper: the checklist
+    /// steps it named (`checklist_items`) are marked as not running, the
+    /// card shows it, and the failure tells the model which of its steps
+    /// nothing works on, to retry or to tell the owner (live 2026-11-13: a
+    /// spawn that failed on its arguments left its step reading as handed
+    /// off).
+    async fn steps_not_started(
+        &self,
+        arguments: &str,
+        facts: &crate::traits::ToolCallContext,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let items: Vec<usize> = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|call| call.get("checklist_items").cloned())
+            .and_then(|items| serde_json::from_value(items).ok())
+            .unwrap_or_default();
+        if items.is_empty() {
+            return error;
+        }
+        let reason = format!("its helper didn't start: {error}");
+        if let (Some(plans), Some(session)) = (self.plan_store.get(), facts.session()) {
+            match plans
+                .helper_did_not_start(session, facts.task_id.as_deref(), &items, &reason)
+                .await
+            {
+                Ok(Some(plan)) => {
+                    if let Some(tx) = crate::traits::status_sender(facts) {
+                        let _ = tx.try_send(StatusUpdate::Checklist {
+                            text: plan.render_compact_checklist(),
+                        });
+                    }
+                }
+                Ok(None) => {}
+                Err(store_error) => {
+                    warn!(%store_error, "Could not mark checklist steps whose helper didn't start")
+                }
+            }
+        }
+        let steps = items
+            .iter()
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::anyhow!(
+            "{error}\n\nNo helper started, so nothing is working on checklist item(s) {steps}. \
+             Call spawn_agent again with corrected arguments, or tell the owner that this part \
+             isn't running."
+        )
+    }
+
+    async fn execute_one(
+        &self,
+        arguments: &str,
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
         let status_tx = crate::traits::status_sender(facts);
         let facts = facts.clone();
 
-        let args: SpawnArgs = serde_json::from_str(arguments).map_err(|error| {
-            anyhow::anyhow!("{error}. Give mission and task, or several sub-agents as `tasks`.")
-        })?;
+        let args = SpawnArgs::parse(arguments)?;
         let project_scope = facts.project_scope.clone();
         let mut parent_authority = crate::agent::authority::parent_authority(&facts).cloned();
         // A child can be made narrower than its parent and never wider.
@@ -1384,6 +1549,11 @@ impl Tool for SpawnAgentTool {
 
         let task = args.task.clone();
         let mission = args.mission.clone();
+        // The one name the owner reads for it, on its start line and its
+        // result alike (live 2026-11-13: "Count slowly to 30" started and
+        // "Time a slow count and notify the user when finished" finished).
+        let name = args.name().to_string();
+        let started_as = background_spawn_outcome(&name);
         let timeout_secs = self.timeout_secs;
         let time_limit = self.time_limit();
         let max_response_chars = self.max_response_chars;
@@ -1398,7 +1568,7 @@ impl Tool for SpawnAgentTool {
             let record = crate::traits::BackgroundSpawn {
                 id: background_id.clone(),
                 session_id: session_id.clone(),
-                mission: mission.chars().take(BACKGROUND_MISSION_CHARS).collect(),
+                mission: name.chars().take(BACKGROUND_MISSION_CHARS).collect(),
                 started_at: chrono::Utc::now().to_rfc3339(),
             };
             if let Err(error) = state.record_background_spawn(&record).await {
@@ -1448,13 +1618,7 @@ impl Tool for SpawnAgentTool {
             }
         }
         let plan_session = approval_session_id.clone();
-        let helper_label = crate::agent::helper_card_label(
-            args.title
-                .as_deref()
-                .map(str::trim)
-                .filter(|title| !title.is_empty())
-                .unwrap_or(args.mission.as_str()),
-        );
+        let helper_label = crate::agent::helper_card_label(&name);
         note_running_helper(&session_id, &background_id, &helper_label);
         let at_start = match hub.as_ref() {
             Some(hub) => (
@@ -1473,6 +1637,7 @@ impl Tool for SpawnAgentTool {
                 job: background_id.clone(),
                 label: helper_label.clone(),
                 at_start,
+                drawn: Default::default(),
             },
         );
 
@@ -1544,7 +1709,7 @@ impl Tool for SpawnAgentTool {
                                         name: "spawn_agent".to_string(),
                                         chunk: format!(
                                             "Background sub-agent still running ({}s): {}",
-                                            elapsed_secs, mission
+                                            elapsed_secs, name
                                         ),
                                     });
                                 }
@@ -1579,12 +1744,12 @@ impl Tool for SpawnAgentTool {
                         format!(
                             "\u{23f9}\u{fe0f} Cancelled in the background: {}\n\n\
                          It may have done part of the work.",
-                            mission
+                            name
                         ),
                     ),
                     Ok(run) => {
                         let (kind, mut message) = format_background_completion(
-                            &mission,
+                            &name,
                             &run.response,
                             run.outcome,
                             run.reported_done,
@@ -1602,10 +1767,7 @@ impl Tool for SpawnAgentTool {
                     Err(error) => match error.downcast_ref::<ChildTimedOut>() {
                         None => (
                             "failed",
-                            format!(
-                                "\u{274c} Failed in the background: {}\n\n{}",
-                                mission, error
-                            ),
+                            format!("\u{274c} Failed in the background: {}\n\n{}", name, error),
                         ),
                         Some(timed_out) => {
                             // The child may have persisted a terminal outcome
@@ -1633,21 +1795,21 @@ impl Tool for SpawnAgentTool {
                                     "completed",
                                     format!(
                                         "\u{2705} Finished in the background: {}\n\n{}",
-                                        mission, outcome.details
+                                        name, outcome.details
                                     ),
                                 ),
                                 Some(outcome) if outcome.status == "blocked" => (
                                     "blocked",
                                     format!(
                                         "\u{26a0}\u{fe0f} Stuck in the background: {}\n\n{}",
-                                        mission, outcome.details
+                                        name, outcome.details
                                     ),
                                 ),
                                 Some(outcome) => (
                                     "failed",
                                     format!(
                                         "\u{274c} Failed in the background: {}\n\n{}",
-                                        mission, outcome.details
+                                        name, outcome.details
                                     ),
                                 ),
                                 None => (
@@ -1655,7 +1817,7 @@ impl Tool for SpawnAgentTool {
                                     format!(
                                         "\u{23f1} Stopped in the background after it made no \
                                          progress: {}\n\n{}",
-                                        mission,
+                                        name,
                                         timed_out.render()
                                     ),
                                 ),
@@ -1690,7 +1852,7 @@ impl Tool for SpawnAgentTool {
                 );
                 let message = format!(
                     "\u{274c} Failed in the background: {}\n\nIt stopped unexpectedly.",
-                    mission
+                    name
                 );
                 // The note is the daemon's own text, so it is trusted.
                 let delivered = std::panic::AssertUnwindSafe(delivery.deliver(
@@ -1735,13 +1897,7 @@ impl Tool for SpawnAgentTool {
             }
         });
 
-        let name = args
-            .title
-            .as_deref()
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
-            .unwrap_or(args.mission.as_str());
-        let mut outcome = background_spawn_outcome(name);
+        let mut outcome = started_as;
         outcome.output.push_str(&scope_overlap_note);
         Ok(outcome)
     }
@@ -1768,6 +1924,10 @@ pub(crate) async fn settle_background_steps(
     succeeded: bool,
 ) {
     let still_running = helper_ended(chat_session, job_id);
+    // After any step redraw of this helper still in flight, and before any
+    // that would start now (it sees the helper ended and draws nothing).
+    let writer = card_writer(chat_session);
+    let _turn = writer.lock().await;
     let (Some(plans), Some(plan_session)) = (plan_store, plan_session) else {
         return;
     };
@@ -3913,6 +4073,7 @@ mod child_runtime_tests {
                 job: "job-steps".to_string(),
                 label: "Slow count to 30".to_string(),
                 at_start: (None, None),
+                drawn: Default::default(),
             },
         )
         .unwrap();
@@ -3986,6 +4147,15 @@ mod child_runtime_tests {
             )
             .await
             .unwrap();
+        // The run's receipts proved the first step.
+        plans
+            .confirm_steps(
+                session,
+                "task-synthetic",
+                &std::collections::BTreeSet::from([0]),
+            )
+            .await
+            .unwrap();
         let hub = Arc::new(CardHub::default());
         let router: Arc<dyn OutboundRouter> = hub.clone();
         let store = notification_store().await;
@@ -4031,6 +4201,311 @@ mod child_runtime_tests {
             .unwrap()
             .remove(0);
         (card, plan)
+    }
+
+    /// A call that names its sub-agent by `title` and says what to do in
+    /// `task`, leaving out `mission`, starts it (live 2026-11-13: both such
+    /// calls failed on "missing field `mission`").
+    #[tokio::test]
+    async fn a_spawn_with_a_title_and_a_task_needs_no_mission() {
+        let child = ScriptedChild::new("Done.", Duration::ZERO);
+        let tool = tool_for(&child);
+        let args = json!({
+            "title": "Count slowly to 30",
+            "task": "Count from 1 to 30, one number every 2 seconds.",
+            "specialist": "executor"
+        })
+        .to_string();
+
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .expect("the child starts");
+
+        assert_eq!(
+            *child.tasks.lock().unwrap(),
+            vec!["Count from 1 to 30, one number every 2 seconds.".to_string()]
+        );
+    }
+
+    /// A background helper is named by its title from its start line to its
+    /// result, not by its mission (live 2026-11-13: "Count slowly to 30"
+    /// started and "Time a slow count and notify the user when finished"
+    /// finished).
+    #[tokio::test]
+    async fn a_background_helper_keeps_its_title_from_start_to_finish() {
+        let child = ScriptedChild::new("Done.", Duration::from_millis(50));
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({
+            "title": "Count slowly to 30",
+            "mission": "Time a slow count and notify the user when finished.",
+            "task": "Count to 30.",
+            "background": true
+        })
+        .to_string();
+
+        let started = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        let entry = wait_for_notification(&store).await;
+
+        assert!(
+            started
+                .output
+                .starts_with("Started in the background: Count slowly to 30."),
+            "{}",
+            started.output
+        );
+        assert!(
+            entry
+                .message
+                .contains("\u{2705} Finished in the background: Count slowly to 30\n"),
+            "{}",
+            entry.message
+        );
+        assert!(
+            !entry.message.contains("Time a slow count"),
+            "{}",
+            entry.message
+        );
+    }
+
+    /// A `spawn_agent` call that fails starts no helper: the checklist step
+    /// it named reads as not running, the failure tells the model which step
+    /// nothing works on, and a corrected call takes the step again.
+    #[tokio::test]
+    async fn a_failed_spawn_leaves_its_step_not_running_until_a_retry_starts() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(pool).await.unwrap());
+        let session = "telegram:synthetic-user-1";
+        plans
+            .upsert_checklist(
+                session,
+                Some("task-synthetic"),
+                "track_requirements",
+                &[
+                    (
+                        "Drupal install in site-a".into(),
+                        crate::plans::StepStatus::InProgress,
+                    ),
+                    (
+                        "WordPress install in site-b".into(),
+                        crate::plans::StepStatus::Pending,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        let child = ScriptedChild::new("Done.", Duration::from_secs(5));
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let router: Arc<dyn OutboundRouter> = Arc::new(CardHub::default());
+        tool.set_hub(Arc::downgrade(&router));
+        tool.set_plan_store(plans.clone());
+        let mut call_facts = facts();
+        call_facts.task_id = Some("task-synthetic".to_string());
+
+        let failed =
+            json!({"title": "WordPress install", "background": true, "checklist_items": [1]});
+        let error = tool
+            .call_with_execution_context(&failed.to_string(), None, call_facts.clone())
+            .await
+            .expect_err("no task, no helper");
+        let error = error.to_string();
+        assert!(
+            error.contains("nothing is working on checklist item(s) 1"),
+            "{error}"
+        );
+        let plan = plans
+            .get_recent_for_session(session, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(plan.steps[1].status, crate::plans::StepStatus::Failed);
+        assert!(plan.steps[1].helper_not_started);
+        assert!(
+            plan.render_compact_checklist()
+                .contains("WordPress install in site-b (didn't run: its helper didn't start)"),
+            "{}",
+            plan.render_compact_checklist()
+        );
+
+        let retried = json!({
+            "title": "WordPress install",
+            "task": "Install WordPress in site-b.",
+            "background": true,
+            "checklist_items": [1]
+        });
+        tool.call_with_execution_context(&retried.to_string(), None, call_facts)
+            .await
+            .expect("the corrected call starts the helper");
+        let plan = plans
+            .get_recent_for_session(session, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(plan.steps[1].status, crate::plans::StepStatus::Background);
+        assert!(!plan.steps[1].helper_not_started);
+    }
+
+    /// Records the card's edits when they land, each landing a while after
+    /// it was sent, as a slow or rate-limited Telegram edit does.
+    #[derive(Default)]
+    struct SlowCardHub {
+        landed: StdMutex<Vec<String>>,
+        slow_ms: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait]
+    impl OutboundRouter for SlowCardHub {
+        async fn send_text(&self, _session_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_text_tracked(
+            &self,
+            _session_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn edit_text(
+            &self,
+            _session_id: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<bool> {
+            let wait = self.slow_ms.load(std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            self.landed.lock().unwrap().push(text.to_string());
+            Ok(true)
+        }
+        async fn send_media(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_media_strict(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn background_status_surface(&self, _session_id: &str) -> Option<String> {
+            None
+        }
+        async fn take_background_status_surface(&self, _session_id: &str) -> Option<String> {
+            None
+        }
+        async fn checklist_surface(&self, _session_id: &str) -> Option<String> {
+            Some("card-1".to_string())
+        }
+        async fn request_inline_approval(
+            &self,
+            _session_id: &str,
+            _description: &str,
+            _risk_level: crate::tools::command_risk::RiskLevel,
+            _warnings: &[String],
+            _permission_mode: crate::tools::command_risk::PermissionMode,
+        ) -> anyhow::Result<crate::types::ApprovalResponse> {
+            anyhow::bail!("no approvals in this test")
+        }
+        async fn register_session_route(&self, _child: &str, _parent: &str) -> bool {
+            false
+        }
+        async fn unregister_session_route(&self, _child: &str, _parent: &str) {}
+    }
+
+    /// A step redraw still in flight when the helper ends lands before the
+    /// finished card, never after it: the card ends on the finished state,
+    /// within the redraw's time, not on the helper's last step (live
+    /// 2026-11-13: "running a command: 13" stayed after the count ended).
+    #[tokio::test]
+    async fn a_helpers_finished_card_is_never_overwritten_by_its_last_step() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(pool).await.unwrap());
+        let chat = "telegram:synthetic-race-chat";
+        plans
+            .upsert_checklist(
+                chat,
+                Some("task-race"),
+                "track_requirements",
+                &[
+                    (
+                        "Count slowly to 30".into(),
+                        crate::plans::StepStatus::Pending,
+                    ),
+                    ("Say done".into(), crate::plans::StepStatus::Pending),
+                ],
+            )
+            .await
+            .unwrap();
+        plans
+            .link_background_job(chat, Some("task-race"), &[0, 1], "job-race")
+            .await
+            .unwrap()
+            .unwrap();
+        let hub = Arc::new(SlowCardHub::default());
+        hub.slow_ms.store(800, std::sync::atomic::Ordering::SeqCst);
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        let weak = Arc::downgrade(&router);
+        note_running_helper(chat, "job-race", "Slow count");
+        let (parent_tx, _parent_rx) = mpsc::channel(64);
+        let helper = show_helper_steps_on_card(
+            Some(parent_tx),
+            HelperCard {
+                hub: Some(weak.clone()),
+                plans: Some(plans.clone()),
+                plan_session: Some(chat.to_string()),
+                chat: chat.to_string(),
+                job: "job-race".to_string(),
+                label: "Slow count".to_string(),
+                at_start: (None, None),
+                drawn: Default::default(),
+            },
+        )
+        .unwrap();
+        helper
+            .send(StatusUpdate::SubAgentProgress {
+                label: "Slow count".into(),
+                progress: "running a command: 13".into(),
+            })
+            .await
+            .unwrap();
+        // The step's redraw is now on its way.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        hub.slow_ms.store(0, std::sync::atomic::Ordering::SeqCst);
+        let ended = std::time::Instant::now();
+        settle_background_steps(
+            Some(&plans),
+            Some(&weak),
+            Some(chat),
+            chat,
+            "job-race",
+            true,
+        )
+        .await;
+        assert!(ended.elapsed() < Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+
+        let landed = hub.landed.lock().unwrap().clone();
+        let last = landed.last().expect("the finished card was drawn");
+        assert!(last.starts_with("✅ Done · 2 of 2 steps"), "{landed:?}");
+        assert!(!last.contains("running a command"), "{landed:?}");
+        drop(helper);
     }
 
     /// A child that finishes its work moves the steps it was given to done

@@ -151,6 +151,10 @@ impl PlanStore {
                 background_jobs: Vec::new(),
                 waits_on_jobs: false,
                 not_done: None,
+                // The model's own tick: done on its word until evidence
+                // confirms it.
+                said_done: item.status == StepStatus::Completed,
+                helper_not_started: false,
                 status: item.status,
                 tool_call_ids: Vec::new(),
                 result_summary: None,
@@ -200,6 +204,33 @@ impl PlanStore {
                 let Some(previous) = existing.steps.get(step.index) else {
                     continue;
                 };
+                // The same step keeps the evidence that proved it: an
+                // update ticking it again neither erases its proof nor
+                // turns proven work into the model's word.
+                if previous.description == step.description {
+                    for receipt in &previous.evidence_receipt_ids {
+                        if !step.evidence_receipt_ids.contains(receipt) {
+                            step.evidence_receipt_ids.push(receipt.clone());
+                        }
+                    }
+                    if step.status == StepStatus::Completed
+                        && previous.status == StepStatus::Completed
+                        && !previous.said_done
+                    {
+                        step.said_done = false;
+                        step.completed_at = previous.completed_at;
+                    }
+                    // Still the step whose helper didn't start, until a
+                    // launch takes it or the model resolves it.
+                    if previous.helper_not_started
+                        && matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
+                    {
+                        step.status = StepStatus::Failed;
+                        step.helper_not_started = true;
+                        step.error = previous.error.clone();
+                        step.completed_at = previous.completed_at;
+                    }
+                }
                 if previous.status == StepStatus::Background
                     && !previous.background_jobs.is_empty()
                     && previous.description == step.description
@@ -259,6 +290,57 @@ impl PlanStore {
             return Ok(None);
         };
         if !plan.link_background_job(indices, job_id) {
+            return Ok(None);
+        }
+        self.update(&plan).await?;
+        Ok(Some(plan))
+    }
+
+    /// The helper for the steps at `indices` of the session's checklist for
+    /// `task_id` never started ([`TaskPlan::helper_did_not_start`]).
+    /// Returns the updated plan, or `None` when nothing changed.
+    pub async fn helper_did_not_start(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        indices: &[usize],
+        reason: &str,
+    ) -> anyhow::Result<Option<TaskPlan>> {
+        let Some(mut plan) = self
+            .get_recent_for_session(session_id, 1)
+            .await?
+            .into_iter()
+            .next()
+            .filter(|plan| task_id.is_none() || plan.task_id.as_deref() == task_id)
+        else {
+            return Ok(None);
+        };
+        if !plan.helper_did_not_start(indices, reason) {
+            return Ok(None);
+        }
+        self.update(&plan).await?;
+        Ok(Some(plan))
+    }
+
+    /// The run's receipts proved the checklist items at `indices` of the
+    /// session's checklist for `task_id` ([`TaskPlan::confirm_steps`]).
+    /// Returns the updated plan, or `None` when nothing changed.
+    pub async fn confirm_steps(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        indices: &std::collections::BTreeSet<usize>,
+    ) -> anyhow::Result<Option<TaskPlan>> {
+        let Some(mut plan) = self
+            .get_recent_for_session(session_id, 1)
+            .await?
+            .into_iter()
+            .next()
+            .filter(|plan| plan.task_id.as_deref() == Some(task_id))
+        else {
+            return Ok(None);
+        };
+        if !plan.confirm_steps(indices) {
             return Ok(None);
         }
         self.update(&plan).await?;
@@ -407,6 +489,7 @@ impl PlanStore {
 
             if effects_match && observation_matches && targets_match {
                 step.status = StepStatus::Completed;
+                step.said_done = false;
                 step.completed_at = Some(Utc::now());
                 step.result_summary = Some(aidaemon_events::text::truncate_str(result, 200));
                 if !step
@@ -701,6 +784,131 @@ mod tests {
             .await
             .unwrap();
         PlanStore::new(pool).await.unwrap()
+    }
+
+    /// A step the model ticks is done only on its word until evidence
+    /// confirms it: the card never shows it ✅ or counts it done, an update
+    /// ticking it again keeps a confirmation, and a helper's success
+    /// confirms the step it was given (live 2026-11-13: "2 of 3 done" right
+    /// after an update ticked two steps nothing had proven).
+    #[tokio::test]
+    async fn a_step_the_model_ticked_is_said_done_until_evidence_confirms_it() {
+        use crate::plans::StepStatus;
+        let store = create_test_store().await;
+        let ticked = |done: bool| {
+            vec![
+                (
+                    "Check the first site".to_string(),
+                    if done {
+                        StepStatus::Completed
+                    } else {
+                        StepStatus::Pending
+                    },
+                ),
+                (
+                    "Check the second site".to_string(),
+                    if done {
+                        StepStatus::Completed
+                    } else {
+                        StepStatus::Pending
+                    },
+                ),
+                ("Report both".to_string(), StepStatus::InProgress),
+            ]
+        };
+        store
+            .upsert_checklist("s1", Some("t1"), "test", &ticked(false))
+            .await
+            .unwrap();
+        let plan = store
+            .upsert_checklist("s1", Some("t1"), "test", &ticked(true))
+            .await
+            .unwrap();
+        let card = plan.render_compact_checklist();
+        assert!(card.starts_with("⚙️ Working · step 3 of 3"), "{card}");
+        assert!(
+            card.contains("☑️ Check the second site (said done; nothing confirmed it)"),
+            "{card}"
+        );
+        assert!(!card.contains("✅"), "{card}");
+        assert_eq!(plan.confirmed_steps(), 0);
+
+        let proven = std::collections::BTreeSet::from([0]);
+        store.confirm_steps("s1", "t1", &proven).await.unwrap();
+        let plan = store
+            .upsert_checklist("s1", Some("t1"), "test", &ticked(true))
+            .await
+            .unwrap();
+        assert!(!plan.steps[0].said_done, "a later tick keeps the proof");
+        assert!(plan.steps[1].said_done);
+
+        store
+            .link_background_job("s1", Some("t1"), &[2], "job-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let plan = store
+            .settle_background_job("s1", "job-1", true)
+            .await
+            .unwrap()
+            .unwrap();
+        let card = plan.render_compact_checklist();
+        assert!(
+            card.starts_with("☑️ Finished · 2 of 3 confirmed, 1 said done"),
+            "{card}"
+        );
+        assert!(card.contains("✅ Report both"), "{card}");
+        assert!(!crate::plans::is_completed_checklist(&card), "{card}");
+    }
+
+    /// A step whose helper never started is not done, the finished card says
+    /// plainly that it didn't run, and a later launch for it takes it again.
+    #[tokio::test]
+    async fn a_step_whose_helper_did_not_start_reads_as_not_run_until_one_does() {
+        use crate::plans::StepStatus;
+        let store = create_test_store().await;
+        let items = vec![
+            ("Install the first site".to_string(), StepStatus::InProgress),
+            ("Install the second site".to_string(), StepStatus::Pending),
+        ];
+        store
+            .upsert_checklist("s1", Some("t1"), "test", &items)
+            .await
+            .unwrap();
+        store
+            .link_background_job("s1", Some("t1"), &[0], "job-1")
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .helper_did_not_start("s1", Some("t1"), &[1], "its helper didn't start")
+            .await
+            .unwrap()
+            .unwrap();
+        let plan = store
+            .settle_background_job("s1", "job-1", true)
+            .await
+            .unwrap()
+            .unwrap();
+        let card = plan.render_compact_checklist();
+        assert!(card.starts_with("❌ Stopped · 1 of 2 done"), "{card}");
+        assert!(
+            card.contains("⚠️ Install the second site (didn't run: its helper didn't start)"),
+            "{card}"
+        );
+        assert!(
+            card.ends_with("Didn't run: Install the second site"),
+            "{card}"
+        );
+
+        let plan = store
+            .link_background_job("s1", Some("t1"), &[1], "job-2")
+            .await
+            .unwrap()
+            .expect("a retried launch takes the step");
+        assert_eq!(plan.steps[1].status, StepStatus::Background);
+        assert!(!plan.steps[1].helper_not_started);
+        assert_eq!(plan.status, PlanStatus::InProgress);
     }
 
     #[tokio::test]

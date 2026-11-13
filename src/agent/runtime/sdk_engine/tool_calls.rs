@@ -1042,6 +1042,16 @@ impl Agent {
                 {
                     warn!(task_id = scope.task_id, %error, "SDK engine: could not record a checklist");
                 }
+                // A step the model ticked shows as done only once receipts
+                // prove it: the card is redrawn with what they proved.
+                if let Some(text) = self
+                    .confirm_checklist_from_receipts(scope.session_id, scope.task_id)
+                    .await
+                {
+                    if let Some(status_tx) = &scope.status_tx {
+                        let _ = status_tx.try_send(StatusUpdate::Checklist { text });
+                    }
+                }
             }
         }
         info!(
