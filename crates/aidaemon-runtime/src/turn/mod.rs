@@ -24,6 +24,7 @@ pub mod sliding_window;
 pub mod system_directives;
 pub mod task_end;
 pub mod task_outcome;
+pub mod task_planning;
 pub mod tool_dispatch;
 pub mod tool_facts;
 pub mod tool_result_notices;

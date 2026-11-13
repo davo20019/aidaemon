@@ -185,11 +185,12 @@ mod turn_context;
 #[path = "runtime/untrusted.rs"]
 pub(crate) mod untrusted;
 pub(in crate::agent) use completion_contract::persistable_completion_contract;
+#[cfg(test)]
+pub(in crate::agent) use followup::FollowupMode;
 pub(in crate::agent) use history::retain_structural_completion_contract;
 pub(in crate::agent) use history::CompletionContract;
 pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;
-pub(in crate::agent) use history::FollowupMode;
 pub(in crate::agent) use history::TurnContext;
 pub(in crate::agent) mod eval;
 /// Evidence routing lives in `aidaemon-runtime`.
