@@ -1,6 +1,7 @@
 pub mod approval;
 pub use aidaemon_tools::background_deliverable;
 #[cfg(feature = "slack")]
+#[cfg(feature = "slack")]
 mod channel_history;
 pub(crate) mod cli_agent;
 #[cfg(feature = "computer_use")]
@@ -43,6 +44,7 @@ mod web_search;
 pub use aidaemon_tool_browser::BrowserTool;
 pub use approval::ApprovalBroker;
 pub(crate) use approval::ProgressClock;
+#[cfg(feature = "slack")]
 #[cfg(feature = "slack")]
 pub use channel_history::ReadChannelHistoryTool;
 pub use cli_agent::CliAgentTool;

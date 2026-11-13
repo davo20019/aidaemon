@@ -44,6 +44,7 @@ pub mod rate_limit;
 mod render;
 pub mod router;
 pub mod runner;
+pub mod send_file;
 pub mod session;
 pub mod slash;
 pub mod split;
