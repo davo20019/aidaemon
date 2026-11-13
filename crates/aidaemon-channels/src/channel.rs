@@ -259,14 +259,192 @@ pub struct ApprovalChoice {
 }
 
 /// A question with buttons, used for tool approvals.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Built with [`ApprovalPrompt::new`], so a new field does not break code
+/// written against an older version.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalPrompt {
     /// Opaque id chosen by the runner; echoed back in the answer.
     pub id: String,
     pub conversation: Conversation,
-    /// Markdown body describing what is being approved.
+    /// Markdown body describing what is being approved: what a channel
+    /// that draws no card of its own shows.
     pub text: String,
     pub choices: Vec<ApprovalChoice>,
+    /// The same request as typed facts, for a channel that renders its own
+    /// card (a web UI, a native dialog). `None` for prompts that are not
+    /// about a tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<ApprovalDetails>,
+}
+
+impl ApprovalPrompt {
+    pub fn new(
+        id: impl Into<String>,
+        conversation: Conversation,
+        text: impl Into<String>,
+        choices: Vec<ApprovalChoice>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            conversation,
+            text: text.into(),
+            choices,
+            details: None,
+        }
+    }
+
+    pub fn with_details(mut self, details: ApprovalDetails) -> Self {
+        self.details = Some(details);
+        self
+    }
+}
+
+/// What an approval prompt asks about, as data: the call waiting, why the
+/// run paused and, when an approval policy asked, its typed request (a
+/// summary, risk, effects and the card's facts: [`aidaemon_core::ApprovalCard`]).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalDetails {
+    /// The tool the call would run.
+    pub tool: String,
+    /// Its arguments, as the model sent them.
+    pub arguments: serde_json::Value,
+    /// Why the run paused, in the words of the hook that paused it.
+    pub reason: String,
+    /// The owner request, when the pause asks the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<aidaemon_core::OwnerApprovalRequest>,
+}
+
+impl ApprovalDetails {
+    pub fn from_interruption(interruption: &aidaemon_core::Interruption) -> Self {
+        Self {
+            tool: interruption.call.name.clone(),
+            arguments: interruption.call.arguments.clone(),
+            reason: interruption.reason.clone(),
+            request: match &interruption.kind {
+                aidaemon_core::InterruptKind::OwnerApproval(request) => Some(request.clone()),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// A run's live status as data, rebuilt by the runner from the run's
+/// events. The runner shows it with [`Channel::send_status`] and
+/// [`Channel::update_status`]; their defaults draw it as Markdown
+/// ([`RunProgress::to_markdown`]), and a channel with its own status UI
+/// overrides them to render the fields.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunProgress {
+    pub phase: ProgressPhase,
+    /// The run's latest tool calls (at most eight), oldest first.
+    pub tools: Vec<ToolProgress>,
+    /// The model's text streamed so far in the current turn, while
+    /// working.
+    pub streamed: String,
+}
+
+/// Whether the run is still going, and how it ended.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressPhase {
+    Working,
+    Ended(RunEnding),
+}
+
+/// How a run ended, as its status line says it.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunEnding {
+    Done,
+    /// It finished with something left undone.
+    PartlyDone,
+    /// It paused for an approval (an [`ApprovalPrompt`] follows).
+    WaitingForApproval,
+    /// It was stopped (cancelled).
+    Stopped,
+    /// A tool finished it as blocked.
+    Blocked,
+    /// The run could not be run at all.
+    Failed,
+    /// Any other end: a limit, a provider failure, no progress.
+    Ended,
+}
+
+impl RunEnding {
+    /// The word the default status line uses.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Done => "Done",
+            Self::PartlyDone => "Partly done",
+            Self::WaitingForApproval => "Waiting for approval",
+            Self::Stopped => "Stopped",
+            Self::Blocked => "Blocked",
+            Self::Failed => "Failed",
+            Self::Ended => "Ended",
+        }
+    }
+}
+
+/// One tool call on a status.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolProgress {
+    pub call_id: String,
+    pub tool: String,
+    pub state: ToolState,
+}
+
+/// Where one tool call stands.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolState {
+    Running,
+    /// It ended, with its receipt's status (a refused call never ran).
+    Ended(aidaemon_core::ReceiptStatus),
+}
+
+impl RunProgress {
+    /// A run that has just started.
+    pub fn working() -> Self {
+        Self {
+            phase: ProgressPhase::Working,
+            tools: Vec::new(),
+            streamed: String::new(),
+        }
+    }
+
+    /// The default rendering: an italic status word, a line per tool call
+    /// and, while working, the streamed text, cut to `max_chars`.
+    pub fn to_markdown(&self, max_chars: usize) -> String {
+        let mut out = match self.phase {
+            ProgressPhase::Working => "_Working..._".to_string(),
+            ProgressPhase::Ended(ending) => format!("_{}_", ending.word()),
+        };
+        for tool in &self.tools {
+            out.push('\n');
+            out.push_str(&match tool.state {
+                ToolState::Running => format!("- Running `{}`", tool.tool),
+                ToolState::Ended(status) => {
+                    format!("- `{}`: {}", tool.tool, crate::render::receipt_word(status))
+                }
+            });
+        }
+        let stream = self.streamed.trim();
+        if self.phase == ProgressPhase::Working && !stream.is_empty() {
+            out.push_str("\n\n");
+            let room = max_chars.saturating_sub(out.chars().count() + 4);
+            out.push_str(&crate::render::tail_chars(stream, room));
+        }
+        crate::render::truncate_chars(&out, max_chars)
+    }
 }
 
 /// A button press (or the text-command fallback) answering a prompt.
@@ -440,6 +618,12 @@ pub trait Channel: Send + Sync {
     /// Receive updates and forward them until `shutdown` is cancelled or the
     /// receiver is dropped. Reconnects on transient failures; returns an
     /// error only for unrecoverable ones (for example a revoked token).
+    ///
+    /// It must be re-runnable: the runner (and the conformance kit) may
+    /// call `run` again after it returned, with a new sender, and updates
+    /// arriving then go to the new one. A push-style channel (a webhook
+    /// server) keeps its listener across runs, or starts a new one, and
+    /// drops what arrives while no `run` is going.
     async fn run(
         &self,
         events: mpsc::Sender<ChannelEvent>,
@@ -463,17 +647,63 @@ pub trait Channel: Send + Sync {
         Err(ChannelError::Unsupported("edit"))
     }
 
-    /// Show an approval prompt with buttons. Channels without buttons may
-    /// leave the default, which the runner replaces with a text prompt and
-    /// `/approve <id>` / `/deny <id>` commands.
+    /// Show an approval prompt with buttons. The runner calls it only
+    /// when [`ChannelCapabilities::buttons`] is true; otherwise, or when
+    /// this returns an error, it sends the prompt's text with
+    /// `/approve <id>` / `/deny <id>` commands instead. A channel without
+    /// buttons leaves the default.
+    ///
+    /// When the prompt is answered (or expires), the runner
+    /// [`edit`](Channel::edit)s the prompt's message to say how it ended,
+    /// which removes the buttons; it calls
+    /// [`remove_buttons`](Channel::remove_buttons) only where it cannot
+    /// edit (the channel cannot, or the prompt is no longer known).
     async fn ask(&self, _prompt: &ApprovalPrompt) -> Result<MessageRef, ChannelError> {
         Err(ChannelError::Unsupported("buttons"))
     }
 
     /// Remove the buttons from a message, leaving its text. Best effort:
-    /// the default does nothing, for channels without buttons.
+    /// the default does nothing, for channels without buttons. See
+    /// [`Channel::ask`] for when the runner calls it.
     async fn remove_buttons(&self, _message: &MessageRef) -> Result<(), ChannelError> {
         Ok(())
+    }
+
+    /// Post a run's live status ([`RunProgress`]). The runner calls it
+    /// once per run, when [`ChannelCapabilities::edit_messages`] is true,
+    /// and then [`Channel::update_status`] as the run goes and when it
+    /// ends. The default sends [`RunProgress::to_markdown`]; override both
+    /// to render the status natively.
+    async fn send_status(
+        &self,
+        conversation: &Conversation,
+        progress: &RunProgress,
+    ) -> Result<MessageRef, ChannelError> {
+        let text = self.status_text(progress);
+        self.send(conversation, &OutboundMessage::text(text)).await
+    }
+
+    /// Update the status [`Channel::send_status`] posted. The default
+    /// [`edit`](Channel::edit)s it to [`RunProgress::to_markdown`].
+    async fn update_status(
+        &self,
+        message: &MessageRef,
+        progress: &RunProgress,
+    ) -> Result<(), ChannelError> {
+        let text = self.status_text(progress);
+        self.edit(message, &text).await
+    }
+
+    /// The Markdown the default status methods send: the progress cut to
+    /// this channel's message length, LaTeX rewritten as for any text
+    /// ([`Channel::strips_latex`]).
+    fn status_text(&self, progress: &RunProgress) -> String {
+        let text = progress.to_markdown(self.capabilities().max_message_len);
+        if self.strips_latex() {
+            crate::latex::strip_latex_keeping_code(&text)
+        } else {
+            text
+        }
     }
 
     /// Show a "typing" indicator. Best effort.

@@ -480,11 +480,11 @@ pub async fn check_channel(
         );
     }
 
-    let prompt = ApprovalPrompt {
-        id: "conformance-prompt-1".to_string(),
-        conversation: conversation.clone(),
-        text: "Allow the conformance probe to continue?".to_string(),
-        choices: vec![
+    let prompt = ApprovalPrompt::new(
+        "conformance-prompt-1",
+        conversation.clone(),
+        "Allow the conformance probe to continue?",
+        vec![
             ApprovalChoice {
                 id: "approve".to_string(),
                 label: "Approve".to_string(),
@@ -494,7 +494,7 @@ pub async fn check_channel(
                 label: "Deny".to_string(),
             },
         ],
-    };
+    );
     let asked = channel.ask(&prompt).await;
     let asked_ref = asked.as_ref().ok().cloned();
     let ask_ok = asked.is_ok();

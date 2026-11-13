@@ -146,25 +146,25 @@ async fn unauthorized_is_auth_error() {
 async fn ask_renders_buttons_with_custom_ids() {
     let http = MockHttp::start().await;
     let ch = channel(&http);
-    let prompt = ApprovalPrompt {
-        id: "prompt-7".into(),
-        conversation: conv(),
-        text: "Run `rm -rf build/`?".into(),
-        choices: vec![
+    let prompt = ApprovalPrompt::new(
+        "prompt-7",
+        conv(),
+        "Run `rm -rf build/`?",
+        vec![
             ApprovalChoice {
-                id: "once".into(),
-                label: "Allow once".into(),
+                id: "once".to_string(),
+                label: "Allow once".to_string(),
             },
             ApprovalChoice {
-                id: "always".into(),
-                label: "Always".into(),
+                id: "always".to_string(),
+                label: "Always".to_string(),
             },
             ApprovalChoice {
-                id: "no".into(),
-                label: "Not now".into(),
+                id: "no".to_string(),
+                label: "Not now".to_string(),
             },
         ],
-    };
+    );
     let r = ch.ask(&prompt).await.unwrap();
     assert_eq!(r.conversation_id, CHANNEL_ID);
 
@@ -197,15 +197,15 @@ async fn ask_renders_buttons_with_custom_ids() {
 #[tokio::test]
 async fn ask_rejects_ids_too_long_for_custom_id() {
     let http = MockHttp::start().await;
-    let prompt = ApprovalPrompt {
-        id: "p".repeat(120),
-        conversation: conv(),
-        text: "Approve?".into(),
-        choices: vec![ApprovalChoice {
-            id: "yes".into(),
-            label: "Yes".into(),
+    let prompt = ApprovalPrompt::new(
+        "p".repeat(120),
+        conv(),
+        "Approve?",
+        vec![ApprovalChoice {
+            id: "yes".to_string(),
+            label: "Yes".to_string(),
         }],
-    };
+    );
     assert!(channel(&http).ask(&prompt).await.is_err());
     assert!(http.requests().is_empty());
 }
