@@ -635,6 +635,7 @@ async fn a_sub_agent_of_a_private_turn_is_opted_out_too() {
             parent_run: None,
             known_resources: Default::default(),
             card_title: None,
+            card_steps: Vec::new(),
             lineage: Vec::new(),
             parent_task: None,
         });

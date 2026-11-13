@@ -1524,6 +1524,9 @@ impl TurnEngine<'_> {
                 .map(|inherited| inherited.known_resources.clone())
                 .unwrap_or_default(),
             card_title: inherited.and_then(|inherited| inherited.card_title.clone()),
+            card_steps: inherited
+                .map(|inherited| inherited.card_steps.clone())
+                .unwrap_or_default(),
             lineage: inherited
                 .map(|inherited| inherited.lineage.clone())
                 .unwrap_or_default(),
@@ -1825,6 +1828,9 @@ impl TurnEngine<'_> {
             .clone()
             .filter(|title| !title.trim().is_empty())
             .unwrap_or_else(|| mission.to_string());
+        // The parent's plan steps it was started for: on every record of it
+        // the card draws.
+        let card_steps = parent_authority.card_steps.clone();
         // Listed by `/status` and `/tasks` in the chat it reports to from the
         // moment it is created, waited on or in the background: its setup
         // (the specialist's tools, its route, its event) is the child's own
@@ -1843,7 +1849,8 @@ impl TurnEngine<'_> {
                     &child_status_label(&card_name),
                     in_background,
                     None,
-                ),
+                )
+                .for_steps(&card_steps),
             ));
         }
         // Emit SubAgentSpawn event
@@ -1952,6 +1959,7 @@ impl TurnEngine<'_> {
         let status_tx = child_status_sender(
             status_tx,
             &card_name,
+            &card_steps,
             in_background,
             listed.as_ref().map(RunningChildEntry::step),
         );
@@ -2068,6 +2076,14 @@ impl TurnEngine<'_> {
 
         drop(approval_route_guard);
 
+        // The run ended: what it declared for the owner is sent now, once,
+        // the last of each kind (its final version, never a capture taken
+        // before the work was done), and what became of each is its record.
+        let delivered = match outcome_coordination.as_ref() {
+            Some(tree) => Some(tree.deliver_run_end(&child_session_for_events).await),
+            None => None,
+        };
+
         // A stopped child never reached its own closeout. The caller decides
         // what the timeout means for any durable task; here we record what
         // the child had already done.
@@ -2115,6 +2131,8 @@ impl TurnEngine<'_> {
             }
             _ => crate::spawn::run_phase(child_outcome, None, None),
         };
+        let mut evidence = evidence;
+        evidence.delivered = delivered;
         // How the child ended reaches the parent's card from the one that
         // measured it: a waited-on child's call (`run_sync`), a background
         // child's run record once its turn is over. Never from here, before

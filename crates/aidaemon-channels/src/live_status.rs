@@ -11,7 +11,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aidaemon_core::card::{CardEnd, HelperView, PlanCard, RunPhase, Step};
+use aidaemon_core::card::{
+    run_attempts, superseded_line, superseded_runs, ActivityKind, CardEnd, HelperView, PlanCard,
+    RunPhase, Step,
+};
 use aidaemon_tools::status::StatusUpdate;
 
 use crate::hub::ChannelHub;
@@ -51,6 +54,20 @@ impl CardView<'_> {
 /// the turn's own step.
 pub fn render_card(view: &CardView<'_>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
+    // A run a later run took its plan steps over from is history: one quiet
+    // line, never a failure in the header or the total (live 2026-11-13: "A
+    // helper didn't finish · 3 of 3 done" and "1 didn't finish" over a
+    // Drupal step a second helper finished).
+    let records: Vec<&HelperView> = view.helpers.iter().map(|(helper, _)| helper).collect();
+    let superseded = superseded_runs(&records);
+    let attempts = run_attempts(&records);
+    let current: Vec<&(HelperView, Option<Duration>)> = view
+        .helpers
+        .iter()
+        .zip(&superseded)
+        .filter(|(_, by)| by.is_none())
+        .map(|(helper, _)| helper)
+        .collect();
     // A one-step plan is its step; with a run on the card that run is the
     // step, so its line is the card's one line for it (live 2026-11-13: a
     // background shell loop showed "Run your shell loop…" from its plan
@@ -59,12 +76,20 @@ pub fn render_card(view: &CardView<'_>) -> Option<String> {
         .plan
         .filter(|plan| plan.steps > 1 || view.helpers.is_empty())
     {
-        parts.push(plan_with_run_header(plan, &view.helpers));
+        parts.push(plan_with_run_header(plan, &current));
     }
-    for (helper, elapsed) in &view.helpers {
-        parts.push(helper_block(helper, *elapsed));
+    for (index, (helper, elapsed)) in view.helpers.iter().enumerate() {
+        match superseded[index] {
+            Some(later) => parts.push(superseded_line(
+                helper,
+                attempts[index],
+                records[later],
+                attempts[later],
+            )),
+            None => parts.push(helper_block(helper, *elapsed)),
+        }
     }
-    if let Some(total) = since_request_total(&view.helpers) {
+    if let Some(total) = since_request_total(&view.helpers, &current) {
         parts.push(total);
     }
     if let Some(took) = view.own_work {
@@ -77,19 +102,27 @@ pub fn render_card(view: &CardView<'_>) -> Option<String> {
         .plan
         .is_some_and(|plan| is_completed_checklist(&plan.text));
     if !done {
-        if let Some((step, elapsed)) = view.activity.filter(|(step, _)| step.is_shown()) {
+        // While helpers are on the card, the turn's own handing-off step is
+        // its wait for them, not work of its own: their lines say what is
+        // being done (live 2026-11-13: "Asking a helper · 3 min so far"
+        // stood under two working helpers until the last of them ended).
+        let waiting_on_helpers = !view.helpers.is_empty();
+        if let Some((step, elapsed)) = view.activity.filter(|(step, _)| {
+            step.is_shown()
+                && !(waiting_on_helpers && matches!(step, Step::Doing(ActivityKind::Delegate)))
+        }) {
             parts.push(format!("⏳ {}", line_with_elapsed(&step.words(), elapsed)));
         }
     }
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
-/// The plan's card under the header its steps and the card's runs give
-/// together ([`PlanCard::header_with_runs`]): the plan's own step marks stay
-/// as its records set them, only the header line is the card's.
-fn plan_with_run_header(plan: &PlanCard, helpers: &[(HelperView, Option<Duration>)]) -> String {
+/// The plan's card under the header its steps and the card's current runs
+/// give together ([`PlanCard::header_with_runs`]): the plan's own step marks
+/// stay as its records set them, only the header line is the card's.
+fn plan_with_run_header(plan: &PlanCard, current: &[&(HelperView, Option<Duration>)]) -> String {
     let text = plan.text.trim_end();
-    let phases: Vec<RunPhase> = helpers.iter().map(|(helper, _)| helper.phase).collect();
+    let phases: Vec<RunPhase> = current.iter().map(|(helper, _)| helper.phase).collect();
     let Some(header) = plan.header_with_runs(&phases) else {
         return text.to_string();
     };
@@ -100,9 +133,13 @@ fn plan_with_run_header(plan: &PlanCard, helpers: &[(HelperView, Option<Duration
 }
 
 /// With several helpers on the card, once every one ended: how long after
-/// the owner's request the last of them ended, from their run records.
-/// One helper's own line already says it.
-fn since_request_total(helpers: &[(HelperView, Option<Duration>)]) -> Option<String> {
+/// the owner's request the last of them ended, from their run records, and
+/// how the current runs (those no later run superseded) ended. One helper's
+/// own line already says it.
+fn since_request_total(
+    helpers: &[(HelperView, Option<Duration>)],
+    current: &[&(HelperView, Option<Duration>)],
+) -> Option<String> {
     if helpers.len() < 2
         || helpers
             .iter()
@@ -116,18 +153,18 @@ fn since_request_total(helpers: &[(HelperView, Option<Duration>)]) -> Option<Str
         .collect::<Option<Vec<_>>>()?
         .into_iter()
         .max_by_key(|since| since.secs)?;
-    // Counted from the runs' phases: a run that failed or stopped is never
-    // "done" (live 2026-11-13: "All 2 done" over a CLI run its sandbox had
-    // refused).
+    // Counted from the current runs' phases: a run that failed or stopped
+    // is never "done" (live 2026-11-13: "All 2 done" over a CLI run its
+    // sandbox had refused), and a superseded try is not counted at all.
     let count = |phase: RunPhase| {
-        helpers
+        current
             .iter()
             .filter(|(helper, _)| helper.phase == phase)
             .count()
     };
     let (failed, stopped) = (count(RunPhase::Failed), count(RunPhase::Stopped));
     if failed == 0 && stopped == 0 {
-        return Some(format!("All {} done {}.", helpers.len(), last.words.trim()));
+        return Some(format!("All {} done {}.", current.len(), last.words.trim()));
     }
     let mut ended = Vec::new();
     if failed > 0 {
@@ -327,9 +364,21 @@ impl LiveStatus {
         match self
             .helpers
             .iter_mut()
+            .rev()
             .find(|(known, _)| known.label == helper.label)
         {
             Some((known, _)) if *known == helper => false,
+            // A helper starting (its first record: running, no step yet)
+            // under the name of one that already ended is a new run, often
+            // a retry of the same step: its own entry, after the first.
+            Some((known, _))
+                if known.phase.is_terminal()
+                    && helper.phase == RunPhase::Running
+                    && helper.step.is_none() =>
+            {
+                self.helpers.push((helper, std::time::Instant::now()));
+                true
+            }
             Some((known, since)) => {
                 // A late step never undoes how the helper ended.
                 if known.phase.is_terminal() && !helper.phase.is_terminal() {
@@ -1026,6 +1075,7 @@ mod tests {
                                 phase,
                                 background,
                                 step: Some(Step::Doing(Search)),
+                                steps: Vec::new(),
                                 took: None,
                                 since_request: None,
                             },
@@ -1131,5 +1181,196 @@ mod tests {
         .await;
         s.close(&sink).await;
         assert_eq!(s.kept_card_message_id().as_deref(), Some("m1"));
+    }
+
+    /// Live 2026-11-13: a Drupal helper didn't finish, the parent started a
+    /// second helper for the same plan step and it finished. The step is
+    /// done, the header and the total say nothing failed, and the first try
+    /// is one quiet history line. The retry is linked by its typed plan
+    /// step, not its name: the two names differ.
+    #[test]
+    fn a_retried_step_reads_done_with_its_first_try_as_history() {
+        let plan = plan("✅ Done · 3 of 3 steps\n\n✅ a\n\n✅ b\n\n✅ c", 3);
+        let helper = |label: &str, phase: RunPhase, secs: u64, at: &str, step: usize| {
+            HelperView {
+                took: Some(format!("Took {secs}s.")),
+                since_request: Some(aidaemon_core::card::SinceRequest {
+                    secs,
+                    words: format!("{secs}s after your request (11:36:00 AM to {at} AM ET)"),
+                }),
+                ..ended(label, phase, false)
+            }
+            .for_steps(&[step])
+        };
+        let card = render_card(&CardView {
+            plan: Some(&plan),
+            helpers: vec![
+                (
+                    helper(
+                        "Install Claude Drupal site",
+                        RunPhase::Stopped,
+                        120,
+                        "11:38:44",
+                        1,
+                    ),
+                    None,
+                ),
+                (
+                    helper(
+                        "Install Claude WordPress site",
+                        RunPhase::Succeeded,
+                        230,
+                        "11:39:51",
+                        0,
+                    ),
+                    None,
+                ),
+                (
+                    helper(
+                        "Finish Claude Drupal site",
+                        RunPhase::Succeeded,
+                        510,
+                        "11:44:31",
+                        1,
+                    ),
+                    None,
+                ),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(card.starts_with("✅ Done · 3 of 3 steps"), "{card}");
+        assert!(!card.contains("A helper didn't finish"), "{card}");
+        assert!(
+            card.contains(
+                "Install Claude Drupal site: first try didn't finish; a second helper finished it"
+            ),
+            "{card}"
+        );
+        assert!(
+            card.ends_with("All 2 done 510s after your request (11:36:00 AM to 11:44:31 AM ET)."),
+            "{card}"
+        );
+
+        // While the second try runs, the first is already history.
+        let retrying = render_card(&CardView {
+            plan: Some(&plan),
+            helpers: vec![
+                (
+                    helper(
+                        "Install Claude Drupal site",
+                        RunPhase::Stopped,
+                        120,
+                        "11:38:44",
+                        1,
+                    ),
+                    None,
+                ),
+                (
+                    HelperView::running("Finish Claude Drupal site", false, None).for_steps(&[1]),
+                    None,
+                ),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            retrying.contains("first try didn't finish; a second helper is on it"),
+            "{retrying}"
+        );
+
+        // Without the typed link, the stopped run stands as it ended.
+        let unlinked = render_card(&CardView {
+            plan: Some(&plan),
+            helpers: vec![
+                (
+                    HelperView {
+                        steps: Vec::new(),
+                        ..helper(
+                            "Install Claude Drupal site",
+                            RunPhase::Stopped,
+                            120,
+                            "11:38:44",
+                            1,
+                        )
+                    },
+                    None,
+                ),
+                (
+                    helper(
+                        "Finish Claude Drupal site",
+                        RunPhase::Succeeded,
+                        510,
+                        "11:44:31",
+                        1,
+                    ),
+                    None,
+                ),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            unlinked.starts_with("⚠️ A helper didn't finish"),
+            "{unlinked}"
+        );
+    }
+
+    /// A retry started under the same name as the try that ended is a run
+    /// of its own on the card, not a late step of the first.
+    #[test]
+    fn a_retry_under_the_same_name_is_its_own_run() {
+        let mut live = LiveStatus::new();
+        live.note_helper(HelperView::running("Drupal install", false, None).for_steps(&[1]));
+        live.note_helper(ended("Drupal install", RunPhase::Stopped, false).for_steps(&[1]));
+        assert!(
+            live.note_helper(HelperView::running("Drupal install", false, None).for_steps(&[1]))
+        );
+        live.note_helper(ended("Drupal install", RunPhase::Succeeded, false).for_steps(&[1]));
+        let card = live.preview().unwrap();
+        assert!(
+            card.contains("Drupal install: first try didn't finish; a second helper finished it"),
+            "{card}"
+        );
+        assert!(
+            card.contains("✅ A helper finished: Drupal install"),
+            "{card}"
+        );
+    }
+
+    /// Live 2026-11-13: "Asking a helper · 3 min so far" stood under two
+    /// working helpers until the last of them ended. The turn waiting on its
+    /// helpers is not a step of its own: the line goes once a helper is on
+    /// the card, and the helpers' lines say what is being done.
+    #[test]
+    fn the_turns_own_handoff_line_ends_while_it_waits_on_helpers() {
+        let asking = doing(ActivityKind::Delegate);
+        let long = Duration::from_secs(190);
+        let before = render_card(&CardView {
+            activity: Some((&asking, long)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(before, "⏳ Asking a helper · 3 min so far");
+        let waiting = render_card(&CardView {
+            helpers: vec![(
+                HelperView::running("Install WordPress", false, Some(doing(ActivityKind::Run))),
+                Some(long),
+            )],
+            activity: Some((&asking, long)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!waiting.contains("Asking a helper"), "{waiting}");
+        assert!(waiting.contains("Running a command"), "{waiting}");
+        // Its own work after the wait is shown as usual.
+        let reading = doing(ActivityKind::Read);
+        let after = render_card(&CardView {
+            helpers: vec![(ended("Install WordPress", RunPhase::Succeeded, false), None)],
+            activity: Some((&reading, Duration::ZERO)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(after.ends_with("⏳ Reading files"), "{after}");
     }
 }

@@ -409,25 +409,22 @@ impl TaskPlan {
     }
 
     /// Hand the steps at `indices` to the background job `job_id`. A step
-    /// already settled (completed, failed, skipped) is left alone. Returns
-    /// whether any step changed.
+    /// owns its runs in order and its outcome is its latest run's: a step
+    /// an earlier run failed or stopped short on is taken over by this one
+    /// (a retry), and only this job's end settles it. A step already done
+    /// or skipped is left alone. Returns whether any step changed.
     pub fn link_background_job(&mut self, indices: &[usize], job_id: &str) -> bool {
         let mut changed = false;
         for &index in indices {
             let Some(step) = self.steps.get_mut(index) else {
                 continue;
             };
-            let retried = step.status == StepStatus::Failed && step.helper_not_started();
-            if !retried
-                && matches!(
-                    step.status,
-                    StepStatus::Completed | StepStatus::Failed | StepStatus::Skipped
-                )
-            {
+            if matches!(step.status, StepStatus::Completed | StepStatus::Skipped) {
                 continue;
             }
             step.evidence = StepEvidence::Settled;
             step.error = None;
+            step.not_done = None;
             step.status = StepStatus::Background;
             step.started_at.get_or_insert_with(Utc::now);
             step.completed_at = None;
@@ -1123,6 +1120,33 @@ pub use aidaemon_channels::live_status::is_completed_checklist;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step owns its runs in order and its outcome is its latest run's:
+    /// a step an earlier helper failed or stopped short on is taken over by
+    /// a later one for the same step, and that run's success completes it.
+    #[test]
+    fn a_retried_step_settles_from_its_latest_run() {
+        for first_end in [JobEnd::Stopped, JobEnd::Failed] {
+            let mut plan = TaskPlan::new(
+                "session_123",
+                "Install two sites",
+                "Two sites",
+                vec![
+                    "Install WordPress".to_string(),
+                    "Install Drupal".to_string(),
+                ],
+                "low",
+            );
+            assert!(plan.link_background_job(&[1], "job-1"));
+            assert!(plan.settle_background_job("job-1", first_end));
+            assert_ne!(plan.steps[1].status, StepStatus::Completed);
+            assert!(plan.link_background_job(&[1], "job-2"), "{first_end:?}");
+            assert_eq!(plan.steps[1].status, StepStatus::Background);
+            assert_eq!(plan.steps[1].not_done, None);
+            assert!(plan.settle_background_job("job-2", JobEnd::Succeeded));
+            assert_eq!(plan.steps[1].status, StepStatus::Completed);
+        }
+    }
 
     #[test]
     fn test_create_plan() {

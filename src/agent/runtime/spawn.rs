@@ -239,7 +239,8 @@ mod tests {
         assert_eq!(crate::tools::terminal::latest_output_line(b"\n \n"), None);
 
         let (parent_tx, mut parent_rx) = mpsc::channel(4);
-        let counter = child_status_sender(Some(parent_tx), "Slow counter", true, None).unwrap();
+        let counter =
+            child_status_sender(Some(parent_tx), "Slow counter", &[], true, None).unwrap();
         counter
             .send(StatusUpdate::CommandOutput {
                 name: "terminal".into(),

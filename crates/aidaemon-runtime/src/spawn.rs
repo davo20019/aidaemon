@@ -104,6 +104,7 @@ pub fn run_phase(
             RunEvidence {
                 unconfirmed: Vec::new(),
                 failure: Some(crate::run_state::RunFailure::ShortOf(resource)),
+                ..Default::default()
             },
         );
     }
@@ -119,6 +120,7 @@ pub fn run_phase(
             RunEvidence {
                 unconfirmed: Vec::new(),
                 failure: Some(failure),
+                ..Default::default()
             },
         );
     }
@@ -172,6 +174,7 @@ pub fn run_phase(
         RunEvidence {
             unconfirmed,
             failure: None,
+            ..Default::default()
         },
     )
 }
@@ -583,12 +586,14 @@ pub const MAX_REPORT_TOOL_RECORDS: usize = 5_000;
 pub fn child_status_sender(
     parent: Option<mpsc::Sender<StatusUpdate>>,
     mission: &str,
+    steps: &[usize],
     background: bool,
     step: Option<ChildStep>,
 ) -> Option<mpsc::Sender<StatusUpdate>> {
     use aidaemon_core::card::{HelperView, Step};
     let parent = parent?;
     let label = child_status_label(mission);
+    let steps = steps.to_vec();
     let (tx, mut rx) = mpsc::channel::<StatusUpdate>(64);
     tokio::spawn(async move {
         while let Some(update) = rx.recv().await {
@@ -618,7 +623,9 @@ pub fn child_status_sender(
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             Some(own_step.clone());
                     }
-                    StatusUpdate::Helper(HelperView::running(&label, background, Some(own_step)))
+                    StatusUpdate::Helper(
+                        HelperView::running(&label, background, Some(own_step)).for_steps(&steps),
+                    )
                 }
                 None => update,
             };
@@ -1504,6 +1511,7 @@ mod tests {
         let wordpress = child_status_sender(
             Some(parent_tx.clone()),
             "Build the WordPress demo site for Acme Corp",
+            &[],
             false,
             None,
         )
@@ -1511,6 +1519,7 @@ mod tests {
         let drupal = child_status_sender(
             Some(parent_tx),
             "Build the Drupal demo site for Acme Corp",
+            &[],
             false,
             None,
         )

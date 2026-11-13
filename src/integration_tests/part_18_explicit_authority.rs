@@ -725,6 +725,7 @@ async fn child_authority_is_the_narrower_of_parent_mode_and_inherited() {
         parent_run: None,
         known_resources: Default::default(),
         card_title: None,
+        card_steps: Vec::new(),
         lineage: Vec::new(),
         parent_task: None,
     });
@@ -754,6 +755,7 @@ async fn child_authority_is_the_narrower_of_parent_mode_and_inherited() {
         parent_run: None,
         known_resources: Default::default(),
         card_title: None,
+        card_steps: Vec::new(),
         lineage: Vec::new(),
         parent_task: None,
     });
@@ -997,6 +999,7 @@ async fn readonly_reaches_a_running_child_through_its_parent_chat() {
             parent_run: None,
             known_resources: Default::default(),
             card_title: None,
+            card_steps: Vec::new(),
             lineage: Vec::new(),
             parent_task: None,
         });
