@@ -1096,6 +1096,18 @@ impl<T> ManageGoalTasksStore for T where
 {
 }
 
+/// Focused persistence contract used by the automation surfaces (scheduled
+/// goals, reminders and mandates): everything their two engines' tools take.
+pub trait AutomationStore:
+    MandateToolStore + ScheduledGoalRunsStore + GoalNotificationStore
+{
+}
+
+impl<T> AutomationStore for T where
+    T: MandateToolStore + ScheduledGoalRunsStore + GoalNotificationStore
+{
+}
+
 /// Focused persistence contract used by blocker reporting.
 pub trait ReportBlockerStore:
     TaskStore + GoalStore + NotificationStore + WorkCoordinationStore

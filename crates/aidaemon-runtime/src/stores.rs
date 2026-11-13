@@ -34,6 +34,7 @@ pub trait StateStore:
     + GoalTraceStore
     + MandateToolStore
     + ManageGoalTasksStore
+    + AutomationStore
     + aidaemon_work::scheduler::SchedulerStore
     + McpRegistryStore
     + SkillsStore
@@ -105,13 +106,13 @@ impl<T> StateStore for T where
 /// a method is only callable with its defining trait in scope.
 pub mod prelude {
     pub use super::{
-        ConversationSummaryStore, DialogueStateStore, DynamicBotStore, DynamicCliAgentStore,
-        DynamicMcpServerStore, EpisodeStore, FactStore, GoalBudgetStore, GoalNotificationStore,
-        GoalScheduleStore, GoalStore, GoalTraceStore, HealthCheckStore, HistorySearchStore,
-        LearningStore, ManageGoalTasksStore, MandateStore, MandateToolStore, McpRegistryStore,
-        MessageStore, NotificationStore, OAuthGatewayStore, OAuthStore, PeopleStore,
-        PromptSnapshotStore, ReportBlockerStore, ScheduledGoalRunsStore, ScheduledRunStore,
-        SessionChannelStore, SettingsStore, SkillStore, SkillsStore, StateStore, TaskDispatchStore,
-        TaskStore, TokenUsageStore, WorkCoordinationStore,
+        AutomationStore, ConversationSummaryStore, DialogueStateStore, DynamicBotStore,
+        DynamicCliAgentStore, DynamicMcpServerStore, EpisodeStore, FactStore, GoalBudgetStore,
+        GoalNotificationStore, GoalScheduleStore, GoalStore, GoalTraceStore, HealthCheckStore,
+        HistorySearchStore, LearningStore, ManageGoalTasksStore, MandateStore, MandateToolStore,
+        McpRegistryStore, MessageStore, NotificationStore, OAuthGatewayStore, OAuthStore,
+        PeopleStore, PromptSnapshotStore, ReportBlockerStore, ScheduledGoalRunsStore,
+        ScheduledRunStore, SessionChannelStore, SettingsStore, SkillStore, SkillsStore, StateStore,
+        TaskDispatchStore, TaskStore, TokenUsageStore, WorkCoordinationStore,
     };
 }

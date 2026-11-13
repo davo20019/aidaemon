@@ -49,6 +49,7 @@ mod project_instructions;
 mod providers;
 use aidaemon_channels::queue::policy as queue_policy;
 use aidaemon_channels::queue::telemetry as queue_telemetry;
+#[cfg(test)]
 use aidaemon_work::reminders;
 mod router;
 mod runtime_ports;

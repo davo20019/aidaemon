@@ -75,6 +75,7 @@ pub mod spawn;
 pub mod spawn_tool;
 pub mod specialists;
 pub mod stores;
+pub mod tools;
 pub mod turn;
 pub mod turn_runtime;
 pub mod untrusted;
