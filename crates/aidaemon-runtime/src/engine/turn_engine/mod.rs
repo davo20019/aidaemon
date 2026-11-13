@@ -1153,6 +1153,8 @@ impl TurnEngine<'_> {
             ),
             background_handoff: AtomicBool::new(false),
             open_background_jobs: AtomicUsize::new(0),
+            background_ack: std::sync::Mutex::new(None),
+            own_work_since: std::sync::Mutex::new(None),
             emitter: &emitter,
             prefix,
             prefix_len,
@@ -1351,6 +1353,27 @@ impl TurnEngine<'_> {
                     {
                         reply = crate::engine::deferral::deferral_notice(attempt, &failure);
                     }
+                }
+                // Work the run finished itself after a helper it waited on
+                // failed has a measured end: the run's own, from the failure
+                // to now, on the card and under the reply, so its time to
+                // finish is quoted from a measurement, never estimated.
+                let own_work_since = scope.own_work_since.lock().ok().and_then(|since| *since);
+                if let (Some(since), TaskStatus::Completed, false) = (
+                    own_work_since,
+                    status,
+                    scope.background_handoff.load(Ordering::Relaxed),
+                ) {
+                    let span = crate::run_state::measured_span(since, chrono::Utc::now());
+                    let took = crate::spawn_tool::took_line(span, std::time::Duration::ZERO);
+                    if let Some(tx) = scope.status_tx.as_ref() {
+                        let _ = tx.try_send(StatusUpdate::OwnWork { took: took.clone() });
+                    }
+                    reply = format!(
+                        "{}\n\n{}Finished here after the helper failed. {took}",
+                        reply.trim_end(),
+                        crate::turn::sliding_window::MEASURED_TIMING_MARK
+                    );
                 }
                 let not_done = abandoned
                     .not_done

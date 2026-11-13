@@ -120,10 +120,11 @@ async fn background_launch_without_notifications_ends_with_its_first_line() {
     assert_eq!(end.effective_outcome(), TaskOutcome::Partial);
 }
 
-/// With completion notifications on, the reply is the friendly handoff and
-/// the assistant message is recorded as a background handoff.
+/// With completion notifications on, the reply is the launch's own first
+/// line (never the request echoed) and the assistant message is recorded as
+/// a background handoff.
 #[tokio::test]
-async fn background_launch_with_notifications_ends_with_the_friendly_handoff() {
+async fn background_launch_with_notifications_ends_with_the_launchs_line() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("synthetic_launcher", "{}"),
         MockProvider::text_response("UNREACHED model narration"),
@@ -131,10 +132,7 @@ async fn background_launch_with_notifications_ends_with_the_friendly_handoff() {
     let harness = root(provider, vec![Arc::new(launcher(true))]).await;
     let reply = ask(&harness, "finish-launch-notify", "Start the synthetic job").await;
 
-    assert_eq!(
-        reply,
-        crate::agent::post_task::build_friendly_background_handoff("Start the synthetic job")
-    );
+    assert_eq!(reply, "Started synthetic job 7; it keeps running.");
     assert_eq!(harness.provider.call_count().await, 1);
     let end = task_end(&harness, "finish-launch-notify").await;
     assert_eq!(end.status, TaskStatus::Completed);
@@ -424,10 +422,7 @@ async fn notifying_launch_with_more_declared_work_hands_off() {
     let text = "Build the site, then send a screenshot";
     let reply = ask(&harness, "finish-launch-more-work", text).await;
 
-    assert_eq!(
-        reply,
-        crate::agent::post_task::build_friendly_background_handoff(text)
-    );
+    assert_eq!(reply, "Started synthetic job 7; it keeps running.");
     assert_eq!(harness.provider.call_count().await, 2);
     let end = task_end(&harness, "finish-launch-more-work").await;
     assert_eq!(end.effective_outcome(), TaskOutcome::Partial);
@@ -453,10 +448,7 @@ async fn stop_with_a_notifying_job_still_running_ships_the_handoff() {
     let text = "Build the site, then send a screenshot";
     let reply = ask(&harness, "finish-stop-running", text).await;
 
-    assert_eq!(
-        reply,
-        crate::agent::post_task::build_friendly_background_handoff(text)
-    );
+    assert_eq!(reply, "Started synthetic job 7; it keeps running.");
     assert_eq!(harness.provider.call_count().await, 3);
     let end = task_end(&harness, "finish-stop-running").await;
     assert_eq!(end.status, TaskStatus::Completed);

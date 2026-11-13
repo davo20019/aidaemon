@@ -387,57 +387,6 @@ pub fn redact_error_line_for_summary(key_line: &str) -> String {
     aidaemon_tools::sanitize::redact_secrets(&windows_summarized)
 }
 
-/// User-facing message shown when a tool's work is moved to the background
-/// (a long-running command, CLI agent, or sub-agent). Warm, plain-language,
-/// and free of internals: NO pid, NO raw shell commands, NO failed-probe
-/// noise, NO "moved to background / notifications enabled" jargon — those
-/// belong in logs, not chat. A short "Working on" gist, derived from the
-/// user's own request, gives a little transparency without exposing commands.
-///
-/// `user_request` is the user's original message. The gist line is omitted
-/// when it is empty or itself an internal/synthetic re-engagement prompt
-/// (so we never echo `[Background command …]` machinery back to the user).
-pub fn build_friendly_background_handoff(user_request: &str) -> String {
-    let mut msg = String::from(
-        "⏳ **Still on it**\n\nThis is taking a little longer, so it's running in the \
-         background now. I'll send the result as soon as it's ready.",
-    );
-    if let Some(gist) = friendly_request_gist(user_request) {
-        msg.push_str("\n\n**Request:** ");
-        msg.push_str(&gist);
-    }
-    msg
-}
-
-/// Most words the handoff's request label keeps.
-const GIST_WORDS: usize = 8;
-
-/// A short label for the user's request on the handoff: its first line, at
-/// most [`GIST_WORDS`] words, so the bubble names the request without
-/// echoing it. Returns `None` for empty or synthetic/internal prompts.
-fn friendly_request_gist(user_request: &str) -> Option<String> {
-    let trimmed = user_request.trim();
-    // Skip synthetic re-engagement prompts and other bracketed control text —
-    // these are internal machinery, not something to quote back to the user.
-    if trimmed.is_empty() || trimmed.starts_with('[') {
-        return None;
-    }
-    let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
-    if first_line.is_empty() {
-        return None;
-    }
-    let mut words = first_line.split_whitespace();
-    let mut label = words
-        .by_ref()
-        .take(GIST_WORDS)
-        .collect::<Vec<_>>()
-        .join(" ");
-    if words.next().is_some() {
-        label.push_str(" …");
-    }
-    Some(aidaemon_channels::presentation::word_preview(&label, 60))
-}
-
 ///
 /// Parses entries like `"read_file(Hero.jsx)"` and `"terminal(\`pip install fpdf\`)"` into
 /// grouped categories so the next interaction can understand what was already done.
@@ -589,58 +538,6 @@ fn categorize_tool_calls_inner(tool_calls: &[String], redact_commands: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_friendly_background_handoff_is_warm_and_internal_free() {
-        let msg =
-            build_friendly_background_handoff("How many PDF files are in my projects folder?");
-        // Warm reassurance + a quoted gist of the user's own request.
-        assert!(msg.starts_with("⏳ **Still on it**"));
-        assert!(msg.contains("running in the background"));
-        assert!(msg.contains("I'll send the result as soon as it's ready"));
-        assert!(msg.contains("**Request:** How many PDF files are in my projects …"));
-        // No internals leaked into chat.
-        assert!(!msg.contains("pid="));
-        assert!(!msg.contains("Moved to background"));
-        assert!(!msg.contains("Completion notifications"));
-        assert!(!msg.contains("find "));
-        assert!(!msg.to_lowercase().contains("failed"));
-        assert!(!msg.contains("Here's what I did"));
-    }
-
-    #[test]
-    fn test_friendly_background_handoff_omits_gist_for_internal_prompts() {
-        // Synthetic re-engagement prompts must not be quoted back to the user.
-        let synthetic = build_friendly_background_handoff(
-            "[Background command completed]\nCommand: `ls`\nOutput:\n5",
-        );
-        assert!(!synthetic.contains("**Request:**"));
-        assert!(synthetic.contains("running in the background"));
-
-        // Empty request → no gist line either.
-        let empty = build_friendly_background_handoff("   ");
-        assert!(!empty.contains("**Request:**"));
-    }
-
-    #[test]
-    fn test_friendly_request_gist_truncates_long_requests() {
-        let long = "a".repeat(500);
-        let gist = friendly_request_gist(&long).expect("gist for long request");
-        assert!(gist.chars().count() <= 60);
-        // A long request is named in a few words, never echoed whole.
-        assert_eq!(
-            friendly_request_gist(
-                "In the background, run a shell command that sleeps for twenty seconds and then prints done"
-            )
-            .as_deref(),
-            Some("In the background, run a shell command that …")
-        );
-        // Multi-line requests collapse to the first line.
-        assert_eq!(
-            friendly_request_gist("count the files\nthen email me").as_deref(),
-            Some("count the files")
-        );
-    }
 
     #[test]
     fn test_categorize_tool_calls_groups_correctly() {

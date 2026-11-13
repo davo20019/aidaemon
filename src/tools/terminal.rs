@@ -30,6 +30,7 @@ use crate::traits::{
 };
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
 use crate::utils::{truncate_str, truncate_with_note};
+use aidaemon_core::card::Step;
 
 use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
 use super::command_risk::{approval_floor_reason, PermissionMode, RiskLevel};
@@ -39,13 +40,6 @@ use super::semantic_command_risk::assess_command;
 
 /// Max bytes per stream buffer (1 MB) to prevent unbounded memory growth.
 const BUFFER_CAP: usize = 1_048_576;
-#[cfg(test)]
-const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 1;
-#[cfg(not(test))]
-const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 35;
-/// Maximum number of periodic progress pings before going silent.
-/// Prevents notification spam for long-running processes (servers, daemons).
-const MAX_BACKGROUND_PROGRESS_PINGS: u32 = 3;
 
 /// Maximum wall time for a background completion to re-enter the agent loop.
 /// The raw command/worker result is always delivered when this budget expires,
@@ -778,256 +772,6 @@ async fn deliver_attributed_background_file(
     }
 }
 
-/// Update the reusable background status card, falling back to a fresh message
-/// (or the durable notification queue) when the channel cannot edit. Unlike the
-/// completion transition below, progress only reads the surface id so later
-/// updates can continue to reuse the same bubble.
-pub(crate) async fn deliver_background_progress_update(
-    hub: Option<&Arc<dyn OutboundRouter>>,
-    state: Option<&Arc<dyn crate::traits::StateStore>>,
-    session_id: &str,
-    goal_id: &str,
-    message: &str,
-    pid: u32,
-) {
-    if let Some(hub) = hub {
-        if let Some(surface_id) = hub.background_status_surface(session_id).await {
-            match hub.edit_text(session_id, &surface_id, message).await {
-                Ok(true) => {
-                    info!(
-                        pid,
-                        session_id, "Background progress updated in the handoff status message"
-                    );
-                    return;
-                }
-                other => {
-                    info!(
-                        pid,
-                        session_id,
-                        ?other,
-                        "Handoff status edit unavailable; falling back to fresh progress message"
-                    );
-                }
-            }
-        }
-    }
-    deliver_background_text(hub, state, session_id, goal_id, message, pid).await;
-}
-
-/// Deliver the background completion ping, preferring to EDIT the session's
-/// registered "⏳ **Still on it**" handoff message in place (single evolving
-/// status bubble) over stacking a new message. Falls back to the plain
-/// send/enqueue path on any miss or edit failure, so the ping is never lost.
-/// The final ANSWER (re-engagement reply) intentionally stays a separate
-/// fresh message — edits do not trigger channel notifications.
-pub(crate) async fn deliver_background_completion_ping(
-    hub: Option<&Arc<dyn OutboundRouter>>,
-    state: Option<&Arc<dyn crate::traits::StateStore>>,
-    session_id: &str,
-    goal_id: &str,
-    message: &str,
-    pid: u32,
-) -> Option<String> {
-    if let Some(hub) = hub {
-        if let Some(surface_id) = hub.take_background_status_surface(session_id).await {
-            match hub.edit_text(session_id, &surface_id, message).await {
-                Ok(true) => {
-                    info!(
-                        pid,
-                        session_id,
-                        "Background completion ping edited into the handoff status message"
-                    );
-                    return Some(surface_id);
-                }
-                other => {
-                    info!(
-                        pid,
-                        session_id,
-                        ?other,
-                        "Handoff status edit unavailable; falling back to fresh ping message"
-                    );
-                }
-            }
-        }
-        // A fresh ping is still a status surface: return its id so the
-        // post-delivery transition can resolve it instead of leaving
-        // "Preparing your result" in the chat forever.
-        match hub.send_text_tracked(session_id, message).await {
-            Ok(surface_id) => return surface_id,
-            Err(error) => {
-                warn!(pid, session_id, %error, "Fresh background completion ping failed");
-            }
-        }
-    }
-    deliver_background_text(hub, state, session_id, goal_id, message, pid).await;
-    None
-}
-
-/// Resolve an edited background status surface after the promised result has
-/// actually been delivered. Once the result is in the chat the status bubble
-/// has nothing left to say, so it is removed; where the channel cannot delete
-/// it, it is edited to a plain pointer at the result (no checkmark, which could
-/// sit above a result that says the work did not go well).
-pub(crate) async fn finalize_background_completion_surface(
-    hub: Option<&Arc<dyn OutboundRouter>>,
-    session_id: &str,
-    surface_id: Option<&str>,
-    outcome: BackgroundSurfaceOutcome,
-) {
-    let (Some(hub), Some(surface_id)) = (hub, surface_id) else {
-        return;
-    };
-    if outcome == BackgroundSurfaceOutcome::Delivered
-        && matches!(hub.delete_message(session_id, surface_id).await, Ok(true))
-    {
-        return;
-    }
-    let _ = hub
-        .edit_text(session_id, surface_id, background_surface_text(outcome))
-        .await;
-}
-
-/// What the background status bubble says once its step has ended.
-pub(crate) fn background_surface_text(outcome: BackgroundSurfaceOutcome) -> &'static str {
-    match outcome {
-        BackgroundSurfaceOutcome::Delivered => "Background job finished – result below.",
-        BackgroundSurfaceOutcome::StillWorking => {
-            "⏳ Still working – another background step is running."
-        }
-        BackgroundSurfaceOutcome::Queued => {
-            "📨 Background job finished – the result is on its way."
-        }
-        BackgroundSurfaceOutcome::DeliveryFailed => {
-            "⚠️ The background step finished, but I couldn't send you the rest of the result."
-        }
-    }
-}
-
-#[cfg(test)]
-mod background_surface_tests {
-    use super::*;
-    use async_trait::async_trait;
-    use std::sync::Mutex as StdMutex;
-
-    /// Records deletes and edits; `can_delete` decides whether a delete works.
-    #[derive(Default)]
-    struct SurfaceHub {
-        can_delete: bool,
-        deleted: StdMutex<Vec<String>>,
-        edits: StdMutex<Vec<String>>,
-    }
-
-    #[async_trait]
-    impl OutboundRouter for SurfaceHub {
-        async fn send_text(&self, _session_id: &str, _text: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn send_text_tracked(
-            &self,
-            _session_id: &str,
-            _text: &str,
-        ) -> anyhow::Result<Option<String>> {
-            Ok(None)
-        }
-        async fn edit_text(
-            &self,
-            _session_id: &str,
-            _message_id: &str,
-            text: &str,
-        ) -> anyhow::Result<bool> {
-            self.edits.lock().unwrap().push(text.to_string());
-            Ok(true)
-        }
-        async fn send_media(
-            &self,
-            _session_id: &str,
-            _media: &crate::types::MediaMessage,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn send_media_strict(
-            &self,
-            _session_id: &str,
-            _media: &crate::types::MediaMessage,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn background_status_surface(&self, _session_id: &str) -> Option<String> {
-            None
-        }
-        async fn take_background_status_surface(&self, _session_id: &str) -> Option<String> {
-            None
-        }
-        async fn delete_message(
-            &self,
-            _session_id: &str,
-            message_id: &str,
-        ) -> anyhow::Result<bool> {
-            if self.can_delete {
-                self.deleted.lock().unwrap().push(message_id.to_string());
-            }
-            Ok(self.can_delete)
-        }
-        async fn request_inline_approval(
-            &self,
-            _session_id: &str,
-            _description: &str,
-            _risk_level: crate::tools::command_risk::RiskLevel,
-            _warnings: &[String],
-            _permission_mode: crate::tools::command_risk::PermissionMode,
-        ) -> anyhow::Result<crate::types::ApprovalResponse> {
-            anyhow::bail!("no approvals in this test")
-        }
-        async fn register_session_route(&self, _child: &str, _parent: &str) -> bool {
-            false
-        }
-        async fn unregister_session_route(&self, _child: &str, _parent: &str) {}
-    }
-
-    async fn finalize(can_delete: bool, outcome: BackgroundSurfaceOutcome) -> Arc<SurfaceHub> {
-        let hub = Arc::new(SurfaceHub {
-            can_delete,
-            ..Default::default()
-        });
-        let router: Arc<dyn OutboundRouter> = hub.clone();
-        finalize_background_completion_surface(Some(&router), "s", Some("m-1"), outcome).await;
-        hub
-    }
-
-    #[tokio::test]
-    async fn a_delivered_result_removes_its_status_bubble() {
-        let hub = finalize(true, BackgroundSurfaceOutcome::Delivered).await;
-        assert_eq!(*hub.deleted.lock().unwrap(), vec!["m-1".to_string()]);
-        assert!(hub.edits.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn without_delete_the_bubble_points_at_the_result_without_a_checkmark() {
-        let hub = finalize(false, BackgroundSurfaceOutcome::Delivered).await;
-        let edits = hub.edits.lock().unwrap();
-        assert_eq!(
-            *edits,
-            vec!["Background job finished – result below.".to_string()]
-        );
-        assert!(!edits[0].contains('✅'));
-    }
-
-    #[tokio::test]
-    async fn a_step_still_running_keeps_its_bubble() {
-        let hub = finalize(true, BackgroundSurfaceOutcome::StillWorking).await;
-        assert!(hub.deleted.lock().unwrap().is_empty());
-        assert!(hub.edits.lock().unwrap()[0].starts_with("⏳ Still working"));
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BackgroundSurfaceOutcome {
-    Delivered,
-    StillWorking,
-    Queued,
-    DeliveryFailed,
-}
-
 async fn deliver_background_text(
     hub: Option<&Arc<dyn OutboundRouter>>,
     state: Option<&Arc<dyn crate::traits::StateStore>>,
@@ -1113,6 +857,9 @@ pub struct TerminalTool {
     /// incomplete checklist (for deliverable attribution + the conservative
     /// delivery-step write-back). Wired via [`set_plan_store`].
     plan_store: OnceLock<Arc<crate::plans::PlanStore>>,
+    /// The runtime's run records: a command moved to the background is a run
+    /// there, shown on its turn's card. Wired via [`set_runs`].
+    runs: OnceLock<Arc<aidaemon_runtime::run_state::RunStates>>,
     /// Inbox directory for harness-side file delivery recovery-copy. Defaults to
     /// the system temp dir until wired via [`with_delivery_dirs`].
     inbox_dir: PathBuf,
@@ -1514,55 +1261,6 @@ fn humanize_elapsed(secs: u64) -> String {
     )
 }
 
-/// Count non-empty in-flight output lines for a user-facing status card.
-/// Raw process output belongs in the final agent interpretation, not in chat:
-/// partial terminal lines are noisy, can wrap badly on mobile, and may expose
-/// implementation details that have no value before the command completes.
-fn progress_output_line_count(output: &str) -> usize {
-    output
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count()
-}
-
-fn output_count_note(output: &str) -> Option<String> {
-    match progress_output_line_count(output) {
-        0 => None,
-        1 => Some("_1 line received so far._".to_string()),
-        count => Some(format!("_{count} lines received so far._")),
-    }
-}
-
-fn format_background_progress_message(elapsed_secs: u64, output: &str) -> String {
-    let mut message = format!(
-        "⏳ **Still working** · {}\n\nOutput is still arriving. I'll share the useful result when it's ready.",
-        humanize_elapsed(elapsed_secs)
-    );
-    if let Some(note) = output_count_note(output) {
-        message.push_str("\n\n");
-        message.push_str(&note);
-    }
-    message
-}
-
-/// One deterministic transition after the frequent progress-ping budget is
-/// exhausted. This deliberately does not re-enter the agent loop: doing that
-/// from inside the process-monitoring `select!` used to block observation of
-/// the process exit and could strand the promised final result. It is the last
-/// edit the card gets, so its duration is a floor ("over") that stays true
-/// rather than a clock that silently stops.
-fn format_background_monitoring_notice(elapsed_secs: u64, output: &str) -> String {
-    let mut message = format!(
-        "⏳ **Taking longer than expected** · running for over {}\n\nI'm still monitoring it and will let you know when it finishes or if it needs attention. Ask me for its status or to stop it anytime.",
-        humanize_elapsed(elapsed_secs)
-    );
-    if let Some(note) = output_count_note(output) {
-        message.push_str("\n\n");
-        message.push_str(&note);
-    }
-    message
-}
-
 /// Format combined stdout/stderr output. Returns the (untruncated-notice)
 /// text plus structured [`TruncationInfo`] when the output was cut down.
 /// Callers decide how the notice reaches the model: foreground call sites
@@ -1828,55 +1526,6 @@ const SHORT_OUTPUT_DIRECT_DELIVERY_MAX_LINES: usize = 4;
 fn is_short_complete_output(output_trimmed: &str) -> bool {
     output_trimmed.chars().count() <= SHORT_OUTPUT_DIRECT_DELIVERY_MAX_CHARS
         && output_trimmed.lines().count() <= SHORT_OUTPUT_DIRECT_DELIVERY_MAX_LINES
-}
-
-/// Build the background-process transition shown before any result delivery.
-/// Process exit is not task completion: the checkmark and "Done" are reserved
-/// for the point where the requested result has actually reached the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackgroundCompletionNext {
-    Nothing,
-    PrepareResult,
-    ContinueRequirements,
-}
-
-fn background_completion_ping_message(
-    exit_code: Option<i32>,
-    elapsed_secs: u64,
-    next: BackgroundCompletionNext,
-) -> String {
-    if exit_code == Some(0) {
-        match next {
-            BackgroundCompletionNext::Nothing => format!(
-                "ℹ️ **Background step finished** · {}\n\nIt didn't return any output.",
-                humanize_elapsed(elapsed_secs)
-            ),
-            BackgroundCompletionNext::PrepareResult => format!(
-                "⏳ **Preparing your result**\n\nThe background step finished in {}. I'm turning it into a clear answer now.",
-                humanize_elapsed(elapsed_secs)
-            ),
-            BackgroundCompletionNext::ContinueRequirements => format!(
-                "⏳ **Continuing your request**\n\nThe background step finished in {}. I'm moving on to the remaining work now.",
-                humanize_elapsed(elapsed_secs)
-            ),
-        }
-    } else {
-        let mut detail = format!("It finished after {}", humanize_elapsed(elapsed_secs));
-        if let Some(code) = exit_code {
-            detail.push_str(&format!(" with exit code {code}"));
-        }
-        detail.push('.');
-        match next {
-            BackgroundCompletionNext::Nothing => {}
-            BackgroundCompletionNext::PrepareResult => {
-                detail.push_str(" I'm checking what happened now.");
-            }
-            BackgroundCompletionNext::ContinueRequirements => {
-                detail.push_str(" I'm checking the error and continuing the remaining work now.");
-            }
-        }
-        format!("⚠️ **Background step needs review**\n\n{detail}")
-    }
 }
 
 /// Elevated capabilities a confined run was granted beyond filesystem scope.
@@ -3677,6 +3326,7 @@ impl TerminalTool {
             recent_background_deliveries: Arc::new(Mutex::new(HashMap::new())),
             delivered_deliverables: Arc::new(Mutex::new(HashMap::new())),
             plan_store: OnceLock::new(),
+            runs: OnceLock::new(),
             inbox_dir: std::env::temp_dir(),
             outbox_dirs: Vec::new(),
             side_calls: OnceLock::new(),
@@ -3751,6 +3401,20 @@ impl TerminalTool {
     /// conservative delivery-step write-back).
     pub fn set_plan_store(&self, plan_store: Arc<crate::plans::PlanStore>) {
         let _ = self.plan_store.set(plan_store);
+    }
+
+    /// Wire the runtime's run records (see `runs`).
+    pub fn set_runs(&self, runs: Arc<aidaemon_runtime::run_state::RunStates>) {
+        let _ = self.runs.set(runs);
+    }
+
+    /// Where a background run of this terminal reports.
+    fn run_home(&self) -> aidaemon_runtime::background_run::RunHome {
+        aidaemon_runtime::background_run::RunHome {
+            runs: self.runs.get_or_init(Default::default).clone(),
+            hub: self.hub.get().cloned(),
+            plans: self.plan_store.get().cloned(),
+        }
     }
 
     pub(crate) fn wiring_ready(&self) -> bool {
@@ -5770,6 +5434,8 @@ impl TerminalTool {
                 // Also re-engages the agent loop so it can process the output and continue
                 // working on the original task.
                 let mut notifier_started = false;
+                // The name of the run this command became, when it is one.
+                let mut run_label: Option<String> = None;
                 let state_for_notify = self.state.clone();
                 let hub_for_notify = self.get_hub();
                 let agent_for_notify = self.agent.get().and_then(|w| w.upgrade());
@@ -5897,9 +5563,37 @@ impl TerminalTool {
                         running.get(&pid).map(|p| p.stderr_buf.clone())
                     };
                     let started_at_for_notify = Instant::now() - foreground_wait;
-                    let detached_for_notify = detach;
                     let max_output_chars = self.max_output_chars;
-                    let status_tx_for_notify = status_tx.clone();
+                    // The command is a run in the runtime's records, on its
+                    // turn's card like a background helper: its latest output
+                    // line is its step, and its end settles the card before
+                    // the result is sent. A detached service never "finishes"
+                    // the work it was asked for, so it is not one.
+                    let run = if detach || session_for_notify.is_empty() {
+                        None
+                    } else {
+                        let label = aidaemon_runtime::background_run::plain_label(
+                            title,
+                            &crate::tools::command_effects::program_label(command),
+                        );
+                        let work_began = chrono::Utc::now()
+                            - chrono::Duration::from_std(foreground_wait).unwrap_or_default();
+                        Some(
+                            aidaemon_runtime::background_run::BackgroundRun::start(
+                                self.run_home(),
+                                aidaemon_runtime::background_run::RunStart {
+                                    id: &format!("command-{pid}-{}", uuid::Uuid::new_v4()),
+                                    chat: &session_for_notify,
+                                    label: &label,
+                                    task_id: owner_task_id.as_deref(),
+                                    status_tx: status_tx.clone(),
+                                    work_began,
+                                },
+                            )
+                            .await,
+                        )
+                    };
+                    run_label = run.as_ref().map(|run| run.label().to_string());
                     if let (Some(stdout_buf), Some(stderr_buf)) =
                         (stdout_for_notify, stderr_for_notify)
                     {
@@ -5920,384 +5614,180 @@ impl TerminalTool {
                                     .join(" "),
                                 160,
                             );
+                            let run = run.as_deref();
+                            // Its result in the chat, after its card settled:
+                            // the body, how it ended only when no card shows
+                            // it, and the measured time.
+                            let conclude = |phase| async move {
+                                match run {
+                                    Some(run) => {
+                                        let (state, on_card) =
+                                            run.finish(phase, Default::default()).await;
+                                        Some((state, on_card))
+                                    }
+                                    None => None,
+                                }
+                            };
+                            let present = |ended: &Option<(
+                                Option<aidaemon_runtime::run_state::RunState>,
+                                bool,
+                            )>,
+                                           body: &str| {
+                                match (run, ended) {
+                                    (Some(run), Some((state, on_card))) => {
+                                        run.result(state.as_ref(), body, *on_card)
+                                    }
+                                    _ => body.to_string(),
+                                }
+                            };
 
                             let mut completion_rx = completion_rx;
-                            // Capture completion output for agent re-engagement
-                            #[allow(unused_assignments)]
-                            let mut completion_output_for_agent: Option<String> = None;
-                            let mut completion_parent_result_id: Option<String> = None;
-                            let completion_unchecked_requirements: Vec<String>;
-                            let mut completion_status_surface_id: Option<String> = None;
-                            let mut ping_interval = tokio::time::interval(Duration::from_secs(
-                                BACKGROUND_PROGRESS_INTERVAL_SECS,
-                            ));
-                            ping_interval
+                            let mut step_tick =
+                                tokio::time::interval(COMMAND_OUTPUT_PROGRESS_EVERY);
+                            step_tick
                                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                            // Consume the immediate first tick; we want periodic pings only.
-                            ping_interval.tick().await;
-                            let mut ping_count: u32 = 0;
-                            // One-time notice for processes that outlive all
-                            // periodic pings (dev servers, watchers): without it
-                            // the notifier goes silent waiting for an exit that
-                            // may never come and the conversation dead-ends.
-                            let mut still_running_notice_sent = false;
-                            // Last output-line count shown to the user. Raw output
-                            // stays out of the status card; a changed count is
-                            // enough to prove forward progress without exposing a
-                            // partial terminal transcript.
-                            let mut last_pinged_output_lines: Option<usize> = None;
-                            // Set in the completion arm. Attributed deliverables suppress
-                            // the generic "finished" ping and resolve to direct delivery
-                            // or an honest ambiguity/failure message.
-                            let deliverable_attribution: DeliverableAttribution;
-                            let direct_deliverable_delivery: bool;
-
-                            loop {
+                            step_tick.tick().await;
+                            let exit_code = loop {
                                 tokio::select! {
-                                    exit = &mut completion_rx => {
-                                        let exit_code = match exit {
-                                            Ok(code) => code,
-                                            Err(e) => {
-                                                warn!(
-                                                    pid,
-                                                    error = %e,
-                                                    command = %command_for_notify,
-                                                    "Terminal background notifier lost completion signal"
-                                                );
-                                                None
-                                            }
-                                        };
-                                        if !notify_on_completion.load(Ordering::Relaxed) {
+                                    exit = &mut completion_rx => break match exit {
+                                        Ok(code) => code,
+                                        Err(e) => {
                                             warn!(
                                                 pid,
+                                                error = %e,
                                                 command = %command_for_notify,
-                                                "Terminal background notifier suppressed (check/kill already handled notification)"
+                                                "Terminal background notifier lost completion signal"
                                             );
-                                            return;
+                                            None
                                         }
-
-                                        let stdout = String::from_utf8_lossy(&stdout_buf.lock().await).to_string();
-                                        let stderr = String::from_utf8_lossy(&stderr_buf.lock().await).to_string();
-                                        // Background delivery bypasses the agent loop
-                                        // entirely, so the truncation notice is
-                                        // rendered inline here immediately (the
-                                        // loop's single render site will never see
-                                        // this text).
-                                        let (formatted, truncation) =
-                                            format_output(&stdout, &stderr, max_output_chars);
-                                        let mut with_notice = formatted;
-                                        if let Some(ref info) = truncation {
-                                            with_notice.push('\n');
-                                            with_notice
-                                                .push_str(&crate::utils::render_truncation_notice(info));
-                                        }
-                                        let output = truncate_with_note(&with_notice, 2500);
-                                        let elapsed_secs = started_at_for_notify.elapsed().as_secs();
-
-                                        // The background transition receipt is nonterminal. Persist
-                                        // a second, terminal receipt on actual process completion so
-                                        // recovery and continuation never have to infer success from
-                                        // a notification sentence.
-                                        if let (Some(event_store), Some(parent_task_id), Some(tool_call_id)) = (
-                                            event_store_for_notify.as_ref(),
-                                            owner_task_id_for_notify.as_ref(),
-                                            tool_call_id_for_notify.as_ref(),
-                                        ) {
-                                            completion_parent_result_id =
-                                                persist_background_completion_receipt(
-                                                    event_store,
-                                                    &BackgroundCompletion {
-                                                        session_id: &session_for_notify,
-                                                        task_id: parent_task_id,
-                                                        tool_call_id,
-                                                        exit_code,
-                                                        output: &with_notice,
-                                                        truncation: truncation.clone(),
-                                                        stderr: &stderr,
-                                                        semantics: completion_semantics_for_notify
-                                                            .clone(),
-                                                        elapsed_secs,
-                                                    },
-                                                )
-                                                .await;
-                                        }
-
-                                        // This continuation belongs to one immutable parent task.
-                                        // A session-global plan may already belong to an unrelated
-                                        // request and is never a valid source of child obligations.
-                                        completion_unchecked_requirements = Vec::new();
-
-                                        // Deliverable attribution: if the command produced exactly
-                                        // one safe explicit output file, deliver THAT file directly
-                                        // after the loop and suppress the generic "finished" ping +
-                                        // model re-engagement (the file is the deterministic answer).
-                                        let command_end = std::time::SystemTime::now();
-                                        let command_start = command_end
-                                            .checked_sub(started_at_for_notify.elapsed())
-                                            .unwrap_or(command_end);
-                                        deliverable_attribution = attribute_background_deliverable(
-                                            &backend_for_notify,
-                                            &declared_write_paths_for_notify,
-                                            command_start,
-                                            command_end,
-                                        )
-                                        .await;
-
-                                        match &deliverable_attribution {
-                                            DeliverableAttribution::One(_) if exit_code == Some(0) => {
-                                                direct_deliverable_delivery = true;
-                                                // Defer to deterministic file delivery after the loop.
-                                                // Do NOT send the generic process-finished ping and do NOT
-                                                // set completion_output_for_agent (no re-engagement).
-                                                info!(
-                                                    pid,
-                                                    session_id = %session_for_notify,
-                                                    "Attributed a produced-output file; delivering it directly (suppressing finished-ping + re-engagement)"
-                                                );
-                                                break;
-                                            }
-                                            DeliverableAttribution::One(path) => {
-                                                direct_deliverable_delivery = false;
-                                                let code = exit_code
-                                                    .map(|c| format!("exit code {c}"))
-                                                    .unwrap_or_else(|| "an unknown exit status".to_string());
-                                                let msg = format!(
-                                                    "⚠️ The background command finished with errors ({code}) and produced `{}`. I'm not sending it automatically because the command did not complete successfully.",
-                                                    path.file_name()
-                                                        .map(|f| f.to_string_lossy().to_string())
-                                                        .unwrap_or_else(|| path.to_string_lossy().to_string())
-                                                );
-                                                deliver_background_text(
-                                                    hub_for_notify.as_ref(),
-                                                    state_for_notify.as_ref(),
-                                                    &session_for_notify,
-                                                    &goal_id_for_notify,
-                                                    &msg,
-                                                    pid,
-                                                )
-                                                .await;
-                                                break;
-                                            }
-                                            DeliverableAttribution::Ambiguous(paths) => {
-                                                direct_deliverable_delivery = false;
-                                                let msg = format!(
-                                                    "⚠️ The background command finished, but multiple output files matched: {}. I did not auto-send a file because the deliverable is ambiguous.",
-                                                    format_deliverable_paths(paths)
-                                                );
-                                                deliver_background_text(
-                                                    hub_for_notify.as_ref(),
-                                                    state_for_notify.as_ref(),
-                                                    &session_for_notify,
-                                                    &goal_id_for_notify,
-                                                    &msg,
-                                                    pid,
-                                                )
-                                                .await;
-                                                break;
-                                            }
-                                            DeliverableAttribution::ExpectedMissing(paths) => {
-                                                direct_deliverable_delivery = false;
-                                                let msg = format!(
-                                                    "⚠️ The background command finished before the expected output file appeared: {}. There's nothing to send.",
-                                                    format_deliverable_paths(paths)
-                                                );
-                                                deliver_background_text(
-                                                    hub_for_notify.as_ref(),
-                                                    state_for_notify.as_ref(),
-                                                    &session_for_notify,
-                                                    &goal_id_for_notify,
-                                                    &msg,
-                                                    pid,
-                                                )
-                                                .await;
-                                                break;
-                                            }
-                                            DeliverableAttribution::None => {
-                                                direct_deliverable_delivery = false;
-                                            }
-                                        }
-
-                                        // No deliverable — show the process transition without
-                                        // claiming the user's request is done. Empty stdout is not
-                                        // evidence of task completion: when an agent is available,
-                                        // it still gets a continuation turn to close the request.
-                                        let output_trimmed = output.trim();
-                                        let output_has_value = !(output_trimmed.is_empty()
-                                            || output_trimmed == "(no output)");
-                                        let next = if !completion_unchecked_requirements.is_empty() {
-                                            BackgroundCompletionNext::ContinueRequirements
-                                        } else if agent_for_notify.is_some() || output_has_value {
-                                            BackgroundCompletionNext::PrepareResult
-                                        } else {
-                                            BackgroundCompletionNext::Nothing
-                                        };
-                                        let message = background_completion_ping_message(
-                                            exit_code,
-                                            elapsed_secs,
-                                            next,
-                                        );
-
-                                        // Prefer editing the reusable background handoff bubble
-                                        // in place (one evolving status message); fall back to
-                                        // the plain send/enqueue path inside the helper.
-                                        completion_status_surface_id = deliver_background_completion_ping(
-                                            hub_for_notify.as_ref(),
-                                            state_for_notify.as_ref(),
-                                            &session_for_notify,
-                                            &goal_id_for_notify,
-                                            &message,
-                                            pid,
-                                        )
-                                        .await;
-                                        // Save output for agent re-engagement after loop
-                                        completion_output_for_agent = Some(output);
-                                        break;
-                                    }
-                                    _ = ping_interval.tick() => {
+                                    },
+                                    _ = step_tick.tick() => {
+                                        // Its latest output line is its step.
+                                        let Some(run) = run else { continue };
                                         if !notify_on_completion.load(Ordering::Relaxed) {
-                                            warn!(
-                                                pid,
-                                                command = %command_for_notify,
-                                                "Terminal background progress pings suppressed (check/kill already handled notification)"
-                                            );
-                                            return;
-                                        }
-                                        // A detached service runs until killed:
-                                        // "still working, I'll share the result"
-                                        // cards promise an end that never comes.
-                                        // Only its exit is news.
-                                        if detached_for_notify {
                                             continue;
                                         }
-
-                                        ping_count += 1;
-                                        if ping_count > MAX_BACKGROUND_PROGRESS_PINGS {
-                                            // Periodic pings are exhausted. Send one deterministic
-                                            // transition and keep this loop dedicated to process
-                                            // monitoring. Liveness alone cannot identify whether the
-                                            // process is stalled, awaiting input, or intentionally
-                                            // long-lived.
-                                            if !still_running_notice_sent {
-                                                still_running_notice_sent = true;
-                                                let elapsed_secs =
-                                                    started_at_for_notify.elapsed().as_secs();
-                                                let stdout = String::from_utf8_lossy(
-                                                    &stdout_buf.lock().await,
-                                                )
-                                                .to_string();
-                                                let stderr = String::from_utf8_lossy(
-                                                    &stderr_buf.lock().await,
-                                                )
-                                                .to_string();
-                                                // Keep process-exit monitoring responsive. A
-                                                // still-running status does not need model
-                                                // interpretation and must never occupy the
-                                                // completion notifier's `select!` loop.
-                                                {
-                                                    let mut combined = stdout;
-                                                    if !stderr.is_empty() {
-                                                        if !combined.is_empty() {
-                                                            combined.push('\n');
-                                                        }
-                                                        combined.push_str(&stderr);
-                                                    }
-                                                    let fallback = format_background_monitoring_notice(
-                                                        elapsed_secs,
-                                                        &combined,
-                                                    );
-                                                    deliver_background_progress_update(
-                                                        hub_for_notify.as_ref(),
-                                                        state_for_notify.as_ref(),
-                                                        &session_for_notify,
-                                                        &goal_id_for_notify,
-                                                        &fallback,
-                                                        pid,
-                                                    )
-                                                    .await;
-                                                }
-                                            }
-                                        } else {
-
-                                        let elapsed_secs = started_at_for_notify.elapsed().as_secs();
-                                        let stdout = String::from_utf8_lossy(&stdout_buf.lock().await).to_string();
-                                        let stderr = String::from_utf8_lossy(&stderr_buf.lock().await).to_string();
-                                        let mut combined = stdout;
-                                        if !stderr.is_empty() {
-                                            if !combined.is_empty() {
-                                                combined.push('\n');
-                                            }
-                                            combined.push_str(&stderr);
+                                        let line = match latest_output_line(&stdout_buf.lock().await) {
+                                            Some(line) => Some(line),
+                                            None => latest_output_line(&stderr_buf.lock().await),
+                                        };
+                                        if let Some(line) = line {
+                                            run.step(Step::Output(line)).await;
                                         }
-                                        // Chat pings get only a line count, never raw process
-                                        // output. The agent receives the full output through
-                                        // re-engagement after completion.
-                                        let output_line_count =
-                                            progress_output_line_count(&combined);
-                                        // Internal progress signal (typing indicator + logs).
-                                        // pid and the raw command belong here, not in the chat.
-                                        if let Some(ref tx) = status_tx_for_notify {
-                                            if let Err(e) = tx.try_send(StatusUpdate::ToolProgress {
-                                                name: "terminal".to_string(),
-                                                chunk: format!(
-                                                    "Background command still running (pid={}, {}s elapsed): {}",
-                                                    pid, elapsed_secs, command_summary
-                                                ),
-                                            }) {
-                                                warn!(
-                                                    pid,
-                                                    error = %e,
-                                                    command = %command_for_notify,
-                                                    "Terminal background notifier failed to send periodic progress status update"
-                                                );
-                                            }
-                                        }
-
-                                        // User-facing channel ping: only when there is genuinely
-                                        // NEW output to report. The agent already told the user the
-                                        // command is running, so repeated "still running, no output"
-                                        // pings are noise. pid and the raw command stay out of chat.
-                                        let has_new_output = output_line_count > 0
-                                            && last_pinged_output_lines != Some(output_line_count);
-                                        if has_new_output {
-                                            last_pinged_output_lines = Some(output_line_count);
-                                            let message = format_background_progress_message(
-                                                elapsed_secs,
-                                                &combined,
-                                            );
-                                            deliver_background_progress_update(
-                                                hub_for_notify.as_ref(),
-                                                state_for_notify.as_ref(),
-                                                &session_for_notify,
-                                                &goal_id_for_notify,
-                                                &message,
-                                                pid,
-                                            )
-                                            .await;
-                                        }
-                                        } // close else for ping_count cap
                                     }
                                 }
+                            };
+                            let phase = match exit_code {
+                                Some(0) => aidaemon_runtime::run_state::RunPhase::Succeeded,
+                                Some(_) => aidaemon_runtime::run_state::RunPhase::Failed,
+                                None => aidaemon_runtime::run_state::RunPhase::Stopped,
+                            };
+                            if !notify_on_completion.load(Ordering::Relaxed) {
+                                // A check or a stop already reported its end:
+                                // the run ends on its card, with no message.
+                                warn!(
+                                    pid,
+                                    command = %command_for_notify,
+                                    "Terminal background notifier suppressed (check/kill already handled notification)"
+                                );
+                                if let Some(run) = run {
+                                    run.finish(phase, Default::default()).await;
+                                }
+                                return;
                             }
 
-                            // Re-engage the agent loop so it can process the background
-                            // command output and continue working on the original task.
-                            // The agent has full session history so it can pick up context.
-                            //
-                            // NOTE: This bypasses the channel's task queue, similar to
-                            // spawn_background_task_lead in heartbeat. If the user sends
-                            // a new message at the exact same time, both could execute
-                            // concurrently. In practice this is rare since the background
-                            // command finishes long after the user's original request.
-                            if direct_deliverable_delivery {
-                                // Deterministic deliverable path: send the single attributed
-                                // produced-output file directly (deliver-once guarded), then
-                                // fall through to the running-map cleanup below. This replaces
-                                // re-engagement / the empty-stdout trivial-skip for the case the
-                                // design targets: a command that writes only to a result file.
-                                if let DeliverableAttribution::One(path) = deliverable_attribution {
+                            let stdout =
+                                String::from_utf8_lossy(&stdout_buf.lock().await).to_string();
+                            let stderr =
+                                String::from_utf8_lossy(&stderr_buf.lock().await).to_string();
+                            // Background delivery bypasses the agent loop
+                            // entirely, so the truncation notice is rendered
+                            // inline here.
+                            let (formatted, truncation) =
+                                format_output(&stdout, &stderr, max_output_chars);
+                            let mut with_notice = formatted;
+                            if let Some(ref info) = truncation {
+                                with_notice.push('\n');
+                                with_notice.push_str(&crate::utils::render_truncation_notice(info));
+                            }
+                            let output = truncate_with_note(&with_notice, 2500);
+                            let elapsed_secs = started_at_for_notify.elapsed().as_secs();
+
+                            // The background transition receipt is nonterminal.
+                            // Persist a second, terminal receipt on actual process
+                            // completion so recovery and continuation never have
+                            // to infer success from a notification sentence.
+                            let mut completion_parent_result_id: Option<String> = None;
+                            if let (Some(event_store), Some(parent_task_id), Some(tool_call_id)) = (
+                                event_store_for_notify.as_ref(),
+                                owner_task_id_for_notify.as_ref(),
+                                tool_call_id_for_notify.as_ref(),
+                            ) {
+                                completion_parent_result_id =
+                                    persist_background_completion_receipt(
+                                        event_store,
+                                        &BackgroundCompletion {
+                                            session_id: &session_for_notify,
+                                            task_id: parent_task_id,
+                                            tool_call_id,
+                                            exit_code,
+                                            output: &with_notice,
+                                            truncation: truncation.clone(),
+                                            stderr: &stderr,
+                                            semantics: completion_semantics_for_notify.clone(),
+                                            elapsed_secs,
+                                        },
+                                    )
+                                    .await;
+                            }
+
+                            // Deliverable attribution: a command that produced
+                            // exactly one safe explicit output file has THAT file
+                            // as its answer, delivered directly (no re-engagement).
+                            let command_end = std::time::SystemTime::now();
+                            let command_start = command_end
+                                .checked_sub(started_at_for_notify.elapsed())
+                                .unwrap_or(command_end);
+                            let deliverable_attribution = attribute_background_deliverable(
+                                &backend_for_notify,
+                                &declared_write_paths_for_notify,
+                                command_start,
+                                command_end,
+                            )
+                            .await;
+                            let deliverable_note = match &deliverable_attribution {
+                                DeliverableAttribution::One(_) if exit_code == Some(0) => None,
+                                DeliverableAttribution::One(path) => Some(format!(
+                                    "⚠️ The background command finished with errors ({}) and produced `{}`. I'm not sending it automatically because the command did not complete successfully.",
+                                    exit_code
+                                        .map(|c| format!("exit code {c}"))
+                                        .unwrap_or_else(|| "an unknown exit status".to_string()),
+                                    path.file_name()
+                                        .map(|f| f.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| path.to_string_lossy().to_string())
+                                )),
+                                DeliverableAttribution::Ambiguous(paths) => Some(format!(
+                                    "⚠️ The background command finished, but multiple output files matched: {}. I did not auto-send a file because the deliverable is ambiguous.",
+                                    format_deliverable_paths(paths)
+                                )),
+                                DeliverableAttribution::ExpectedMissing(paths) => Some(format!(
+                                    "⚠️ The background command finished before the expected output file appeared: {}. There's nothing to send.",
+                                    format_deliverable_paths(paths)
+                                )),
+                                DeliverableAttribution::None => None,
+                            };
+
+                            if let DeliverableAttribution::One(path) = &deliverable_attribution {
+                                if exit_code == Some(0) {
+                                    info!(
+                                        pid,
+                                        session_id = %session_for_notify,
+                                        "Attributed a produced-output file; delivering it directly (no re-engagement)"
+                                    );
+                                    conclude(phase).await;
                                     deliver_attributed_background_file(
                                         &backend_for_notify,
-                                        &path,
+                                        path,
                                         &session_for_notify,
                                         &command_summary,
                                         &inbox_dir_for_notify,
@@ -6311,47 +5801,42 @@ impl TerminalTool {
                                     )
                                     .await;
                                 }
-                            } else if let Some(output) = completion_output_for_agent {
+                            }
+                            if let Some(note) = deliverable_note {
+                                let ended = conclude(phase).await;
+                                deliver_background_text(
+                                    hub_for_notify.as_ref(),
+                                    state_for_notify.as_ref(),
+                                    &session_for_notify,
+                                    &goal_id_for_notify,
+                                    &present(&ended, &note),
+                                    pid,
+                                )
+                                .await;
+                            }
+                            if matches!(deliverable_attribution, DeliverableAttribution::None) {
                                 let output_trimmed = output.trim();
                                 // Only genuinely empty output is trivial. A short
-                                // result is often the whole answer — a `wc -l` count,
-                                // a numeric total, a one-word status — so it must NOT
-                                // be dropped here (length is not a proxy for value).
+                                // result is often the whole answer (a `wc -l`
+                                // count, a one-word status), so it is never
+                                // dropped for its length.
                                 let is_trivial =
                                     output_trimmed.is_empty() || output_trimmed == "(no output)";
-                                let followup_expected = agent_for_notify.is_some()
-                                    || !is_trivial
-                                    || !completion_unchecked_requirements.is_empty();
-                                let mut result_delivered = false;
-                                let mut result_queued = false;
-                                let mut followup_still_working = false;
-                                if is_trivial
-                                    && agent_for_notify.is_none()
-                                    && completion_unchecked_requirements.is_empty()
-                                {
-                                    info!(
-                                        pid,
-                                        "No agent or remaining requirement for empty background output"
-                                    );
+                                if is_trivial && agent_for_notify.is_none() {
+                                    info!(pid, "No agent for empty background output");
+                                    conclude(phase).await;
                                 } else if !is_trivial
-                                    && completion_unchecked_requirements.is_empty()
                                     && is_short_complete_output(output_trimmed)
                                     && owner_task_id_for_notify.is_none()
                                 {
-                                    // SHORT, unowned utility result (a `wc -l` count, a path, a
-                                    // one-line status). Do NOT re-enter the full agent loop:
-                                    // with small models it tends to RE-RUN the command,
-                                    // re-detaching to the background and emitting duplicate
-                                    // "finished" pings. Instead, ask the model for a one-line
-                                    // interpretation via a TOOL-LESS call (it can only reply
-                                    // in text — it cannot re-run anything), so the user gets a
-                                    // contextual answer ("345 raw matches, not files") with no
-                                    // churn. Task-owned completions always use the typed
-                                    // continuation path below so response/proof/delivery lineage
-                                    // is durable. If this unowned call is unavailable, fall back to the raw
-                                    // result so the answer is never lost.
-                                    // The side-call gateway bounds the call by its
-                                    // own deadline and returns `None` when it passes.
+                                    // SHORT, unowned utility result: a tool-less
+                                    // interpretation (it cannot re-run anything),
+                                    // else the raw result, so the answer is never
+                                    // lost. Task-owned completions use the typed
+                                    // continuation below.
+                                    if let Some(run) = run {
+                                        run.step(Step::Reporting).await;
+                                    }
                                     let interpreted = match agent_for_notify {
                                         Some(ref agent) => {
                                             agent
@@ -6363,33 +5848,17 @@ impl TerminalTool {
                                         }
                                         None => None,
                                     };
-                                    let message = match interpreted {
-                                        Some(text) => {
-                                            info!(
-                                                pid,
-                                                session_id = %session_for_notify,
-                                                "Delivered short background output via tool-less LLM interpretation (no re-engagement)"
-                                            );
-                                            text
-                                        }
-                                        None => {
-                                            info!(
-                                                pid,
-                                                session_id = %session_for_notify,
-                                                "Delivering short background output as raw result (interpretation unavailable)"
-                                            );
-                                            format_short_background_result(output_trimmed)
-                                        }
-                                    };
+                                    let message = interpreted.unwrap_or_else(|| {
+                                        format_short_background_result(output_trimmed)
+                                    });
                                     // Background deliveries bypass the agent loop's
-                                    // completion sanitizer, so run the same user-facing
-                                    // reply sanitization here — the tool-less LLM
-                                    // interpretation can echo internal scaffolding
-                                    // (control hints, [SYSTEM]/[CONTENT FILTERED] directives).
+                                    // completion sanitizer.
                                     let message =
                                         crate::tools::sanitize::sanitize_user_facing_reply(
                                             &message,
                                         );
+                                    // A result is a duplicate by its body: the
+                                    // measured footer differs per run.
                                     let delivery_allowed = {
                                         let mut log =
                                             recent_background_deliveries_for_notify.lock().await;
@@ -6400,63 +5869,33 @@ impl TerminalTool {
                                             Instant::now(),
                                         )
                                     };
-                                    if !delivery_allowed {
-                                        result_delivered = true;
+                                    let ended = conclude(phase).await;
+                                    let message = present(&ended, &message);
+                                    if delivery_allowed {
+                                        deliver_background_text(
+                                            hub_for_notify.as_ref(),
+                                            state_for_notify.as_ref(),
+                                            &session_for_notify,
+                                            &goal_id_for_notify,
+                                            &message,
+                                            pid,
+                                        )
+                                        .await;
+                                    } else {
                                         info!(
                                             pid,
                                             session_id = %session_for_notify,
                                             "Suppressed duplicate short background command output"
                                         );
-                                    } else {
-                                        let mut delivered = false;
-                                        if let Some(ref hub) = hub_for_notify {
-                                            if let Err(e) =
-                                                hub.send_text(&session_for_notify, &message).await
-                                            {
-                                                warn!(
-                                                    pid,
-                                                    error = %e,
-                                                    session_id = %session_for_notify,
-                                                    "Failed to deliver short background command output"
-                                                );
-                                            } else {
-                                                delivered = true;
-                                                result_delivered = true;
-                                            }
-                                        }
-                                        if !delivered {
-                                            if let Some(ref state) = state_for_notify {
-                                                let entry = crate::traits::NotificationEntry::new(
-                                                    &goal_id_for_notify,
-                                                    &session_for_notify,
-                                                    "progress",
-                                                    &message,
-                                                );
-                                                match state.enqueue_notification(&entry).await {
-                                                    Ok(()) => result_queued = true,
-                                                    Err(e) => {
-                                                        warn!(
-                                                            pid,
-                                                            error = %e,
-                                                            session_id = %session_for_notify,
-                                                            goal_id = %goal_id_for_notify,
-                                                            "Failed to enqueue short background command output"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
                                     }
                                 } else {
-                                    // Preferred path: feed the output back through the agent so the
-                                    // user gets a formatted, summarized reply instead of raw stdout.
-                                    // Only if that path is unavailable or yields nothing do we fall
-                                    // back to delivering the output verbatim (so content is never lost).
+                                    // Feed the output back through the agent so the
+                                    // owner gets a written answer; only if that path
+                                    // is unavailable or yields nothing does the raw
+                                    // output go out, so content is never lost.
                                     //
-                                    // Re-engagement budget: a re-engaged loop that stalls can spawn
-                                    // another background command whose completion re-engages again,
-                                    // looping indefinitely. Past the per-session cap, skip the agent
-                                    // and deliver the raw output via the fallback below.
+                                    // Re-engagement budget: past the per-session cap
+                                    // the raw output goes out instead.
                                     let reengage_budget_ok = {
                                         let mut log = reengagements_for_notify.lock().await;
                                         reengagement_allowed(
@@ -6473,11 +5912,13 @@ impl TerminalTool {
                                             "Background re-engagement budget exhausted; delivering raw output instead of re-entering agent loop"
                                         );
                                     }
+                                    if let Some(run) = run {
+                                        run.step(Step::Reporting).await;
+                                    }
                                     let mut formatted_delivered = false;
-                                    if !reengage_budget_ok {
-                                        // Skip the agent path entirely — fall through to the
-                                        // raw-output fallback delivery below.
-                                    } else if let Some(ref agent) = agent_for_notify {
+                                    if let (true, Some(agent)) =
+                                        (reengage_budget_ok, agent_for_notify.as_ref())
+                                    {
                                         let followup = build_background_reengagement_followup(
                                             &command_summary,
                                             &output,
@@ -6508,19 +5949,12 @@ impl TerminalTool {
                                         .await
                                         {
                                             Ok(envelope) => {
-                                                // Defense-in-depth: the re-engaged loop reads session
-                                                // history containing this command's "moved to background"
-                                                // tool result and sometimes regurgitates that internal
-                                                // scaffolding. The agent's own sanitizer runs upstream,
-                                                // but re-run it here so the terminal delivery path can
-                                                // never leak scaffolding regardless of upstream changes.
+                                                // Defense-in-depth: never leak scaffolding
+                                                // the re-engaged loop may echo.
                                                 let reply =
                                                     crate::tools::sanitize::sanitize_user_facing_reply(
                                                         &envelope.text,
                                                     );
-                                                followup_still_working = envelope.disposition
-                                                    == crate::events::AssistantResponseDisposition::BackgroundHandoff;
-                                                // Send the agent's analysis to the user
                                                 if !reply.trim().is_empty() {
                                                     let delivery_allowed = {
                                                         let mut log =
@@ -6534,6 +5968,8 @@ impl TerminalTool {
                                                             Instant::now(),
                                                         )
                                                     };
+                                                    let ended = conclude(phase).await;
+                                                    let reply = present(&ended, &reply);
                                                     if !delivery_allowed {
                                                         formatted_delivered = true;
                                                         let _ = agent
@@ -6573,16 +6009,13 @@ impl TerminalTool {
                                                         {
                                                             Ok(platform_id) => {
                                                                 formatted_delivered = true;
-                                                                let ids = platform_id
-                                                                    .into_iter()
-                                                                    .collect();
                                                                 let _ = agent
                                                                     .record_continuation_delivery(
                                                                         &session_for_notify,
                                                                         envelope.delivery(
                                                                             "background_router",
                                                                             crate::events::ResponseDeliveryState::PlatformAcknowledged,
-                                                                            ids,
+                                                                            platform_id.into_iter().collect(),
                                                                             None,
                                                                         ),
                                                                     )
@@ -6620,14 +6053,11 @@ impl TerminalTool {
                                         }
                                     }
 
-                                    // Fallback: the agent couldn't deliver a formatted reply, so
-                                    // send the raw output (wrapped in a code block) rather than
-                                    // leaving the user with only a "completed" ping and no content.
+                                    // Fallback: no written answer reached the chat,
+                                    // so the raw output goes out rather than nothing.
                                     if !formatted_delivered {
                                         let fallback = if is_trivial {
-                                            format_background_continuation_failure(
-                                                &completion_unchecked_requirements,
-                                            )
+                                            format_background_continuation_failure(&[])
                                         } else {
                                             format!(
                                                 "Output from `{}`:\n\n```\n{}\n```",
@@ -6645,98 +6075,38 @@ impl TerminalTool {
                                                 Instant::now(),
                                             )
                                         };
-                                        if !delivery_allowed {
-                                            formatted_delivered = true;
+                                        let ended = conclude(phase).await;
+                                        let fallback = present(&ended, &fallback);
+                                        if delivery_allowed {
+                                            deliver_background_text(
+                                                hub_for_notify.as_ref(),
+                                                state_for_notify.as_ref(),
+                                                &session_for_notify,
+                                                &goal_id_for_notify,
+                                                &fallback,
+                                                pid,
+                                            )
+                                            .await;
+                                        } else {
                                             info!(
                                                 pid,
                                                 session_id = %session_for_notify,
                                                 "Suppressed duplicate fallback background command output"
                                             );
-                                        } else {
-                                            let mut delivered = false;
-                                            if let Some(ref hub) = hub_for_notify {
-                                                if let Err(e) = hub
-                                                    .send_text(&session_for_notify, &fallback)
-                                                    .await
-                                                {
-                                                    warn!(
-                                                        pid,
-                                                        error = %e,
-                                                        session_id = %session_for_notify,
-                                                        "Failed to deliver fallback background command output"
-                                                    );
-                                                } else {
-                                                    delivered = true;
-                                                    formatted_delivered = true;
-                                                }
-                                            }
-                                            if !delivered {
-                                                if let Some(ref state) = state_for_notify {
-                                                    let entry =
-                                                        crate::traits::NotificationEntry::new(
-                                                            &goal_id_for_notify,
-                                                            &session_for_notify,
-                                                            "progress",
-                                                            &fallback,
-                                                        );
-                                                    match state.enqueue_notification(&entry).await {
-                                                        Ok(()) => result_queued = true,
-                                                        Err(e) => {
-                                                            warn!(
-                                                                pid,
-                                                                error = %e,
-                                                                session_id = %session_for_notify,
-                                                                goal_id = %goal_id_for_notify,
-                                                                "Failed to enqueue fallback background command output"
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            }
                                         }
                                     }
-                                    result_delivered = formatted_delivered;
-                                }
-
-                                if followup_expected {
-                                    let outcome = if followup_still_working && result_delivered {
-                                        BackgroundSurfaceOutcome::StillWorking
-                                    } else if result_delivered {
-                                        BackgroundSurfaceOutcome::Delivered
-                                    } else if result_queued {
-                                        BackgroundSurfaceOutcome::Queued
-                                    } else {
-                                        BackgroundSurfaceOutcome::DeliveryFailed
-                                    };
-                                    finalize_background_completion_surface(
-                                        hub_for_notify.as_ref(),
-                                        &session_for_notify,
-                                        completion_status_surface_id.as_deref(),
-                                        outcome,
-                                    )
-                                    .await;
                                 }
                             }
-                            // Bug C fix: remove the finished process from `running`
-                            // (and its dedupe / task-process indexes) so the idle-reaper
-                            // cannot later send a contradictory "stopped, no results"
-                            // message for a process whose output was already delivered.
-                            //
-                            // We only reach this point after the completion_rx arm breaks
-                            // out of the select loop — i.e. the process has already exited
-                            // and its output has been delivered (status ping + agent
-                            // re-engagement / raw fallback above). Removing here is safe
-                            // because:
-                            //   • handle_check / handle_kill suppress notify_on_completion
-                            //     and return early before we get here, so they own cleanup.
-                            //   • reap_stale_background_processes filters notifier_active &&
-                            //     !detached; removing from running here means the reaper
-                            //     finds no entry and skips the process entirely.
-                            //   • The entry is NOT moved to `self.completed` (the notifier
-                            //     already delivered the output directly), consistent with
-                            //     how handle_kill works for notifier-active processes.
+                            // However the result went, the run has ended.
+                            if let Some(run) = run {
+                                run.finish(phase, Default::default()).await;
+                            }
+                            // Remove the finished process from `running` (and
+                            // its dedupe / task-process indexes), so the idle
+                            // reaper never reports a process whose output was
+                            // already delivered. check/kill return early above
+                            // and own their cleanup.
                             if let Some(reaped) = running_for_notify.lock().await.remove(&pid) {
-                                // Clean up dedupe-key index (mirrors remove_indexes_for_process).
                                 if let Some(ref key) = reaped.dedupe_key {
                                     if key == &dedupe_key_for_notify {
                                         let mut dedupe =
@@ -6746,7 +6116,6 @@ impl TerminalTool {
                                         }
                                     }
                                 }
-                                // Clean up task-process index.
                                 if !reaped.detached {
                                     if let Some(ref task_id) = owner_task_id_for_notify {
                                         let mut task_map = task_processes_for_notify.lock().await;
@@ -6799,8 +6168,18 @@ impl TerminalTool {
                         pid
                     )
                 } else if notifier_started {
+                    // The first line is the turn's reply when it hands off.
+                    let lead = run_label
+                        .as_deref()
+                        .map(|label| {
+                            format!(
+                                "{}\n",
+                                aidaemon_runtime::background_run::started_in_background(label)
+                            )
+                        })
+                        .unwrap_or_default();
                     format!(
-                        "Command still running after {}s. Moved to background (pid={}).\n\
+                        "{lead}Command still running after {}s. Moved to background (pid={}).\n\
                          IMPORTANT: Continue with your next steps immediately — do NOT wait or repeatedly check this process.\n\
                          You can run other commands (like curl) while this runs in the background.\n\
                          Use action=\"check\" with pid={} to see output later, or action=\"kill\" with pid={} to stop it.",
@@ -11246,17 +10625,6 @@ mod tests {
         assert!(error.to_string().contains("timed out"), "{error}");
     }
 
-    #[test]
-    fn monitoring_notice_is_terminally_honest() {
-        let notice = format_background_monitoring_notice(170, "192.0.2.31\n192.0.2.32\n192.0.2.45");
-        assert!(notice.contains("**Taking longer than expected** · running for over 2m 50s"));
-        assert!(notice.contains("I'm still monitoring it"));
-        assert!(notice.contains("if it needs attention"));
-        assert!(notice.contains("_3 lines received so far._"));
-        assert!(!notice.contains("192.0.2.45"));
-        assert!(!notice.contains("watchdog"));
-    }
-
     #[tokio::test]
     async fn reengagement_slots_serialize_concurrent_completions() {
         // Live 2026-07-12: two background completions re-engaged the agent
@@ -12696,40 +12064,6 @@ mod tests {
     }
 
     #[test]
-    fn progress_output_line_count_ignores_blank_lines() {
-        assert_eq!(progress_output_line_count("working-update"), 1);
-        assert_eq!(
-            progress_output_line_count("line one\n\nline two\nline three"),
-            3
-        );
-        assert_eq!(progress_output_line_count(""), 0);
-        assert_eq!(progress_output_line_count("  \n \n"), 0);
-    }
-
-    #[test]
-    fn background_progress_card_reports_count_without_raw_output() {
-        // Chatty commands (ls -R) must not dump even a tail into chat. The
-        // complete output reaches the agent after the process exits.
-        let output = (1..=500)
-            .map(|i| format!("file_{}.txt", i))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let card = format_background_progress_message(65, &output);
-        assert!(card.contains("⏳ **Still working** · 1m 5s"));
-        assert!(card.contains("_500 lines received so far._"));
-        assert!(!card.contains("file_1.txt"));
-        assert!(!card.contains("file_500.txt"));
-    }
-
-    #[test]
-    fn background_progress_card_does_not_echo_long_lines() {
-        let long_line = "x".repeat(5000);
-        let card = format_background_progress_message(40, &long_line);
-        assert!(card.contains("_1 line received so far._"));
-        assert!(!card.contains(&"x".repeat(20)));
-    }
-
-    #[test]
     fn self_heal_extracts_and_safety_filters_denied_config_paths() {
         let home = std::env::temp_dir().join(format!("aidaemon-heal-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
@@ -12834,50 +12168,6 @@ mod tests {
         let (text, truncation) = format_output("hello", "", 4000);
         assert!(text.contains("hello"));
         assert!(truncation.is_none());
-    }
-
-    #[test]
-    fn completion_ping_distinguishes_process_exit_from_task_completion() {
-        // Live UX repro: a process-exit ping said "✅ Done" while the agent was
-        // still preparing the requested result. Intermediate states must be
-        // explicitly nonterminal and say what happens next.
-        let preparing = background_completion_ping_message(
-            Some(0),
-            63,
-            BackgroundCompletionNext::PrepareResult,
-        );
-        assert!(preparing.contains("**Preparing your result**"));
-        assert!(preparing.contains("background step finished in 1m 3s"));
-        assert!(preparing.contains("turning it into a clear answer"));
-        assert!(!preparing.contains("Done"));
-        assert!(!preparing.contains('✅'));
-
-        let continuing = background_completion_ping_message(
-            Some(0),
-            63,
-            BackgroundCompletionNext::ContinueRequirements,
-        );
-        assert!(continuing.contains("**Continuing your request**"));
-        assert!(continuing.contains("moving on to the remaining work"));
-        assert!(!continuing.contains("Done"));
-
-        // With no agent, output, or outstanding requirement, report the exact
-        // terminal condition without implying that the whole request succeeded.
-        let no_followup =
-            background_completion_ping_message(Some(0), 63, BackgroundCompletionNext::Nothing);
-        assert_eq!(
-            no_followup,
-            "ℹ️ **Background step finished** · 1m 3s\n\nIt didn't return any output."
-        );
-
-        let err = background_completion_ping_message(
-            Some(2),
-            40,
-            BackgroundCompletionNext::PrepareResult,
-        );
-        assert!(err.contains("**Background step needs review**"));
-        assert!(err.contains("finished after 40s with exit code 2"));
-        assert!(err.contains("checking what happened now"));
     }
 
     #[test]
@@ -13059,164 +12349,111 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_background_terminal_ack_progress_and_completion_sequence() {
+    async fn card_chat_terminal(chat: &crate::testing::CardChat) -> TerminalTool {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
+        std::mem::forget(db_file);
         let embedding_service = Arc::new(EmbeddingService::new().unwrap());
         let state = Arc::new(
             SqliteStateStore::new(&db_path, 100, None, embedding_service)
                 .await
                 .unwrap(),
         );
-        let pool = state.pool();
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             crate::execution::active_execution_backend(),
             vec!["*".to_string()],
-            approval_tx,
+            crate::tools::ApprovalBroker::new(approval_tx_raw),
             1,
             4000,
             PermissionMode::Yolo,
-            pool,
+            state.pool(),
         )
         .await
-        .with_state(state.clone() as Arc<dyn StateStore>);
-
-        // Emit output early so a periodic ping has something NEW to report —
-        // no-output commands are now intentionally quiet until completion.
-        let response = tool
-            .call_with(r#"{"action":"run","command":"echo working-update; sleep 3; echo terminal-sequence-ok"}"#, crate::testing::call_facts("sess_seq"))
-            .await
-            .unwrap();
-        assert!(
-            response.contains("Moved to background (pid="),
-            "expected background ack in tool response, got: {}",
-            response
-        );
-
-        let mut saw_progress_ping = false;
-        let mut saw_completion = false;
-        for _ in 0..60 {
-            let pending = state.get_pending_notifications(50).await.unwrap();
-            for entry in pending.iter().filter(|entry| {
-                entry.session_id == "sess_seq" && entry.notification_type == "progress"
-            }) {
-                if entry.message.contains("**Still working**")
-                    && entry.message.contains("1 line received so far")
-                    && !entry.message.contains("working-update")
-                {
-                    saw_progress_ping = true;
-                }
-                if entry.message.contains("**Preparing your result**")
-                    || entry.message.contains("**Background step needs review**")
-                    || entry.message.contains("**Background step finished**")
-                {
-                    saw_completion = true;
-                }
-            }
-            if saw_progress_ping && saw_completion {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-
-        let messages = state
-            .get_pending_notifications(50)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.session_id == "sess_seq")
-            .map(|entry| entry.message)
-            .collect::<Vec<_>>();
-        assert!(
-            saw_progress_ping,
-            "expected at least one periodic background progress ping; messages={messages:?}"
-        );
-        assert!(
-            saw_completion,
-            "expected background completion notification with final output"
-        );
+        .with_state(state as Arc<dyn StateStore>);
+        tool.set_hub(chat.outbound());
+        tool
     }
 
-    /// A long-running command that produces no output until completion must NOT
-    /// spam the user with periodic "still running" pings — only the completion
-    /// notification should reach the channel. (The agent already told the user
-    /// the command is running.)
+    /// A command moved to the background is a run on its turn's one card:
+    /// the turn's reply names it, its latest output line is its step, it
+    /// settles to its final header when it ends, and the result follows in
+    /// its own message without the header (live 2026-11-13: "Still on it …
+    /// Request: <the whole prompt>", then "Preparing your result", removed
+    /// with no final header).
     #[tokio::test]
-    async fn test_background_terminal_no_output_is_quiet_until_completion() {
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
-        let pool = state.pool();
-        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
-        let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
-            vec!["*".to_string()],
-            approval_tx,
-            1,
-            4000,
-            PermissionMode::Yolo,
-            pool,
-        )
-        .await
-        .with_state(state.clone() as Arc<dyn StateStore>);
-
-        let response = tool
-            .call_with(
-                r#"{"action":"run","command":"sleep 3"}"#,
-                crate::testing::call_facts("sess_quiet"),
+    async fn a_background_command_shows_one_card_that_settles() {
+        let chat = crate::testing::CardChat::new("telegram:synthetic-card").await;
+        let tool = card_chat_terminal(&chat).await;
+        let outcome = chat
+            .turn(
+                |tx| {
+                    tool.call_with_execution_context(
+                        r#"{"action":"run","command":"echo step-one; sleep 5; echo all-done","description":"counting script","background":true}"#,
+                        Some(tx),
+                        crate::testing::call_facts("telegram:synthetic-card"),
+                    )
+                },
+                |outcome| {
+                    outcome
+                        .as_ref()
+                        .map(|outcome| outcome.output.lines().next().unwrap_or("").to_string())
+                        .unwrap_or_default()
+                },
             )
             .await
             .unwrap();
-        assert!(response.contains("Moved to background (pid="));
-
-        let mut saw_progress_ping = false;
-        let mut saw_completion = false;
-        for _ in 0..60 {
-            let pending = state.get_pending_notifications(50).await.unwrap();
-            for entry in pending.iter().filter(|entry| {
-                entry.session_id == "sess_quiet" && entry.notification_type == "progress"
-            }) {
-                if entry.message.contains("**Still working**") {
-                    saw_progress_ping = true;
-                }
-                if entry.message.contains("**Preparing your result**")
-                    || entry.message.contains("**Background step needs review**")
-                    || entry.message.contains("**Background step finished**")
-                {
-                    saw_completion = true;
-                }
-            }
-            if saw_completion {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-
-        let messages = state
-            .get_pending_notifications(50)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.session_id == "sess_quiet")
-            .map(|entry| entry.message)
-            .collect::<Vec<_>>();
+        assert!(outcome.metadata.background_handoff);
+        assert!(outcome
+            .output
+            .starts_with("Started in the background: counting script."));
         assert!(
-            !saw_progress_ping,
-            "no-output command should not emit periodic progress pings; messages={messages:?}"
+            chat.wait_for(Duration::from_secs(10), |text| text
+                .starts_with("⏳ Running in the background: counting script")
+                && text.contains("last output: step-one"))
+                .await,
+            "{:#?}",
+            chat.shown().await
         );
         assert!(
-            saw_completion,
-            "completion notification should still arrive"
+            chat.wait_for(Duration::from_secs(20), |text| text.contains("all-done")
+                && text.contains("Measured"))
+                .await,
+            "{:#?}",
+            chat.shown().await
         );
+        chat.assert_one_settled_card("✅ Finished in the background: counting script", "all-done")
+            .await;
+    }
+
+    /// A command that prints nothing has no step on its card, and its end
+    /// settles the card with nothing else to say: no message of its own.
+    #[tokio::test]
+    async fn a_quiet_background_command_settles_its_card_and_says_nothing() {
+        let chat = crate::testing::CardChat::new("telegram:synthetic-quiet").await;
+        let tool = card_chat_terminal(&chat).await;
+        chat.turn(
+            |tx| {
+                tool.call_with_execution_context(
+                    r#"{"action":"run","command":"sleep 3","background":true}"#,
+                    Some(tx),
+                    crate::testing::call_facts("telegram:synthetic-quiet"),
+                )
+            },
+            |_| String::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            chat.wait_for(Duration::from_secs(15), |text| text
+                .starts_with("✅ Finished in the background"))
+                .await,
+            "{:#?}",
+            chat.shown().await
+        );
+        let shown = chat.shown().await;
+        assert_eq!(shown.len(), 1, "only the card: {shown:#?}");
+        assert!(!shown[0].contains("last output"), "{shown:#?}");
     }
 
     #[test]
@@ -13762,7 +12999,7 @@ mod tests {
                 .filter(|entry| {
                     entry.session_id == "sess_dupe_result"
                         && entry.notification_type == "progress"
-                        && entry.message == "Result: `duplicate-result`"
+                        && entry.message.contains("Result: `duplicate-result`")
                 })
                 .count();
             if result_count >= 2 {
@@ -13777,7 +13014,7 @@ mod tests {
             .filter(|entry| {
                 entry.session_id == "sess_dupe_result"
                     && entry.notification_type == "progress"
-                    && entry.message == "Result: `duplicate-result`"
+                    && entry.message.contains("Result: `duplicate-result`")
             })
             .count();
         assert_eq!(
@@ -13788,73 +13025,6 @@ mod tests {
                 .filter(|entry| entry.session_id == "sess_dupe_result")
                 .map(|entry| entry.message.as_str())
                 .collect::<Vec<_>>()
-        );
-    }
-
-    /// Once periodic pings are exhausted, the notifier must send one
-    /// deterministic transition and remain responsive to process completion.
-    #[tokio::test]
-    async fn test_background_terminal_long_running_emits_still_running_notice() {
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
-        let pool = state.pool();
-        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
-        let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
-            vec!["*".to_string()],
-            approval_tx,
-            1,
-            4000,
-            PermissionMode::Yolo,
-            pool,
-        )
-        .await
-        .with_state(state.clone() as Arc<dyn StateStore>);
-
-        // Stay alive past the frequent-ping budget, then finish. The final
-        // output must still arrive after the one-time monitoring transition.
-        let response = tool
-            .call_with(
-                r#"{"action":"run","command":"echo scan-ready; sleep 6; echo scan-finished"}"#,
-                crate::testing::call_facts("sess_server"),
-            )
-            .await
-            .unwrap();
-        assert!(response.contains("Moved to background (pid="));
-
-        let mut saw_still_running_notice = false;
-        let mut saw_final_output = false;
-        for _ in 0..80 {
-            let pending = state.get_pending_notifications(50).await.unwrap();
-            saw_still_running_notice |= pending.iter().any(|entry| {
-                entry.session_id == "sess_server"
-                    && entry.notification_type == "progress"
-                    && entry.message.contains("**Taking longer than expected**")
-            });
-            saw_final_output |= pending.iter().any(|entry| {
-                entry.session_id == "sess_server"
-                    && entry.notification_type == "progress"
-                    && entry.message.contains("scan-finished")
-            });
-            if saw_still_running_notice && saw_final_output {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        assert!(
-            saw_still_running_notice,
-            "expected a one-time still-running notice after pings are exhausted"
-        );
-        assert!(
-            saw_final_output,
-            "expected final output after the monitoring transition"
         );
     }
 

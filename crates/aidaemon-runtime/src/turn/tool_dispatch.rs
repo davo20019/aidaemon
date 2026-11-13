@@ -402,25 +402,11 @@ pub fn access_manifest_scope_check(
     Some(ScopeCheck::Rejected(reason))
 }
 
-/// The reply for a turn a tool handed to the background without completion
-/// notifications: the tool's own first line.
-pub fn build_background_detach_ack(
-    result_text: &str,
-    metadata: &aidaemon_events::traits::ToolCallMetadata,
-) -> String {
-    let first_line = aidaemon_events::traits::first_primary_message_line(result_text, &[])
-        .unwrap_or_else(|| "The task is running in the background.".to_string());
-    // Use structured tool metadata rather than inferring notification semantics
-    // from rendered tool output text.
-    let notifications_active = metadata.completion_notifications_enabled;
-    if notifications_active {
-        format!(
-            "{} Completion notifications are enabled, and the final result will be sent automatically when it finishes.",
-            first_line
-        )
-    } else {
-        first_line.to_string()
-    }
+/// The reply for a turn a tool handed to the background: the call's own
+/// first line ("Started in the background: …"), which names the run.
+pub fn build_background_detach_ack(result_text: &str) -> String {
+    aidaemon_events::traits::first_primary_message_line(result_text, &[])
+        .unwrap_or_else(|| "The task is running in the background.".to_string())
 }
 
 pub fn is_trivial_success_excerpt(s: &str) -> bool {
@@ -2359,50 +2345,22 @@ mod tests {
         .is_empty());
     }
 
+    /// A handoff's reply is the launch's own first line, which names the
+    /// run: never the request echoed, never a second promise about the
+    /// result (the run's card says how it goes).
     #[test]
-    fn builds_deterministic_background_ack_from_tool_result() {
-        let with_notify = aidaemon_events::traits::ToolCallMetadata {
-            completion_notifications_enabled: true,
-            ..Default::default()
-        };
-        let without_notify = aidaemon_events::traits::ToolCallMetadata::default();
-
-        // With notifications enabled — should promise automatic delivery.
+    fn a_handoff_reply_is_the_launchs_first_line() {
         let ack = build_background_detach_ack(
-            "Command still running after 30s. Moved to background (pid=123).\n\nCompletion notifications are enabled. The user will be notified when this process finishes.\n\n[SYSTEM] ...",
-            &with_notify,
+            "Started in the background: counting script. Its result will come to this chat \
+             when it finishes.\nCommand still running after 30s. Moved to background \
+             (pid=123).\n\n[SYSTEM] ...",
         );
-        assert!(ack.contains("Moved to background (pid=123)"));
-        assert!(ack.contains("final result will be sent automatically"));
-
-        // Without notifications — should NOT promise automatic delivery.
-        let ack_no_notify = build_background_detach_ack(
-            "Command still running after 30s. Moved to background (pid=456).\n\nThis process is task-owned and will be auto-killed when the current task ends.",
-            &without_notify,
+        assert_eq!(
+            ack,
+            "Started in the background: counting script. Its result will come to this chat \
+             when it finishes."
         );
-        assert!(ack_no_notify.contains("Moved to background (pid=456)"));
-        assert!(!ack_no_notify.contains("final result will be sent automatically"));
-    }
-
-    #[test]
-    fn background_ack_uses_structured_notification_metadata_not_text() {
-        let with_notify = aidaemon_events::traits::ToolCallMetadata {
-            completion_notifications_enabled: true,
-            ..Default::default()
-        };
-        let without_notify = aidaemon_events::traits::ToolCallMetadata::default();
-
-        let ack = build_background_detach_ack(
-            "Command still running after 30s. Moved to background (pid=123).",
-            &with_notify,
-        );
-        assert!(ack.contains("final result will be sent automatically"));
-
-        let ack_no_notify = build_background_detach_ack(
-            "Command still running after 30s. Moved to background (pid=456).\n\nCompletion notifications are enabled. The user will be notified when this process finishes.",
-            &without_notify,
-        );
-        assert!(!ack_no_notify.contains("final result will be sent automatically"));
+        assert!(!ack.contains("pid="));
     }
 
     #[test]

@@ -50,13 +50,6 @@ pub struct ChannelHub {
     /// an image already in the chat is not sent again; genuinely different
     /// content is never suppressed.
     recent_media_deliveries: RwLock<HashMap<String, tokio::time::Instant>>,
-    /// Per-session editable message id of a delivered background-handoff reply
-    /// ("⏳ **Still on it**"). Progress updates read it without consuming it,
-    /// while the completion ping consumes it (take), so the full background
-    /// lifecycle can reuse one message instead of stacking status bubbles.
-    /// Last writer wins per session; take() removes the entry, so a second
-    /// concurrent background command degrades to a fresh ping message.
-    background_status_surfaces: RwLock<HashMap<String, String>>,
     /// Per-session message id of the plan card a turn left in the chat. A
     /// background job settling checklist steps edits it, so the card moves
     /// from "running in the background" to what happened.
@@ -113,7 +106,6 @@ impl ChannelHub {
             delivery_note_sink: None,
             last_sent_text: RwLock::new(HashMap::new()),
             recent_media_deliveries: RwLock::new(HashMap::new()),
-            background_status_surfaces: RwLock::new(HashMap::new()),
             checklist_surfaces: RwLock::new(HashMap::new()),
             checklist_history: RwLock::new(HashMap::new()),
             approval_tap: std::sync::RwLock::new(None),
@@ -133,26 +125,6 @@ impl ChannelHub {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
-    }
-
-    /// Register the editable message id of a just-delivered background-handoff
-    /// reply for this session. See `background_status_surfaces`.
-    pub async fn register_background_status_surface(&self, session_id: &str, message_id: &str) {
-        self.background_status_surfaces
-            .write()
-            .await
-            .insert(session_id.to_string(), message_id.to_string());
-    }
-
-    /// Return the registered background status surface without consuming it.
-    /// Periodic progress updates use this to keep editing the original handoff;
-    /// completion still owns the terminal `take` transition below.
-    pub async fn background_status_surface(&self, session_id: &str) -> Option<String> {
-        self.background_status_surfaces
-            .read()
-            .await
-            .get(session_id)
-            .cloned()
     }
 
     /// Register the plan card a finished turn left in this session's chat.
@@ -191,15 +163,6 @@ impl ChannelHub {
             .await
             .get(session_id)
             .cloned()
-    }
-
-    /// Take (and remove) the registered background-handoff message id for this
-    /// session, if any.
-    pub async fn take_background_status_surface(&self, session_id: &str) -> Option<String> {
-        self.background_status_surfaces
-            .write()
-            .await
-            .remove(session_id)
     }
 
     /// How long a delivered document suppresses an identical re-delivery.
@@ -1047,14 +1010,6 @@ impl OutboundRouter for ChannelHub {
         media: &MediaMessage,
     ) -> anyhow::Result<()> {
         ChannelHub::send_media_strict(self, session_id, media).await
-    }
-
-    async fn background_status_surface(&self, session_id: &str) -> Option<String> {
-        ChannelHub::background_status_surface(self, session_id).await
-    }
-
-    async fn take_background_status_surface(&self, session_id: &str) -> Option<String> {
-        ChannelHub::take_background_status_surface(self, session_id).await
     }
 
     async fn delete_message(&self, session_id: &str, message_id: &str) -> anyhow::Result<bool> {

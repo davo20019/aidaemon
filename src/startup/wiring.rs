@@ -88,14 +88,20 @@ pub async fn wire_hub_cycles(
     // can be delivered immediately (not only via heartbeat queue polling).
     // Also give it a weak agent reference so background completions can re-engage
     // the agent loop to process the output and continue the original task.
+    // A command or agent left running in the background is a run in the
+    // same records as a background helper, on its turn's card.
+    let runs = crate::runtime_ports::ChildAgentRuntime::helper_runs(agent.as_ref());
     if let Some(tt) = terminal_tool {
+        tt.set_runs(runs.clone());
         tt.set_hub(Arc::downgrade(&outbound));
         tt.set_agent(Arc::downgrade(agent));
         // Durable plan store for completion-time deliverable attribution and the
         // conservative delivery-step write-back.
-        tt.set_plan_store(plan_store);
+        tt.set_plan_store(plan_store.clone());
     }
     if let Some(cat) = cli_agent_tool {
+        cat.set_runs(runs);
+        cat.set_plan_store(plan_store);
         cat.set_hub(Arc::downgrade(&outbound));
         let runtime: Arc<dyn ConversationRuntime> = agent.clone();
         cat.set_agent(Arc::downgrade(&runtime));

@@ -105,6 +105,7 @@ mod tests {
             chat: "telegram:synthetic-chat".to_string(),
             label: "Slow count".to_string(),
             phase,
+            requested_at: None,
             started_at: start,
             ended_at: Some(start + chrono::Duration::seconds(finished)),
             work_began: first_step.map(|secs| start + chrono::Duration::seconds(secs)),
@@ -1852,12 +1853,6 @@ mod child_runtime_tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn background_status_surface(&self, _session_id: &str) -> Option<String> {
-            None
-        }
-        async fn take_background_status_surface(&self, _session_id: &str) -> Option<String> {
-            None
-        }
         async fn request_inline_approval(
             &self,
             _session_id: &str,
@@ -1921,12 +1916,6 @@ mod child_runtime_tests {
             _media: &crate::types::MediaMessage,
         ) -> anyhow::Result<()> {
             Ok(())
-        }
-        async fn background_status_surface(&self, _session_id: &str) -> Option<String> {
-            None
-        }
-        async fn take_background_status_surface(&self, _session_id: &str) -> Option<String> {
-            None
         }
         async fn checklist_surface(&self, _session_id: &str) -> Option<String> {
             if self.turn_running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -2018,12 +2007,9 @@ mod child_runtime_tests {
         assert_eq!(edits.len(), 1, "{edits:?}");
         assert_eq!(edits[0].0, "card-1", "{edits:?}");
         assert!(edits[0].1.contains("Slow count"), "{edits:?}");
-        assert_eq!(
-            runs.get("job-own-card").map(|run| run.card),
-            Some(aidaemon_runtime::run_state::RunCard::Kept(
-                "card-1".to_string()
-            )),
-        );
+        // Nothing on its card runs any more: the card settled and the
+        // record was let go.
+        assert!(runs.get("job-own-card").is_none());
     }
 
     /// A helper's steps reach the card its turn left after that turn ended,
@@ -2073,7 +2059,7 @@ mod child_runtime_tests {
                 chat: chat.to_string(),
                 job: "job-steps".to_string(),
                 label: "Slow count to 30".to_string(),
-                at_start: (None, None),
+                at_start: None,
                 drawn: Default::default(),
             },
         )
@@ -2410,12 +2396,6 @@ mod child_runtime_tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn background_status_surface(&self, _session_id: &str) -> Option<String> {
-            None
-        }
-        async fn take_background_status_surface(&self, _session_id: &str) -> Option<String> {
-            None
-        }
         async fn checklist_surface(&self, _session_id: &str) -> Option<String> {
             Some("card-1".to_string())
         }
@@ -2485,7 +2465,7 @@ mod child_runtime_tests {
                 chat: chat.to_string(),
                 job: "job-race".to_string(),
                 label: "Slow count".to_string(),
-                at_start: (None, None),
+                at_start: None,
                 drawn: Default::default(),
             },
         )

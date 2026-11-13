@@ -32,6 +32,8 @@ use crate::traits::{
 use crate::types::StatusUpdate;
 use crate::types::{ApprovalResponse, UserRole};
 use crate::utils::{floor_char_boundary, truncate_str, truncate_with_note};
+use aidaemon_core::card::Step;
+use aidaemon_runtime::background_run::BackgroundRun;
 use aidaemon_tools::permission_bypass::strip_permission_bypass_flags;
 #[cfg(test)]
 use aidaemon_tools::permission_bypass::without_permission_bypass;
@@ -84,13 +86,6 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(25);
 #[cfg(not(test))]
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Cadence for durable, chat-visible updates after a CLI task has detached from
-/// its original request. Foreground status streams remain more frequent.
-#[cfg(test)]
-const BACKGROUND_CHAT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
-#[cfg(not(test))]
-const BACKGROUND_CHAT_PROGRESS_INTERVAL: Duration = Duration::from_secs(120);
-
 /// How long `action="check"` waits for a running task to finish before it
 /// reports "still running". A check that answers at once invites a model to
 /// poll in a tight loop, each poll re-billing the whole context (live
@@ -140,102 +135,6 @@ fn mark_left_in_background() {
 /// Record that this call observed a background task's end.
 fn mark_background_settled() {
     let _ = BACKGROUND_SETTLED.try_with(|flag| flag.set(true));
-}
-
-fn format_background_progress(
-    tool_name: &str,
-    task_context: &str,
-    elapsed_secs: u64,
-    latest_activity: Option<&str>,
-) -> String {
-    let elapsed = if elapsed_secs < 90 {
-        format!("{elapsed_secs}s")
-    } else {
-        format!("{} min", (elapsed_secs + 30) / 60)
-    };
-    // The worker's own stream lines ("Working... (120s)") are its status, not
-    // the owner's: the chat message says only how long and what for.
-    let _ = latest_activity;
-    let mut worker = tool_name.chars();
-    let worker = match worker.next() {
-        Some(first) => first.to_uppercase().chain(worker).collect::<String>(),
-        None => String::new(),
-    };
-    format!(
-        "\u{23f3} Still working on it in the background ({elapsed}).\n{worker}: {}",
-        truncate_with_note(task_context, 200),
-    )
-}
-
-async fn deliver_cli_agent_notification(
-    hub: Option<&Arc<dyn OutboundRouter>>,
-    state: &Arc<dyn StateStore>,
-    goal_id: &str,
-    session_id: &str,
-    notification_type: &str,
-    message: &str,
-    context: &str,
-) -> bool {
-    if session_id.trim().is_empty() {
-        warn!("{context}: no session available; update dropped");
-        return false;
-    }
-
-    // Progress belongs in the session's one background status message (the
-    // handoff reply, registered when it was delivered): edit it in place
-    // rather than stacking a new message per update. Without one, or when the
-    // channel cannot edit, fall through to a fresh message.
-    if notification_type == "progress" {
-        if let Some(hub) = hub {
-            if let Some(surface_id) = hub.background_status_surface(session_id).await {
-                if matches!(
-                    hub.edit_text(session_id, &surface_id, message).await,
-                    Ok(true)
-                ) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    let message = crate::channels::present_notification(notification_type, message);
-    if let Some(hub) = hub {
-        match hub.send_text(session_id, &message).await {
-            Ok(()) => return true,
-            Err(e) => warn!(
-                session_id = %session_id,
-                goal_id = %goal_id,
-                notification_type = %notification_type,
-                error = %e,
-                "{context}: direct hub delivery failed"
-            ),
-        }
-    }
-
-    let queue_goal_id = if goal_id.trim().is_empty() {
-        "global"
-    } else {
-        goal_id
-    };
-    let entry = crate::traits::NotificationEntry::new(
-        queue_goal_id,
-        session_id,
-        notification_type,
-        &message,
-    );
-    match state.enqueue_notification(&entry).await {
-        Ok(()) => true,
-        Err(e) => {
-            warn!(
-                session_id = %session_id,
-                goal_id = %goal_id,
-                notification_type = %notification_type,
-                error = %e,
-                "{context}: enqueue fallback failed"
-            );
-            false
-        }
-    }
 }
 
 /// Tracks recent output lines to detect infinite loops
@@ -489,6 +388,9 @@ fn permission_profile_path_key(path: &str) -> Result<&str, String> {
 /// A running CLI agent being tracked.
 struct RunningCliAgent {
     tool_name: String,
+    /// The name the owner reads for it: its title in plain words, else
+    /// what it is ("bash-agent coding agent"), never its prompt.
+    label: String,
     prompt_summary: String,
     started_at: Instant,
     /// Combined output for display (includes [stderr] prefixes)
@@ -681,6 +583,11 @@ pub struct CliAgentTool {
     /// the agent kernel (`record_owner_answer`) and consumed by the run.
     owner_answers: Arc<crate::tools::owner_answers::OwnerAnsweredCalls>,
     hub: OnceLock<Weak<dyn OutboundRouter>>,
+    /// The runtime's run records: an agent left running in the background is
+    /// a run there, shown on its turn's card. Wired via [`Self::set_runs`].
+    runs: OnceLock<Arc<aidaemon_runtime::run_state::RunStates>>,
+    /// The session checklists a background run's turn waits on.
+    plan_store: OnceLock<Arc<crate::plans::PlanStore>>,
     /// Re-enter the root agent when background delegation completes so the
     /// delegated step advances the original user outcome instead of ending it.
     agent: OnceLock<Weak<dyn ConversationRuntime>>,
@@ -1493,6 +1400,8 @@ impl CliAgentTool {
             concurrency_limiter: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT)),
             owner_answers: Default::default(),
             hub: OnceLock::new(),
+            runs: OnceLock::new(),
+            plan_store: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -1519,6 +1428,25 @@ impl CliAgentTool {
         self.agent
             .set(agent)
             .expect("CliAgentTool::set_agent called more than once");
+    }
+
+    /// Wire the runtime's run records (see `runs`).
+    pub fn set_runs(&self, runs: Arc<aidaemon_runtime::run_state::RunStates>) {
+        let _ = self.runs.set(runs);
+    }
+
+    /// Where a background run of this tool reports.
+    fn run_home(&self) -> aidaemon_runtime::background_run::RunHome {
+        aidaemon_runtime::background_run::RunHome {
+            runs: self.runs.get_or_init(Default::default).clone(),
+            hub: self.hub.get().cloned(),
+            plans: self.plan_store.get().cloned(),
+        }
+    }
+
+    /// Wire the session checklists (see `plan_store`).
+    pub fn set_plan_store(&self, plan_store: Arc<crate::plans::PlanStore>) {
+        let _ = self.plan_store.set(plan_store);
     }
 
     fn get_hub(&self) -> Option<Arc<dyn OutboundRouter>> {
@@ -2256,6 +2184,7 @@ impl CliAgentTool {
         enforce_native_access: bool,
         async_mode: bool,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        title: Option<&str>,
     ) -> anyhow::Result<String> {
         // Get entry from the tools map (clone what we need, release lock)
         let (mut command, mut args, timeout, max_output, is_dynamic) = {
@@ -2694,12 +2623,32 @@ impl CliAgentTool {
         let should_notify_for_task = Arc::clone(&should_notify);
         let backend_for_completion = self.backend.clone();
         let slot_permit_for_task = slot_permit;
+        // Once the agent is left running in the background it is a run in the
+        // runtime's records, on its turn's card (see `start_background_run`).
+        let run_slot: Arc<std::sync::OnceLock<Arc<BackgroundRun>>> = Arc::default();
+        let run_for_task = run_slot.clone();
+        let run_label = aidaemon_runtime::background_run::plain_label(
+            title,
+            &format!("{tool_name} coding agent"),
+        );
+        let run_began = chrono::Utc::now();
+        if async_mode {
+            self.start_background_run(
+                &run_slot,
+                &task_id,
+                session_id,
+                &run_label,
+                delegated_task_id,
+                status_tx.clone(),
+                run_began,
+            )
+            .await;
+        }
         tokio::spawn(async move {
             let _slot_permit = slot_permit_for_task;
             let mut stdout_reader = BufReader::new(stdout).lines();
             let mut stderr_reader = BufReader::new(stderr).lines();
             let mut last_progress = Instant::now();
-            let mut last_chat_progress = Instant::now();
             let mut status_tick = tokio::time::interval(PROGRESS_INTERVAL);
             status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             status_tick.tick().await; // consume the immediate first tick
@@ -2871,6 +2820,13 @@ impl CliAgentTool {
                     }
 
                     let elapsed_secs = started_at.elapsed().as_secs();
+                    let latest_output = progress_items
+                        .iter()
+                        .rev()
+                        .flat_map(|item| item.lines().rev())
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                        .map(|line| truncate_str(line, 120).to_string());
                     let chunk = if !progress_items.is_empty() {
                         // Deduplicate consecutive items
                         progress_items.dedup();
@@ -2890,32 +2846,10 @@ impl CliAgentTool {
                         });
                     }
 
-                    if should_notify_for_task.load(Ordering::Relaxed)
-                        && last_chat_progress.elapsed() >= BACKGROUND_CHAT_PROGRESS_INTERVAL
-                    {
-                        let message = format_background_progress(
-                            &tool_name_owned,
-                            &task_context,
-                            elapsed_secs,
-                            Some(&chunk),
-                        );
-                        let hub = hub_for_completion.clone();
-                        let state = state_for_completion.clone();
-                        let goal_id = notify_goal_id.clone();
-                        let session_id = notify_session_id.clone();
-                        tokio::spawn(async move {
-                            deliver_cli_agent_notification(
-                                hub.as_ref(),
-                                &state,
-                                &goal_id,
-                                &session_id,
-                                "progress",
-                                &message,
-                                "cli_agent background progress notifier",
-                            )
-                            .await;
-                        });
-                        last_chat_progress = Instant::now();
+                    // A background run's step is the agent's latest real
+                    // output line, never a heartbeat or a timer.
+                    if let (Some(run), Some(line)) = (run_for_task.get().cloned(), latest_output) {
+                        tokio::spawn(async move { run.step(Step::Output(line)).await });
                     }
 
                     pending_lines.clear();
@@ -3021,13 +2955,12 @@ impl CliAgentTool {
                 // Send proactive notification when the caller won't necessarily be waiting
                 // for completion (async_mode or sync->timeout moved to background).
                 if notify_async || should_notify_for_task.load(Ordering::Relaxed) {
-                    let duration_secs = duration as u64;
-                    let duration_display = if duration_secs >= 60 {
-                        format!("{}m{}s", duration_secs / 60, duration_secs % 60)
+                    let run = run_for_task.get().cloned();
+                    let phase = if success {
+                        aidaemon_runtime::run_state::RunPhase::Succeeded
                     } else {
-                        format!("{}s", duration_secs)
+                        aidaemon_runtime::run_state::RunPhase::Failed
                     };
-
                     let status_word = if success { "completed" } else { "failed" };
                     let notification_summary: String = persisted_output.chars().take(500).collect();
                     let diff_section = if let Some(ref dir) = notify_working_dir {
@@ -3037,19 +2970,14 @@ impl CliAgentTool {
                     } else {
                         None
                     };
-
-                    let message = format!(
-                        "Background task {} ({}, {})\nTask: {}\nResult: {}{}",
-                        status_word,
-                        tool_name_owned,
-                        duration_display,
-                        task_context,
-                        notification_summary,
-                        diff_section.unwrap_or_default(),
+                    // The result alone: the run's card says what it was and
+                    // how it ended, with its measured time.
+                    let body = format!(
+                        "{}{}",
+                        notification_summary.trim(),
+                        diff_section.unwrap_or_default()
                     );
                     let notification_type = if success { "completed" } else { "failed" };
-                    let message =
-                        crate::channels::present_notification(notification_type, &message);
 
                     // Direct channel delivery is intentionally not a second
                     // agent turn, but the result must still enter the session's
@@ -3082,7 +3010,11 @@ impl CliAgentTool {
                         );
                     }
 
-                    let mut delivered = false;
+                    // The written answer, when the agent loop gives one.
+                    let mut reply: Option<(
+                        String,
+                        Option<crate::runtime_ports::AgentResponseEnvelope>,
+                    )> = None;
                     if notify_goal_id.is_empty() && !notify_session_id.trim().is_empty() {
                         let reengagement_allowed = {
                             let mut log = reengagements_for_completion.lock().await;
@@ -3111,114 +3043,30 @@ impl CliAgentTool {
                                 session_id = %notify_session_id,
                                 "Re-engaging agent loop after CLI agent completion"
                             );
-                            let continuation_started = Instant::now();
-                            let mut continuation_progress =
-                                tokio::time::interval(BACKGROUND_CHAT_PROGRESS_INTERVAL);
-                            continuation_progress
-                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                            continuation_progress.tick().await;
-                            let mut continuation = std::pin::pin!(
-                                crate::tools::terminal::run_background_continuation(
-                                    agent.as_ref(),
-                                    ConversationRequest {
-                                        session_id: notify_session_id.clone(),
-                                        user_text: followup,
-                                        status_tx: None,
-                                        user_role: crate::types::UserRole::Owner,
-                                        channel_ctx: crate::types::ChannelContext::internal(),
-                                        heartbeat: None,
-                                        parent_task_id: None,
-                                        parent_tool_call_id: None,
-                                        parent_result_id: None,
-                                    },
-                                )
-                            );
-                            let continuation_result = loop {
-                                tokio::select! {
-                                    result = &mut continuation => break result,
-                                    _ = continuation_progress.tick() => {
-                                        let progress_message = format_background_progress(
-                                            "AIDaemon",
-                                            &task_context,
-                                            continuation_started.elapsed().as_secs(),
-                                            Some("Processing the delegated result and continuing the remaining work."),
-                                        );
-                                        deliver_cli_agent_notification(
-                                            hub_for_completion.as_ref(),
-                                            &state_for_completion,
-                                            &notify_goal_id,
-                                            &notify_session_id,
-                                            "progress",
-                                            &progress_message,
-                                            "cli_agent completion continuation progress notifier",
-                                        )
-                                        .await;
-                                    }
-                                }
-                            };
-                            match continuation_result {
+                            if let Some(run) = run.as_ref() {
+                                run.step(Step::Reporting).await;
+                            }
+                            match crate::tools::terminal::run_background_continuation(
+                                agent.as_ref(),
+                                ConversationRequest {
+                                    session_id: notify_session_id.clone(),
+                                    user_text: followup,
+                                    status_tx: None,
+                                    user_role: crate::types::UserRole::Owner,
+                                    channel_ctx: crate::types::ChannelContext::internal(),
+                                    heartbeat: None,
+                                    parent_task_id: None,
+                                    parent_tool_call_id: None,
+                                    parent_result_id: None,
+                                },
+                            )
+                            .await
+                            {
                                 Ok(envelope) if !envelope.text.trim().is_empty() => {
-                                    let reply = crate::tools::sanitize::sanitize_user_facing_reply(
+                                    let text = crate::tools::sanitize::sanitize_user_facing_reply(
                                         &envelope.text,
                                     );
-                                    if let Some(ref hub) = hub_for_completion {
-                                        let _ = agent
-                                            .record_continuation_delivery(
-                                                &notify_session_id,
-                                                envelope.delivery(
-                                                    "background_router",
-                                                    crate::events::ResponseDeliveryState::Queued,
-                                                    Vec::new(),
-                                                    None,
-                                                ),
-                                            )
-                                            .await;
-                                        match hub
-                                            .send_text_tracked(&notify_session_id, &reply)
-                                            .await
-                                        {
-                                            Ok(platform_id) => {
-                                                delivered = true;
-                                                let _ = agent
-                                                    .record_continuation_delivery(
-                                                        &notify_session_id,
-                                                        envelope.delivery(
-                                                            "background_router",
-                                                            crate::events::ResponseDeliveryState::PlatformAcknowledged,
-                                                            platform_id.into_iter().collect(),
-                                                            None,
-                                                        ),
-                                                    )
-                                                    .await;
-                                            }
-                                            Err(e) => warn!(
-                                                task_id = %task_id_for_notify,
-                                                session_id = %notify_session_id,
-                                                error = %e,
-                                                "cli_agent continuation reply delivery failed"
-                                            ),
-                                        }
-                                    }
-                                    if !delivered {
-                                        let entry = crate::traits::NotificationEntry::new(
-                                            &notify_goal_id,
-                                            &notify_session_id,
-                                            "progress",
-                                            &reply,
-                                        );
-                                        match state_for_completion
-                                            .enqueue_notification(&entry)
-                                            .await
-                                        {
-                                            Ok(()) => delivered = true,
-                                            Err(e) => warn!(
-                                                task_id = %task_id_for_notify,
-                                                session_id = %notify_session_id,
-                                                error = %e,
-                                                "cli_agent continuation reply enqueue failed"
-                                            ),
-                                        }
-                                    }
+                                    reply = Some((text, Some(envelope)));
                                 }
                                 Ok(_) => warn!(
                                     task_id = %task_id_for_notify,
@@ -3235,47 +3083,65 @@ impl CliAgentTool {
                         }
                     }
 
+                    // The run ends first: its card settles to its final
+                    // header, then the result follows without repeating it.
+                    let ended = match run.as_ref() {
+                        Some(run) => Some(run.finish(phase, Default::default()).await),
+                        None => None,
+                    };
+                    let present = |body: &str| match (run.as_ref(), ended.as_ref()) {
+                        (Some(run), Some((state, on_card))) => {
+                            run.result(state.as_ref(), body, *on_card)
+                        }
+                        _ => crate::channels::present_notification(notification_type, body),
+                    };
+                    let (text, envelope) = match reply {
+                        Some((text, envelope)) => (present(&text), envelope),
+                        None => (present(&body), None),
+                    };
+
+                    let mut delivered = false;
                     if let Some(ref hub) = hub_for_completion {
-                        if delivered {
-                            // The continuation reply is the useful completion;
-                            // suppress the lower-level raw task notification.
-                        } else if let Err(e) = hub.send_text(&notify_session_id, &message).await {
-                            warn!(
+                        if let (Some(envelope), Some(agent)) =
+                            (envelope.as_ref(), agent_for_completion.as_ref())
+                        {
+                            let _ = agent
+                                .record_continuation_delivery(
+                                    &notify_session_id,
+                                    envelope.delivery(
+                                        "background_router",
+                                        crate::events::ResponseDeliveryState::Queued,
+                                        Vec::new(),
+                                        None,
+                                    ),
+                                )
+                                .await;
+                        }
+                        match hub.send_text_tracked(&notify_session_id, &text).await {
+                            Ok(platform_id) => {
+                                delivered = true;
+                                if let (Some(envelope), Some(agent)) =
+                                    (envelope.as_ref(), agent_for_completion.as_ref())
+                                {
+                                    let _ = agent
+                                        .record_continuation_delivery(
+                                            &notify_session_id,
+                                            envelope.delivery(
+                                                "background_router",
+                                                crate::events::ResponseDeliveryState::PlatformAcknowledged,
+                                                platform_id.into_iter().collect(),
+                                                None,
+                                            ),
+                                        )
+                                        .await;
+                                }
+                            }
+                            Err(e) => warn!(
                                 task_id = %task_id_for_notify,
                                 session_id = %notify_session_id,
                                 error = %e,
                                 "cli_agent background completion direct hub delivery failed"
-                            );
-                        } else {
-                            delivered = true;
-                        }
-                    }
-
-                    // The session's background status message ("still working
-                    // on it…") is resolved now the job is over. Once the result
-                    // went out as its own message the status only repeats it,
-                    // so it is removed; it is marked resolved instead where the
-                    // channel cannot delete, or when the result was queued.
-                    if let Some(ref hub) = hub_for_completion {
-                        let surface = hub.take_background_status_surface(&notify_session_id).await;
-                        let removed = match (&surface, delivered) {
-                            (Some(id), true) => {
-                                matches!(hub.delete_message(&notify_session_id, id).await, Ok(true))
-                            }
-                            _ => false,
-                        };
-                        if !removed {
-                            crate::tools::terminal::finalize_background_completion_surface(
-                                Some(hub),
-                                &notify_session_id,
-                                surface.as_deref(),
-                                if delivered {
-                                    crate::tools::terminal::BackgroundSurfaceOutcome::Delivered
-                                } else {
-                                    crate::tools::terminal::BackgroundSurfaceOutcome::Queued
-                                },
-                            )
-                            .await;
+                            ),
                         }
                     }
 
@@ -3289,7 +3155,7 @@ impl CliAgentTool {
                             queue_goal_id,
                             &notify_session_id,
                             notification_type,
-                            &message,
+                            &text,
                         );
                         if let Err(e) = state_for_completion.enqueue_notification(&entry).await {
                             warn!(
@@ -3301,6 +3167,18 @@ impl CliAgentTool {
                         }
                     }
                 }
+            }
+            // However it ended, its run ends with it (a second end is a
+            // no-op).
+            if let Some(run) = run_for_task.get().cloned() {
+                let phase = if exit_code == Some(0) && !loop_detected {
+                    aidaemon_runtime::run_state::RunPhase::Succeeded
+                } else {
+                    aidaemon_runtime::run_state::RunPhase::Failed
+                };
+                tokio::spawn(async move {
+                    run.finish(phase, Default::default()).await;
+                });
             }
             // Publish completion only after durable invocation/task state has
             // been flushed. Reapers and `check` callers must never observe a
@@ -3314,6 +3192,7 @@ impl CliAgentTool {
             let working_dir_owned = diff_capture_working_dir.clone();
             let agent = RunningCliAgent {
                 tool_name: tool_name.to_string(),
+                label: run_label.clone(),
                 prompt_summary: short_summary.clone(),
                 started_at: started_at_instant,
                 display_buf,
@@ -3333,9 +3212,12 @@ impl CliAgentTool {
 
             mark_left_in_background();
             return Ok(format!(
-                "CLI agent '{}' started in background (task_id={}). \
+                "{}\nCLI agent '{}' started in background (task_id={}). \
                  Use action=\"check\" with task_id=\"{}\" to see output when done.",
-                tool_name, task_id, task_id
+                aidaemon_runtime::background_run::started_in_background(&run_label),
+                tool_name,
+                task_id,
+                task_id
             ));
         }
 
@@ -3511,12 +3393,24 @@ impl CliAgentTool {
                     truncate_with_note(&buf, 1000)
                 };
 
-                // The caller got an early return; ensure we notify on completion.
+                // The caller got an early return: the agent is a background
+                // run now, and its completion is delivered.
+                self.start_background_run(
+                    &run_slot,
+                    &task_id,
+                    session_id,
+                    &run_label,
+                    delegated_task_id,
+                    status_tx.clone(),
+                    run_began,
+                )
+                .await;
                 should_notify.store(true, Ordering::Relaxed);
 
                 // Store the running agent for later checking/cancellation
                 let agent = RunningCliAgent {
                     tool_name: tool_name.to_string(),
+                    label: run_label.clone(),
                     prompt_summary: short_summary.clone(),
                     started_at: started_at_instant,
                     display_buf,
@@ -3536,13 +3430,48 @@ impl CliAgentTool {
 
                 mark_left_in_background();
                 Ok(format!(
-                    "CLI agent '{}' still running after {}s. Moved to background (task_id={}).\n\
+                    "{}\nCLI agent '{}' still running after {}s. Moved to background (task_id={}).\n\
                      Use action=\"check\" with task_id=\"{}\" to see output, or action=\"cancel\" to stop it.\n\n\
                      Partial output:\n{}",
-                    tool_name, elapsed, task_id, task_id, partial_output
+                    aidaemon_runtime::background_run::started_in_background(&run_label),
+                    tool_name,
+                    elapsed,
+                    task_id,
+                    task_id,
+                    partial_output
                 ))
             }
         }
+    }
+
+    /// Record the agent as a background run and show it on its turn's card.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_background_run(
+        &self,
+        slot: &std::sync::OnceLock<Arc<BackgroundRun>>,
+        task_id: &str,
+        session_id: &str,
+        label: &str,
+        turn_task_id: Option<&str>,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        work_began: chrono::DateTime<chrono::Utc>,
+    ) {
+        if session_id.trim().is_empty() || slot.get().is_some() {
+            return;
+        }
+        let run = BackgroundRun::start(
+            self.run_home(),
+            aidaemon_runtime::background_run::RunStart {
+                id: &format!("cli-agent-{task_id}"),
+                chat: session_id,
+                label,
+                task_id: turn_task_id,
+                status_tx,
+                work_began,
+            },
+        )
+        .await;
+        let _ = slot.set(run);
     }
 
     async fn persist_delegated_cli_handoff(
@@ -4511,11 +4440,7 @@ impl crate::traits::ToolSemantics for CliAgentTool {
             .map(
                 |(task_id, agent)| aidaemon_tools::semantics::BackgroundJob {
                     key: task_id.clone(),
-                    title: format!(
-                        "Coding agent ({}): {}",
-                        agent.tool_name,
-                        truncate_str(agent.prompt_summary.trim(), 80)
-                    ),
+                    title: agent.label.clone(),
                     started_at: now
                         - chrono::Duration::from_std(agent.started_at.elapsed())
                             .unwrap_or_default(),
@@ -5035,6 +4960,7 @@ impl CliAgentTool {
                             enforce_native_access,
                             async_mode,
                             status_tx.clone(),
+                            args.description.as_deref(),
                         )
                         .await
                     {
@@ -5345,20 +5271,6 @@ mod tests {
         assert!(followup.contains("The root cause is in scheduler.rs"));
     }
 
-    #[test]
-    fn background_progress_is_elapsed_state_not_prompt_wording() {
-        let message = format_background_progress(
-            "codex",
-            "Investigate an arbitrary unfinished operation",
-            240,
-            Some("Running focused validation"),
-        );
-
-        assert!(message.contains("Still working on it in the background (4 min)"));
-        assert!(message.contains("Codex: Investigate"));
-        assert!(!message.contains("Running focused validation"));
-    }
-
     /// Create a CliAgentTool with `echo` registered as a test tool.
     /// Uses a real temp-file SQLite DB for state persistence.
     async fn setup_echo_tool() -> (CliAgentTool, tempfile::NamedTempFile) {
@@ -5410,6 +5322,8 @@ mod tests {
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             owner_answers: Default::default(),
             hub: OnceLock::new(),
+            runs: OnceLock::new(),
+            plan_store: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -5467,6 +5381,8 @@ mod tests {
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             owner_answers: Default::default(),
             hub: OnceLock::new(),
+            runs: OnceLock::new(),
+            plan_store: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -7224,6 +7140,8 @@ mod tests {
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             owner_answers: Default::default(),
             hub: OnceLock::new(),
+            runs: OnceLock::new(),
+            plan_store: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -7302,6 +7220,8 @@ mod tests {
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             owner_answers: Default::default(),
             hub: OnceLock::new(),
+            runs: OnceLock::new(),
+            plan_store: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -7473,6 +7393,8 @@ mod tests {
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             owner_answers: Default::default(),
             hub: OnceLock::new(),
+            runs: OnceLock::new(),
+            plan_store: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -7730,42 +7652,74 @@ mod tests {
         .unwrap();
         let jobs = tool.background_jobs("session-cli-jobs").await;
         assert_eq!(jobs.len(), 1, "{jobs:?}");
-        assert!(
-            jobs[0].title.starts_with("Coding agent (bash-agent): "),
-            "{jobs:?}"
-        );
+        // Named by what it is, never by its prompt.
+        assert_eq!(jobs[0].title, "bash-agent coding agent", "{jobs:?}");
         assert_eq!(jobs[0].task_id.as_deref(), Some("turn-cli"));
         assert!(tool.background_jobs("another-session").await.is_empty());
         assert!(tool.stop_background_job(&jobs[0].key).await);
         assert!(tool.background_jobs("session-cli-jobs").await.is_empty());
     }
 
+    /// A CLI agent left running in the background is a run on its turn's
+    /// one card: the reply names it in plain words (never the prompt), its
+    /// latest output line is its step (never "(N min)"), it settles to its
+    /// final header, and its result follows without the header.
     #[tokio::test]
-    async fn async_run_queues_chat_visible_progress_while_still_running() {
+    async fn a_background_agent_shows_one_card_that_settles() {
         let (tool, _db) = setup_bash_tool().await;
-        let state = tool.state.clone();
-        tool.call_with_status_under_contract(
-            r#"{"action":"run","tool":"bash-agent","prompt":"sleep 5","async_mode":true}"#,
-            None,
-            false,
-            false,
-            &crate::testing::call_facts("session-progress"),
-        )
-        .await
-        .unwrap();
-
-        tokio::time::sleep(Duration::from_millis(750)).await;
-        let notifications = state.get_pending_notifications(20).await.unwrap();
+        let chat = crate::testing::CardChat::new("telegram:synthetic-agent").await;
+        tool.set_hub(chat.outbound());
+        let facts = crate::testing::call_facts("telegram:synthetic-agent");
+        let output = chat
+            .turn(
+                |tx| {
+                    tool.call_with_status_under_contract(
+                        r#"{"action":"run","tool":"bash-agent","prompt":"echo working-on-it; sleep 4; echo agent-done","description":"tidy the notes","async_mode":true}"#,
+                        Some(tx),
+                        false,
+                        false,
+                        &facts,
+                    )
+                },
+                |output| {
+                    output
+                        .as_ref()
+                        .map(|output| output.lines().next().unwrap_or("").to_string())
+                        .unwrap_or_default()
+                },
+            )
+            .await
+            .unwrap();
         assert!(
-            notifications.iter().any(|entry| {
-                entry.session_id == "session-progress"
-                    && entry.notification_type == "progress"
-                    && entry.message.contains("Still working")
-            }),
-            "pending notifications: {notifications:?}"
+            output.starts_with("Started in the background: tidy the notes."),
+            "{output}"
         );
-
-        tool.handle_cancel_all("session-progress").await.unwrap();
+        assert!(
+            chat.wait_for(Duration::from_secs(10), |text| text
+                .starts_with("⏳ Running in the background: tidy the notes")
+                && text.contains("last output: working-on-it"))
+                .await,
+            "{:#?}",
+            chat.shown().await
+        );
+        assert!(
+            chat.wait_for(Duration::from_secs(20), |text| text.contains("agent-done")
+                && text.contains("Measured"))
+                .await,
+            "{:#?}",
+            chat.shown().await
+        );
+        chat.assert_one_settled_card(
+            "✅ Finished in the background: tidy the notes",
+            "agent-done",
+        )
+        .await;
+        for text in chat.shown().await {
+            assert!(
+                !text.contains("sleep 4"),
+                "the prompt is never echoed: {text}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
