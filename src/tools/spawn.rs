@@ -112,6 +112,7 @@ mod tests {
             step: None,
             evidence: aidaemon_runtime::run_state::RunEvidence {
                 unconfirmed: unconfirmed.iter().map(|s| s.to_string()).collect(),
+                failure: None,
             },
             card: Default::default(),
         }
@@ -574,6 +575,8 @@ mod child_runtime_tests {
         runs: Arc<aidaemon_runtime::run_state::RunStates>,
         /// How its runs end when they return.
         phase: StdMutex<RunPhase>,
+        /// What its run records say of how they ended.
+        evidence: StdMutex<aidaemon_runtime::run_state::RunEvidence>,
     }
 
     impl ScriptedChild {
@@ -593,6 +596,7 @@ mod child_runtime_tests {
                 authorities: StdMutex::new(Vec::new()),
                 runs: Default::default(),
                 phase: StdMutex::new(RunPhase::Succeeded),
+                evidence: StdMutex::new(Default::default()),
             })
         }
     }
@@ -653,7 +657,7 @@ mod child_runtime_tests {
                 outcome: TaskOutcome::Succeeded,
                 trust: SourceTrust::Trusted,
                 phase: *self.phase.lock().unwrap(),
-                evidence: Default::default(),
+                evidence: self.evidence.lock().unwrap().clone(),
             })
         }
         fn helper_runs(&self) -> Arc<aidaemon_runtime::run_state::RunStates> {
@@ -2856,9 +2860,161 @@ mod child_runtime_tests {
             "new_folders": [free],
         })
         .to_string();
-        tool.call_with_execution_context(&args, None, facts())
-            .await
-            .expect("a folder that doesn't exist yet is fine");
+        tool.call_with_execution_context(
+            &args,
+            None,
+            facts_with_authority(aidaemon_core::Authority::full()),
+        )
+        .await
+        .expect("a folder that doesn't exist yet is fine");
         assert_eq!(child.tasks.lock().unwrap().len(), 1);
+
+        // The spawn made the folder, empty, and told the child it is there
+        // to work in.
+        let made = std::path::Path::new(&free);
+        assert!(made.is_dir(), "the new folder exists before the child runs");
+        assert_eq!(std::fs::read_dir(made).unwrap().count(), 0);
+        assert!(
+            child.tasks.lock().unwrap()[0].contains(&format!("{free}, was just created")),
+            "{:?}",
+            child.tasks.lock().unwrap()
+        );
+        // Its write authority is derived from the spec, in one place: the
+        // folder made for it is inside, anything else is outside.
+        let declaration = child.declarations.lock().unwrap()[0].clone();
+        assert_eq!(declaration.new_folders, std::slice::from_ref(&free));
+        let parent = crate::agent::authority::InheritedAuthority {
+            child_declaration: Some(declaration),
+            ..crate::agent::authority::parent_authority(&facts_with_authority(
+                aidaemon_core::Authority::full(),
+            ))
+            .unwrap()
+            .clone()
+        };
+        let child_access = crate::agent::authority::narrow_for_child(
+            &parent,
+            crate::agent::authority::ResolvedAuthority {
+                authority: aidaemon_core::Authority::full(),
+                owner_level: Some(crate::config::OwnerLevel::Full),
+                task_access: None,
+            },
+        )
+        .task_access
+        .expect("a child with a declared folder is confined to it");
+        let writes = |path: &str| crate::traits::ToolCallAccessManifest {
+            write_targets: vec![crate::traits::ToolTargetHint::new(
+                crate::traits::ToolTargetHintKind::Path,
+                path.to_string(),
+            )
+            .unwrap()],
+            ..Default::default()
+        };
+        let check = |path: &str| {
+            aidaemon_runtime::turn::tool_dispatch::access_manifest_scope_check(
+                "write_file",
+                &writes(path),
+                Some(&child_access),
+                &[],
+                None,
+                &crate::tools::DaemonPaths::default(),
+            )
+        };
+        assert!(check(&format!("{free}/wp-config.php")).is_none());
+        assert!(check(&format!("{free}/.ddev/config.yaml")).is_none());
+        let taken_file = format!("{taken}/index.php");
+        assert!(
+            check(&taken_file).is_some(),
+            "the earlier site next to it is outside the child's scope"
+        );
+    }
+
+    /// A spawn that cannot start gives back the folders it made, so the
+    /// name is free again.
+    #[tokio::test]
+    async fn a_spawn_that_fails_to_start_gives_its_new_folder_back() {
+        let root = tempfile::tempdir().unwrap();
+        let child = ScriptedChild::new("set up", Duration::from_millis(10));
+        child
+            .fails_in_setup
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let tool = tool_for(&child);
+        let folder = root.path().join("site").display().to_string();
+        let args = json!({
+            "title": "Site install",
+            "task": "Install a fresh site",
+            "new_folders": [folder],
+        })
+        .to_string();
+        let _ = tool.call_with_execution_context(&args, None, facts()).await;
+        assert!(!std::path::Path::new(&folder).exists());
+    }
+
+    /// A helper whose run record says it did none of its work fails, with
+    /// the typed reason, whatever its reply says: the parent gets the
+    /// failure and the measured time worded as how long it ran before
+    /// failing, never as a time to finish.
+    #[tokio::test]
+    async fn a_helper_that_did_nothing_fails_with_its_typed_reason() {
+        let child = ScriptedChild::new(
+            "**Blocked:** the folder does not exist here.",
+            Duration::from_millis(10),
+        );
+        *child.phase.lock().unwrap() = RunPhase::Failed;
+        *child.evidence.lock().unwrap() = aidaemon_runtime::run_state::RunEvidence {
+            unconfirmed: Vec::new(),
+            failure: Some(aidaemon_runtime::run_state::RunFailure::NothingDone {
+                undone: vec!["Install WordPress with DDEV".to_string()],
+            }),
+        };
+        let tool = tool_for(&child);
+        let args = json!({
+            "title": "WordPress install",
+            "task": "Install WordPress",
+        })
+        .to_string();
+        let error = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .expect_err("a helper that did nothing failed")
+            .to_string();
+        assert!(error.contains("Sub-agent failed."), "{error}");
+        assert!(
+            error.contains("It ended without doing any of its work")
+                && error.contains("Install WordPress with DDEV"),
+            "the typed reason reaches the parent: {error}"
+        );
+        assert!(
+            error.contains("and failed.") && error.contains("not how long its work takes"),
+            "{error}"
+        );
+
+        // In a batch beside a helper that succeeded, the failure is that
+        // helper's section and the call is not a success.
+        let ok = Ok(reported("done".to_string(), SourceTrust::Trusted));
+        let combined = combine_batch(
+            vec![
+                (
+                    "Drupal install".to_string(),
+                    ok.map(|mut outcome| {
+                        outcome.metadata.outcome_status =
+                            Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded);
+                        outcome
+                    }),
+                ),
+                (
+                    "WordPress install".to_string(),
+                    Err(anyhow::anyhow!(error.clone())),
+                ),
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(combined
+            .output
+            .contains("### WordPress install\nFailed: Sub-agent failed."));
+        assert_ne!(
+            combined.metadata.outcome_status,
+            Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded)
+        );
     }
 }

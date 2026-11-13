@@ -1076,6 +1076,7 @@ impl BrowserTool {
         &self,
         args: &Value,
         session_id: &str,
+        fence: Option<&std::sync::Arc<dyn aidaemon_tools::semantics::FileFence>>,
     ) -> Result<DispatchResult, String> {
         // `page_for` already rejects an empty session id before any capture; we
         // additionally guard the media-delivery path below so an empty id can
@@ -1149,9 +1150,39 @@ impl BrowserTool {
             }
         };
 
+        // One request delivers a page's screenshot once: the first agent of
+        // the request to send it owns that delivery (live 2026-11-13: a
+        // helper sent the Drupal homepage, then the main agent sent it again).
+        // A later capture is kept for looking at, not sent.
+        let subject = format!("screenshot:{}", short_page_name(&display_url));
+        if let Some(fence) = fence {
+            if let Err(delivered) = fence.claim_delivery(&subject).await {
+                return Ok(DispatchResult {
+                    text: format!(
+                        "Screenshot captured, not sent: {} already sent the owner a screenshot \
+                         of {} at {} in this request, and each is sent once. This capture is \
+                         only for you to look at.\nSaved to: {}",
+                        delivered.by,
+                        short_page_name(&display_url),
+                        delivered.owner_time(),
+                        saved_attachment.local_path
+                    ),
+                    attachments: vec![saved_attachment],
+                    semantics: None,
+                });
+            }
+        }
+        let release = |reason: String| async move {
+            if let Some(fence) = fence {
+                fence.release_delivery(&subject).await;
+            }
+            reason
+        };
+
         // Honest delivery: ask the media listener to report the ACTUAL outcome.
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-        self.media_tx
+        if let Err(e) = self
+            .media_tx
             .send(MediaMessage {
                 session_id: session_id.to_string(),
                 caption: caption.clone(),
@@ -1159,7 +1190,9 @@ impl BrowserTool {
                 result_tx: Some(result_tx),
             })
             .await
-            .map_err(|e| format!("Failed to send screenshot to chat: {}", e))?;
+        {
+            return Err(release(format!("Failed to send screenshot to chat: {}", e)).await);
+        }
 
         // Wait (bounded) for the listener to confirm delivery, then report
         // HONESTLY — never claim "sent" unless the channel actually accepted it.
@@ -1180,24 +1213,27 @@ impl BrowserTool {
                 )
             }
             Ok(Ok(Err(reason))) => {
-                return Err(format!(
+                return Err(release(format!(
                     "Screenshot captured but could NOT be delivered to chat: {}. The image was not sent.",
                     reason
                 ))
+                .await)
             }
             Ok(Err(_)) => {
-                return Err(
+                return Err(release(
                     "Screenshot captured but delivery could not be confirmed (the delivery channel \
                  was dropped). The image may not have been sent."
                         .to_string(),
                 )
+                .await)
             }
             Err(_) => {
-                return Err(
+                return Err(release(
                     "Screenshot captured but delivery could not be confirmed within the timeout. \
                  The image may not have been sent."
                         .to_string(),
                 )
+                .await)
             }
         };
 
@@ -1796,13 +1832,14 @@ impl BrowserTool {
         action: &str,
         args: &Value,
         session_id: &str,
+        fence: Option<&std::sync::Arc<dyn aidaemon_tools::semantics::FileFence>>,
     ) -> Result<DispatchResult, String> {
         match action {
             "navigate" => self
                 .action_navigate(args, session_id)
                 .await
                 .map(DispatchResult::text_only),
-            "screenshot" => self.action_screenshot(args, session_id).await,
+            "screenshot" => self.action_screenshot(args, session_id, fence).await,
             "render_pdf" => self.action_render_pdf(args).await,
             "click" => self
                 .action_click(args, session_id)
@@ -1910,8 +1947,9 @@ impl BrowserTool {
         action: &str,
         args: &Value,
         session_id: &str,
+        fence: Option<&std::sync::Arc<dyn aidaemon_tools::semantics::FileFence>>,
     ) -> Result<DispatchResult, String> {
-        let first = self.dispatch_action(action, args, session_id).await;
+        let first = self.dispatch_action(action, args, session_id, fence).await;
         let err = match first {
             Ok(ok) => return Ok(ok),
             Err(e) => e,
@@ -1944,7 +1982,7 @@ impl BrowserTool {
         if Self::action_is_safe_to_replay(action) {
             // Idempotent: retry once against a freshly-minted page.
             info!(action, "retrying idempotent browser action after reconnect");
-            return self.dispatch_action(action, args, session_id).await;
+            return self.dispatch_action(action, args, session_id, fence).await;
         }
 
         // Mutation: NEVER auto-replay. The connection is restored for subsequent
@@ -2243,7 +2281,11 @@ impl BrowserTool {
             return Ok(DispatchResult::text_only(format!("Error: {}", reason)));
         }
 
-        match self.dispatch_with_recovery(action, &args, session_id).await {
+        let fence = aidaemon_tools::semantics::file_fence(facts).cloned();
+        match self
+            .dispatch_with_recovery(action, &args, session_id, fence.as_ref())
+            .await
+        {
             Ok(result) => Ok(result),
             Err(err_text) => {
                 warn!(action, error = %err_text, "Browser action failed");

@@ -2238,6 +2238,37 @@ pub trait FileFence: Send + Sync {
     /// Taken before the tool reads the file it is about to change, and held
     /// until the write has landed.
     async fn begin_write(&self, path: &str) -> Result<Box<dyn FileWriteGuard>, String>;
+
+    /// Claim the delivery to the owner of the artifact `subject` names (a
+    /// page's screenshot names the page) for this call. One request's agents
+    /// deliver each artifact once: whoever delivers it first owns it, and a
+    /// later claim gets who did and when. Release a claim whose delivery
+    /// then failed ([`Self::release_delivery`]).
+    async fn claim_delivery(&self, _subject: &str) -> Result<(), DeliveredArtifact> {
+        Ok(())
+    }
+
+    /// Give back a claim whose delivery did not happen.
+    async fn release_delivery(&self, _subject: &str) {}
+}
+
+/// An artifact one of the request's agents already delivered to the owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveredArtifact {
+    /// Who delivered it, in words the owner reads ("you", or the helper's
+    /// mission).
+    pub by: String,
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+impl DeliveredArtifact {
+    /// When it was delivered, on the owner's clock ("3:41:22 AM").
+    pub fn owner_time(&self) -> String {
+        self.at
+            .with_timezone(&chrono::Local)
+            .format("%-I:%M:%S %p")
+            .to_string()
+    }
 }
 
 /// This call's [`FileFence`], carried in [`ToolCallContext::extensions`].

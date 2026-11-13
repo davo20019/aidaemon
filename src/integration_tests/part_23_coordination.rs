@@ -401,6 +401,7 @@ mod coordination_tests {
         parent.child_declaration = Some(crate::agent::authority::ChildDeclaration {
             parent_session: "telegram:synthetic-user-1".to_string(),
             scope: vec!["/w/synthetic".to_string()],
+            new_folders: Vec::new(),
             precedence: None,
             claim: None,
         });

@@ -385,6 +385,9 @@ pub struct ChildDeclaration {
     pub parent_session: String,
     /// Files or directories the child will change, resolved.
     pub scope: Vec<String>,
+    /// Folders made fresh for this child's work (absolute; the spawn
+    /// created them empty, see `spawn_tool::claim_new_folders`).
+    pub new_folders: Vec<String>,
     /// Who wins where that scope overlaps a running sibling's, if stated.
     pub precedence: Option<crate::coordination::Precedence>,
     /// The child's place in spawn order, held until it joins the roster.
@@ -469,6 +472,22 @@ pub struct InheritedAuthority {
     pub parent_task: Option<aidaemon_events::TaskRef>,
 }
 
+impl ChildDeclaration {
+    /// Where the child may write: its declared scope and the folders made
+    /// for it, absolute paths only. Empty: the spawn declared none, and the
+    /// child writes where its parent may.
+    pub fn write_scope(&self) -> Vec<String> {
+        let mut roots: Vec<String> = Vec::new();
+        for path in self.scope.iter().chain(&self.new_folders) {
+            let path = shellexpand::tilde(path.trim()).into_owned();
+            if std::path::Path::new(&path).is_absolute() && !roots.contains(&path) {
+                roots.push(path);
+            }
+        }
+        roots
+    }
+}
+
 /// The parent turn's authority the dispatcher handed `spawn_agent`: an
 /// application fact (it carries the owner's configured level), so it rides
 /// in the call context's extensions rather than as a typed SDK field.
@@ -496,15 +515,66 @@ pub const INHERITED_REQUEST_CHARS: usize = 4000;
 
 /// A child's own resolution narrowed by what its parent turn had: the
 /// narrower authority, the lower owner level (a guest parent's `None` stays
-/// `None`), and the parent's workspace confinement when it had one.
+/// `None`), and the parent's workspace confinement when it had one, further
+/// confined to what its spawn declared it will change
+/// ([`ChildDeclaration::write_scope`]).
 pub fn narrow_for_child(parent: &InheritedAuthority, own: ResolvedAuthority) -> ResolvedAuthority {
+    let inherited = parent.task_access.clone().or(own.task_access);
+    let declared = parent
+        .child_declaration
+        .as_ref()
+        .map(ChildDeclaration::write_scope)
+        .unwrap_or_default();
     ResolvedAuthority {
         authority: parent.authority.narrow(&own.authority),
         owner_level: match (parent.owner_level, own.owner_level) {
             (Some(parent), Some(own)) => Some(parent.min(own)),
             _ => None,
         },
-        task_access: parent.task_access.clone().or(own.task_access),
+        task_access: confine_writes(inherited, &declared),
+    }
+}
+
+/// `access` with writes confined to `roots`, never wider: under an existing
+/// confinement only the roots inside its write grants stay (none inside:
+/// writes go nowhere), and without one reads stay free as for a bound
+/// workspace. No roots: `access` unchanged.
+fn confine_writes(
+    access: Option<ToolCallAccessManifest>,
+    roots: &[String],
+) -> Option<ToolCallAccessManifest> {
+    if roots.is_empty() {
+        return access;
+    }
+    let grant = |root: &String| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, root.clone());
+    match access {
+        Some(mut access) => {
+            let within = |root: &String| {
+                let root = std::path::Path::new(root);
+                access.write_targets.iter().any(|target| {
+                    matches!(
+                        target.kind,
+                        ToolTargetHintKind::ProjectScope | ToolTargetHintKind::Path
+                    ) && root.starts_with(&target.value)
+                })
+            };
+            let kept: Vec<ToolTargetHint> = roots
+                .iter()
+                .filter(|root| within(root))
+                .filter_map(grant)
+                .collect();
+            access.write_targets = kept;
+            Some(access)
+        }
+        None => {
+            let read = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, "/".to_string())?;
+            Some(ToolCallAccessManifest {
+                execution_cwd: None,
+                read_targets: vec![read],
+                write_targets: roots.iter().filter_map(grant).collect(),
+                adapter_read_targets: Vec::new(),
+            })
+        }
     }
 }
 
@@ -965,6 +1035,64 @@ mod tests {
             },
         );
         assert_eq!(child.owner_level, None);
+    }
+
+    /// A child's write scope is what its spawn declared (its scope and the
+    /// folders made for it), and never wider than its parent's own
+    /// confinement: a declared root outside it is dropped.
+    #[test]
+    fn a_childs_writes_are_its_declared_scope_and_new_folders() {
+        let declared = |scope: &[&str], new_folders: &[&str]| ChildDeclaration {
+            scope: scope.iter().map(|path| path.to_string()).collect(),
+            new_folders: new_folders.iter().map(|path| path.to_string()).collect(),
+            ..Default::default()
+        };
+        let own = || ResolvedAuthority {
+            authority: Authority::full(),
+            owner_level: Some(OwnerLevel::Full),
+            task_access: None,
+        };
+        let writes = |access: &Option<ToolCallAccessManifest>| -> Vec<String> {
+            access
+                .as_ref()
+                .map(|access| {
+                    access
+                        .write_targets
+                        .iter()
+                        .map(|target| target.value.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        // Unconfined parent: writes go to the scope and the new folder only.
+        let mut parent = inherited(Authority::full(), Some(OwnerLevel::Full), None);
+        parent.child_declaration = Some(declared(
+            &["/tmp/aidaemon-test/shared/notes.md"],
+            &["/tmp/aidaemon-test/site-2"],
+        ));
+        let child = narrow_for_child(&parent, own());
+        assert_eq!(
+            writes(&child.task_access),
+            [
+                "/tmp/aidaemon-test/shared/notes.md",
+                "/tmp/aidaemon-test/site-2"
+            ]
+        );
+
+        // Nothing declared: the child writes where its parent may.
+        parent.child_declaration = Some(declared(&[], &[]));
+        assert_eq!(narrow_for_child(&parent, own()).task_access, None);
+
+        // A parent bound to a workspace keeps only the roots inside it.
+        let mut bound = inherited(
+            Authority::full(),
+            Some(OwnerLevel::Full),
+            bound_workspace_access("/tmp/aidaemon-test/ws"),
+        );
+        bound.child_declaration = Some(declared(&[], &["/tmp/aidaemon-test/ws/new", "/etc/x"]));
+        let child = narrow_for_child(&bound, own());
+        assert_eq!(writes(&child.task_access), ["/tmp/aidaemon-test/ws/new"]);
     }
 
     /// `/mode unrestricted` on a shared chat never relaxes a

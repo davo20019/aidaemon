@@ -37,12 +37,49 @@ pub fn phase_of(outcome: TaskOutcome) -> RunPhase {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunEvidence {
     pub unconfirmed: Vec<String>,
+    /// Why a `Failed` run failed, from its typed records; `None` for an
+    /// error, which says why itself.
+    pub failure: Option<RunFailure>,
+}
+
+/// Why a helper's run failed, decided from its typed records (its checklist
+/// steps and its receipts), never from its reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunFailure {
+    /// It ended without changing anything, while each step of its own that
+    /// needed a change was left undone: these steps (live 2026-11-13: a
+    /// WordPress install helper looked at its folder, found it missing and
+    /// stopped, reported "Blocked" in words, and its run read as finished).
+    NothingDone { undone: Vec<String> },
+}
+
+impl RunFailure {
+    /// The failure in one plain sentence.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::NothingDone { undone } if undone.is_empty() => {
+                "It ended without doing any of its work: nothing was changed.".to_string()
+            }
+            Self::NothingDone { undone } => format!(
+                "It ended without doing any of its work: nothing was changed, and {} undone: {}.",
+                if undone.len() == 1 {
+                    "this step is"
+                } else {
+                    "these steps are"
+                },
+                undone.join("; ")
+            ),
+        }
+    }
 }
 
 impl RunEvidence {
-    /// The one plain line under a finish header, when a typed step is
-    /// unconfirmed.
+    /// The one plain line under a finish header: why it failed, else the
+    /// typed steps left unconfirmed.
     pub fn line(&self) -> Option<String> {
+        if let Some(failure) = &self.failure {
+            return Some(failure.reason());
+        }
         match self.unconfirmed.as_slice() {
             [] => None,
             [one] => Some(format!("I couldn't verify one of its steps: {one}.")),
