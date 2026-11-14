@@ -347,7 +347,12 @@ const WEB_MODULES: &[(&str, &str)] = &[
     ("ui.js", include_str!("../web/ui.js")),
 ];
 
-async fn web_page() -> Response {
+async fn web_page(State(gateway): State<Arc<ClientGateway>>) -> Response {
+    // With the nsh app served, the old page's links (pairing links,
+    // bookmarks) open it instead; the browser keeps the `#offer=…`.
+    if gateway.config.app_dir.as_deref().is_some_and(|d| !d.trim().is_empty()) {
+        return axum::response::Redirect::temporary("/client/v1/next/").into_response();
+    }
     (
         [
             (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
