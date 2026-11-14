@@ -652,3 +652,108 @@ mod tests {
         assert_eq!(count, 2);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Upkeep scheduled from the Settings page (`settings_upkeep`)
+// ---------------------------------------------------------------------------
+
+async fn open_for_upkeep(db_path: &Path, key: Option<&str>) -> anyhow::Result<SqlitePool> {
+    let opts = SqliteConnectOptions::new().filename(db_path);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await?;
+    #[cfg(feature = "encryption")]
+    if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
+        apply_encryption_key(&pool, key).await?;
+    }
+    #[cfg(not(feature = "encryption"))]
+    let _ = key;
+    Ok(pool)
+}
+
+/// Fold the WAL into the database file, so the file alone holds it.
+pub(crate) async fn checkpoint(db_path: &Path, key: Option<&str>) -> anyhow::Result<()> {
+    let pool = open_for_upkeep(db_path, key).await?;
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    Ok(())
+}
+
+/// The database at `db_path` opens with `key` and passes its integrity check.
+pub(crate) async fn check_opens(db_path: &Path, key: Option<&str>) -> anyhow::Result<()> {
+    let pool = open_for_upkeep(db_path, key).await?;
+    let row = sqlx::query("PRAGMA quick_check").fetch_one(&pool).await?;
+    let verdict: String = row.try_get(0)?;
+    pool.close().await;
+    anyhow::ensure!(verdict == "ok", "integrity check said: {verdict}");
+    Ok(())
+}
+
+/// Re-encrypt the database from key `old` to key `new`.
+#[cfg(feature = "encryption")]
+pub(crate) async fn rekey(db_path: &Path, old: &str, new: &str) -> anyhow::Result<()> {
+    let pool = open_for_upkeep(db_path, Some(old)).await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PRAGMA rekey = '{}'",
+        new.replace('\'', "''")
+    )))
+    .execute(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("SQLCipher rekey failed: {e}"))?;
+    pool.close().await;
+    Ok(())
+}
+
+/// A fresh database key.
+#[cfg(feature = "encryption")]
+pub(crate) fn new_encryption_key() -> String {
+    generate_encryption_key_hex()
+}
+
+/// The `.env` file the database key is kept in when not in the keychain.
+#[cfg(feature = "encryption")]
+pub(crate) fn env_file_path(config_path: &Path) -> PathBuf {
+    resolve_env_file_path(config_path)
+}
+
+/// Store the database key in the `.env` file at `env_path`.
+#[cfg(feature = "encryption")]
+pub(crate) fn write_env_key(env_path: &Path, key: &str) -> anyhow::Result<()> {
+    persist_key_to_env_file(env_path, key)
+}
+
+#[cfg(all(test, feature = "encryption"))]
+mod upkeep_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_rekeyed_database_opens_only_with_the_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.db");
+        let pool = connect_sqlite_with_create(path.to_str().unwrap(), true)
+            .await
+            .unwrap();
+        apply_encryption_key(&pool, "old-synthetic-key")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE t (v TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t VALUES ('kept')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        checkpoint(&path, Some("old-synthetic-key")).await.unwrap();
+        rekey(&path, "old-synthetic-key", "new-synthetic-key")
+            .await
+            .unwrap();
+        check_opens(&path, Some("new-synthetic-key")).await.unwrap();
+        assert!(check_opens(&path, Some("old-synthetic-key")).await.is_err());
+    }
+}

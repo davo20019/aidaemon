@@ -1,5 +1,6 @@
 pub mod channels;
 pub mod client_gateway;
+pub(crate) mod client_settings;
 pub mod db_security;
 pub mod db_upkeep;
 pub(crate) mod engine;
@@ -11,6 +12,7 @@ pub mod nodes;
 pub mod oauth;
 pub(crate) mod prompt;
 pub mod runtime;
+pub(crate) mod settings_upkeep;
 pub mod skills;
 pub mod stores;
 pub(crate) mod terminal_bridge;

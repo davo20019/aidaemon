@@ -33,6 +33,9 @@ pub async fn run(
     }
 
     crate::startup::db_security::enforce_database_encryption(&mut config, &config_path).await?;
+    // Upkeep the owner scheduled from an app (move the file, rotate its
+    // key), before anything opens the database.
+    crate::startup::settings_upkeep::run_scheduled(&mut config, &config_path).await;
     crate::otel_export::start(&config.telemetry);
 
     let queue_policy = config.daemon.queue_policy.normalized();
@@ -433,6 +436,7 @@ pub async fn run(
             jobs: heartbeat_telemetry,
             queues: queue_telemetry.clone(),
             memory: memory_store.clone(),
+            mcp: Some(mcp_registry.clone()),
         },
     )
     .await?;

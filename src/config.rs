@@ -92,6 +92,90 @@ pub fn store_in_keychain(field_name: &str, value: &str) -> anyhow::Result<()> {
     aidaemon_secrets::SecretStore::set(secret_store().as_ref(), field_name, value)
 }
 
+/// The keychain entry a config setting set to `"keychain"` is read from
+/// (the names `resolve_secrets` uses), for storing it from an app. `None`:
+/// the setting is not read from the keychain, or (the database key) is
+/// changed only by rotating it.
+pub fn keychain_name_for(key: &str) -> Option<String> {
+    use aidaemon_secrets::names;
+    // `a.b[2].c` as segments: ("a", None), ("b", Some(2)), ("c", None).
+    let mut parts: Vec<(&str, Option<usize>)> = Vec::new();
+    for part in key.split('.') {
+        match part.split_once('[') {
+            Some((name, rest)) => {
+                let index = rest.strip_suffix(']')?.parse().ok()?;
+                parts.push((name, Some(index)));
+            }
+            None => parts.push((part, None)),
+        }
+    }
+    let plain = |i: usize| {
+        parts
+            .get(i)
+            .filter(|(_, index)| index.is_none())
+            .map(|(n, _)| *n)
+    };
+    match parts.first()? {
+        ("provider", None) => {
+            // provider(.fallbacks[i])*.field | ...extra_headers.NAME
+            let mut prefix: Option<String> = None;
+            let mut at = 1;
+            while let Some(("fallbacks", Some(index))) = parts.get(at).copied() {
+                prefix = Some(names::provider_fallback_prefix(prefix.as_deref(), index));
+                at += 1;
+            }
+            match (plain(at)?, parts.len() - at) {
+                (field @ ("api_key" | "gateway_token"), 1) => {
+                    Some(names::provider_field(prefix.as_deref(), field))
+                }
+                ("extra_headers", 2) => {
+                    Some(names::provider_header(prefix.as_deref(), plain(at + 1)?))
+                }
+                _ => None,
+            }
+        }
+        ("agent", None) if key == "agent.engine.api_key" => Some("agent_engine_api_key".into()),
+        ("telegram", None) if key == "telegram.bot_token" => Some("bot_token".into()),
+        ("telegram_bots", Some(i)) if plain(1) == Some("bot_token") && parts.len() == 2 => {
+            Some(names::bot_token("bot_token", "telegram_bot_token", *i))
+        }
+        ("discord", None) if key == "discord.bot_token" => Some("discord_bot_token".into()),
+        ("discord_bots", Some(i)) if plain(1) == Some("bot_token") && parts.len() == 2 => Some(
+            names::bot_token("discord_bot_token", "discord_bot_token", *i),
+        ),
+        ("slack", None) => match key {
+            "slack.app_token" => Some("slack_app_token".into()),
+            "slack.bot_token" => Some("slack_bot_token".into()),
+            _ => None,
+        },
+        ("slack_bots", Some(i)) if parts.len() == 2 => match plain(1)? {
+            "app_token" => Some(names::bot_token("slack_app_token", "slack_app_token", *i)),
+            "bot_token" => Some(names::bot_token("slack_bot_token", "slack_bot_token", *i)),
+            _ => None,
+        },
+        ("triggers", None) if key == "triggers.email.password" => Some("email_password".into()),
+        ("search", None) if key == "search.api_key" => Some("search_api_key".into()),
+        ("decisions", None) if key == "decisions.api_key" => Some("decisions_api_key".into()),
+        ("terminal", None) if key == "terminal.daemon_connect_token" => {
+            Some("terminal_daemon_connect_token".into())
+        }
+        ("telemetry", None) if plain(1) == Some("otlp_headers") && parts.len() == 3 => {
+            Some(names::otlp_header(plain(2)?))
+        }
+        ("http_auth", None) if parts.len() == 3 => match plain(2)? {
+            field @ ("api_key"
+            | "api_secret"
+            | "access_token"
+            | "access_token_secret"
+            | "token"
+            | "header_value"
+            | "password") => Some(names::http_auth(plain(1)?, field)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Delete a secret from the OS keychain.
 pub fn delete_from_keychain(field_name: &str) -> anyhow::Result<()> {
     aidaemon_secrets::SecretStore::delete(secret_store().as_ref(), field_name)
@@ -2409,6 +2493,39 @@ mod tests {
     use super::*;
     use crate::testing::{EnvVars, KeychainIsolation};
     use std::sync::LazyLock;
+
+    #[test]
+    fn keychain_names_match_what_the_loader_reads() {
+        use aidaemon_secrets::names;
+        assert_eq!(
+            keychain_name_for("provider.api_key"),
+            Some(names::provider_field(None, "api_key"))
+        );
+        let first = names::provider_fallback_prefix(None, 1);
+        assert_eq!(
+            keychain_name_for("provider.fallbacks[1].gateway_token"),
+            Some(names::provider_field(Some(&first), "gateway_token"))
+        );
+        assert_eq!(
+            keychain_name_for("provider.extra_headers.X-Synthetic"),
+            Some(names::provider_header(None, "X-Synthetic"))
+        );
+        assert_eq!(
+            keychain_name_for("telegram_bots[2].bot_token"),
+            Some(names::bot_token("bot_token", "telegram_bot_token", 2))
+        );
+        assert_eq!(
+            keychain_name_for("http_auth.acme.token"),
+            Some(names::http_auth("acme", "token"))
+        );
+        assert_eq!(
+            keychain_name_for("search.api_key").as_deref(),
+            Some("search_api_key")
+        );
+        // The database key changes only by rotating it.
+        assert_eq!(keychain_name_for("state.encryption_key"), None);
+        assert_eq!(keychain_name_for("provider.models.default"), None);
+    }
 
     /// A config written before a policy key was retired must still parse:
     /// `PolicyConfig` tolerates unknown keys rather than failing startup.

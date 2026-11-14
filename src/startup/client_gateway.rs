@@ -79,6 +79,7 @@ pub(crate) struct DaemonClientHost {
     pub state: Arc<dyn StateStore>,
     pub commands: crate::channels::commands::CommandContext,
     pub system: SystemSources,
+    pub settings: crate::startup::client_settings::SettingsHost,
 }
 
 /// What the app's System area reads: the daemon's models, token use, model
@@ -93,6 +94,8 @@ pub(crate) struct SystemSources {
     pub queues: Arc<crate::queue_telemetry::QueueTelemetry>,
     /// What the daemon remembers, for the app's Memory page.
     pub memory: Arc<dyn aidaemon_memory::stores::MemoryStores>,
+    /// The MCP servers, for the app's Settings page (taken by it).
+    pub mcp: Option<crate::mcp::McpRegistry>,
 }
 
 /// A stored time (RFC 3339 or SQLite's `YYYY-MM-DD HH:MM:SS`, UTC) in ms.
@@ -445,6 +448,29 @@ impl ClientHost for DaemonClientHost {
         Some(self.system.status().await)
     }
 
+    async fn settings(&self) -> anyhow::Result<Option<aidaemon_client_protocol::Settings>> {
+        self.settings.settings().await.map(Some)
+    }
+
+    async fn settings_gate(
+        &self,
+        change: &aidaemon_client_protocol::SettingsChange,
+    ) -> Result<aidaemon_client_gateway::SettingsGate, String> {
+        self.settings.gate(change).await
+    }
+
+    async fn change_settings(
+        &self,
+        change: aidaemon_client_protocol::SettingsChange,
+        approved: bool,
+    ) -> Result<aidaemon_client_gateway::SettingsDone, String> {
+        self.settings.change(change, approved).await
+    }
+
+    fn client_seen(&self) {
+        self.settings.client_seen();
+    }
+
     async fn history(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<HistoryMessage>> {
         let messages = self.state.get_history(session_id, limit).await?;
         // Runtime continuations and system notices ride as user-role turns
@@ -634,9 +660,13 @@ pub async fn start(
     hub: Arc<ChannelHub>,
     approvals: crate::tools::ApprovalBroker,
     endpoints: aidaemon_core::EndpointSource,
-    system: SystemSources,
+    mut system: SystemSources,
 ) -> anyhow::Result<()> {
+    let commands = deps.command_context();
     if !config.client_gateway.enabled {
+        // An address change that turned the gateway off still rolls back
+        // when no app can reach it.
+        let _ = crate::startup::settings_upkeep::arm_trial(&commands.config_path);
         return Ok(());
     }
     let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel(16);
@@ -660,7 +690,13 @@ pub async fn start(
         hub,
         host: Arc::new(DaemonClientHost {
             state: deps.state.clone(),
-            commands: deps.command_context(),
+            settings: crate::startup::client_settings::SettingsHost::new(
+                commands.config_path.clone(),
+                deps.state.clone(),
+                system.mcp.take(),
+                Some(deps.command_context()),
+            ),
+            commands,
             system,
         }),
         log,

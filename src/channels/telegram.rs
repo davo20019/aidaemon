@@ -425,22 +425,7 @@ static LOW_LATENCY_RESTART_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
 /// Replace the current process with a fresh instance of itself.
 fn restart_process() {
-    use std::os::unix::process::CommandExt;
-
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::error!("Failed to get current exe path: {}", e);
-            return;
-        }
-    };
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    tracing::info!(exe = %exe.display(), "Exec-ing new process");
-
-    // This replaces the current process — does not return on success
-    let err = std::process::Command::new(&exe).args(&args).exec();
-    tracing::error!("exec failed: {}", err);
+    crate::startup::settings_upkeep::restart_in_place();
 }
 
 impl Cx<'_> {

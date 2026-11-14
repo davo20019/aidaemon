@@ -17,6 +17,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 static INSTANCE_LOCK: OnceLock<File> = OnceLock::new();
+/// The lock beside a database moved this start (the first stays held too).
+static MOVED_LOCK: OnceLock<File> = OnceLock::new();
 
 /// Acquire the single-instance lock at `lock_path`, held until this process
 /// exits. Returns an error (naming the holder pid when recorded) if another
@@ -25,7 +27,24 @@ pub fn acquire(lock_path: &Path) -> anyhow::Result<()> {
     if INSTANCE_LOCK.get().is_some() {
         return Ok(());
     }
+    let file = lock(lock_path)?;
+    // Hold the handle for the whole process lifetime so the lock stays held.
+    let _ = INSTANCE_LOCK.set(file);
+    Ok(())
+}
 
+/// Also hold the lock beside a database this start moved, so an instance
+/// started on the new path refuses too.
+pub fn acquire_moved(lock_path: &Path) -> anyhow::Result<()> {
+    if MOVED_LOCK.get().is_some() {
+        return Ok(());
+    }
+    let file = lock(lock_path)?;
+    let _ = MOVED_LOCK.set(file);
+    Ok(())
+}
+
+fn lock(lock_path: &Path) -> anyhow::Result<File> {
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -56,9 +75,7 @@ pub fn acquire(lock_path: &Path) -> anyhow::Result<()> {
     let _ = file.set_len(0);
     let _ = write!(file, "{}", std::process::id());
     let _ = file.flush();
-    // Hold the handle for the whole process lifetime so the lock stays held.
-    let _ = INSTANCE_LOCK.set(file);
-    Ok(())
+    Ok(file)
 }
 
 #[cfg(test)]
