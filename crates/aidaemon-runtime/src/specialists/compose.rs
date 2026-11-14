@@ -305,7 +305,7 @@ pub fn compose_executor_prompt_from_registry(
 
     if has_cli_agent {
         prompt.push_str(
-            "\n- Delegation mode is active: `terminal`, `browser`, and `run_command` are not available here.\n\
+            "\n- Delegation mode is active: `terminal` and `browser` are not available here.\n\
              Use direct file tools (`read_file`, `edit_file`, `write_file`, `search_files`) for narrow file work.\n\
              Use `cli_agent` for shell/test flows or multi-step coding and research work.\n\
              For public URL reachability or returned text, use an available HTTP read tool or ask `cli_agent` to run curl; do not require browser access unless the task is visual or interactive.\n\
@@ -643,7 +643,7 @@ pub mod legacy {
 
         if has_cli_agent {
             prompt.push_str(
-                "\n- Delegation mode is active: `terminal`, `browser`, and `run_command` are not available here.\n\
+                "\n- Delegation mode is active: `terminal` and `browser` are not available here.\n\
                  Use direct file tools (`read_file`, `edit_file`, `write_file`, `search_files`) for narrow file work.\n\
                  Use `cli_agent` for shell/test flows or multi-step coding and research work.\n\
                  For public URL reachability or returned text, use an available HTTP read tool or ask `cli_agent` to run curl; do not require browser access unless the task is visual or interactive.\n\
@@ -898,7 +898,7 @@ mod tests {
         let prompt =
             legacy::build_executor_prompt("refactor auth", "user request", 2, 4, true, None, None);
         assert!(prompt.contains("Delegation mode is active"));
-        assert!(prompt.contains("`terminal`, `browser`, and `run_command` are not available"));
+        assert!(prompt.contains("`terminal` and `browser` are not available"));
         assert!(!prompt.contains("prefer `terminal` directly"));
         assert!(prompt.contains("action=\"run\""));
         assert!(prompt.contains("working_dir"));

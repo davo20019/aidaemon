@@ -577,6 +577,11 @@ impl TurnEngine<'_> {
                  update_instructions or bind_workspace, by the automation's name or ref.",
             )
             .retired_tool(
+                "run_command",
+                "Use terminal: allowlisted build, lint, read-only git and inspection commands \
+                 run there confined without asking.",
+            )
+            .retired_tool(
                 "share_memory",
                 "Use manage_memories with action \"set_privacy\" and privacy \"global\".",
             )

@@ -25,8 +25,8 @@ use crate::tools::{
     GenerateImageTool, GoalTraceTool, HealthProbeTool, HttpRequestTool, ListCheckpointsTool,
     ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool, ManageMandatesTool, ManageMcpTool,
     ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool, PolicyMetricsTool, ReadFileTool,
-    RememberFactTool, RunCommandTool, SearchFilesTool, SearchHistoryTool, SendFileTool,
-    SpawnAgentTool, SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool, WriteFileTool,
+    RememberFactTool, SearchFilesTool, SearchHistoryTool, SendFileTool, SpawnAgentTool,
+    SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::traits::Tool;
 use crate::traits::store_prelude::*;
@@ -238,7 +238,6 @@ enum BaseToolId {
     WriteFile,
     EditFile,
     SearchFiles,
-    RunCommand,
     CheckEnvironment,
 }
 
@@ -311,10 +310,6 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
     BaseToolSpec {
         id: BaseToolId::SearchFiles,
         name: "search_files",
-    },
-    BaseToolSpec {
-        id: BaseToolId::RunCommand,
-        name: "run_command",
     },
     BaseToolSpec {
         id: BaseToolId::CheckEnvironment,
@@ -1277,10 +1272,6 @@ async fn build_base_tool(
         },
         BaseToolId::SearchFiles => BuiltBaseTool {
             tool: Arc::new(SearchFilesTool::on_backend(execution_backend, daemon_paths)),
-            terminal_tool: None,
-        },
-        BaseToolId::RunCommand => BuiltBaseTool {
-            tool: Arc::new(RunCommandTool::new(execution_backend)),
             terminal_tool: None,
         },
         BaseToolId::CheckEnvironment => BuiltBaseTool {

@@ -225,7 +225,6 @@ mod scoped_workspace_tests {
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(crate::tools::WriteFileTool::new(backend())),
             Box::new(crate::tools::EditFileTool::new(backend())),
-            Box::new(crate::tools::RunCommandTool::new(backend())),
             Box::new(crate::tools::spawn::SpawnAgentTool::new_deferred(4000, 60)),
             Box::new(crate::tools::ManagePeopleTool::new(
                 state.clone(),
@@ -245,7 +244,7 @@ mod scoped_workspace_tests {
             let name = tool.name();
             assert_eq!(
                 facts.checkpoints_writes,
-                matches!(name, "write_file" | "edit_file" | "run_command"),
+                matches!(name, "write_file" | "edit_file"),
                 "{name}"
             );
             assert_eq!(

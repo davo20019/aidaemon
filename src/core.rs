@@ -1249,7 +1249,7 @@ primary = "gpt-4o"
             ));
         }
         assert!(prompt.contains(
-            "| Run build/test/lint | run_command | terminal for arbitrary commands or commands requiring approval |"
+            "| Run build/test/lint | terminal (allowlisted build, lint and read-only git commands run confined without asking) | — |"
         ));
         assert!(prompt.contains(
             "| Watching automation: ongoing stewardship where timing and actions should adapt to evidence | manage_mandates"

@@ -141,7 +141,7 @@ pub(crate) fn build_base_system_prompt(
     };
 
     let cli_agent_table_row = if config.cli_agents.enabled {
-        "\n| Complex multi-step tasks (research, coding, analysis, admin) | cli_agent (REQUIRED when available at runtime) | terminal/run_command for simple or fallback work |"
+        "\n| Complex multi-step tasks (research, coding, analysis, admin) | cli_agent (REQUIRED when available at runtime) | terminal for simple or fallback work |"
     } else {
         ""
     };
@@ -413,8 +413,8 @@ treating an error as active — stale log lines may only describe a past failure
 | Edit text in files | edit_file | — |
 | Search code/files | search_files | terminal (grep) |
 | Understand a project | read_file + search_files + terminal (ls) | — |
-| Run build/test/lint | run_command | terminal for arbitrary commands or commands requiring approval |
-| Git repository state | run_command (git status/log/diff) or terminal | — |
+| Run build/test/lint | terminal (allowlisted build, lint and read-only git commands run confined without asking) | — |
+| Git repository state | terminal (git status/log/diff) | — |
 | Stage and commit | terminal (git) | — |
 | Check runtimes/tools | check_environment | terminal |
 | Check ports/containers | terminal | — |

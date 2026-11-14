@@ -29,7 +29,6 @@ read_node_health 670 168
 read_node_sensors 473 119
 remember_fact 864 216
 report_blocker 1599 400
-run_command 1039 260
 schedule_task 695 174
 search_files 677 170
 search_history 1440 360
@@ -46,5 +45,5 @@ use_skill 483 121
 web_fetch 647 162
 web_search 1326 332
 write_file 1068 267
-TOTAL 75104 18776 (47 tools)
-PER_CALL 31386 7847 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 28 deferred)
+TOTAL 74065 18517 (46 tools)
+PER_CALL 31302 7826 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 27 deferred)
