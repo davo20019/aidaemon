@@ -206,7 +206,16 @@ output.map(crate::traits::ToolCallOutcome::from_output)
 }
 }
 
-impl crate::traits::ToolSemantics for RecordingTerminal {}
+impl crate::traits::ToolSemantics for RecordingTerminal {
+    // A stand-in for the terminal: it declares the terminal's working-dir fact,
+    // which is what anchors a call without a directory to the project dir.
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            project_dir_argument: aidaemon_tools::semantics::ProjectDirArgument::ShellWorkingDir,
+            ..Default::default()
+        }
+    }
+}
 
 /// A call without a directory runs in the request's project directory, not
 /// the daemon's cwd (the R52 failure: a bound goal's commands ran elsewhere).
