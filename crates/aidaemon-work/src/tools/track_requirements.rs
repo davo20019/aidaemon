@@ -554,6 +554,16 @@ impl TrackRequirementsTool {
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 expected_targets,
+                owner_units: item
+                    .get("owner_units")
+                    .and_then(Value::as_array)
+                    .map(|units| {
+                        units
+                            .iter()
+                            .filter_map(|unit| unit.as_u64().and_then(|n| usize::try_from(n).ok()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
         }
 
@@ -616,6 +626,7 @@ impl TrackRequirementsTool {
                     changed = true;
                 }
                 changed |= plan.wait_on_background_jobs(&running);
+                changed |= plan.unmark_runless_background_steps();
                 if changes_off {
                     changed |=
                         plan.hold_back_unfinished_steps(crate::plans::NotDoneReason::ChangesOff);

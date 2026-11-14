@@ -187,6 +187,7 @@ impl PlanStore {
                 required_mutation_effects: crate::traits::ToolMutationEffects::NONE,
                 requires_observation: false,
                 expected_targets: Vec::new(),
+                owner_units: Vec::new(),
             })
             .collect();
         self.upsert_checklist_graph(session_id, task_id, trigger, &graph_items)
@@ -213,6 +214,7 @@ impl PlanStore {
                 required_mutation_effects: item.required_mutation_effects,
                 requires_observation: item.requires_observation,
                 expected_targets: item.expected_targets.clone(),
+                owner_units: item.owner_units.clone(),
                 evidence_receipt_ids: Vec::new(),
                 background_jobs: Vec::new(),
                 waited_jobs: Vec::new(),
@@ -279,16 +281,35 @@ impl PlanStore {
         if let Some(mut existing) = reusable {
             // A step a background job is still doing stays with that job:
             // a checklist update cannot finish or drop work it did not do.
-            // Only the job's end settles it.
+            // Only the job's end settles it. A step is found by its typed
+            // identity (its owner units, else its unchanged words), not by
+            // where the new list puts it ([`aidaemon_events::step_identity`]):
+            // live 2026-11-14, a re-declaration right after two launches
+            // moved their rows, their runs' links were dropped, and rows the
+            // helpers were doing read "not attempted" and never settled.
             let mut steps = steps;
-            for step in &mut steps {
-                let Some(previous) = existing.steps.get(step.index) else {
-                    continue;
-                };
+            fn key(step: &PlanStep) -> aidaemon_events::step_identity::StepKey<'_> {
+                aidaemon_events::step_identity::StepKey {
+                    description: &step.description,
+                    owner_units: &step.owner_units,
+                }
+            }
+            let (same, carried) = {
+                let old_keys: Vec<_> = existing.steps.iter().map(key).collect();
+                let new_keys: Vec<_> = steps.iter().map(key).collect();
+                (
+                    aidaemon_events::step_identity::same_steps(&old_keys, &new_keys),
+                    aidaemon_events::step_identity::carried_work(&old_keys, &new_keys),
+                )
+            };
+            let mut orphaned_jobs: Vec<String> = Vec::new();
+            for (previous, (same, carried)) in
+                existing.steps.iter().zip(same.into_iter().zip(carried))
+            {
                 // The same step keeps the evidence that proved it: an
                 // update ticking it again neither erases its proof nor
                 // turns proven work into the model's word.
-                if previous.description == step.description {
+                if let Some(step) = same.and_then(|index| steps.get_mut(index)) {
                     for receipt in &previous.evidence_receipt_ids {
                         if !step.evidence_receipt_ids.contains(receipt) {
                             step.evidence_receipt_ids.push(receipt.clone());
@@ -312,21 +333,52 @@ impl PlanStore {
                         step.completed_at = previous.completed_at;
                     }
                 }
-                if previous.status == StepStatus::Background
-                    && previous.has_background_jobs()
-                    && previous.description == step.description
-                {
+                if !(previous.status == StepStatus::Background && previous.has_background_jobs()) {
+                    continue;
+                }
+                // Its runs go with the work: to the same step, else to each
+                // step carrying the same owner units.
+                if carried.is_empty() {
+                    for job in previous.background_jobs.iter().chain(&previous.waited_jobs) {
+                        if !orphaned_jobs.contains(job) {
+                            orphaned_jobs.push(job.clone());
+                        }
+                    }
+                    continue;
+                }
+                for index in carried {
+                    let Some(step) = steps.get_mut(index) else {
+                        continue;
+                    };
                     step.status = StepStatus::Background;
-                    step.background_jobs = previous.background_jobs.clone();
-                    step.waited_jobs = previous.waited_jobs.clone();
-                    step.made_folders = previous.made_folders.clone();
-                    step.started_at = previous.started_at;
+                    for job in &previous.background_jobs {
+                        if !step.background_jobs.contains(job) {
+                            step.background_jobs.push(job.clone());
+                        }
+                    }
+                    for job in &previous.waited_jobs {
+                        if !step.waited_jobs.contains(job) && !step.background_jobs.contains(job) {
+                            step.waited_jobs.push(job.clone());
+                        }
+                    }
+                    for folder in &previous.made_folders {
+                        if !step.made_folders.contains(folder) {
+                            step.made_folders.push(folder.clone());
+                        }
+                    }
+                    step.started_at = match (step.started_at, previous.started_at) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
                     step.completed_at = None;
                 }
             }
             existing.steps = steps;
             existing.current_step = current_step;
             existing.updated_at = now;
+            // Runs whose work the new list no longer names still end: the
+            // steps left open wait on them, so their ends settle the plan.
+            existing.wait_on_background_jobs(&orphaned_jobs);
             existing.sync_active_step();
             self.update(&existing).await?;
             Ok(existing)
@@ -965,6 +1017,7 @@ mod tests {
             required_mutation_effects: effects,
             requires_observation: false,
             expected_targets: Vec::new(),
+            owner_units: Vec::new(),
         };
         let ticked = |done: bool| {
             let status = if done {
@@ -1159,6 +1212,7 @@ mod tests {
                     required_mutation_effects: ToolMutationEffects::EXTERNAL_DELIVERY,
                     requires_observation: false,
                     expected_targets: vec!["/tmp/report.pdf".into()],
+                    owner_units: Vec::new(),
                 }],
             )
             .await
@@ -1489,6 +1543,124 @@ mod tests {
         assert_eq!(plan.status, PlanStatus::Completed);
     }
 
+    /// Live 2026-11-14: the plan listed the installs and a screenshot of
+    /// each site; one call launched a helper per site, each taking on its
+    /// install by the owner's unit; then the turn re-declared the plan in
+    /// the helpers' words, rows moved. Each install row keeps its run, the
+    /// screenshot waits on both, and the last run's end settles the plan
+    /// done, no row left running.
+    #[tokio::test]
+    async fn a_re_declared_plan_keeps_each_step_with_its_run_and_settles_done() {
+        use crate::plans::{ChecklistItem, JobEnd, StepStatus};
+        let store = create_test_store().await;
+        let item = |text: &str, units: &[usize], status: StepStatus| ChecklistItem {
+            description: text.to_string(),
+            status,
+            depends_on: Vec::new(),
+            required_mutation_effects: crate::traits::ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+            requires_observation: false,
+            expected_targets: Vec::new(),
+            owner_units: units.to_vec(),
+        };
+        let plan = store
+            .upsert_checklist_graph(
+                "s",
+                Some("t"),
+                "track_requirements",
+                &[
+                    item(
+                        "Install your Claude-company Drupal site",
+                        &[0],
+                        StepStatus::Pending,
+                    ),
+                    item(
+                        "Install your Claude-company WordPress site",
+                        &[1],
+                        StepStatus::Pending,
+                    ),
+                    item(
+                        "Capture a homepage screenshot of each site",
+                        &[0, 1],
+                        StepStatus::Pending,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        // Each launch names an item this plan doesn't list, and its unit.
+        let drupal = plan.launch_steps(&[7], &[0]);
+        let wordpress = plan.launch_steps(&[], &[1]);
+        assert_eq!((drupal.clone(), wordpress.clone()), (vec![0], vec![1]));
+        store
+            .link_background_job("s", Some("t"), &drupal, "job-d")
+            .await
+            .unwrap();
+        let plan = store
+            .link_background_job("s", Some("t"), &wordpress, "job-w")
+            .await
+            .unwrap()
+            .expect("linked");
+        assert_eq!(plan.steps[2].status, StepStatus::Background);
+        assert_eq!(plan.steps[2].waited_jobs, vec!["job-d", "job-w"]);
+
+        let plan = store
+            .upsert_checklist_graph(
+                "s",
+                Some("t"),
+                "track_requirements",
+                &[
+                    item("Check DDEV", &[], StepStatus::Completed),
+                    item(
+                        "Install Claude company WordPress in wp-2",
+                        &[1],
+                        StepStatus::Background,
+                    ),
+                    item(
+                        "Install Claude company Drupal in drupal-2",
+                        &[0],
+                        StepStatus::Background,
+                    ),
+                    item(
+                        "Capture a homepage screenshot of each site",
+                        &[0, 1],
+                        StepStatus::Pending,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.steps.len(),
+            4,
+            "a re-declaration adds no row for work it lists"
+        );
+        assert_eq!(plan.steps[1].background_jobs, vec!["job-w"]);
+        assert_eq!(plan.steps[2].background_jobs, vec!["job-d"]);
+        assert_eq!(plan.steps[3].waited_jobs, vec!["job-d", "job-w"]);
+
+        store
+            .settle_background_job("s", "job-d", JobEnd::Succeeded)
+            .await
+            .unwrap()
+            .expect("settled");
+        let plan = store
+            .settle_background_job("s", "job-w", JobEnd::Succeeded)
+            .await
+            .unwrap()
+            .expect("settled");
+        assert!(
+            plan.steps
+                .iter()
+                .all(|step| step.status == StepStatus::Completed),
+            "{:?}",
+            plan.steps
+                .iter()
+                .map(|step| step.status)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(plan.status, PlanStatus::Completed);
+    }
+
     /// Live 2026-11-13: the model marked the two helper steps "background",
     /// then one `spawn_agent` batch started both helpers without naming
     /// steps. The marked steps take both launches (the launches link
@@ -1512,6 +1684,7 @@ mod tests {
             },
             requires_observation: false,
             expected_targets: Vec::new(),
+            owner_units: Vec::new(),
         };
         store
             .upsert_checklist_graph(

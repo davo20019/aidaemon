@@ -174,9 +174,44 @@ pub struct RunOperation {
     /// the item it serves.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checklist_items: Vec<usize>,
+    /// How many runs this operation left working (a batch launch: one per
+    /// child), from its receipt. Zero on older records: one at most.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub launched_runs: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// One step of a checklist declaration, as step identity reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredStep {
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_units: Vec<usize>,
+}
+
+impl DeclaredStep {
+    fn key(&self) -> crate::step_identity::StepKey<'_> {
+        crate::step_identity::StepKey {
+            description: &self.description,
+            owner_units: &self.owner_units,
+        }
+    }
 }
 
 impl RunOperation {
+    /// How many items this operation can have taken on without naming
+    /// them: one per run it left working, one for any other attempt.
+    fn attempts(&self) -> usize {
+        if self.is_background_in_flight() {
+            self.launched_runs.max(1)
+        } else {
+            1
+        }
+    }
+
     /// A background handoff is an intermediate receipt for an invocation that
     /// is still running. Derive the state from the existing outcome field so
     /// aggregates serialized before this lifecycle distinction remain valid.
@@ -386,6 +421,12 @@ pub struct RunAggregate {
     /// executing model linked them (`owner_units` on an item).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checklist_owner_units: BTreeMap<usize, Vec<usize>>,
+    /// The latest checklist declaration's steps (words and owner units, by
+    /// index): what a later declaration is matched against, so a launch's
+    /// items follow their steps wherever a re-declaration moves them
+    /// ([`crate::step_identity`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_steps: Vec<DeclaredStep>,
     /// How this run's path targets and hints compare. The backend's fixed
     /// facts, not part of the projection, so never serialized.
     #[serde(skip, default = "LexicalPaths::daemon_host")]
@@ -442,6 +483,7 @@ impl RunAggregate {
             adopted_obligation_aliases: BTreeMap::new(),
             owner_units: Vec::new(),
             checklist_owner_units: BTreeMap::new(),
+            declared_steps: Vec::new(),
             paths,
         }
     }
@@ -720,6 +762,42 @@ impl RunAggregate {
         }
     }
 
+    /// A re-declared checklist: each launch's items follow their steps to
+    /// where the new list puts them ([`crate::step_identity::carried_work`]),
+    /// so work a run took on is never read against another row, and a step
+    /// the new list dropped is no longer one the launch names.
+    fn carry_launches_to(&mut self, items: &[crate::ExecutorExpectationItem]) {
+        let next: Vec<DeclaredStep> = items
+            .iter()
+            .map(|item| DeclaredStep {
+                description: item.description.clone(),
+                owner_units: item.owner_units.clone(),
+            })
+            .collect();
+        let previous = std::mem::replace(&mut self.declared_steps, next);
+        if previous.is_empty() {
+            return;
+        }
+        let old_keys: Vec<_> = previous.iter().map(DeclaredStep::key).collect();
+        let new_keys: Vec<_> = self.declared_steps.iter().map(DeclaredStep::key).collect();
+        let carried = crate::step_identity::carried_work(&old_keys, &new_keys);
+        for operation in self.operations.values_mut() {
+            if operation.checklist_items.is_empty() {
+                continue;
+            }
+            let mut moved: Vec<usize> = Vec::new();
+            for item in &operation.checklist_items {
+                for index in carried.get(*item).into_iter().flatten() {
+                    if !moved.contains(index) {
+                        moved.push(*index);
+                    }
+                }
+            }
+            moved.sort_unstable();
+            operation.checklist_items = moved;
+        }
+    }
+
     /// Compile the executing model's typed checklist into obligations. Each
     /// typed item becomes one obligation keyed by its index: a mutation item
     /// is `Achieve` (closed by a succeeded receipt carrying the effect); an
@@ -744,6 +822,7 @@ impl RunAggregate {
             .iter()
             .flat_map(|item| item.depends_on.iter().copied())
             .collect();
+        self.carry_launches_to(&declared.items);
         let mut declared_ids = BTreeSet::new();
         self.checklist_owner_units = declared
             .items
@@ -1333,7 +1412,7 @@ impl RunAggregate {
                 .is_some_and(|obligation| obligation.class == RunObligationClass::Achieve)
         };
         if self.checklist_owner_units.is_empty() {
-            let attempts = self
+            let attempts: usize = self
                 .operations
                 .values()
                 .filter(|operation| {
@@ -1347,7 +1426,8 @@ impl RunAggregate {
                                     .iter()
                                     .any(|item| item_changes(*item))))
                 })
-                .count();
+                .map(RunOperation::attempts)
+                .sum();
             return change_units.into_iter().skip(attempts).collect();
         }
         let unattempted = self.unattempted_checklist_items_of(&self.unattempted_checklist_work());
@@ -1381,7 +1461,7 @@ impl RunAggregate {
                 || operation.owner_declined
                 || operation.is_background_in_flight()
         };
-        let named: BTreeSet<usize> = self
+        let mut named: BTreeSet<usize> = self
             .operations
             .values()
             .filter(|operation| {
@@ -1389,12 +1469,34 @@ impl RunAggregate {
             })
             .flat_map(|operation| operation.checklist_items.iter().copied())
             .collect();
-        let unnamed_attempts = self
+        // Attempted by owner unit: the owner's units the named items carry
+        // out are taken on, and an item whose every unit is taken on was
+        // attempted, whichever row a launch named for it (live 2026-11-14:
+        // the parent's own install rows read "I didn't start" while the
+        // helpers it launched for the same units installed both sites).
+        let taken_units: BTreeSet<usize> = named
+            .iter()
+            .filter_map(|item| self.checklist_owner_units.get(item))
+            .flatten()
+            .copied()
+            .collect();
+        named.extend(
+            self.checklist_owner_units
+                .iter()
+                .filter(|(_, units)| {
+                    !units.is_empty() && units.iter().all(|unit| taken_units.contains(unit))
+                })
+                .map(|(item, _)| *item),
+        );
+        // Each run an unnamed call left working took on one item at most:
+        // a launch of two helpers is two attempts.
+        let unnamed_attempts: usize = self
             .operations
             .values()
             .filter(|operation| operation.checklist_items.is_empty())
             .filter(attempted)
-            .count();
+            .map(RunOperation::attempts)
+            .sum();
         let mut open: Vec<(usize, String)> = self
             .obligations
             .iter()
@@ -1417,10 +1519,15 @@ impl RunAggregate {
     }
 
     /// Record a launch whose receipt is being written now: the job it left
-    /// running took on `checklist_items` (none named: one item at most).
-    /// Lets a handoff be judged with the launch it makes, before its
-    /// receipt reaches the ledger.
-    pub fn with_pending_launch(mut self, operation_id: &str, checklist_items: &[usize]) -> Self {
+    /// running took on `checklist_items` (none named: one item at most per
+    /// run it left working, `launched_runs`). Lets a handoff be judged with
+    /// the launch it makes, before its receipt reaches the ledger.
+    pub fn with_pending_launch(
+        mut self,
+        operation_id: &str,
+        checklist_items: &[usize],
+        launched_runs: usize,
+    ) -> Self {
         let operation = self
             .operations
             .entry(operation_id.to_string())
@@ -1448,9 +1555,11 @@ impl RunAggregate {
                 result_id: None,
                 operation_lineage: None,
                 checklist_items: Vec::new(),
+                launched_runs: 0,
             });
         operation.dispatched = true;
         operation.outcome = Some(ToolOutcomeStatus::Backgrounded);
+        operation.launched_runs = operation.launched_runs.max(launched_runs);
         for item in checklist_items {
             if !operation.checklist_items.contains(item) {
                 operation.checklist_items.push(*item);
@@ -1570,6 +1679,7 @@ impl RunAggregate {
                 result_id: None,
                 operation_lineage: call.operation_lineage,
                 checklist_items: Vec::new(),
+                launched_runs: 0,
             },
         );
     }
@@ -1713,13 +1823,21 @@ impl RunAggregate {
                 result_id: None,
                 operation_lineage: None,
                 checklist_items: Vec::new(),
+                launched_runs: 0,
             });
         operation.outcome = Some(receipt.outcome_status);
-        for item in &receipt.checklist_items {
-            if !operation.checklist_items.contains(item) {
-                operation.checklist_items.push(*item);
+        // The items a call names are read from its first receipt. A later
+        // receipt for the same call (a background run's end) repeats the
+        // launch's indices, which a re-declaration since may have moved
+        // ([`Self::carry_launches_to`]): it adds none.
+        if operation.result_id.is_none() {
+            for item in &receipt.checklist_items {
+                if !operation.checklist_items.contains(item) {
+                    operation.checklist_items.push(*item);
+                }
             }
         }
+        operation.launched_runs = operation.launched_runs.max(receipt.launched_runs);
         operation.dispatched = operation.dispatched || receipt.invocation_stage.reached_dispatch();
         operation.policy_denied =
             operation.policy_denied || (!operation.dispatched && receipt.access_denial.is_some());
@@ -3341,6 +3459,7 @@ mod tests {
                     collection_observations: Vec::new(),
                     mandate_authority: None,
                     checklist_items: Vec::new(),
+                    launched_runs: 0,
                 }),
             },
         )
@@ -7566,6 +7685,163 @@ mod tests {
                 .uncovered_owner_units()
                 .is_empty()
         );
+    }
+
+    /// An install or screenshot step: a change, worded `text`, carrying out
+    /// the owner's `units`.
+    fn unit_step(
+        index: usize,
+        text: &str,
+        units: &[usize],
+        status: &str,
+    ) -> ExecutorExpectationItem {
+        ExecutorExpectationItem {
+            description: text.to_string(),
+            owner_units: units.to_vec(),
+            ..checklist_item(
+                index,
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                false,
+                &[],
+                status,
+            )
+        }
+    }
+
+    fn batch_launch(items: serde_json::Value, runs: usize) -> Vec<Event> {
+        let mut launch = result(
+            "spawn",
+            "spawn_agent",
+            ToolOutcomeStatus::Backgrounded,
+            0,
+            ToolCallSemantics::default(),
+        );
+        launch.data["receipt"]["checklist_items"] = items;
+        launch.data["receipt"]["launched_runs"] = serde_json::json!(runs);
+        vec![call("spawn", "spawn_agent"), launch]
+    }
+
+    /// Live 2026-11-14: the turn declared its plan (installs and a
+    /// screenshot of each site), launched one helper per site in one call,
+    /// then re-declared the plan with the helpers' own wording, rows moved.
+    /// Every step's owner units were taken on by a run: nothing reads "not
+    /// started", and the launch's items follow their steps.
+    #[test]
+    fn steps_a_launch_took_on_by_unit_stay_attempted_across_a_re_declaration() {
+        let mut events = vec![
+            owner_contract(&[("Install Drupal", true), ("Install WordPress", true)]),
+            declared_with_outcome(
+                vec![
+                    unit_step(
+                        0,
+                        "Install your Claude-company Drupal site",
+                        &[0],
+                        "pending",
+                    ),
+                    unit_step(
+                        1,
+                        "Install your Claude-company WordPress site",
+                        &[1],
+                        "pending",
+                    ),
+                    unit_step(
+                        2,
+                        "Capture a homepage screenshot of each site",
+                        &[0, 1],
+                        "pending",
+                    ),
+                ],
+                None,
+            ),
+        ];
+        events.extend(batch_launch(serde_json::json!([0, 1]), 2));
+        events.push(declared_with_outcome(
+            vec![
+                checklist_item(0, ToolMutationEffects::NONE, true, &[], "completed"),
+                unit_step(
+                    1,
+                    "Install Claude company WordPress in wp-2",
+                    &[1],
+                    "background",
+                ),
+                unit_step(
+                    2,
+                    "Install Claude company Drupal in drupal-2",
+                    &[0],
+                    "background",
+                ),
+                unit_step(
+                    3,
+                    "Capture a homepage screenshot of each site",
+                    &[0, 1],
+                    "pending",
+                ),
+            ],
+            None,
+        ));
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.operations["spawn"].checklist_items,
+            vec![1, 2],
+            "the launch's items follow their steps"
+        );
+        assert!(
+            aggregate.unattempted_declared_work().is_empty(),
+            "{:?}",
+            aggregate.unattempted_declared_work()
+        );
+        assert!(aggregate.uncovered_owner_units().is_empty());
+    }
+
+    /// Two helpers launched in one call without naming items are two
+    /// attempts, not one.
+    #[test]
+    fn an_unnamed_batch_launch_attempts_one_item_per_run() {
+        let install = |index| {
+            checklist_item(
+                index,
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                false,
+                &[],
+                "pending",
+            )
+        };
+        let mut events = vec![
+            owner_contract(&[("Install Drupal", true), ("Install WordPress", true)]),
+            declared_with_outcome(vec![install(0), install(1)], None),
+        ];
+        events.extend(batch_launch(serde_json::json!([]), 2));
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate.unattempted_declared_work().is_empty());
+        assert!(aggregate.uncovered_owner_units().is_empty());
+    }
+
+    /// A unit really not taken on is still listed: one helper launched for
+    /// Drupal leaves the WordPress step, the screenshot of both, and the
+    /// owner's WordPress unit not started.
+    #[test]
+    fn a_unit_no_run_took_on_is_still_not_started() {
+        let mut events = vec![
+            owner_contract(&[("Install Drupal", true), ("Install WordPress", true)]),
+            declared_with_outcome(
+                vec![
+                    unit_step(0, "Install Drupal", &[0], "pending"),
+                    unit_step(1, "Install WordPress", &[1], "pending"),
+                    unit_step(2, "Screenshot each site", &[0, 1], "pending"),
+                ],
+                None,
+            ),
+        ];
+        events.extend(batch_launch(serde_json::json!([0]), 1));
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.unattempted_checklist_items(),
+            BTreeSet::from([1, 2])
+        );
+        assert_eq!(aggregate.uncovered_owner_units(), vec![1]);
     }
 
     /// A request that only observes (a status question) declares no work,

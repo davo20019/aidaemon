@@ -944,7 +944,11 @@ impl TurnEngine<'_> {
                         let judged = self
                             .sdk_judge_unattempted_work(
                                 scope,
-                                Some((&request.call_id, &outcome.metadata.checklist_items)),
+                                Some((
+                                    &request.call_id,
+                                    &outcome.metadata.checklist_items,
+                                    outcome.metadata.launched_runs,
+                                )),
                             )
                             .await;
                         if let Some(sdk::StopDecision::Continue { message }) = judged {

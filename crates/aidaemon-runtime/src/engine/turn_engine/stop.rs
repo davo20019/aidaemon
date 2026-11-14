@@ -549,7 +549,7 @@ impl TurnEngine<'_> {
     pub async fn sdk_judge_unattempted_work(
         &self,
         scope: &TurnScope<'_>,
-        launch: Option<(&str, &[usize])>,
+        launch: Option<(&str, &[usize], usize)>,
     ) -> Option<sdk::StopDecision> {
         let aggregate = self
             .events()
@@ -557,7 +557,7 @@ impl TurnEngine<'_> {
             .await
             .ok()?;
         let aggregate = match launch {
-            Some((call_id, items)) => aggregate.with_pending_launch(call_id, items),
+            Some((call_id, items, runs)) => aggregate.with_pending_launch(call_id, items, runs),
             None => aggregate,
         };
         let changes_permitted =

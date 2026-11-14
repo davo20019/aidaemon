@@ -1690,6 +1690,11 @@ pub struct ToolCallMetadata {
     /// attribution of work to declared items, never read from text.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checklist_items: Vec<usize>,
+    /// How many runs this call left working (a batch launch starts one per
+    /// child). Each run takes on its own work: a launch of two helpers that
+    /// names no items is two attempts, never one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub launched_runs: usize,
     /// Completion semantics for this specific tool call.
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,
@@ -3463,4 +3468,8 @@ mod file_trust_tests {
         assert_eq!(file_output_trust(r#"{}"#, &keys, &roots), Untrusted);
         assert_eq!(file_output_trust("not json", &keys, &roots), Untrusted);
     }
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }

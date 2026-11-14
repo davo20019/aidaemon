@@ -85,6 +85,7 @@ impl TaskPlan {
                 required_mutation_effects: ToolMutationEffects::NONE,
                 requires_observation: false,
                 expected_targets: Vec::new(),
+                owner_units: Vec::new(),
                 evidence_receipt_ids: Vec::new(),
                 background_jobs: Vec::new(),
                 waited_jobs: Vec::new(),
@@ -437,6 +438,7 @@ impl TaskPlan {
             }
             changed = true;
         }
+        changed |= self.wait_on_runs_of_taken_units();
         if changed {
             // A step whose helper didn't start may have resolved the plan;
             // it is being worked on again.
@@ -444,6 +446,84 @@ impl TaskPlan {
                 self.status = PlanStatus::InProgress;
             }
             self.updated_at = Utc::now();
+        }
+        changed
+    }
+
+    /// The steps a launch takes on: the steps it names that the plan lists,
+    /// and each step whose owner units all fall within the units the launch
+    /// says it carries out (`owner_units`). Typed links only: a launch
+    /// whose named item is not a step of this plan, but which names the
+    /// owner's unit, takes on the plan's own step for that unit, never a
+    /// new row.
+    pub fn launch_steps(&self, named: &[usize], owner_units: &[usize]) -> Vec<usize> {
+        let mut steps: Vec<usize> = named
+            .iter()
+            .copied()
+            .filter(|index| *index < self.steps.len())
+            .collect();
+        if !owner_units.is_empty() {
+            for step in &self.steps {
+                if !step.owner_units.is_empty()
+                    && step
+                        .owner_units
+                        .iter()
+                        .all(|unit| owner_units.contains(unit))
+                    && !steps.contains(&step.index)
+                {
+                    steps.push(step.index);
+                }
+            }
+        }
+        steps.sort_unstable();
+        steps
+    }
+
+    /// A step still open whose every owner unit a run took on (through the
+    /// steps those runs were handed) is being done by those runs: it waits
+    /// on each of them and settles from their ends, never left open or
+    /// called unattempted while they do its units (a screenshot of both
+    /// sites, done by the two helpers installing them). Returns whether
+    /// anything changed.
+    fn wait_on_runs_of_taken_units(&mut self) -> bool {
+        let taken: Vec<(Vec<usize>, Vec<String>)> = self
+            .steps
+            .iter()
+            .filter(|step| {
+                step.status == StepStatus::Background && !step.background_jobs.is_empty()
+            })
+            .map(|step| (step.owner_units.clone(), step.background_jobs.clone()))
+            .collect();
+        let mut changed = false;
+        for step in &mut self.steps {
+            let open = matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
+                || (step.status == StepStatus::Background && step.background_jobs.is_empty());
+            if !open || step.owner_units.is_empty() {
+                continue;
+            }
+            let covered = step
+                .owner_units
+                .iter()
+                .all(|unit| taken.iter().any(|(units, _)| units.contains(unit)));
+            if !covered {
+                continue;
+            }
+            for (units, jobs) in &taken {
+                if !units.iter().any(|unit| step.owner_units.contains(unit)) {
+                    continue;
+                }
+                for job in jobs {
+                    if !step.waited_jobs.contains(job) {
+                        step.waited_jobs.push(job.clone());
+                        changed = true;
+                    }
+                }
+            }
+            if step.status != StepStatus::Background {
+                step.status = StepStatus::Background;
+                step.completed_at = None;
+                changed = true;
+            }
         }
         changed
     }
@@ -547,6 +627,26 @@ impl TaskPlan {
             if self.is_finished() {
                 self.status = self.resolved_status();
             }
+            self.updated_at = Utc::now();
+        }
+        changed
+    }
+
+    /// A step the checklist marked "background" that no run took on or
+    /// waits on is not running: it is open again, judged like any open step
+    /// (a launch takes it, the turn's end settles it). The mark alone never
+    /// leaves a row "running in the background" with nothing running.
+    /// Returns whether anything changed.
+    pub fn unmark_runless_background_steps(&mut self) -> bool {
+        let mut changed = false;
+        for step in &mut self.steps {
+            if step.status == StepStatus::Background && !step.has_background_jobs() {
+                step.status = StepStatus::Pending;
+                changed = true;
+            }
+        }
+        if changed {
+            self.sync_active_step();
             self.updated_at = Utc::now();
         }
         changed
@@ -1047,6 +1147,11 @@ pub struct PlanStep {
     /// Exact canonical targets (path, URL, or resource ID), never prose.
     #[serde(default)]
     pub expected_targets: Vec<String>,
+    /// The owner's units of work this step carries out (`owner_units` on
+    /// its checklist item): the typed identity a re-declaration and a
+    /// launch find the step by, wherever it sits in the list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_units: Vec<usize>,
     /// Tool-call receipt IDs that proved this step.
     #[serde(default)]
     pub evidence_receipt_ids: Vec<String>,
@@ -1116,6 +1221,8 @@ pub struct ChecklistItem {
     pub required_mutation_effects: ToolMutationEffects,
     pub requires_observation: bool,
     pub expected_targets: Vec<String>,
+    /// The owner's units of work the item carries out.
+    pub owner_units: Vec<usize>,
 }
 
 fn plan_step_node_id(index: usize) -> String {

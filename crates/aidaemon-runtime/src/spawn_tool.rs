@@ -336,6 +336,8 @@ pub fn combine_batch(
     // helpers installed a site each in one call, and the card said it
     // couldn't verify either: the batch result had dropped their items).
     let mut checklist_items: Vec<usize> = Vec::new();
+    // Each child started is its own run: a batch of two launches two.
+    let mut launched_runs = 0;
     let mut truncation: Option<aidaemon_tools::semantics::TruncationInfo> = None;
     for (mission, run) in runs {
         // Its own name, in words the parent can repeat to the owner. A
@@ -348,6 +350,7 @@ pub fn combine_batch(
         };
         match run {
             Ok(outcome) => {
+                launched_runs += outcome.metadata.launched_runs.max(1);
                 for item in &outcome.metadata.checklist_items {
                     if !checklist_items.contains(item) {
                         checklist_items.push(*item);
@@ -393,6 +396,7 @@ pub fn combine_batch(
     outcome.metadata.truncation = truncation;
     checklist_items.sort_unstable();
     outcome.metadata.checklist_items = checklist_items;
+    outcome.metadata.launched_runs = launched_runs;
     if background {
         return Ok(outcome.handed_to_background());
     }
@@ -429,6 +433,12 @@ pub struct SpawnArgs {
     /// supersedes an earlier one that didn't finish.
     #[serde(default)]
     pub checklist_items: Vec<usize>,
+    /// The owner's units of work (numbered in "What the owner asked for")
+    /// this child carries out: it takes on the plan's own steps for them
+    /// ([`aidaemon_work::plans::TaskPlan::launch_steps`]), whichever item
+    /// it names.
+    #[serde(default)]
+    pub owner_units: Vec<usize>,
     /// Task ID — when provided by a task lead, the executor tracks activity against this task.
     #[serde(default)]
     pub task_id: Option<String>,
@@ -670,6 +680,12 @@ impl Tool for SpawnAgentTool {
                         "uniqueItems": true,
                         "description": "The zero-based indices of your track_requirements items this sub-agent does. With background=true they show as running in the background until it ends, then as done or failed by its result. To retry a step an earlier sub-agent didn't finish, name the same items: the new run takes the step over, and the earlier try shows as history, not as a failure."
                     },
+                    "owner_units": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 0 },
+                        "uniqueItems": true,
+                        "description": "The owner's units of work (numbered in \"What the owner asked for\") this sub-agent carries out. It takes on your checklist's own items for those units, so name them even when you also give checklist_items."
+                    },
                     "task_id": {
                         "type": "string",
                         "description": "Task ID to associate with this executor (used by task leads to connect executor work to task tracking)"
@@ -844,6 +860,28 @@ impl SpawnAgentTool {
         Err(refusal.into())
     }
 
+    /// The plan steps this launch takes on, resolved against the request's
+    /// one plan ([`aidaemon_work::plans::TaskPlan::launch_steps`]): its
+    /// named items that the plan lists, and the plan's own steps for the
+    /// owner units it carries out. Without a plan, what it named.
+    async fn launch_steps(
+        &self,
+        args: &SpawnArgs,
+        facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> Vec<usize> {
+        let (Some(plans), Some(session)) = (self.plan_store.get(), facts.session()) else {
+            return args.checklist_items.clone();
+        };
+        match plans.latest(session, facts.task_id.as_deref()).await {
+            Ok(Some(plan)) => plan.launch_steps(&args.checklist_items, &args.owner_units),
+            Ok(None) => args.checklist_items.clone(),
+            Err(error) => {
+                warn!(%error, "Could not read the checklist a launch takes on");
+                args.checklist_items.clone()
+            }
+        }
+    }
+
     /// A `spawn_agent` call that failed started no helper: the checklist
     /// steps it named (`checklist_items`) are marked as not running, the
     /// card shows it, and the failure tells the model which of its steps
@@ -921,7 +959,7 @@ impl SpawnAgentTool {
     /// Start one child for parsed `args`, whose `new_folders` were made.
     async fn start_child(
         &self,
-        args: SpawnArgs,
+        mut args: SpawnArgs,
         new_folders: Vec<String>,
         facts: &aidaemon_tools::semantics::ToolCallContext,
     ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
@@ -960,6 +998,7 @@ impl SpawnAgentTool {
             background = args.background,
             "spawn_agent tool invoked"
         );
+        args.checklist_items = self.launch_steps(&args, &facts).await;
         self.refuse_steps_a_running_helper_does(&args, &facts, agent.as_ref())
             .await?;
 
@@ -1492,6 +1531,7 @@ impl SpawnAgentTool {
         // The launch's typed link to the declared items it took on: the
         // run's ledger judges each declared item by it.
         outcome.metadata.checklist_items = args.checklist_items.clone();
+        outcome.metadata.launched_runs = 1;
         outcome.output.push_str(&scope_overlap_note);
         Ok(outcome)
     }
