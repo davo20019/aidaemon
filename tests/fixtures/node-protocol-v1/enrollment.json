@@ -1,0 +1,15 @@
+{
+  "protocol": { "major": 1, "minor": 0 },
+  "offer_id": "offer_synthetic_01",
+  "offer_secret": "synthetic-enrollment-secret-0000000000000001",
+  "node_kind": "simulator",
+  "public_key_sec1": "A2V4YW1wbGVleGFtcGxlZXhhbXBsZWV4YW1wbGVleGFtcGxl",
+  "metadata": {
+    "runtime_version": "0.1.0",
+    "firmware_version": "simulated",
+    "board": null
+  },
+  "capabilities": [
+    { "capability_id": "input.text", "version": 1, "limits": {} }
+  ]
+}

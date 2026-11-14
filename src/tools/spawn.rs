@@ -1,915 +1,31 @@
-use std::collections::HashSet;
-use std::sync::{Arc, OnceLock, Weak};
-use std::time::Duration;
+//! `spawn_agent` lives in `aidaemon-runtime` ([`aidaemon_runtime::spawn_tool`]).
 
-use async_trait::async_trait;
-use once_cell::sync::Lazy;
-use regex::Regex;
-use serde::Deserialize;
-use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
-use tracing::{info, warn};
-
-use crate::events::TaskOutcome;
-use crate::runtime_ports::{ChildAgentRequest, ChildAgentRuntime, OutboundRouter};
-use crate::traits::{AgentRole, StateStore, Tool, ToolCapabilities};
-use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
-
-/// A tool that allows the LLM to spawn a sub-agent for a focused task.
-///
-/// The sub-agent runs its own agentic loop with a dedicated session and a
-/// system prompt that includes the given mission. Its final text response is
-/// returned as the tool result.
-///
-/// The circular dependency (runtime → tools → SpawnAgentTool → runtime) is
-/// broken by storing a weak [`ChildAgentRuntime`] port inside a `OnceLock`.
-/// The reference is installed after the concrete root runtime is constructed.
-pub struct SpawnAgentTool {
-    agent: OnceLock<Weak<dyn ChildAgentRuntime>>,
-    hub: OnceLock<Weak<dyn OutboundRouter>>,
-    state: Option<Arc<dyn StateStore>>,
-    max_response_chars: usize,
-    timeout_secs: u64,
-    executor_task_runs: Arc<Mutex<HashSet<String>>>,
-}
+pub use aidaemon_runtime::spawn_tool::*;
 
 #[cfg(test)]
-const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 1;
-#[cfg(not(test))]
-const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 20;
+mod test_scope {
+    pub(super) use std::sync::{Arc, Weak};
+    pub(super) use std::time::Duration;
 
-/// Fallback description used when the parent runtime isn't wired yet
-/// (early bootstrap) or when the registry is empty.
-const STATIC_SPECIALIST_ARG_DESCRIPTION: &str =
-    "Optional. Pick the specialist profile matching this task. \
-     Omit to use the broad executor profile.";
+    pub(super) use aidaemon_core::SourceTrust;
+    pub(super) use aidaemon_runtime::turn::sliding_window::MEASURED_TIMING_MARK;
+    pub(super) use async_trait::async_trait;
+    pub(super) use serde_json::json;
+    pub(super) use tokio::sync::mpsc;
 
-/// Format the per-kind `(name, description)` pairs from
-/// `SpecialistRegistry::llm_visible_kinds()` into the multi-line description
-/// surfaced via the `specialist` parameter of `spawn_agent`. Kept as a free
-/// function so tests can exercise the formatter without wiring a full Agent.
-pub(crate) fn format_specialist_arg_description<S: AsRef<str>>(entries: &[(S, String)]) -> String {
-    if entries.is_empty() {
-        return STATIC_SPECIALIST_ARG_DESCRIPTION.to_string();
-    }
-    let mut s =
-        String::from("Optional. Pick the specialist profile that best matches this task:\n");
-    for (name, description) in entries {
-        s.push_str("- ");
-        s.push_str(name.as_ref());
-        s.push_str(": ");
-        s.push_str(description);
-        if !description.ends_with('.') {
-            s.push('.');
-        }
-        s.push('\n');
-    }
-    s.push_str("Omit `specialist` to use the broad executor profile.");
-    s
+    pub(super) use crate::events::TaskOutcome;
+    pub(super) use crate::runtime_ports::{
+        ChildAgentRequest, ChildAgentRun, ChildAgentRuntime, ChildTimedOut, OutboundRouter,
+    };
+    pub(super) use crate::traits::{AgentRole, StateStore, Tool, ToolCallContext};
+    pub(super) use crate::types::{ChannelVisibility, StatusUpdate, UserRole};
+    pub(super) use aidaemon_runtime::helper_run::card::*;
+    pub(super) use aidaemon_runtime::helper_run::delivery::*;
+    pub(super) use aidaemon_runtime::run_state::RunPhase;
+    pub(super) use aidaemon_runtime::run_state::timing::*;
 }
-
-impl SpawnAgentTool {
-    /// Create a SpawnAgentTool with a known child-runtime reference.
-    #[allow(dead_code)]
-    pub fn new(
-        agent: Weak<dyn ChildAgentRuntime>,
-        max_response_chars: usize,
-        timeout_secs: u64,
-    ) -> Self {
-        let lock = OnceLock::new();
-        let _ = lock.set(agent);
-        Self {
-            agent: lock,
-            hub: OnceLock::new(),
-            state: None,
-            max_response_chars,
-            timeout_secs,
-            executor_task_runs: Arc::new(Mutex::new(HashSet::new())),
-        }
-    }
-
-    /// Create a SpawnAgentTool with a deferred agent reference.
-    /// Call [`set_agent`] after constructing the root runtime.
-    pub fn new_deferred(max_response_chars: usize, timeout_secs: u64) -> Self {
-        Self {
-            agent: OnceLock::new(),
-            hub: OnceLock::new(),
-            state: None,
-            max_response_chars,
-            timeout_secs,
-            executor_task_runs: Arc::new(Mutex::new(HashSet::new())),
-        }
-    }
-
-    /// Set state store reference for queued background notifications when direct
-    /// channel delivery is unavailable.
-    pub fn with_state(mut self, state: Arc<dyn StateStore>) -> Self {
-        self.state = Some(state);
-        self
-    }
-
-    /// Set the child-runtime reference exactly once after root construction.
-    /// Panics if called more than once.
-    pub fn set_agent(&self, agent: Weak<dyn ChildAgentRuntime>) {
-        self.agent
-            .set(agent)
-            .expect("SpawnAgentTool::set_agent called more than once");
-    }
-
-    fn get_agent(&self) -> anyhow::Result<Arc<dyn ChildAgentRuntime>> {
-        let weak = self
-            .agent
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("SpawnAgentTool: agent reference not set"))?;
-        weak.upgrade()
-            .ok_or_else(|| anyhow::anyhow!("SpawnAgentTool: parent agent has been dropped"))
-    }
-
-    /// Set the channel hub reference for background mode notifications.
-    pub fn set_hub(&self, hub: Weak<dyn OutboundRouter>) {
-        self.hub
-            .set(hub)
-            .expect("SpawnAgentTool::set_hub called more than once");
-    }
-
-    fn get_hub(&self) -> Option<Arc<dyn OutboundRouter>> {
-        self.hub.get().and_then(|w| w.upgrade())
-    }
-
-    pub(crate) fn wiring_ready(&self) -> bool {
-        self.agent_wired() && self.hub.get().and_then(Weak::upgrade).is_some()
-    }
-
-    pub(crate) fn agent_wired(&self) -> bool {
-        self.agent.get().and_then(Weak::upgrade).is_some()
-    }
-
-    /// Render the `specialist` parameter's description text, pulling each
-    /// kind's frontmatter description from the live `SpecialistRegistry`
-    /// (so user overrides at `~/.aidaemon/specialists/<kind>.md` flow
-    /// through to the LLM-facing schema on next start).
-    ///
-    /// During early bootstrap the parent `Agent` may not yet be wired up
-    /// (the weak ref hasn't been set). In that case we fall back to a
-    /// static description with no per-kind text — the `enum` list still
-    /// constrains the value, so the LLM can still pick a valid kind even
-    /// without descriptions.
-    fn build_specialist_arg_description(&self) -> String {
-        let agent = match self.get_agent() {
-            Ok(a) => a,
-            Err(_) => {
-                warn!(
-                    "spawn_agent schema: parent agent not yet available; falling back to static specialist description"
-                );
-                return STATIC_SPECIALIST_ARG_DESCRIPTION.to_string();
-            }
-        };
-
-        format_specialist_arg_description(&agent.specialist_descriptions())
-    }
-
-    /// Acquire a per-task in-flight lock for executor spawns.
-    async fn try_begin_executor_task(&self, task_id: &str) -> bool {
-        let mut runs = self.executor_task_runs.lock().await;
-        if runs.contains(task_id) {
-            return false;
-        }
-        runs.insert(task_id.to_string());
-        true
-    }
-
-    /// Release a per-task in-flight lock for executor spawns.
-    async fn finish_executor_task(&self, task_id: &str) {
-        self.executor_task_runs.lock().await.remove(task_id);
-    }
-}
-
-/// Truncate a string to at most `max_chars` bytes without splitting a
-/// multi-byte UTF-8 character. Returns the original string when it fits.
-fn truncate_utf8(s: &str, max_chars: usize) -> &str {
-    if s.len() <= max_chars {
-        return s;
-    }
-    // Find the last char boundary at or before `max_chars`.
-    let boundary = s
-        .char_indices()
-        .map(|(i, _)| i)
-        .take_while(|&i| i <= max_chars)
-        .last()
-        .unwrap_or(0);
-    &s[..boundary]
-}
-
-fn format_background_completion(
-    mission: &str,
-    response: &str,
-    outcome: TaskOutcome,
-    max_response_chars: usize,
-) -> (&'static str, String) {
-    let text = truncate_utf8(response, max_response_chars);
-    match outcome {
-        TaskOutcome::Succeeded => (
-            "completed",
-            format!(
-                "\u{2705} Background task complete\nMission: {}\n\n{}",
-                mission, text
-            ),
-        ),
-        TaskOutcome::Partial => (
-            "partial",
-            format!(
-                "\u{26a0}\u{fe0f} Background task incomplete\nMission: {}\n\n{}",
-                mission, text
-            ),
-        ),
-        TaskOutcome::Failed => (
-            "failed",
-            format!(
-                "\u{274c} Background task failed\nMission: {}\n\n{}",
-                mission, text
-            ),
-        ),
-    }
-}
-
-/// Parse a leading wait/delay prefix from a task string.
-/// Examples: "wait for 2 minutes ...", "in 30 seconds ...", "after 1 hour ..."
-fn parse_leading_wait_seconds(task: &str) -> Option<u64> {
-    static LEADING_WAIT_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r"(?i)^\s*(?:wait\s+(?:for\s+)?|in\s+|after\s+)(\d+)\s*(seconds?|secs?|s|minutes?|mins?|min|m|hours?|hrs?|h)\b",
-        )
-        .expect("leading wait regex should compile")
-    });
-
-    let caps = LEADING_WAIT_RE.captures(task.trim())?;
-    let value: u64 = caps.get(1)?.as_str().parse().ok()?;
-    let unit = caps.get(2)?.as_str().to_ascii_lowercase();
-    match unit.as_str() {
-        "s" | "sec" | "secs" | "second" | "seconds" => Some(value),
-        "m" | "min" | "mins" | "minute" | "minutes" => Some(value.saturating_mul(60)),
-        "h" | "hr" | "hrs" | "hour" | "hours" => Some(value.saturating_mul(3600)),
-        _ => None,
-    }
-}
-
-/// Strip a leading wait/delay prefix from a task string.
-fn strip_leading_wait(task: &str) -> String {
-    static STRIP_WAIT_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r"(?i)^\s*(?:wait\s+(?:for\s+)?|in\s+|after\s+)\d+\s*(?:seconds?|secs?|s|minutes?|mins?|min|m|hours?|hrs?|h)\s*[,;]?\s*(?:then\s+|and\s+|,\s*)?",
-        )
-        .expect("strip wait regex should compile")
-    });
-
-    let remainder = STRIP_WAIT_RE.replace(task.trim(), "").to_string();
-    let trimmed = remainder.trim().to_string();
-    if trimmed.len() < 3 {
-        String::new()
-    } else {
-        trimmed
-    }
-}
-
-async fn deliver_background_notification(
-    hub: Option<&Arc<dyn OutboundRouter>>,
-    state: Option<&Arc<dyn StateStore>>,
-    goal_id: &str,
-    session_id: &str,
-    notification_type: &str,
-    message: &str,
-    context: &str,
-) {
-    let message = crate::channels::present_notification(notification_type, message);
-    let mut delivered = false;
-    if let Some(hub_arc) = hub {
-        if let Err(e) = hub_arc.send_text(session_id, &message).await {
-            warn!(
-                session_id = %session_id,
-                goal_id = %goal_id,
-                notification_type = %notification_type,
-                error = %e,
-                "{context}: direct hub delivery failed"
-            );
-        } else {
-            delivered = true;
-        }
-    }
-
-    if delivered {
-        return;
-    }
-
-    if let Some(state_store) = state {
-        let entry =
-            crate::traits::NotificationEntry::new(goal_id, session_id, notification_type, &message);
-        if let Err(e) = state_store.enqueue_notification(&entry).await {
-            warn!(
-                session_id = %session_id,
-                goal_id = %goal_id,
-                notification_type = %notification_type,
-                error = %e,
-                "{context}: enqueue fallback failed"
-            );
-        }
-    } else {
-        warn!(
-            session_id = %session_id,
-            goal_id = %goal_id,
-            notification_type = %notification_type,
-            "{context}: no hub and no queue fallback configured; update dropped"
-        );
-    }
-}
-
-#[derive(Deserialize)]
-struct SpawnArgs {
-    /// High-level mission / role description for the sub-agent.
-    mission: String,
-    /// The concrete task or question the sub-agent should work on.
-    task: String,
-    /// When true, spawn the sub-agent in the background and return immediately.
-    #[serde(default)]
-    background: bool,
-    /// Task ID — when provided by a task lead, the executor tracks activity against this task.
-    #[serde(default)]
-    task_id: Option<String>,
-    /// Optional specialist profile hint. The parent LLM can pick one of the supported
-    /// kinds (code, browser_verifier, artifact_writer, research, review, comms_draft,
-    /// executor, generic) so the child agent uses the matching profile. Threaded
-    /// through `spawn_child`; Task 12 wires it into kind resolution.
-    #[serde(default)]
-    specialist: Option<String>,
-    /// Session ID injected by execute_tool — used for background completion notifications.
-    #[serde(default)]
-    _session_id: Option<String>,
-    /// Channel visibility injected by execute_tool — propagated to child agents.
-    #[serde(default)]
-    _channel_visibility: Option<String>,
-    /// User role injected by execute_tool — propagated to child agents to prevent
-    /// privilege escalation (e.g., Guest user spawning Owner-level sub-agent).
-    #[serde(default)]
-    _user_role: Option<String>,
-    /// Task ID injected by execute_tool for task-lead → executor spawning.
-    #[serde(default)]
-    _task_id: Option<String>,
-    /// Goal ID injected by execute_tool for task-lead → executor spawning.
-    #[serde(default)]
-    _goal_id: Option<String>,
-    /// Explicit trust flag injected by execute_tool for trusted scheduled runs.
-    #[serde(default)]
-    _trusted_session: Option<bool>,
-    /// Parent project scope injected by execute_tool for child scope inheritance.
-    #[serde(default)]
-    _project_scope: Option<String>,
-}
-
-fn build_child_channel_context(args: &SpawnArgs) -> ChannelContext {
-    let visibility = args
-        ._channel_visibility
-        .as_deref()
-        .map(ChannelVisibility::from_str_lossy)
-        .unwrap_or(ChannelVisibility::Internal);
-    ChannelContext {
-        visibility,
-        platform: "internal".to_string(),
-        channel_name: None,
-        channel_id: None,
-        workspace_id: None,
-        sender_name: None,
-        sender_id: None,
-        channel_member_names: vec![],
-        user_id_map: std::collections::HashMap::new(),
-        workspace_grant: None,
-        trusted: args._trusted_session.unwrap_or(false),
-    }
-}
-
-#[async_trait]
-impl Tool for SpawnAgentTool {
-    fn name(&self) -> &str {
-        "spawn_agent"
-    }
-
-    fn description(&self) -> &str {
-        "Delegate a focused task to a fresh sub-agent. PREFER delegation when the work is multi-step \
-         (research → synthesize, code → test, fetch → analyze), matches a named specialist (see the \
-         `specialist` enum: code, browser_verifier, research, review, artifact_writer, comms_draft, ...), \
-         benefits from a fresh context window, or can run in parallel with other work. Do NOT delegate \
-         trivial one-shot reads (a single read_file, a single web_search) — handle those directly. \
-         The sub-agent starts with a fresh context and the same tools, so reference files by path and \
-         do not paste prior tool output."
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "name": "spawn_agent",
-            "description": "Delegate a focused task to a fresh sub-agent. PREFER delegation when the work \
-                is multi-step (research → synthesize, code → test, fetch → analyze), matches a named \
-                specialist (see the `specialist` enum: code, browser_verifier, research, review, \
-                artifact_writer, comms_draft, ...), benefits from a fresh context window, or can run in \
-                parallel with other work. Do NOT delegate trivial one-shot reads (a single read_file, a \
-                single web_search) — handle those directly. The sub-agent starts with a fresh context and \
-                the same tools, so reference files by path and do not paste prior tool output.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mission": {
-                        "type": "string",
-                        "description": "High-level mission or role for the sub-agent \
-                            (e.g. 'Research assistant focused on Python packaging')"
-                    },
-                    "task": {
-                        "type": "string",
-                        "description": "The specific task or question the sub-agent should accomplish. \
-                            Keep it self-contained but concise: state the goal, success criteria, and any \
-                            non-obvious constraints. Do NOT paste file contents, prior tool output, or \
-                            conversation excerpts — give file paths and let the sub-agent read them itself."
-                    },
-                    "background": {
-                        "type": "boolean",
-                        "description": "When true, spawn the sub-agent in the background and return immediately. \
-                            The result will be delivered through the parent session when the sub-agent finishes. \
-                            Use this for long-running tasks where the user doesn't need to wait.",
-                        "default": false
-                    },
-                    "task_id": {
-                        "type": "string",
-                        "description": "Task ID to associate with this executor (used by task leads to connect executor work to task tracking)"
-                    },
-                    "specialist": {
-                        "type": "string",
-                        "enum": [
-                            "code",
-                            "browser_verifier",
-                            "artifact_writer",
-                            "research",
-                            "review",
-                            "comms_draft",
-                            "executor",
-                            "generic"
-                        ],
-                        "description": self.build_specialist_arg_description()
-                    }
-                },
-                "required": ["mission", "task"],
-                "additionalProperties": false
-            }
-        })
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.call_with_status(arguments, None).await
-    }
-
-    async fn call_with_status(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<String> {
-        let args: SpawnArgs = serde_json::from_str(arguments)?;
-        let agent = self.get_agent()?;
-
-        info!(
-            depth = agent.depth(),
-            max_depth = agent.max_depth(),
-            mission = %args.mission,
-            background = args.background,
-            "spawn_agent tool invoked"
-        );
-
-        // Preserve execution context that was injected by the parent agent.
-        let channel_ctx = build_child_channel_context(&args);
-
-        // Propagate parent's user role to prevent privilege escalation.
-        // Default to Guest (least privilege) if not provided.
-        let user_role = match args._user_role.as_deref() {
-            Some("Owner") => UserRole::Owner,
-            Some("Guest") => UserRole::Guest,
-            _ => UserRole::Guest,
-        };
-
-        // Determine child role based on parent's role.
-        let child_role = if agent.role() == AgentRole::TaskLead {
-            Some(AgentRole::Executor)
-        } else {
-            None
-        };
-
-        // LLM-provided task_id takes priority; fall back to injected _task_id
-        let task_id_ref = args.task_id.or(args._task_id.clone());
-        let goal_id_ref = args._goal_id.clone();
-
-        // TaskLead -> Executor spawns must target a concrete, pre-claimed task and
-        // are deduplicated per task_id so the same work is not launched twice.
-        let executor_task_id = if child_role == Some(AgentRole::Executor) {
-            let Some(task_id) = task_id_ref.clone() else {
-                return Err(anyhow::anyhow!(
-                    "TaskLead must pass task_id when spawning an executor. Claim a task first with manage_goal_tasks(action='claim_task')."
-                ));
-            };
-            if let Err(e) = agent
-                .validate_executor_task_for_spawn(&task_id, goal_id_ref.as_deref())
-                .await
-            {
-                return Err(anyhow::anyhow!(
-                    "Blocked executor spawn for task {}: {}",
-                    task_id,
-                    e
-                ));
-            }
-            if !self.try_begin_executor_task(&task_id).await {
-                return Err(anyhow::anyhow!(
-                    "Task {} already has an executor running. Wait for it to finish before spawning another.",
-                    task_id
-                ));
-            }
-            Some(task_id)
-        } else {
-            None
-        };
-
-        // Fast-path leading wait tasks to avoid burning tokens in a child loop.
-        // This covers direct spawn_agent executor calls (which bypass task-lead
-        // auto-dispatch wait interception).
-        let mut effective_mission = args.mission.clone();
-        let mut effective_task = args.task.clone();
-        if let Some(wait_secs) = parse_leading_wait_seconds(&effective_task) {
-            let remainder = strip_leading_wait(&effective_task);
-            info!(
-                wait_secs,
-                has_remainder = !remainder.is_empty(),
-                "Intercepted leading wait in spawn_agent task; sleeping locally"
-            );
-            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-
-            if remainder.is_empty() {
-                if let Some(ref task_id) = executor_task_id {
-                    self.finish_executor_task(task_id).await;
-                }
-                return Ok(format!("Waited for {} second(s).", wait_secs));
-            }
-
-            effective_task = remainder.clone();
-            // Keep mission aligned when it appears to mirror task input.
-            if parse_leading_wait_seconds(&effective_mission).is_some()
-                || effective_mission
-                    .trim()
-                    .eq_ignore_ascii_case(args.task.trim())
-            {
-                effective_mission = remainder;
-            }
-        }
-
-        let approval_session_id = args._session_id.clone();
-
-        if !args.background {
-            let result = self
-                .run_sync(
-                    agent,
-                    &effective_mission,
-                    &effective_task,
-                    status_tx,
-                    channel_ctx,
-                    user_role,
-                    child_role,
-                    goal_id_ref.as_deref(),
-                    task_id_ref.as_deref(),
-                    args._project_scope.as_deref(),
-                    args.specialist.as_deref(),
-                    approval_session_id.as_deref(),
-                )
-                .await;
-            if let Some(ref task_id) = executor_task_id {
-                self.finish_executor_task(task_id).await;
-            }
-            return result;
-        }
-
-        // Background mode: need at least one completion delivery path.
-        let hub = self.get_hub();
-        let state = self.state.clone();
-        let hub_for_parent_delivery = hub.as_ref().map(Arc::downgrade);
-        if hub.is_none() && state.is_none() {
-            info!(
-                "Background mode requested but no hub/state notification path is available, falling back to sync"
-            );
-            let result = self
-                .run_sync(
-                    agent,
-                    &effective_mission,
-                    &effective_task,
-                    status_tx,
-                    channel_ctx,
-                    user_role,
-                    child_role,
-                    goal_id_ref.as_deref(),
-                    task_id_ref.as_deref(),
-                    args._project_scope.as_deref(),
-                    args.specialist.as_deref(),
-                    approval_session_id.as_deref(),
-                )
-                .await;
-            if let Some(ref task_id) = executor_task_id {
-                self.finish_executor_task(task_id).await;
-            }
-            return result;
-        }
-        let session_id = match approval_session_id.as_deref() {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => {
-                info!("Background mode requested but no session_id, falling back to sync");
-                let result = self
-                    .run_sync(
-                        agent,
-                        &effective_mission,
-                        &effective_task,
-                        status_tx,
-                        channel_ctx,
-                        user_role,
-                        child_role,
-                        goal_id_ref.as_deref(),
-                        task_id_ref.as_deref(),
-                        args._project_scope.as_deref(),
-                        args.specialist.as_deref(),
-                        approval_session_id.as_deref(),
-                    )
-                    .await;
-                if let Some(ref task_id) = executor_task_id {
-                    self.finish_executor_task(task_id).await;
-                }
-                return result;
-            }
-        };
-
-        let task = effective_task.clone();
-        let mission = effective_mission.clone();
-        let timeout_secs = self.timeout_secs;
-        let max_response_chars = self.max_response_chars;
-        let executor_task_runs = Arc::clone(&self.executor_task_runs);
-        let executor_task_id_for_bg = executor_task_id;
-        let notify_goal_id = goal_id_ref.clone().unwrap_or_else(|| "global".to_string());
-        let notify_status_tx = status_tx.clone();
-
-        tokio::spawn(async move {
-            let started_at = std::time::Instant::now();
-            let mut progress_interval =
-                tokio::time::interval(Duration::from_secs(BACKGROUND_PROGRESS_INTERVAL_SECS));
-            progress_interval.tick().await; // consume immediate tick
-            let timeout_duration = Duration::from_secs(timeout_secs);
-            let mut result_fut = std::pin::pin!(tokio::time::timeout(
-                timeout_duration,
-                agent.run_child(ChildAgentRequest {
-                    mission: mission.clone(),
-                    task: task.clone(),
-                    status_tx: status_tx.clone(),
-                    channel_ctx,
-                    user_role,
-                    child_role,
-                    goal_id: goal_id_ref.clone(),
-                    task_id: task_id_ref.clone(),
-                    project_scope: args._project_scope.clone(),
-                    specialist: args.specialist.clone(),
-                    approval_session_id: Some(session_id.clone()),
-                }),
-            ));
-            let result = loop {
-                tokio::select! {
-                    res = &mut result_fut => break res,
-                    _ = progress_interval.tick() => {
-                        let elapsed_secs = started_at.elapsed().as_secs();
-                        let progress_message = format!(
-                            "Background sub-agent still running after {}s.\nMission: {}",
-                            elapsed_secs, mission
-                        );
-                        if let Some(ref tx) = notify_status_tx {
-                            let _ = tx.try_send(StatusUpdate::ToolProgress {
-                                name: "spawn_agent".to_string(),
-                                chunk: format!(
-                                    "Background sub-agent still running ({}s): {}",
-                                    elapsed_secs, mission
-                                ),
-                            });
-                        }
-                        deliver_background_notification(
-                            hub.as_ref(),
-                            state.as_ref(),
-                            &notify_goal_id,
-                            &session_id,
-                            "progress",
-                            &progress_message,
-                            "spawn_agent background progress notifier",
-                        )
-                        .await;
-                    }
-                }
-            };
-
-            let (notification_type, message) = match result {
-                Ok(Ok(run)) => format_background_completion(
-                    &mission,
-                    &run.response,
-                    run.outcome,
-                    max_response_chars,
-                ),
-                Ok(Err(e)) => (
-                    "failed",
-                    format!(
-                        "\u{274c} Background task failed\nMission: {}\nError: {}",
-                        mission, e
-                    ),
-                ),
-                Err(_) => {
-                    // The child may have persisted a terminal outcome before
-                    // the timeout cancelled it — deliver that instead of a
-                    // generic timeout failure.
-                    let salvaged = match task_id_ref.as_deref() {
-                        Some(task_id) => {
-                            agent
-                                .salvage_executor_task_outcome(task_id, timeout_secs)
-                                .await
-                        }
-                        None => None,
-                    };
-                    match salvaged {
-                        Some(outcome) if outcome.status == "completed" => (
-                            "completed",
-                            format!(
-                                "\u{2705} Background task complete\nMission: {}\n\n{}",
-                                mission, outcome.details
-                            ),
-                        ),
-                        Some(outcome) if outcome.status == "blocked" => (
-                            "blocked",
-                            format!(
-                                "\u{26a0}\u{fe0f} Background task blocked\nMission: {}\n\n{}",
-                                mission, outcome.details
-                            ),
-                        ),
-                        Some(outcome) => (
-                            "failed",
-                            format!(
-                                "\u{274c} Background task failed\nMission: {}\n\n{}",
-                                mission, outcome.details
-                            ),
-                        ),
-                        None => (
-                            "failed",
-                            format!(
-                                "\u{23f1} Background task timed out\nMission: {}\nTimed out after {}s",
-                                mission, timeout_secs
-                            ),
-                        ),
-                    }
-                }
-            };
-            let delivered = match agent
-                .deliver_background_child_result(
-                    hub_for_parent_delivery.as_ref(),
-                    &session_id,
-                    &message,
-                )
-                .await
-            {
-                Ok(sent) => sent,
-                Err(e) => {
-                    warn!(
-                        session_id = %session_id,
-                        goal_id = %notify_goal_id,
-                        notification_type = %notification_type,
-                        error = %e,
-                        "spawn_agent background completion notifier: parent delivery failed"
-                    );
-                    false
-                }
-            };
-
-            if !delivered {
-                deliver_background_notification(
-                    None,
-                    state.as_ref(),
-                    &notify_goal_id,
-                    &session_id,
-                    notification_type,
-                    &message,
-                    "spawn_agent background completion notifier",
-                )
-                .await;
-            }
-
-            if let Some(task_id) = executor_task_id_for_bg {
-                executor_task_runs.lock().await.remove(&task_id);
-            }
-        });
-
-        Ok(format!(
-            "Sub-agent spawned in background for mission: \"{}\". \
-             The result will be delivered through the parent session when it completes.",
-            args.mission
-        ))
-    }
-}
-
-impl SpawnAgentTool {
-    /// Run the sub-agent synchronously (blocking until completion or timeout).
-    #[allow(clippy::too_many_arguments)]
-    async fn run_sync(
-        &self,
-        agent: Arc<dyn ChildAgentRuntime>,
-        mission: &str,
-        task: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        channel_ctx: ChannelContext,
-        user_role: UserRole,
-        child_role: Option<AgentRole>,
-        goal_id: Option<&str>,
-        task_id: Option<&str>,
-        project_scope: Option<&str>,
-        arg_specialist: Option<&str>,
-        approval_session_id: Option<&str>,
-    ) -> anyhow::Result<String> {
-        let timeout_duration = Duration::from_secs(self.timeout_secs);
-        let result = tokio::time::timeout(
-            timeout_duration,
-            agent.run_child(ChildAgentRequest {
-                mission: mission.to_string(),
-                task: task.to_string(),
-                status_tx,
-                channel_ctx,
-                user_role,
-                child_role,
-                goal_id: goal_id.map(str::to_string),
-                task_id: task_id.map(str::to_string),
-                project_scope: project_scope.map(str::to_string),
-                specialist: arg_specialist.map(str::to_string),
-                approval_session_id: approval_session_id.map(str::to_string),
-            }),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(run)) => {
-                let response = match run.outcome {
-                    TaskOutcome::Succeeded => run.response,
-                    TaskOutcome::Partial => {
-                        format!("\u{26a0}\u{fe0f} Sub-agent incomplete\n\n{}", run.response)
-                    }
-                    TaskOutcome::Failed => {
-                        return Err(anyhow::anyhow!("Sub-agent failed: {}", run.response));
-                    }
-                };
-                let max_len = self.max_response_chars;
-                if response.len() > max_len {
-                    let truncated = truncate_utf8(&response, max_len);
-                    Ok(format!(
-                        "{}\n\n[Sub-agent response truncated at {} chars]",
-                        truncated, max_len
-                    ))
-                } else {
-                    Ok(response)
-                }
-            }
-            Ok(Err(e)) => Err(anyhow::anyhow!("Specialist failed: {}", e)),
-            Err(_) => {
-                if let Some(task_id) = task_id {
-                    // The child may have persisted a terminal outcome (e.g.
-                    // report_blocker) before the timeout cancelled it — use
-                    // that instead of discarding the work.
-                    if let Some(salvaged) = agent
-                        .salvage_executor_task_outcome(task_id, self.timeout_secs)
-                        .await
-                    {
-                        let prefix = match salvaged.status.as_str() {
-                            "completed" => "\u{2705} Sub-agent complete",
-                            "blocked" => "\u{26a0}\u{fe0f} Sub-agent blocked",
-                            _ => "\u{274c} Sub-agent failed",
-                        };
-                        return Ok(format!("{prefix}\n\n{}", salvaged.details));
-                    }
-                    if child_role == Some(AgentRole::Executor) {
-                        agent
-                            .mark_executor_task_timeout(task_id, self.timeout_secs)
-                            .await;
-                    }
-                }
-                Err(anyhow::anyhow!(
-                    "Specialist timed out after {} seconds",
-                    self.timeout_secs
-                ))
-            }
-        }
-    }
-}
+#[cfg(test)]
+use test_scope::*;
 
 #[cfg(test)]
 mod tests {
@@ -918,6 +34,25 @@ mod tests {
     use crate::state::SqliteStateStore;
     use crate::traits::{NotificationStore, StateStore};
     use std::sync::Arc;
+
+    /// A background spawn ends the turn from the tool's typed outcome, not
+    /// from its wording: the finish and the handoff fact are set whatever
+    /// the message says.
+    #[test]
+    fn background_spawn_hands_the_turn_off() {
+        let outcome = background_spawn_outcome("Summarize the synthetic report");
+        assert!(outcome.metadata.background_handoff);
+        assert!(
+            !outcome.metadata.background_started,
+            "a sub-agent is not a tracked process launch"
+        );
+        let finish = outcome.finish.expect("the turn hands off");
+        assert_eq!(finish.outcome, aidaemon_core::FinishOutcome::Partial);
+        assert_eq!(
+            finish.reply, None,
+            "the dispatcher writes the handoff reply"
+        );
+    }
 
     #[test]
     fn truncate_utf8_ascii() {
@@ -957,29 +92,163 @@ mod tests {
         assert_eq!(truncate_utf8("", 0), "");
     }
 
-    #[test]
-    fn partial_background_result_is_not_labeled_complete() {
-        let (notification_type, message) = format_background_completion(
-            "Build and verify the site",
-            "Blocked on workspace access.",
-            TaskOutcome::Partial,
-            8_000,
-        );
-        assert_eq!(notification_type, "partial");
-        assert!(message.starts_with("\u{26a0}\u{fe0f} Background task incomplete"));
-        assert!(!message.contains("\u{2705} Background task complete"));
+    /// A synthetic ended run record.
+    pub(super) fn ended_run(
+        phase: RunPhase,
+        // The folders of steps no receipt confirmed (each a file write).
+        unconfirmed: &[&str],
+        first_step: Option<i64>,
+        finished: i64,
+        waited: u64,
+    ) -> aidaemon_runtime::run_state::RunState {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-11-13T02:05:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        aidaemon_runtime::run_state::RunState {
+            id: "background_spawn:synthetic".to_string(),
+            chat: "telegram:synthetic-chat".to_string(),
+            label: "Slow count".to_string(),
+            phase,
+            requested_at: None,
+            started_at: start,
+            ended_at: Some(start + chrono::Duration::seconds(finished)),
+            work_began: first_step.map(|secs| start + chrono::Duration::seconds(secs)),
+            waited: Duration::from_secs(waited),
+            step: None,
+            steps: Vec::new(),
+            evidence: aidaemon_runtime::run_state::RunEvidence {
+                unconfirmed: unconfirmed
+                    .iter()
+                    .map(|path| aidaemon_runtime::run_state::UnconfirmedStep {
+                        effect: crate::traits::ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                        target: Some(path.to_string()),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            failure: (phase == RunPhase::Failed)
+                .then_some(aidaemon_runtime::run_state::RunFailure::NoCause),
+            card: Default::default(),
+            background: true,
+            request: None,
+            made_folders: Vec::new(),
+        }
     }
 
+    /// The result's header is the run's phase, its one evidence line names
+    /// only typed action steps nothing verified, and its footer is the measured
+    /// time: what the helper wrote is only the body.
     #[test]
-    fn successful_background_result_keeps_completion_label() {
-        let (notification_type, message) = format_background_completion(
-            "Build and verify the site",
-            "Build passed.",
-            TaskOutcome::Succeeded,
+    fn a_runs_result_renders_from_its_record() {
+        let stopped = render_run_result(
+            &ended_run(RunPhase::Stopped, &[], None, 60, 0),
+            "WordPress install",
+            "The site is running.",
             8_000,
+            false,
         );
-        assert_eq!(notification_type, "completed");
-        assert!(message.starts_with("\u{2705} Background task complete"));
+        assert!(
+            stopped.starts_with("\u{26a0}\u{fe0f} Didn't finish in the background: WordPress install\n\nThe site is running."),
+            "{stopped}"
+        );
+        assert!(!stopped.contains("Finished in the background"));
+
+        let succeeded = render_run_result(
+            &ended_run(RunPhase::Succeeded, &[], Some(2), 62, 0),
+            "Slow count",
+            "Done.",
+            8_000,
+            false,
+        );
+        assert!(
+            succeeded.starts_with("\u{2705} Finished in the background: Slow count\n\nDone."),
+            "{succeeded}"
+        );
+        assert!(!succeeded.contains("confirm"), "{succeeded}");
+        assert!(succeeded.contains("Took 1m"), "{succeeded}");
+
+        let unconfirmed = render_run_result(
+            &ended_run(RunPhase::Succeeded, &["/srv/site/shots"], None, 60, 0),
+            "Site install",
+            "Done.",
+            8_000,
+            false,
+        );
+        // The outcome leads and the report follows; what only the report
+        // vouches for is said after it (live 2026-11-13: "Its report is the
+        // only record of 2 steps" was the result's first line).
+        assert!(
+            unconfirmed.starts_with(
+                "\u{2705} Finished in the background: Site install\n\nDone.\n\n\
+                 Only the report above shows the files it wrote in /srv/site/shots."
+            ),
+            "{unconfirmed}"
+        );
+    }
+
+    /// How a run ended is said once: when its card shows it, the result
+    /// carries the body and the measured time, never the card's header
+    /// again (live 2026-11-13: "Finished in the background: X" on the card
+    /// and again on the result).
+    #[test]
+    fn the_result_never_repeats_the_cards_header() {
+        for phase in [RunPhase::Succeeded, RunPhase::Stopped, RunPhase::Failed] {
+            let run = ended_run(phase, &["/srv/site/shots"], Some(2), 62, 0);
+            let message = render_run_result(&run, "Slow count", "Counted to 30.", 8_000, true);
+            for header in [phase.headline(), phase.helper_headline(false)] {
+                assert!(!message.contains(header), "{header:?} in {message:?}");
+            }
+            assert!(!message.contains("Slow count"), "{message}");
+            // A failed run leads with why it failed, from its record; any
+            // other's leads with its report, and what that report alone
+            // records follows it.
+            match phase {
+                RunPhase::Failed => {
+                    let reason = run.reason().expect("a failed run has its reason");
+                    assert!(
+                        message.starts_with(&format!("{reason}\n\nCounted to 30.")),
+                        "{message}"
+                    );
+                }
+                _ => assert!(
+                    message.starts_with(
+                        "Counted to 30.\n\nOnly the report above shows the files it \
+                         wrote in /srv/site/shots."
+                    ),
+                    "{message}"
+                ),
+            }
+            assert!(message.contains("Took 1m"), "{message}");
+        }
+    }
+
+    /// A helper's title, and each plan item, names the folder the work
+    /// creates, so the owner's first "Started in the background" lines say
+    /// where it goes (live 2026-11-13: the new -6 folders showed up first in
+    /// a status reply).
+    #[tokio::test]
+    async fn titles_and_plan_items_name_the_folder_the_work_creates() {
+        let tool = SpawnAgentTool::new_deferred(8000, 300);
+        let schema = tool.schema();
+        let title = schema["parameters"]["properties"]["title"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            title.contains("when the work creates or works in a folder, that folder's name"),
+            "{title}"
+        );
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = crate::tools::track_requirements::TrackRequirementsTool::new(Arc::new(
+            crate::plans::PlanStore::new(pool).await.unwrap(),
+        ));
+        assert!(
+            crate::traits::Tool::description(&plans)
+                .contains("name the folder or file an item creates")
+        );
     }
 
     #[test]
@@ -1012,52 +281,139 @@ mod tests {
         let json = r#"{"mission": "test", "task": "do stuff"}"#;
         let args: SpawnArgs = serde_json::from_str(json).unwrap();
         assert!(!args.background);
-        assert!(args._session_id.is_none());
-        assert!(args._channel_visibility.is_none());
     }
 
     #[test]
     fn spawn_args_background_true() {
-        let json = r#"{"mission": "test", "task": "do stuff", "background": true, "_session_id": "tg:123"}"#;
+        let json = r#"{"mission": "test", "task": "do stuff", "background": true}"#;
         let args: SpawnArgs = serde_json::from_str(json).unwrap();
         assert!(args.background);
-        assert_eq!(args._session_id.as_deref(), Some("tg:123"));
+    }
+
+    fn spawn_args(extra: serde_json::Value) -> SpawnArgs {
+        let mut args = serde_json::json!({"mission": "m", "task": "t"});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(args).unwrap()
     }
 
     #[test]
-    fn spawn_args_with_channel_visibility() {
-        let json = r#"{"mission": "test", "task": "do stuff", "_channel_visibility": "public"}"#;
-        let args: SpawnArgs = serde_json::from_str(json).unwrap();
-        assert_eq!(args._channel_visibility.as_deref(), Some("public"));
+    fn a_child_is_narrowed_only_when_asked() {
+        assert!(
+            requested_child_authority(&spawn_args(serde_json::json!({})))
+                .unwrap()
+                .is_none()
+        );
+
+        let requested =
+            requested_child_authority(&spawn_args(serde_json::json!({"access": "read_only"})))
+                .unwrap()
+                .unwrap();
+        assert_eq!(requested.level, aidaemon_core::AccessLevel::ReadOnly);
+        assert_eq!(requested.tools, None);
+
+        let requested = requested_child_authority(&spawn_args(
+            serde_json::json!({"tools": ["read_file", " search_files "]}),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(requested.level, aidaemon_core::AccessLevel::Write);
+        assert_eq!(
+            requested.tools.unwrap().into_iter().collect::<Vec<_>>(),
+            ["read_file", "search_files"]
+        );
+
+        assert!(
+            requested_child_authority(&spawn_args(serde_json::json!({"tools": [" "]}))).is_err()
+        );
     }
 
     #[test]
-    fn spawn_args_with_trusted_session() {
-        let json = r#"{"mission":"test","task":"do stuff","_trusted_session":true,"_channel_visibility":"internal"}"#;
-        let args: SpawnArgs = serde_json::from_str(json).unwrap();
-        let channel_ctx = build_child_channel_context(&args);
+    fn asking_for_more_than_the_parent_has_gives_nothing_extra() {
+        let parent = aidaemon_core::Authority::read_only();
+        let requested =
+            requested_child_authority(&spawn_args(serde_json::json!({"access": "write"})))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            parent.narrow(&requested).level,
+            aidaemon_core::AccessLevel::ReadOnly
+        );
+    }
+
+    /// The parent turn's authority reaches spawn_agent only through the
+    /// dispatcher's typed facts; an argument of the same name is ignored.
+    #[test]
+    fn parent_authority_comes_from_the_call_facts() {
+        let parent = crate::agent::authority::InheritedAuthority {
+            authority: aidaemon_core::Authority::read_only(),
+            owner_level: Some(crate::config::OwnerLevel::Full),
+            task_access: None,
+            mode_session: Some("tg:123".to_string()),
+            untrusted_context: true,
+            origin_request: Some("Summarize the synthetic notes.".to_string()),
+            origin_trusted: true,
+            trusted_roots: Vec::new(),
+            declined: vec![aidaemon_core::EffectKey::egress(
+                "https",
+                "h.example.invalid",
+                None,
+            )],
+            shared_declines: None,
+            learning: None,
+            spawn_family: None,
+            child_declaration: None,
+            parent_run: None,
+            known_resources: Default::default(),
+            card_title: None,
+            card_steps: Vec::new(),
+            lineage: Vec::new(),
+            parent_task: None,
+        };
+        let mut facts = ToolCallContext::default();
+        assert!(crate::agent::authority::parent_authority(&facts).is_none());
+        facts.extensions.insert(parent.clone());
+        assert_eq!(
+            crate::agent::authority::parent_authority(&facts),
+            Some(&parent)
+        );
+        // The model cannot supply one: SpawnArgs has no such argument.
+        let json = serde_json::json!({
+            "mission": "test",
+            "task": "do stuff",
+            "_parent_authority": parent,
+        });
+        assert!(serde_json::from_value::<SpawnArgs>(json).is_ok());
+    }
+
+    #[test]
+    fn child_channel_context_takes_the_call_visibility() {
+        let facts = ToolCallContext {
+            channel_visibility: Some(ChannelVisibility::Public),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_child_channel_context(&facts).visibility,
+            ChannelVisibility::Public
+        );
+        assert_eq!(
+            build_child_channel_context(&ToolCallContext::default()).visibility,
+            ChannelVisibility::Internal
+        );
+    }
+
+    #[test]
+    fn child_channel_context_takes_the_call_trust() {
+        let facts = ToolCallContext {
+            trusted_session: true,
+            channel_visibility: Some(ChannelVisibility::Internal),
+            ..Default::default()
+        };
+        let channel_ctx = build_child_channel_context(&facts);
         assert_eq!(channel_ctx.visibility, ChannelVisibility::Internal);
         assert!(channel_ctx.trusted);
-    }
-
-    #[test]
-    fn parse_and_strip_leading_wait() {
-        assert_eq!(
-            parse_leading_wait_seconds("wait for 2 minutes then run df"),
-            Some(120)
-        );
-        assert_eq!(
-            strip_leading_wait("wait for 2 minutes then run df"),
-            "run df"
-        );
-        assert_eq!(parse_leading_wait_seconds("in 45 sec check disk"), Some(45));
-        assert_eq!(strip_leading_wait("after 1 hour, reboot"), "reboot");
-    }
-
-    #[test]
-    fn strip_leading_wait_pure_wait_returns_empty() {
-        assert_eq!(parse_leading_wait_seconds("wait 5 min"), Some(300));
-        assert!(strip_leading_wait("wait 5 min").is_empty());
+        assert!(!build_child_channel_context(&ToolCallContext::default()).trusted);
     }
 
     #[tokio::test]
@@ -1076,25 +432,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_notification_falls_back_to_queue_when_hub_missing() {
+    async fn background_notification_reaches_the_queue() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service = Arc::new(EmbeddingService::deterministic());
         let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+            SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)
                 .await
                 .unwrap(),
         );
         let state_dyn: Arc<dyn StateStore> = state.clone();
 
-        deliver_background_notification(
-            None,
-            Some(&state_dyn),
+        enqueue_background_notification(
+            Some(&(state_dyn.clone() as Arc<dyn crate::traits::NotificationStore>)),
             "goal_spawn_test",
             "sess_spawn_test",
-            "progress",
-            "Background sub-agent still running after 20s.\nMission: test",
+            "completed",
+            "Background task complete.\nMission: test",
             "spawn_test",
+            false,
         )
         .await;
 
@@ -1102,8 +458,8 @@ mod tests {
         assert!(pending.iter().any(|entry| {
             entry.goal_id == "goal_spawn_test"
                 && entry.session_id == "sess_spawn_test"
-                && entry.notification_type == "progress"
-                && entry.message.contains("still running")
+                && entry.notification_type == "completed"
+                && entry.message.contains("Mission: test")
         }));
     }
 }
@@ -1215,5 +571,2563 @@ mod specialist_arg_tests {
             .and_then(|d| d.as_str())
             .expect("specialist description string");
         assert_eq!(desc, STATIC_SPECIALIST_ARG_DESCRIPTION);
+    }
+}
+
+#[cfg(test)]
+mod child_runtime_tests {
+    use super::*;
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::runtime_ports::{ChildWorkReport, SalvagedTaskOutcome};
+    use crate::state::SqliteStateStore;
+    use crate::traits::NotificationStore;
+    use crate::traits::ToolCalls as _;
+    use std::sync::Mutex as StdMutex;
+
+    /// A child runtime that answers from a script, recording what it was asked.
+    struct ScriptedChild {
+        response: String,
+        delay: Duration,
+        tasks: StdMutex<Vec<String>>,
+        failure: StdMutex<Option<anyhow::Error>>,
+        cancel: tokio_util::sync::CancellationToken,
+        role: StdMutex<AgentRole>,
+        timed_out_tasks: StdMutex<Vec<String>>,
+        panics: std::sync::atomic::AtomicBool,
+        /// Fails before the child begins running.
+        fails_in_setup: std::sync::atomic::AtomicBool,
+        salvage_lookups: StdMutex<Vec<String>>,
+        /// What each spawn declared about its child.
+        declarations: StdMutex<Vec<crate::agent::authority::ChildDeclaration>>,
+        /// The authority each child was started with.
+        authorities: StdMutex<Vec<Option<aidaemon_core::Authority>>>,
+        /// Its tree's helper run records.
+        runs: Arc<aidaemon_runtime::run_state::RunStates>,
+        /// How its runs end when they return.
+        end: StdMutex<aidaemon_runtime::run_state::RunEnd>,
+        /// What its run records say of how they ended.
+        evidence: StdMutex<aidaemon_runtime::run_state::RunEvidence>,
+    }
+
+    impl ScriptedChild {
+        fn new(response: &str, delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                response: response.to_string(),
+                delay,
+                tasks: StdMutex::new(Vec::new()),
+                failure: StdMutex::new(None),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                role: StdMutex::new(AgentRole::Orchestrator),
+                timed_out_tasks: StdMutex::new(Vec::new()),
+                panics: std::sync::atomic::AtomicBool::new(false),
+                fails_in_setup: std::sync::atomic::AtomicBool::new(false),
+                declarations: StdMutex::new(Vec::new()),
+                salvage_lookups: StdMutex::new(Vec::new()),
+                authorities: StdMutex::new(Vec::new()),
+                runs: Default::default(),
+                end: StdMutex::new(aidaemon_runtime::run_state::RunEnd::Succeeded),
+                evidence: StdMutex::new(Default::default()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ChildAgentRuntime for ScriptedChild {
+        fn depth(&self) -> usize {
+            0
+        }
+        fn max_depth(&self) -> usize {
+            3
+        }
+        fn role(&self) -> AgentRole {
+            *self.role.lock().unwrap()
+        }
+        fn specialist_descriptions(&self) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        async fn validate_executor_task_for_spawn(
+            &self,
+            _task_id: &str,
+            _expected_goal_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn run_child(&self, request: ChildAgentRequest) -> anyhow::Result<ChildAgentRun> {
+            if self
+                .fails_in_setup
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("synthetic setup failure");
+            }
+            crate::agent::authority::mark_child_began();
+            self.authorities.lock().unwrap().push(
+                request
+                    .parent_authority
+                    .as_ref()
+                    .map(|parent| parent.authority.clone()),
+            );
+            if let Some(declaration) = request
+                .parent_authority
+                .as_ref()
+                .and_then(|parent| parent.child_declaration.clone())
+            {
+                self.declarations.lock().unwrap().push(declaration);
+            }
+            self.tasks.lock().unwrap().push(request.task);
+            tokio::time::sleep(self.delay).await;
+            if self.panics.load(std::sync::atomic::Ordering::SeqCst) {
+                panic!("synthetic child panic");
+            }
+            if let Some(failure) = self.failure.lock().unwrap().take() {
+                return Err(failure);
+            }
+            Ok(ChildAgentRun {
+                session: "sub_agent_synthetic".to_string(),
+                response: self.response.clone(),
+                outcome: TaskOutcome::Succeeded,
+                trust: SourceTrust::Trusted,
+                end: self.end.lock().unwrap().clone(),
+                evidence: self.evidence.lock().unwrap().clone(),
+            })
+        }
+        fn helper_runs(&self) -> Arc<aidaemon_runtime::run_state::RunStates> {
+            self.runs.clone()
+        }
+        async fn background_cancel_token(
+            &self,
+            _id: &str,
+        ) -> Option<tokio_util::sync::CancellationToken> {
+            Some(self.cancel.clone())
+        }
+        async fn salvage_executor_task_outcome(
+            &self,
+            task_id: &str,
+            _timeout_secs: u64,
+        ) -> Option<SalvagedTaskOutcome> {
+            self.salvage_lookups
+                .lock()
+                .unwrap()
+                .push(task_id.to_string());
+            None
+        }
+        async fn mark_executor_task_timeout(&self, task_id: &str, _timeout_secs: u64) {
+            self.timed_out_tasks
+                .lock()
+                .unwrap()
+                .push(task_id.to_string());
+        }
+        async fn deliver_background_child_result(
+            &self,
+            _router: Option<&Weak<dyn OutboundRouter>>,
+            _parent_session_id: &str,
+            _text: &str,
+            _trust: SourceTrust,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    fn tool_for(child: &Arc<ScriptedChild>) -> SpawnAgentTool {
+        let tool = SpawnAgentTool::new_deferred(100, 30);
+        let runtime: Arc<dyn ChildAgentRuntime> = child.clone();
+        tool.set_agent(Arc::downgrade(&runtime));
+        tool
+    }
+
+    fn facts() -> ToolCallContext {
+        ToolCallContext {
+            session_id: "telegram:synthetic-user-1".to_string(),
+            ..Default::default()
+        }
+    }
+
+    async fn notification_store() -> Arc<SqliteStateStore> {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        std::mem::forget(db_file);
+        let embedding_service = Arc::new(EmbeddingService::deterministic());
+        Arc::new(
+            SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// A child's own delegations reach the chat without waiting for the queue.
+    #[tokio::test]
+    async fn a_childs_spawn_tool_has_the_hub() {
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store;
+        let router: Arc<dyn OutboundRouter> = Arc::new(CountingHub::default());
+        let tool = SpawnAgentTool::for_child(100, 30, state, Some(Arc::downgrade(&router)));
+        assert!(tool.get_hub().is_some());
+    }
+
+    /// A timed-out child that already acted is not a retryable failure.
+    #[tokio::test]
+    async fn timeout_after_side_effects_warns_instead_of_failing() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        *child.failure.lock().unwrap() = Some(
+            ChildTimedOut {
+                limit_secs: 30,
+                report: ChildWorkReport {
+                    changed: vec!["send_file: report.pdf".to_string()],
+                    ..Default::default()
+                },
+            }
+            .into(),
+        );
+        let tool = tool_for(&child);
+        let args = json!({"mission": "Send", "task": "Send it"}).to_string();
+
+        let outcome = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .expect("reported, not an error");
+
+        assert!(outcome.output.contains("send_file: report.pdf"));
+        assert!(outcome.output.contains("Do NOT run it again"));
+        assert_eq!(outcome.metadata.output_trust, Some(SourceTrust::Untrusted));
+    }
+
+    #[tokio::test]
+    async fn timeout_with_no_side_effects_stays_a_retryable_error() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        *child.failure.lock().unwrap() = Some(
+            ChildTimedOut {
+                limit_secs: 30,
+                report: ChildWorkReport::default(),
+            }
+            .into(),
+        );
+        let tool = tool_for(&child);
+        let args = json!({"mission": "Read", "task": "Read it"}).to_string();
+
+        let error = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .expect_err("nothing happened, so a retry is safe");
+
+        assert!(error.to_string().contains("no progress for 30 seconds"));
+    }
+
+    /// A background executor that runs out of time releases its task the way
+    /// a waited-on one does.
+    #[tokio::test]
+    async fn a_timed_out_background_executor_releases_its_task() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        *child.role.lock().unwrap() = AgentRole::TaskLead;
+        *child.failure.lock().unwrap() = Some(
+            ChildTimedOut {
+                limit_secs: 30,
+                report: ChildWorkReport::default(),
+            }
+            .into(),
+        );
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({
+            "mission": "Execute",
+            "task": "t",
+            "task_id": "task-synthetic-1",
+            "background": true,
+        })
+        .to_string();
+
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        wait_for_notification(&store).await;
+
+        assert_eq!(
+            *child.timed_out_tasks.lock().unwrap(),
+            vec!["task-synthetic-1".to_string()]
+        );
+    }
+
+    /// A grant written with the provider's function namespace names the
+    /// tool; a name the caller does not have is refused, not silently
+    /// turned into a child with no tools.
+    #[test]
+    fn granted_tool_names_are_exact_or_refused() {
+        assert_eq!(tool_name_from_grant(" functions.read_file "), "read_file");
+        assert_eq!(tool_name_from_grant("search_files"), "search_files");
+        let requested = requested_child_authority(
+            &serde_json::from_value::<SpawnArgs>(serde_json::json!({
+                "mission": "m",
+                "task": "t",
+                "tools": ["functions.read_file", "made_up"]
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let own = vec!["read_file".to_string(), "search_files".to_string()];
+        assert_eq!(
+            ungrantable_tools(&requested, &aidaemon_core::Authority::full(), Some(&own)),
+            vec!["made_up".to_string()]
+        );
+        let narrow = aidaemon_core::Authority {
+            level: aidaemon_core::AccessLevel::Write,
+            tools: Some(["search_files".to_string()].into_iter().collect()),
+        };
+        let mut outside = ungrantable_tools(&requested, &narrow, Some(&own));
+        outside.sort();
+        assert_eq!(
+            outside,
+            vec!["made_up".to_string(), "read_file".to_string()]
+        );
+    }
+
+    /// A spawn holding its child to read-only access is itself read-only, so
+    /// a read-only coordinator may delegate; a writing spawn is not.
+    #[test]
+    fn a_read_only_spawn_is_a_read_only_call() {
+        use crate::traits::ToolSemantics;
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        let tool = tool_for(&child);
+        let roots = crate::traits::TrustRoots::new(&[]);
+        let read = json!({"mission": "m", "task": "t", "access": "read_only"}).to_string();
+        let write = json!({"mission": "m", "task": "t", "access": "write"}).to_string();
+        let unset = json!({"mission": "m", "task": "t"}).to_string();
+        assert!(tool.call_annotations_in(&read, &roots).read_only);
+        assert!(!tool.call_annotations_in(&write, &roots).read_only);
+        assert!(!tool.call_annotations_in(&unset, &roots).read_only);
+    }
+
+    /// A child whose run succeeded is a succeeded receipt even when its
+    /// report is full of failure vocabulary: the typed outcome crosses back
+    /// to the parent, not a scan of the wording.
+    #[tokio::test]
+    async fn a_succeeded_child_reports_its_typed_outcome_not_its_wording() {
+        let child = ScriptedChild::new(
+            "## Findings\n### Bugs\n- Error: the handler fails on empty input.\nFAILED checks: 2",
+            Duration::ZERO,
+        );
+        let tool = tool_for(&child);
+        let args = json!({"mission": "Review", "task": "t"}).to_string();
+        let outcome = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(crate::traits::ToolOutcomeStatus::Succeeded)
+        );
+    }
+
+    /// What the parent says of a helper's start, end and duration quotes the
+    /// daemon's measurement: a child's result leads with it, in the owner's
+    /// 12-hour clock, so a cut of a long report never drops it.
+    #[tokio::test]
+    async fn a_childs_result_leads_with_its_measured_run_in_the_owners_clock() {
+        let report = "x".repeat(200_000);
+        let child = ScriptedChild::new(&report, Duration::ZERO);
+        let tool = tool_for(&child);
+        let args = json!({"mission": "Slow count", "task": "t"}).to_string();
+        let outcome = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        let first = outcome.output.lines().next().unwrap_or_default();
+        assert!(
+            first.starts_with(&format!("{MEASURED_TIMING_MARK}Slow count took ")),
+            "{first}"
+        );
+        assert!(first.contains(" AM ") || first.contains(" PM "), "{first}");
+    }
+
+    /// One call with `tasks` starts its children together: they overlap,
+    /// every result comes back under its mission with when it ran, and the
+    /// call succeeds only because each child did.
+    #[tokio::test]
+    async fn a_batch_call_runs_its_children_together() {
+        use crate::traits::ToolSemantics;
+        let child = ScriptedChild::new("done", Duration::from_millis(300));
+        let tool = tool_for(&child);
+        let args = json!({
+            "tasks": [
+                {"mission": "Count routes", "task": "a"},
+                {"mission": "Count tests", "task": "b"},
+                {"mission": "Count files", "task": "c"}
+            ]
+        })
+        .to_string();
+        let begun = std::time::Instant::now();
+        let outcome = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        assert!(
+            begun.elapsed() < Duration::from_millis(800),
+            "three 300ms children took {:?}",
+            begun.elapsed()
+        );
+        assert_eq!(child.tasks.lock().unwrap().len(), 3);
+        for mission in ["Count routes", "Count tests", "Count files"] {
+            assert!(outcome.output.contains(mission), "{}", outcome.output);
+        }
+        assert_eq!(outcome.output.matches(MEASURED_TIMING_MARK).count(), 3);
+        assert_eq!(
+            outcome
+                .output
+                .matches("These are the daemon's measurements")
+                .count(),
+            3
+        );
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(crate::traits::ToolOutcomeStatus::Succeeded)
+        );
+        let read_only = json!({
+            "access": "read_only",
+            "tasks": [{"mission": "a", "task": "b"}, {"mission": "c", "task": "d"}]
+        })
+        .to_string();
+        assert!(
+            tool.call_annotations_in(&read_only, &crate::traits::TrustRoots::new(&[]))
+                .read_only
+        );
+    }
+
+    #[test]
+    fn batch_entries_take_the_calls_defaults_and_override_them() {
+        use crate::traits::ToolSemantics;
+        let tasks = batch_tasks(
+            &json!({
+                "access": "read_only",
+                "tasks": [
+                    {"mission": "m1", "task": "t1"},
+                    {"mission": "m2", "task": "t2", "access": "write"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(tasks[0]["access"], "read_only");
+        assert_eq!(tasks[1]["access"], "write");
+        assert!(
+            batch_tasks(&json!({"mission": "m", "task": "t"}).to_string())
+                .unwrap()
+                .is_none()
+        );
+        for bad in [
+            json!({"tasks": []}),
+            json!({"mission": "m", "tasks": [{"mission": "a", "task": "b"}]}),
+            json!({"tasks": [{"mission": "a", "task": "b", "tasks": []}]}),
+            json!({"tasks": [
+                {"mission": "a", "task": "b", "background": true},
+                {"mission": "c", "task": "d"}
+            ]}),
+        ] {
+            assert!(batch_tasks(&bad.to_string()).is_err(), "{bad}");
+        }
+        // A write in any entry keeps the call's worst case.
+        let tool = SpawnAgentTool::new_deferred(100, 30);
+        let mixed = json!({"tasks": [
+            {"mission": "a", "task": "b", "access": "read_only"},
+            {"mission": "c", "task": "d"}
+        ]})
+        .to_string();
+        assert!(
+            !tool
+                .call_annotations_in(&mixed, &crate::traits::TrustRoots::new(&[]))
+                .read_only
+        );
+    }
+
+    #[test]
+    fn a_batch_with_a_failed_child_is_not_a_success_and_names_it() {
+        let ok = || {
+            let mut outcome = reported("fine".to_string(), SourceTrust::Trusted);
+            outcome.metadata.outcome_status = Some(crate::traits::ToolOutcomeStatus::Succeeded);
+            outcome
+        };
+        let combined = combine_batch(
+            vec![
+                ("first".to_string(), Ok(ok())),
+                ("second".to_string(), Err(anyhow::anyhow!("boom"))),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            combined.metadata.outcome_status,
+            Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult)
+        );
+        assert_eq!(combined.metadata.output_trust, Some(SourceTrust::Untrusted));
+        assert!(combined.output.contains("### second\nFailed: boom"));
+        assert!(
+            combine_batch(
+                vec![("only".to_string(), Err(anyhow::anyhow!("boom")))],
+                false
+            )
+            .is_err()
+        );
+    }
+
+    /// Starting helpers in the background answers with one plain line each,
+    /// naming the helper: the run may ship it as its reply, so no bare
+    /// heading ("Counter A") ever stands alone in the chat.
+    #[test]
+    fn a_background_start_reads_as_one_line_per_helper() {
+        let combined = combine_batch(
+            vec![
+                (
+                    "Counter A".to_string(),
+                    Ok(background_spawn_outcome("Counter A")),
+                ),
+                (
+                    "Counter B".to_string(),
+                    Ok(background_spawn_outcome("Counter B")),
+                ),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            combined.output,
+            "Started in the background: Counter A. Its result will come to this chat when it \
+             finishes.\nStarted in the background: Counter B. Its result will come to this chat \
+             when it finishes."
+        );
+        assert!(!combined.output.contains('#'));
+    }
+
+    /// A background child that panics still clears its record, frees its
+    /// task, and tells the parent session it failed.
+    #[tokio::test]
+    async fn a_panicking_background_child_is_cleaned_up_and_reported() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        child
+            .panics
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *child.role.lock().unwrap() = AgentRole::TaskLead;
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({
+            "mission": "Execute",
+            "task": "t",
+            "task_id": "task-synthetic-2",
+            "background": true,
+        })
+        .to_string();
+
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        let entry = wait_for_notification(&store).await;
+        assert_eq!(entry.notification_type, "failed");
+        assert_eq!(entry.session_id, "telegram:synthetic-user-1");
+        assert!(!entry.untrusted, "the failure note carries no child text");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store
+                .background_spawns_for_session("telegram:synthetic-user-1")
+                .await
+                .unwrap()
+                .is_empty()
+                || tool
+                    .executor_task_runs
+                    .lock()
+                    .await
+                    .contains("task-synthetic-2")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the record and the task claim are released");
+    }
+
+    fn timed_out_read_only() -> anyhow::Error {
+        ChildTimedOut {
+            limit_secs: 30,
+            report: ChildWorkReport::default(),
+        }
+        .into()
+    }
+
+    fn facts_on_a_turn() -> ToolCallContext {
+        ToolCallContext {
+            task_id: Some("task-turn-synthetic".to_string()),
+            ..facts()
+        }
+    }
+
+    /// The turn's own id says nothing about a plain child: a read-only
+    /// timeout stays trusted, and no durable task is looked up for it.
+    #[tokio::test]
+    async fn a_plain_background_childs_timeout_ignores_the_turns_task_id() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        *child.failure.lock().unwrap() = Some(timed_out_read_only());
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({"mission": "Read", "task": "t", "background": true}).to_string();
+
+        tool.call_with_execution_context(&args, None, facts_on_a_turn())
+            .await
+            .unwrap();
+        let entry = wait_for_notification(&store).await;
+
+        assert!(!entry.untrusted);
+        assert!(child.salvage_lookups.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_plain_foreground_childs_timeout_looks_up_no_task() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        *child.failure.lock().unwrap() = Some(timed_out_read_only());
+        let tool = tool_for(&child);
+        let args = json!({"mission": "Read", "task": "t"}).to_string();
+
+        tool.call_with_execution_context(&args, None, facts_on_a_turn())
+            .await
+            .expect_err("a read-only timeout stays retryable");
+
+        assert!(child.salvage_lookups.lock().unwrap().is_empty());
+    }
+
+    /// An executor's task is real, so its timeout is still looked up.
+    #[tokio::test]
+    async fn an_executors_timeout_still_looks_up_its_task() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        *child.role.lock().unwrap() = AgentRole::TaskLead;
+        *child.failure.lock().unwrap() = Some(timed_out_read_only());
+        let tool = tool_for(&child);
+        let args =
+            json!({"mission": "Execute", "task": "t", "task_id": "task-synthetic-3"}).to_string();
+
+        tool.call_with_execution_context(&args, None, facts_on_a_turn())
+            .await
+            .expect_err("a read-only timeout stays retryable");
+
+        assert_eq!(
+            *child.salvage_lookups.lock().unwrap(),
+            vec!["task-synthetic-3".to_string()]
+        );
+    }
+
+    fn facts_in_tree(family: &crate::agent::authority::SpawnFamily) -> ToolCallContext {
+        let mut call_facts = facts();
+        call_facts
+            .extensions
+            .insert(crate::agent::authority::InheritedAuthority {
+                authority: aidaemon_core::Authority::full(),
+                owner_level: None,
+                task_access: None,
+                mode_session: None,
+                untrusted_context: false,
+                origin_request: None,
+                origin_trusted: false,
+                trusted_roots: Vec::new(),
+                declined: Vec::new(),
+                shared_declines: None,
+                learning: None,
+                spawn_family: Some(family.clone()),
+                child_declaration: None,
+                parent_run: None,
+                known_resources: Default::default(),
+                card_title: None,
+                card_steps: Vec::new(),
+                lineage: Vec::new(),
+                parent_task: None,
+            });
+        call_facts
+    }
+
+    /// What the coordinator says about an overlap at spawn travels with the
+    /// child as typed state, in spawn order, even when the sibling it
+    /// overlaps has not joined the roster yet.
+    #[tokio::test]
+    async fn precedence_and_spawn_order_travel_with_the_child() {
+        use crate::agent::coordination::Precedence;
+        let child = ScriptedChild::new("Finished.", Duration::ZERO);
+        let tool = tool_for(&child);
+        let family = crate::agent::authority::SpawnFamily::new(Default::default());
+        let first = json!({"mission": "m1", "task": "t", "scope": ["/w/src"]}).to_string();
+        let second = json!({
+            "mission": "m2", "task": "t", "scope": ["/w/src/lib.rs"],
+            "precedence": "this_child"
+        })
+        .to_string();
+        for args in [&first, &second] {
+            tool.call_with_execution_context(args, None, facts_in_tree(&family))
+                .await
+                .unwrap();
+        }
+        let declared = child.declarations.lock().unwrap().clone();
+        assert_eq!(declared.len(), 2);
+        assert_eq!(declared[0].precedence, None);
+        assert_eq!(declared[1].precedence, Some(Precedence::ThisChild));
+        let order = |at: usize| declared[at].claim.as_ref().unwrap().order();
+        assert!(order(0) < order(1));
+
+        let unknown = json!({"mission": "m", "task": "t", "precedence": "mine"}).to_string();
+        assert!(
+            tool.call_with_execution_context(&unknown, None, facts_in_tree(&family))
+                .await
+                .is_err()
+        );
+    }
+
+    /// An overlap with a running sibling is stated, never refused, and the
+    /// child's result ends with what the log says about it.
+    #[tokio::test]
+    async fn a_scope_overlap_and_the_childs_log_reach_the_spawn_result() {
+        use crate::agent::coordination::{LogEntry, Member};
+        let child = ScriptedChild::new("Finished.", Duration::ZERO);
+        let tool = tool_for(&child);
+        let family = crate::agent::authority::SpawnFamily::new(Default::default());
+        family.coordination().add_member(Member {
+            session: "sub_agent_sibling".to_string(),
+            parent: "root".to_string(),
+            mission: "Other work".to_string(),
+            specialist: None,
+            scope: vec!["/w/src".to_string()],
+            running: true,
+        });
+        family.coordination().log(LogEntry::WriteOutsideScope {
+            member: "sub_agent_synthetic".to_string(),
+            path: "/w/elsewhere".to_string(),
+        });
+        let args = json!({"mission": "m", "task": "t", "scope": ["/w/src/lib.rs"]}).to_string();
+
+        let outcome = tool
+            .call_with_execution_context(&args, None, facts_in_tree(&family))
+            .await
+            .unwrap();
+
+        // The measured run leads, then the child's own report.
+        assert!(
+            outcome.output.starts_with(MEASURED_TIMING_MARK)
+                && outcome.output.contains("\n\nFinished."),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains("/w/elsewhere"),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains("sub_agent_sibling"),
+            "{}",
+            outcome.output
+        );
+    }
+
+    /// Children past the request's running limit are refused, not queued.
+    #[tokio::test]
+    async fn a_request_cannot_run_more_children_than_its_limit() {
+        let child = ScriptedChild::new("done", Duration::from_millis(300));
+        let tool = tool_for(&child);
+        let family =
+            crate::agent::authority::SpawnFamily::new(crate::agent::authority::SpawnFamilyLimits {
+                max_concurrent: 1,
+                max_total: 10,
+                ..Default::default()
+            });
+        let mut call_facts = facts();
+        call_facts
+            .extensions
+            .insert(crate::agent::authority::InheritedAuthority {
+                authority: aidaemon_core::Authority::read_only(),
+                owner_level: None,
+                task_access: None,
+                mode_session: None,
+                untrusted_context: false,
+                origin_request: None,
+                origin_trusted: true,
+                trusted_roots: Vec::new(),
+                declined: Vec::new(),
+                shared_declines: None,
+                learning: None,
+                spawn_family: Some(family),
+                child_declaration: None,
+                parent_run: None,
+                known_resources: Default::default(),
+                card_title: None,
+                card_steps: Vec::new(),
+                lineage: Vec::new(),
+                parent_task: None,
+            });
+        let args = json!({"mission": "m", "task": "t"}).to_string();
+
+        let (first, second) = tokio::join!(
+            tool.call_with_execution_context(&args, None, call_facts.clone()),
+            tool.call_with_execution_context(&args, None, call_facts.clone()),
+        );
+
+        let refused = usize::from(first.is_err()) + usize::from(second.is_err());
+        assert_eq!(refused, 1);
+        assert_eq!(child.tasks.lock().unwrap().len(), 1);
+    }
+
+    fn family_facts(max_total: usize) -> ToolCallContext {
+        let family =
+            crate::agent::authority::SpawnFamily::new(crate::agent::authority::SpawnFamilyLimits {
+                max_concurrent: 5,
+                max_total,
+                ..Default::default()
+            });
+        let mut call_facts = facts();
+        call_facts
+            .extensions
+            .insert(crate::agent::authority::InheritedAuthority {
+                authority: aidaemon_core::Authority::read_only(),
+                owner_level: None,
+                task_access: None,
+                mode_session: None,
+                untrusted_context: false,
+                origin_request: None,
+                origin_trusted: true,
+                trusted_roots: Vec::new(),
+                declined: Vec::new(),
+                shared_declines: None,
+                learning: None,
+                spawn_family: Some(family),
+                child_declaration: None,
+                parent_run: None,
+                known_resources: Default::default(),
+                card_title: None,
+                card_steps: Vec::new(),
+                lineage: Vec::new(),
+                parent_task: None,
+            });
+        call_facts
+    }
+
+    /// A spawn that fails before its child begins running does not use up
+    /// the request's total; one whose child ran does.
+    #[tokio::test]
+    async fn a_failed_setup_does_not_use_up_the_requests_total() {
+        let child = ScriptedChild::new("done", Duration::ZERO);
+        let tool = tool_for(&child);
+        let call_facts = family_facts(1);
+        let args = json!({"mission": "m", "task": "t"}).to_string();
+
+        child
+            .fails_in_setup
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tool.call_with_execution_context(&args, None, call_facts.clone())
+            .await
+            .expect_err("setup failed");
+        child
+            .fails_in_setup
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tool.call_with_execution_context(&args, None, call_facts.clone())
+            .await
+            .expect("the failed setup left its place");
+        tool.call_with_execution_context(&args, None, call_facts.clone())
+            .await
+            .expect_err("the child that ran used the only place");
+        assert_eq!(child.tasks.lock().unwrap().len(), 1);
+    }
+
+    /// The same holds for a background spawn.
+    #[tokio::test]
+    async fn a_failed_background_setup_does_not_use_up_the_requests_total() {
+        let child = ScriptedChild::new("done", Duration::ZERO);
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let call_facts = family_facts(1);
+        let args = json!({"mission": "m", "task": "t", "background": true}).to_string();
+
+        child
+            .fails_in_setup
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tool.call_with_execution_context(&args, None, call_facts.clone())
+            .await
+            .unwrap();
+        wait_for_notification(&store).await;
+        child
+            .fails_in_setup
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while tool
+                .call_with_execution_context(&args, None, call_facts.clone())
+                .await
+                .is_err()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the failed setup gives its place back once it ends");
+        tool.call_with_execution_context(&args, None, call_facts.clone())
+            .await
+            .expect_err("the child that ran used the only place");
+    }
+
+    async fn wait_for_notification(store: &SqliteStateStore) -> crate::traits::NotificationEntry {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let pending = store.get_pending_notifications(10).await.unwrap();
+                if let Some(entry) = pending.into_iter().next() {
+                    return entry;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a notification arrives")
+    }
+
+    fn facts_with_authority(authority: aidaemon_core::Authority) -> ToolCallContext {
+        let mut call_facts = facts();
+        call_facts.user_role = Some(UserRole::Owner);
+        call_facts
+            .extensions
+            .insert(crate::agent::authority::InheritedAuthority {
+                authority,
+                owner_level: None,
+                task_access: None,
+                mode_session: None,
+                untrusted_context: false,
+                origin_request: None,
+                origin_trusted: true,
+                trusted_roots: Vec::new(),
+                declined: Vec::new(),
+                shared_declines: None,
+                learning: None,
+                spawn_family: None,
+                child_declaration: None,
+                parent_run: None,
+                known_resources: Default::default(),
+                card_title: None,
+                card_steps: Vec::new(),
+                lineage: Vec::new(),
+                parent_task: None,
+            });
+        call_facts
+    }
+
+    /// A child, background or not, starts with its parent turn's authority
+    /// and never more: a full-access parent's child may run a command that
+    /// changes things, a read-only parent's child may not, and a parent can
+    /// narrow its child further with `access`.
+    #[tokio::test]
+    async fn a_child_runs_with_its_parent_turns_authority_foreground_or_background() {
+        use aidaemon_core::{Authority, ToolAnnotations};
+        let command = ToolAnnotations::WRITE;
+        let cases = [
+            (Authority::full(), json!({}), true),
+            (Authority::read_only(), json!({}), false),
+            (Authority::full(), json!({"access": "read_only"}), false),
+        ];
+        for background in [false, true] {
+            for (parent, extra, allowed) in cases.clone() {
+                let child = ScriptedChild::new("done", Duration::ZERO);
+                let store = notification_store().await;
+                let state: Arc<dyn StateStore> = store.clone();
+                let tool = tool_for(&child).with_state(state);
+                let mut args = json!({
+                    "mission": "Run a command",
+                    "task": "Run one shell command.",
+                    "tools": ["terminal"],
+                    "background": background,
+                });
+                for (key, value) in extra.as_object().unwrap() {
+                    args[key] = value.clone();
+                }
+                tool.call_with_execution_context(
+                    &args.to_string(),
+                    None,
+                    facts_with_authority(parent.clone()),
+                )
+                .await
+                .unwrap();
+                let given = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if let Some(given) = child.authorities.lock().unwrap().first().cloned() {
+                            return given;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the child starts")
+                .expect("the child carries its parent's authority");
+                assert_eq!(
+                    given.permits("terminal", command).is_ok(),
+                    allowed,
+                    "background={background} parent={parent:?} extra={extra} given={given:?}"
+                );
+                assert_eq!(given.level, parent.level.min(given.level));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_background_child_is_on_record_only_while_it_runs() {
+        let child = ScriptedChild::new("done", Duration::from_millis(400));
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({"mission": "Report", "task": "t", "background": true}).to_string();
+
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        let running = store
+            .background_spawns_for_session("telegram:synthetic-user-1")
+            .await
+            .unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].mission, "Report");
+
+        wait_for_notification(&store).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store
+                .background_spawns_for_session("telegram:synthetic-user-1")
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the record is cleared");
+    }
+
+    #[tokio::test]
+    async fn the_owner_can_cancel_a_background_child() {
+        let child = ScriptedChild::new("never delivered", Duration::from_secs(600));
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({"mission": "Report", "task": "t", "background": true}).to_string();
+
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        child.cancel.cancel();
+
+        let entry = wait_for_notification(&store).await;
+        assert!(
+            entry.message.contains("Stopped by you: Report")
+                && !entry.message.contains("Didn't finish"),
+            "{}",
+            entry.message
+        );
+        assert!(!entry.message.contains("never delivered"));
+    }
+
+    /// A helper's result and its chat footer give one duration, how long it
+    /// took from its first step to its report, and the times it spans on
+    /// the owner's clock, with seconds when under ten minutes so the times
+    /// agree with the duration (live 2026-11-13: "Ran 2m 44s (8:34 PM ET to
+    /// 8:37 PM ET)" was its first to last tool call, beside its own 152 s).
+    #[test]
+    fn a_helpers_time_is_its_first_step_to_its_report() {
+        let started = chrono::Utc::now();
+        let run = |first_step: Option<i64>, finished: i64, waited: u64| MeasuredRun {
+            started,
+            finished: started + chrono::Duration::seconds(finished),
+            steps: first_step.map(|a| {
+                (
+                    started + chrono::Duration::seconds(a),
+                    started + chrono::Duration::seconds(finished - 9),
+                )
+            }),
+            waited: Duration::from_secs(waited),
+        };
+        let record = |first_step: Option<i64>, finished: i64, waited: u64| {
+            let mut state =
+                super::tests::ended_run(RunPhase::Succeeded, &[], None, finished, waited);
+            state.started_at = started;
+            state.ended_at = Some(started + chrono::Duration::seconds(finished));
+            state.work_began = first_step.map(|a| started + chrono::Duration::seconds(a));
+            state
+        };
+        let seconds = |at: i64| {
+            (started + chrono::Duration::seconds(at))
+                .with_timezone(&chrono::Local)
+                .format("%-I:%M:%S %p")
+                .to_string()
+        };
+
+        let footer = background_timing(&record(Some(7), 78, 0)).unwrap();
+        assert_eq!(
+            footer,
+            format!(
+                "{MEASURED_TIMING_MARK}Took 1m 11s ({} to {} {}).",
+                seconds(7),
+                seconds(78),
+                crate::cron_utils::owner_zone_label(
+                    chrono::Local::now().offset().local_minus_utc()
+                )
+            )
+        );
+        let window = run_window("Slow counter", &run(Some(7), 78, 0));
+        assert!(
+            window.starts_with(&format!(
+                "{MEASURED_TIMING_MARK}Slow counter took 1m 11s (71s), {} to {} ",
+                seconds(7),
+                seconds(78)
+            )),
+            "{window}"
+        );
+        assert!(!window.contains("in all"), "{window}");
+
+        // No steps: from when it was started.
+        let footer = background_timing(&record(None, 78, 20)).unwrap();
+        assert!(
+            footer.starts_with(&format!(
+                "{MEASURED_TIMING_MARK}Took 1m 18s ({} to ",
+                seconds(0)
+            )),
+            "{footer}"
+        );
+        assert!(
+            footer.ends_with(" It waited 20s of that for your answer."),
+            "{footer}"
+        );
+
+        // Ten minutes or more: the owner's usual clock, no seconds.
+        let long = background_timing(&record(Some(0), 900, 0)).unwrap();
+        let owner_start = crate::cron_utils::owner_time(&started);
+        assert!(
+            long.contains(&format!("Took 15m ({owner_start} to ")),
+            "{long}"
+        );
+    }
+
+    /// Every duration the owner reads equals its run record's: the record's
+    /// start and end, cut to the whole second, and their difference (live
+    /// 2026-11-13: a 20.4 s run read "20 seconds" beside 2:21:16 to
+    /// 2:21:37). The parent's note, the card's line and the result's
+    /// footer all say 21s for that run.
+    #[test]
+    fn owner_facing_durations_equal_the_records() {
+        use chrono::TimeZone;
+        let started = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 13, 19, 21, 16)
+            .unwrap()
+            + chrono::Duration::milliseconds(800);
+        let finished = started + chrono::Duration::milliseconds(20_400);
+        let run = MeasuredRun {
+            started,
+            finished,
+            steps: None,
+            waited: Duration::ZERO,
+        };
+        let clock = |at: chrono::DateTime<chrono::Utc>| {
+            at.with_timezone(&chrono::Local)
+                .format("%-I:%M:%S %p")
+                .to_string()
+        };
+        let (from, to) = (clock(started), clock(finished));
+        assert!(
+            from.contains(":21:16 ") && to.contains(":21:37 "),
+            "{from} {to}"
+        );
+
+        let note = run_window("Count lines", &run);
+        assert!(
+            note.contains(&format!("Count lines took 21s (21s), {from} to {to} ")),
+            "{note}"
+        );
+        let card = aidaemon_runtime::run_state::timing::took_line(run.span(), run.waited);
+        assert!(
+            card.starts_with(&format!("Took 21s ({from} to {to} ")),
+            "{card}"
+        );
+
+        let mut record = super::tests::ended_run(RunPhase::Succeeded, &[], None, 0, 0);
+        record.started_at = started;
+        record.work_began = None;
+        record.ended_at = Some(finished);
+        assert_eq!(record.took(), Some(chrono::Duration::seconds(21)));
+        let footer = background_timing(&record).unwrap();
+        assert_eq!(footer, format!("{MEASURED_TIMING_MARK}{card}"));
+    }
+
+    #[tokio::test]
+    async fn a_background_childs_result_says_how_long_it_took() {
+        let child = ScriptedChild::new("synthetic report", Duration::from_millis(50));
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({"mission": "Report", "task": "t", "background": true}).to_string();
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        let entry = wait_for_notification(&store).await;
+        assert!(
+            entry
+                .message
+                .contains(&format!("\n\n{MEASURED_TIMING_MARK}Took ")),
+            "{}",
+            entry.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_tells_each_chat_what_it_lost() {
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        state
+            .record_background_spawn(&crate::traits::BackgroundSpawn {
+                id: "background_spawn:1".to_string(),
+                session_id: "telegram:synthetic-user-1".to_string(),
+                mission: "Publish the synthetic report".to_string(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        report_interrupted_background_children(
+            &(state.clone() as Arc<dyn crate::traits::NotificationStore>),
+        )
+        .await;
+
+        let entry = wait_for_notification(&store).await;
+        assert_eq!(entry.session_id, "telegram:synthetic-user-1");
+        assert!(
+            entry
+                .message
+                .contains("A restart stopped this background job")
+        );
+        assert!(entry.message.contains("Publish the synthetic report"));
+        assert!(store.take_background_spawns().await.unwrap().is_empty());
+    }
+
+    /// A task that merely starts like a delay reaches the child at once and
+    /// word for word: wording never decides whether to wait.
+    #[tokio::test]
+    async fn task_wording_never_delays_the_child() {
+        let child = ScriptedChild::new("done", Duration::ZERO);
+        let tool = tool_for(&child);
+        let task = "In 5 hours of logs, find the errors";
+        let args = json!({"mission": "Log review", "task": task}).to_string();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tool.call_with_execution_context(&args, None, facts()),
+        )
+        .await
+        .expect("the child starts immediately")
+        .unwrap();
+
+        assert_eq!(*child.tasks.lock().unwrap(), vec![task.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn truncated_foreground_result_says_what_is_missing() {
+        let child = ScriptedChild::new(&"x".repeat(500), Duration::ZERO);
+        let tool = tool_for(&child);
+        let args = json!({"mission": "Report", "task": "Write the report"}).to_string();
+
+        let outcome = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+
+        let truncation = outcome.metadata.truncation.expect("reported out of band");
+        assert_eq!((truncation.shown_chars, truncation.total_chars), (100, 500));
+        assert!(!outcome.output.contains("OUTPUT TRUNCATED"));
+    }
+
+    #[test]
+    fn truncated_background_result_says_what_is_missing() {
+        let message = render_run_result(
+            &super::tests::ended_run(RunPhase::Succeeded, &[], None, 5, 0),
+            "Report",
+            &"x".repeat(500),
+            100,
+            false,
+        );
+        assert!(message.contains("OUTPUT TRUNCATED"));
+    }
+
+    /// Counts what reaches the chat.
+    #[derive(Default)]
+    struct CountingHub {
+        sent: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl OutboundRouter for CountingHub {
+        async fn send_text(&self, _session_id: &str, text: &str) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+        async fn send_text_tracked(
+            &self,
+            _session_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn edit_text(
+            &self,
+            _session_id: &str,
+            _message_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn send_media(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_media_strict(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_inline_approval(
+            &self,
+            _session_id: &str,
+            _description: &str,
+            _risk_level: crate::tools::command_risk::RiskLevel,
+            _warnings: &[String],
+            _permission_mode: crate::tools::command_risk::PermissionMode,
+        ) -> anyhow::Result<crate::types::ApprovalResponse> {
+            anyhow::bail!("no approvals in this test")
+        }
+        async fn register_session_route(&self, _child: &str, _parent: &str) -> bool {
+            false
+        }
+        async fn unregister_session_route(&self, _child: &str, _parent: &str) {}
+    }
+
+    /// Records the plan card's edits.
+    #[derive(Default)]
+    struct CardHub {
+        edits: StdMutex<Vec<(String, String)>>,
+        /// No card is kept yet: the turn is still running.
+        turn_running: std::sync::atomic::AtomicBool,
+        /// A later turn kept this card after "card-1".
+        later_card: StdMutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl OutboundRouter for CardHub {
+        async fn send_text(&self, _session_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_text_tracked(
+            &self,
+            _session_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn edit_text(
+            &self,
+            _session_id: &str,
+            message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<bool> {
+            self.edits
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            Ok(true)
+        }
+        async fn send_media(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_media_strict(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn checklist_surface(&self, _session_id: &str) -> Option<String> {
+            if self.turn_running.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            Some(
+                self.later_card
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "card-1".to_string()),
+            )
+        }
+        async fn checklist_surface_after(
+            &self,
+            _session_id: &str,
+            after: Option<&str>,
+        ) -> Option<String> {
+            if self.turn_running.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            match after {
+                None => Some("card-1".to_string()),
+                Some("card-1") => self.later_card.lock().unwrap().clone(),
+                Some(_) => None,
+            }
+        }
+        async fn request_inline_approval(
+            &self,
+            _session_id: &str,
+            _description: &str,
+            _risk_level: crate::tools::command_risk::RiskLevel,
+            _warnings: &[String],
+            _permission_mode: crate::tools::command_risk::PermissionMode,
+        ) -> anyhow::Result<crate::types::ApprovalResponse> {
+            anyhow::bail!("no approvals in this test")
+        }
+        async fn register_session_route(&self, _child: &str, _parent: &str) -> bool {
+            false
+        }
+        async fn unregister_session_route(&self, _child: &str, _parent: &str) {}
+    }
+
+    /// A no-plan helper that ends after a later turn kept its own card
+    /// settles the card its starting turn kept, recorded on its run, and
+    /// leaves the later turn's card alone (the newest card belonged to
+    /// another turn).
+    #[tokio::test]
+    async fn a_helpers_end_edits_its_own_turns_card_not_the_newest() {
+        let chat = "telegram:synthetic-own-card-chat";
+        let hub = Arc::new(CardHub::default());
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        let weak = Arc::downgrade(&router);
+        let runs = Arc::new(aidaemon_runtime::run_state::RunStates::default());
+        runs.begin("job-own-card", chat, "Slow count", None);
+        runs.card_before("job-own-card", None);
+        // The starting turn kept card-1; then a later turn kept card-2.
+        *hub.later_card.lock().unwrap() = Some("card-2".to_string());
+        assert_eq!(
+            hub.checklist_surface(chat).await.as_deref(),
+            Some("card-2"),
+            "the newest card is the later turn's"
+        );
+        runs.finish(
+            "job-own-card",
+            aidaemon_runtime::run_state::RunEnd::Succeeded,
+            aidaemon_runtime::run_state::RunMeasure {
+                ended_at: chrono::Utc::now(),
+                work_began: None,
+                waited: Duration::ZERO,
+            },
+            Default::default(),
+            aidaemon_runtime::run_state::RunReport {
+                text: "Done.".into(),
+                untrusted: false,
+            },
+        );
+        settle_background_steps(
+            &runs,
+            None,
+            Some(&weak),
+            None,
+            chat,
+            "job-own-card",
+            crate::plans::JobEnd::Succeeded,
+            false,
+        )
+        .await;
+        let edits = hub.edits.lock().unwrap().clone();
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits[0].0, "card-1", "{edits:?}");
+        assert!(edits[0].1.contains("Slow count"), "{edits:?}");
+        // Nothing on its card runs any more: the card settled and the
+        // record was let go.
+        assert!(runs.get("job-own-card").is_none());
+    }
+
+    /// A run whose card can no longer be told (its chat's card history no
+    /// longer holds the card it began beside, as after a restart) never
+    /// draws itself over the card a later turn kept: that card shows that
+    /// turn's own runs (live 2026-11-13: a shell loop's card was overwritten
+    /// with a CLI agent's "Done 9m 40s" and stayed wrong).
+    #[tokio::test]
+    async fn a_run_with_an_unknown_card_leaves_a_later_turns_card_alone() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(pool).await.unwrap());
+        let chat = "telegram:synthetic-unknown-card-chat";
+        plans
+            .upsert_checklist(
+                chat,
+                Some("task-unknown"),
+                "track_requirements",
+                &[(
+                    "Install WordPress".into(),
+                    crate::plans::StepStatus::Pending,
+                )],
+            )
+            .await
+            .unwrap();
+        plans
+            .link_background_job(chat, Some("task-unknown"), &[0], "job-unknown")
+            .await
+            .unwrap()
+            .expect("the step waits on the run");
+        let hub = Arc::new(CardHub::default());
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        let weak = Arc::downgrade(&router);
+        let runs = Arc::new(aidaemon_runtime::run_state::RunStates::default());
+        runs.begin("job-unknown", chat, "Install WordPress", None);
+        // It began beside a card the hub no longer remembers; a later turn
+        // kept card-2 since.
+        runs.card_before("job-unknown", Some("forgotten-card".to_string()));
+        *hub.later_card.lock().unwrap() = Some("card-2".to_string());
+        runs.finish(
+            "job-unknown",
+            aidaemon_runtime::run_state::RunEnd::Failed(
+                aidaemon_runtime::run_state::RunFailure::NoCause,
+            ),
+            aidaemon_runtime::run_state::RunMeasure {
+                ended_at: chrono::Utc::now(),
+                work_began: None,
+                waited: Duration::ZERO,
+            },
+            Default::default(),
+            aidaemon_runtime::run_state::RunReport {
+                text: "Blocked.".into(),
+                untrusted: false,
+            },
+        );
+        let shown = settle_background_steps(
+            &runs,
+            Some(&plans),
+            Some(&weak),
+            Some(chat),
+            chat,
+            "job-unknown",
+            crate::plans::JobEnd::Failed,
+            false,
+        )
+        .await;
+        assert!(!shown, "no card shows it: its result says how it ended");
+        let edits = hub.edits.lock().unwrap().clone();
+        assert!(edits.is_empty(), "{edits:?}");
+    }
+
+    /// A helper's steps reach the card its turn left after that turn ended,
+    /// under its start line; while the turn runs, its live card shows them
+    /// and the kept card is left alone (live 2026-11-13: the card said only
+    /// "Started in the background: Slow count to 30" for the whole count).
+    #[tokio::test]
+    async fn a_helpers_steps_reach_its_card_after_its_turn() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(pool).await.unwrap());
+        let chat = "telegram:synthetic-steps-chat";
+        plans
+            .upsert_checklist(
+                chat,
+                Some("task-steps"),
+                "track_requirements",
+                &[(
+                    "Count slowly to 30".into(),
+                    crate::plans::StepStatus::Pending,
+                )],
+            )
+            .await
+            .unwrap();
+        plans
+            .link_background_job(chat, Some("task-steps"), &[0], "job-steps")
+            .await
+            .unwrap()
+            .expect("the step waits on the helper");
+        let hub = Arc::new(CardHub::default());
+        hub.turn_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        let runs = Arc::new(aidaemon_runtime::run_state::RunStates::default());
+        runs.begin("job-steps", chat, "Slow count to 30", None);
+        let (parent_tx, mut parent_rx) = mpsc::channel(8);
+        let helper = show_helper_steps_on_card(
+            Some(parent_tx),
+            HelperCard {
+                runs: runs.clone(),
+                hub: Some(Arc::downgrade(&router)),
+                plans: Some(plans.clone()),
+                plan_session: Some(chat.to_string()),
+                chat: chat.to_string(),
+                job: "job-steps".to_string(),
+                label: "Slow count to 30".to_string(),
+                at_start: None,
+                drawn: Default::default(),
+            },
+        )
+        .unwrap();
+        let step = |lines: u64| {
+            StatusUpdate::Helper(aidaemon_core::card::HelperView::running(
+                "Slow count to 30",
+                true,
+                Some(aidaemon_core::card::Step::Output { lines }),
+            ))
+        };
+
+        helper.send(step(14)).await.unwrap();
+        assert!(matches!(
+            parent_rx.recv().await,
+            Some(StatusUpdate::Helper(view)) if view == runs.get("job-steps").unwrap().view()
+        ));
+        tokio::time::sleep(HELPER_CARD_EVERY + Duration::from_millis(500)).await;
+        assert!(
+            hub.edits.lock().unwrap().is_empty(),
+            "the turn's own card shows it"
+        );
+
+        hub.turn_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        helper.send(step(15)).await.unwrap();
+        let card = tokio::time::timeout(HELPER_CARD_EVERY * 3, async {
+            loop {
+                if let Some((id, text)) = hub.edits.lock().unwrap().last().cloned() {
+                    assert_eq!(id, "card-1");
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the kept card shows the helper's step");
+        assert!(
+            card.contains(
+                "⏳ Running in the background: Slow count to 30\nRunning a command · 15 lines of output so far"
+            ),
+            "{card}"
+        );
+        assert_eq!(
+            runs.get("job-steps").and_then(|run| run.step),
+            Some(aidaemon_core::card::Step::Output { lines: 15 }),
+            "/tasks reads the same step from the run record"
+        );
+    }
+
+    /// Launch a background child for checklist items 1 and 2 of a three-item
+    /// checklist, and return the plan card the chat ends up showing.
+    async fn background_card_after(child: &Arc<ScriptedChild>) -> (String, crate::plans::TaskPlan) {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(pool).await.unwrap());
+        let session = "telegram:synthetic-user-1";
+        plans
+            .upsert_checklist(
+                session,
+                Some("task-synthetic"),
+                "track_requirements",
+                &[
+                    (
+                        "Inspect both sites".into(),
+                        crate::plans::StepStatus::Completed,
+                    ),
+                    (
+                        "Resume the first setup".into(),
+                        crate::plans::StepStatus::Pending,
+                    ),
+                    (
+                        "Send the screenshot".into(),
+                        crate::plans::StepStatus::Pending,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        // The run's receipts proved the first step.
+        plans
+            .confirm_steps(
+                session,
+                "task-synthetic",
+                &std::collections::BTreeSet::from([0]),
+            )
+            .await
+            .unwrap();
+        let hub = Arc::new(CardHub::default());
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(child).with_state(state);
+        tool.set_hub(Arc::downgrade(&router));
+        tool.set_plan_store(plans.clone());
+        let args = json!({
+            "mission": "Setup",
+            "task": "Resume it",
+            "background": true,
+            "checklist_items": [1, 2]
+        })
+        .to_string();
+        let mut call_facts = facts();
+        call_facts.task_id = Some("task-synthetic".to_string());
+
+        tool.call_with_execution_context(&args, None, call_facts)
+            .await
+            .unwrap();
+        let running = plans.get_recent_for_session(session, 1).await.unwrap();
+        let running = running[0].render_compact_checklist();
+        assert!(
+            running.starts_with("⏳ Continuing in the background · 1 of 3 done"),
+            "{running}"
+        );
+        assert!(running.contains("⏳ Send the screenshot (running in the background)"));
+
+        let card = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some((id, text)) = hub.edits.lock().unwrap().last().cloned() {
+                    assert_eq!(id, "card-1", "the turn's card is edited in place");
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the card is updated when the child ends");
+        let plan = plans
+            .get_recent_for_session(session, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        (card, plan)
+    }
+
+    /// A call that names its sub-agent by `title` and says what to do in
+    /// `task`, leaving out `mission`, starts it (live 2026-11-13: both such
+    /// calls failed on "missing field `mission`").
+    #[tokio::test]
+    async fn a_spawn_with_a_title_and_a_task_needs_no_mission() {
+        let child = ScriptedChild::new("Done.", Duration::ZERO);
+        let tool = tool_for(&child);
+        let args = json!({
+            "title": "Count slowly to 30",
+            "task": "Count from 1 to 30, one number every 2 seconds.",
+            "specialist": "executor"
+        })
+        .to_string();
+
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .expect("the child starts");
+
+        assert_eq!(
+            *child.tasks.lock().unwrap(),
+            vec!["Count from 1 to 30, one number every 2 seconds.".to_string()]
+        );
+    }
+
+    /// A background helper is named by its title from its start line to its
+    /// result, not by its mission (live 2026-11-13: "Count slowly to 30"
+    /// started and "Time a slow count and notify the user when finished"
+    /// finished).
+    #[tokio::test]
+    async fn a_background_helper_keeps_its_title_from_start_to_finish() {
+        let child = ScriptedChild::new("Done.", Duration::from_millis(50));
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({
+            "title": "Count slowly to 30",
+            "mission": "Time a slow count and notify the user when finished.",
+            "task": "Count to 30.",
+            "background": true
+        })
+        .to_string();
+
+        let started = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        let entry = wait_for_notification(&store).await;
+
+        assert!(
+            started
+                .output
+                .starts_with("Started in the background: Count slowly to 30."),
+            "{}",
+            started.output
+        );
+        assert!(
+            entry
+                .message
+                .contains("\u{2705} Finished in the background: Count slowly to 30\n"),
+            "{}",
+            entry.message
+        );
+        assert!(
+            !entry.message.contains("Time a slow count"),
+            "{}",
+            entry.message
+        );
+    }
+
+    /// A `spawn_agent` call that fails starts no helper: the checklist step
+    /// it named reads as not running, the failure tells the model which step
+    /// nothing works on, and a corrected call takes the step again.
+    #[tokio::test]
+    async fn a_failed_spawn_leaves_its_step_not_running_until_a_retry_starts() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(pool).await.unwrap());
+        let session = "telegram:synthetic-user-1";
+        plans
+            .upsert_checklist(
+                session,
+                Some("task-synthetic"),
+                "track_requirements",
+                &[
+                    (
+                        "Drupal install in site-a".into(),
+                        crate::plans::StepStatus::InProgress,
+                    ),
+                    (
+                        "WordPress install in site-b".into(),
+                        crate::plans::StepStatus::Pending,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        let child = ScriptedChild::new("Done.", Duration::from_secs(5));
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let router: Arc<dyn OutboundRouter> = Arc::new(CardHub::default());
+        tool.set_hub(Arc::downgrade(&router));
+        tool.set_plan_store(plans.clone());
+        let mut call_facts = facts();
+        call_facts.task_id = Some("task-synthetic".to_string());
+
+        let failed =
+            json!({"title": "WordPress install", "background": true, "checklist_items": [1]});
+        let error = tool
+            .call_with_execution_context(&failed.to_string(), None, call_facts.clone())
+            .await
+            .expect_err("no task, no helper");
+        let error = error.to_string();
+        assert!(
+            error.contains("nothing is working on checklist item(s) 1"),
+            "{error}"
+        );
+        let plan = plans
+            .get_recent_for_session(session, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(plan.steps[1].status, crate::plans::StepStatus::Failed);
+        assert!(plan.steps[1].helper_not_started());
+        assert!(
+            plan.render_compact_checklist()
+                .contains("WordPress install in site-b (didn't run)"),
+            "{}",
+            plan.render_compact_checklist()
+        );
+
+        let retried = json!({
+            "title": "WordPress install",
+            "task": "Install WordPress in site-b.",
+            "background": true,
+            "checklist_items": [1]
+        });
+        tool.call_with_execution_context(&retried.to_string(), None, call_facts)
+            .await
+            .expect("the corrected call starts the helper");
+        let plan = plans
+            .get_recent_for_session(session, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(plan.steps[1].status, crate::plans::StepStatus::Background);
+        assert!(!plan.steps[1].helper_not_started());
+    }
+
+    /// Records the card's edits when they land, each landing a while after
+    /// it was sent, as a slow or rate-limited Telegram edit does.
+    #[derive(Default)]
+    struct SlowCardHub {
+        landed: StdMutex<Vec<String>>,
+        slow_ms: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait]
+    impl OutboundRouter for SlowCardHub {
+        async fn send_text(&self, _session_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_text_tracked(
+            &self,
+            _session_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn edit_text(
+            &self,
+            _session_id: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<bool> {
+            let wait = self.slow_ms.load(std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            self.landed.lock().unwrap().push(text.to_string());
+            Ok(true)
+        }
+        async fn send_media(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_media_strict(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn checklist_surface(&self, _session_id: &str) -> Option<String> {
+            Some("card-1".to_string())
+        }
+        async fn request_inline_approval(
+            &self,
+            _session_id: &str,
+            _description: &str,
+            _risk_level: crate::tools::command_risk::RiskLevel,
+            _warnings: &[String],
+            _permission_mode: crate::tools::command_risk::PermissionMode,
+        ) -> anyhow::Result<crate::types::ApprovalResponse> {
+            anyhow::bail!("no approvals in this test")
+        }
+        async fn register_session_route(&self, _child: &str, _parent: &str) -> bool {
+            false
+        }
+        async fn unregister_session_route(&self, _child: &str, _parent: &str) {}
+    }
+
+    /// A step redraw still in flight when the helper ends lands before the
+    /// finished card, never after it: the card ends on the finished state,
+    /// within the redraw's time, not on the helper's last step (live
+    /// 2026-11-13: "running a command: 13" stayed after the count ended).
+    #[tokio::test]
+    async fn a_helpers_finished_card_is_never_overwritten_by_its_last_step() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(pool).await.unwrap());
+        let chat = "telegram:synthetic-race-chat";
+        plans
+            .upsert_checklist(
+                chat,
+                Some("task-race"),
+                "track_requirements",
+                &[
+                    (
+                        "Count slowly to 30".into(),
+                        crate::plans::StepStatus::Pending,
+                    ),
+                    ("Say done".into(), crate::plans::StepStatus::Pending),
+                ],
+            )
+            .await
+            .unwrap();
+        plans
+            .link_background_job(chat, Some("task-race"), &[0, 1], "job-race")
+            .await
+            .unwrap()
+            .unwrap();
+        let hub = Arc::new(SlowCardHub::default());
+        hub.slow_ms.store(800, std::sync::atomic::Ordering::SeqCst);
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        let weak = Arc::downgrade(&router);
+        let runs = Arc::new(aidaemon_runtime::run_state::RunStates::default());
+        runs.begin("job-race", chat, "Slow count", None);
+        let (parent_tx, _parent_rx) = mpsc::channel(64);
+        let helper = show_helper_steps_on_card(
+            Some(parent_tx),
+            HelperCard {
+                runs: runs.clone(),
+                hub: Some(weak.clone()),
+                plans: Some(plans.clone()),
+                plan_session: Some(chat.to_string()),
+                chat: chat.to_string(),
+                job: "job-race".to_string(),
+                label: "Slow count".to_string(),
+                at_start: None,
+                drawn: Default::default(),
+            },
+        )
+        .unwrap();
+        helper
+            .send(StatusUpdate::Helper(
+                aidaemon_core::card::HelperView::running(
+                    "Slow count",
+                    true,
+                    Some(aidaemon_core::card::Step::Output { lines: 13 }),
+                ),
+            ))
+            .await
+            .unwrap();
+        // The step's redraw is now on its way.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        hub.slow_ms.store(0, std::sync::atomic::Ordering::SeqCst);
+        let ended = std::time::Instant::now();
+        runs.finish(
+            "job-race",
+            aidaemon_runtime::run_state::RunEnd::Succeeded,
+            aidaemon_runtime::run_state::RunMeasure {
+                ended_at: chrono::Utc::now(),
+                work_began: None,
+                waited: Duration::ZERO,
+            },
+            Default::default(),
+            aidaemon_runtime::run_state::RunReport {
+                text: "Done.".into(),
+                untrusted: false,
+            },
+        );
+        settle_background_steps(
+            &runs,
+            Some(&plans),
+            Some(&weak),
+            Some(chat),
+            chat,
+            "job-race",
+            crate::plans::JobEnd::Succeeded,
+            false,
+        )
+        .await;
+        assert!(ended.elapsed() < Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+
+        let landed = hub.landed.lock().unwrap().clone();
+        let last = landed.last().expect("the finished card was drawn");
+        assert!(last.starts_with("✅ Done · 2 of 2 steps"), "{landed:?}");
+        assert!(!last.contains("Running a command"), "{landed:?}");
+        assert!(
+            last.ends_with("✅ Finished in the background: Slow count"),
+            "{landed:?}"
+        );
+        drop(helper);
+    }
+
+    /// A child that finishes its work moves the steps it was given to done
+    /// on the card, from the typed launch, not from what anyone wrote.
+    #[tokio::test]
+    async fn finished_background_child_marks_its_steps_done() {
+        let child = ScriptedChild::new("set up", Duration::from_millis(200));
+        let (card, plan) = background_card_after(&child).await;
+        assert!(card.starts_with("✅ Done · 3 of 3 steps"), "{card}");
+        assert!(
+            plan.steps
+                .iter()
+                .all(|step| step.status == crate::plans::StepStatus::Completed)
+        );
+    }
+
+    /// A child that fails marks its steps failed, never done.
+    #[tokio::test]
+    async fn failed_background_child_marks_its_steps_failed() {
+        let child = ScriptedChild::new("unused", Duration::from_millis(200));
+        *child.failure.lock().unwrap() = Some(anyhow::anyhow!("synthetic failure"));
+        let (card, plan) = background_card_after(&child).await;
+        assert!(card.starts_with("❌ Stopped · 1 of 3 done"), "{card}");
+        assert!(
+            card.contains("Resume the first setup (couldn't be done)"),
+            "{card}"
+        );
+        assert_eq!(plan.steps[1].status, crate::plans::StepStatus::Failed);
+        assert_eq!(plan.steps[2].status, crate::plans::StepStatus::Failed);
+    }
+
+    /// A background job reports when it has something to report: its result.
+    #[tokio::test]
+    async fn background_child_sends_no_interim_chat_messages() {
+        let child = ScriptedChild::new("all done", Duration::from_millis(2_500));
+        let hub = Arc::new(CountingHub::default());
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        tool.set_hub(Arc::downgrade(&router));
+        let args = json!({"mission": "Report", "task": "Write it", "background": true}).to_string();
+
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let pending = store.get_pending_notifications(10).await.unwrap();
+                if pending.iter().any(|n| n.notification_type == "completed") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the result arrives");
+
+        let sent = hub.sent.lock().unwrap();
+        assert!(sent.is_empty(), "no interim pings: {sent:?}");
+    }
+
+    /// What every surface shows for one background helper: the card while
+    /// it runs, its run record then, and the chat's finish line and the
+    /// final card once it ended.
+    struct Surfaces {
+        running_card: String,
+        running_record: RunPhase,
+        running_lines: Vec<aidaemon_core::card::HelperView>,
+        message: String,
+        final_card: String,
+    }
+
+    async fn surfaces_for(child: &Arc<ScriptedChild>, cancel: bool) -> Surfaces {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(pool).await.unwrap());
+        let session = "telegram:synthetic-user-1";
+        plans
+            .upsert_checklist(
+                session,
+                Some("task-agree"),
+                "track_requirements",
+                &[
+                    (
+                        "Check the tools".into(),
+                        crate::plans::StepStatus::Completed,
+                    ),
+                    ("Install the site".into(), crate::plans::StepStatus::Pending),
+                ],
+            )
+            .await
+            .unwrap();
+        plans
+            .confirm_steps(
+                session,
+                "task-agree",
+                &std::collections::BTreeSet::from([0]),
+            )
+            .await
+            .unwrap();
+        let hub = Arc::new(CardHub::default());
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(child).with_state(state);
+        tool.set_hub(Arc::downgrade(&router));
+        tool.set_plan_store(plans.clone());
+        let args = json!({
+            "title": "Site install",
+            "task": "Install it",
+            "background": true,
+            "checklist_items": [1]
+        })
+        .to_string();
+        let mut call_facts = facts();
+        call_facts.task_id = Some("task-agree".to_string());
+        tool.call_with_execution_context(&args, None, call_facts)
+            .await
+            .unwrap();
+
+        let running_card =
+            plans.get_recent_for_session(session, 1).await.unwrap()[0].render_compact_checklist();
+        let records = child.runs.for_chat(session);
+        assert_eq!(records.len(), 1, "one record per helper run");
+        let running_record = records[0].phase;
+        let running_lines: Vec<aidaemon_core::card::HelperView> = child
+            .runs
+            .for_chat(session)
+            .iter()
+            .map(aidaemon_runtime::run_state::RunState::view)
+            .collect();
+        if cancel {
+            child.cancel.cancel();
+        }
+        let message = wait_for_notification(&store).await.message;
+        let final_card = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some((_, text)) = hub.edits.lock().unwrap().last().cloned() {
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the card is redrawn when the run ends");
+        Surfaces {
+            running_card,
+            running_record,
+            running_lines,
+            message,
+            final_card,
+        }
+    }
+
+    /// Running, succeeded, failed and stopped helpers: the card, the run
+    /// record, the helper line, the finish header, its measured footer and
+    /// the step's mark all say the same thing, from the one run record.
+    #[tokio::test]
+    async fn every_surface_agrees_on_how_a_helper_stands() {
+        let cases: [(&str, RunPhase, bool, &str); 4] = [
+            (
+                "succeeded",
+                RunPhase::Succeeded,
+                false,
+                "✅ Install the site",
+            ),
+            (
+                "stopped short",
+                RunPhase::Stopped,
+                false,
+                "⏭️ Install the site (not done: its helper stopped before it finished)",
+            ),
+            (
+                "failed",
+                RunPhase::Failed,
+                false,
+                "⚠️ Install the site (couldn't be done)",
+            ),
+            (
+                "cancelled",
+                RunPhase::Stopped,
+                true,
+                "⏭️ Install the site (not done: you stopped its helper)",
+            ),
+        ];
+        for (case, phase, cancel, step_line) in cases {
+            let delay = if cancel {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_millis(300)
+            };
+            let child = ScriptedChild::new("The site is up.", delay);
+            match phase {
+                RunPhase::Failed => {
+                    *child.failure.lock().unwrap() = Some(anyhow::anyhow!("synthetic failure"))
+                }
+                RunPhase::Stopped => {
+                    *child.end.lock().unwrap() = aidaemon_runtime::run_state::RunEnd::Stopped(None)
+                }
+                _ => *child.end.lock().unwrap() = aidaemon_runtime::run_state::RunEnd::Succeeded,
+            }
+            let seen = surfaces_for(&child, cancel).await;
+
+            // While it runs.
+            assert_eq!(seen.running_record, RunPhase::Running, "{case}");
+            assert!(
+                seen.running_card
+                    .starts_with("⏳ Continuing in the background · 1 of 2 done"),
+                "{case}: {}",
+                seen.running_card
+            );
+            assert!(
+                seen.running_card
+                    .contains("⏳ Install the site (running in the background)"),
+                "{case}: {}",
+                seen.running_card
+            );
+            // Each line names its run: the card keeps one entry per run.
+            let run = seen.running_lines.first().and_then(|line| line.run.clone());
+            assert!(run.is_some(), "{case}");
+            assert_eq!(
+                seen.running_lines,
+                vec![
+                    aidaemon_core::card::HelperView::running("Site install", true, None)
+                        .for_steps(&[1])
+                        .of_run(run.as_deref())
+                ],
+                "{case}"
+            );
+
+            // Once it ended: how it ended is on the card, once; the result
+            // carries the body and the measured time.
+            let headline = if cancel {
+                "\u{23f9}\u{fe0f} Stopped by you"
+            } else {
+                phase.headline()
+            };
+            assert!(
+                seen.final_card
+                    .contains(&format!("{headline}: Site install")),
+                "{case}: {}",
+                seen.final_card
+            );
+            for any in [RunPhase::Succeeded, RunPhase::Failed, RunPhase::Stopped] {
+                assert!(
+                    !seen.message.contains(any.headline()),
+                    "{case}: {}",
+                    seen.message
+                );
+            }
+            assert!(seen.message.contains("Took "), "{case}: {}", seen.message);
+            assert!(
+                !seen.message.contains("confirm"),
+                "{case}: {}",
+                seen.message
+            );
+            assert!(
+                seen.final_card.contains(step_line),
+                "{case}: {}",
+                seen.final_card
+            );
+            // The card settles to the helper's final header, the same one
+            // its result starts with; one that failed or was cancelled says
+            // why under it, from its record.
+            let header = match (phase, cancel) {
+                (RunPhase::Failed, _) => format!(
+                    "{}: Site install\nIt stopped on an error: synthetic failure.",
+                    phase.headline()
+                ),
+                // Stopped by the owner: the header says it, with no
+                // reason line and nothing of a failure.
+                (_, true) => format!("{headline}: Site install"),
+                _ => format!("{}: Site install", phase.headline()),
+            };
+            assert!(
+                seen.final_card.ends_with(&header),
+                "{case}: {}",
+                seen.final_card
+            );
+            assert!(
+                !seen.final_card.contains("running in the background"),
+                "{case}: {}",
+                seen.final_card
+            );
+            if phase != RunPhase::Failed {
+                assert!(
+                    !seen.final_card.contains("couldn't be done"),
+                    "{case}: only a typed failure reads as couldn't be done: {}",
+                    seen.final_card
+                );
+            }
+            assert!(
+                child.runs.for_chat("telegram:synthetic-user-1").is_empty(),
+                "{case}: the ended run's record goes once its result is out"
+            );
+        }
+    }
+
+    /// A fresh install never starts in a folder that already holds
+    /// something: the call names the next free folder and no helper runs,
+    /// and a folder that doesn't exist yet starts.
+    #[tokio::test]
+    async fn new_work_never_starts_in_a_folder_that_already_exists() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("site-3")).unwrap();
+        std::fs::create_dir(root.path().join("site-4")).unwrap();
+        let child = ScriptedChild::new("set up", Duration::from_millis(10));
+        let tool = tool_for(&child);
+        let taken = root.path().join("site-3").display().to_string();
+        let args = json!({
+            "title": "Site install in site-3",
+            "task": "Install a fresh site",
+            "new_folders": [taken],
+        })
+        .to_string();
+        let error = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .expect_err("an existing folder is not a fresh one");
+        let free = root.path().join("site-5").display().to_string();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{taken} already exists"))
+                && error
+                    .to_string()
+                    .contains(&format!("next free name is {free}")),
+            "{error}"
+        );
+        assert!(child.tasks.lock().unwrap().is_empty(), "no helper ran");
+
+        let args = json!({
+            "title": "Site install in site-5",
+            "task": "Install a fresh site",
+            "new_folders": [free],
+        })
+        .to_string();
+        tool.call_with_execution_context(
+            &args,
+            None,
+            facts_with_authority(aidaemon_core::Authority::full()),
+        )
+        .await
+        .expect("a folder that doesn't exist yet is fine");
+        assert_eq!(child.tasks.lock().unwrap().len(), 1);
+
+        // The spawn made the folder, empty, and told the child it is there
+        // to work in.
+        let made = std::path::Path::new(&free);
+        assert!(made.is_dir(), "the new folder exists before the child runs");
+        assert_eq!(std::fs::read_dir(made).unwrap().count(), 0);
+        assert!(
+            child.tasks.lock().unwrap()[0].contains(&format!("{free}, was just created")),
+            "{:?}",
+            child.tasks.lock().unwrap()
+        );
+        // Its write authority is derived from the spec, in one place: the
+        // folder made for it is inside, anything else is outside.
+        let declaration = child.declarations.lock().unwrap()[0].clone();
+        assert_eq!(declaration.new_folders, std::slice::from_ref(&free));
+        let parent = crate::agent::authority::InheritedAuthority {
+            child_declaration: Some(declaration),
+            ..crate::agent::authority::parent_authority(&facts_with_authority(
+                aidaemon_core::Authority::full(),
+            ))
+            .unwrap()
+            .clone()
+        };
+        let child_access = crate::agent::authority::narrow_for_child(
+            &parent,
+            crate::agent::authority::ResolvedAuthority {
+                authority: aidaemon_core::Authority::full(),
+                owner_level: Some(crate::config::OwnerLevel::Full),
+                task_access: None,
+            },
+        )
+        .task_access
+        .expect("a child with a declared folder is confined to it");
+        let writes = |path: &str| crate::traits::ToolCallAccessManifest {
+            write_targets: vec![
+                crate::traits::ToolTargetHint::new(
+                    crate::traits::ToolTargetHintKind::Path,
+                    path.to_string(),
+                )
+                .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let check = |path: &str| {
+            aidaemon_runtime::turn::tool_dispatch::access_manifest_scope_check(
+                "write_file",
+                &writes(path),
+                Some(&child_access),
+                &[],
+                None,
+                &crate::tools::DaemonPaths::default(),
+            )
+        };
+        assert!(check(&format!("{free}/wp-config.php")).is_none());
+        assert!(check(&format!("{free}/.ddev/config.yaml")).is_none());
+        let taken_file = format!("{taken}/index.php");
+        assert!(
+            check(&taken_file).is_some(),
+            "the earlier site next to it is outside the child's scope"
+        );
+    }
+
+    /// A spawn that cannot start gives back the folders it made, so the
+    /// name is free again.
+    #[tokio::test]
+    async fn a_spawn_that_fails_to_start_gives_its_new_folder_back() {
+        let root = tempfile::tempdir().unwrap();
+        let child = ScriptedChild::new("set up", Duration::from_millis(10));
+        child
+            .fails_in_setup
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let tool = tool_for(&child);
+        let folder = root.path().join("site").display().to_string();
+        let args = json!({
+            "title": "Site install",
+            "task": "Install a fresh site",
+            "new_folders": [folder],
+        })
+        .to_string();
+        let _ = tool.call_with_execution_context(&args, None, facts()).await;
+        assert!(!std::path::Path::new(&folder).exists());
+    }
+
+    /// A helper whose run record says it did none of its work fails, with
+    /// the typed reason, whatever its reply says: the parent gets the
+    /// failure and the measured time worded as how long it ran before
+    /// failing, never as a time to finish.
+    #[tokio::test]
+    async fn a_helper_that_did_nothing_fails_with_its_typed_reason() {
+        let child = ScriptedChild::new(
+            "**Blocked:** the folder does not exist here.",
+            Duration::from_millis(10),
+        );
+        *child.end.lock().unwrap() = aidaemon_runtime::run_state::RunEnd::Failed(
+            aidaemon_runtime::run_state::RunFailure::NothingDone {
+                undone: vec!["Install WordPress with DDEV".to_string()],
+            },
+        );
+        let tool = tool_for(&child);
+        let args = json!({
+            "title": "WordPress install",
+            "task": "Install WordPress",
+        })
+        .to_string();
+        let error = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .expect_err("a helper that did nothing failed")
+            .to_string();
+        assert!(error.contains("Sub-agent failed."), "{error}");
+        assert!(
+            error.contains("It ended without doing any of its work")
+                && error.contains("Install WordPress with DDEV"),
+            "the typed reason reaches the parent: {error}"
+        );
+        assert!(
+            error.contains("and failed.") && error.contains("not how long its work takes"),
+            "{error}"
+        );
+
+        // In a batch beside a helper that succeeded, the failure is that
+        // helper's section and the call is not a success.
+        let ok = Ok(reported("done".to_string(), SourceTrust::Trusted));
+        let combined = combine_batch(
+            vec![
+                (
+                    "Drupal install".to_string(),
+                    ok.map(|mut outcome| {
+                        outcome.metadata.outcome_status =
+                            Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded);
+                        outcome
+                    }),
+                ),
+                (
+                    "WordPress install".to_string(),
+                    Err(anyhow::anyhow!(error.clone())),
+                ),
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(
+            combined
+                .output
+                .contains("### WordPress install\nFailed: Sub-agent failed.")
+        );
+        assert_ne!(
+            combined.metadata.outcome_status,
+            Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded)
+        );
     }
 }

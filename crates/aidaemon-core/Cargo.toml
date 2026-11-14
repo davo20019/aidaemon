@@ -1,0 +1,45 @@
+[package]
+name = "aidaemon-core"
+description = "The aidaemon agent kernel: a small, hook-driven agent loop with tools, providers, receipts and resumable state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-core"
+readme = "README.md"
+keywords = ["agent", "llm", "ai", "hooks", "kernel"]
+categories = ["asynchronous", "development-tools"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/", "PLAN.md", "plans/", "public-api.txt"]
+publish = false
+
+[features]
+# Exposes `aidaemon_core::testing` (ScriptedProvider and helpers) so users can
+# test their own tools and hooks without a real model, and
+# `aidaemon_core::conformance` (tool and provider conformance kits).
+testing = []
+
+[dependencies]
+async-trait = "0.1"
+futures = "0.3"
+hex = "0.4"
+hmac = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = "0.7"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+aidaemon-core = { path = ".", features = ["testing"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[[example]]
+name = "kernel_tour"
+required-features = ["testing"]

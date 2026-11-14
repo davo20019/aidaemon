@@ -1,74 +1,73 @@
 #![recursion_limit = "256"]
 
 mod agent;
-mod agent_handoff;
-mod backoff;
 mod channels;
-mod checkpoints;
-mod cli_agent_flags;
 mod config;
+mod context_budget;
 mod conversation;
 mod core;
-mod cron_utils;
+#[cfg(test)]
+use aidaemon_work::schedule as cron_utils;
 mod daemon;
 mod dashboard;
-mod db;
-mod duration_format;
 #[allow(dead_code)]
 mod events;
+mod otel_export;
 pub use events::{
     CompletionProofReference, Event, EventType, TaskCompletionProofData, TaskEndData, ToolCallData,
     UserMessageData,
 };
 pub(crate) mod execution;
-mod execution_graph;
+#[cfg(test)]
 mod execution_policy;
-mod goal_tokens;
+use aidaemon_work::goal_tokens;
 pub mod harness_eval;
 mod health;
 mod heartbeat;
 mod llm_markers;
 mod llm_runtime;
 mod logging;
-mod mandates;
+mod mandates {
+    //! The mandate policy lives in `aidaemon_work::mandates`.
+    #[allow(unused_imports)]
+    pub use aidaemon_work::MANDATE_PROTOCOL_TOOLS;
+    #[allow(unused_imports)]
+    pub(crate) use aidaemon_work::mandates::{history, policy::*};
+    #[allow(unused_imports)]
+    pub(crate) use aidaemon_work::{admissibility, authority};
+}
 mod mcp;
 mod memory;
-mod message_content;
 pub mod nodes;
 mod oauth;
-#[allow(dead_code)]
-mod plans;
-mod project_instructions;
+#[allow(unused_imports)]
+use aidaemon_work::plans;
 mod providers;
-mod queue_policy;
-mod queue_telemetry;
-mod reminders;
+use aidaemon_channels::queue::policy as queue_policy;
+use aidaemon_channels::queue::telemetry as queue_telemetry;
+#[cfg(test)]
+use aidaemon_work::reminders;
 mod router;
 mod runtime_ports;
-mod session;
 mod single_instance;
 mod skills;
 mod startup;
 mod state;
-mod stt_setup;
-mod tasks;
-#[cfg(feature = "terminal-bridge")]
-mod terminal_bridge;
-mod terminal_lite;
-mod token_alerts;
+use aidaemon_channels::tasks;
 mod tools;
 #[cfg(feature = "computer_use")]
 pub use config::ComputerUseConfig;
 #[cfg(feature = "computer_use")]
 pub use tools::computer_use;
 mod traits;
-mod triggers;
+use aidaemon_work::triggers;
 mod types;
 mod updater;
 pub mod utils;
 mod wizard;
-mod workspaces;
 
+#[cfg(test)]
+mod contract_shape_tests;
 #[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
@@ -83,9 +82,9 @@ use std::process::Stdio;
 const SUPPORTED_TERMINAL_AGENTS: &[&str] = &["codex", "claude", "gemini", "opencode"];
 const MAX_AGENT_LAUNCH_ARGS: usize = 24;
 const MAX_AGENT_LAUNCH_ARG_CHARS: usize = 256;
-pub(crate) const RUNTIME_CONFIG_PATH_ENV_KEY: &str = "AIDAEMON_RUNTIME_CONFIG_PATH";
-pub(crate) const RUNTIME_ENV_FILE_ENV_KEY: &str = "AIDAEMON_RUNTIME_ENV_FILE";
-pub(crate) const RUNTIME_WORKDIR_ENV_KEY: &str = "AIDAEMON_RUNTIME_WORKDIR";
+pub(crate) use aidaemon_tools::check_environment::{
+    RUNTIME_CONFIG_PATH_ENV_KEY, RUNTIME_ENV_FILE_ENV_KEY, RUNTIME_WORKDIR_ENV_KEY,
+};
 
 fn runtime_working_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -109,19 +108,23 @@ fn resolve_runtime_env_file_path(working_dir: &Path) -> PathBuf {
     working_dir.join(".env")
 }
 
+/// Publish the resolved paths in the process environment, where the secret
+/// store, `check_environment` and the daemon's child processes read them.
+///
+/// Must run while the process is still single-threaded: [`run`] calls it
+/// first, before logging, the Tokio runtime or anything else starts a thread.
 fn export_runtime_context(config_path: &Path, env_file_path: &Path, working_dir: &Path) {
-    std::env::set_var(
-        RUNTIME_CONFIG_PATH_ENV_KEY,
-        config_path.to_string_lossy().to_string(),
-    );
-    std::env::set_var(
-        RUNTIME_ENV_FILE_ENV_KEY,
-        env_file_path.to_string_lossy().to_string(),
-    );
-    std::env::set_var(
-        RUNTIME_WORKDIR_ENV_KEY,
-        working_dir.to_string_lossy().to_string(),
-    );
+    let vars = [
+        (RUNTIME_CONFIG_PATH_ENV_KEY, config_path),
+        (RUNTIME_ENV_FILE_ENV_KEY, env_file_path),
+        (RUNTIME_WORKDIR_ENV_KEY, working_dir),
+    ];
+    for (key, path) in vars {
+        // SAFETY: called from the top of `run` on the main thread before any
+        // other thread exists, so nothing can read the environment
+        // concurrently.
+        unsafe { std::env::set_var(key, &*path.to_string_lossy()) };
+    }
 }
 
 fn load_startup_env_file(env_file_path: &Path) {
@@ -154,15 +157,22 @@ pub fn run() -> anyhow::Result<()> {
     // - Default: .env in the daemon working directory.
     // - Override: AIDAEMON_ENV_FILE=/absolute/path/to/envfile
     export_runtime_context(&config_path, &env_file_path, &working_dir);
+    let daemon_paths = tools::DaemonPaths::new(vec![
+        config_path.clone(),
+        env_file_path.clone(),
+        working_dir.join(".env"),
+    ]);
     load_startup_env_file(&env_file_path);
 
     // Interactive runs log to stderr. Background service logs are written to
     // an owner-only, size-rotated file so a long-lived daemon cannot consume
     // the host disk through launch-service output redirection.
+    // html5ever warns about markup it cannot place ("foster parenting not
+    // implemented") on ordinary fetched pages; nothing here can act on it.
     logging::init(if cfg!(feature = "browser") {
-        "info,chromiumoxide=off"
+        "info,html5ever=error,chromiumoxide=off"
     } else {
-        "info"
+        "info,html5ever=error"
     })?;
 
     // Handle CLI arguments
@@ -181,6 +191,9 @@ pub fn run() -> anyhow::Result<()> {
                 println!("  install-service       Install as a system service (launchd/systemd)");
                 println!("  check-update          Check for available updates");
                 println!("  migrate [--config]    Run DB migrations and exit");
+                println!(
+                    "  memory-export DIR     Write a readable copy of memory to a new directory"
+                );
                 println!("  setup low-latency     Configure Telegram webhook low-latency mode");
                 println!(
                     "  browser login          Launch Chrome to log into services for the agent"
@@ -200,9 +213,13 @@ pub fn run() -> anyhow::Result<()> {
                 println!("  auth login openai     Connect a ChatGPT subscription (Codex OAuth)");
                 println!("  auth status           Show connected model subscriptions");
                 println!("  auth logout openai    Disconnect the ChatGPT subscription");
-                println!("  dashboard             Open the authenticated local dashboard");
-                println!("  dashboard login-url   Print a local dashboard login URL");
                 println!("  node <command>        Pair, inspect, authorize, or revoke Nodes");
+                println!(
+                    "  client-token          Mint the local Client Gateway token (revokes the old)"
+                );
+                println!("  pair                  Pair a phone or browser with the Client Gateway");
+                println!("  app                   Open the AIdaemon app in a window");
+                println!("  tui                   Run the AIdaemon app in this terminal");
                 println!("  keychain set <key>    Store a secret in the OS keychain");
                 println!("  keychain get <key>    Retrieve a secret from the OS keychain");
                 println!("  keychain delete <key> Remove a secret from the OS keychain");
@@ -237,6 +254,9 @@ pub fn run() -> anyhow::Result<()> {
             "migrate" => {
                 return handle_migrate_command(&args[2..], config_path.as_path());
             }
+            "memory-export" => {
+                return handle_memory_export_command(&args[2..], config_path.as_path());
+            }
             "setup" => {
                 return handle_setup_command(&args[2..], config_path.as_path());
             }
@@ -259,13 +279,31 @@ pub fn run() -> anyhow::Result<()> {
                 return handle_keychain_command(&args[2..]);
             }
             "dashboard" => {
-                return handle_dashboard_command(&args[2..], config_path.as_path());
+                anyhow::bail!(
+                    "The dashboard page is gone: its status lives in the AIdaemon app \
+                     (aidaemon app, aidaemon tui, or the web app the gateway serves)."
+                );
             }
             "auth" => {
                 return handle_auth_command(&args[2..]);
             }
             "node" => {
                 return nodes::cli::handle_node_command(&args[2..], config_path.as_path());
+            }
+            "client-token" => {
+                return handle_client_token_command(&args[2..], config_path.as_path());
+            }
+            "pair" => {
+                return handle_pair_command(&args[2..], config_path.as_path(), false);
+            }
+            "web" => {
+                return handle_pair_command(&args[2..], config_path.as_path(), true);
+            }
+            "tui" => {
+                return handle_tui_command(&args[2..], config_path.as_path());
+            }
+            "app" => {
+                return handle_app_command(&args[2..], config_path.as_path());
             }
             other => {
                 if let Some(agent) = normalize_terminal_agent_name(other) {
@@ -306,12 +344,12 @@ pub fn run() -> anyhow::Result<()> {
             for candidate in &candidates {
                 if candidate.exists() {
                     eprintln!("Trying restore from {}...", candidate.display());
-                    if let Ok(()) = std::fs::copy(candidate, &config_path).map(|_| ()) {
-                        if config::AppConfig::load(&config_path).is_ok() {
-                            eprintln!("Restored config from {}", candidate.display());
-                            restored = true;
-                            break;
-                        }
+                    if let Ok(()) = std::fs::copy(candidate, &config_path).map(|_| ())
+                        && config::AppConfig::load(&config_path).is_ok()
+                    {
+                        eprintln!("Restored config from {}", candidate.display());
+                        restored = true;
+                        break;
                     }
                 }
             }
@@ -343,62 +381,7 @@ pub fn run() -> anyhow::Result<()> {
         .enable_all()
         .thread_stack_size(8 * 1024 * 1024)
         .build()?
-        .block_on(crate::core::run(config, config_path))
-}
-
-fn dashboard_login_url(config_path: &Path) -> anyhow::Result<String> {
-    let config = config::AppConfig::load(config_path)?;
-    if !config.daemon.dashboard_enabled {
-        anyhow::bail!("The dashboard is disabled in config.toml");
-    }
-    let token = config::resolve_from_keychain("dashboard_token").map_err(|error| {
-        anyhow::anyhow!(
-            "Dashboard token is unavailable: {error}. Start or restart the daemon first."
-        )
-    })?;
-    let host = match config.daemon.health_bind.trim() {
-        "" | "0.0.0.0" | "::" => "127.0.0.1".to_string(),
-        value if value.contains(':') && !value.starts_with('[') => format!("[{value}]"),
-        value => value.to_string(),
-    };
-    Ok(format!(
-        "http://{}:{}/#token={}",
-        host, config.daemon.health_port, token
-    ))
-}
-
-fn handle_dashboard_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
-    let action = args.first().map(String::as_str).unwrap_or("open");
-    let login_url = dashboard_login_url(config_path)?;
-    match action {
-        "open" => {
-            #[cfg(target_os = "macos")]
-            let status = std::process::Command::new("open")
-                .arg(&login_url)
-                .status()?;
-            #[cfg(target_os = "linux")]
-            let status = std::process::Command::new("xdg-open")
-                .arg(&login_url)
-                .status()?;
-            #[cfg(target_os = "windows")]
-            let status = std::process::Command::new("rundll32")
-                .arg("url.dll,FileProtocolHandler")
-                .arg(&login_url)
-                .status()?;
-            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-            anyhow::bail!("Opening the dashboard is not supported on this platform");
-
-            if !status.success() {
-                anyhow::bail!("Could not open the local dashboard in a browser");
-            }
-            println!("Opened the authenticated local dashboard.");
-        }
-        "login-url" => {
-            println!("{login_url}");
-        }
-        _ => anyhow::bail!("Usage: aidaemon dashboard [open|login-url]"),
-    }
-    Ok(())
+        .block_on(crate::core::run(config, config_path, daemon_paths))
 }
 
 #[allow(unreachable_code)]
@@ -472,6 +455,51 @@ fn handle_browser_command(
             std::process::exit(1);
         }
     }
+    Ok(())
+}
+
+fn handle_memory_export_command(args: &[String], default_config_path: &Path) -> anyhow::Result<()> {
+    let mut config_path = default_config_path.to_path_buf();
+    let mut directory = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                println!("Usage: aidaemon memory-export DIR [--config PATH]");
+                println!();
+                println!("Write what the daemon's own memory holds as Markdown files. Facts you");
+                println!("asked it to forget are left out.");
+                println!("DIR must not exist yet. The files contain personal data and are");
+                println!("readable only by you.");
+                return Ok(());
+            }
+            "-c" | "--config" => {
+                let Some(path) = args.get(i + 1) else {
+                    anyhow::bail!("Missing value for --config");
+                };
+                config_path = PathBuf::from(path);
+                i += 2;
+            }
+            other if directory.is_none() && !other.starts_with('-') => {
+                directory = Some(PathBuf::from(other));
+                i += 1;
+            }
+            other => anyhow::bail!("Unknown memory-export option: {other}"),
+        }
+    }
+    let Some(directory) = directory else {
+        anyhow::bail!("Usage: aidaemon memory-export DIR [--config PATH]");
+    };
+    let _ = dotenvy::dotenv();
+    let config = config::AppConfig::load(&config_path)?;
+    let written = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(crate::core::run_memory_export(config, directory.clone()))?;
+    for (name, entries) in written {
+        println!("{name}: {entries} entries");
+    }
+    println!("Wrote {}", directory.display());
     Ok(())
 }
 
@@ -559,7 +587,7 @@ fn handle_agent_command(args: &[String]) -> anyhow::Result<()> {
             };
             #[cfg(feature = "terminal-bridge")]
             {
-                crate::terminal_bridge::run_local_attach_cli(code)
+                crate::startup::terminal_bridge::run_local_attach_cli(code)
             }
             #[cfg(not(feature = "terminal-bridge"))]
             {
@@ -586,7 +614,7 @@ fn handle_agent_command(args: &[String]) -> anyhow::Result<()> {
             #[cfg(feature = "terminal-bridge")]
             {
                 let explicit_session_id = args.get(1).map(|v| v.as_str());
-                crate::terminal_bridge::run_local_share_cli(explicit_session_id)
+                crate::startup::terminal_bridge::run_local_share_cli(explicit_session_id)
             }
             #[cfg(not(feature = "terminal-bridge"))]
             {
@@ -602,7 +630,9 @@ fn handle_agent_command(args: &[String]) -> anyhow::Result<()> {
             println!("  aidaemon agent start <codex|claude|gemini|opencode> [cwd] [-- flags...]");
             println!("  aidaemon share [session_id]");
             println!();
-            println!("Attach your native terminal to an active /agent session started from Telegram Mini App.");
+            println!(
+                "Attach your native terminal to an active /agent session started from Telegram Mini App."
+            );
             println!(
                 "The one-time code is generated inside Telegram when you tap Continue on Computer."
             );
@@ -615,6 +645,318 @@ fn handle_agent_command(args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         other => anyhow::bail!("Unknown agent command: {other}"),
+    }
+}
+
+/// `aidaemon client-token [--print]`: mint the local token the Client
+/// Gateway accepts. Its hash goes to the gateway's token file and the
+/// owner's copy to `~/.aidaemon/client-token` (owner-only), which
+/// `aidaemon tui`, `aidaemon web` and `aidaemon pair` read; `--print` also
+/// writes it to stdout for scripts. Minting again revokes the previous token.
+fn handle_client_token_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
+    let mut print = false;
+    for arg in args {
+        match arg.as_str() {
+            "--print" => print = true,
+            "-h" | "--help" => {
+                println!("Usage: aidaemon client-token [--print]");
+                println!();
+                println!("Mint the token local apps use with the Client Gateway");
+                println!("([client_gateway] in config.toml) and save it for `aidaemon tui`");
+                println!("and `aidaemon web`. The old token stops working. --print also");
+                println!("writes it to stdout, for scripts (Authorization: Bearer <token>).");
+                return Ok(());
+            }
+            other => anyhow::bail!("Unknown client-token option: {other}"),
+        }
+    }
+    // Read only the gateway's table: loading the whole config would
+    // resolve secrets from the keychain.
+    let settings = crate::startup::client_gateway::settings_from_file(config_path);
+    let path = aidaemon_client_gateway::token::mint_local_token(&settings)?;
+    if print {
+        println!("{}", std::fs::read_to_string(&path)?.trim());
+    }
+    eprintln!(
+        "Client Gateway token minted and saved to {} (owner-only). The old token stops working.",
+        path.display()
+    );
+    Ok(())
+}
+
+/// The gateway's settings for a client command, or the steps to turn it on.
+fn client_gateway_ready(
+    config_path: &Path,
+) -> anyhow::Result<aidaemon_client_gateway::ClientGatewayConfig> {
+    let settings = crate::startup::client_gateway::settings_from_file(config_path);
+    anyhow::ensure!(
+        settings.enabled,
+        "The Client Gateway is off. Ask the agent to \"enable the client gateway\", or add\n\n\
+         [client_gateway]\nenabled = true\n\n\
+         to {} and restart the daemon (/restart in a chat).",
+        config_path.display()
+    );
+    Ok(settings)
+}
+
+/// `aidaemon tui [--device NAME]`: the terminal client on the running
+/// daemon's Client Gateway, with the gateway's own address and the local
+/// token (minted on first use).
+fn handle_tui_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("Usage: aidaemon tui");
+        println!();
+        println!("The AIdaemon app in this terminal: chat, every chat's turns and approvals.");
+        println!("Needs [client_gateway] enabled and the aidaemon-app binary (it ships with");
+        println!("releases and install.sh).");
+        return Ok(());
+    }
+    if let Some(other) = args.first() {
+        anyhow::bail!("Unknown tui option: {other}");
+    }
+    launch_app(config_path, true)
+}
+
+/// `aidaemon app`: the AIdaemon app in a window on this machine.
+fn handle_app_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("Usage: aidaemon app");
+        println!();
+        println!("The AIdaemon app in a window: chat, approvals and running work.");
+        println!("Needs [client_gateway] enabled and the aidaemon-app binary.");
+        return Ok(());
+    }
+    if let Some(other) = args.first() {
+        anyhow::bail!("Unknown app option: {other}");
+    }
+    launch_app(config_path, false)
+}
+
+/// The `aidaemon-app` binary: beside this one, else on `PATH`.
+fn app_binary() -> Option<std::path::PathBuf> {
+    let name = if cfg!(windows) {
+        "aidaemon-app.exe"
+    } else {
+        "aidaemon-app"
+    };
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
+        .filter(|path| path.is_file());
+    beside.or_else(|| {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(name))
+                .find(|path| path.is_file())
+        })
+    })
+}
+
+/// Start the app against this machine's gateway, signed in with the owner's
+/// local token; the terminal build takes over this terminal until it quits.
+fn launch_app(config_path: &Path, terminal: bool) -> anyhow::Result<()> {
+    let settings = client_gateway_ready(config_path)?;
+    let Some(binary) = app_binary() else {
+        anyhow::bail!(
+            "The aidaemon-app binary is not installed. It ships with each release (install.sh \
+             installs it beside aidaemon); from a checkout: cargo build --release \
+             --manifest-path clients/app/Cargo.toml"
+        );
+    };
+    let token = crate::startup::client_gateway::local_token_or_mint(&settings)?;
+    let mut command = std::process::Command::new(binary);
+    command
+        .env(
+            "AIDAEMON_GATEWAY_URL",
+            format!("ws://{}/client/v1/ws", settings.bind_addr()?),
+        )
+        .env("AIDAEMON_CLIENT_TOKEN", token);
+    if terminal {
+        let status = command.arg("--tui").status()?;
+        anyhow::ensure!(status.success(), "the app exited with {status}");
+    } else {
+        command.spawn()?;
+        println!("Opened the AIdaemon app.");
+    }
+    Ok(())
+}
+
+/// Open `url` in the default browser.
+fn open_in_browser(url: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    let status = std::process::Command::new("open").arg(url).status()?;
+    #[cfg(target_os = "linux")]
+    let status = std::process::Command::new("xdg-open").arg(url).status()?;
+    #[cfg(target_os = "windows")]
+    let status = std::process::Command::new("rundll32")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(url)
+        .status()?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    anyhow::bail!("Opening a browser is not supported on this platform");
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    anyhow::ensure!(status.success(), "Could not open a browser");
+    Ok(())
+}
+
+/// `aidaemon pair [--token-file FILE]` / `aidaemon web`: make a pairing
+/// offer on the running daemon's Client Gateway, show its code and a QR
+/// code of the web client's link (`web` also opens it in this machine's
+/// browser), and confirm the device here when it redeems the offer. Uses
+/// the owner's local token (`AIDAEMON_CLIENT_TOKEN`, `--token-file`, or the
+/// saved copy, minted on first use).
+fn handle_pair_command(args: &[String], config_path: &Path, open_web: bool) -> anyhow::Result<()> {
+    use aidaemon_client_protocol::{Enrollment, EnrollmentState, PairingDecision, PairingOffer};
+    let command = if open_web { "web" } else { "pair" };
+    let mut token = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--token-file" => {
+                let Some(path) = args.get(i + 1) else {
+                    anyhow::bail!("Missing value for --token-file");
+                };
+                token = Some(std::fs::read_to_string(path)?.trim().to_string());
+                i += 2;
+            }
+            "-h" | "--help" => {
+                if open_web {
+                    println!("Usage: aidaemon web [--token-file FILE]");
+                    println!();
+                    println!("Open the web client in this machine's browser and pair it with the");
+                    println!("Client Gateway. Needs [client_gateway] enabled.");
+                } else {
+                    println!("Usage: aidaemon pair [--token-file FILE]");
+                    println!();
+                    println!(
+                        "Pair a phone or browser with the Client Gateway (scan the QR code or"
+                    );
+                    println!("enter the code). Needs [client_gateway] enabled.");
+                }
+                return Ok(());
+            }
+            other => anyhow::bail!("Unknown {command} option: {other}"),
+        }
+    }
+    let settings = client_gateway_ready(config_path)?;
+    let token = match token.filter(|t| !t.trim().is_empty()) {
+        Some(token) => token,
+        None => crate::startup::client_gateway::local_token_or_mint(&settings)?,
+    };
+    let address = settings.bind_addr()?;
+    let base = format!("http://{address}");
+    let http = reqwest::blocking::Client::new();
+    let response = http
+        .post(format!("{base}/client/v1/pairing/offers"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({}))
+        .send()
+        .map_err(|error| anyhow::anyhow!("Is the daemon running with the gateway on? {error}"))?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "The gateway refused the offer ({}): check the token",
+        response.status()
+    );
+    let offer: PairingOffer = response.json()?;
+    // The daemon knows the live address (a tunnel's origin); an older
+    // daemon does not say, so fall back to the config file's.
+    let public_url = offer
+        .public_url
+        .clone()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| settings.public_url());
+    let link = format!(
+        "{}{}#offer={}&code={}&fp={}",
+        public_url.trim_end_matches('/'),
+        settings.web_app_path(),
+        offer.offer_id,
+        offer.code,
+        offer.fingerprint
+    );
+    if let Some(code) = (!open_web)
+        .then(|| qrcode::QrCode::new(link.as_bytes()).ok())
+        .flatten()
+    {
+        println!(
+            "{}",
+            code.render::<qrcode::render::unicode::Dense1x2>()
+                .quiet_zone(true)
+                .build()
+        );
+    }
+    if open_web {
+        let local = format!(
+            "http://{address}{}#offer={}&code={}&fp={}",
+            settings.web_app_path(),
+            offer.offer_id,
+            offer.code,
+            offer.fingerprint
+        );
+        match open_in_browser(&local) {
+            Ok(()) => println!("Opened the web client in your browser."),
+            Err(error) => println!("Could not open a browser ({error}); open {local}"),
+        }
+        println!("Elsewhere: open {link}");
+    } else {
+        println!("Open {link}");
+    }
+    println!(
+        "or enter the code {} on the device (valid 10 minutes).",
+        offer.code
+    );
+    println!("Daemon fingerprint: {}", offer.fingerprint);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let enrollment: Enrollment = http
+            .get(format!(
+                "{base}/client/v1/pairing/offers/{}",
+                offer.offer_id
+            ))
+            .bearer_auth(&token)
+            .send()?
+            .json()?;
+        match enrollment.state {
+            EnrollmentState::Open => continue,
+            EnrollmentState::Pending => {
+                let scopes: Vec<String> = enrollment
+                    .scopes
+                    .iter()
+                    .map(|s| format!("{s:?}").to_lowercase())
+                    .collect();
+                let approve = dialoguer::Confirm::new()
+                    .with_prompt(format!(
+                        "Pair “{}” ({:?}) with access to: {}?",
+                        enrollment.device_name.unwrap_or_default(),
+                        enrollment
+                            .device_kind
+                            .unwrap_or(aidaemon_client_protocol::ClientKind::Unknown),
+                        scopes.join(", ")
+                    ))
+                    .default(false)
+                    .interact()?;
+                let settled: Enrollment = http
+                    .post(format!(
+                        "{base}/client/v1/pairing/offers/{}/decision",
+                        offer.offer_id
+                    ))
+                    .bearer_auth(&token)
+                    .json(&PairingDecision { approve })
+                    .send()?
+                    .json()?;
+                match settled.device_id {
+                    Some(device_id) => println!("Paired: {device_id}"),
+                    None => println!("Not paired."),
+                }
+                return Ok(());
+            }
+            EnrollmentState::Expired => {
+                anyhow::bail!("The offer expired; run `aidaemon {command}` again")
+            }
+            other => {
+                println!("Pairing ended: {other:?}");
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -634,7 +976,7 @@ fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
             None => anyhow::bail!("Usage: aidaemon auth logout openai"),
         },
         "status" => {
-            match crate::oauth::chatgpt_codex::load_credentials() {
+            match crate::providers::chatgpt_login::load_credentials() {
                 Some(creds) => {
                     let state = if creds.needs_refresh(chrono::Utc::now()) {
                         "refresh due"
@@ -690,7 +1032,7 @@ fn auth_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 }
 
 fn run_chatgpt_login(paste: bool) -> anyhow::Result<()> {
-    use crate::oauth::chatgpt_codex::{self, CallbackMode};
+    use crate::providers::chatgpt_login::{self as chatgpt_codex, CallbackMode};
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -732,61 +1074,20 @@ fn run_chatgpt_login(paste: bool) -> anyhow::Result<()> {
 }
 
 fn run_chatgpt_logout() -> anyhow::Result<()> {
-    if !crate::oauth::chatgpt_codex::is_connected() {
+    if !crate::providers::chatgpt_login::is_connected() {
         println!("No ChatGPT subscription is connected.");
         return Ok(());
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    auth_runtime()?.block_on(crate::oauth::chatgpt_codex::logout(&client))?;
+    auth_runtime()?.block_on(crate::providers::chatgpt_login::logout(&client))?;
     println!("Disconnected the ChatGPT subscription.");
     Ok(())
 }
 
-pub(crate) fn normalize_terminal_agent_name(raw: &str) -> Option<&'static str> {
-    let normalized = raw.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "codex" => Some("codex"),
-        "claude" => Some("claude"),
-        "gemini" => Some("gemini"),
-        "opencode" => Some("opencode"),
-        _ => None,
-    }
-}
-
-pub(crate) fn normalize_terminal_agent_permission_aliases(
-    agent: Option<&str>,
-    args: Vec<String>,
-) -> (Vec<String>, bool) {
-    if !agent
-        .map(|value| value.trim().eq_ignore_ascii_case("claude"))
-        .unwrap_or(false)
-    {
-        return (args, false);
-    }
-
-    let mut out = Vec::with_capacity(args.len());
-    let mut has_dangerous_skip = false;
-    let mut rewrote = false;
-
-    for arg in args {
-        if arg == "--dangerously-skip-permissions" {
-            has_dangerous_skip = true;
-            out.push(arg);
-        } else if arg == "--allow-dangerously-skip-permissions" {
-            rewrote = true;
-            if !has_dangerous_skip {
-                out.push("--dangerously-skip-permissions".to_string());
-                has_dangerous_skip = true;
-            }
-        } else {
-            out.push(arg);
-        }
-    }
-
-    (out, rewrote)
-}
+pub(crate) use aidaemon_tools::cli_agent_flags::terminal_agent_name as normalize_terminal_agent_name;
+pub(crate) use aidaemon_tools::permission_bypass::normalize_terminal_agent_permission_aliases;
 
 fn parse_terminal_agent_launch_args(
     raw_args: &[String],
@@ -846,7 +1147,7 @@ fn launch_terminal_agent(agent: &str, raw_args: &[String]) -> anyhow::Result<()>
     let (launch_args, _) = normalize_terminal_agent_permission_aliases(Some(agent), launch_args);
     #[cfg(feature = "terminal-bridge")]
     {
-        crate::terminal_bridge::run_local_start_cli(agent, cwd.as_deref(), &launch_args)
+        crate::startup::terminal_bridge::run_local_start_cli(agent, cwd.as_deref(), &launch_args)
     }
     #[cfg(not(feature = "terminal-bridge"))]
     {
@@ -1044,34 +1345,5 @@ mod cli_alias_tests {
         assert_eq!(normalize_terminal_agent_name("CoDeX"), Some("codex"));
         assert_eq!(normalize_terminal_agent_name("claude"), Some("claude"));
         assert_eq!(normalize_terminal_agent_name("nope"), None);
-    }
-
-    #[test]
-    fn normalize_terminal_agent_permission_aliases_rewrites_claude_allow_flag() {
-        let args = vec![
-            "--allow-dangerously-skip-permissions".to_string(),
-            "--model".to_string(),
-            "sonnet".to_string(),
-        ];
-        let (normalized, rewrote) =
-            normalize_terminal_agent_permission_aliases(Some("claude"), args);
-        assert!(rewrote);
-        assert_eq!(
-            normalized,
-            vec![
-                "--dangerously-skip-permissions".to_string(),
-                "--model".to_string(),
-                "sonnet".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn normalize_terminal_agent_permission_aliases_leaves_other_agents_unchanged() {
-        let args = vec!["--allow-dangerously-skip-permissions".to_string()];
-        let (normalized, rewrote) =
-            normalize_terminal_agent_permission_aliases(Some("codex"), args.clone());
-        assert!(!rewrote);
-        assert_eq!(normalized, args);
     }
 }

@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The agent can move your app's view. Ask in the TUI or the web client ("show me what's waiting", "open the plan session") and it opens the session, brings the approval card up, shows the running work or focuses a pane, with a one-line note of what moved and why and a way back. Only the app you typed in moves; a move never answers an approval, sends, pairs or stops anything, and while you are typing it is only offered. New tool `client_view`, offered only on a turn sent from an app that can show it (on with `[client_gateway]`; turn off with the tool switch `client_view`).
+- The TUI and the web client are keyboard-first: Esc stops the session's work, `y`/`s`/`a`/`n` answer the card once it has been on screen long enough to read, one palette (Ctrl-P in the TUI, Ctrl/Cmd+K on the web) for sessions and commands, and a status line that always says whether the daemon is connected, reconnecting, not running or has signed the device out.
+
+### Changed
+
+- A long task no longer loses track of what it read when the model's context window fills. Each model request is now fitted by one budgeter: old tool results are replaced by a short note saying which call returned what (first and last line, size), and the model is told plainly when a result it has not seen yet was left out, so it asks for it again instead of guessing. Before, the oldest steps were dropped without a word (the model restarted the task) and a turn with many large results could still go over the window and fail. The budget follows the model's real token count as replies report it, and a provider saying a request was too long lowers the budget even for a model with a configured `model_budgets` entry.
+- The release binary includes the Docker execution backend: `execution-docker` is a default feature (it adds no dependencies), so `[execution] backend = "docker"` works without a custom build. Docker is still needed only when that backend is selected.
+- On Linux, `[terminal] confinement = "sandbox"` no longer fails when the Codex sandbox adapter is not installed: it confines commands with bubblewrap (`bwrap`) instead, with the same task-scoped read, write and network grants, and logs which sandbox it uses. With neither available the command is refused, never run on the host. `host` stays the default on every OS.
+
+### Dependencies updated
+
+- Every dependency moved to its latest semver-compatible release, and to its latest major: reqwest 0.13 (one HTTP client in the tree, rustls), sqlx 0.9 with libsqlite3-sys 0.37 (SQLCipher builds unchanged), rand 0.10 with the RustCrypto 0.11 generation (sha2, hmac, hkdf, aes-gcm, p256 0.14), tokio-tungstenite 0.30, toml 1.2 and toml_edit 0.25, self_update 1.3, sysinfo 0.40, dirs 7, croner 4, strum 0.28, dialoguer 0.12, base64 0.23, htmd 0.5, portable-pty 0.9, fastembed 7 (same AllMiniLM-L6-v2 model, so stored embeddings stay valid), chromiumoxide 0.9, keyring 4 (finds secrets saved by keyring 3), async-imap 0.12 and others. serde_yaml (deprecated) is replaced by serde-saphyr, read with YAML 1.2 scalars so config and scenario files parse as before. Digests, keys and signatures are byte-for-byte the same. Built and linted on Rust 1.99.
+
+### Added
+
+- **`aidaemon tui` and `aidaemon web`: the Client Gateway's clients with no flags.** `aidaemon tui` opens the terminal client on the gateway's own address; `aidaemon web` opens the web client in this machine's browser and pairs it (confirm in the terminal). Both use the local token saved at `~/.aidaemon/client-token` (owner-only), minted on first use; `aidaemon client-token` now saves it there instead of printing it (`--print` for scripts). With the gateway off they say how to turn it on. Ask the agent to "enable the client gateway" and `manage_config` does it in one approved step: `[client_gateway] enabled = true` plus the saved token, never shown in chat, then `/restart`. Any change to a `client_gateway` key now needs the owner's approval.
+
+- **Pair phones and browsers with the Client Gateway, and a web client.** `/pair_device` in a chat (or `aidaemon pair` at the terminal, which shows a QR code) makes a single-use code valid ten minutes; the device redeems it with its own P-256 key and you confirm in that chat (or terminal). Each connection signs a challenge for a 15-minute token carrying the device's scopes (observe, chat, approve) and, for a watch, a risk ceiling. `/devices` lists them; `/revoke_device <id>` ends a device's tokens and open connections at once. The gateway serves a small web client at `/client/v1/app`, built from TypeScript types generated from the protocol schema (`clients/web`); set `public_url` to your HTTPS tunnel so pairing links point there.
+
+- **`aidaemon-tui`, a terminal client for the Client Gateway.** Sessions from every chat, the chat with live status (and streaming when the gateway sends it), approval cards drawn from their typed facts with the same choices the chat offers, running work with cancel, `/stop` and slash commands; it reconnects by itself and resumes from its last event, resending unanswered commands under their original ids. `cargo run -p aidaemon-tui -- --token-file FILE`.
+
+- **Client Gateway (off by default).** `[client_gateway] enabled = true` serves the AIdaemon Client Protocol v1 on a loopback port (WebSocket `/client/v1/ws`, plus `POST /client/v1/commands` and the long-poll `GET /client/v1/events`) for the owner's own apps. An app's message runs on the same turn runner as the chat bots; every chat's turns show as client events; every approval card can be answered from the app, first answer wins (the chat's card then says who answered); clients resume from their last event without loss or duplicates, or get a snapshot. `aidaemon client-token` mints the local token. A non-loopback bind is refused.
+
+- **The SDK's shell is sandboxed by default on Linux too.** `aidaemon_tools::default_tools` (and `Shell::sandboxed`) run commands in bubblewrap on Linux, as they use seatbelt on macOS: the workspace is writable, the rest of the filesystem read-only, `/tmp` private, the network off unless allowed. Without a working `bwrap` the shell runs on the host and logs a one-time warning instead of pretending. Override with `default_tools_with_sandbox` or `AIDAEMON_SHELL_SANDBOX=auto|bubblewrap|seatbelt|local`; `Shell::deny_read` hides host paths from the contained backends. The bubblewrap backend's confinement tests now run for real on Linux CI. The daemon's `terminal` tool is unchanged (`[terminal] confinement = "host"` by default on every platform).
+
+- **A snapshot of the database before each upgrade.** The first time a new aidaemon version starts on an existing database, it writes a consistent, compacted copy (`VACUUM INTO`, encrypted with the same key) to `backups/` next to the database before any migration runs, and keeps the newest two (`[state] upgrade_backups`, `0` turns it off). Upgrading still needs no manual step: every schema change in this release is applied by the startup migrations.
+
+- **SQLite upkeep.** The query planner's statistics are refreshed after startup migrations and every six hours (`PRAGMA optimize`, bounded per index); a database that was never analyzed gets them on its first start. SDK users get the same through `aidaemon_store_sqlite::maintenance::{optimize, snapshot}`, and `SqliteStore::open` now applies the daemon's cache, mmap and temp-store settings and optimizes at open.
+
+- **Used-up quotas fall over to other providers at once.** A ChatGPT plan's usage limit, a Gemini daily quota, an account out of credit (OpenAI `insufficient_quota`, Anthropic "credit balance is too low") or a rejected key now skips that account's other models without sending them and moves to the next `[[provider.fallbacks]]` entry, instead of retrying each model with backoff (about 90 seconds on a capped ChatGPT plan). The account stays skipped by every caller until the quota's stated reset (a few minutes when none is stated). When every provider fails, the reply names the limit and when it resets instead of the last fallback's error.
+
+- **Swappable long-term memory.** Agent turns reach memory only through a memory plugin: recall is injected by a `before_model` hook, extraction and learning run at run end, and the plugin owns its tools. `[memory] backend = "sdk"` (with the `sdk-memory` cargo feature) uses the `aidaemon-memory` crate instead of the daemon's own memory (`remember` / `recall` tools, a separate SQLite file at `[memory] path`). Default `daemon`. Background memory jobs (consolidation, retention, people intelligence, `/memory`) still use the daemon store.
+
+### Changed
+
+- **Fewer dependencies.** Unused direct dependencies are gone (globset, htmd, ignore, llm_readability, sha1, zeroize), and once_cell, fd-lock and async-std are replaced by std and tokio equivalents: the single-instance lock uses std's file lock, the email trigger runs on the daemon's tokio runtime, and the Slack/Discord channels and terminal bridge share chromiumoxide's WebSocket stack. About 17 fewer third-party crates in the default build.
+
+- **Explicit memory search ranks one list.** `manage_memories` `search` now pools keyword and semantic candidates and orders them by one score: the reranker's, or reciprocal rank fusion without one. Keyword matches are weighted by how rare each word is, exact-key matches always come first, and results below the reranker's relevance floor are dropped. The floor (`Reranker::relevance_floor`, a `RelevanceFloor`) has a lower bar for candidates the keyword scorer also found than for semantic-only ones, since cross-encoders score keyword-list queries low even for the right fact; SDK rerankers have none by default, and the daemon's reranker sets provisional values from the new `reranker_floor_calibration` test. Multi-word phrase matches pin a fact only on whole consecutive words, at most five per search. "Related context" lists at most five facts, drawn only from the namespaces, people and family facts of the results actually shown, ranked against the query, and kept only when they score within the floor's gap of the best hit. Owner facts shown through their canonical projection remain semantically searchable. The header reports how many facts were shown and considered, and how many were relevant only when a floor judged them. SDK stores get this through `FactStore::search_facts` and `aidaemon_memory::search`; `search_facts_semantic` and `assemble_neighborhood` are removed.
+
+- **A tool must now explicitly signal that it has finished.** A phrase like "Moved to background" in its output no longer ends a run.
+
+- **A request that fails on the provider is queued again.** Since every turn moved to the SDK kernel, a turn that failed on the model provider before any tool ran was no longer queued for an automatic re-run. It is again, for a person's own request (not goal runs, sub-agents or automated triggers). After a plan's usage limit, the re-run waits until just after the stated reset, as long as that is within 12 hours, and the reply says when.
+
+- **A rejected key moves on to the fallback providers.** Authentication failures used to end the call; other configured providers are now tried.
+
+- **Recalled memory is its own system message.** Facts, episodes, the core profile and the critical-facts block moved out of the system prompt into one note placed after the per-task context, so the core prompt stays byte-stable across turns.
+- **`[state] daily_token_budget` is ignored** (logged once at startup). The SDK kernel never enforced it; per-goal daily budgets and `subagents.task_token_budget` still apply. Cap total spend with a provider spend limit.
+- **A scheduled run's per-check budget is its only token limit.** When a scheduled goal sets `budget_per_check`, `subagents.task_token_budget` no longer stacks on top of it, so the run budget's extension and alert decide when it stops. Without a per-check budget the task budget applies as before.
+- **The legacy loop's code is deleted** (about 37,000 lines): its phases, gates, forcing ladder, recovery builders and the tests that only exercised them. The replay-note learning channel, which only the dropped gates fed, is gone with them.
+- **Every agent turn runs on the aidaemon SDK kernel.** The legacy iteration loop is gone; turn setup (assessment, contract, prompt, tool filtering) is unchanged and the kernel drives model calls, tool dispatch and the ledger closeout. The `sdk-engine` cargo feature is removed, and `[agent.engine] kind` is accepted but ignored (logged once). Not carried over: the intent gate, pre-execution plan / critique / evidence gates, the reflection side call, the semantic read cache and guided `tool_choice` forcing.
+- **Plain reminders skip the agent.** `create_scheduled_goal` takes a typed `reminder` message; such a goal is active at once (no confirmation prompt, since it only messages you) and fires as "⏰ Reminder: …" instead of running a task lead and an executor.
+- **`set_reminder` tool.** A plain reminder takes two required fields, `message` and `when`, instead of an action inside the 24-action `manage_memories` (where cheaper models picked the wrong action or dropped the schedule).
+- **Browser navigation shows the page.** `navigate` and `new_tab` return a short text preview, so the agent no longer needs a `get_text` or a screenshot (which was also posted to the chat) after every page it opens.
+- **Edit backups leave your folders alone.** `write_file`/`edit_file` keep their one-per-file backup under `~/.aidaemon/file-backups/` on the local backend instead of writing `<file>.bak` beside it.
+
+### Fixed
+
+- **Background fact extraction stores only what the user stated.** Each extracted fact must carry the user's stance and a verbatim quote from the user's message; a question ("do you know what kind of boat I own?") no longer becomes a stored fact, and facts the agent already saved during the turn are not stored a second time under another key.
+
+- **Saving a fact into a large category is fast again.** The key-similarity check embedded every stored key in the category on each write, about 9 seconds with 1,500 project facts. Each stored key's vector is now computed once and kept with the fact (removed with it by retention), so later writes embed only the new key. Each write also re-projected every fact in its category, superseded rows included, into the claim index; it now projects only the rows that write changed.
+
+- **"Database is locked" when tagging the identity of a user message.** The annotation takes the write lock before reading, so a concurrent commit no longer fails it instantly.
+
+- **"Database is locked" under concurrent writes.** 38 write transactions began deferred; under WAL one that reads before it writes fails at once when another connection commits first, and the busy timeout cannot help. Every write transaction now takes the write lock when it begins (`BEGIN IMMEDIATE`), and a test rejects a new deferred one. In a contention benchmark with eight writers, deferred transactions lost 85% of their commits and immediate ones none.
+
+- **Faster memory recall.** Fact recall over 4,000 facts went from 178 ms to 39 ms (p95 241 ms to 43 ms): decoded embedding vectors stay in memory until the table changes (tracked by a trigger-maintained counter, so writes from anywhere invalidate them), the per-hit lookups that ran one query per fact are batched, and recall no longer loads every fact's embedding blob. The counter and triggers are created by the startup migration.
+
+- **SDK turns keep the legacy tool boundary.** Behavior the old dispatcher owned is back on every turn:
+  - Untrusted tool output (web, MCP, terminal, channel history) is wrapped as data and sanitized again before the model sees it, and an oversized result is paged, spilled to a file, or compressed to the per-model cap.
+  - A call without a directory runs in the request's project directory (a scheduled goal's bound workspace), not the daemon's cwd.
+  - The controller refuses protected host data and undeclared writes outside the task boundary, and an exact out-of-scope terminal target goes to the approval prompt.
+  - Tools run under the configured call timeout.
+  - A tool that returns an error, and a call the kernel refuses itself (unknown tool, invalid arguments, the same-tool limit), now leave a typed receipt in the run ledger.
+  - A `computer_use` loop's pinned vision model serves the rest of its task, and a GUI success claim waits for a look after an unverified coordinate click.
+- **Task outcomes follow receipts.** A run with no contract whose operations all failed is recorded as failed, and a run that owed work but ran nothing is failed rather than partial. Before, both could read as succeeded or partial.
+- **Budget pressure is visible again.** A task or scheduled run gets one warning at 80% of its token budget before it is stopped.
+- **Finished checklists don't come back.** Advisory checklist steps are closed when the run completes, so a restart no longer pauses the plan and asks to resume finished work.
+- **Mandate reviews end on their decision.** A committed WAIT, ASK or STOP ends the review without another model call, and an exhausted cycle balance closes from that decision (or a bounded WAIT) instead of failing as a provider error.
+- **Stopped runs reply in plain language.** A run that hits a limit, gets stuck or loses the provider no longer shows internal debug text; its reply is sanitized, provider errors are redacted, and secrets are filtered on public channels.
+- **Learning sees failures again.** Tool errors and the recoveries that follow feed error solutions and failure patterns; failed model calls are recorded in telemetry; token estimates are calibrated; a provider blip before any work gets the longer retry ladder; and a reply cut off while thinking lowers reasoning effort for the next call.
+- **`web_fetch` keeps listing pages whole.** On download and release pages readability kept a side section (python.org: "verify your download") and dropped the release list, so the agent reported an older version as current. A short extract cut from a large page now returns the whole page text.
+- **A silent model no longer replaces a real answer with "I completed N actions."** When the closeout sends a correct final answer back for more work and the model then replies with nothing, that answer ships instead of a generic activity summary.
+- **Folder-scoped checklist steps close.** A write or read inside a folder the checklist named now counts for that folder.
+- **Cancelling a goal's last schedule cancels the goal**, and `list_scheduled` shows active goals that have no schedule (they never run) so they can be cancelled.
+- **Read-only requests can use the terminal again.** The authority check judged `terminal` as a whole (not read-only) and refused even a plain `find`; it now judges each call, and the terminal still enforces read-only itself.
+- **Recall of earlier work works with models that fill every field.** Optional tool arguments left as `""` or `[]` are dropped before dispatch, so `search_history` no longer filters on an empty session and `create_scheduled_goal` no longer loses `schedule` behind an empty `schedules`.
+- **An inspection step is not reopened by the edit built on it.** A checklist observation that a later item depends on is no longer invalidated by that item's changes, so "inspect → edit → verify" turns stop looping on an impossible pre-edit inspection.
+- **Background jobs hand off in plain language**, and a small text result file is quoted in its delivery caption.
+- **Scheduled-run cards show the outcome**, not the "Goal completed:" label.
+- **`/model` leads the task assessment** as well as the turn.
+- **Telegram:** inline code inside bold, italic or link text no longer shows literal backticks.
+
+### Security
+
+- **MCP servers no longer receive session, role or channel details in tool arguments.**
+- **An MCP server's own hints (read-only, closed-world) no longer relax any safety check.**
+
 ## [0.12.9] - 2026-10-22
 
 ### Fixed

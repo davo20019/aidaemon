@@ -1,0 +1,70 @@
+{
+  "description": "An event type this client does not know changes nothing but its seq; unknown fields are ignored.",
+  "frames": [
+    {
+      "at_ms": 1767225601000,
+      "event": {
+        "mood": "curious",
+        "origin": "app",
+        "session_id": "app:s1",
+        "text": "hello",
+        "type": "user_message"
+      },
+      "seq": 1,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225602000,
+      "event": {
+        "payload": {
+          "x": 1
+        },
+        "type": "from_the_future"
+      },
+      "seq": 2,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 3,
+      "event": {
+        "session_id": "app:s1",
+        "text": "still here",
+        "type": "assistant_message"
+      },
+      "later": true,
+      "seq": 3,
+      "type": "event"
+    }
+  ],
+  "state": {
+    "approvals": {},
+    "last_seq": 3,
+    "notice": null,
+    "order": [
+      "app:s1"
+    ],
+    "sessions": {
+      "app:s1": {
+        "lines": [
+          {
+            "at_ms": 1767225601000,
+            "kind": "user",
+            "origin": "app",
+            "text": "hello"
+          },
+          {
+            "at_ms": 3,
+            "kind": "assistant",
+            "text": "still here"
+          }
+        ],
+        "live": null,
+        "summary": null
+      }
+    },
+    "tasks": {},
+    "view_request": null
+  }
+}

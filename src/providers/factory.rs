@@ -5,17 +5,19 @@ use tracing::{info, warn};
 use crate::config::{AppConfig, ProviderConfig, ProviderKind};
 use crate::llm_runtime::ProviderRuntimeTarget;
 use crate::router::Router;
-use crate::traits::ModelProvider;
+
+use super::sdk_backed::ModelList;
 
 pub(crate) struct ProviderRouterBundle {
-    pub provider: Arc<dyn ModelProvider>,
+    pub provider: crate::llm_runtime::ModelBackend,
+    pub models: ModelList,
     pub primary_model: String,
     pub router: Option<Router>,
     pub provider_kind: ProviderKind,
     pub failover_targets: Vec<ProviderRuntimeTarget>,
 }
 
-const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+use aidaemon_providers::OPENAI_DEFAULT_BASE_URL;
 
 fn provider_specific_base_url_override(config: &ProviderConfig) -> Option<&str> {
     let trimmed = config.base_url.trim();
@@ -26,50 +28,169 @@ fn provider_specific_base_url_override(config: &ProviderConfig) -> Option<&str> 
     }
 }
 
-fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRuntimeTarget> {
-    let provider_base_override = provider_specific_base_url_override(config);
+/// The daemon's ChatGPT OAuth state as the SDK backend's credentials: the
+/// process-wide manager serializes refresh-token rotation across every
+/// subscription-backed adapter.
+struct DaemonChatGptAuth {
+    manager: Arc<crate::providers::chatgpt_login::ChatGptCredentialManager>,
+    client: reqwest::Client,
+}
 
-    let provider: Arc<dyn ModelProvider> = match config.kind {
-        ProviderKind::OpenaiCompatible => Arc::new(
-            super::OpenAiCompatibleProvider::new_with_all_options(
-                &config.base_url,
-                &config.api_key,
-                config.gateway_token.as_deref(),
-                config.extra_headers.clone(),
-                config.max_tokens,
-            )
-            .map_err(|error| anyhow::anyhow!("{error}"))?
-            .with_reasoning_effort(config.reasoning_effort.clone())
-            .with_llama_cpp_thinking(config.llama_cpp_thinking)
-            .with_slot_routing(config.slot_routing.clone())
-            .with_streaming(config.streaming)
-            .with_structured_answer_models(config.structured_answer_models.clone()),
-        ),
-        ProviderKind::XaiNative => Arc::new(
-            super::XaiNativeProvider::new_with_options(
-                &config.api_key,
-                provider_base_override,
-                config.max_tokens,
-                config.extra_headers.clone(),
-            )
-            .map_err(|error| anyhow::anyhow!("{error}"))?,
-        ),
-        ProviderKind::GoogleGenai => {
-            Arc::new(super::GoogleGenAiProvider::new_with_base_url_and_headers(
-                &config.api_key,
-                provider_base_override,
-                config.extra_headers.clone(),
-            ))
+#[async_trait::async_trait]
+impl aidaemon_providers::ChatGptAuth for DaemonChatGptAuth {
+    async fn credentials(&self) -> Result<aidaemon_providers::ChatGptCredentials, String> {
+        self.manager
+            .usable_credentials(&self.client)
+            .await
+            .map(sdk_credentials)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn refresh_after_rejection(
+        &self,
+        rejected_token: &str,
+    ) -> Result<aidaemon_providers::ChatGptCredentials, String> {
+        self.manager
+            .refresh_after_rejection(&self.client, rejected_token)
+            .await
+            .map(sdk_credentials)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn mark_rejected(&self, token: &str, detail: &str) {
+        self.manager.mark_rejected(token, detail).await;
+    }
+}
+
+fn sdk_credentials(
+    credentials: crate::providers::chatgpt_login::ChatGptCredentials,
+) -> aidaemon_providers::ChatGptCredentials {
+    aidaemon_providers::ChatGptCredentials {
+        access_token: credentials.access_token,
+        account_id: credentials.account_id,
+    }
+}
+
+/// The ChatGPT-subscription backend on the daemon's OAuth login.
+pub(crate) fn chatgpt_backend(
+    base_override: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> anyhow::Result<aidaemon_providers::ChatGpt> {
+    let client =
+        super::build_http_client(std::time::Duration::from_secs(60)).map_err(anyhow::Error::msg)?;
+    let mut builder = aidaemon_providers::ChatGpt::builder()
+        .base_url(base_override.unwrap_or(crate::providers::chatgpt_login::CODEX_BACKEND_BASE_URL))
+        .auth(DaemonChatGptAuth {
+            manager: crate::providers::chatgpt_login::shared_credential_manager(),
+            client,
+        });
+    if let Some(effort) = reasoning_effort {
+        builder = builder.reasoning_effort(effort);
+    }
+    builder.build().map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+/// The configured models, for backends whose API the daemon does not list.
+fn configured_models(config: &ProviderConfig) -> Vec<String> {
+    let models = &config.models;
+    let mut out = vec![
+        models.primary.clone(),
+        models.fast.clone(),
+        models.smart.clone(),
+    ];
+    out.retain(|model| !model.is_empty());
+    out.dedup();
+    out
+}
+
+/// The SDK backend for `config`'s kind (behind a [`aidaemon_core::QuotaGuard`]),
+/// and how its models are listed.
+pub(crate) fn build_provider(
+    config: &ProviderConfig,
+) -> anyhow::Result<(crate::llm_runtime::ModelBackend, ModelList)> {
+    use aidaemon_providers as backends;
+    let config_error = |error: backends::ConfigError| anyhow::anyhow!("{error}");
+    let base_override = provider_specific_base_url_override(config);
+    let headers = config.extra_headers.clone().unwrap_or_default();
+    let mut models = ModelList::Fixed(configured_models(config));
+    let backend: Arc<dyn aidaemon_core::Provider> = match config.kind {
+        ProviderKind::OpenaiCompatible => {
+            if config.llama_cpp_thinking
+                || config.slot_routing.enabled
+                || !config.structured_answer_models.is_empty()
+            {
+                warn!(
+                    "llama_cpp_thinking, slot_routing and structured_answer_models are no \
+                     longer supported and are ignored"
+                );
+            }
+            let mut builder = backends::OpenAiCompatible::builder()
+                .base_url(&config.base_url)
+                .api_key(&config.api_key)
+                .timeout(std::time::Duration::from_secs(360));
+            if let Some(token) = config.gateway_token.as_deref().filter(|t| !t.is_empty()) {
+                builder = builder.header("cf-aig-authorization", format!("Bearer {token}"));
+            }
+            for (name, value) in &headers {
+                builder = builder.header(name, value);
+            }
+            if let Some(max) = config.max_tokens {
+                builder = builder.max_tokens(max);
+            }
+            if let Some(effort) = &config.reasoning_effort {
+                builder = builder.reasoning_effort(effort);
+            }
+            models = ModelList::OpenAiModels {
+                base_url: config.base_url.clone(),
+                api_key: Some(config.api_key.clone()).filter(|key| !key.is_empty()),
+            };
+            Arc::new(builder.build().map_err(config_error)?)
         }
-        ProviderKind::Anthropic => Arc::new(
-            super::AnthropicNativeProvider::new_with_options(
-                &config.api_key,
-                provider_base_override,
-                config.max_tokens,
-                config.extra_headers.clone(),
-            )
-            .with_reasoning_effort(config.reasoning_effort.clone()),
-        ),
+        ProviderKind::XaiNative => {
+            let mut builder = backends::Xai::builder()
+                .api_key(&config.api_key)
+                .timeout(std::time::Duration::from_secs(120));
+            if let Some(base) = base_override {
+                builder = builder.base_url(base);
+            }
+            for (name, value) in &headers {
+                builder = builder.header(name, value);
+            }
+            if let Some(max) = config.max_tokens {
+                builder = builder.max_tokens(max);
+            }
+            Arc::new(builder.build().map_err(config_error)?)
+        }
+        ProviderKind::GoogleGenai => {
+            let mut builder = backends::GoogleGenai::builder()
+                .api_key(&config.api_key)
+                .timeout(std::time::Duration::from_secs(360));
+            if let Some(base) = base_override {
+                builder = builder.base_url(base);
+            }
+            for (name, value) in &headers {
+                builder = builder.header(name, value);
+            }
+            Arc::new(builder.build().map_err(config_error)?)
+        }
+        ProviderKind::Anthropic => {
+            let mut builder = backends::Anthropic::builder()
+                .api_key(&config.api_key)
+                .timeout(std::time::Duration::from_secs(360));
+            if let Some(base) = base_override {
+                builder = builder.base_url(base);
+            }
+            for (name, value) in &headers {
+                builder = builder.header(name, value);
+            }
+            if let Some(max) = config.max_tokens {
+                builder = builder.max_tokens(max);
+            }
+            if let Some(effort) = &config.reasoning_effort {
+                builder = builder.reasoning_effort(effort);
+            }
+            Arc::new(builder.build().map_err(config_error)?)
+        }
         ProviderKind::OpenaiChatgpt => {
             if config.max_tokens.is_some() {
                 warn!(
@@ -77,33 +198,68 @@ fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRunt
                      the Codex backend accepts no output cap"
                 );
             }
-            Arc::new(
-                super::OpenAiChatGptProvider::new(provider_base_override)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?
-                    .with_reasoning_effort(config.reasoning_effort.clone()),
-            )
+            models = ModelList::Fixed(
+                backends::CHATGPT_KNOWN_MODELS
+                    .iter()
+                    .map(|model| model.to_string())
+                    .collect(),
+            );
+            Arc::new(chatgpt_backend(
+                base_override,
+                config.reasoning_effort.as_deref(),
+            )?)
         }
     };
+    // One guard per configured account: once the account's quota, credit
+    // or credential fails, every caller skips it until that can have
+    // changed, instead of sending each model and waiting out its retries.
+    let backend: Arc<dyn aidaemon_core::Provider> =
+        Arc::new(aidaemon_core::QuotaGuard::from_arc(backend));
+    Ok((backend, models))
+}
+
+fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRuntimeTarget> {
+    let (provider, models) = build_provider(config)?;
 
     let router = Router::new(config.models.clone());
     let primary_model = router.default_model().to_string();
     let router = (!router.is_uniform()).then_some(router);
 
-    Ok(ProviderRuntimeTarget::new(
-        provider,
-        router,
-        config.kind,
-        primary_model,
-    ))
+    Ok(
+        ProviderRuntimeTarget::new(provider, router, config.kind, primary_model)
+            .with_models(models),
+    )
 }
 
 pub(crate) fn build_provider_router(config: &AppConfig) -> anyhow::Result<ProviderRouterBundle> {
     let primary_target = build_provider_target(&config.provider)?;
+    // A hosted fallback that needs an API key and has none yet (added to the
+    // config, key to come from `/setkey`) is left out of the chain instead
+    // of stopping the daemon; the primary still must build.
     let failover_targets = config
         .provider
         .fallbacks
         .iter()
-        .map(build_provider_target)
+        .enumerate()
+        .filter(|(index, fallback)| {
+            // Local OpenAI-compatible servers need no key; ChatGPT uses OAuth.
+            let keyless = fallback.api_key.trim().is_empty()
+                && matches!(
+                    fallback.kind,
+                    crate::config::ProviderKind::GoogleGenai
+                        | crate::config::ProviderKind::Anthropic
+                        | crate::config::ProviderKind::XaiNative
+                );
+            if keyless {
+                tracing::warn!(
+                    fallback = index,
+                    kind = ?fallback.kind,
+                    "fallback provider has no API key yet; left out of the failover chain"
+                );
+            }
+            !keyless
+        })
+        .map(|(_, fallback)| build_provider_target(fallback))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     let primary_router = primary_target.router();
@@ -120,9 +276,60 @@ pub(crate) fn build_provider_router(config: &AppConfig) -> anyhow::Result<Provid
 
     Ok(ProviderRouterBundle {
         provider: primary_target.provider(),
+        models: primary_target.models().clone(),
         primary_model,
         router: primary_router,
         provider_kind: primary_target.provider_kind(),
         failover_targets,
     })
+}
+
+#[cfg(test)]
+mod keyless_fallback_tests {
+    use super::*;
+
+    fn config(text: &str) -> AppConfig {
+        let mut config: AppConfig = toml::from_str(text).unwrap();
+        config.provider.apply_model_defaults_recursive();
+        config
+    }
+
+    #[test]
+    fn a_gemini_fallback_without_a_key_is_skipped_not_fatal() {
+        let config = config(
+            r#"
+            [provider]
+            api_key = "synthetic-primary-key"
+            [[provider.fallbacks]]
+            kind = "google_genai"
+            api_key = ""
+            [[provider.fallbacks]]
+            kind = "openai_compatible"
+            base_url = "http://localhost:11434/v1"
+            api_key = ""
+            [provider.fallbacks.models]
+            default = "local-model"
+            "#,
+        );
+        let bundle = build_provider_router(&config).expect("the daemon still starts");
+        // The keyless Gemini entry is left out; the keyless local server stays.
+        assert_eq!(bundle.failover_targets.len(), 1);
+    }
+
+    #[test]
+    fn decisions_reuse_the_gemini_fallback_key() {
+        let config = config(
+            r#"
+            [provider]
+            api_key = "synthetic-primary-key"
+            [[provider.fallbacks]]
+            kind = "google_genai"
+            api_key = "synthetic-gemini-key"
+            "#,
+        );
+        assert_eq!(
+            config.gemini_provider_api_key().as_deref(),
+            Some("synthetic-gemini-key")
+        );
+    }
 }

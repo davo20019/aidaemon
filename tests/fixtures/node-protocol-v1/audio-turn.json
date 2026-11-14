@@ -1,0 +1,8 @@
+{
+  "input_kind": "audio",
+  "request_id": "req_fixture_audio_001",
+  "content_type": "audio/wav",
+  "size_bytes": 128044,
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "duration_ms": 4000
+}

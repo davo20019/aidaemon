@@ -1,0 +1,11 @@
+{
+  "access_token": "acs_synthetic",
+  "device_id": "dv-1",
+  "expires_at_ms": 1767226500000,
+  "risk_ceiling": "medium",
+  "scopes": [
+    "observe",
+    "chat",
+    "approve"
+  ]
+}

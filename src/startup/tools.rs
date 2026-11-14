@@ -8,12 +8,10 @@ use tracing::info;
 use crate::config::AppConfig;
 use crate::events::EventStore;
 use crate::health::HealthProbeStore;
-use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
 use crate::nodes::tool::{
     ManageNodeMonitorsTool, ReadNodeHealthTool, ReadNodeSensorsTool, SendNodeAudioTool,
 };
-use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 #[cfg(feature = "browser")]
 use crate::tools::BrowserTool;
@@ -21,18 +19,17 @@ use crate::tools::BrowserTool;
 use crate::tools::ComputerUseTool;
 #[cfg(feature = "slack")]
 use crate::tools::ReadChannelHistoryTool;
+use crate::tools::terminal::ApprovalRequest;
 use crate::tools::{
     CheckEnvironmentTool, CliAgentTool, ConfigManagerTool, DiagnoseTool, EditFileTool,
-    GenerateImageTool, GitCommitTool, GitInfoTool, GoalTraceTool, HealthProbeTool, HttpRequestTool,
-    ListCheckpointsTool, ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool,
-    ManageMandatesTool, ManageMcpTool, ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool,
-    PolicyMetricsTool, ProjectInspectTool, ReadFileTool, RememberFactTool, RunCommandTool,
-    ScheduledGoalRunsTool, SearchFilesTool, SearchHistoryTool, SendFileTool, ServiceStatusTool,
-    ShareMemoryTool, SpawnAgentTool, SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    GenerateImageTool, GoalTraceTool, HealthProbeTool, HttpRequestTool, ListCheckpointsTool,
+    ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool, ManageMandatesTool, ManageMcpTool,
+    ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool, PolicyMetricsTool, ReadFileTool,
+    RememberFactTool, SearchFilesTool, SearchHistoryTool, SendFileTool, SpawnAgentTool,
+    SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
-use crate::traits::store_prelude::*;
 use crate::traits::Tool;
+use crate::traits::store_prelude::*;
 use crate::types::MediaMessage;
 use sqlx::SqlitePool;
 
@@ -44,7 +41,6 @@ use sqlx::SqlitePool;
 /// this point.
 pub struct ToolSetup {
     pub tools: Vec<Arc<dyn Tool>>,
-    pub execution_backend: crate::execution::SharedExecutionBackend,
     pub approval_tx: ApprovalBroker,
     pub approval_rx: mpsc::Receiver<ApprovalRequest>,
     pub media_rx: mpsc::Receiver<MediaMessage>,
@@ -63,11 +59,22 @@ pub struct ToolSetup {
 /// not the concrete persistence implementation. This keeps SQLite-specific
 /// construction inside `startup::stores` while still allowing infrastructure
 /// tools to use the pool directly where their APIs require it.
+/// How tools reach the daemon's own memory.
+#[derive(Clone)]
+pub struct ToolMemoryAccess {
+    pub store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
+    /// False when another memory system replaced the daemon's. Its tools are
+    /// hidden then, and tools outside memory stop reading the daemon's store.
+    pub own_memory: bool,
+}
+
 pub struct ToolSetupDependencies {
+    pub execution_backend: crate::execution::SharedExecutionBackend,
     pub state: Arc<dyn StateStore>,
+    pub memory: ToolMemoryAccess,
     pub pool: SqlitePool,
     pub event_store: Arc<EventStore>,
-    pub llm_runtime: SharedLlmRuntime,
+    pub side_calls: crate::llm_runtime::gateway::SideCallGateway,
     pub health_store: Option<Arc<HealthProbeStore>>,
     pub approval_capacity: usize,
     pub media_capacity: usize,
@@ -81,20 +88,22 @@ pub struct ToolSetupDependencies {
 pub async fn setup_tools(
     config: &AppConfig,
     config_path: &Path,
+    daemon_paths: crate::tools::DaemonPaths,
     dependencies: ToolSetupDependencies,
 ) -> anyhow::Result<ToolSetup> {
     let ToolSetupDependencies {
+        execution_backend,
         state,
+        memory,
         pool,
         event_store,
-        llm_runtime,
+        side_calls,
         health_store,
         approval_capacity,
         media_capacity,
     } = dependencies;
     let BaseToolsBundle {
         mut tools,
-        execution_backend,
         approval_tx,
         approval_rx,
         media_tx,
@@ -103,16 +112,21 @@ pub async fn setup_tools(
     } = build_base_tools(
         config,
         config_path.to_path_buf(),
+        daemon_paths,
+        execution_backend.clone(),
         state.clone(),
+        memory.clone(),
         pool.clone(),
         event_store.clone(),
         approval_capacity,
         media_capacity,
+        health_store.clone(),
     )
     .await?;
 
     if let Some(terminal) = &terminal_tool {
-        terminal.set_command_risk_runtime(llm_runtime.clone());
+        terminal.set_side_calls(side_calls);
+        crate::startup::trust_all::publish(terminal.clone());
     }
 
     let OptionalToolsOutcome {
@@ -123,12 +137,12 @@ pub async fn setup_tools(
         &mut tools,
         config,
         state.clone(),
+        memory.clone(),
         pool.clone(),
         event_store,
-        llm_runtime.clone(),
         health_store,
-        approval_tx.clone(),
         media_tx.clone(),
+        execution_backend.clone(),
     )
     .await?;
 
@@ -146,7 +160,6 @@ pub async fn setup_tools(
         http_profiles.clone(),
         state.clone() as Arc<dyn crate::traits::SkillsStore>,
         &mut tools,
-        approval_tx.clone(),
     )
     .await?;
 
@@ -159,11 +172,15 @@ pub async fn setup_tools(
         config_path,
         http_profiles,
         state,
+        memory.clone(),
         mcp_registry.clone(),
-        approval_tx.clone(),
     )
     .await?;
 
+    aidaemon_runtime::tool_manifest::check_declared(
+        &tools,
+        aidaemon_runtime::tool_manifest::ToolContext::Global,
+    );
     for tool in &tools {
         info!(
             name = tool.name(),
@@ -174,7 +191,6 @@ pub async fn setup_tools(
 
     Ok(ToolSetup {
         tools,
-        execution_backend,
         approval_tx,
         approval_rx,
         media_rx,
@@ -190,7 +206,6 @@ pub async fn setup_tools(
 
 pub struct BaseToolsBundle {
     pub tools: Vec<Arc<dyn Tool>>,
-    pub execution_backend: crate::execution::SharedExecutionBackend,
     pub approval_tx: ApprovalBroker,
     pub approval_rx: mpsc::Receiver<ApprovalRequest>,
     pub media_tx: mpsc::Sender<MediaMessage>,
@@ -214,14 +229,12 @@ enum BaseToolId {
     SystemInfo,
     Terminal,
     RememberFact,
-    ShareMemory,
     ManageMemories,
+    SetReminder,
+    ScheduleTask,
     ManageMandates,
+    ManageAutomations,
     SearchHistory,
-    ScheduledGoalRuns,
-    GoalTrace,
-    ToolTrace,
-    PolicyMetrics,
     ConfigManager,
     WebFetch,
     WebSearch,
@@ -229,12 +242,7 @@ enum BaseToolId {
     WriteFile,
     EditFile,
     SearchFiles,
-    ProjectInspect,
-    RunCommand,
-    GitInfo,
-    GitCommit,
     CheckEnvironment,
-    ServiceStatus,
 }
 
 struct BaseToolSpec {
@@ -256,36 +264,28 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
         name: "remember_fact",
     },
     BaseToolSpec {
-        id: BaseToolId::ShareMemory,
-        name: "share_memory",
-    },
-    BaseToolSpec {
         id: BaseToolId::ManageMemories,
         name: "manage_memories",
+    },
+    BaseToolSpec {
+        id: BaseToolId::SetReminder,
+        name: "set_reminder",
+    },
+    BaseToolSpec {
+        id: BaseToolId::ScheduleTask,
+        name: "schedule_task",
     },
     BaseToolSpec {
         id: BaseToolId::ManageMandates,
         name: "manage_mandates",
     },
     BaseToolSpec {
+        id: BaseToolId::ManageAutomations,
+        name: "manage_automations",
+    },
+    BaseToolSpec {
         id: BaseToolId::SearchHistory,
         name: "search_history",
-    },
-    BaseToolSpec {
-        id: BaseToolId::ScheduledGoalRuns,
-        name: "scheduled_goal_runs",
-    },
-    BaseToolSpec {
-        id: BaseToolId::GoalTrace,
-        name: "goal_trace",
-    },
-    BaseToolSpec {
-        id: BaseToolId::ToolTrace,
-        name: "tool_trace",
-    },
-    BaseToolSpec {
-        id: BaseToolId::PolicyMetrics,
-        name: "policy_metrics",
     },
     BaseToolSpec {
         id: BaseToolId::ConfigManager,
@@ -316,37 +316,20 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
         name: "search_files",
     },
     BaseToolSpec {
-        id: BaseToolId::ProjectInspect,
-        name: "project_inspect",
-    },
-    BaseToolSpec {
-        id: BaseToolId::RunCommand,
-        name: "run_command",
-    },
-    BaseToolSpec {
-        id: BaseToolId::GitInfo,
-        name: "git_info",
-    },
-    BaseToolSpec {
-        id: BaseToolId::GitCommit,
-        name: "git_commit",
-    },
-    BaseToolSpec {
         id: BaseToolId::CheckEnvironment,
         name: "check_environment",
-    },
-    BaseToolSpec {
-        id: BaseToolId::ServiceStatus,
-        name: "service_status",
     },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumCount, strum::EnumIter)]
 enum OptionalToolId {
     Diagnose,
+    GoalTrace,
+    PolicyMetrics,
     NodeHealth,
     NodeSensors,
     NodeAudio,
+    NodeRestart,
     NodeMonitoring,
     #[cfg(feature = "browser")]
     Browser,
@@ -356,6 +339,7 @@ enum OptionalToolId {
     SendFile,
     CliAgents,
     HealthProbe,
+    ClientView,
     #[cfg(feature = "slack")]
     SlackChannelHistory,
 }
@@ -380,6 +364,10 @@ fn optional_enabled_node_audio(config: &AppConfig) -> bool {
         && config.nodes.speech.enabled
 }
 
+fn optional_enabled_node_restart(config: &AppConfig) -> bool {
+    config.nodes.gateway.enabled
+}
+
 fn optional_enabled_node_monitoring(config: &AppConfig) -> bool {
     config.nodes.gateway.enabled && config.nodes.monitoring.enabled
 }
@@ -402,6 +390,10 @@ fn optional_enabled_cli_agents(config: &AppConfig) -> bool {
     config.cli_agents.enabled
 }
 
+fn optional_enabled_client_gateway(config: &AppConfig) -> bool {
+    config.client_gateway.enabled
+}
+
 fn optional_enabled_always(_: &AppConfig) -> bool {
     true
 }
@@ -409,7 +401,17 @@ fn optional_enabled_always(_: &AppConfig) -> bool {
 const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
     OptionalToolSpec {
         id: OptionalToolId::Diagnose,
-        name: "diagnose",
+        name: "self_diagnose",
+        enabled_if: optional_enabled_diagnostics,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::GoalTrace,
+        name: "goal_trace",
+        enabled_if: optional_enabled_diagnostics,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::PolicyMetrics,
+        name: "policy_metrics",
         enabled_if: optional_enabled_diagnostics,
     },
     OptionalToolSpec {
@@ -426,6 +428,11 @@ const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
         id: OptionalToolId::NodeAudio,
         name: "send_node_audio",
         enabled_if: optional_enabled_node_audio,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::NodeRestart,
+        name: "node_restart",
+        enabled_if: optional_enabled_node_restart,
     },
     OptionalToolSpec {
         id: OptionalToolId::NodeMonitoring,
@@ -464,6 +471,11 @@ const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
         name: "health_probe",
         enabled_if: optional_enabled_always,
     },
+    OptionalToolSpec {
+        id: OptionalToolId::ClientView,
+        name: "client_view",
+        enabled_if: optional_enabled_client_gateway,
+    },
     #[cfg(feature = "slack")]
     OptionalToolSpec {
         id: OptionalToolId::SlackChannelHistory,
@@ -477,8 +489,7 @@ enum RuntimeToolId {
     ManageMcp,
     ManagePeople,
     HttpRequest,
-    ManageHttpAuth,
-    ManageOauth,
+    ManageAuth,
     ManageApi,
     SpawnAgent,
 }
@@ -526,14 +537,8 @@ const RUNTIME_TOOL_MANIFEST: &[RuntimeToolSpec] = &[
         depends_on: &[],
     },
     RuntimeToolSpec {
-        id: RuntimeToolId::ManageHttpAuth,
-        name: "manage_http_auth",
-        enabled_if: runtime_enabled_always,
-        depends_on: &[RuntimeToolId::HttpRequest],
-    },
-    RuntimeToolSpec {
-        id: RuntimeToolId::ManageOauth,
-        name: "manage_oauth",
+        id: RuntimeToolId::ManageAuth,
+        name: "manage_auth",
         enabled_if: runtime_enabled_oauth,
         depends_on: &[RuntimeToolId::HttpRequest],
     },
@@ -541,7 +546,7 @@ const RUNTIME_TOOL_MANIFEST: &[RuntimeToolSpec] = &[
         id: RuntimeToolId::ManageApi,
         name: "manage_api",
         enabled_if: runtime_enabled_always,
-        depends_on: &[RuntimeToolId::HttpRequest, RuntimeToolId::ManageOauth],
+        depends_on: &[RuntimeToolId::HttpRequest, RuntimeToolId::ManageAuth],
     },
     RuntimeToolSpec {
         id: RuntimeToolId::SpawnAgent,
@@ -598,26 +603,21 @@ fn validate_runtime_manifest(manifest: &[RuntimeToolSpec]) -> anyhow::Result<()>
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn build_base_tools(
     config: &AppConfig,
     config_path: PathBuf,
+    daemon_paths: crate::tools::DaemonPaths,
+    execution_backend: crate::execution::SharedExecutionBackend,
     state: Arc<dyn StateStore>,
+    memory: ToolMemoryAccess,
     pool: SqlitePool,
     event_store: Arc<EventStore>,
     approval_queue_capacity: usize,
     media_queue_capacity: usize,
+    health_store: Option<Arc<HealthProbeStore>>,
 ) -> anyhow::Result<BaseToolsBundle> {
-    let execution_backend = crate::execution::install_execution_backend(
-        crate::execution::build_execution_backend(&config.execution, &config_path).await?,
-    )?;
-    info!(
-        backend = execution_backend.kind().as_str(),
-        backend_id = execution_backend.id(),
-        workspace = execution_backend.workspace_root().as_str(),
-        confined = !execution_backend.allows_outside_workspace(),
-        "Initialized agent execution environment"
-    );
-    let checkpoint_manager = crate::checkpoints::install_manager(
+    let checkpoint_manager = aidaemon_tools::checkpoints::install_manager(
         &config.checkpoints,
         pool.clone(),
         event_store.clone(),
@@ -642,12 +642,16 @@ pub async fn build_base_tools(
         }
         let built = build_base_tool(
             spec.id,
+            execution_backend.clone(),
+            daemon_paths.clone(),
             config,
             &config_path,
             state.clone(),
+            memory.clone(),
             pool.clone(),
             event_store.clone(),
             approval_tx.clone(),
+            health_store.clone(),
         )
         .await?;
         info!(
@@ -666,7 +670,6 @@ pub async fn build_base_tools(
 
     Ok(BaseToolsBundle {
         tools,
-        execution_backend,
         approval_tx,
         approval_rx,
         media_tx,
@@ -685,12 +688,12 @@ pub async fn register_optional_tools(
     tools: &mut Vec<Arc<dyn Tool>>,
     config: &AppConfig,
     state: Arc<dyn StateStore>,
+    memory: ToolMemoryAccess,
     pool: SqlitePool,
     event_store: Arc<EventStore>,
-    llm_runtime: SharedLlmRuntime,
     health_store: Option<Arc<HealthProbeStore>>,
-    approval_tx: ApprovalBroker,
     media_tx: mpsc::Sender<MediaMessage>,
+    execution_backend: crate::execution::SharedExecutionBackend,
 ) -> anyhow::Result<OptionalToolsOutcome> {
     let inbox_dir = shellexpand::tilde(&config.files.inbox_dir).to_string();
     let mut has_cli_agents = false;
@@ -709,11 +712,21 @@ pub async fn register_optional_tools(
                 }
                 tools.push(Arc::new(DiagnoseTool::new(
                     event_store.clone(),
-                    state.clone(),
-                    llm_runtime.clone(),
                     config.diagnostics.max_events,
                     config.diagnostics.include_raw_tool_args,
                 )));
+            }
+            OptionalToolId::GoalTrace => {
+                if !config.tools.is_enabled("goal_trace") {
+                    continue;
+                }
+                tools.push(Arc::new(GoalTraceTool::new(state.clone())));
+            }
+            OptionalToolId::PolicyMetrics => {
+                if !config.tools.is_enabled("policy_metrics") {
+                    continue;
+                }
+                tools.push(Arc::new(PolicyMetricsTool));
             }
             OptionalToolId::NodeSensors => {
                 if !config.tools.is_enabled("read_node_sensors") {
@@ -743,6 +756,16 @@ pub async fn register_optional_tools(
                 );
                 tools.push(Arc::new(SendNodeAudioTool::new(announcements)));
             }
+            OptionalToolId::NodeRestart => {
+                if !config.tools.is_enabled("node_restart") {
+                    continue;
+                }
+                let store = Arc::new(crate::nodes::NodeStore::new(
+                    pool.clone(),
+                    crate::nodes::auth::load_or_create_instance_key()?,
+                ));
+                tools.push(Arc::new(crate::nodes::restart::NodeRestartTool::new(store)));
+            }
             OptionalToolId::NodeMonitoring => {
                 if !config.tools.is_enabled("manage_node_monitors") {
                     continue;
@@ -759,10 +782,10 @@ pub async fn register_optional_tools(
                     continue;
                 }
                 let browser_tool = BrowserTool::new(
-                    config.browser.clone(),
+                    config.browser.settings(),
                     media_tx.clone(),
-                    approval_tx.clone(),
                     inbox_dir.clone(),
+                    execution_backend.clone(),
                 )
                 .map_err(|e| anyhow::anyhow!("Invalid browser configuration: {e}"))?;
                 tools.push(Arc::new(browser_tool));
@@ -778,9 +801,9 @@ pub async fn register_optional_tools(
                     config.computer_use.clone(),
                     vision,
                     std::path::PathBuf::from(&inbox_dir),
-                    approval_tx.clone(),
                     media_tx.clone(),
                     Some(event_store.clone()),
+                    crate::tools::computer_use::Desktop::Real,
                 )));
             }
             OptionalToolId::SendFile => {
@@ -789,8 +812,13 @@ pub async fn register_optional_tools(
                 }
                 std::fs::create_dir_all(&inbox_dir)?;
                 tools.push(Arc::new(
-                    SendFileTool::new(media_tx.clone(), &config.files.outbox_dirs, &inbox_dir)
-                        .with_event_store(event_store.clone()),
+                    SendFileTool::new(
+                        execution_backend.clone(),
+                        media_tx.clone(),
+                        &config.files.outbox_dirs,
+                        &inbox_dir,
+                    )
+                    .with_event_store(event_store.clone()),
                 ));
             }
             OptionalToolId::GenerateImage => {
@@ -799,9 +827,12 @@ pub async fn register_optional_tools(
                 }
                 std::fs::create_dir_all(&inbox_dir)?;
                 tools.push(Arc::new(
-                    GenerateImageTool::chatgpt_subscription(PathBuf::from(&inbox_dir))
-                        .map_err(anyhow::Error::msg)?
-                        .with_event_store(event_store.clone()),
+                    GenerateImageTool::chatgpt_subscription(
+                        PathBuf::from(&inbox_dir),
+                        crate::providers::chatgpt_login::shared_credential_manager(),
+                    )
+                    .map_err(anyhow::Error::msg)?
+                    .with_event_store(event_store.clone()),
                 ));
             }
             OptionalToolId::CliAgents => {
@@ -810,13 +841,15 @@ pub async fn register_optional_tools(
                 if !register_cli && !register_manage_cli {
                     continue;
                 }
-                let cli_tool = CliAgentTool::discover(
+                let mut cli_tool = CliAgentTool::discover(
+                    execution_backend.clone(),
                     config.cli_agents.clone(),
                     state.clone(),
-                    llm_runtime.clone(),
-                    approval_tx.clone(),
                 )
                 .await;
+                if memory.own_memory {
+                    cli_tool = cli_tool.with_context_facts(memory.store.clone());
+                }
                 has_cli_agents = cli_tool.has_tools();
                 let arc = Arc::new(cli_tool);
                 cli_agent_tool = Some(arc.clone());
@@ -831,8 +864,7 @@ pub async fn register_optional_tools(
                     }
                 }
                 if register_manage_cli {
-                    let manage_cli =
-                        ManageCliAgentsTool::new(arc, state.clone(), approval_tx.clone());
+                    let manage_cli = ManageCliAgentsTool::new(arc, state.clone());
                     tools.push(Arc::new(manage_cli));
                 }
             }
@@ -845,28 +877,36 @@ pub async fn register_optional_tools(
                 };
                 tools.push(Arc::new(HealthProbeTool::new(store.clone())));
             }
+            OptionalToolId::ClientView => {
+                if !config.tools.is_enabled("client_view") {
+                    continue;
+                }
+                tools.push(Arc::new(crate::tools::ClientViewTool::new(Arc::new(
+                    crate::startup::client_gateway::GatewayViews,
+                ))));
+            }
             #[cfg(feature = "slack")]
             OptionalToolId::SlackChannelHistory => {
                 if !config.tools.is_enabled("read_channel_history") {
                     continue;
                 }
-                let mut slack_tokens: Vec<String> = config
+                // Opted in, so registered even before any Slack bot exists:
+                // the tokens are the configured bots plus the bots connected
+                // at runtime, read on every call, so a bot `/connect`ed after
+                // startup is seen.
+                let configured: Vec<String> = config
                     .all_slack_bots()
                     .iter()
                     .map(|bot| bot.bot_token.clone())
                     .collect();
-                if let Ok(dynamic_bots) = state.get_dynamic_bots().await {
-                    for bot in dynamic_bots {
-                        if bot.channel_type == "slack" && !bot.bot_token.is_empty() {
-                            slack_tokens.push(bot.bot_token.clone());
-                        }
-                    }
-                }
-                if slack_tokens.is_empty() {
-                    continue;
-                }
-                info!(count = slack_tokens.len(), "Channel history tool enabled");
-                tools.push(Arc::new(ReadChannelHistoryTool::new(slack_tokens)));
+                let connected: Arc<dyn aidaemon_channels::hub::DynamicBotStore> = state.clone();
+                info!(
+                    configured = configured.len(),
+                    "Channel history tool enabled"
+                );
+                tools.push(Arc::new(ReadChannelHistoryTool::with_tokens(
+                    crate::tools::SlackBotTokens::with_connected(configured, connected),
+                )));
             }
         }
 
@@ -896,8 +936,8 @@ pub async fn register_runtime_tools(
     config_path: &Path,
     http_profiles: crate::oauth::SharedHttpProfiles,
     state: Arc<dyn StateStore>,
+    memory: ToolMemoryAccess,
     mcp_registry: McpRegistry,
-    approval_tx: ApprovalBroker,
 ) -> anyhow::Result<RuntimeToolsOutcome> {
     validate_runtime_manifest(RUNTIME_TOOL_MANIFEST)?;
 
@@ -945,8 +985,8 @@ pub async fn register_runtime_tools(
             config,
             config_path,
             state.clone(),
+            memory.clone(),
             mcp_registry.clone(),
-            approval_tx.clone(),
             http_profiles.clone(),
             &mut http_request_tool,
             &mut spawn_tool,
@@ -974,8 +1014,8 @@ async fn register_runtime_tool_by_id(
     config: &AppConfig,
     config_path: &Path,
     state: Arc<dyn StateStore>,
+    memory: ToolMemoryAccess,
     mcp_registry: McpRegistry,
-    approval_tx: ApprovalBroker,
     http_profiles: crate::oauth::SharedHttpProfiles,
     http_request_tool: &mut Option<Arc<HttpRequestTool>>,
     spawn_tool: &mut Option<Arc<SpawnAgentTool>>,
@@ -983,11 +1023,14 @@ async fn register_runtime_tool_by_id(
 ) -> anyhow::Result<()> {
     match tool_id {
         RuntimeToolId::ManageMcp => {
-            let manage_mcp = ManageMcpTool::new(mcp_registry, approval_tx);
+            let manage_mcp = ManageMcpTool::new(mcp_registry);
             tools.push(Arc::new(manage_mcp));
         }
         RuntimeToolId::ManagePeople => {
-            tools.push(Arc::new(ManagePeopleTool::new(state.clone())));
+            tools.push(Arc::new(ManagePeopleTool::new(
+                state.clone(),
+                memory.store.clone(),
+            )));
             // Seed the DB setting from config if not already set.
             if state.get_setting("people_enabled").await?.is_none() {
                 state
@@ -1003,25 +1046,23 @@ async fn register_runtime_tool_by_id(
             }
         }
         RuntimeToolId::HttpRequest => {
-            let tool = Arc::new(HttpRequestTool::new(http_profiles, approval_tx));
+            let tool = Arc::new(HttpRequestTool::new(http_profiles));
             tools.push(tool.clone());
             *http_request_tool = Some(tool);
         }
-        RuntimeToolId::ManageHttpAuth => {
-            tools.push(Arc::new(ManageHttpAuthTool::new(
-                config_path.to_path_buf(),
-                http_profiles,
-                approval_tx,
-                state as Arc<dyn crate::traits::StateStore>,
-            )));
-        }
-        RuntimeToolId::ManageOauth => {
+        RuntimeToolId::ManageAuth => {
+            let manage_http_auth = ManageHttpAuthTool::new(
+                crate::config::config_file(config_path),
+                http_profiles.clone(),
+                state.clone() as Arc<dyn crate::traits::StateStore>,
+                crate::config::shared_secret_store(),
+            );
             let callback_url = config
                 .oauth
                 .callback_url
                 .clone()
                 .unwrap_or_else(|| format!("http://localhost:{}", config.daemon.health_port));
-            let gateway = crate::oauth::OAuthGateway::new(
+            let gateway = crate::startup::oauth::daemon_gateway(
                 state.clone() as Arc<dyn crate::traits::OAuthGatewayStore>,
                 http_profiles,
                 callback_url,
@@ -1048,17 +1089,22 @@ async fn register_runtime_tool_by_id(
                 http_tool.set_oauth_gateway(gateway.clone()).await;
             }
 
-            tools.push(Arc::new(ManageOAuthTool::new(
+            let manage_oauth = ManageOAuthTool::new(
                 gateway.clone(),
                 state.clone() as Arc<dyn crate::traits::StateStore>,
-                config_path.to_path_buf(),
-                approval_tx,
-            )));
+                crate::config::config_file(config_path),
+            );
+            tools.push(Arc::new(
+                aidaemon_tools::services::manage_auth::ManageAuthTool::new(
+                    manage_http_auth,
+                    manage_oauth,
+                ),
+            ));
             *oauth_gateway = Some(gateway);
         }
         RuntimeToolId::ManageApi => {
             let gateway = oauth_gateway.clone().ok_or_else(|| {
-                anyhow::anyhow!("manage_api requires manage_oauth to be initialized first")
+                anyhow::anyhow!("manage_api requires manage_auth to be initialized first")
             })?;
             let skills_dir = if config.skills.enabled {
                 let dir = config_path
@@ -1072,13 +1118,13 @@ async fn register_runtime_tool_by_id(
             };
 
             tools.push(Arc::new(ManageApiTool::new(
-                config_path.to_path_buf(),
+                crate::config::config_file(config_path),
                 skills_dir,
                 config.skills.registries.clone(),
                 config.search.clone(),
                 http_profiles,
-                approval_tx,
-                state.clone() as Arc<dyn crate::traits::StateStore>,
+                state.clone() as Arc<dyn crate::traits::OAuthStore>,
+                state.clone() as Arc<dyn crate::traits::SkillsStore>,
                 gateway,
             )));
         }
@@ -1098,18 +1144,23 @@ async fn register_runtime_tool_by_id(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_base_tool(
     tool_id: BaseToolId,
+    execution_backend: crate::execution::SharedExecutionBackend,
+    daemon_paths: crate::tools::DaemonPaths,
     config: &AppConfig,
     config_path: &Path,
     state: Arc<dyn StateStore>,
+    memory: ToolMemoryAccess,
     pool: SqlitePool,
     event_store: Arc<EventStore>,
     approval_tx: ApprovalBroker,
+    health_store: Option<Arc<HealthProbeStore>>,
 ) -> anyhow::Result<BuiltBaseTool> {
     let built = match tool_id {
         BaseToolId::SystemInfo => BuiltBaseTool {
-            tool: Arc::new(SystemInfoTool),
+            tool: Arc::new(SystemInfoTool::new(execution_backend)),
             terminal_tool: None,
         },
         BaseToolId::Terminal => {
@@ -1125,6 +1176,7 @@ async fn build_base_tool(
                 .collect();
             let terminal = Arc::new(
                 TerminalTool::new(
+                    execution_backend,
                     config.terminal.allowed_prefixes.clone(),
                     approval_tx,
                     config.terminal.initial_timeout_secs,
@@ -1135,8 +1187,10 @@ async fn build_base_tool(
                 .await
                 .with_confinement(config.terminal.confinement)
                 .with_event_store(event_store)
-                .with_state(state)
-                .with_self_correction(config.self_correction.clone())
+                .with_stores(
+                    state.clone() as Arc<dyn crate::traits::GoalStore>,
+                    state as Arc<dyn crate::traits::NotificationStore>,
+                )
                 .with_delivery_dirs(inbox_dir, outbox_dirs),
             );
             BuiltBaseTool {
@@ -1145,55 +1199,55 @@ async fn build_base_tool(
             }
         }
         BaseToolId::RememberFact => BuiltBaseTool {
-            tool: Arc::new(RememberFactTool::new(state)),
-            terminal_tool: None,
-        },
-        BaseToolId::ShareMemory => BuiltBaseTool {
-            tool: Arc::new(ShareMemoryTool::new(state, approval_tx)),
+            tool: Arc::new(RememberFactTool::new(memory.store.clone())),
             terminal_tool: None,
         },
         BaseToolId::ManageMemories => BuiltBaseTool {
-            tool: Arc::new(ManageMemoriesTool::new(state).with_approval_tx(approval_tx.clone())),
+            tool: Arc::new(ManageMemoriesTool::new(state, memory.store.clone())),
+            terminal_tool: None,
+        },
+        BaseToolId::SetReminder => BuiltBaseTool {
+            tool: Arc::new(crate::tools::SetReminderTool::new(state)),
+            terminal_tool: None,
+        },
+        BaseToolId::ScheduleTask => BuiltBaseTool {
+            tool: Arc::new(crate::tools::ScheduleTaskTool::new(state)),
             terminal_tool: None,
         },
         BaseToolId::ManageMandates => BuiltBaseTool {
-            tool: Arc::new(ManageMandatesTool::new(state, approval_tx).with_skills_dir(
+            tool: Arc::new(ManageMandatesTool::new(state).with_strategy_skills(
                 config.skills.enabled.then(|| {
-                    config_path
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."))
-                        .join(&config.skills.dir)
+                    crate::startup::tool_config::strategy_skills_dir(
+                        config_path
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .join(&config.skills.dir),
+                    )
                 }),
             )),
             terminal_tool: None,
         },
+        BaseToolId::ManageAutomations => BuiltBaseTool {
+            tool: Arc::new(
+                crate::tools::ManageAutomationsTool::new(state).with_health_probes(health_store),
+            ),
+            terminal_tool: None,
+        },
         BaseToolId::SearchHistory => BuiltBaseTool {
-            tool: Arc::new(SearchHistoryTool::new(
-                state,
-                config.state.retention.messages_days,
-            )),
-            terminal_tool: None,
-        },
-        BaseToolId::ScheduledGoalRuns => BuiltBaseTool {
-            tool: Arc::new(ScheduledGoalRunsTool::new(state)),
-            terminal_tool: None,
-        },
-        BaseToolId::GoalTrace => BuiltBaseTool {
-            tool: Arc::new(GoalTraceTool::new(state)),
-            terminal_tool: None,
-        },
-        BaseToolId::ToolTrace => BuiltBaseTool {
-            tool: Arc::new(ToolTraceTool::new(state)),
-            terminal_tool: None,
-        },
-        BaseToolId::PolicyMetrics => BuiltBaseTool {
-            tool: Arc::new(PolicyMetricsTool),
+            tool: {
+                let search = SearchHistoryTool::new(state, config.state.retention.messages_days);
+                Arc::new(if memory.own_memory {
+                    search.with_episodes(memory.store.clone())
+                } else {
+                    search
+                })
+            },
             terminal_tool: None,
         },
         BaseToolId::ConfigManager => BuiltBaseTool {
             tool: Arc::new(ConfigManagerTool::new(
-                config_path.to_path_buf(),
-                approval_tx,
+                crate::config::config_file(config_path),
+                crate::config::shared_secret_store(),
             )),
             terminal_tool: None,
         },
@@ -1206,43 +1260,23 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::ReadFile => BuiltBaseTool {
-            tool: Arc::new(ReadFileTool),
+            tool: Arc::new(ReadFileTool::on_backend(execution_backend, daemon_paths)),
             terminal_tool: None,
         },
         BaseToolId::WriteFile => BuiltBaseTool {
-            tool: Arc::new(WriteFileTool),
+            tool: Arc::new(WriteFileTool::on_backend(execution_backend, daemon_paths)),
             terminal_tool: None,
         },
         BaseToolId::EditFile => BuiltBaseTool {
-            tool: Arc::new(EditFileTool),
+            tool: Arc::new(EditFileTool::on_backend(execution_backend, daemon_paths)),
             terminal_tool: None,
         },
         BaseToolId::SearchFiles => BuiltBaseTool {
-            tool: Arc::new(SearchFilesTool),
-            terminal_tool: None,
-        },
-        BaseToolId::ProjectInspect => BuiltBaseTool {
-            tool: Arc::new(ProjectInspectTool),
-            terminal_tool: None,
-        },
-        BaseToolId::RunCommand => BuiltBaseTool {
-            tool: Arc::new(RunCommandTool),
-            terminal_tool: None,
-        },
-        BaseToolId::GitInfo => BuiltBaseTool {
-            tool: Arc::new(GitInfoTool),
-            terminal_tool: None,
-        },
-        BaseToolId::GitCommit => BuiltBaseTool {
-            tool: Arc::new(GitCommitTool),
+            tool: Arc::new(SearchFilesTool::on_backend(execution_backend, daemon_paths)),
             terminal_tool: None,
         },
         BaseToolId::CheckEnvironment => BuiltBaseTool {
-            tool: Arc::new(CheckEnvironmentTool),
-            terminal_tool: None,
-        },
-        BaseToolId::ServiceStatus => BuiltBaseTool {
-            tool: Arc::new(ServiceStatusTool),
+            tool: Arc::new(CheckEnvironmentTool::new(execution_backend)),
             terminal_tool: None,
         },
     };
@@ -1250,25 +1284,34 @@ async fn build_base_tool(
     Ok(built)
 }
 
+/// The tool catalog as the model can see it, assembled for the schema lint
+/// and the per-tool goldens from `aidaemon_runtime::tool_manifest`: every
+/// startup-registered tool with its feature switched on, plus an instance
+/// of every other tool the manifest declares for the catalog (skills, the
+/// checklist, sub-agents and the role-scoped tools a task, mandate run or
+/// coordinated child gets).
 #[cfg(test)]
-mod tests {
+pub(crate) mod lint_catalog {
     use super::*;
-    use crate::agent::Agent;
-    use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
+    use crate::events::EventStoreForTests as _;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::testing::MockProvider;
-    use crate::traits::ModelProvider;
-    use proptest::prelude::*;
-    use serde_json::json;
-    use std::collections::HashSet;
     use tempfile::{NamedTempFile, TempDir};
 
-    async fn build_tool_schemas_for_contract_validation(
-        diagnostics_enabled: bool,
-        files_enabled: bool,
-        subagents_enabled: bool,
-    ) -> anyhow::Result<Vec<serde_json::Value>> {
+    pub(crate) struct Catalog {
+        pub tools: Vec<Arc<dyn Tool>>,
+        _guards: (TempDir, NamedTempFile, NamedTempFile),
+        pub state: Arc<SqliteStateStore>,
+        /// Node tools read their instance key from the secret store: never
+        /// the developer's real keychain.
+        _keychain: Option<crate::testing::KeychainIsolation>,
+    }
+
+    /// The tools startup registers (base, optional, runtime), with the
+    /// config `configure` leaves.
+    pub(crate) async fn build_registered(
+        configure: impl FnOnce(&mut AppConfig),
+    ) -> anyhow::Result<Catalog> {
         let mut config: AppConfig = toml::from_str(
             r#"
             [provider]
@@ -1276,9 +1319,6 @@ mod tests {
             "#,
         )?;
         config.provider.models.apply_defaults(&config.provider.kind);
-        config.diagnostics.enabled = diagnostics_enabled;
-        config.files.enabled = files_enabled;
-        config.subagents.enabled = subagents_enabled;
         config.cli_agents.enabled = false;
         config.oauth.enabled = false;
         // Validate the full manifest⇄construction contract: every base tool must
@@ -1287,6 +1327,7 @@ mod tests {
         // BASE_TOOL_REGISTRY. The disable behavior itself is covered by
         // `disabled_tools_are_omitted_from_base_registry`.
         config.tools.disabled.clear();
+        configure(&mut config);
 
         let io_temp = TempDir::new()?;
         config.files.inbox_dir = io_temp.path().join("inbox").display().to_string();
@@ -1294,43 +1335,49 @@ mod tests {
 
         let db_file = NamedTempFile::new()?;
         let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new()?);
-        let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+        let embedding_service = Arc::new(EmbeddingService::deterministic());
+        let state =
+            Arc::new(SqliteStateStore::for_tests(&db_path, 100, None, embedding_service).await?);
         let event_store = Arc::new(EventStore::new(state.pool()).await?);
         let config_file = NamedTempFile::new()?;
 
-        let model_provider = Arc::new(MockProvider::new()) as Arc<dyn ModelProvider>;
         let mut bundle = build_base_tools(
             &config,
             config_file.path().to_path_buf(),
+            crate::tools::DaemonPaths::default(),
+            crate::execution::active_execution_backend(),
             state.clone(),
+            ToolMemoryAccess {
+                store: state.memory_stores(),
+                own_memory: true,
+            },
             state.pool(),
             event_store.clone(),
             32,
             8,
+            None,
         )
         .await?;
-        let llm_runtime = SharedLlmRuntime::new(
-            model_provider,
-            router_from_models(config.provider.models.clone()),
-            config.provider.kind,
-            config.provider.models.primary.clone(),
-        );
         let _optional = register_optional_tools(
             &mut bundle.tools,
             &config,
             state.clone(),
+            ToolMemoryAccess {
+                store: state.memory_stores(),
+                own_memory: true,
+            },
             state.pool(),
             event_store.clone(),
-            llm_runtime,
             None,
-            bundle.approval_tx.clone(),
             bundle.media_tx.clone(),
+            crate::execution::active_execution_backend(),
         )
         .await?;
 
-        let mcp_registry =
-            McpRegistry::new(state.clone() as Arc<dyn crate::traits::McpRegistryStore>);
+        let mcp_registry = McpRegistry::new(
+            state.clone() as Arc<dyn crate::traits::McpRegistryStore>,
+            crate::config::secret_store().clone(),
+        );
         let http_profiles: crate::oauth::SharedHttpProfiles =
             Arc::new(tokio::sync::RwLock::new(config.http_auth.clone()));
         let _runtime = register_runtime_tools(
@@ -1339,16 +1386,232 @@ mod tests {
             config_file.path(),
             http_profiles,
             state.clone(),
+            ToolMemoryAccess {
+                store: state.memory_stores(),
+                own_memory: true,
+            },
             mcp_registry,
-            bundle.approval_tx.clone(),
         )
         .await?;
 
-        Ok(bundle
+        Ok(Catalog {
+            tools: bundle.tools,
+            _guards: (io_temp, db_file, config_file),
+            state,
+            _keychain: None,
+        })
+    }
+
+    /// Whether this build compiles the daemon feature a tool is under.
+    pub(crate) fn compiled(entry: &aidaemon_runtime::tool_manifest::ToolEntry) -> bool {
+        match entry.feature {
+            None => true,
+            Some("browser") => cfg!(feature = "browser"),
+            Some("computer_use") => cfg!(feature = "computer_use"),
+            Some("slack") => cfg!(feature = "slack"),
+            Some(other) => panic!("{}: unknown feature {other}", entry.name),
+        }
+    }
+
+    /// The tools the manifest puts in the lint catalog, in this build.
+    pub(crate) fn linted_names() -> Vec<&'static str> {
+        aidaemon_runtime::tool_manifest::TOOL_MANIFEST
+            .iter()
+            .filter(|entry| {
+                compiled(entry) && entry.lint == aidaemon_runtime::tool_manifest::Lint::Catalog
+            })
+            .map(|entry| entry.name)
+            .collect()
+    }
+
+    /// Every tool the model can be offered, each feature on: what startup
+    /// registers in this test build, then an instance of every other tool
+    /// the manifest puts in the catalog (skills, the checklist, tools whose
+    /// startup dependency the test build lacks, and the per-run tools).
+    pub(crate) async fn build_full() -> anyhow::Result<Catalog> {
+        let keychain = crate::testing::KeychainIsolation::acquire();
+        let mut catalog = build_registered(|config| {
+            config.diagnostics.enabled = true;
+            config.files.enabled = true;
+            config.subagents.enabled = true;
+            config.nodes.gateway.enabled = true;
+            config.nodes.announcements.enabled = true;
+            config.nodes.speech.enabled = true;
+            config.nodes.monitoring.enabled = true;
+            config.browser.enabled = cfg!(feature = "browser");
+            config.computer_use.enabled = cfg!(feature = "computer_use");
+        })
+        .await?;
+        let state = catalog.state.clone();
+        let skills_dir = catalog._guards.0.path().join("skills");
+        std::fs::create_dir_all(&skills_dir)?;
+        for name in linted_names() {
+            if catalog.tools.iter().any(|tool| tool.name() == name) {
+                continue;
+            }
+            let tool = catalog_instance(name, &state, &skills_dir).await?;
+            anyhow::ensure!(
+                tool.name() == name,
+                "the catalog instance for {name} is named {}",
+                tool.name()
+            );
+            catalog.tools.push(tool);
+        }
+        catalog._keychain = Some(keychain);
+        Ok(catalog)
+    }
+
+    /// An instance of a declared tool startup does not register in the
+    /// test build. A new manifest entry that neither startup registers
+    /// here nor has an instance fails the catalog.
+    async fn catalog_instance(
+        name: &str,
+        state: &Arc<SqliteStateStore>,
+        skills_dir: &Path,
+    ) -> anyhow::Result<Arc<dyn Tool>> {
+        let skills_dir = skills_dir.to_path_buf();
+        Ok(match name {
+            "use_skill" => Arc::new(crate::tools::UseSkillTool::new(skills_dir)),
+            "skill_resources" => Arc::new(crate::tools::SkillResourcesTool::new(
+                skills_dir,
+                Arc::new(crate::skills::FileSystemResolver::new())
+                    as Arc<dyn crate::skills::ResourceResolver>,
+            )),
+            "manage_skills" => Arc::new(crate::tools::ManageSkillsTool::new(
+                skills_dir,
+                state.clone(),
+            )),
+            "track_requirements" => Arc::new(
+                crate::tools::track_requirements::TrackRequirementsTool::new(Arc::new(
+                    crate::plans::PlanStore::new(state.pool()).await?,
+                )),
+            ),
+            "escalate_to_parent" => Arc::new(crate::tools::EscalateToParentTool),
+            // Registered by startup only with a checkpoint manager and a
+            // health store.
+            "list_checkpoints" => Arc::new(crate::tools::ListCheckpointsTool),
+            "health_probe" => Arc::new(crate::tools::HealthProbeTool::new(Arc::new(
+                crate::health::HealthProbeStore::new(state.pool()).await?,
+            ))),
+            "manage_goal_tasks" => Arc::new(
+                aidaemon_work::tools::manage_goal_tasks::ManageGoalTasksTool::new(
+                    "synthetic-goal".to_string(),
+                    state.clone(),
+                ),
+            ),
+            "report_blocker" => Arc::new(crate::tools::report_blocker::ReportBlockerTool::new(
+                "synthetic-task".to_string(),
+                state.clone(),
+            )),
+            "mandate_review" => Arc::new(
+                aidaemon_work::tools::mandate_review::MandateReviewTool::new(state.clone()),
+            ),
+            other => anyhow::bail!(
+                "{other} is in tool_manifest's catalog but startup does not register it in \
+                 the test build and the lint catalog has no instance of it"
+            ),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::EventStoreForTests as _;
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+    use proptest::prelude::*;
+    use serde_json::json;
+    use std::collections::HashSet;
+    use tempfile::NamedTempFile;
+
+    async fn build_tool_schemas_for_contract_validation(
+        diagnostics_enabled: bool,
+        files_enabled: bool,
+        subagents_enabled: bool,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let catalog = super::lint_catalog::build_registered(|config| {
+            config.diagnostics.enabled = diagnostics_enabled;
+            config.files.enabled = files_enabled;
+            config.subagents.enabled = subagents_enabled;
+        })
+        .await?;
+        Ok(catalog
             .tools
             .iter()
             .map(|tool| json!({"type":"function","function": tool.schema()}))
             .collect())
+    }
+
+    /// The lint catalog is the manifest: every tool it holds is declared
+    /// for the catalog, and every tool declared for it is there.
+    #[tokio::test]
+    async fn the_lint_catalog_holds_exactly_the_declared_tools() {
+        let catalog = super::lint_catalog::build_full().await.unwrap();
+        let built: std::collections::BTreeSet<&str> =
+            catalog.tools.iter().map(|tool| tool.name()).collect();
+        let declared: std::collections::BTreeSet<&str> =
+            super::lint_catalog::linted_names().into_iter().collect();
+        assert_eq!(built, declared);
+        assert_eq!(built.len(), catalog.tools.len(), "a tool registered twice");
+    }
+
+    /// Every startup registry entry is declared in the manifest as built
+    /// there, and every manifest entry built at startup has its registry
+    /// entry.
+    #[test]
+    fn startup_registries_and_the_manifest_agree() {
+        use aidaemon_runtime::tool_manifest::{BuiltAt, TOOL_MANIFEST, ToolContext, entry};
+        // Optional groups that register tools under other names.
+        fn group_of(name: &str) -> &str {
+            match name {
+                "cli_agent" | "manage_cli_agents" => "cli_agents",
+                other => other,
+            }
+        }
+        let mut problems = Vec::new();
+        let mut expect = |name: &str, built_at: BuiltAt| match entry(name) {
+            Some(declared)
+                if declared.built_at == built_at
+                    && declared.contexts.contains(&ToolContext::Global) => {}
+            other => problems.push(format!("{name}: declared as {other:?}")),
+        };
+        for spec in BASE_TOOL_REGISTRY {
+            expect(spec.name, BuiltAt::StartupBase);
+        }
+        for spec in OPTIONAL_TOOL_REGISTRY
+            .iter()
+            .filter(|spec| spec.name != "cli_agents")
+        {
+            expect(spec.name, BuiltAt::StartupOptional);
+        }
+        for spec in RUNTIME_TOOL_MANIFEST {
+            expect(spec.name, BuiltAt::StartupRuntime);
+        }
+        for declared in TOOL_MANIFEST
+            .iter()
+            .filter(|e| super::lint_catalog::compiled(e))
+        {
+            let registered = match declared.built_at {
+                BuiltAt::StartupBase => {
+                    declared.name == "list_checkpoints"
+                        || BASE_TOOL_REGISTRY
+                            .iter()
+                            .any(|spec| spec.name == declared.name)
+                }
+                BuiltAt::StartupOptional => OPTIONAL_TOOL_REGISTRY
+                    .iter()
+                    .any(|spec| spec.name == group_of(declared.name)),
+                BuiltAt::StartupRuntime => RUNTIME_TOOL_MANIFEST
+                    .iter()
+                    .any(|spec| spec.name == declared.name),
+                _ => true,
+            };
+            if !registered {
+                problems.push(format!("{}: no startup registry entry", declared.name));
+            }
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
     }
 
     #[test]
@@ -1507,8 +1770,7 @@ mod tests {
                 "manage_mcp",
                 "manage_people",
                 "http_request",
-                "manage_http_auth",
-                "manage_oauth",
+                "manage_auth",
                 "manage_api",
                 "spawn_agent",
             ]
@@ -1561,8 +1823,8 @@ mod tests {
     #[test]
     fn runtime_manifest_validator_rejects_unknown_dependencies() {
         let manifest = [RuntimeToolSpec {
-            id: RuntimeToolId::ManageOauth,
-            name: "manage_oauth",
+            id: RuntimeToolId::ManageAuth,
+            name: "manage_auth",
             enabled_if: runtime_enabled_always,
             depends_on: &[RuntimeToolId::HttpRequest],
         }];
@@ -1576,8 +1838,8 @@ mod tests {
     fn runtime_manifest_validator_rejects_dependency_order() {
         let manifest = [
             RuntimeToolSpec {
-                id: RuntimeToolId::ManageOauth,
-                name: "manage_oauth",
+                id: RuntimeToolId::ManageAuth,
+                name: "manage_auth",
                 enabled_if: runtime_enabled_always,
                 depends_on: &[RuntimeToolId::HttpRequest],
             },
@@ -1605,7 +1867,8 @@ mod tests {
                 .as_str()
                 .unwrap_or("<unknown>")
                 .to_string();
-            let result = Agent::validate_tool_definition_contract(&schema);
+            let result =
+                aidaemon_runtime::engine::tool_roster::validate_tool_definition_contract(&schema);
             assert!(
                 result.is_ok(),
                 "tool schema contract failed for {}: {:?}",
@@ -1622,16 +1885,16 @@ mod tests {
             [provider]
             api_key = "test-key"
             [tools]
-            disabled = ["policy_metrics", "goal_trace", "check_environment"]
+            disabled = ["web_search", "check_environment"]
             "#,
         )
         .unwrap();
         config.provider.models.apply_defaults(&config.provider.kind);
 
         let db_file = NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service = Arc::new(EmbeddingService::deterministic());
         let state = Arc::new(
-            SqliteStateStore::new(
+            SqliteStateStore::for_tests(
                 &db_file.path().display().to_string(),
                 100,
                 None,
@@ -1646,20 +1909,42 @@ mod tests {
         let bundle = build_base_tools(
             &config,
             config_file.path().to_path_buf(),
+            crate::tools::DaemonPaths::default(),
+            crate::execution::active_execution_backend(),
             state.clone(),
+            ToolMemoryAccess {
+                store: state.memory_stores(),
+                own_memory: true,
+            },
             state.pool(),
             event_store,
             8,
             8,
+            None,
         )
         .await
         .unwrap();
 
         let names: Vec<&str> = bundle.tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"policy_metrics"));
-        assert!(!names.contains(&"goal_trace"));
+        assert!(!names.contains(&"web_search"));
         assert!(!names.contains(&"check_environment"));
         assert!(names.contains(&"terminal"));
+    }
+
+    #[tokio::test]
+    async fn forensics_tools_register_only_with_diagnostics() {
+        for diagnostics in [false, true] {
+            let schemas = build_tool_schemas_for_contract_validation(diagnostics, false, false)
+                .await
+                .unwrap();
+            let names: Vec<&str> = schemas
+                .iter()
+                .filter_map(|schema| schema["function"]["name"].as_str())
+                .collect();
+            for tool in ["goal_trace", "policy_metrics", "self_diagnose"] {
+                assert_eq!(names.contains(&tool), diagnostics, "{tool}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1675,8 +1960,7 @@ mod tests {
 
         assert!(names.contains(&"manage_api".to_string()));
         assert!(names.contains(&"http_request".to_string()));
-        assert!(names.contains(&"manage_http_auth".to_string()));
-        assert!(names.contains(&"manage_oauth".to_string()));
+        assert!(names.contains(&"manage_auth".to_string()));
     }
 
     proptest! {
@@ -1702,7 +1986,7 @@ mod tests {
                         .as_str()
                         .unwrap_or("<unknown>")
                         .to_string();
-                    let result = Agent::validate_tool_definition_contract(&schema);
+                    let result = aidaemon_runtime::engine::tool_roster::validate_tool_definition_contract(&schema);
                     assert!(
                         result.is_ok(),
                         "tool schema contract failed for {}: {:?}",

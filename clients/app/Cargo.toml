@@ -1,0 +1,61 @@
+[package]
+name = "nsh-app-aidaemon"
+description = "AIdaemon: chat, coding and agent management on desktop, web and terminal"
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+# `aidaemon app` and `aidaemon tui` launch it by this name.
+[[bin]]
+name = "aidaemon-app"
+path = "src/main.rs"
+
+[dependencies]
+nsh-core = "=0.5.0"
+nsh-base = "=0.5.0"
+env_logger = "0.11"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aidaemon-client-core = { path = "../../crates/aidaemon-client-core", default-features = false }
+aidaemon-client-protocol = { path = "../../crates/client-protocol" }
+# Timestamps in the owner's time.
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+
+# Desktop and terminal: the shared tokio link, on NSH's background threads.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+aidaemon-client-core = { path = "../../crates/aidaemon-client-core" }
+tokio = { version = "1", features = ["sync"] }
+chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
+dirs = "6"
+# The terminal build (`--tui`): NSH's terminal surface and its input glue.
+nsh-platform-tui = { version = "=0.5.0", default-features = false, features = ["run-app"] }
+nsh-tui-host = "=0.5.0"
+nsh-engine = "=0.5.0"
+ratatui-core = { version = "0.1.2", features = ["std", "layout-cache", "underline-color"] }
+ratatui-crossterm = "0.1.2"
+crossterm = "0.29"
+
+# The browser: the page's socket, Web Crypto and storage.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = "0.4"
+futures = "0.3"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+
+[dev-dependencies]
+nsh-engine = "=0.5.0"
+nsh-testing = "=0.5.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nsh-platform-linux = { version = "=0.5.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nsh-platform-macos = { version = "=0.5.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nsh-platform-windows = { version = "=0.5.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }

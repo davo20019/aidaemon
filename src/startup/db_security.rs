@@ -4,7 +4,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use rand::RngCore;
+use rand::Rng;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tracing::{info, warn};
@@ -99,16 +101,16 @@ fn resolve_or_create_encryption_key(
     config_path: &Path,
     db_mode: DbMode,
 ) -> anyhow::Result<String> {
-    if let Some(ref key) = config.state.encryption_key {
-        if !key.trim().is_empty() {
-            return Ok(key.trim().to_string());
-        }
+    if let Some(ref key) = config.state.encryption_key
+        && !key.trim().is_empty()
+    {
+        return Ok(key.trim().to_string());
     }
 
-    if let Ok(key) = std::env::var(DB_ENCRYPTION_ENV_KEY) {
-        if !key.trim().is_empty() {
-            return Ok(key.trim().to_string());
-        }
+    if let Ok(key) = std::env::var(DB_ENCRYPTION_ENV_KEY)
+        && !key.trim().is_empty()
+    {
+        return Ok(key.trim().to_string());
     }
 
     if db_mode == DbMode::EncryptedOrUnknown {
@@ -122,7 +124,8 @@ fn resolve_or_create_encryption_key(
     let key = generate_encryption_key_hex();
     let env_path = resolve_env_file_path(config_path);
     persist_key_to_env_file(&env_path, &key)?;
-    std::env::set_var(DB_ENCRYPTION_ENV_KEY, &key);
+    // The caller stores the key in `config.state.encryption_key`, which every
+    // database opener reads first; later runs load it from the env file.
     info!(
         env_path = %env_path.display(),
         "Generated a new database encryption key and stored it in .env"
@@ -159,7 +162,9 @@ async fn migrate_plaintext_db_to_encrypted(db_path: &Path, key: &str) -> anyhow:
         key.replace('\'', "''")
     );
     let plain_pool = connect_sqlite_with_create(db_path_str, true).await?;
-    sqlx::query(&attach_sql).execute(&plain_pool).await?;
+    sqlx::query(sqlx::AssertSqlSafe(&*attach_sql))
+        .execute(&plain_pool)
+        .await?;
     sqlx::query("SELECT sqlcipher_export('encrypted')")
         .execute(&plain_pool)
         .await?;
@@ -247,10 +252,10 @@ async fn verify_encrypted_database(
             "Database integrity check found corruption limited to replaceable search indexes; rebuilding them"
         );
         if repairable.memory {
-            crate::state::sqlite::migrations::rebuild_memory_fts_projections(&pool).await?;
+            aidaemon_memory::sqlite::rebuild_memory_fts_projections(&pool).await?;
         }
         if repairable.history {
-            crate::state::sqlite::history_search::reset_fts_projection(&pool).await?;
+            aidaemon_runtime::history::search::reset_fts_projection(&pool).await?;
         }
         issues = database_integrity_issues(&pool).await?;
         if issues.is_empty() {
@@ -354,10 +359,13 @@ async fn connect_sqlite_with_create(
 #[cfg(feature = "encryption")]
 async fn apply_encryption_key(pool: &SqlitePool, key: &str) -> anyhow::Result<()> {
     let escaped_key = key.replace('\'', "''");
-    sqlx::query(&format!("PRAGMA key = '{}'", escaped_key))
-        .execute(pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to apply SQLCipher key: {}", e))?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PRAGMA key = '{}'",
+        escaped_key
+    )))
+    .execute(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to apply SQLCipher key: {}", e))?;
     Ok(())
 }
 
@@ -378,7 +386,9 @@ async fn collect_table_counts(pool: &SqlitePool) -> anyhow::Result<HashMap<Strin
             "SELECT COUNT(*) AS c FROM \"{}\"",
             table.replace('"', "\"\"")
         );
-        let (count,): (i64,) = sqlx::query_as(&sql).fetch_one(pool).await?;
+        let (count,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+            .fetch_one(pool)
+            .await?;
         counts.insert(table, count);
     }
     Ok(counts)
@@ -421,10 +431,10 @@ fn detect_db_mode(db_path: &Path) -> anyhow::Result<DbMode> {
 
 #[cfg(feature = "encryption")]
 fn resolve_env_file_path(config_path: &Path) -> PathBuf {
-    if let Ok(path) = std::env::var(DB_ENV_FILE_ENV_KEY) {
-        if !path.trim().is_empty() {
-            return PathBuf::from(path);
-        }
+    if let Ok(path) = std::env::var(DB_ENV_FILE_ENV_KEY)
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
     }
     config_path
         .parent()
@@ -471,7 +481,7 @@ fn persist_key_to_env_file(env_path: &Path, key: &str) -> anyhow::Result<()> {
 #[cfg(feature = "encryption")]
 fn generate_encryption_key_hex() -> String {
     let mut key_bytes = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key_bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut key_bytes);
     bytes_to_hex(&key_bytes)
 }
 
@@ -521,10 +531,10 @@ fn shm_path(db_path: &Path) -> PathBuf {
 
 #[cfg(feature = "encryption")]
 fn remove_if_exists(path: PathBuf) {
-    if path.exists() {
-        if let Err(e) = std::fs::remove_file(&path) {
-            warn!(path = %path.display(), error = %e, "Failed to remove stale SQLite sidecar file");
-        }
+    if path.exists()
+        && let Err(e) = std::fs::remove_file(&path)
+    {
+        warn!(path = %path.display(), error = %e, "Failed to remove stale SQLite sidecar file");
     }
 }
 

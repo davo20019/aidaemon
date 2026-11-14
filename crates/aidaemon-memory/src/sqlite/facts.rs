@@ -1,0 +1,2166 @@
+use super::*;
+
+const FACT_SEMANTIC_MIN_SCORE: f32 = 0.3;
+const FACT_LEXICAL_MIN_SCORE: f32 = 0.3;
+const FACT_LEXICAL_MAX_SCORE: f32 = 0.55;
+const FACT_FRESHNESS_MAX_BOOST: f32 = 0.15;
+const FACT_FRESHNESS_DECAY_HOURS: f32 = 168.0; // 7 days
+
+/// Conservative fallback for passive prompt recall when embeddings are
+/// unavailable. Returning recent facts regardless of relevance leaks unrelated
+/// context into the model; an empty result is safer because explicit memory
+/// search remains available to the agent.
+fn lexical_relevant_facts(facts: &[Fact], query: &str, max: usize) -> Vec<Fact> {
+    let query_lower = query.to_lowercase();
+    let tokens = query_tokens(&query_lower);
+    let mut scored = facts
+        .iter()
+        .filter_map(|fact| {
+            let score = lexical_fallback_score(&query_lower, &tokens, fact);
+            (score > FACT_LEXICAL_MIN_SCORE).then_some((fact, score))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.0.updated_at.cmp(&left.0.updated_at))
+    });
+    scored
+        .into_iter()
+        .take(max)
+        .map(|(fact, _)| fact.clone())
+        .collect()
+}
+
+/// Keywords that signal the user wants ALL facts, not a filtered subset.
+const EXHAUSTIVE_QUERY_MARKERS: &[&str] = &[
+    "everything you know",
+    "everything about me",
+    "all about me",
+    "all you know",
+    "tell me everything",
+    "complete list",
+    "full list",
+    "what do you know about me",
+    "what do you remember",
+    "list all",
+    "list everything",
+    "verify your memory",
+    "memory check",
+    "memory test",
+    "dump all",
+];
+
+fn is_exhaustive_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    EXHAUSTIVE_QUERY_MARKERS.iter().any(|m| q.contains(m))
+}
+
+/// Build a key-only embedding text for semantic dedup comparison.
+///
+/// Focuses on category + readable key (no value) so that dedup detects
+/// keys referring to the same concept regardless of their values.
+fn build_dedup_key_text(category: &str, key: &str) -> String {
+    let readable_key = key.replace(['_', '-'], " ");
+    format!(
+        "The user's {} {}. {} attribute: {}",
+        category, readable_key, category, readable_key
+    )
+}
+
+fn hybrid_fact_score(
+    fact: &Fact,
+    semantic: f32,
+    lexical: f32,
+    graph_match: bool,
+    freshness: f32,
+) -> f32 {
+    crate::HybridWeights::default().fuse(&crate::Signals {
+        semantic,
+        lexical,
+        graph: if graph_match { 1.0 } else { 0.0 },
+        freshness: (freshness / FACT_FRESHNESS_MAX_BOOST).clamp(0.0, 1.0),
+        confidence: if fact.source == "consolidation" {
+            0.7
+        } else {
+            1.0
+        },
+        provenance: if fact.source_excerpt.is_some() {
+            1.0
+        } else {
+            0.3
+        },
+    })
+}
+
+/// Build a natural-language embedding text for a fact.
+///
+/// Instead of `[project] inter_service: gRPC`, this produces something like:
+/// `"Project: inter-service communication technology is gRPC"`
+///
+/// Natural language embeds much better against natural language queries
+/// like "What tech stack does my project use?".
+pub fn build_fact_embedding_text(category: &str, key: &str, value: &str) -> String {
+    // Convert underscore/hyphen keys to readable form
+    let readable_key = key.replace(['_', '-'], " ");
+
+    // Build a natural-language sentence
+    format!(
+        "{} - {}: {}. The user's {} is {}.",
+        category, readable_key, value, readable_key, value
+    )
+}
+
+/// Whether two canonical fact keys are structurally distinct concepts that
+/// must never be merged, whatever their embeddings say.
+///
+/// Merge-safe: zero token overlap (possible synonyms), pure reordering
+/// ("company_previous" / "previous_company"), and a subset whose extra tokens
+/// are all known qualifiers ("editor" / "preferred_editor"). Distinct: two
+/// single-token keys (short keys embed too alike: "age" / "name"), partial
+/// overlap ("dog_name_old" / "dog_name_new"), and a subset whose extra token
+/// is likely an entity ("birthday" / "carlos_birthday", "age" / "child_age").
+fn keys_name_distinct_concepts(
+    new_tokens: &std::collections::HashSet<&str>,
+    existing_tokens: &std::collections::HashSet<&str>,
+) -> bool {
+    const SAFE_MODIFIERS: &[&str] = &[
+        "preferred",
+        "favorite",
+        "fav",
+        "default",
+        "primary",
+        "current",
+        "previous",
+        "old",
+        "new",
+        "last",
+        "first",
+        "main",
+        "secondary",
+        "alternate",
+        "alt",
+        "other",
+        "work",
+        "home",
+        "personal",
+        "daily",
+        "weekly",
+        "morning",
+        "evening",
+        "night",
+    ];
+    let shared = new_tokens.intersection(existing_tokens).count();
+    let new_count = new_tokens.len();
+    let existing_count = existing_tokens.len();
+    if new_count <= 1 && existing_count <= 1 {
+        return true;
+    }
+    let is_subset = new_tokens.is_subset(existing_tokens) || existing_tokens.is_subset(new_tokens);
+    if shared > 0 && !is_subset {
+        return true;
+    }
+    if is_subset && new_count != existing_count {
+        let (larger, smaller) = if new_count > existing_count {
+            (new_tokens, existing_tokens)
+        } else {
+            (existing_tokens, new_tokens)
+        };
+        return !larger
+            .difference(smaller)
+            .all(|token| SAFE_MODIFIERS.contains(token));
+    }
+    false
+}
+
+/// Sources that record the owner's own words. Background extractors can
+/// never overwrite these, only restate or add beside them.
+pub fn is_owner_authored_fact_source(source: &str) -> bool {
+    matches!(source, "agent" | "user_stated" | "owner" | "owner-stated")
+}
+
+/// Full-fact (key + value) embedding similarity at which an automated write is
+/// a restatement of an active fact rather than new knowledge. Measured on the
+/// live store: pairs at or above this are paraphrased keys for one value
+/// ("blog_deploy_stack" / "blog_deployment_stack", "tweet_account" /
+/// "twitter_account"); below it, distinct values start to appear.
+pub(crate) const FACT_RESTATEMENT_MIN_SIMILARITY: f32 = 0.93;
+
+/// Categories whose keys name a person or their attributes, where a key that
+/// differs by an entity token must stay separate even at high similarity.
+pub fn fact_category_is_personal(category: &str) -> bool {
+    matches!(
+        category.trim().to_ascii_lowercase().as_str(),
+        "user" | "people" | "relationship" | "relationships" | "family"
+    )
+}
+
+fn value_tokens(value: &str) -> std::collections::HashSet<String> {
+    value
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Values carry the same claim: identical numbers (versions, dates, counts,
+/// ids differ in one digit and the embedding cannot see it) and at least half
+/// of their words shared.
+fn values_make_the_same_claim(a: &str, b: &str) -> bool {
+    let (a, b) = (value_tokens(a), value_tokens(b));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let numbers = |tokens: &std::collections::HashSet<String>| {
+        tokens
+            .iter()
+            .filter(|token| token.chars().any(|c| c.is_ascii_digit()))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    if numbers(&a) != numbers(&b) {
+        return false;
+    }
+    let shared = a.intersection(&b).count();
+    shared * 2 >= a.union(&b).count()
+}
+
+/// Whether two active facts in one category are the same knowledge.
+pub fn facts_are_restatements(
+    category: &str,
+    a: (&str, &str),
+    b: (&str, &str),
+    similarity: f32,
+) -> bool {
+    similarity >= FACT_RESTATEMENT_MIN_SIMILARITY && facts_make_the_same_claim(category, a, b)
+}
+
+/// The similarity-independent half of [`facts_are_restatements`]: similar
+/// text still has to carry one claim about one thing.
+pub(crate) fn facts_make_the_same_claim(
+    category: &str,
+    (key_a, value_a): (&str, &str),
+    (key_b, value_b): (&str, &str),
+) -> bool {
+    if !values_make_the_same_claim(value_a, value_b) {
+        return false;
+    }
+    if !fact_category_is_personal(category) {
+        return true;
+    }
+    let a = canonicalize_fact_key(key_a);
+    let b = canonicalize_fact_key(key_b);
+    let a_tokens = a.split('_').filter(|t| !t.is_empty()).collect();
+    let b_tokens = b.split('_').filter(|t| !t.is_empty()).collect();
+    a == b || !keys_name_distinct_concepts(&a_tokens, &b_tokens)
+}
+
+fn canonicalize_fact_key(key: &str) -> String {
+    let raw = key.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::with_capacity(raw.len());
+    let mut last_was_sep = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('_');
+            last_was_sep = true;
+        }
+    }
+
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        raw.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn canonical_personal_key(key: &str) -> String {
+    match canonicalize_fact_key(key).as_str() {
+        "birthday" | "date_of_birth" | "dob" => "birth_date".to_string(),
+        "current_residence" | "home" | "location" => "residence".to_string(),
+        "place_of_birth" => "birthplace".to_string(),
+        "favorite_name" | "preferred_first_name" => "preferred_name".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn prefer_canonical_facts(
+    mut canonical: Vec<Fact>,
+    legacy: Vec<Fact>,
+    query: &str,
+    max: usize,
+) -> Vec<Fact> {
+    let query_lower = query.to_lowercase();
+    let query_words = query_tokens(&query_lower);
+    if !query.trim().is_empty() && !is_exhaustive_query(query) {
+        canonical.retain(|fact| {
+            lexical_fallback_score(&query_lower, &query_words, fact) > 0.0
+                || fact.value.to_lowercase().contains(query_lower.trim())
+        });
+    }
+
+    let canonical_owner_keys: std::collections::HashSet<String> = canonical
+        .iter()
+        .filter(|fact| fact.category == "user")
+        .map(|fact| canonical_personal_key(&fact.key))
+        .collect();
+    let has_relationships = canonical
+        .iter()
+        .any(|fact| fact.category == "relationships");
+    canonical.extend(legacy.into_iter().filter(|fact| {
+        !(fact.category == "user"
+            && canonical_owner_keys.contains(&canonical_personal_key(&fact.key))
+            || has_relationships
+                && matches!(
+                    canonicalize_fact_key(&fact.key).as_str(),
+                    "daughter"
+                        | "son"
+                        | "child"
+                        | "mother"
+                        | "father"
+                        | "parent"
+                        | "daughter_name"
+                        | "son_name"
+                        | "child_name"
+                        | "mother_name"
+                        | "father_name"
+                ))
+    }));
+    // Preserve semantic/graph ranking within each group, but always surface an
+    // exact structured-key hit before loosely related embedding matches. This
+    // is critical for short profile questions such as "my dad" (`dad_name`) or
+    // "my mom" (`mom_name`), where generic identity facts otherwise outrank the
+    // answer-bearing record.
+    canonical.sort_by_key(|fact| {
+        let key = fact.key.to_ascii_lowercase();
+        std::cmp::Reverse(
+            query_words
+                .iter()
+                .filter(|word| contains_word(&key, word))
+                .count(),
+        )
+    });
+    canonical.truncate(max);
+    canonical
+}
+
+fn fact_freshness_boost(now: DateTime<Utc>, updated_at: DateTime<Utc>) -> f32 {
+    let age_hours = (now - updated_at).num_hours().max(0) as f32;
+    FACT_FRESHNESS_MAX_BOOST * (1.0 - (age_hours / FACT_FRESHNESS_DECAY_HOURS).min(1.0))
+}
+
+pub(super) fn is_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "did"
+            | "do"
+            | "does"
+            | "for"
+            | "from"
+            | "how"
+            | "i"
+            | "in"
+            | "is"
+            | "it"
+            | "me"
+            | "my"
+            | "of"
+            | "on"
+            | "or"
+            | "please"
+            | "tell"
+            | "that"
+            | "the"
+            | "to"
+            | "was"
+            | "we"
+            | "were"
+            | "what"
+            | "when"
+            | "where"
+            | "who"
+            | "why"
+            | "you"
+            | "your"
+    )
+}
+
+fn query_tokens(query_lower: &str) -> Vec<&str> {
+    query_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .filter(|t| !is_stopword(t))
+        .collect()
+}
+
+fn contains_word(haystack_lower: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    haystack_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| w == needle)
+}
+
+fn lexical_fallback_score(query_lower: &str, tokens: &[&str], fact: &Fact) -> f32 {
+    let q = query_lower.trim();
+    if q.is_empty() || tokens.is_empty() {
+        return 0.0;
+    }
+
+    let key = fact.key.to_lowercase();
+    let value = fact.value.to_lowercase();
+    let category = fact.category.to_lowercase();
+
+    let q_is_token = q.chars().all(|c| c.is_alphanumeric());
+    let value_has_q = q_is_token && contains_word(&value, q);
+
+    // Keys/categories are structured; substring matching is fine.
+    // Values are natural language; prefer word-boundary matching to avoid
+    // false positives like "dog" matching "dodger".
+    if key.contains(q) || category.contains(q) || value_has_q {
+        return FACT_LEXICAL_MAX_SCORE;
+    }
+
+    // If any query token matches the structured key exactly (word boundary),
+    // treat as high-confidence lexical relevance.
+    if tokens.iter().any(|t| contains_word(&key, t)) {
+        return FACT_LEXICAL_MAX_SCORE;
+    }
+
+    let mut matched = 0usize;
+    for t in tokens {
+        if key.contains(t) || category.contains(t) || contains_word(&value, t) {
+            matched += 1;
+        }
+    }
+    (matched as f32 / tokens.len() as f32) * FACT_LEXICAL_MAX_SCORE
+}
+
+impl SqliteMemory {
+    /// Cosine scores for the facts in `ids` that `indexed` has no score for,
+    /// from each fact's own stored vector. Usually none: every fact with a
+    /// claim is in the embedding index. Read in chunks, so a recall never
+    /// loads every fact's blob.
+    async fn unindexed_fact_scores(
+        &self,
+        query_vec: &[f32],
+        ids: impl Iterator<Item = i64>,
+        indexed: &std::collections::HashMap<i64, f32>,
+    ) -> std::collections::HashMap<i64, f32> {
+        let missing: Vec<i64> = ids.filter(|id| !indexed.contains_key(id)).collect();
+        let mut scores = std::collections::HashMap::new();
+        for chunk in missing.chunks(500) {
+            let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT id, embedding FROM facts WHERE embedding IS NOT NULL AND id IN (",
+            );
+            let mut separated = builder.separated(", ");
+            for id in chunk {
+                separated.push_bind(*id);
+            }
+            separated.push_unseparated(")");
+            let rows = match builder.build().fetch_all(&self.pool).await {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(%error, "could not read fact vectors for recall");
+                    return scores;
+                }
+            };
+            for row in rows {
+                let blob: Vec<u8> = row.get("embedding");
+                if let Ok(vector) = decode_embedding(&blob) {
+                    scores.insert(row.get("id"), cosine_similarity(query_vec, &vector));
+                }
+            }
+        }
+        scores
+    }
+
+    /// Ends the active copies of a fact the owner just changed or forgot:
+    /// facts in any category that hold the same value under a key whose words
+    /// contain, or are contained in, those of `key` (`favorite_tea` beside `test_favorite_tea`,
+    /// `user/marker` beside `personal/marker`). Background extraction stores
+    /// such copies; left active, the old value survived the change.
+    async fn supersede_copies(
+        &self,
+        changed_id: i64,
+        key: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Ok(());
+        }
+        let canonical = canonicalize_fact_key(key);
+        let tokens: std::collections::HashSet<&str> =
+            canonical.split('_').filter(|t| !t.is_empty()).collect();
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, key FROM facts
+             WHERE superseded_at IS NULL AND id <> ? AND LOWER(TRIM(value)) = LOWER(?)",
+        )
+        .bind(changed_id)
+        .bind(value)
+        .fetch_all(&self.pool)
+        .await?;
+        let now = Utc::now().to_rfc3339();
+        for (id, other_key) in rows {
+            let other = canonicalize_fact_key(&other_key);
+            let other: std::collections::HashSet<&str> =
+                other.split('_').filter(|t| !t.is_empty()).collect();
+            // One key must name the other with modifiers added: a shared
+            // word alone (`pet_name`, `daughter_name`) is a different fact.
+            if !(tokens.is_subset(&other) || other.is_subset(&tokens)) {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE facts SET superseded_at = ? WHERE id = ? AND superseded_at IS NULL",
+            )
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+            if let Err(error) = self.project_fact_memory(id).await {
+                tracing::warn!(%error, fact_id = id, "Deferred superseded-copy projection");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Owner type of the cached key-text vectors fact dedup compares. The fact
+/// row owns its vector, so retention drops it with the fact; lookups go by
+/// the key text's hash.
+const DEDUP_KEY_OWNER: &str = "fact_key";
+const DEDUP_KEY_PURPOSE: &str = "dedup";
+
+impl SqliteMemory {
+    /// Vectors for fact-dedup key texts, in order. `texts` pairs each text
+    /// with the fact row it belongs to, if any; a stored row's vector is
+    /// cached under that row and read back next time: a category holds
+    /// thousands of keys, and embedding them all on every write took
+    /// seconds.
+    async fn dedup_key_vectors(
+        &self,
+        texts: Vec<(Option<i64>, String)>,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        use crate::embedding_index::content_hash;
+        let model = self.embedding_service.model_id();
+        let hashes: Vec<String> = texts.iter().map(|(_, t)| content_hash(t)).collect();
+        let mut cached: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+        let mut unique: Vec<&String> = hashes.iter().collect();
+        unique.sort();
+        unique.dedup();
+        for chunk in unique.chunks(500) {
+            let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT content_hash, embedding FROM memory_embeddings
+                 WHERE owner_type = ",
+            );
+            builder
+                .push_bind(DEDUP_KEY_OWNER)
+                .push(" AND embedding_purpose = ")
+                .push_bind(DEDUP_KEY_PURPOSE)
+                .push(" AND embedding_model = ")
+                .push_bind(&model)
+                .push(" AND stale_at IS NULL AND content_hash IN (");
+            let mut separated = builder.separated(", ");
+            for hash in chunk {
+                separated.push_bind(*hash);
+            }
+            separated.push_unseparated(")");
+            for row in builder.build().fetch_all(&self.pool).await? {
+                let blob: Vec<u8> = row.get("embedding");
+                if let Ok(vector) = decode_embedding(&blob) {
+                    cached.insert(row.get("content_hash"), vector);
+                }
+            }
+        }
+
+        // (hash, owning fact, text)
+        let mut missing: Vec<(String, Option<i64>, String)> = Vec::new();
+        let mut queued = std::collections::HashSet::new();
+        for ((owner, text), hash) in texts.iter().zip(&hashes) {
+            if !cached.contains_key(hash) && queued.insert(hash.clone()) {
+                missing.push((hash.clone(), *owner, text.clone()));
+            }
+        }
+        if !missing.is_empty() {
+            let vectors = self
+                .embedding_service
+                .embed_many(missing.iter().map(|(_, _, text)| text.clone()).collect())
+                .await?;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            for ((hash, owner, _), vector) in missing.iter().zip(&vectors) {
+                let Some(owner) = owner else {
+                    continue;
+                };
+                sqlx::query(
+                    "INSERT INTO memory_embeddings
+                        (owner_type, owner_id, embedding_purpose, embedding_model,
+                         embedding_dim, content_hash, embedding, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+                     ON CONFLICT(owner_type, owner_id, embedding_purpose, embedding_model, content_hash)
+                     DO UPDATE SET embedding = excluded.embedding, stale_at = NULL,
+                                   updated_at = datetime('now')",
+                )
+                .bind(DEDUP_KEY_OWNER)
+                .bind(owner.to_string())
+                .bind(DEDUP_KEY_PURPOSE)
+                .bind(&model)
+                .bind(vector.len() as i64)
+                .bind(hash)
+                .bind(encode_embedding(vector))
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            for ((hash, _, _), vector) in missing.into_iter().zip(vectors) {
+                cached.insert(hash, vector);
+            }
+        }
+        hashes
+            .iter()
+            .map(|hash| {
+                cached
+                    .get(hash)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("no dedup vector for a key"))
+            })
+            .collect()
+    }
+
+    /// Every fact an explicit search ranks, loaded once: canonical
+    /// projections, then active rows, minus owner rows a projection already
+    /// covers. The map sends each such projection to the raw row it
+    /// replaced, whose vector stands in for it: projections have no vector
+    /// of their own, and without one they would be reachable by keyword only.
+    async fn explicit_search_facts(
+        &self,
+    ) -> anyhow::Result<(Vec<Fact>, std::collections::HashMap<i64, i64>)> {
+        let mut facts = self.canonical_personal_facts().await?;
+        let projection_by_key: std::collections::HashMap<String, i64> = facts
+            .iter()
+            .filter(|fact| fact.category == "user")
+            .map(|fact| (canonical_personal_key(&fact.key), fact.id))
+            .collect();
+        // The newest covered row stands in.
+        let mut newest: std::collections::HashMap<i64, (i64, DateTime<Utc>)> =
+            std::collections::HashMap::new();
+        for fact in self.get_all_facts_with_provenance().await? {
+            let covering = (fact.category == "user")
+                .then(|| projection_by_key.get(&canonical_personal_key(&fact.key)))
+                .flatten();
+            match covering {
+                Some(projection) => {
+                    let slot = newest
+                        .entry(*projection)
+                        .or_insert((fact.id, fact.updated_at));
+                    if fact.updated_at > slot.1 {
+                        *slot = (fact.id, fact.updated_at);
+                    }
+                }
+                None => facts.push(fact),
+            }
+        }
+        let stand_ins = newest.into_iter().map(|(p, (id, _))| (p, id)).collect();
+        Ok((facts, stand_ins))
+    }
+
+    /// Cosine of the query against every fact with a current vector, by
+    /// position in `facts`. Empty when the query cannot be embedded.
+    async fn explicit_search_cosine(
+        &self,
+        query: &str,
+        facts: &[Fact],
+        stand_ins: &std::collections::HashMap<i64, i64>,
+    ) -> Vec<(usize, f32)> {
+        let query_vec = match self.embedding_service.embed(query.to_string()).await {
+            Ok(vector) => vector,
+            Err(error) => {
+                tracing::warn!(target: "memory_recall", %error, "explicit fact search: query embedding failed; lexical only");
+                return Vec::new();
+            }
+        };
+        let vector_id = |fact: &Fact| stand_ins.get(&fact.id).copied().unwrap_or(fact.id);
+        let indexed = self
+            .fact_embedding_scores(&query_vec, facts.len() + stand_ins.len())
+            .await
+            .unwrap_or_default();
+        let fallback = self
+            .unindexed_fact_scores(
+                &query_vec,
+                facts.iter().map(vector_id).filter(|id| *id > 0),
+                &indexed,
+            )
+            .await;
+        facts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, fact)| {
+                let id = vector_id(fact);
+                indexed
+                    .get(&id)
+                    .or_else(|| fallback.get(&id))
+                    .map(|score| (i, *score))
+            })
+            .collect()
+    }
+
+    /// Rerank `docs` against the query, or `None` when there is no reranker
+    /// or it fails (the caller then falls back to its unreranked order).
+    /// `deadline` is the whole search's (`StoreModels::rerank_deadline`).
+    async fn explicit_search_rerank(
+        &self,
+        query: &str,
+        docs: Vec<String>,
+        deadline: Option<tokio::time::Instant>,
+        step: &'static str,
+    ) -> Option<Vec<(usize, f32)>> {
+        let deadline = deadline?;
+        if docs.is_empty() {
+            return Some(Vec::new());
+        }
+        match self
+            .embedding_service
+            .rerank(query.to_string(), docs, deadline)
+            .await
+        {
+            Ok(scores) => Some(scores),
+            Err(error) => {
+                tracing::warn!(target: "memory_recall", %error, step, "explicit fact search: rerank unavailable; using unreranked order");
+                None
+            }
+        }
+    }
+
+    fn rerank_floor(&self) -> Option<crate::search::RelevanceFloor> {
+        self.embedding_service
+            .reranker
+            .as_ref()
+            .and_then(|reranker| reranker.relevance_floor())
+    }
+}
+
+#[async_trait]
+impl FactStore for SqliteMemory {
+    async fn search_facts(
+        &self,
+        query: &str,
+        limit: usize,
+        config: &crate::search::FactSearchConfig,
+    ) -> anyhow::Result<crate::search::FactSearchReport> {
+        use crate::neighborhood::{eligible_neighbors, is_relationship_key, seeds_from_hits};
+        use crate::search::{self, LexicalIndex};
+
+        if query.trim().is_empty() || limit == 0 {
+            return Ok(search::FactSearchReport::default());
+        }
+        let started = std::time::Instant::now();
+        let (facts, stand_ins) = self.explicit_search_facts().await?;
+        let load_ms = started.elapsed().as_millis() as u64;
+
+        let stage = std::time::Instant::now();
+        let lexical = LexicalIndex::build(&facts).score(query);
+        let lexical_ms = stage.elapsed().as_millis() as u64;
+
+        let stage = std::time::Instant::now();
+        let cosine = self.explicit_search_cosine(query, &facts, &stand_ins).await;
+        let embed_ms = stage.elapsed().as_millis() as u64;
+
+        let stage = std::time::Instant::now();
+        let pool = search::candidates(&facts, &lexical, &cosine, config);
+        let docs: Vec<String> = pool
+            .iter()
+            .map(|c| {
+                let f = &facts[c.index];
+                build_fact_embedding_text(&f.category, &f.key, &f.value)
+            })
+            .collect();
+        let rerank_deadline = self.embedding_service.rerank_deadline();
+        let reranked = self
+            .explicit_search_rerank(query, docs, rerank_deadline, "hits")
+            .await;
+        let floor = self.rerank_floor();
+        let mut report = search::rank(&facts, &pool, reranked.as_deref(), floor, limit, config);
+        let rerank_ms = stage.elapsed().as_millis() as u64;
+
+        // Expansion seeds come only from the hits actually returned.
+        let stage = std::time::Instant::now();
+        let hit_facts: Vec<Fact> = report.hits.iter().map(|h| h.fact.clone()).collect();
+        let known_people: Vec<String> = PeopleStore::get_all_people(self)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|p| std::iter::once(p.name).chain(p.aliases))
+            .collect();
+        let seeds = seeds_from_hits(&hit_facts, &known_people);
+        let relationship_cluster = hit_facts.iter().any(|f| is_relationship_key(&f.key));
+        if !seeds.is_empty() || relationship_cluster {
+            let exclude: std::collections::HashSet<i64> = hit_facts.iter().map(|f| f.id).collect();
+            let mut neighbors = eligible_neighbors(&facts, &seeds, relationship_cluster, &exclude);
+            // A neighbor duplicating a hit's content is not new context.
+            let shown: std::collections::HashSet<(&str, &str, &str)> = hit_facts
+                .iter()
+                .map(|f| (f.category.as_str(), f.key.as_str(), f.value.as_str()))
+                .collect();
+            neighbors.retain(|f| {
+                !shown.contains(&(f.category.as_str(), f.key.as_str(), f.value.as_str()))
+            });
+
+            let position: std::collections::HashMap<i64, usize> =
+                facts.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
+            let cosine_by_index: std::collections::HashMap<usize, f32> =
+                cosine.iter().copied().collect();
+            let lexical_by_index: std::collections::HashMap<usize, f32> =
+                lexical.iter().map(|h| (h.index, h.score)).collect();
+            let prior = |f: &Fact| -> f32 {
+                let index = position[&f.id];
+                if cosine.is_empty() {
+                    lexical_by_index.get(&index).copied().unwrap_or(0.0)
+                } else {
+                    cosine_by_index.get(&index).copied().unwrap_or(0.0)
+                }
+            };
+            if neighbors.len() > config.related_pool {
+                neighbors.sort_by(|a, b| prior(b).total_cmp(&prior(a)).then(a.id.cmp(&b.id)));
+                neighbors.truncate(config.related_pool);
+            }
+            let docs: Vec<String> = neighbors
+                .iter()
+                .map(|f| build_fact_embedding_text(&f.category, &f.key, &f.value))
+                .collect();
+            let related = match self
+                .explicit_search_rerank(query, docs, rerank_deadline, "related")
+                .await
+            {
+                Some(scores) => {
+                    search::rank_related(&neighbors, &scores, floor, report.best_score(), config)
+                }
+                None => {
+                    let scores: Vec<(usize, f32)> = neighbors
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| (i, prior(f)))
+                        .collect();
+                    // No floor: a relationship cluster (a parent of the
+                    // person searched) shares no words with the query, so a
+                    // cosine cutoff would drop exactly the designed case.
+                    search::rank_related(&neighbors, &scores, None, None, config)
+                }
+            };
+            report.related = related;
+        }
+        let expand_ms = stage.elapsed().as_millis() as u64;
+
+        // Scores of the leading hits, so a relevance floor can be chosen
+        // from evidence: `key=score (kind)`.
+        let summarize = |hits: &[search::SearchHit]| {
+            hits.iter()
+                .take(3)
+                .map(|h| format!("{}={:.3} ({:?})", h.fact.key, h.score, h.kind))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let top = summarize(&report.hits);
+        let related_top = summarize(&report.related);
+        tracing::info!(
+            target: "memory_recall",
+            load_ms,
+            lexical_ms,
+            embed_ms,
+            rerank_ms,
+            expand_ms,
+            considered = report.considered,
+            passed_floor = report.passed_floor,
+            returned = report.hits.len(),
+            related = report.related.len(),
+            reranked = report.reranked,
+            top = %top,
+            related_top = %related_top,
+            "explicit fact search"
+        );
+        Ok(report)
+    }
+
+    async fn stamp_fact_provenance(
+        &self,
+        category: &str,
+        key: &str,
+        source: &str,
+        first_seen_at: Option<DateTime<Utc>>,
+        source_excerpt: Option<&str>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE facts
+             SET source = ?, first_seen_at = ?, source_excerpt = ?
+             WHERE category = ? AND key = ? AND superseded_at IS NULL",
+        )
+        .bind(source)
+        .bind(first_seen_at.map(|at| at.to_rfc3339()))
+        .bind(source_excerpt)
+        .bind(category)
+        .bind(key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn reconcile_personal_memory(
+        &self,
+        write: &crate::records::PersonalMemoryWrite,
+        source: &str,
+        source_excerpt: Option<&str>,
+        channel_id: Option<&str>,
+        privacy: FactPrivacy,
+    ) -> anyhow::Result<crate::records::PersonalMemoryWriteResult> {
+        self.reconcile_structured_personal_memory(
+            write,
+            source,
+            source_excerpt,
+            channel_id,
+            privacy,
+        )
+        .await
+    }
+
+    async fn get_canonical_memory_facts(&self) -> anyhow::Result<Vec<Fact>> {
+        self.canonical_personal_facts().await
+    }
+
+    async fn record_memory_recall(
+        &self,
+        fact_ids: &[i64],
+        episode_ids: &[i64],
+    ) -> anyhow::Result<()> {
+        // Canonical projections carry synthetic negative ids; they have no
+        // row to count against.
+        let now = Utc::now().to_rfc3339();
+        for (table, ids) in [("facts", fact_ids), ("episodes", episode_ids)] {
+            let ids: Vec<i64> = ids.iter().copied().filter(|id| *id > 0).collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let placeholders = vec!["?"; ids.len()].join(", ");
+            let sql = format!(
+                "UPDATE {table} SET recall_count = COALESCE(recall_count, 0) + 1, last_recalled_at = ? WHERE id IN ({placeholders})"
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(&now);
+            for id in &ids {
+                query = query.bind(id);
+            }
+            query.execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    async fn fold_restated_facts(&self) -> anyhow::Result<usize> {
+        struct Candidate {
+            id: i64,
+            category: String,
+            key: String,
+            value: String,
+            owner_authored: bool,
+            recall_count: i64,
+            vector: Vec<f32>,
+        }
+        let _upsert_guard = self.fact_upsert_lock.lock().await;
+        let rows = sqlx::query(
+            "SELECT id, category, key, value, source, COALESCE(recall_count, 0) AS recall_count, embedding
+             FROM facts
+             WHERE superseded_at IS NULL AND embedding IS NOT NULL
+             ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_category: std::collections::BTreeMap<String, Vec<Candidate>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let blob: Vec<u8> = row.get("embedding");
+            let Ok(vector) = decode_embedding(&blob) else {
+                continue;
+            };
+            let category: String = row.get("category");
+            let source: String = row.get("source");
+            by_category
+                .entry(category.trim().to_ascii_lowercase())
+                .or_default()
+                .push(Candidate {
+                    id: row.get("id"),
+                    category,
+                    key: row.get("key"),
+                    value: row.get("value"),
+                    owner_authored: is_owner_authored_fact_source(&source),
+                    recall_count: row.get("recall_count"),
+                    vector,
+                });
+        }
+
+        // Star clustering in authority order: owner-stated first, then the
+        // most recalled, then the oldest (its key is the one already in use).
+        // Each fact folds into the first kept fact it restates; no chaining,
+        // so a cluster never drifts away from its representative.
+        let mut folded: Vec<(i64, i64)> = Vec::new();
+        for candidates in by_category.values_mut() {
+            candidates.sort_by(|a, b| {
+                b.owner_authored
+                    .cmp(&a.owner_authored)
+                    .then(b.recall_count.cmp(&a.recall_count))
+                    .then(a.id.cmp(&b.id))
+            });
+            let mut kept: Vec<usize> = Vec::new();
+            for index in 0..candidates.len() {
+                let candidate = &candidates[index];
+                let representative = kept.iter().copied().find(|&kept_index| {
+                    let rep = &candidates[kept_index];
+                    let sim = cosine_similarity(&candidate.vector, &rep.vector);
+                    facts_are_restatements(
+                        &candidate.category,
+                        (&candidate.key, &candidate.value),
+                        (&rep.key, &rep.value),
+                        sim,
+                    )
+                });
+                match representative {
+                    Some(rep) if !candidate.owner_authored => {
+                        folded.push((candidate.id, candidates[rep].id));
+                    }
+                    _ => kept.push(index),
+                }
+            }
+        }
+        if folded.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        for (folded_id, kept_id) in &folded {
+            sqlx::query(
+                "UPDATE facts SET superseded_at = ? WHERE id = ? AND superseded_at IS NULL",
+            )
+            .bind(&now)
+            .bind(folded_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE facts SET recall_count = MAX(COALESCE(recall_count, 0),
+                     (SELECT COALESCE(recall_count, 0) FROM facts WHERE id = ?))
+                 WHERE id = ?",
+            )
+            .bind(folded_id)
+            .bind(kept_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        tracing::info!(
+            folded = folded.len(),
+            "Folded restated facts into their representatives"
+        );
+        Ok(folded.len())
+    }
+
+    async fn memory_health_report(&self) -> anyhow::Result<crate::records::MemoryHealthReport> {
+        self.canonical_memory_health().await
+    }
+
+    async fn repair_memory_projections(
+        &self,
+    ) -> anyhow::Result<crate::records::MemoryHealthReport> {
+        self.backfill_missing_memory_projections().await?;
+        self.canonical_memory_health().await
+    }
+
+    async fn refresh_fact_memory(&self, category: &str, key: &str) -> anyhow::Result<()> {
+        if let Some(id) = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM facts WHERE lower(category) = lower(?) AND lower(key) = lower(?)
+             AND superseded_at IS NULL ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(category)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            self.project_fact_memory(id).await?;
+        }
+        Ok(())
+    }
+
+    async fn project_extracted_fact_graph(
+        &self,
+        category: &str,
+        key: &str,
+        source_excerpt: &str,
+        graph: &crate::records::ExtractedMemoryGraph,
+    ) -> anyhow::Result<()> {
+        self.persist_extracted_fact_graph(category, key, source_excerpt, graph)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_fact_with_provenance(
+        &self,
+        category: &str,
+        key: &str,
+        value: &str,
+        source: &str,
+        channel_id: Option<&str>,
+        privacy: FactPrivacy,
+        first_seen_at: Option<DateTime<Utc>>,
+        source_excerpt: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // The legacy flat-fact API performs a read/reconcile/write sequence.
+        // Serialize that sequence so two concurrent writes for the same key
+        // cannot both supersede the active row and race through the unique
+        // active-fact constraint. Structured personal-memory writes use their
+        // own explicit SQL transaction and do not take this compatibility lock.
+        let _upsert_guard = self.fact_upsert_lock.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let privacy_str = privacy.to_string();
+
+        let category_clean = category.trim();
+        let key_clean = key.trim();
+        let canonical_key = canonicalize_fact_key(key_clean);
+
+        // Find existing current fact (not superseded).
+        // Prefer exact match; fall back to canonical match to avoid key drift
+        // ("dog name" vs "dog_name") creating duplicates.
+        let mut existing: Option<(i64, String, String)> = None;
+
+        if let Some(row) = sqlx::query(
+            "SELECT id, key, value FROM facts WHERE category = ? AND key = ? AND superseded_at IS NULL",
+        )
+        .bind(category_clean)
+        .bind(key_clean)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            existing = Some((row.get("id"), row.get("key"), row.get("value")));
+        } else {
+            if canonical_key != key_clean
+                && let Some(row) = sqlx::query(
+                    "SELECT id, key, value FROM facts WHERE category = ? AND key = ? AND superseded_at IS NULL",
+                )
+                .bind(category_clean)
+                .bind(&canonical_key)
+                .fetch_optional(&self.pool)
+                .await?
+                {
+                    existing = Some((row.get("id"), row.get("key"), row.get("value")));
+                }
+
+            if existing.is_none() && !canonical_key.is_empty() {
+                // Canonical scan: match an existing key by canonical form.
+                // Limits churn when historical keys were not canonicalized.
+                let rows = sqlx::query(
+                    "SELECT id, key, value FROM facts WHERE category = ? AND superseded_at IS NULL ORDER BY updated_at DESC",
+                )
+                .bind(category_clean)
+                .fetch_all(&self.pool)
+                .await?;
+                for row in rows {
+                    let existing_key: String = row.get("key");
+                    if canonicalize_fact_key(&existing_key) == canonical_key {
+                        existing = Some((row.get("id"), existing_key, row.get("value")));
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Semantic dedup: if key-based matching found nothing, check if any active
+        // fact in the same category is semantically equivalent (different key, same
+        // concept). Catches synonym keys like "editor" vs "preferred_editor".
+        //
+        // We compare key-only embeddings (category + readable key) rather than
+        // full fact embeddings (which include value), because dedup should detect
+        // that two keys refer to the same concept regardless of their values.
+        if existing.is_none() {
+            let category_facts = sqlx::query(
+                "SELECT id, key, value FROM facts
+                 WHERE category = ? AND superseded_at IS NULL",
+            )
+            .bind(category_clean)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let new_tokens: std::collections::HashSet<&str> =
+                canonical_key.split('_').filter(|t| !t.is_empty()).collect();
+
+            // Guard against false semantic matches for keys that are
+            // structurally similar but intentionally distinct.
+            //
+            // If keys share SOME tokens, have the same token count, but
+            // differ in at least one token, they're variants of the same
+            // base concept (e.g., "dog_name_old" vs "dog_name_new") — skip.
+            //
+            // But allow through:
+            // - Keys that are a subset/superset (modifier pattern):
+            //   "editor" vs "preferred_editor" — different count, proceed.
+            // - Keys that are just reordered (same tokens, same count):
+            //   "company_previous" vs "previous_company" — all shared, proceed.
+            // - Keys with zero overlap: completely different concepts.
+            let comparable: Vec<&sqlx::sqlite::SqliteRow> = category_facts
+                .iter()
+                .filter(|row| {
+                    let existing_canonical = canonicalize_fact_key(&row.get::<String, _>("key"));
+                    let existing_tokens: std::collections::HashSet<&str> = existing_canonical
+                        .split('_')
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                    !keys_name_distinct_concepts(&new_tokens, &existing_tokens)
+                })
+                .collect();
+
+            // One embedder call for the new key and every comparable key: a
+            // call per row costs a model hop each and made one write into a
+            // large category take seconds.
+            if !comparable.is_empty() {
+                let mut texts = Vec::with_capacity(comparable.len() + 1);
+                texts.push((None, build_dedup_key_text(category_clean, key_clean)));
+                texts.extend(comparable.iter().map(|row| {
+                    (
+                        Some(row.get::<i64, _>("id")),
+                        build_dedup_key_text(category_clean, &row.get::<String, _>("key")),
+                    )
+                }));
+                if let Ok(vectors) = self.dedup_key_vectors(texts).await {
+                    let new_vec = &vectors[0];
+                    let mut best_match: Option<(i64, String, String, f32)> = None;
+                    for (row, existing_vec) in comparable.iter().zip(&vectors[1..]) {
+                        let sim = cosine_similarity(new_vec, existing_vec);
+                        if sim > 0.85 && sim > best_match.as_ref().map_or(0.0, |m| m.3) {
+                            best_match = Some((
+                                row.get("id"),
+                                row.get::<String, _>("key"),
+                                row.get::<String, _>("value"),
+                                sim,
+                            ));
+                        }
+                    }
+
+                    if let Some((id, matched_key, matched_value, sim)) = best_match {
+                        tracing::info!(
+                            category = category_clean,
+                            new_key = key_clean,
+                            matched_key = matched_key.as_str(),
+                            similarity = sim,
+                            "Semantic dedup: matched existing fact by embedding similarity"
+                        );
+                        existing = Some((id, matched_key, matched_value));
+                    }
+                }
+            }
+        }
+
+        let key_for_write = existing
+            .as_ref()
+            .map(|(_, k, _)| k.clone())
+            .unwrap_or_else(|| {
+                if canonical_key.is_empty() {
+                    key_clean.to_string()
+                } else {
+                    canonical_key.clone()
+                }
+            });
+
+        // Pre-compute embedding for the fact text (best-effort).
+        let fact_text = build_fact_embedding_text(category_clean, &key_for_write, value);
+        let embedding_blob = self
+            .embedding_service
+            .embed(fact_text)
+            .await
+            .ok()
+            .map(|v| encode_embedding(&v));
+
+        let automated_source = !is_owner_authored_fact_source(source);
+        if existing.is_none() && automated_source {
+            // A key with only superseded rows was deleted or merged away.
+            // Background extraction must not resurrect it; the owner can
+            // still re-add it explicitly.
+            let tombstoned: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM facts WHERE category = ? AND key IN (?, ?) LIMIT 1",
+            )
+            .bind(category_clean)
+            .bind(key_clean)
+            .bind(&key_for_write)
+            .fetch_optional(&self.pool)
+            .await?;
+            if tombstoned.is_some() {
+                tracing::debug!(
+                    category = category_clean,
+                    key = key_clean,
+                    source,
+                    "Automated fact write skipped: key was deleted or merged"
+                );
+                return Ok(());
+            }
+            // Paraphrased key, same knowledge: refresh the active fact rather
+            // than storing a second copy that competes for recall slots.
+            if let Some(new_vec) = embedding_blob
+                .as_deref()
+                .and_then(|blob| decode_embedding(blob).ok())
+            {
+                let candidates = sqlx::query(
+                    "SELECT id, key, value, embedding FROM facts
+                     WHERE category = ? AND superseded_at IS NULL AND embedding IS NOT NULL",
+                )
+                .bind(category_clean)
+                .fetch_all(&self.pool)
+                .await?;
+                let restated = candidates.iter().find_map(|row| {
+                    let other_key: String = row.get("key");
+                    let other_value: String = row.get("value");
+                    let blob: Vec<u8> = row.get("embedding");
+                    let other_vec = decode_embedding(&blob).ok()?;
+                    let sim = cosine_similarity(&new_vec, &other_vec);
+                    facts_are_restatements(
+                        category_clean,
+                        (key_clean, value),
+                        (&other_key, &other_value),
+                        sim,
+                    )
+                    .then(|| (row.get::<i64, _>("id"), other_key, sim))
+                });
+                if let Some((id, matched_key, sim)) = restated {
+                    tracing::info!(
+                        category = category_clean,
+                        new_key = key_clean,
+                        matched_key = matched_key.as_str(),
+                        similarity = sim,
+                        source,
+                        "Automated fact write folded into existing restatement"
+                    );
+                    sqlx::query("UPDATE facts SET updated_at = ? WHERE id = ?")
+                        .bind(&now)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        if let Some((old_id, _old_key, old_value)) = &existing {
+            // If the value is different, mark old as superseded and insert new.
+            //
+            // Source priority guard: no background extractor (consolidation,
+            // progressive, task learning) may overwrite a fact the owner
+            // stated. Extractors read tool output and paraphrase; they can
+            // lift a wrong value from a hallucinated or stale message. The
+            // owner's own words are ground truth until the owner changes them.
+            if old_value != value && automated_source {
+                let existing_source: Option<String> =
+                    sqlx::query_scalar("SELECT source FROM facts WHERE id = ?")
+                        .bind(old_id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                if existing_source
+                    .as_deref()
+                    .is_some_and(is_owner_authored_fact_source)
+                {
+                    tracing::info!(
+                        category = category_clean,
+                        key = key_clean,
+                        existing_source = ?existing_source,
+                        source,
+                        "Automated fact write skipped: refusing to overwrite owner-stated fact"
+                    );
+                    return Ok(());
+                }
+            }
+            if old_value != value {
+                sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
+                    .bind(&now)
+                    .bind(old_id)
+                    .execute(&self.pool)
+                    .await?;
+
+                // Insert new fact with embedding — ignore duplicate entry errors (code 2067)
+                // that can occur due to active-unique constraint race conditions.
+                let insert_result = sqlx::query(
+                    "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy, embedding, first_seen_at, source_excerpt)
+                     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+                )
+                .bind(category_clean)
+                .bind(&key_for_write)
+                .bind(value)
+                .bind(source)
+                .bind(&now)
+                .bind(&now)
+                .bind(channel_id)
+                .bind(&privacy_str)
+                .bind(&embedding_blob)
+                .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+                .bind(source_excerpt)
+                .execute(&self.pool)
+                .await;
+
+                match insert_result {
+                    Ok(_) => {}
+                    Err(sqlx::Error::Database(ref db_err))
+                        if db_err.code().as_deref() == Some("2067") =>
+                    {
+                        // Duplicate entry — another active row already exists (concurrent upsert).
+                        // Update the active row to "last write wins" without resurrecting the
+                        // superseded row (which would violate partial unique indexes).
+                        let updated = sqlx::query(
+                            "UPDATE facts
+                             SET value = ?, source = ?, updated_at = ?,
+                                 channel_id = ?, privacy = ?,
+                                 embedding = COALESCE(?, embedding),
+                                 first_seen_at = COALESCE(?, first_seen_at),
+                                 source_excerpt = COALESCE(?, source_excerpt)
+                             WHERE category = ? AND key = ? AND superseded_at IS NULL",
+                        )
+                        .bind(value)
+                        .bind(source)
+                        .bind(&now)
+                        .bind(channel_id)
+                        .bind(&privacy_str)
+                        .bind(&embedding_blob)
+                        .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+                        .bind(source_excerpt)
+                        .bind(category_clean)
+                        .bind(&key_for_write)
+                        .execute(&self.pool)
+                        .await?;
+
+                        // Legacy fallback: if no active row exists (e.g., old UNIQUE(category,key)
+                        // constraint), keep data consistent by updating in-place.
+                        if updated.rows_affected() == 0 {
+                            sqlx::query(
+                                "UPDATE facts
+                                 SET value = ?, source = ?, updated_at = ?, superseded_at = NULL,
+                                     channel_id = ?, privacy = ?,
+                                     embedding = COALESCE(?, embedding),
+                                     first_seen_at = COALESCE(?, first_seen_at),
+                                     source_excerpt = COALESCE(?, source_excerpt)
+                                 WHERE id = ?",
+                            )
+                            .bind(value)
+                            .bind(source)
+                            .bind(&now)
+                            .bind(channel_id)
+                            .bind(&privacy_str)
+                            .bind(&embedding_blob)
+                            .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+                            .bind(source_excerpt)
+                            .bind(old_id)
+                            .execute(&self.pool)
+                            .await?;
+                        }
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                if !automated_source {
+                    self.supersede_copies(*old_id, &key_for_write, old_value)
+                        .await?;
+                }
+            } else {
+                // Same value — update timestamp and backfill embedding.
+                // An automated restatement never demotes an owner-stated
+                // fact's source; otherwise the newer source is recorded.
+                let existing_source: Option<String> =
+                    sqlx::query_scalar("SELECT source FROM facts WHERE id = ?")
+                        .bind(old_id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                if automated_source
+                    && existing_source
+                        .as_deref()
+                        .is_some_and(is_owner_authored_fact_source)
+                {
+                    sqlx::query(
+                        "UPDATE facts SET updated_at = ?, embedding = COALESCE(embedding, ?) WHERE id = ?",
+                    )
+                    .bind(&now)
+                    .bind(&embedding_blob)
+                    .bind(old_id)
+                    .execute(&self.pool)
+                    .await?;
+                } else {
+                    sqlx::query(
+                        "UPDATE facts SET source = ?, updated_at = ?, embedding = COALESCE(embedding, ?), first_seen_at = COALESCE(first_seen_at, ?), source_excerpt = COALESCE(source_excerpt, ?) WHERE id = ?",
+                    )
+                    .bind(source)
+                    .bind(&now)
+                    .bind(&embedding_blob)
+                    .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+                    .bind(source_excerpt)
+                    .bind(old_id)
+                    .execute(&self.pool)
+                    .await?;
+                }
+            }
+        } else {
+            // No existing fact - insert new with embedding
+            // Ignore duplicate entry errors (code 2067) from concurrent inserts
+            let insert_result = sqlx::query(
+                "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy, embedding, first_seen_at, source_excerpt)
+                 VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+            )
+            .bind(category_clean)
+            .bind(&key_for_write)
+            .bind(value)
+            .bind(source)
+            .bind(&now)
+            .bind(&now)
+            .bind(channel_id)
+            .bind(&privacy_str)
+            .bind(&embedding_blob)
+            .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+            .bind(source_excerpt)
+            .execute(&self.pool)
+            .await;
+
+            match insert_result {
+                Ok(_) => {}
+                Err(sqlx::Error::Database(ref db_err))
+                    if db_err.code().as_deref() == Some("2067") =>
+                {
+                    // Duplicate entry — another active row already exists (concurrent upsert).
+                    // Update the active row to "last write wins".
+                    let updated = sqlx::query(
+                        "UPDATE facts
+                         SET value = ?, source = ?, updated_at = ?,
+                             channel_id = ?, privacy = ?,
+                             embedding = COALESCE(?, embedding),
+                             first_seen_at = COALESCE(?, first_seen_at),
+                             source_excerpt = COALESCE(?, source_excerpt)
+                         WHERE category = ? AND key = ? AND superseded_at IS NULL",
+                    )
+                    .bind(value)
+                    .bind(source)
+                    .bind(&now)
+                    .bind(channel_id)
+                    .bind(&privacy_str)
+                    .bind(&embedding_blob)
+                    .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+                    .bind(source_excerpt)
+                    .bind(category_clean)
+                    .bind(&key_for_write)
+                    .execute(&self.pool)
+                    .await?;
+
+                    if updated.rows_affected() == 0 {
+                        // If there is no active row, update the most recent version in-place.
+                        // This can happen on legacy schemas where a superseded row still blocks
+                        // inserts (old UNIQUE(category,key) constraint).
+                        if let Some(row) = sqlx::query(
+                            "SELECT id FROM facts WHERE category = ? AND key = ? ORDER BY updated_at DESC LIMIT 1",
+                        )
+                        .bind(category_clean)
+                        .bind(&key_for_write)
+                        .fetch_optional(&self.pool)
+                        .await?
+                        {
+                            let id: i64 = row.get("id");
+                            sqlx::query(
+                                "UPDATE facts
+                                 SET value = ?, source = ?, updated_at = ?, superseded_at = NULL,
+                                     channel_id = ?, privacy = ?,
+                                     embedding = COALESCE(?, embedding),
+                                     first_seen_at = COALESCE(?, first_seen_at),
+                                     source_excerpt = COALESCE(?, source_excerpt)
+                                 WHERE id = ?",
+                            )
+                            .bind(value)
+                            .bind(source)
+                            .bind(&now)
+                            .bind(channel_id)
+                            .bind(&privacy_str)
+                            .bind(&embedding_blob)
+                            .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+                            .bind(source_excerpt)
+                            .bind(id)
+                            .execute(&self.pool)
+                            .await?;
+                        }
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // ── Post-store conflict sweep ──────────────────────────────────
+        //
+        // When the user explicitly stores a fact via remember_fact (source
+        // == "agent"), scan other active facts in the same category for
+        // semantically similar entries that represent stale/conflicting
+        // values for the same concept stored under a different key.
+        //
+        // Example: user says "my coffee is cappuccino" → stored as
+        // (preference, coffee_preference).  We also supersede
+        // (preference, beverage = "coffee (cold brew)") which is the same
+        // concept under a different key that escaped key-level dedup.
+        //
+        // Guards:
+        // - Only for source=="agent" (user-explicit, not consolidation/test)
+        // - Full-fact embedding similarity > 0.82 (stricter than key dedup)
+        // - Lexical overlap: at least one significant word from the new
+        //   fact's key or value must appear in the other fact's key or value
+        //   (prevents cross-concept supersession in the same category)
+        if source == "agent"
+            && let Some(ref new_emb_blob) = embedding_blob
+            && let Ok(new_vec) = decode_embedding(new_emb_blob)
+        {
+            let others = sqlx::query(
+                "SELECT id, key, value, embedding FROM facts
+                         WHERE category = ? AND superseded_at IS NULL
+                           AND key != ?
+                           AND embedding IS NOT NULL",
+            )
+            .bind(category_clean)
+            .bind(&key_for_write)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default();
+
+            // Build keyword set from the new fact's key + value for
+            // lexical overlap guard.  Only words ≥3 chars to skip
+            // noise like "a", "is", "my".
+            let new_words: std::collections::HashSet<String> = key_clean
+                .split(|c: char| !c.is_alphanumeric())
+                .chain(value.split(|c: char| !c.is_alphanumeric()))
+                .filter(|w| w.len() >= 3)
+                .map(|w| w.to_ascii_lowercase())
+                .collect();
+
+            for row in &others {
+                let other_id: i64 = row.get("id");
+                let other_key: String = row.get("key");
+                let other_value: String = row.get("value");
+                let blob: Vec<u8> = row.get("embedding");
+
+                // Lexical overlap guard: at least one meaningful word
+                // from the new fact must appear in the other fact.
+                let other_text = format!("{} {}", other_key, other_value).to_ascii_lowercase();
+                let has_overlap = new_words.iter().any(|w| other_text.contains(w.as_str()));
+                if !has_overlap {
+                    continue;
+                }
+
+                if let Ok(other_vec) = decode_embedding(&blob) {
+                    let sim = cosine_similarity(&new_vec, &other_vec);
+                    // High similarity on full-fact embedding (value-aware)
+                    // means these facts describe the same concept.  Only
+                    // supersede if the values actually differ (otherwise
+                    // it's a harmless duplicate that adds context).
+                    if sim > 0.82 && other_value != value {
+                        tracing::info!(
+                            category = category_clean,
+                            new_key = key_clean,
+                            new_value = value,
+                            conflicting_key = other_key.as_str(),
+                            conflicting_value = other_value.as_str(),
+                            similarity = sim,
+                            "Conflict sweep: superseding stale fact with different key"
+                        );
+                        let _ = sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
+                            .bind(&now)
+                            .bind(other_id)
+                            .execute(&self.pool)
+                            .await;
+                    }
+                }
+            }
+        }
+
+        if let Err(error) = self.sync_fact_memory_written_at(category_clean, &now).await {
+            tracing::warn!(%error, category = category_clean, "Deferred fact memory projection");
+        }
+        Ok(())
+    }
+
+    async fn get_facts(&self, category: Option<&str>) -> anyhow::Result<Vec<Fact>> {
+        // Only return current (non-superseded) facts
+        let rows = if let Some(cat) = category {
+            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt FROM facts WHERE category = ? AND superseded_at IS NULL ORDER BY updated_at DESC")
+                .bind(cat)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC")
+                .fetch_all(&self.pool)
+                .await?
+        };
+
+        let mut facts = Vec::with_capacity(rows.len());
+        for row in rows {
+            facts.push(Self::row_to_fact(&row));
+        }
+        Ok(facts)
+    }
+
+    async fn get_relevant_facts(&self, query: &str, max: usize) -> anyhow::Result<Vec<Fact>> {
+        // Load facts; vectors come from the embedding index, and only facts
+        // it has none for read their own blob (`unindexed_fact_scores`).
+        let rows = sqlx::query(
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt
+             FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let all_facts: Vec<Fact> = rows.iter().map(Self::row_to_fact).collect();
+
+        if all_facts.is_empty() || query.trim().is_empty() {
+            let mut facts = all_facts;
+            facts.truncate(max);
+            let canonical = self.canonical_personal_facts().await.unwrap_or_default();
+            return Ok(prefer_canonical_facts(canonical, facts, query, max));
+        }
+
+        // Exhaustive queries ("tell me everything", "what do you know about me")
+        // bypass semantic search and return all facts to avoid retrieval gaps.
+        if is_exhaustive_query(query) {
+            tracing::info!(
+                query = query,
+                total_facts = all_facts.len(),
+                "Exhaustive query detected — returning all facts without scoring"
+            );
+            let mut facts = all_facts;
+            facts.truncate(max);
+            let canonical = self.canonical_personal_facts().await.unwrap_or_default();
+            return Ok(prefer_canonical_facts(canonical, facts, query, max));
+        }
+
+        // Embed the query
+        let query_vec = match self.embedding_service.embed(query.to_string()).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to embed query for passive fact filtering; using lexical matches: {}",
+                    e
+                );
+                let facts = lexical_relevant_facts(&all_facts, query, max);
+                let canonical = self.canonical_personal_facts().await.unwrap_or_default();
+                return Ok(prefer_canonical_facts(canonical, facts, query, max));
+            }
+        };
+
+        let now = Utc::now();
+        let query_lower = query.to_lowercase();
+        let tokens = query_tokens(&query_lower);
+        let indexed_scores = self
+            .fact_embedding_scores(&query_vec, rows.len())
+            .await
+            .unwrap_or_default();
+        let fts_fact_ids: std::collections::HashSet<i64> = self
+            .search_memory_claims(
+                query,
+                None,
+                ChannelVisibility::Internal,
+                true,
+                max.saturating_mul(4).max(16),
+            )
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|claim| claim.source_fact_id)
+            .collect();
+        let graph_fact_ids = self
+            .graph_fact_ids_for_query(query)
+            .await
+            .unwrap_or_default();
+
+        // Score facts using stored embeddings, with a small recency boost for sorting.
+        // IMPORTANT: the recency boost must not change which facts pass the semantic threshold.
+        let fallback_scores = self
+            .unindexed_fact_scores(&query_vec, all_facts.iter().map(|f| f.id), &indexed_scores)
+            .await;
+        let mut candidates: Vec<(usize, f32, f32, bool)> = Vec::with_capacity(rows.len());
+        for (i, fact) in all_facts.iter().enumerate() {
+            let freshness = fact_freshness_boost(now, fact.updated_at);
+
+            let semantic = indexed_scores
+                .get(&fact.id)
+                .or_else(|| fallback_scores.get(&fact.id))
+                .copied();
+            let lexical = if fts_fact_ids.contains(&fact.id) {
+                FACT_LEXICAL_MAX_SCORE
+            } else {
+                lexical_fallback_score(&query_lower, &tokens, fact)
+            };
+            if let Some(semantic) = semantic {
+                if semantic > FACT_SEMANTIC_MIN_SCORE {
+                    candidates.push((
+                        i,
+                        semantic,
+                        hybrid_fact_score(
+                            fact,
+                            semantic,
+                            lexical,
+                            graph_fact_ids.contains(&fact.id),
+                            freshness,
+                        ),
+                        true,
+                    ));
+                    continue;
+                }
+                // Below semantic threshold — try lexical as fallback for keyword matches
+                let best = semantic.max(lexical);
+                let is_semantic = best == semantic;
+                candidates.push((
+                    i,
+                    best,
+                    hybrid_fact_score(
+                        fact,
+                        semantic,
+                        lexical,
+                        graph_fact_ids.contains(&fact.id),
+                        freshness,
+                    ),
+                    is_semantic,
+                ));
+                continue;
+            }
+
+            // Missing/invalid embedding: fall back to cheap lexical relevance so
+            // freshly saved facts can still be retrieved during embedding backfill.
+            candidates.push((
+                i,
+                lexical,
+                hybrid_fact_score(
+                    fact,
+                    0.0,
+                    lexical,
+                    graph_fact_ids.contains(&fact.id),
+                    freshness,
+                ),
+                false,
+            ));
+        }
+        candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut relevant: Vec<Fact> = Vec::with_capacity(max.min(all_facts.len()));
+        let mut seen_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for (i, base_score, _sort_score, is_semantic) in candidates.into_iter() {
+            if relevant.len() >= max {
+                break;
+            }
+            let min_score = if is_semantic {
+                FACT_SEMANTIC_MIN_SCORE
+            } else {
+                FACT_LEXICAL_MIN_SCORE
+            };
+            if base_score > min_score {
+                let fact = all_facts[i].clone();
+                if seen_ids.insert(fact.id) {
+                    relevant.push(fact);
+                }
+            }
+        }
+
+        let canonical = self.canonical_personal_facts().await.unwrap_or_default();
+        Ok(prefer_canonical_facts(canonical, relevant, query, max))
+    }
+
+    async fn get_relevant_facts_for_channel(
+        &self,
+        query: &str,
+        max: usize,
+        channel_id: Option<&str>,
+        visibility: ChannelVisibility,
+        requester_is_owner: bool,
+    ) -> anyhow::Result<Vec<Fact>> {
+        // In DM/Internal contexts, use semantic relevance search so that only
+        // facts related to the current query are injected into the prompt.
+        // Previously this called get_facts(None) which returned ALL facts
+        // without filtering, causing unrelated facts to bleed into context.
+        //
+        // SECURITY: only the OWNER gets the unfiltered graph in a DM. A non-owner
+        // (allowlisted Guest) DMing the bot must NOT receive Private or
+        // other-channel facts — fall through to the privacy filter below, same as
+        // a group channel. Without this gate, a guest's prompt would be injected
+        // with the owner's private memory.
+        if requester_is_owner
+            && matches!(
+                visibility,
+                ChannelVisibility::Private | ChannelVisibility::Internal
+            )
+        {
+            return self.get_relevant_facts(query, max).await;
+        }
+
+        // PublicExternal: do NOT inject any stored facts (treat as untrusted).
+        if matches!(visibility, ChannelVisibility::PublicExternal) {
+            return Ok(vec![]);
+        }
+
+        // Public/PrivateGroup: global + same-channel facts (no private, no other-channel)
+        let rows = sqlx::query(
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt
+             FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        // One visibility rule for every surface that shows a fact
+        // (`memory_visible`): what the prompt is given here is what a
+        // memory search would show this audience.
+        let all_facts: Vec<Fact> = rows.iter().map(Self::row_to_fact).collect();
+        let filtered_indices: Vec<usize> = all_facts
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                super::memory_visible(
+                    self.channels.as_ref(),
+                    f.privacy,
+                    f.channel_id.as_deref(),
+                    channel_id,
+                    visibility,
+                    requester_is_owner,
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        let filtered: Vec<Fact> = filtered_indices
+            .iter()
+            .map(|&i| all_facts[i].clone())
+            .collect();
+
+        if filtered.is_empty() || query.trim().is_empty() {
+            let mut facts = filtered;
+            facts.truncate(max);
+            return Ok(facts);
+        }
+
+        // Apply semantic filtering using stored embeddings
+        let query_vec = match self.embedding_service.embed(query.to_string()).await {
+            Ok(v) => v,
+            Err(_) => {
+                let facts = lexical_relevant_facts(&filtered, query, max);
+                return Ok(facts);
+            }
+        };
+
+        let now = Utc::now();
+        let query_lower = query.to_lowercase();
+        let tokens = query_tokens(&query_lower);
+        let indexed_scores = self
+            .fact_embedding_scores(&query_vec, rows.len())
+            .await
+            .unwrap_or_default();
+        let fts_fact_ids: std::collections::HashSet<i64> = self
+            .search_memory_claims(
+                query,
+                channel_id,
+                visibility,
+                requester_is_owner,
+                max.saturating_mul(4).max(16),
+            )
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|claim| claim.source_fact_id)
+            .collect();
+        let graph_fact_ids = self
+            .graph_fact_ids_for_query(query)
+            .await
+            .unwrap_or_default();
+
+        let fallback_scores = self
+            .unindexed_fact_scores(&query_vec, filtered.iter().map(|f| f.id), &indexed_scores)
+            .await;
+        let mut candidates: Vec<(usize, f32, f32, bool)> = Vec::with_capacity(filtered.len());
+        for (fi, fact) in filtered.iter().enumerate() {
+            let freshness = fact_freshness_boost(now, fact.updated_at);
+
+            let semantic = indexed_scores
+                .get(&fact.id)
+                .or_else(|| fallback_scores.get(&fact.id))
+                .copied();
+            let lexical = if fts_fact_ids.contains(&fact.id) {
+                FACT_LEXICAL_MAX_SCORE
+            } else {
+                lexical_fallback_score(&query_lower, &tokens, fact)
+            };
+            if let Some(semantic) = semantic {
+                if semantic > FACT_SEMANTIC_MIN_SCORE {
+                    candidates.push((
+                        fi,
+                        semantic,
+                        hybrid_fact_score(
+                            fact,
+                            semantic,
+                            lexical,
+                            graph_fact_ids.contains(&fact.id),
+                            freshness,
+                        ),
+                        true,
+                    ));
+                    continue;
+                }
+                // Below semantic threshold — try lexical as fallback for keyword matches
+                let best = semantic.max(lexical);
+                let is_semantic = best == semantic;
+                candidates.push((
+                    fi,
+                    best,
+                    hybrid_fact_score(
+                        fact,
+                        semantic,
+                        lexical,
+                        graph_fact_ids.contains(&fact.id),
+                        freshness,
+                    ),
+                    is_semantic,
+                ));
+                continue;
+            }
+
+            candidates.push((
+                fi,
+                lexical,
+                hybrid_fact_score(
+                    fact,
+                    0.0,
+                    lexical,
+                    graph_fact_ids.contains(&fact.id),
+                    freshness,
+                ),
+                false,
+            ));
+        }
+        candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut relevant: Vec<Fact> = Vec::with_capacity(max.min(filtered.len()));
+        let mut seen_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for (fi, base_score, _sort_score, is_semantic) in candidates.into_iter() {
+            if relevant.len() >= max {
+                break;
+            }
+            let min_score = if is_semantic {
+                FACT_SEMANTIC_MIN_SCORE
+            } else {
+                FACT_LEXICAL_MIN_SCORE
+            };
+            if base_score > min_score {
+                let fact = filtered[fi].clone();
+                if seen_ids.insert(fact.id) {
+                    relevant.push(fact);
+                }
+            }
+        }
+
+        Ok(relevant)
+    }
+
+    async fn update_fact_privacy(&self, fact_id: i64, privacy: FactPrivacy) -> anyhow::Result<()> {
+        sqlx::query("UPDATE facts SET privacy = ? WHERE id = ?")
+            .bind(privacy.to_string())
+            .bind(fact_id)
+            .execute(&self.pool)
+            .await?;
+        if let Err(error) = self.project_fact_memory(fact_id).await {
+            tracing::warn!(%error, fact_id, "Deferred fact privacy projection");
+        }
+        Ok(())
+    }
+
+    async fn delete_fact(&self, fact_id: i64) -> anyhow::Result<()> {
+        // A canonical personal-memory record reaches the model under a
+        // synthetic negative id; forgetting it retracts that record.
+        if fact_id < 0 {
+            self.retract_canonical_projection(fact_id, "owner_forget")
+                .await?;
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339();
+        let forgotten: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT LOWER(TRIM(category)), LOWER(TRIM(key)), value FROM facts
+             WHERE id = ? AND superseded_at IS NULL",
+        )
+        .bind(fact_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(fact_id)
+            .execute(&self.pool)
+            .await?;
+        if let Err(error) = self.project_fact_memory(fact_id).await {
+            tracing::warn!(%error, fact_id, "Deferred deleted-fact projection");
+        }
+        if let Some((category, key, value)) = forgotten {
+            self.supersede_copies(fact_id, &key, &value).await?;
+            if is_owner_profile_category(&category) {
+                self.retract_owner_profile_key(&key, "owner_forget").await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_fact_by_key(&self, category: &str, key: &str) -> anyhow::Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        // Canonicalize: lowercase, trim, strip [brackets]
+        let cat_clean = category.trim().to_lowercase();
+        let key_clean = key.trim().to_lowercase();
+        let deleted: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT id, key, value FROM facts WHERE LOWER(TRIM(category)) = ? AND LOWER(TRIM(key)) = ? AND superseded_at IS NULL",
+        )
+        .bind(&cat_clean)
+        .bind(&key_clean)
+        .fetch_all(&self.pool)
+        .await?;
+        let ids: Vec<i64> = deleted.iter().map(|(id, _, _)| *id).collect();
+        let result = sqlx::query(
+            "UPDATE facts SET superseded_at = ? WHERE LOWER(TRIM(category)) = ? AND LOWER(TRIM(key)) = ? AND superseded_at IS NULL",
+        )
+        .bind(&now)
+        .bind(&cat_clean)
+        .bind(&key_clean)
+        .execute(&self.pool)
+        .await?;
+        for id in ids {
+            if let Err(error) = self.project_fact_memory(id).await {
+                tracing::warn!(%error, fact_id = id, "Deferred deleted-fact projection");
+            }
+        }
+        // The owner's profile also lives in the canonical store, which the
+        // prompt renders as its own block: forgetting the legacy row alone
+        // left the old value in front of the model.
+        for (id, key, value) in &deleted {
+            self.supersede_copies(*id, key, value).await?;
+        }
+        let canonical = is_owner_profile_category(&cat_clean)
+            && self
+                .retract_owner_profile_key(&key_clean, "owner_forget")
+                .await?;
+        Ok(result.rows_affected() > 0 || canonical)
+    }
+
+    async fn get_all_facts_with_provenance(&self) -> anyhow::Result<Vec<Fact>> {
+        let rows = sqlx::query(
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt
+             FROM facts WHERE superseded_at IS NULL ORDER BY category, key"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(Self::row_to_fact).collect())
+    }
+}
+
+/// Legacy categories whose keys describe the owner, as the canonical store
+/// projects them (`user`) and as writers name them.
+fn is_owner_profile_category(category: &str) -> bool {
+    matches!(category, "user" | "personal" | "profile")
+}

@@ -1,0 +1,53 @@
+[package]
+name = "aidaemon-client-gateway"
+description = "The Client Gateway: serves the AIdaemon Client Protocol (/client/v1) over WebSocket and HTTP so the owner's own apps drive the same turn runner, approvals and running-work list as the chat bots; internal to aidaemon, no stability promise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-client-gateway"
+readme = "README.md"
+keywords = ["agent", "gateway", "websocket", "llm"]
+categories = ["network-programming", "asynchronous"]
+# Integration tests need dev-dependencies that are not published with the crate.
+exclude = ["tests/", "benches/"]
+publish = false
+
+[dependencies]
+aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels" }
+aidaemon-client-protocol = { version = "0.20.0", path = "../client-protocol" }
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
+aidaemon-events = { version = "0.20.0", path = "../aidaemon-events" }
+aidaemon-store-sqlite = { version = "0.20.0", path = "../aidaemon-store-sqlite", features = ["client-events"] }
+aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools" }
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.23"
+axum = { version = "0.8", features = ["ws"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "7"
+hex = "0.4"
+p256 = { version = "0.14", features = ["ecdsa"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shellexpand = "3"
+sha2 = "0.11"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+aidaemon-client-core = { path = "../aidaemon-client-core" }
+aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
+rand = "0.10"
+aidaemon-channels = { path = "../aidaemon-channels", features = ["testing"] }
+futures = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-tungstenite = "0.30"

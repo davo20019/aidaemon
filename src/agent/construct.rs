@@ -1,460 +1,206 @@
-//! `Agent` constructors extracted from `agent/mod.rs` (Phase 5 decoupling).
-//!
-//! Pure relocation — no logic changes. Houses `Agent::new`, the `#[cfg(test)]`
-//! `set_test_*` overrides, and the internal `with_depth` sub-agent constructor.
+//! Builds the daemon's [`Agent`] from its parts and the daemon's host ports:
+//! its memory over the daemon stores, its file policy, OTel export and
+//! computer-use pins.
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
-
-use tokio::sync::RwLock;
-use tracing::info;
-
-use crate::config::{
-    AudioConfig, IterationLimitConfig, PathAliasConfig, PolicyConfig, SttConfig, VisionConfig,
-};
-use crate::events::EventStore;
-use crate::goal_tokens::GoalTokenRegistry;
-use crate::llm_runtime::SharedLlmRuntime;
-use crate::mcp::McpRegistry;
-use crate::runtime_ports::OutboundRouter;
-use crate::skills;
-use crate::traits::{AgentRole, StateStore, Tool};
+use std::sync::Arc;
 
 #[cfg(test)]
-use super::execution_state::ExecutionBudget;
-use super::{init_policy_tunables_once, Agent, AgentLimits, HarnessEvalConfig};
+use super::Agent;
+use super::AgentParts;
+use aidaemon_runtime::agent::{HostPorts, TraceExport};
 
-/// Runtime services shared by every agent instance.
-///
-/// Keeping these infrastructure dependencies together prevents the startup
-/// layer from having to know the internal shape of the agent's construction
-/// contract. Agent policy and per-instance configuration remain separate data.
-pub(crate) struct AgentRuntimeDependencies {
-    pub llm_runtime: SharedLlmRuntime,
-    pub state: Arc<dyn StateStore>,
-    pub event_store: Arc<EventStore>,
-    pub tools: Vec<Arc<dyn Tool>>,
+/// The daemon's root agent, unshared, for tests that change it before use
+/// (startup assembles through `aidaemon_sdk::runtime::host`).
+#[cfg(test)]
+pub(crate) fn new_agent(parts: AgentParts) -> Agent {
+    let ports = host_ports(&parts);
+    Agent::new(parts, ports)
 }
 
-/// Named root-agent construction contract. Keeping startup inputs as data
-/// prevents positional argument drift as dependencies evolve.
-pub(crate) struct AgentConstruction {
-    pub dependencies: AgentRuntimeDependencies,
-    pub model: String,
-    pub system_prompt: String,
-    pub config_path: PathBuf,
-    pub skills_dir: PathBuf,
-    pub max_depth: usize,
-    pub max_iterations: usize,
-    pub max_iterations_cap: usize,
-    pub max_response_chars: usize,
-    pub timeout_secs: u64,
-    pub max_facts: usize,
-    pub daily_token_budget: Option<u64>,
-    pub iteration_config: IterationLimitConfig,
-    pub task_timeout_secs: Option<u64>,
-    pub task_token_budget: Option<u64>,
-    pub llm_call_timeout_secs: Option<u64>,
-    pub mcp_registry: Option<McpRegistry>,
-    pub goal_token_registry: Option<GoalTokenRegistry>,
-    pub hub: Option<Weak<dyn OutboundRouter>>,
-    pub record_decision_points: bool,
-    pub context_window_config: crate::config::ContextWindowConfig,
-    pub policy_config: PolicyConfig,
-    pub path_aliases: PathAliasConfig,
-    pub inherited_project_scope: Option<String>,
-    pub specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
-    pub interactive_slot: Option<u32>,
-    pub vision_config: VisionConfig,
-    pub audio_config: AudioConfig,
-    pub stt_config: SttConfig,
-    pub harness_eval_config: HarnessEvalConfig,
+/// The daemon's ports for an agent built from `parts`.
+pub(crate) fn host_ports(parts: &AgentParts) -> HostPorts {
+    let deps = &parts.dependencies;
+    let daemon_memory = super::memory_plugin::DaemonMemory::new(
+        deps.state.clone(),
+        deps.memory_store.clone(),
+        deps.event_store.clone(),
+        deps.llm_runtime.clone(),
+        deps.side_calls.clone(),
+        parts.context_window_config.clone(),
+        parts.max_facts,
+        parts.record_decision_points,
+        &parts.system_prompt,
+    );
+    let transcript_writes = daemon_memory.writes();
+    HostPorts {
+        memory: Arc::new(daemon_memory),
+        transcript_writes,
+        file_policy: crate::tools::daemon_file_policy(parts.daemon_paths.clone()),
+        trace: Some(Arc::new(DaemonTrace)),
+        computer_use: computer_use(),
+    }
 }
 
-// impl-Agent justification: constructor, with_depth, and test setters — the only place Agent fields are wired.
-impl Agent {
-    pub(crate) fn new(input: AgentConstruction) -> Self {
-        let AgentConstruction {
-            dependencies:
-                AgentRuntimeDependencies {
-                    llm_runtime,
-                    state,
-                    event_store,
-                    tools,
-                },
-            model,
-            system_prompt,
-            config_path,
-            skills_dir,
-            max_depth,
-            max_iterations,
-            max_iterations_cap,
-            max_response_chars,
-            timeout_secs,
-            max_facts,
-            daily_token_budget,
-            iteration_config,
-            task_timeout_secs,
-            task_token_budget,
-            llm_call_timeout_secs,
-            mcp_registry,
-            goal_token_registry,
-            hub,
-            record_decision_points,
-            context_window_config,
-            policy_config,
-            path_aliases,
-            inherited_project_scope,
-            specialists,
-            interactive_slot,
-            vision_config,
-            audio_config,
-            stt_config,
-            harness_eval_config,
-        } = input;
-        init_policy_tunables_once(policy_config.uncertainty_clarify_threshold);
-        let fallback = if let Some(router) = llm_runtime.router() {
-            info!(
-                default_model = router.default_model(),
-                fallbacks = ?router.fallback_models(),
-                "Model router enabled"
-            );
-            router
-                .first_fallback()
-                .map(str::to_string)
-                .unwrap_or_else(|| model.clone())
-        } else {
-            info!("No distinct fallback models configured; fallback cascade limited");
-            model.clone()
-        };
+/// The daemon's OTel export, read when a run starts.
+struct DaemonTrace;
 
-        // Log iteration config
-        match &iteration_config {
-            IterationLimitConfig::Unlimited => {
-                info!("Iteration limit: Unlimited (natural completion)");
-            }
-            IterationLimitConfig::Soft { threshold, warn_at } => {
-                info!(threshold, warn_at, "Iteration limit: Soft");
-            }
-            IterationLimitConfig::Hard { initial, cap } => {
-                info!(initial, cap, "Iteration limit: Hard (legacy)");
-            }
-        }
+impl TraceExport for DaemonTrace {
+    fn sink(&self) -> Option<Arc<dyn aidaemon_core::EventSink>> {
+        crate::otel_export::sink()
+    }
 
-        if let Some(secs) = llm_call_timeout_secs {
-            info!(timeout_secs = secs, "LLM call watchdog timeout enabled");
-        }
+    fn observe_sent(&self, run: aidaemon_core::RunId, messages: &[serde_json::Value]) {
+        crate::otel_export::observe_sent(run, messages);
+    }
+}
 
-        Self {
-            llm_runtime,
-            state,
-            event_store,
-            tools,
-            model: RwLock::new(model),
-            fallback_model: RwLock::new(fallback),
-            system_prompt,
-            config_path,
-            skill_cache: skills::SkillCache::new(skills_dir.clone()),
-            skills_dir,
-            depth: 0,
-            limits: AgentLimits {
-                max_depth,
-                iteration_config,
-                max_iterations,
-                max_iterations_cap,
-                max_response_chars,
-                timeout_secs,
-                max_facts,
-                daily_token_budget,
-                llm_call_timeout: llm_call_timeout_secs.map(Duration::from_secs),
-                task_timeout: task_timeout_secs.map(Duration::from_secs),
-                task_token_budget,
+fn computer_use() -> Option<Arc<dyn aidaemon_runtime::host::ComputerUseState>> {
+    #[cfg(feature = "computer_use")]
+    {
+        Some(Arc::new(super::computer_use::ComputerUsePins))
+    }
+    #[cfg(not(feature = "computer_use"))]
+    None
+}
+
+/// Lower the token-pressure watermark in focused tests without weakening
+/// production defaults; the turn's post-reply compaction reads the
+/// transcript writer's own copy, rebuilt here with the lower one.
+#[cfg(test)]
+pub(crate) fn set_context_compaction_tokens_for_test(
+    agent: &mut Agent,
+    token_threshold: usize,
+    recent_tokens: usize,
+) {
+    use aidaemon_runtime::host::TurnHost as _;
+    agent.set_test_context_compaction_tokens(token_threshold, recent_tokens);
+    let writes = super::memory_plugin::DaemonMemory::new(
+        agent.state_store().clone(),
+        agent.memory_stores().clone(),
+        agent.event_store().clone(),
+        agent.llm_runtime().clone(),
+        agent.side_calls().clone(),
+        agent.turn_runtime().context_window_config.clone(),
+        0,
+        false,
+        "",
+    )
+    .writes();
+    agent.set_test_transcript_writes(writes);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::events::EventStoreForTests as _;
+    use crate::testing::MockProvider;
+    use crate::types::{ChannelContext, UserRole};
+
+    /// Startup's path: the daemon's parts and ports assembled through the
+    /// SDK's turn-runtime preset give an agent wired to itself that answers
+    /// a turn, with the engine settings and run store it was given.
+    #[tokio::test]
+    async fn the_daemon_assembles_through_the_runtime_preset() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let skills_dir = tempfile::TempDir::new().unwrap();
+        let embedding = Arc::new(crate::memory::embeddings::EmbeddingService::deterministic());
+        let state = Arc::new(
+            crate::state::SqliteStateStore::for_tests(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding,
+            )
+            .await
+            .unwrap(),
+        );
+        let event_store = Arc::new(crate::events::EventStore::new(state.pool()).await.unwrap());
+        let provider = Arc::new(MockProvider::with_responses(vec![
+            MockProvider::text_response("Assembled and answering."),
+        ]));
+        let llm_runtime = crate::llm_runtime::SharedLlmRuntime::new(
+            provider.clone() as crate::llm_runtime::ModelBackend,
+            None,
+            crate::config::ProviderKind::OpenaiCompatible,
+            "mock-model".to_string(),
+        );
+        let files = crate::config::FilesConfig::default();
+        let parts = super::AgentParts {
+            dependencies: super::super::AgentDependencies {
+                memory_store: state.memory_stores(),
+                side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
+                    llm_runtime.clone(),
+                    state.clone(),
+                    event_store.clone(),
+                ),
+                llm_runtime,
+                state: state.clone() as Arc<dyn crate::traits::StateStore>,
+                event_store,
+                tools: Vec::new(),
             },
-            model_override: RwLock::new(false),
-            mcp_registry,
-            role: AgentRole::Orchestrator,
-            task_id: None,
-            goal_id: None,
-            mandate_execution: None,
-            cancel_token: None,
-            goal_token_registry,
-            hub: RwLock::new(hub),
-            plan_store: RwLock::new(None),
-            checklist_turn_flags: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
-            schedule_approved_sessions: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
-            billing_failed_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            // Seed the in-memory ignore-set from config so a fresh start never
-            // forces `tool_choice=required` on a known-bad model. Persisted
-            // runtime-learned entries are merged in later via
-            // `load_required_tool_choice_ignored()` (async, post-construction).
-            required_tool_choice_ignored_models: Arc::new(tokio::sync::RwLock::new(
-                policy_config
-                    .required_tool_choice_ignored_models
-                    .iter()
-                    .cloned()
-                    .collect(),
-            )),
-            self_ref: RwLock::new(None),
-            context_window_config,
-            policy_config,
-            path_aliases,
-            inherited_project_scope,
-            approval_session_id: None,
-            root_tools: None, // Root agent — its own tools ARE the root tools
-            record_decision_points,
-            current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            window_keep_from_tracker: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            #[cfg(test)]
-            execution_budget_override: None,
-            specialists,
-            core_prompts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            turn_renders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            turn_anchors: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            interactive_slot,
-            session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            vision_config,
-            audio_config,
-            stt_config,
-            harness_eval: Arc::new(RwLock::new(None)),
-            harness_eval_config,
-            correction_contexts: Arc::new(tokio::sync::RwLock::new(
-                super::CorrectionContextRegistry::default(),
-            )),
-        }
-    }
-
-    /// Override agent to executor mode (depth=1) for integration tests.
-    /// This bypasses orchestrator routing so tests exercise the execution loop directly.
-    #[cfg(test)]
-    pub fn set_test_executor_mode(&mut self) {
-        self.depth = 1;
-        self.role = AgentRole::Executor;
-    }
-
-    #[cfg(test)]
-    pub fn set_test_vision_config(&mut self, vision: VisionConfig) {
-        self.vision_config = vision;
-    }
-
-    #[cfg(test)]
-    pub fn set_test_audio_config(&mut self, audio: AudioConfig) {
-        self.audio_config = audio;
-    }
-
-    #[cfg(test)]
-    pub fn set_test_stt_config(&mut self, stt: SttConfig) {
-        self.stt_config = stt;
-    }
-
-    #[cfg(test)]
-    pub async fn set_test_model(&self, model: impl Into<String>) {
-        *self.model.write().await = model.into();
-    }
-
-    /// Reset agent to orchestrator mode (depth=0) for integration tests.
-    /// Use this when testing depth-0-only code paths (e.g. "Done" synthesis).
-    #[cfg(test)]
-    pub fn set_test_orchestrator_mode(&mut self) {
-        self.depth = 0;
-        self.role = AgentRole::Orchestrator;
-    }
-
-    #[cfg(test)]
-    pub fn set_test_task_lead_mode(&mut self) {
-        self.depth = 1;
-        self.role = AgentRole::TaskLead;
-    }
-
-    #[cfg(test)]
-    pub fn set_test_task_token_budget(&mut self, budget: Option<u64>) {
-        self.limits.task_token_budget = budget;
-    }
-
-    #[cfg(test)]
-    pub fn set_test_execution_budget_override(&mut self, budget: Option<ExecutionBudget>) {
-        self.execution_budget_override = budget;
-    }
-
-    #[cfg(test)]
-    pub fn set_test_daily_token_budget(&mut self, budget: Option<u64>) {
-        self.limits.daily_token_budget = budget;
-    }
-
-    #[cfg(test)]
-    pub fn set_test_iteration_config(&mut self, config: IterationLimitConfig) {
-        self.limits.iteration_config = config;
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub fn set_test_task_timeout(&mut self, timeout: Option<Duration>) {
-        self.limits.task_timeout = timeout;
-    }
-
-    #[cfg(test)]
-    pub fn set_test_goal_id(&mut self, goal_id: Option<String>) {
-        self.goal_id = goal_id;
-    }
-
-    #[cfg(test)]
-    pub fn set_test_task_id(&mut self, task_id: Option<String>) {
-        self.task_id = task_id;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn push_test_tool(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.push(tool);
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn set_test_mandate_execution(
-        &mut self,
-        mandate_id: &str,
-        mandate_version: i64,
-        authority: crate::traits::MandateAuthority,
-        goal_id: &str,
-        root_task_id: &str,
-        root_task_attempt_id: &str,
-        attempt: &crate::traits::TaskAttempt,
-    ) {
-        self.task_id = Some(attempt.task_id.clone());
-        self.goal_id = Some(goal_id.to_string());
-        self.mandate_execution = Some(super::MandateExecutionFence {
-            mandate_id: mandate_id.to_string(),
-            mandate_version,
-            authority,
-            goal_id: goal_id.to_string(),
-            goal_run_id: attempt.goal_run_id.clone(),
-            root_task_id: root_task_id.to_string(),
-            root_task_attempt_id: root_task_attempt_id.to_string(),
-            worker_task_id: attempt.task_id.clone(),
-            attempt_id: attempt.id.clone(),
-            lease_token: attempt.lease_token.clone(),
-        });
-    }
-
-    /// Create an Agent with explicit depth/max_depth (used internally for sub-agents).
-    /// Sub-agents don't auto-route — they use whatever model was selected by the parent.
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::agent) fn with_depth(
-        llm_runtime: SharedLlmRuntime,
-        state: Arc<dyn StateStore>,
-        event_store: Arc<EventStore>,
-        tools: Vec<Arc<dyn Tool>>,
-        model: String,
-        system_prompt: String,
-        config_path: PathBuf,
-        skills_dir: PathBuf,
-        depth: usize,
-        max_depth: usize,
-        iteration_config: IterationLimitConfig,
-        max_iterations: usize,
-        max_iterations_cap: usize,
-        max_response_chars: usize,
-        timeout_secs: u64,
-        max_facts: usize,
-        task_timeout: Option<Duration>,
-        task_token_budget: Option<u64>,
-        llm_call_timeout: Option<Duration>,
-        mcp_registry: Option<McpRegistry>,
-        role: AgentRole,
-        task_id: Option<String>,
-        goal_id: Option<String>,
-        mandate_execution: Option<super::MandateExecutionFence>,
-        cancel_token: Option<tokio_util::sync::CancellationToken>,
-        goal_token_registry: Option<GoalTokenRegistry>,
-        hub: Option<Weak<dyn OutboundRouter>>,
-        schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
-        billing_failed_models: Arc<tokio::sync::RwLock<HashMap<String, Instant>>>,
-        required_tool_choice_ignored_models: Arc<tokio::sync::RwLock<HashSet<String>>>,
-        record_decision_points: bool,
-        context_window_config: crate::config::ContextWindowConfig,
-        policy_config: PolicyConfig,
-        path_aliases: PathAliasConfig,
-        inherited_project_scope: Option<String>,
-        approval_session_id: Option<String>,
-        root_tools: Option<Vec<Arc<dyn Tool>>>,
-        specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
-        vision_config: VisionConfig,
-        audio_config: AudioConfig,
-        stt_config: SttConfig,
-        harness_eval_config: HarnessEvalConfig,
-        correction_contexts: Arc<tokio::sync::RwLock<super::CorrectionContextRegistry>>,
-    ) -> Self {
-        let fallback = llm_runtime
-            .router()
-            .and_then(|router| router.first_fallback().map(str::to_string))
-            .unwrap_or_else(|| model.clone());
-        Self {
-            llm_runtime,
-            state,
-            event_store,
-            tools,
-            model: RwLock::new(model),
-            fallback_model: RwLock::new(fallback),
-            system_prompt,
-            config_path,
-            skill_cache: skills::SkillCache::new(skills_dir.clone()),
-            skills_dir,
-            depth,
-            limits: AgentLimits {
-                max_depth,
-                iteration_config,
-                max_iterations,
-                max_iterations_cap,
-                max_response_chars,
-                timeout_secs,
-                max_facts,
-                daily_token_budget: None,
-                llm_call_timeout,
-                task_timeout,
-                task_token_budget,
-            },
-            model_override: RwLock::new(false),
-            mcp_registry,
-            role,
-            task_id,
-            goal_id,
-            mandate_execution,
-            cancel_token,
-            goal_token_registry,
-            hub: RwLock::new(hub),
-            plan_store: RwLock::new(None),
-            checklist_turn_flags: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
-            schedule_approved_sessions,
-            billing_failed_models,
-            required_tool_choice_ignored_models,
-            self_ref: RwLock::new(None),
-            context_window_config,
-            policy_config,
-            path_aliases,
-            inherited_project_scope,
-            approval_session_id,
-            root_tools,
-            record_decision_points,
-            current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            window_keep_from_tracker: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            #[cfg(test)]
-            execution_budget_override: None,
-            specialists,
-            core_prompts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            turn_renders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            turn_anchors: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            // Sub-agents never pin the interactive slot — only the root agent's
-            // main generation loop does. They default to the background slot.
+            model: "mock-model".to_string(),
+            system_prompt: "You are a helpful test assistant.".to_string(),
+            config_path: std::path::PathBuf::from("config.toml"),
+            daemon_paths: Default::default(),
+            execution_backend: crate::execution::active_execution_backend(),
+            skills_dir: skills_dir.path().to_path_buf(),
+            max_depth: 3,
+            max_iterations: 10,
+            max_iterations_cap: 20,
+            max_response_chars: 8000,
+            timeout_secs: 30,
+            max_facts: 20,
+            iteration_config: crate::config::IterationLimitConfig::Unlimited,
+            task_token_budget: None,
+            spawn_family: Default::default(),
+            llm_call_timeout_secs: None,
+            mcp_registry: None,
+            goal_token_registry: None,
+            hub: None,
+            record_decision_points: false,
+            context_window_config: Default::default(),
+            policy_config: Default::default(),
+            path_aliases: Default::default(),
+            inbox_dir: None,
+            inherited_project_scope: None,
+            specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
             interactive_slot: None,
-            session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            vision_config,
-            audio_config,
-            stt_config,
-            harness_eval: Arc::new(RwLock::new(None)),
-            harness_eval_config,
-            // Shared with the spawning parent so the remediation hierarchy
-            // (task-lead + executors) all see the same registered context.
-            correction_contexts,
+            vision_config: crate::config::VisionConfig::from_files(&files),
+            audio_config: crate::config::AudioConfig::from_files(&files),
+            stt_config: crate::config::SttConfig::from_files(&files),
+            harness_eval_config: (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
+        };
+        let ports = super::host_ports(&parts);
+        let run_store = Arc::new(
+            aidaemon_store_sqlite::SqliteStore::from_pool(state.pool())
+                .await
+                .unwrap(),
+        );
+        let agent = aidaemon_sdk::runtime::host(parts, ports)
+            .engine(Default::default())
+            .run_store(run_store.clone())
+            .build()
+            .await;
+
+        crate::startup::wiring::wire_agent_cycles(&agent, None)
+            .await
+            .expect("the preset wires the agent to itself");
+        {
+            use aidaemon_runtime::host::EngineContext as _;
+            assert!(Arc::ptr_eq(agent.run_store().unwrap(), &run_store));
         }
+        let reply = agent
+            .handle_message(
+                "telegram:synthetic-user-1",
+                "Say hello.",
+                None,
+                UserRole::Owner,
+                ChannelContext::private("synthetic-user-1"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, "Assembled and answering.");
     }
 }

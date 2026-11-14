@@ -1,3 +1,6 @@
+use crate::agent::SpawnChildForTest as _;
+use crate::runtime_ports::DaemonAgentRuntime as _;
+
 include!("integration_tests/part_00.rs");
 include!("integration_tests/part_01.rs");
 include!("integration_tests/part_02.rs");
@@ -14,7 +17,17 @@ include!("integration_tests/part_12_delegation.rs");
 include!("integration_tests/part_13_dialogue_state.rs");
 include!("integration_tests/part_14_pillar_b.rs");
 include!("integration_tests/part_15_gutted_reply_retry.rs");
+include!("integration_tests/part_16_tool_result_boundary.rs");
 include!("integration_tests/scheduler_flaw.rs");
-include!("integration_tests/intent_classifier_bench.rs");
 include!("integration_tests/background_deliverable_tests.rs");
 include!("integration_tests/live_status_surface.rs");
+include!("integration_tests/live_sdk_turns.rs");
+include!("integration_tests/part_17_mid_turn_steering.rs");
+include!("integration_tests/part_18_explicit_authority.rs");
+include!("integration_tests/part_19_untrusted_content.rs");
+include!("integration_tests/part_20_owner_approvals.rs");
+include!("integration_tests/part_21_owed_requests.rs");
+include!("integration_tests/part_22_deferred_items.rs");
+include!("integration_tests/part_23_coordination.rs");
+include!("integration_tests/part_24_client_gateway.rs");
+include!("integration_tests/part_25_unattempted_work.rs");

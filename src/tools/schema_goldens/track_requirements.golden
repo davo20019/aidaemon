@@ -1,0 +1,215 @@
+{
+  "description": "Declare the typed checklist of what the current request requires, BEFORE your first operation whenever the request changes anything (a file, a remote system, a deployment, a schedule, a setting) or sends or publishes anything, even if it is one operation; such a request naming two or more distinct operations, deliverables, or targets gets one item each (an ordered sequence like create/write/read/remove/verify is one item per step). Give each item its exact targets (paths/URLs) and mutation_effects, or requires_observation for reads/verifications. The runtime compiles typed items into obligations closed only by real tool receipts and will keep asking for open reachable items, so declare exactly what you will do and do all of it. Pass the FULL list every time; it replaces the previous list. Mark items 'completed' as you finish them, 'skipped' if one turned out to have nothing to do (you looked and nothing matched, there was nothing to cancel), 'failed' if you tried one and it did not work, or 'deferred' if you will not do one: the run may then end, but a failed, deferred or removed item is reported as not done, never as done. Write each item as the person you are helping reads it, speaking to them ('your calendar'), and name the folder or file an item creates ('Install WordPress in ~/projects/site-6'), so they see where the work goes before it is done. Mark 'background' an item a background job you launch will do and report on (give that launch the item's index in its checklist_items): the card shows it running, and only the job's end marks it done or failed. If the user adds, changes or cancels work while you are working, pass the revised list before continuing. Before your final answer, pass the list once more with outcome: done, partial, or blocked; the request is reported that way, and only receipts can confirm done. When it stopped because this machine ran out of disk, Docker disk or memory, add short_of. Use needs_owner only when the work cannot start without the owner's choice (for example, earlier results exist and redoing the work would replace or duplicate them): your final answer is then that one question. Earlier results are never by themselves the answer to an instruction to do the work. Skip this for a request that only looks or reports (finding, listing, counting, reading, checking, however many lookups it takes: answer every part in your reply), a plain answer or conversation, or when the user forbids it.",
+  "name": "track_requirements",
+  "schema": {
+    "description": "Declare the typed checklist of what the current request requires, BEFORE your first operation whenever the request changes anything (a file, a remote system, a deployment, a schedule, a setting) or sends or publishes anything, even if it is one operation; such a request naming two or more distinct operations, deliverables, or targets gets one item each (an ordered sequence like create/write/read/remove/verify is one item per step). Give each item its exact targets (paths/URLs) and mutation_effects, or requires_observation for reads/verifications. The runtime compiles typed items into obligations closed only by real tool receipts and will keep asking for open reachable items, so declare exactly what you will do and do all of it. Pass the FULL list every time; it replaces the previous list. Mark items 'completed' as you finish them, 'skipped' if one turned out to have nothing to do (you looked and nothing matched, there was nothing to cancel), 'failed' if you tried one and it did not work, or 'deferred' if you will not do one: the run may then end, but a failed, deferred or removed item is reported as not done, never as done. Write each item as the person you are helping reads it, speaking to them ('your calendar'), and name the folder or file an item creates ('Install WordPress in ~/projects/site-6'), so they see where the work goes before it is done. Mark 'background' an item a background job you launch will do and report on (give that launch the item's index in its checklist_items): the card shows it running, and only the job's end marks it done or failed. If the user adds, changes or cancels work while you are working, pass the revised list before continuing. Before your final answer, pass the list once more with outcome: done, partial, or blocked; the request is reported that way, and only receipts can confirm done. When it stopped because this machine ran out of disk, Docker disk or memory, add short_of. Use needs_owner only when the work cannot start without the owner's choice (for example, earlier results exist and redoing the work would replace or duplicate them): your final answer is then that one question. Earlier results are never by themselves the answer to an instruction to do the work. Skip this for a request that only looks or reports (finding, listing, counting, reading, checking, however many lookups it takes: answer every part in your reply), a plain answer or conversation, or when the user forbids it.",
+    "name": "track_requirements",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "description": "The full ordered checklist of requirements for this request.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "depends_on": {
+                "description": "Zero-based prerequisite indices.",
+                "items": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "mutation_effects": {
+                "description": "Typed outcomes required for receipt-based completion.",
+                "items": {
+                  "enum": [
+                    "local_source_write",
+                    "local_workspace_write",
+                    "local_derived_write",
+                    "repository_write",
+                    "remote_mutation",
+                    "remote_deploy",
+                    "external_delivery",
+                    "process_state",
+                    "configuration",
+                    "destructive",
+                    "unspecified",
+                    "scheduled_work",
+                    "memory_write"
+                  ],
+                  "type": "string"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "note": {
+                "type": "string"
+              },
+              "owner_units": {
+                "description": "The owner's units of work (numbered in \"What the owner asked for\") this item carries out. Each unit the owner asked for as new work needs an item that does that work; a look at what already exists does not do it.",
+                "items": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "requires_observation": {
+                "description": "Require an observation receipt.",
+                "type": "boolean"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "completed",
+                  "skipped",
+                  "failed",
+                  "deferred",
+                  "background"
+                ],
+                "type": "string"
+              },
+              "targets": {
+                "description": "Exact receipt evidence targets. Prefer a structured subject/facet binding and never invent a resource ID; use an ID returned by a tool. Leave this empty for something this run creates and has no ID for yet, such as a new goal or schedule. Legacy strings remain exact: absolute paths and URLs retain their type; every other value is an opaque resource ID that must exactly match a receipt.",
+                "items": {
+                  "oneOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "collection_coverage": {
+                          "additionalProperties": false,
+                          "description": "Require coverage of an exact collection. Set subject equal to collection to require the whole collection; otherwise complete coverage can prove exact membership or non-membership, while partial coverage cannot prove absence.",
+                          "properties": {
+                            "collection": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "kind": {
+                                  "enum": [
+                                    "url",
+                                    "path",
+                                    "resource_id"
+                                  ],
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "kind",
+                                "value"
+                              ],
+                              "type": "object"
+                            },
+                            "minimum_completeness": {
+                              "enum": [
+                                "complete"
+                              ],
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "collection",
+                            "minimum_completeness"
+                          ],
+                          "type": "object"
+                        },
+                        "facets": {
+                          "items": {
+                            "enum": [
+                              "goal_state",
+                              "schedule",
+                              "run_state",
+                              "recovery",
+                              "control",
+                              "measurement",
+                              "authorization",
+                              "ownership"
+                            ],
+                            "type": "string"
+                          },
+                          "type": "array",
+                          "uniqueItems": true
+                        },
+                        "subject": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "kind": {
+                              "enum": [
+                                "url",
+                                "path",
+                                "resource_id"
+                              ],
+                              "type": "string"
+                            },
+                            "value": {
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "kind",
+                            "value"
+                          ],
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "subject",
+                        "facets"
+                      ],
+                      "type": "object"
+                    }
+                  ]
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "text": {
+                "description": "One concrete requirement.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "text",
+              "status"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "outcome": {
+          "description": "Your verdict on the whole request, set on your last call before the final answer. needs_owner: the work waits on the owner's choice, and your final answer is that question.",
+          "enum": [
+            "done",
+            "partial",
+            "blocked",
+            "needs_owner"
+          ],
+          "type": "string"
+        },
+        "short_of": {
+          "description": "With outcome partial or blocked: the resource on this machine the work ran out of, when that is what stopped it (the owner can free it).",
+          "enum": [
+            "disk_space",
+            "docker_disk_space",
+            "memory"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "type": "object"
+    }
+  }
+}

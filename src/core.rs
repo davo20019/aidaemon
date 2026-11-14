@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use tracing::info;
 
-use crate::agent::Agent;
 use crate::channels::{ChannelHub, SessionMap};
 use crate::config::{AppConfig, AudioConfig, SttConfig, VisionConfig};
 use crate::llm_runtime::SharedLlmRuntime;
@@ -15,7 +14,11 @@ use crate::startup::{
 use crate::tasks::TaskRegistry;
 use crate::triggers::{self, TriggerManager};
 
-pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::Result<()> {
+pub async fn run(
+    config: AppConfig,
+    config_path: std::path::PathBuf,
+    daemon_paths: crate::tools::DaemonPaths,
+) -> anyhow::Result<()> {
     let mut config = config;
 
     // Single-instance guard: refuse to start if another daemon already holds the
@@ -30,8 +33,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     }
 
     crate::startup::db_security::enforce_database_encryption(&mut config, &config_path).await?;
+    crate::otel_export::start(&config.telemetry);
 
-    let write_consistency_thresholds = config.policy.write_consistency.thresholds();
     let queue_policy = config.daemon.queue_policy.normalized();
 
     let queue_telemetry = Arc::new(QueueTelemetry::new_with_policy(
@@ -42,14 +45,32 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         queue_policy.overload_ratio,
     ));
 
+    // The one execution environment of this process. Built here, once, and
+    // passed to everything that needs it: approvals, process handles and file
+    // observations can never be replayed against a different target.
+    let execution_backend =
+        crate::execution::build_execution_backend(&config.execution, &config_path).await?;
+    info!(
+        backend = execution_backend.kind().as_str(),
+        backend_id = execution_backend.id(),
+        workspace = execution_backend.workspace_root().as_str(),
+        confined = !execution_backend.allows_outside_workspace(),
+        "Initialized agent execution environment"
+    );
+
     let stores::StoreBundle {
         embedding_service,
         state,
+        memory_store,
         pool,
         event_store,
         plan_store,
         health_store,
-    } = stores::build_stores(&config).await?;
+    } = stores::build_stores(
+        &config,
+        crate::execution::LexicalPaths::of(&*execution_backend),
+    )
+    .await?;
 
     let crate::providers::factory::ProviderRouterBundle {
         provider,
@@ -57,6 +78,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         router,
         provider_kind,
         failover_targets,
+        models,
     } = crate::providers::factory::build_provider_router(&config)?;
     let llm_runtime = SharedLlmRuntime::new_with_failovers(
         provider.clone(),
@@ -64,25 +86,54 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         provider_kind,
         model.clone(),
         failover_targets,
+    )
+    .with_models(models);
+    // The one door for model calls made outside the agent loop.
+    let side_calls = crate::llm_runtime::gateway::SideCallGateway::new(
+        llm_runtime.clone(),
+        state.clone(),
+        event_store.clone(),
+    );
+    // The optional decision layer; off unless `[decisions]` configures it.
+    // A Gemini decision backend with no key of its own uses the key of a
+    // configured `google_genai` provider.
+    side_calls.set_decisions(
+        crate::llm_runtime::decide::DecisionLayer::from_config_with_key(
+            &config.decisions,
+            config.gemini_provider_api_key().as_deref(),
+        ),
     );
 
     let memory_pipeline::MemoryPipelineBundle {
         consolidator: _consolidator,
         pruner,
-        memory_manager,
+        memory_jobs,
     } = memory_pipeline::build_memory_pipeline(
         &config,
         state.clone(),
+        memory_store.clone(),
         pool.clone(),
         event_store.clone(),
         plan_store.clone(),
         llm_runtime.clone(),
+        side_calls.clone(),
         embedding_service.clone(),
     );
 
+    let memory = crate::agent::memory_plugin::configured_memory(
+        &config.memory,
+        &llm_runtime,
+        &side_calls,
+        state.clone(),
+        pool.clone(),
+    )
+    .await;
+
+    // Paths in the configured file inbox are shown to the owner by name.
+    aidaemon_tools::internal_markers::register_inbox_dir(&config.files.inbox_dir);
+
     let startup_tools::ToolSetup {
         tools,
-        execution_backend: _execution_backend,
         approval_tx,
         approval_rx,
         media_rx,
@@ -96,11 +147,17 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     } = startup_tools::setup_tools(
         &config,
         &config_path,
+        daemon_paths.clone(),
         startup_tools::ToolSetupDependencies {
+            execution_backend: execution_backend.clone(),
             state: state.clone(),
+            memory: startup_tools::ToolMemoryAccess {
+                store: memory_store.clone(),
+                own_memory: memory.own_memory(),
+            },
             pool: pool.clone(),
             event_store: event_store.clone(),
-            llm_runtime: llm_runtime.clone(),
+            side_calls: side_calls.clone(),
             health_store: health_store.clone(),
             approval_capacity: queue_policy.approval_capacity,
             media_capacity: queue_policy.media_capacity,
@@ -119,9 +176,14 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         crate::tools::track_requirements::StableSubjectVocabulary::from_tools(&tools);
     let track_requirements_tool = Arc::new(
         crate::tools::track_requirements::TrackRequirementsTool::new(plan_store.clone())
-            .with_stable_subjects(stable_subjects),
+            .with_stable_subjects(stable_subjects)
+            .with_state(state.clone()),
     );
-    tools.push(track_requirements_tool.clone());
+    aidaemon_runtime::tool_manifest::push(
+        &mut tools,
+        aidaemon_runtime::tool_manifest::ToolContext::Global,
+        track_requirements_tool.clone(),
+    );
 
     // 7. Agent (with deferred spawn tool wiring to break the circular dep)
     let skill_names: Vec<String> = if let Some(ref dir) = skills_dir {
@@ -133,8 +195,12 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         Vec::new()
     };
     let custom_persona = startup_prompt::load_agent_persona(&config, &config_path)?;
-    let base_system_prompt =
-        startup_prompt::build_base_system_prompt(&config, &skill_names, custom_persona.as_deref())?;
+    let base_system_prompt = startup_prompt::build_base_system_prompt(
+        &config,
+        &skill_names,
+        custom_persona.as_deref(),
+        &memory.prompt,
+    )?;
 
     let llm_call_timeout_secs = if config.daemon.watchdog.enabled {
         Some(config.daemon.watchdog.llm_call_timeout_secs)
@@ -161,9 +227,13 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         specialists_dir.as_deref(),
     ));
 
-    let agent = Arc::new(Agent::new(crate::agent::AgentConstruction {
-        dependencies: crate::agent::AgentRuntimeDependencies {
+    let sdk_engine = crate::startup::engine::settings_from_config(&config, &*execution_backend);
+
+    let parts = crate::agent::AgentParts {
+        dependencies: crate::agent::AgentDependencies {
+            memory_store: memory_store.clone(),
             llm_runtime: llm_runtime.clone(),
+            side_calls: side_calls.clone(),
             state: state.clone(),
             event_store: event_store.clone(),
             tools,
@@ -171,6 +241,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         model,
         system_prompt: base_system_prompt,
         config_path: config_path.clone(),
+        daemon_paths,
+        execution_backend: execution_backend.clone(),
         skills_dir: skills_dir.clone().unwrap_or_default(),
         max_depth: config.subagents.max_depth,
         max_iterations: config.subagents.max_iterations,
@@ -178,10 +250,15 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         max_response_chars: config.subagents.max_response_chars,
         timeout_secs: config.subagents.timeout_secs,
         max_facts: config.state.max_facts,
-        daily_token_budget: config.state.daily_token_budget,
         iteration_config: config.subagents.effective_iteration_limit(),
-        task_timeout_secs: config.subagents.task_timeout_secs,
         task_token_budget: config.subagents.task_token_budget,
+        spawn_family: crate::agent::authority::SpawnFamilyLimits {
+            max_concurrent: config.subagents.max_concurrent,
+            max_total: config.subagents.max_per_request,
+            coordination: config.subagents.coordination,
+            max_escalations_per_child: config.subagents.max_escalations_per_child,
+            max_escalations_per_request: config.subagents.max_escalations_per_request,
+        },
         llm_call_timeout_secs,
         mcp_registry: Some(mcp_registry.clone()),
         goal_token_registry: Some(goal_token_registry.clone()),
@@ -190,6 +267,9 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         context_window_config: config.state.context_window.clone(),
         policy_config: config.policy.clone(),
         path_aliases: config.path_aliases.clone(),
+        inbox_dir: Some(std::path::PathBuf::from(
+            shellexpand::tilde(&config.files.inbox_dir).to_string(),
+        )),
         inherited_project_scope: None,
         specialists,
         // Pin the interactive generation loop to the configured slot only when
@@ -204,20 +284,35 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         audio_config: AudioConfig::from_files(&config.files),
         stt_config: SttConfig::from_files(&config.files),
         harness_eval_config: (&config.diagnostics.harness_eval).into(),
-    }));
+    };
+    let ports = crate::agent::host_ports(&parts);
+    let own_memory = memory.own_memory();
+    let memory_services = memory.services;
+    // The daemon runs on the SDK's turn-runtime preset: the agent host and
+    // its turn engine, with the daemon's ports.
+    let agent = aidaemon_sdk::runtime::host(parts, ports)
+        .engine(sdk_engine)
+        // The kernel's run store shares the daemon's pool, so runs inherit
+        // its encryption and WAL settings and live in the same database file.
+        .run_store(Arc::new(
+            aidaemon_store_sqlite::SqliteStore::from_pool(pool.clone())
+                .await
+                .map_err(|error| anyhow::anyhow!("kernel run store: {error}"))?,
+        ))
+        .memory(memory.plugin)
+        .build()
+        .await;
+    // Owner-approval cards from the kernel go out on the same channel the
+    // tools' cards use.
+    agent.owner_approvals().set_broker(approval_tx.clone());
 
     // Close the deferred Agent ↔ SpawnAgentTool + agent self-reference cycles.
     crate::startup::wiring::wire_agent_cycles(&agent, spawn_tool.as_ref()).await?;
 
-    // Merge persisted runtime-learned "ignores tool_choice=required" models into
-    // the config-seeded in-memory set, so a model that melted down once stays
-    // flagged across restarts (the 264s gemma meltdown never re-arms).
-    agent.load_required_tool_choice_ignored().await;
-
     // 8. Event bus for triggers
     let (event_tx, event_rx) = triggers::event_bus(queue_policy.trigger_event_capacity);
     // 9. Triggers
-    let trigger_manager = Arc::new(TriggerManager::new(config.triggers.clone(), event_tx));
+    let trigger_manager = Arc::new(TriggerManager::new(config.triggers.settings(), event_tx));
     trigger_manager.spawn();
 
     // 9b. Scheduler deprecated — evergreen goals replace it.
@@ -227,6 +322,13 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     startup_migrations::maybe_run_legacy_system_maintenance_goal_migration(
         state.clone(),
         pool.clone(),
+    )
+    .await;
+
+    // Background sub-agents do not survive a restart: tell their chats. Done
+    // before channels start, so nothing running now can be mistaken for lost.
+    aidaemon_runtime::helper_run::delivery::report_interrupted_background_children(
+        &(state.clone() as Arc<dyn crate::traits::NotificationStore>),
     )
     .await;
 
@@ -242,14 +344,18 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             pool: pool.clone(),
             event_store: event_store.clone(),
             pruner: pruner.clone(),
-            memory_manager: memory_manager.clone(),
+            memory_jobs: memory_jobs.clone(),
+            own_memory,
+            memory_store: memory_store.clone(),
+            memory_services,
             wake_rx,
             inbox_dir: inbox_dir.clone(),
             skills_dir: skills_dir.clone(),
-            llm_runtime: llm_runtime.clone(),
+            side_calls,
             oauth_gateway: oauth_gateway.clone(),
             watchdog_stale_threshold_secs,
             goal_token_registry: goal_token_registry.clone(),
+            execution_backend: execution_backend.clone(),
             terminal_tool: terminal_tool.clone(),
         },
     )
@@ -265,24 +371,24 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // 10b. Task registry for tracking background agent work
     let task_registry = Arc::new(TaskRegistry::new(50));
+    agent.set_task_registry(task_registry.clone());
 
     // 11. Channels
-    let channel_agent: Arc<dyn crate::runtime_ports::ChannelAgentRuntime> = agent.clone();
-    let channel_bundle = startup_channels::build_channels(
-        &config,
-        crate::channels::ChannelRuntimeDeps {
-            agent: channel_agent,
-            config_path: config_path.clone(),
-            session_map: session_map.clone(),
-            task_registry: task_registry.clone(),
-            files_enabled: config.files.enabled,
-            inbox_dir: std::path::PathBuf::from(&inbox_dir),
-            max_file_size_mb: config.files.max_file_size_mb,
-            state: state.clone() as Arc<dyn crate::traits::StateStore>,
-            watchdog_stale_threshold_secs,
-        },
-    )
-    .await;
+    let channel_agent: Arc<dyn crate::runtime_ports::DaemonAgentRuntime> = agent.clone();
+    let channel_deps = crate::channels::ChannelRuntimeDeps {
+        agent: channel_agent,
+        config_path: config_path.clone(),
+        session_map: session_map.clone(),
+        task_registry: task_registry.clone(),
+        files_enabled: config.files.enabled,
+        inbox_dir: std::path::PathBuf::from(&inbox_dir),
+        max_file_size_mb: config.files.max_file_size_mb,
+        state: state.clone() as Arc<dyn crate::traits::StateStore>,
+        watchdog_stale_threshold_secs,
+        // Empty until the Client Gateway (when enabled) starts watching.
+        watch: Default::default(),
+    };
+    let channel_bundle = startup_channels::build_channels(&config, channel_deps.clone()).await;
 
     // 12. Channel Hub — routes approvals, media, and notifications
     let hub = Arc::new(
@@ -302,14 +408,46 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         plan_store.clone(),
     )
     .await?;
-    crate::startup::nodes::start(&config, pool.clone(), agent.clone(), hub.clone()).await?;
+    let mut gateway_endpoints = crate::startup::exposure::endpoints(&config);
+    crate::startup::nodes::start(
+        &config,
+        pool.clone(),
+        agent.clone(),
+        hub.clone(),
+        gateway_endpoints.node.clone(),
+    )
+    .await?;
+    crate::startup::client_gateway::start(
+        &config,
+        pool.clone(),
+        &channel_deps,
+        hub.clone(),
+        approval_tx.clone(),
+        gateway_endpoints.client.clone(),
+        crate::startup::client_gateway::SystemSources {
+            started_at: std::time::Instant::now(),
+            models: config.provider.models.clone(),
+            pool: pool.clone(),
+            events: event_store.clone(),
+            health: health_store.clone(),
+            jobs: heartbeat_telemetry,
+            queues: queue_telemetry.clone(),
+            memory: memory_store.clone(),
+        },
+    )
+    .await?;
     // Give the agent its plan_store handle so the completion phase can read the
     // active checklist for soft verification + recap (deferred to avoid touching
     // the large Agent::new signature and all subagent spawn call sites).
     agent.set_plan_store(plan_store.clone()).await;
 
     // Start the heartbeat coordinator now that hub and agent are available.
-    startup_runtime::start_heartbeat_coordinator(heartbeat_opt, &hub, &agent);
+    let shutdown = aidaemon_core::CancellationToken::new();
+    // Tunnels start after both gateways and stop with the daemon.
+    let exposure =
+        crate::startup::exposure::start(&config, &mut gateway_endpoints, shutdown.clone());
+    let background =
+        startup_runtime::start_heartbeat_coordinator(heartbeat_opt, &hub, &agent, shutdown.clone());
 
     // Give all channels a reference to the hub for dynamic bot registration
     let weak_hub = Arc::downgrade(&hub);
@@ -351,11 +489,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             state: state.clone(),
             pool: pool.clone(),
             event_store: event_store.clone(),
-            health_store: health_store.clone(),
-            heartbeat_telemetry: heartbeat_telemetry.clone(),
             oauth_gateway: oauth_gateway.clone(),
-            write_consistency_thresholds,
-            queue_telemetry: queue_telemetry.clone(),
             heartbeat_wake_tx: wake_tx.clone(),
         },
     );
@@ -390,20 +524,128 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // 16. Start channels
     info!("Starting aidaemon v{}", env!("CARGO_PKG_VERSION"));
-    channel_bundle.spawn_all();
+    let startup_recipients = channel_bundle.startup_recipients(&config);
+    channel_bundle.spawn_all(shutdown.clone());
+    {
+        // Failover into a dead key is only discovered during an outage.
+        let provider = config.provider.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            let rejected = crate::channels::set_key::rejected_keys(&provider).await;
+            if !rejected.is_empty() {
+                tracing::warn!(?rejected, "Configured provider keys were rejected");
+                let message = format!(
+                    "A configured model provider won't work:\n{}\nOn Telegram, /setkey replaces a key.",
+                    rejected.join("\n")
+                );
+                if let Some((bot, users)) = startup_recipients {
+                    use crate::traits::HubChannel;
+                    for user in users {
+                        if let Err(error) = bot.send_text(&user.to_string(), &message).await {
+                            tracing::warn!(%error, "Failed to send the rejected-key warning");
+                        }
+                    }
+                }
+            }
+        });
+    }
     #[cfg(feature = "terminal-bridge")]
-    crate::terminal_bridge::spawn_if_configured(&config, state.clone());
+    crate::startup::terminal_bridge::spawn_if_configured(&config, state.clone());
 
     // Wait for shutdown signal (ctrl+c), then gracefully pause plans
-    info!("All subsystems started, waiting for shutdown signal (ctrl+c)");
-    tokio::signal::ctrl_c().await.ok();
+    info!("All subsystems started, waiting for a shutdown signal");
+    shutdown_signal().await;
     info!("Shutdown signal received");
+
+    // Stop launching background work and let what is running finish.
+    shutdown.cancel();
+    if let Some(background) = background {
+        let _ = background.await;
+    }
+    if let Some(exposure) = exposure {
+        exposure.join().await;
+    }
 
     // Shut down all MCP server processes
     info!("Shutting down MCP servers...");
     mcp_registry.shutdown_all().await;
 
     Ok(())
+}
+
+/// Ctrl-C, or the SIGTERM a service manager sends on restart.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Could not listen for SIGTERM");
+                tokio::signal::ctrl_c().await.ok();
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await.ok();
+}
+
+/// Write a readable copy of the daemon's memory to `directory`. The directory
+/// must not exist yet, and only the owner can read what is written. The
+/// database is opened read-only, so this is safe while the daemon runs.
+pub async fn run_memory_export(
+    config: AppConfig,
+    directory: std::path::PathBuf,
+) -> anyhow::Result<Vec<(String, usize)>> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let key = config
+        .state
+        .encryption_key
+        .clone()
+        .or_else(|| std::env::var("AIDAEMON_ENCRYPTION_KEY").ok())
+        .filter(|key| !key.trim().is_empty());
+    let mut options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&config.state.db_path)
+        .read_only(true)
+        .busy_timeout(std::time::Duration::from_secs(30));
+    #[cfg(feature = "encryption")]
+    if let Some(key) = &key {
+        options = options.pragma("key", format!("'{}'", key.trim().replace('\'', "''")));
+    }
+    #[cfg(not(feature = "encryption"))]
+    let _ = key;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    let files = aidaemon_memory::sqlite::SqliteMemory::new(
+        pool,
+        Arc::new(crate::startup::stores::daemon_embeddings()?),
+    )
+    .export_readable()
+    .await?;
+
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .map_err(|error| anyhow::anyhow!("cannot create {}: {error}", directory.display()))?;
+    let mut written = Vec::new();
+    for file in files {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(file.name))?;
+        std::io::Write::write_all(&mut output, file.content.as_bytes())?;
+        written.push((file.name.to_string(), file.entries));
+    }
+    Ok(written)
 }
 
 /// Run all startup database migrations and exit.
@@ -417,7 +659,8 @@ pub async fn run_migrations_only(
     let mut config = config;
     crate::startup::db_security::enforce_database_encryption(&mut config, &config_path).await?;
 
-    let stores::StoreBundle { state, pool, .. } = stores::build_stores(&config).await?;
+    let stores::StoreBundle { state, pool, .. } =
+        stores::build_stores(&config, crate::execution::LexicalPaths::daemon_host()).await?;
     startup_migrations::maybe_run_legacy_system_maintenance_goal_migration(state, pool).await;
 
     Ok(())
@@ -428,11 +671,11 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::startup::migrations::{
-        retire_legacy_system_maintenance_goals, LEGACY_KNOWLEDGE_MAINTENANCE_GOAL_DESC,
-        LEGACY_MEMORY_HEALTH_GOAL_DESC, LEGACY_SYSTEM_SESSION_ID,
+        LEGACY_KNOWLEDGE_MAINTENANCE_GOAL_DESC, LEGACY_MEMORY_HEALTH_GOAL_DESC,
+        LEGACY_SYSTEM_SESSION_ID, retire_legacy_system_maintenance_goals,
     };
     use crate::startup::prompt::{
-        build_base_system_prompt, load_agent_persona, MAX_PERSONA_FILE_BYTES,
+        MAX_PERSONA_FILE_BYTES, build_base_system_prompt, load_agent_persona,
     };
     use crate::state::SqliteStateStore;
     use crate::traits::store_prelude::*;
@@ -441,9 +684,9 @@ mod tests {
     async fn setup_state() -> Arc<SqliteStateStore> {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().to_str().unwrap().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service = Arc::new(EmbeddingService::deterministic());
         let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+            SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)
                 .await
                 .unwrap(),
         );
@@ -740,10 +983,150 @@ primary = "gpt-4o"
         )
     }
 
+    /// The export runs beside a live daemon: it must not need the write lock.
+    #[tokio::test]
+    async fn memory_export_works_while_the_database_is_being_written() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let state = crate::state::SqliteStateStore::for_tests(
+            db.to_str().unwrap(),
+            100,
+            None,
+            Arc::new(crate::memory::embeddings::EmbeddingService::deterministic()),
+        )
+        .await
+        .unwrap();
+        let mut writer = state.pool().acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let mut config = minimal_config();
+        config.state.db_path = db.to_str().unwrap().to_string();
+        config.state.encryption_key = None;
+        let output = dir.path().join("export");
+
+        let written = run_memory_export(config.clone(), output.clone())
+            .await
+            .unwrap();
+
+        assert!(written.iter().any(|(name, _)| name == "facts.md"));
+        let mode = std::fs::metadata(output.join("facts.md"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(
+            run_memory_export(config, output).await.is_err(),
+            "never writes into an existing directory"
+        );
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+    }
+
+    #[test]
+    fn the_base_prompt_says_only_what_the_memory_system_says() {
+        use crate::startup::prompt::MemoryPrompt;
+        let config = minimal_config();
+        let prompt =
+            |memory: MemoryPrompt| build_base_system_prompt(&config, &[], None, &memory).unwrap();
+
+        let own = prompt(MemoryPrompt::DaemonsOwn);
+        assert!(own.contains("`remember_fact`"));
+        assert!(own.contains("manage_people"));
+
+        let none = prompt(MemoryPrompt::Replaced(None));
+        assert!(!none.contains("## Memory"));
+        let guided = prompt(MemoryPrompt::Replaced(Some("Keep a journal.".to_string())));
+        assert!(guided.contains("## Memory\nKeep a journal."));
+        for replaced in [none, guided] {
+            assert!(!replaced.contains("remember_fact"));
+            assert!(!replaced.contains("manage_people"));
+        }
+    }
+
+    /// Live 2026-11-12: a run reported "can't connect to Docker" with
+    /// OrbStack stopped instead of starting it. The prompt says to remove an
+    /// obstacle within the agent's authority before reporting it.
+    #[test]
+    fn the_base_prompt_says_to_remove_obstacles_first() {
+        use crate::startup::prompt::MemoryPrompt;
+        let prompt =
+            build_base_system_prompt(&minimal_config(), &[], None, &MemoryPrompt::DaemonsOwn)
+                .unwrap();
+        assert!(prompt.contains(&format!(
+            "- **Remove obstacles you can.** {}\n",
+            aidaemon_policies::OBSTACLE_GUIDANCE
+        )));
+    }
+
+    /// Live 2026-11-13: an install request sent again became "verify the
+    /// existing project and report its original install time", and the
+    /// helper gave an earlier run's 5m 15s as if current. The prompt says a
+    /// repeated request is new work and that a measurement belongs to the
+    /// run that made it.
+    #[test]
+    fn the_base_prompt_redoes_a_repeated_request_and_keeps_measurements_with_their_run() {
+        use crate::startup::prompt::MemoryPrompt;
+        let prompt =
+            build_base_system_prompt(&minimal_config(), &[], None, &MemoryPrompt::DaemonsOwn)
+                .unwrap();
+        assert!(prompt.contains(
+            "When the owner asks again for work you already did, here or earlier, do the work \
+             again as asked, with fresh names next to what already exists, unless they say \
+             otherwise."
+        ));
+        assert!(prompt.contains("never give an earlier run's measurement as this run's result"));
+        // A helper reports no time at all: its run's time is the daemon's
+        // measurement, added under its report.
+        assert!(
+            include_str!("../specialists/_executor_base.md")
+                .contains(aidaemon_runtime::specialists::compose::OWN_DURATION_RULE)
+        );
+    }
+
+    /// Live 2026-11-13: a clear request for two fresh installs got "Did you
+    /// want a fresh pair of installs?" because earlier ones existed, and a
+    /// later turn gave install times it then retracted. The prompt says to
+    /// do a clear request the non-destructive way and say so, asking only
+    /// when existing work would change, and to state durations only from
+    /// measurements in the conversation.
+    #[test]
+    fn the_base_prompt_does_clear_requests_and_states_only_measured_durations() {
+        use crate::startup::prompt::MemoryPrompt;
+        let prompt =
+            build_base_system_prompt(&minimal_config(), &[], None, &MemoryPrompt::DaemonsOwn)
+                .unwrap();
+        assert!(prompt.contains(
+            "- **Do clear requests without asking.** When the request is clear and the way to do \
+             it without harming anything that exists is obvious"
+        ));
+        assert!(
+            prompt
+                .contains("Ask first only when the choices would destroy or change existing work.")
+        );
+        assert!(prompt.contains(&format!(
+            "A result's line starting \"{}\" is the daemon's own measurement",
+            aidaemon_runtime::turn::sliding_window::MEASURED_TIMING_MARK.trim_end()
+        )));
+        assert!(prompt.contains("say it wasn't measured rather than giving or recalling a number"));
+        assert!(prompt.contains(
+            "Never state a duration or a time you did not receive from a measurement: quote a \
+             measured value exactly as given"
+        ));
+    }
+
     #[test]
     fn base_prompt_uses_default_agent_identity() {
         let config = minimal_config();
-        let prompt = build_base_system_prompt(&config, &[], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &config,
+            &[],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
         assert!(prompt.contains(
             "You are aidaemon, a personal AI assistant with persistent memory running on aidaemon"
         ));
@@ -753,9 +1136,17 @@ primary = "gpt-4o"
     #[test]
     fn base_prompt_is_outcome_driven_instead_of_tool_count_driven() {
         let config = minimal_config();
-        let prompt = build_base_system_prompt(&config, &[], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &config,
+            &[],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
 
-        assert!(prompt.contains("**Outcome-driven autonomy — when to continue and when to stop:**"));
+        assert!(
+            prompt.contains("**Outcome-driven autonomy — when to continue and when to stop:**")
+        );
         assert!(prompt.contains(
             "Treat the user's requested outcome as the unit of work, not an individual message, command, or tool call"
         ));
@@ -779,6 +1170,7 @@ primary = "gpt-4o"
             &config,
             &[],
             Some("# Role\nBe a candid research partner.\n\n# Style\nBe concise."),
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
         )
         .unwrap();
 
@@ -828,7 +1220,13 @@ primary = "gpt-4o"
     #[test]
     fn base_prompt_replaces_catalog_with_pointer() {
         let config = minimal_config();
-        let prompt = build_base_system_prompt(&config, &[], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &config,
+            &[],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
 
         // Pointer text is present.
         assert!(
@@ -860,11 +1258,18 @@ primary = "gpt-4o"
             ));
         }
         assert!(prompt.contains(
-            "| Run build/test/lint | run_command | terminal for arbitrary commands or commands requiring approval |"
+            "| Run build/test/lint | terminal (allowlisted build, lint and read-only git commands run confined without asking) | — |"
         ));
         assert!(prompt.contains(
-            "| Ongoing stewardship where timing and actions should adapt to evidence | manage_mandates"
+            "| Watching automation: ongoing stewardship where timing and actions should adapt to evidence | manage_mandates"
         ));
+        assert!(prompt.contains(
+            "| List the user's automations (every kind), show, edit (reschedule, rename, snooze), pause/resume/cancel one by name | manage_automations"
+        ));
+        assert!(prompt.contains(
+            "| Run scheduled work now, read its run history or last failure, set its budget, run instructions or workspace | manage_automations"
+        ));
+        assert!(!prompt.contains("scheduled_goal_runs"));
         assert!(prompt.contains("Do not use keyword filters"));
         assert!(prompt.contains("manage_mandates(action=\"draft\")"));
     }
@@ -885,9 +1290,18 @@ primary = "gpt-4o"
 enabled = true
 "#,
         );
-        let prompt = build_base_system_prompt(&enabled, &[], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &enabled,
+            &[],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
         assert!(prompt.contains("## CLI Agent Delegation"));
-        assert!(prompt.contains("Always set working_dir"));
+        // When to choose it comes from what its sandbox can do.
+        assert!(prompt.contains("Its sandbox cannot reach the network"));
+        assert!(prompt.contains("goes to spawn_agent"));
+        assert!(prompt.contains("`working_dir`"));
 
         let disabled = parse_config(
             r#"
@@ -903,7 +1317,13 @@ primary = "gpt-4o"
 enabled = false
 "#,
         );
-        let prompt = build_base_system_prompt(&disabled, &[], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &disabled,
+            &[],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
         assert!(!prompt.contains("## CLI Agent Delegation"));
     }
 
@@ -930,7 +1350,13 @@ allowed_domains = ["api.twitter.com"]
         );
 
         // Only "twitter" has a matching skill guide; "stripe" is missing one.
-        let prompt = build_base_system_prompt(&config, &["twitter".to_string()], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &config,
+            &["twitter".to_string()],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
         assert!(prompt.contains("## API Runtime Context"));
         assert!(
             prompt.contains("Available manual HTTP auth profiles: stripe, twitter")
@@ -947,7 +1373,13 @@ allowed_domains = ["api.twitter.com"]
     #[test]
     fn api_runtime_context_reports_none_when_empty() {
         let config = minimal_config();
-        let prompt = build_base_system_prompt(&config, &[], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &config,
+            &[],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
         assert!(prompt.contains("Available manual HTTP auth profiles: none."));
         assert!(prompt.contains("Profiles missing API guides: none."));
     }

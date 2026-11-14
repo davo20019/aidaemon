@@ -1,0 +1,141 @@
+//! Text helpers shared by tools and event payloads.
+
+/// Truncates a string to at most `max_chars` characters, adding "..." if truncated.
+///
+/// This function is UTF-8 safe and respects character boundaries, avoiding panics
+/// when truncating strings that contain multi-byte characters (like emojis).
+///
+/// # Arguments
+/// * `s` - The string to truncate
+/// * `max_chars` - Maximum number of characters (not bytes) in the result, including the "..." suffix
+///
+/// # Examples
+/// ```
+/// use aidaemon_tools::text::truncate_str;
+///
+/// assert_eq!(truncate_str("hello", 10), "hello");
+/// assert_eq!(truncate_str("hello world", 8), "hello...");
+/// assert_eq!(truncate_str("🦀🦀🦀🦀🦀", 4), "🦀...");
+/// ```
+pub fn truncate_str(s: &str, max_chars: usize) -> String {
+    truncate_impl(s, max_chars, "...")
+}
+
+/// Truncates a string to at most `max_chars` characters, adding "\n... (truncated)" if truncated.
+///
+/// Similar to [`truncate_str`], but uses a more verbose suffix suitable for multi-line
+/// CLI output where the truncation should be clearly visible on its own line.
+///
+/// This function is UTF-8 safe and respects character boundaries.
+///
+/// # Arguments
+/// * `s` - The string to truncate
+/// * `max_chars` - Maximum number of characters (not bytes) before the suffix
+pub fn truncate_with_note(s: &str, max_chars: usize) -> String {
+    truncate_impl(s, max_chars, "\n... (truncated)")
+}
+
+/// Internal implementation for string truncation.
+fn truncate_impl(s: &str, max_chars: usize, suffix: &str) -> String {
+    // Fast path: if string is short enough, return as-is
+    // We check byte length first as a cheap filter before counting chars
+    if s.len() <= max_chars {
+        // Byte length is <= max_chars, so char count must also be <= max_chars
+        // (each char is at least 1 byte)
+        return s.to_string();
+    }
+
+    // Count actual characters
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        return s.to_string();
+    }
+
+    let suffix_len = suffix.chars().count();
+
+    // Need to truncate - reserve space for suffix
+    if max_chars <= suffix_len {
+        // If max_chars is less than or equal to suffix length, just return truncated suffix
+        return suffix.chars().take(max_chars).collect();
+    }
+
+    // Take max_chars - suffix_len characters and append suffix
+    let truncated: String = s.chars().take(max_chars - suffix_len).collect();
+    format!("{}{}", truncated, suffix)
+}
+
+/// Whether `keyword` appears in `text` as whole words (case-insensitive,
+/// surrounding punctuation ignored), so "send" matches "Send it!" but not
+/// "sender".
+pub fn contains_keyword_as_words(text: &str, keyword: &str) -> bool {
+    let normalize = |w: &str| -> String {
+        w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
+            .to_lowercase()
+    };
+    let text_words: Vec<String> = text
+        .split_whitespace()
+        .map(normalize)
+        .filter(|w| !w.is_empty())
+        .collect();
+    let kw_words: Vec<String> = keyword
+        .split_whitespace()
+        .map(normalize)
+        .filter(|w| !w.is_empty())
+        .collect();
+    if kw_words.is_empty() {
+        return false;
+    }
+    text_words
+        .windows(kw_words.len())
+        .any(|window| window == kw_words.as_slice())
+}
+
+/// Returns the largest byte index ≤ `byte_limit` that falls on a UTF-8 char boundary.
+///
+/// Use this when you need to slice a string by approximate byte length without panicking.
+/// The returned index is safe to use with `&s[..index]`.
+pub fn floor_char_boundary(s: &str, byte_limit: usize) -> usize {
+    if byte_limit >= s.len() {
+        return s.len();
+    }
+    let mut i = byte_limit;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Build an explicit, instructional truncation notice for tool output that was
+/// cut down before re-entering the model context. A passive marker like
+/// "(truncated)" is routinely ignored — the model fills the gap and fabricates
+/// the omitted content (e.g. inventing the rest of a user list). This notice
+/// states how much is missing and forbids enumerating what isn't visible.
+pub fn truncation_notice(shown_chars: usize, total_chars: usize) -> String {
+    truncation_notice_with_hint(
+        shown_chars,
+        total_chars,
+        "If the user needs the full result, tell them it is longer than you can see \
+         and re-run with a narrower filter, a count (e.g. `wc -l`), or pagination.",
+    )
+}
+
+/// Like [`truncation_notice`], but with a tool-specific remediation sentence —
+/// the right next step differs per tool (re-run with `wc -l` for terminal,
+/// re-fetch with a larger `max_chars` for web_fetch, etc.).
+pub fn truncation_notice_with_hint(
+    shown_chars: usize,
+    total_chars: usize,
+    remediation_hint: &str,
+) -> String {
+    let omitted = total_chars.saturating_sub(shown_chars);
+    format!(
+        "[⚠ OUTPUT TRUNCATED — {shown} of {total} characters shown; {omitted} omitted and \
+         NOT visible to you. Do NOT enumerate, list, count, or quote any item that is not \
+         literally present in the text you can see — inventing the omitted content is an \
+         error. {hint}]",
+        shown = shown_chars,
+        total = total_chars,
+        omitted = omitted,
+        hint = remediation_hint,
+    )
+}

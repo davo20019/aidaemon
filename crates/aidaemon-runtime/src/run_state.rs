@@ -1,0 +1,1443 @@
+//! One typed record per background helper run, owned by the runtime.
+//!
+//! A run is `Running` from its start until the runtime records how it ended
+//! (`Succeeded`, `Failed` or `Stopped`), with the times the runtime
+//! measured and the evidence its receipts left. Model text never sets any of
+//! it. Every surface that shows a helper (the plan card's helper lines and
+//! step marks, the finish header and its "Took" footer, `/tasks`) renders
+//! from this record, and the result's delivery subscribes to the run's
+//! terminal transition: it is pushed to the chat the moment the run ends,
+//! never on the chat's next message.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use aidaemon_events::TaskOutcome;
+use chrono::{DateTime, Utc};
+use tokio::sync::mpsc;
+
+pub use aidaemon_core::card::RunPhase;
+use aidaemon_core::card::{HelperView, Step};
+
+pub mod timing;
+
+/// The phase a child's typed end outcome gives.
+pub fn phase_of(outcome: TaskOutcome) -> RunPhase {
+    match outcome {
+        TaskOutcome::Succeeded => RunPhase::Succeeded,
+        TaskOutcome::Partial => RunPhase::Stopped,
+        TaskOutcome::Failed => RunPhase::Failed,
+    }
+}
+
+/// What the run's receipts left unproven: its own typed checklist steps
+/// that declared a side effect and that no receipt confirmed. A step that
+/// changes nothing needs none: the helper's report says what it found.
+/// Only a run with more than one typed step lists them; a one-step run's
+/// step is the run itself, which its phase already says.
+///
+/// Why it failed or stopped is not evidence: it is part of how it ended
+/// ([`RunEnd`]), so a failed run cannot be recorded without its reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunEvidence {
+    pub unconfirmed: Vec<UnconfirmedStep>,
+    /// What its run sent the owner when it ended: each declared
+    /// deliverable and what became of it. `None`: it ran outside a
+    /// request's delivery ledger, so nothing recorded what it sent.
+    pub delivered: Option<Vec<crate::coordination::RunDelivery>>,
+    /// The owner also declined some of its steps, while another cause
+    /// explains how it ended ([`crate::spawn::run_phase`]'s precedence):
+    /// the steps in its words, said as a second line under that cause.
+    /// `None`: nothing was declined, or the decline is itself the cause.
+    pub declined: Option<Vec<String>>,
+}
+
+/// A typed step no receipt confirmed: what it declared it would change and
+/// where. The owner reads it from these, never from the step's own text,
+/// which is the helper's planning (live 2026-11-14: "Only the report above
+/// confirms this step: Capture a homepage screenshot in the site folder…").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnconfirmedStep {
+    pub effect: aidaemon_tools::semantics::ToolMutationEffects,
+    /// The path or URL it named, when it named one.
+    pub target: Option<String>,
+}
+
+impl UnconfirmedStep {
+    /// What the step did, in a few plain words ("the files it wrote in
+    /// ~/sites/drupal").
+    pub fn what(&self) -> String {
+        use aidaemon_tools::semantics::ToolMutationEffects as E;
+        let words = [
+            (E::REMOTE_DEPLOY, "the deploy"),
+            (E::EXTERNAL_DELIVERY, "what it sent"),
+            (E::DESTRUCTIVE, "what it deleted"),
+            (E::REPOSITORY_WRITE, "the commit"),
+            (E::REMOTE_MUTATION, "the change it made online"),
+            (E::PROCESS_STATE, "the service it started or stopped"),
+            (E::SCHEDULED_WORK, "the schedule it set up"),
+            (E::MEMORY_WRITE, "what it saved to memory"),
+            (E::CONFIGURATION, "the settings it changed"),
+            (E::LOCAL_SOURCE_WRITE, "the code it changed"),
+            (E::LOCAL_WORKSPACE_WRITE, "the files it wrote"),
+            (E::LOCAL_DERIVED_WRITE, "the files it wrote"),
+        ]
+        .into_iter()
+        .find(|(effect, _)| self.effect.intersects(*effect))
+        .map_or("a change it made", |(_, words)| words);
+        match self.target.as_deref() {
+            Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+                format!("{words} for {url}")
+            }
+            Some(path) => format!("{words} in {path}"),
+            None => words.to_string(),
+        }
+    }
+}
+
+/// "a", "a and b", "a, b and c", each said once.
+fn joined(steps: &[UnconfirmedStep]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for step in steps {
+        let what = step.what();
+        if !parts.contains(&what) {
+            parts.push(what);
+        }
+    }
+    match parts.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// How a run ended: its phase, with why when it did not succeed. A run
+/// recorded as failed always carries its reason: there is no way to end
+/// one `Failed` without a [`RunFailure`] (live 2026-11-13: a background
+/// disk-usage command read "Failed in the background" with nothing more,
+/// and a second run started without the owner hearing why).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunEnd {
+    Succeeded,
+    /// It stopped before finishing; why, when its records say.
+    Stopped(Option<RunFailure>),
+    Failed(RunFailure),
+}
+
+impl RunEnd {
+    /// The phase every surface shows.
+    pub fn phase(&self) -> RunPhase {
+        match self {
+            Self::Succeeded => RunPhase::Succeeded,
+            Self::Stopped(_) => RunPhase::Stopped,
+            Self::Failed(_) => RunPhase::Failed,
+        }
+    }
+
+    /// The one plain line under a finish header, from a run's end and
+    /// evidence: why it did not succeed, else the typed steps left
+    /// unconfirmed.
+    pub fn line(&self, evidence: &RunEvidence) -> Option<String> {
+        self.reason(evidence).or_else(|| evidence.line())
+    }
+
+    /// Why it did not succeed: its primary cause, then a step the owner
+    /// declined as a second line ([`RunEvidence::declined_line`]).
+    pub fn reason(&self, evidence: &RunEvidence) -> Option<String> {
+        reasons(self.failure(), evidence)
+    }
+
+    /// The owner stopped it: a stop the card says plainly ("Stopped by
+    /// you"), never a failure.
+    pub fn stopped_by_owner(&self) -> bool {
+        matches!(
+            self,
+            Self::Stopped(Some(RunFailure::Cancelled {
+                by: CancelledBy::Owner
+            }))
+        )
+    }
+
+    /// Why it did not succeed, when known.
+    pub fn failure(&self) -> Option<&RunFailure> {
+        match self {
+            Self::Succeeded | Self::Stopped(None) => None,
+            Self::Stopped(Some(failure)) | Self::Failed(failure) => Some(failure),
+        }
+    }
+
+    /// How a program the runtime watched ended, from its exit status: zero
+    /// succeeded, any other status failed with it, none (killed, or its
+    /// status lost) stopped.
+    pub fn of_exit(code: Option<i32>) -> Self {
+        match code {
+            Some(0) => Self::Succeeded,
+            Some(code) => Self::Failed(RunFailure::Exited { code: Some(code) }),
+            None => Self::Stopped(Some(RunFailure::Exited { code: None })),
+        }
+    }
+}
+
+/// The most of an error's own text a failure reason keeps.
+pub const ERROR_REASON_CHARS: usize = 240;
+
+/// Why a helper's run failed, decided from its typed records (its checklist
+/// steps, its receipts, its end record and the runtime's own errors), never
+/// from its reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunFailure {
+    /// It ended without changing anything, while each step of its own that
+    /// needed a change was left undone: these steps (live 2026-11-13: a
+    /// WordPress install helper looked at its folder, found it missing and
+    /// stopped, reported "Blocked" in words, and its run read as finished).
+    NothingDone { undone: Vec<String> },
+    /// Its program ended with an error status, or was stopped (`None`).
+    Exited { code: Option<i32> },
+    /// It stopped because this machine ran out of something the owner can
+    /// free, as the working agent declared in its typed verdict
+    /// (`track_requirements`' `short_of`): its end offers the step that
+    /// frees it ([`FreeStep`]).
+    ShortOf(aidaemon_events::ShortResource),
+    /// An error ended it: the runtime's own error, as it recorded it (its
+    /// end record's error, or the error its run returned), never its reply.
+    Errored { error: String },
+    /// The daemon's own code failed while it ran.
+    Crashed,
+    /// It changed something but ended with these steps of its own that
+    /// needed a change left undone.
+    Unfinished { undone: Vec<String> },
+    /// The owner declined a step it asked to take (an approval card
+    /// answered no): it went on without it and ended short of its work.
+    /// `steps` are its own checklist steps the declined calls served, in
+    /// its words; empty when none was linked. Not a failure: the owner's
+    /// answer (live 2026-11-13: the owner declined a WordPress helper's
+    /// password rotation, its screenshot still reached them, and its card
+    /// read "its helper stopped before it finished").
+    Declined { steps: Vec<String> },
+    /// Someone stopped it before it finished: a stop, never a failure and
+    /// never an error (live 2026-11-14: an owner `/cancel` read "❌ A helper
+    /// failed … It stopped on an error: stopped by the owner").
+    Cancelled { by: CancelledBy },
+    /// It made no progress for its limit and was stopped.
+    NoProgress,
+    /// Its end record says it failed and records nothing more: said as
+    /// that, so the owner is never left with a bare "failed".
+    NoCause,
+}
+
+/// Who stopped a run before it finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelledBy {
+    /// The owner, from the chat (`/cancel`, or a stop request read as one).
+    Owner,
+}
+
+/// The concrete next step offered for a resource a run ran out of: what
+/// frees it, in plain words, and the command that would, when there is one
+/// safe to name. Typed by the resource, never by an error's wording (live
+/// 2026-11-13: DDEV stopped on "critically low Docker disk space" and the
+/// answer only reported it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreeStep {
+    /// What ran out, as the owner reads it.
+    pub what: &'static str,
+    /// The step that frees it, offered.
+    pub offer: &'static str,
+    /// The command it runs, when the step is one command.
+    pub command: Option<&'static str>,
+}
+
+impl FreeStep {
+    pub fn of(resource: aidaemon_events::ShortResource) -> Self {
+        use aidaemon_events::ShortResource;
+        match resource {
+            ShortResource::DockerDiskSpace => Self {
+                what: "Docker ran out of disk space",
+                offer: "I can free the space Docker isn't using (stopped containers, images no \
+                        container uses, and its build cache) and then try again",
+                command: Some("docker system prune"),
+            },
+            ShortResource::DiskSpace => Self {
+                what: "this computer ran out of disk space",
+                offer: "I can list what takes the most space in your home folder, so you can \
+                        pick what to delete, and then try again",
+                command: None,
+            },
+            ShortResource::Memory => Self {
+                what: "this computer ran out of memory",
+                offer: "I can list the programs using the most memory, so you can pick what to \
+                        close, and then try again",
+                command: None,
+            },
+        }
+    }
+
+    /// "Next step: … (`docker system prune`). Want me to?"
+    pub fn line(&self) -> String {
+        match self.command {
+            Some(command) => format!("Next step: {} (`{command}`). Want me to?", self.offer),
+            None => format!("Next step: {}. Want me to?", self.offer),
+        }
+    }
+}
+
+impl RunFailure {
+    /// The failure in one plain sentence.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::NothingDone { undone } if undone.is_empty() => {
+                "It ended without doing any of its work: nothing was changed.".to_string()
+            }
+            Self::NothingDone { undone } => format!(
+                "It ended without doing any of its work: nothing was changed, and {} undone: {}.",
+                if undone.len() == 1 {
+                    "this step is"
+                } else {
+                    "these steps are"
+                },
+                undone.join("; ")
+            ),
+            Self::Exited { code: Some(code) } => {
+                format!("Its program stopped with an error (exit status {code}).")
+            }
+            Self::Exited { code: None } => {
+                "Its program was stopped before it finished.".to_string()
+            }
+            Self::ShortOf(resource) => {
+                let step = FreeStep::of(*resource);
+                format!("It stopped because {}. {}", step.what, step.line())
+            }
+            Self::Errored { error } => {
+                let error = error.split_whitespace().collect::<Vec<_>>().join(" ");
+                let error = aidaemon_events::text::truncate_str(&error, ERROR_REASON_CHARS);
+                format!("It stopped on an error: {}.", error.trim_end_matches('.'))
+            }
+            Self::Crashed => {
+                "It stopped unexpectedly: the daemon hit an internal error while it ran."
+                    .to_string()
+            }
+            Self::Unfinished { undone } => format!(
+                "It ended before finishing: {} undone: {}.",
+                if undone.len() == 1 {
+                    "this step is"
+                } else {
+                    "these steps are"
+                },
+                undone.join("; ")
+            ),
+            Self::Declined { steps } if steps.is_empty() => {
+                "You declined one of its steps, so it went on without it.".to_string()
+            }
+            Self::Declined { steps } => format!(
+                "You declined {}, so it went on without {}: {}.",
+                if steps.len() == 1 {
+                    "one of its steps"
+                } else {
+                    "some of its steps"
+                },
+                if steps.len() == 1 { "it" } else { "them" },
+                steps.join("; ")
+            ),
+            Self::Cancelled {
+                by: CancelledBy::Owner,
+            } => "You stopped it before it finished.".to_string(),
+            Self::NoProgress => {
+                "It made no progress for its time limit, so it was stopped.".to_string()
+            }
+            Self::NoCause => {
+                "It ended without a successful outcome, and its records give no cause.".to_string()
+            }
+        }
+    }
+}
+
+/// A run's reasons in their one order: the primary cause of its end, then
+/// any step the owner declined as a second line. Never the decline alone
+/// when another cause ended it.
+fn reasons(failure: Option<&RunFailure>, evidence: &RunEvidence) -> Option<String> {
+    let primary = failure.map(RunFailure::reason)?;
+    Some(match evidence.declined_line() {
+        Some(declined) => format!("{primary}\n{declined}"),
+        None => primary,
+    })
+}
+
+impl RunEvidence {
+    /// The steps the owner declined while another cause ended the run, in
+    /// one plain line under that cause.
+    pub fn declined_line(&self) -> Option<String> {
+        let steps = self.declined.as_ref()?;
+        Some(match steps.as_slice() {
+            [] => "You also declined one of its steps.".to_string(),
+            [one] => format!("You also declined one of its steps: {one}."),
+            many => format!("You also declined some of its steps: {}.", many.join("; ")),
+        })
+    }
+
+    /// The same steps, said after the report they rely on: the result
+    /// reads the report first, then what nothing but that report shows
+    /// (`has_report`: there is a report above to point to).
+    pub fn after_report(&self, has_report: bool) -> Option<String> {
+        let source = if has_report {
+            "the report above"
+        } else {
+            "its report"
+        };
+        (!self.unconfirmed.is_empty())
+            .then(|| format!("Only {source} shows {}.", joined(&self.unconfirmed)))
+    }
+
+    /// The typed steps left unconfirmed, in one plain line. They belong to
+    /// a run that finished (its own verdict was done and nothing
+    /// contradicts it), so the line says only what is true of them, in
+    /// words that agree with "finished": its report is the one record of
+    /// them (live 2026-11-13: "I couldn't verify one of its steps" under a
+    /// ✅ read as a failure).
+    pub fn line(&self) -> Option<String> {
+        (!self.unconfirmed.is_empty()).then(|| {
+            format!(
+                "Its report is the only record of {}.",
+                joined(&self.unconfirmed)
+            )
+        })
+    }
+}
+
+/// One helper run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunState {
+    /// The background job id that names it everywhere.
+    pub id: String,
+    /// The chat it reports to.
+    pub chat: String,
+    /// The name the owner reads for it.
+    pub label: String,
+    pub phase: RunPhase,
+    /// When the owner's request that started it reached the runner, when a
+    /// chat turn started it: a time "since your request" is measured from
+    /// here.
+    pub requested_at: Option<DateTime<Utc>>,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    /// Its first tool step, when it took one: how long it took is measured
+    /// from there, its start-up left out.
+    pub work_began: Option<DateTime<Utc>>,
+    /// How long it waited for the owner's answer on a card.
+    pub waited: Duration,
+    /// Its latest step while it runs.
+    pub step: Option<Step>,
+    /// The plan steps it was started for (`checklist_items`).
+    pub steps: Vec<usize>,
+    pub evidence: RunEvidence,
+    /// Why it did not succeed, as its end recorded it ([`RunEnd`]): always
+    /// set for a failed run.
+    pub failure: Option<RunFailure>,
+    /// The chat card this run's line is drawn on after its turn: the card
+    /// the turn that started it kept. A no-plan run's end edits exactly this
+    /// card, never whichever card is newest.
+    pub card: RunCard,
+    /// It runs in the background, past the turn that started it; `false`
+    /// for a helper its turn waits on.
+    pub background: bool,
+    /// The chat turn (its task id) whose request started it, when one did.
+    pub request: Option<String>,
+    /// The folders its work made, from the claim evidence (each found
+    /// absent before a call that then created it): the real folders, which
+    /// its plan steps name on the card when it ends.
+    pub made_folders: Vec<String>,
+}
+
+/// Which chat card a run's line is drawn on once the turn that started it
+/// ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunCard {
+    /// The starting turn has not kept its card yet; `before` is the chat's
+    /// kept card when the run began (`None`: there was none), so the card
+    /// is the first one the chat keeps after it.
+    Pending { before: Option<String> },
+    /// The message id of the card the starting turn kept.
+    Kept(String),
+}
+
+impl Default for RunCard {
+    fn default() -> Self {
+        Self::Pending { before: None }
+    }
+}
+
+impl RunState {
+    /// When its work began: its first step, else its start.
+    pub fn began(&self) -> DateTime<Utc> {
+        self.work_began.unwrap_or(self.started_at)
+    }
+
+    /// When its work began and ended and how long it took, once it ended
+    /// ([`measured_span`]).
+    pub fn span(&self) -> Option<MeasuredSpan> {
+        self.ended_at
+            .map(|ended| measured_span(self.began(), ended))
+    }
+
+    /// Its one time set, once it ended ([`RunTimes`]).
+    pub fn times(&self) -> Option<RunTimes> {
+        self.ended_at
+            .map(|ended| RunTimes::new(self.began(), ended, self.requested_at, self.waited))
+    }
+
+    /// How long it took, once it ended.
+    pub fn took(&self) -> Option<chrono::Duration> {
+        self.span().map(|span| span.took())
+    }
+
+    /// Why it did not succeed, in plain words, from its record: the one
+    /// renderer of a run's reason, for its card, its result and the
+    /// parent's continuation alike.
+    pub fn reason(&self) -> Option<String> {
+        reasons(self.failure.as_ref(), &self.evidence)
+    }
+
+    /// The owner stopped it ([`RunEnd::stopped_by_owner`]).
+    pub fn stopped_by_owner(&self) -> bool {
+        self.phase == RunPhase::Stopped
+            && matches!(
+                self.failure,
+                Some(RunFailure::Cancelled {
+                    by: CancelledBy::Owner
+                })
+            )
+    }
+
+    /// The one plain line under its finish header: why it did not
+    /// succeed, else the typed steps left unconfirmed.
+    pub fn line(&self) -> Option<String> {
+        self.reason().or_else(|| self.evidence.line())
+    }
+
+    /// The helper as every card shows it.
+    pub fn view(&self) -> HelperView {
+        HelperView {
+            run: Some(self.id.clone()),
+            label: self.label.clone(),
+            phase: self.phase,
+            background: self.background,
+            step: match self.phase {
+                RunPhase::Running => self.step.clone(),
+                _ => None,
+            },
+            steps: self.steps.clone(),
+            // The one measured line every surface shows for it
+            // ([`RunTimes::line`]): the card, its result and the parent's
+            // continuation all read the same labelled times. On the card
+            // when a request started it, so the time from that request to
+            // the run's start is said, not left as a gap between two
+            // figures; a run no request started has it under its result.
+            // Why it failed or stopped, on its card as in its result.
+            // Stopped by the owner: its header says so, with no reason line.
+            reason: match self.phase {
+                _ if self.stopped_by_owner() => None,
+                RunPhase::Failed | RunPhase::Stopped => self.reason(),
+                _ => None,
+            },
+            stopped_by_owner: self.stopped_by_owner(),
+            // A waited-on helper's header always carries its time: its turn
+            // is still open when it ends.
+            took: self
+                .times()
+                .filter(|times| !self.background || times.requested.is_some())
+                .map(|times| times.line()),
+            since_request: self
+                .requested_at
+                .zip(self.ended_at)
+                .map(|(requested, ended)| {
+                    crate::run_state::timing::since_request_view(requested, ended)
+                }),
+        }
+    }
+}
+
+/// What the run's end carries to its delivery: the helper's own report (its
+/// text; never what decides its phase) and whether that text is trusted.
+#[derive(Debug, Clone)]
+pub struct RunReport {
+    pub text: String,
+    pub untrusted: bool,
+}
+
+/// A run reached a terminal phase.
+#[derive(Debug, Clone)]
+pub struct RunEnded {
+    pub state: RunState,
+    pub report: RunReport,
+}
+
+/// How many ended waited-on runs a chat keeps on record.
+pub const MAX_WAITED_RUNS: usize = 32;
+
+/// Every helper run of one runtime. A run stays listed after it ends (until
+/// [`RunStates::forget`]), so a surface drawn late still reads how it ended.
+#[derive(Default)]
+pub struct RunStates {
+    runs: Mutex<HashMap<String, Entry>>,
+    order: std::sync::atomic::AtomicU64,
+    groups: Mutex<HashMap<String, RunGroup>>,
+}
+
+/// The runs one turn started, in the order they started, and the ends of
+/// those whose results are ready.
+#[derive(Default)]
+struct RunGroup {
+    members: Vec<String>,
+    ended: HashMap<String, GroupEnd>,
+}
+
+/// The group of the runs one chat turn started: every background run that
+/// turn left running (helpers, commands, CLI agents) is answered together
+/// once the last of them ends.
+pub fn turn_group(chat: &str, task_id: &str) -> String {
+    format!("{chat}#{task_id}")
+}
+
+/// When the owner's request behind a group of runs came in: the earliest
+/// request time their records hold.
+pub fn request_began(ends: &[GroupEnd]) -> Option<DateTime<Utc>> {
+    ends.iter().filter_map(|end| end.state.requested_at).min()
+}
+
+/// What a request's answer is measured against: when the owner asked, how
+/// many runs it waited on, and when the last of them ended. It decides
+/// whether the answer's own time adds anything to the runs' times
+/// ([`crate::run_state::timing::answer_sent_line`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestClock {
+    pub requested: DateTime<Utc>,
+    pub runs: usize,
+    /// `None` when no run's end is on record.
+    pub last_run_ended: Option<DateTime<Utc>>,
+}
+
+impl RequestClock {
+    /// The clock of a group of runs' answer, from their records.
+    pub fn of_group(ends: &[GroupEnd]) -> Option<Self> {
+        Some(Self {
+            requested: request_began(ends)?,
+            runs: ends.len(),
+            last_run_ended: ends.iter().filter_map(|end| end.state.ended_at).max(),
+        })
+    }
+
+    /// The clock of one run's answer, from its record.
+    pub fn of_run(state: &RunState) -> Option<Self> {
+        Some(Self {
+            requested: state.requested_at?,
+            runs: 1,
+            last_run_ended: state.ended_at,
+        })
+    }
+}
+
+/// One grouped run's end with its result, held until its group's last run
+/// ends.
+#[derive(Debug, Clone)]
+pub struct GroupEnd {
+    pub state: RunState,
+    pub report: RunReport,
+    /// Its own result message, rendered from its record: what the chat gets
+    /// when the group's answer cannot be written.
+    pub message: String,
+}
+
+/// What a run's end means for its group ([`RunStates::group_end`]).
+#[derive(Debug)]
+pub enum GroupTurn {
+    /// It is not one of several runs a turn started: its result is its own
+    /// answer.
+    Alone,
+    /// Other runs of its group still run: its result waits for theirs.
+    Waiting,
+    /// It was the group's last run: every member's end, in start order. Given
+    /// once.
+    Complete(Vec<GroupEnd>),
+}
+
+struct Entry {
+    seq: u64,
+    state: RunState,
+    on_end: Option<mpsc::UnboundedSender<RunEnded>>,
+}
+
+impl RunStates {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
+        self.runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Start run `id` in `chat`. `on_end` subscribes to its terminal
+    /// transition: it receives the run once, the moment it ends.
+    pub fn begin(
+        &self,
+        id: &str,
+        chat: &str,
+        label: &str,
+        on_end: Option<mpsc::UnboundedSender<RunEnded>>,
+    ) -> RunState {
+        let state = RunState {
+            id: id.to_string(),
+            chat: chat.to_string(),
+            label: label.to_string(),
+            phase: RunPhase::Running,
+            requested_at: aidaemon_channels::turns::TurnOver::current()
+                .map(|turn| turn.requested_at()),
+            started_at: Utc::now(),
+            ended_at: None,
+            work_began: None,
+            waited: Duration::ZERO,
+            step: None,
+            steps: Vec::new(),
+            evidence: RunEvidence::default(),
+            failure: None,
+            card: RunCard::default(),
+            background: true,
+            request: None,
+            made_folders: Vec::new(),
+        };
+        let seq = self
+            .order
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.lock().insert(
+            id.to_string(),
+            Entry {
+                seq,
+                state: state.clone(),
+                on_end,
+            },
+        );
+        state
+    }
+
+    /// Start run `id` in `chat`, a helper its turn waits on, begun at
+    /// `started_at` for the chat turn `request`. It has the same record as a
+    /// background run (so every surface reads it the same way) but no
+    /// subscriber: its turn takes its result. The chat keeps the last
+    /// [`MAX_WAITED_RUNS`] waited-on runs that ended.
+    pub fn begin_waited(
+        &self,
+        id: &str,
+        chat: &str,
+        label: &str,
+        started_at: DateTime<Utc>,
+        request: Option<&str>,
+    ) -> RunState {
+        let mut state = self.begin(id, chat, label, None);
+        state.background = false;
+        state.started_at = started_at;
+        state.request = request.map(str::to_string);
+        let mut runs = self.lock();
+        if let Some(entry) = runs.get_mut(id) {
+            entry.state = state.clone();
+        }
+        let mut ended: Vec<(u64, String)> = runs
+            .iter()
+            .filter(|(_, entry)| {
+                entry.state.chat == chat
+                    && !entry.state.background
+                    && entry.state.phase.is_terminal()
+            })
+            .map(|(id, entry)| (entry.seq, id.clone()))
+            .collect();
+        ended.sort();
+        let excess = ended.len().saturating_sub(MAX_WAITED_RUNS);
+        for (_, old) in ended.into_iter().take(excess) {
+            runs.remove(&old);
+        }
+        state
+    }
+
+    /// Run `id` was started by the chat turn `request` (its task id).
+    pub fn for_request(&self, id: &str, request: &str) {
+        if let Some(entry) = self.lock().get_mut(id) {
+            entry.state.request = Some(request.to_string());
+        }
+    }
+
+    /// Run `id` is one of the runs of `group`: the runs one turn started.
+    /// Their results are answered together once the last of them ends
+    /// ([`Self::group_end`]).
+    pub fn join_group(&self, id: &str, group: &str) {
+        if !self.lock().contains_key(id) {
+            return;
+        }
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let members = &mut groups.entry(group.to_string()).or_default().members;
+        if !members.iter().any(|member| member == id) {
+            members.push(id.to_string());
+        }
+    }
+
+    /// Whether run `id` is one of a group of runs one turn started, whose
+    /// request is answered once, by a continuation of that turn, after the
+    /// last of them ends ([`Self::group_end`]). Asked before its end is
+    /// given: that continuation, not the runs' ends, then settles the
+    /// request's own steps.
+    pub fn answered_together(&self, id: &str) -> bool {
+        self.groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .any(|group| group.members.len() > 1 && group.members.iter().any(|member| member == id))
+    }
+
+    /// Run `id`'s result is ready (`end`). A run alone in its group, or in
+    /// none, is [`GroupTurn::Alone`]; otherwise its end is held until every
+    /// member's is, and the call that brings the last one gets them all, in
+    /// start order, exactly once.
+    pub fn group_end(&self, id: &str, end: GroupEnd) -> GroupTurn {
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(group) = groups
+            .iter()
+            .find(|(_, group)| group.members.iter().any(|member| member == id))
+            .map(|(name, _)| name.clone())
+        else {
+            return GroupTurn::Alone;
+        };
+        let Some(entry) = groups.get_mut(&group) else {
+            return GroupTurn::Alone;
+        };
+        if entry.members.len() < 2 {
+            groups.remove(&group);
+            return GroupTurn::Alone;
+        }
+        entry.ended.insert(id.to_string(), end);
+        if entry
+            .members
+            .iter()
+            .any(|member| !entry.ended.contains_key(member))
+        {
+            return GroupTurn::Waiting;
+        }
+        let Some(mut entry) = groups.remove(&group) else {
+            return GroupTurn::Waiting;
+        };
+        GroupTurn::Complete(
+            entry
+                .members
+                .iter()
+                .filter_map(|member| entry.ended.remove(member))
+                .collect(),
+        )
+    }
+
+    /// Run `id` was started for the plan steps `steps`.
+    pub fn link_steps(&self, id: &str, steps: &[usize]) {
+        if let Some(entry) = self.lock().get_mut(id) {
+            entry.state.steps = steps.to_vec();
+        }
+    }
+
+    /// Run `id`'s work made `folders` (its claim evidence).
+    pub fn note_folders(&self, id: &str, folders: &[String]) {
+        if let Some(entry) = self.lock().get_mut(id) {
+            for folder in folders {
+                if !entry.state.made_folders.contains(folder) {
+                    entry.state.made_folders.push(folder.clone());
+                }
+            }
+        }
+    }
+
+    /// The running run's latest step. Ignored once it ended.
+    pub fn step(&self, id: &str, step: Step) -> bool {
+        let mut runs = self.lock();
+        match runs.get_mut(id) {
+            Some(entry) if entry.state.phase == RunPhase::Running => {
+                entry.state.step = Some(step);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The chat's kept card when run `id` began: its own card is the first
+    /// one the chat keeps after this. Ignored once the card is known.
+    pub fn card_before(&self, id: &str, before: Option<String>) {
+        if let Some(entry) = self.lock().get_mut(id)
+            && matches!(entry.state.card, RunCard::Pending { .. })
+        {
+            entry.state.card = RunCard::Pending { before };
+        }
+    }
+
+    /// Run `id`'s line is drawn on card `message_id`, the card its starting
+    /// turn kept. Set once: a later card belongs to a later turn.
+    pub fn keep_card(&self, id: &str, message_id: &str) {
+        if let Some(entry) = self.lock().get_mut(id)
+            && matches!(entry.state.card, RunCard::Pending { .. })
+        {
+            entry.state.card = RunCard::Kept(message_id.to_string());
+        }
+    }
+
+    /// Record how run `id` ended, with what the runtime measured, and push
+    /// it to its subscriber. A run ends once: a second end is ignored.
+    pub fn finish(
+        &self,
+        id: &str,
+        end: RunEnd,
+        measured: RunMeasure,
+        evidence: RunEvidence,
+        report: RunReport,
+    ) -> Option<RunState> {
+        let phase = end.phase();
+        let (state, on_end) = {
+            let mut runs = self.lock();
+            let entry = runs.get_mut(id)?;
+            if entry.state.phase.is_terminal() {
+                return None;
+            }
+            entry.state.phase = phase;
+            entry.state.ended_at = Some(measured.ended_at);
+            entry.state.work_began = measured.work_began;
+            entry.state.waited = measured.waited;
+            entry.state.evidence = evidence;
+            entry.state.failure = end.failure().cloned();
+            (entry.state.clone(), entry.on_end.take())
+        };
+        if let Some(on_end) = on_end {
+            let _ = on_end.send(RunEnded {
+                state: state.clone(),
+                report,
+            });
+        }
+        Some(state)
+    }
+
+    pub fn get(&self, id: &str) -> Option<RunState> {
+        self.lock().get(id).map(|entry| entry.state.clone())
+    }
+
+    /// The chat's runs, oldest first.
+    pub fn for_chat(&self, chat: &str) -> Vec<RunState> {
+        let runs = self.lock();
+        let mut listed: Vec<(u64, RunState)> = runs
+            .values()
+            .filter(|entry| entry.state.chat == chat)
+            .map(|entry| (entry.seq, entry.state.clone()))
+            .collect();
+        listed.sort_by_key(|(seq, _)| *seq);
+        listed.into_iter().map(|(_, state)| state).collect()
+    }
+
+    /// The runs drawn on card `card` (the card their starting turn kept),
+    /// oldest first.
+    pub fn on_card(&self, chat: &str, card: &str) -> Vec<RunState> {
+        self.for_chat(chat)
+            .into_iter()
+            .filter(|state| matches!(&state.card, RunCard::Kept(kept) if kept == card))
+            .collect()
+    }
+
+    /// The chat's runs still running, oldest first.
+    pub fn running(&self, chat: &str) -> Vec<RunState> {
+        self.for_chat(chat)
+            .into_iter()
+            .filter(|state| state.phase == RunPhase::Running)
+            .collect()
+    }
+
+    /// Drop an ended run's record.
+    pub fn forget(&self, id: &str) {
+        let mut runs = self.lock();
+        if runs
+            .get(id)
+            .is_some_and(|entry| entry.state.phase.is_terminal())
+        {
+            runs.remove(id);
+        }
+    }
+}
+
+tokio::task_local! {
+    static CURRENT_RUN: std::cell::RefCell<Option<String>>;
+}
+
+/// Run `fut` as background run `id`: the child it starts first takes the
+/// id ([`take_current_run`]), so `/tasks` lists that child from the run's
+/// record.
+pub async fn within_run<F: std::future::Future>(id: &str, fut: F) -> F::Output {
+    CURRENT_RUN
+        .scope(std::cell::RefCell::new(Some(id.to_string())), fut)
+        .await
+}
+
+/// The run id [`within_run`] set, taken once: the helper itself gets it,
+/// never a child it starts in turn.
+pub fn take_current_run() -> Option<String> {
+    CURRENT_RUN
+        .try_with(|run| run.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
+/// A measured stretch of time as the owner reads it: both ends cut to the
+/// whole second first, so the duration is always the difference of the
+/// times shown (live 2026-11-13: a 20.4 s run read "20 seconds" beside
+/// 2:21:16 to 2:21:37, which is 21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeasuredSpan {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+}
+
+impl MeasuredSpan {
+    /// How long it took: `to - from`, never negative.
+    pub fn took(&self) -> chrono::Duration {
+        (self.to - self.from).max(chrono::Duration::zero())
+    }
+}
+
+/// `from` to `to`, measured to the whole second ([`MeasuredSpan`]).
+pub fn measured_span(from: DateTime<Utc>, to: DateTime<Utc>) -> MeasuredSpan {
+    use chrono::SubsecRound;
+    let from = from.trunc_subsecs(0);
+    MeasuredSpan {
+        from,
+        to: to.trunc_subsecs(0).max(from),
+    }
+}
+
+/// The one set of times a run's record gives, and the only one any surface
+/// shows for it: its work from start to end ("took", start-up left out:
+/// its first step, else its start) and, when a request started it, that
+/// request's time, so "started … after your request" and "… after your
+/// request" are the same three instants seen two ways. All cut to the whole
+/// second first, so the request's gap plus the run's own time is exactly
+/// its time after the request (live 2026-11-13: "Done 43s after your
+/// request" beside "Took 30s" left 13 s unexplained, and a group answer
+/// quoted "took 3m 55s" while the card said "5m 54s after your request").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunTimes {
+    /// Its work, start to end.
+    pub run: MeasuredSpan,
+    /// The owner's request that started it, never after its start.
+    pub requested: Option<DateTime<Utc>>,
+    /// How long it waited for the owner's answer on a card.
+    pub waited: Duration,
+}
+
+impl RunTimes {
+    pub fn new(
+        began: DateTime<Utc>,
+        ended: DateTime<Utc>,
+        requested: Option<DateTime<Utc>>,
+        waited: Duration,
+    ) -> Self {
+        use chrono::SubsecRound;
+        let run = measured_span(began, ended);
+        Self {
+            run,
+            requested: requested.map(|at| at.trunc_subsecs(0).min(run.from)),
+            waited,
+        }
+    }
+
+    /// Its work's own time: start to end.
+    pub fn took(&self) -> chrono::Duration {
+        self.run.took()
+    }
+
+    /// From the request to its start: the time before its work began.
+    pub fn started_after_request(&self) -> Option<chrono::Duration> {
+        self.requested.map(|requested| self.run.from - requested)
+    }
+
+    /// From the request to its end: what the owner means by "how long did
+    /// it take".
+    pub fn after_request(&self) -> Option<MeasuredSpan> {
+        self.requested.map(|requested| MeasuredSpan {
+            from: requested,
+            to: self.run.to,
+        })
+    }
+
+    /// The one labelled line for the owner and the parent: "Took 30s (8:17:58
+    /// AM to 8:18:28 AM ET), started 13s after your request, so it ended 43s
+    /// after your request." Each figure says what it measures; none is left
+    /// for anyone to work out.
+    pub fn line(&self) -> String {
+        use timing::{compact, owner_clock_range};
+        let mut line = format!(
+            "Took {} ({})",
+            compact(self.took()),
+            owner_clock_range(self.run.from, self.run.to)
+        );
+        if let (Some(gap), Some(whole)) = (self.started_after_request(), self.after_request()) {
+            if gap.num_seconds() == 0 {
+                line.push_str(", starting at your request");
+            } else {
+                line.push_str(&format!(
+                    ", started {} after your request, so it ended {} after your request",
+                    compact(gap),
+                    compact(whole.took())
+                ));
+            }
+        }
+        line.push('.');
+        if self.waited.as_secs() > 0 {
+            line.push_str(&format!(
+                " It waited {} of that for your answer.",
+                aidaemon_tools::duration_format::compact_seconds(
+                    i64::try_from(self.waited.as_secs()).unwrap_or(i64::MAX),
+                    aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
+                )
+            ));
+        }
+        line
+    }
+}
+
+/// What the runtime measured of a run when it ended.
+#[derive(Debug, Clone, Copy)]
+pub struct RunMeasure {
+    pub ended_at: DateTime<Utc>,
+    pub work_began: Option<DateTime<Utc>>,
+    pub waited: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A helper its turn waits on has the same record as a background one:
+    /// two attempts under one label are two records, each read by its id,
+    /// and a waited-on helper's view is not a background one.
+    #[test]
+    fn waited_on_attempts_with_one_label_are_two_records() {
+        let runs = RunStates::default();
+        let now = Utc::now();
+        runs.begin_waited("helper:a", "chat", "Install Drupal", now, Some("task-1"));
+        runs.begin_waited("helper:b", "chat", "Install Drupal", now, Some("task-1"));
+        let measure = RunMeasure {
+            ended_at: now,
+            work_began: None,
+            waited: Duration::ZERO,
+        };
+        runs.finish(
+            "helper:a",
+            RunEnd::Stopped(None),
+            measure,
+            RunEvidence::default(),
+            report(),
+        );
+        runs.finish(
+            "helper:b",
+            RunEnd::Succeeded,
+            measure,
+            RunEvidence::default(),
+            report(),
+        );
+        let chat = runs.for_chat("chat");
+        assert_eq!(
+            chat.iter()
+                .map(|run| (run.id.as_str(), run.phase))
+                .collect::<Vec<_>>(),
+            vec![
+                ("helper:a", RunPhase::Stopped),
+                ("helper:b", RunPhase::Succeeded)
+            ]
+        );
+        assert!(chat.iter().all(|run| !run.view().background));
+        assert!(
+            chat.iter()
+                .all(|run| run.request.as_deref() == Some("task-1"))
+        );
+    }
+
+    fn report() -> RunReport {
+        RunReport {
+            text: "Done.".to_string(),
+            untrusted: false,
+        }
+    }
+
+    fn measure() -> RunMeasure {
+        RunMeasure {
+            ended_at: Utc::now(),
+            work_began: None,
+            waited: Duration::ZERO,
+        }
+    }
+
+    /// A run's end is pushed to its subscriber once, at the transition, and
+    /// later steps or ends change nothing.
+    #[tokio::test]
+    async fn a_runs_end_is_pushed_once_and_is_final() {
+        let runs = RunStates::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        runs.begin("job-1", "chat-a", "Slow count", Some(tx));
+        assert!(runs.step("job-1", Step::Output { lines: 3 }));
+        assert!(rx.try_recv().is_err(), "nothing is pushed while it runs");
+        let ended = runs
+            .finish(
+                "job-1",
+                RunEnd::Succeeded,
+                measure(),
+                RunEvidence::default(),
+                report(),
+            )
+            .expect("it ends");
+        assert_eq!(ended.phase, RunPhase::Succeeded);
+        let pushed = rx.try_recv().expect("pushed at the transition");
+        assert_eq!(pushed.state, ended);
+        assert!(
+            runs.finish(
+                "job-1",
+                RunEnd::Failed(RunFailure::NoCause),
+                measure(),
+                RunEvidence::default(),
+                report()
+            )
+            .is_none()
+        );
+        assert!(!runs.step("job-1", Step::Output { lines: 4 }));
+        assert_eq!(runs.get("job-1").unwrap().phase, RunPhase::Succeeded);
+        assert!(runs.running("chat-a").is_empty());
+    }
+
+    /// Live 2026-11-13: a background shell loop's card said "Done 43s
+    /// after your request" and its result "Took 30s", leaving the 13 s
+    /// before it started unexplained. The card's line is the record's one
+    /// time set: how long it took, when after the request it started, and
+    /// so when after the request it ended.
+    #[test]
+    fn the_cards_line_says_when_after_the_request_a_run_started() {
+        use chrono::TimeZone;
+        let requested = Utc.with_ymd_and_hms(2026, 11, 13, 13, 23, 36).unwrap()
+            + chrono::Duration::milliseconds(748);
+        let state = RunState {
+            id: "loop".into(),
+            chat: "chat".into(),
+            label: "a shell loop".into(),
+            phase: RunPhase::Succeeded,
+            requested_at: Some(requested),
+            started_at: requested + chrono::Duration::seconds(14),
+            ended_at: Some(requested + chrono::Duration::milliseconds(42_729)),
+            work_began: Some(requested + chrono::Duration::milliseconds(12_400)),
+            waited: Duration::ZERO,
+            step: None,
+            steps: Vec::new(),
+            evidence: RunEvidence::default(),
+            failure: None,
+            card: RunCard::default(),
+            background: true,
+            request: None,
+            made_folders: Vec::new(),
+        };
+        let times = state.times().unwrap();
+        let line = state.view().took.expect("the card's measured line");
+        assert_eq!(line, times.line());
+        assert!(line.starts_with("Took 30s ("), "{line}");
+        assert!(
+            line.ends_with(", started 13s after your request, so it ended 43s after your request."),
+            "{line}"
+        );
+        assert_eq!(
+            times.started_after_request().unwrap() + times.took(),
+            times.after_request().unwrap().took()
+        );
+        // No request on record: its time is under its result, not the card.
+        let unrequested = RunState {
+            requested_at: None,
+            ..state
+        };
+        assert_eq!(unrequested.view().took, None);
+    }
+
+    /// Live 2026-11-13: a background disk-usage command exited 1 and read
+    /// "Failed in the background: measuring caches and app data. Took 1m
+    /// 6s…" with no reason; a second run started and the owner never heard
+    /// why. A failed run is recorded only with its typed reason, and its
+    /// card and its result say it in the same plain words.
+    #[test]
+    fn every_failure_path_renders_a_reason() {
+        use aidaemon_events::ShortResource;
+        let failures = [
+            RunFailure::NothingDone { undone: Vec::new() },
+            RunFailure::NothingDone {
+                undone: vec!["Install Drupal".into()],
+            },
+            RunFailure::Exited { code: Some(1) },
+            RunFailure::Exited { code: None },
+            RunFailure::ShortOf(ShortResource::DockerDiskSpace),
+            RunFailure::ShortOf(ShortResource::DiskSpace),
+            RunFailure::ShortOf(ShortResource::Memory),
+            RunFailure::Errored {
+                error: "provider quota exhausted".into(),
+            },
+            RunFailure::Crashed,
+            RunFailure::Unfinished {
+                undone: vec!["Repair the homepage".into()],
+            },
+            RunFailure::Cancelled {
+                by: CancelledBy::Owner,
+            },
+            RunFailure::NoProgress,
+            RunFailure::NoCause,
+        ];
+        let runs = RunStates::default();
+        for (index, failure) in failures.into_iter().enumerate() {
+            let reason = failure.reason();
+            assert!(reason.trim().len() > 10, "{failure:?}: {reason}");
+            let id = format!("run-{index}");
+            runs.begin(&id, "chat", "measuring caches and app data", None);
+            let ended = runs
+                .finish(
+                    &id,
+                    RunEnd::Failed(failure.clone()),
+                    measure(),
+                    RunEvidence::default(),
+                    report(),
+                )
+                .expect("it ends");
+            assert_eq!(ended.phase, RunPhase::Failed);
+            assert_eq!(ended.failure.as_ref(), Some(&failure));
+            assert_eq!(ended.line(), Some(reason.clone()));
+            assert_eq!(ended.view().reason, Some(reason.clone()));
+            let result = crate::helper_run::delivery::render_run_result(
+                &ended,
+                "measuring caches and app data",
+                "",
+                100,
+                true,
+            );
+            assert!(result.contains(&reason), "{result}");
+            let card = aidaemon_channels::live_status::render_card(
+                &aidaemon_channels::live_status::CardView {
+                    helpers: vec![(ended.view(), None)],
+                    ..Default::default()
+                },
+            )
+            .expect("a card");
+            assert!(card.contains(&reason), "{card}");
+        }
+    }
+
+    /// Live 2026-11-13: the result led with "Its report is the only record
+    /// of 2 steps", and its deliveries were the helper's own claim. It is
+    /// composed from the record: outcome, the report, what only the report
+    /// vouches for, what the record says reached the owner, the measured
+    /// time last.
+    #[test]
+    fn a_result_is_composed_from_the_record_around_the_report() {
+        use crate::coordination::{RunDelivery, RunDeliveryOutcome};
+        let runs = RunStates::default();
+        runs.begin("run-1", "chat", "Install Drupal", None);
+        let page = aidaemon_tools::semantics::DeliverableKind::Screenshot {
+            page: "synthetic-drupal.ddev.site".to_string(),
+        };
+        let ended = runs
+            .finish(
+                "run-1",
+                RunEnd::Succeeded,
+                RunMeasure {
+                    ended_at: Utc::now(),
+                    work_began: Some(Utc::now() - chrono::Duration::seconds(196)),
+                    waited: Duration::ZERO,
+                },
+                RunEvidence {
+                    unconfirmed: vec![
+                        UnconfirmedStep {
+                            effect: aidaemon_tools::semantics::ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                            target: Some("/srv/drupal".to_string()),
+                        },
+                        UnconfirmedStep {
+                            effect: aidaemon_tools::semantics::ToolMutationEffects::CONFIGURATION,
+                            target: None,
+                        },
+                    ],
+                    delivered: Some(vec![
+                        RunDelivery {
+                            kind: page.clone(),
+                            caption: "Drupal homepage".to_string(),
+                            outcome: RunDeliveryOutcome::Sent { at: Utc::now() },
+                        },
+                        RunDelivery {
+                            kind: page,
+                            caption: "Drupal homepage, styled".to_string(),
+                            outcome: RunDeliveryOutcome::Failed {
+                                reason: "no channel found for session".to_string(),
+                            },
+                        },
+                    ]),
+                    declined: None,
+                },
+                report(),
+            )
+            .expect("it ends");
+        let result = crate::helper_run::delivery::render_run_result(
+            &ended,
+            "Install Drupal",
+            "Done.",
+            100,
+            false,
+        );
+        let at = |needle: &str| {
+            result
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing from {result}"))
+        };
+        let outcome = at(ended.phase.headline());
+        let body = at("Done.");
+        let evidence = at(
+            "Only the report above shows the files it wrote in /srv/drupal and the settings it changed.",
+        );
+        let sent = at("Sent you: Drupal homepage (at ");
+        let failed = at("Couldn't send you ");
+        assert!(
+            outcome < body && body < evidence && evidence < sent && sent < failed,
+            "{result}"
+        );
+        let measured = at(crate::turn::sliding_window::MEASURED_TIMING_MARK);
+        assert!(failed < measured, "{result}");
+        assert!(!result.starts_with("Its report"), "{result}");
+    }
+
+    /// The exit status of a program the runtime watched is how it ended:
+    /// an error status fails with it, a lost status stops with that said.
+    #[test]
+    fn a_programs_exit_status_is_its_end() {
+        assert_eq!(RunEnd::of_exit(Some(0)), RunEnd::Succeeded);
+        assert_eq!(
+            RunEnd::of_exit(Some(1)),
+            RunEnd::Failed(RunFailure::Exited { code: Some(1) })
+        );
+        assert_eq!(RunEnd::of_exit(None).phase(), RunPhase::Stopped);
+        assert!(RunEnd::of_exit(None).failure().is_some());
+        assert!(
+            RunEnd::of_exit(Some(1))
+                .line(&RunEvidence::default())
+                .is_some_and(|line| line.contains("exit status 1"))
+        );
+    }
+
+    /// `/tasks` lists a background helper from its run record: the step
+    /// and start the card shows, not a copy of its own.
+    #[test]
+    fn tasks_list_a_helper_from_its_run_record() {
+        let children = std::sync::Arc::new(crate::spawn::RunningChildren::default());
+        let runs = children.runs();
+        let begun = runs.begin("job-7", "chat-a", "Slow count", None);
+        let _entry = children.enter("chat-a", "Slow count", "Count", "child-7", Some("job-7"));
+        runs.step("job-7", Step::Output { lines: 9 });
+        let listed = children.listed("chat-a");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].step, Some(Step::Output { lines: 9 }));
+        assert_eq!(listed[0].child.started_at, begun.started_at);
+    }
+}

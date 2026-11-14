@@ -1,0 +1,175 @@
+{
+  "description": "Running work is listed while running or cancelling, and dropped when it ends.",
+  "frames": [
+    {
+      "at_ms": 1767225601000,
+      "event": {
+        "task": {
+          "description": "Working on your message",
+          "id": "b1:app:s1#4",
+          "number": 4,
+          "session_id": "app:s1",
+          "started_at_ms": 1767225602000,
+          "state": "running"
+        },
+        "type": "task_updated"
+      },
+      "seq": 1,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225602000,
+      "event": {
+        "task": {
+          "description": "Background build",
+          "id": "b1:app:s1#5",
+          "number": 5,
+          "session_id": "app:s1",
+          "started_at_ms": 1767225602000,
+          "state": "running"
+        },
+        "type": "task_updated"
+      },
+      "seq": 2,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225603000,
+      "event": {
+        "task": {
+          "description": "Working on your message",
+          "id": "b1:app:s1#4",
+          "number": 4,
+          "session_id": "app:s1",
+          "started_at_ms": 1767225602000,
+          "state": "cancelling"
+        },
+        "type": "task_updated"
+      },
+      "seq": 3,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225604000,
+      "event": {
+        "task": {
+          "description": "Background build",
+          "finished_at_ms": 1767225700000,
+          "id": "b1:app:s1#5",
+          "number": 5,
+          "session_id": "app:s1",
+          "started_at_ms": 1767225602000,
+          "state": "completed"
+        },
+        "type": "task_updated"
+      },
+      "seq": 4,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225605000,
+      "event": {
+        "origin": "app",
+        "session_id": "app:s1",
+        "turn_id": "t9",
+        "type": "turn_started"
+      },
+      "seq": 5,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225606000,
+      "event": {
+        "state": "cancelled",
+        "text": "",
+        "turn_id": "t9",
+        "type": "turn_completed"
+      },
+      "seq": 6,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225607000,
+      "event": {
+        "origin": "app",
+        "session_id": "app:s1",
+        "turn_id": "t10",
+        "type": "turn_started"
+      },
+      "seq": 7,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225608000,
+      "event": {
+        "error": "the model timed out",
+        "state": "failed",
+        "text": "",
+        "turn_id": "t10",
+        "type": "turn_completed"
+      },
+      "seq": 8,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225609000,
+      "event": {
+        "state": "completed",
+        "text": "An answer from before",
+        "turn_id": "t-before-window",
+        "type": "turn_completed"
+      },
+      "seq": 9,
+      "session_id": "app:s1",
+      "type": "event"
+    }
+  ],
+  "state": {
+    "approvals": {},
+    "last_seq": 9,
+    "notice": null,
+    "order": [
+      "app:s1"
+    ],
+    "sessions": {
+      "app:s1": {
+        "lines": [
+          {
+            "kind": "note",
+            "text": "Stopped."
+          },
+          {
+            "kind": "note",
+            "text": "Failed: the model timed out"
+          },
+          {
+            "at_ms": 1767225609000,
+            "kind": "assistant",
+            "text": "An answer from before"
+          }
+        ],
+        "live": null,
+        "summary": null
+      }
+    },
+    "tasks": {
+      "b1:app:s1#4": {
+        "description": "Working on your message",
+        "id": "b1:app:s1#4",
+        "number": 4,
+        "session_id": "app:s1",
+        "started_at_ms": 1767225602000,
+        "state": "cancelling"
+      }
+    },
+    "view_request": null
+  }
+}

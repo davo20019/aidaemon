@@ -1,0 +1,254 @@
+{
+  "description": "Draft, create, inspect, and govern owner-confirmed ongoing mandates.",
+  "name": "manage_mandates",
+  "schema": {
+    "description": "Draft, create, inspect, and govern owner-confirmed ongoing mandates.",
+    "name": "manage_mandates",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "draft",
+            "create",
+            "list",
+            "get",
+            "update",
+            "pause",
+            "resume",
+            "answer_question",
+            "resolve_reconciliation",
+            "cancel",
+            "list_intentions"
+          ],
+          "type": "string"
+        },
+        "allow_observations": {
+          "type": "boolean"
+        },
+        "autonomy_mode": {
+          "enum": [
+            "bounded",
+            "autopilot"
+          ],
+          "type": "string"
+        },
+        "clear_strategy": {
+          "type": "boolean"
+        },
+        "constraints": {
+          "description": "Owner-facing guardrail. Use one short plain-language rule per item; split compound rules and avoid implementation jargon.",
+          "items": {
+            "maxLength": 500,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
+        "default_review_minutes": {
+          "description": "How often the mandate runs, in minutes (every hour = 60). For a fixed interval set min_review_minutes and max_review_minutes to the same value.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "duration_minutes": {
+          "description": "Create only, relative to activation. Updates ignore this field; use expires_at to change an existing mandate's expiry.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "expires_at": {
+          "description": "RFC3339 fixed deadline. Supported by both create and update.",
+          "type": "string"
+        },
+        "guidance": {
+          "maxLength": 1024,
+          "type": "string"
+        },
+        "include_terminal": {
+          "type": "boolean"
+        },
+        "limit": {
+          "maximum": 10,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mandate_id": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "max_mutating_actions_per_cycle": {
+          "maximum": 24,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_mutating_actions_per_rolling_24h": {
+          "maximum": 24,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_review_minutes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "min_review_minutes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "min_seconds_between_mutations": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "draft/create: the short name the owner gave the mandate, exactly as given; omit when none. Other actions: selects the mandate by that name when mandate_id is omitted.",
+          "maxLength": 80,
+          "type": "string"
+        },
+        "objective": {
+          "maxLength": 2048,
+          "type": "string"
+        },
+        "operation_scopes": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "allowed_query_params": {
+                "items": {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              "kind": {
+                "enum": [
+                  "observation",
+                  "mutation"
+                ],
+                "type": "string"
+              },
+              "mutation_effects": {
+                "items": {
+                  "enum": [
+                    "remote_mutation",
+                    "external_delivery"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 2,
+                "type": "array"
+              },
+              "operation": {
+                "enum": [
+                  "GET",
+                  "HEAD",
+                  "OPTIONS",
+                  "POST",
+                  "PUT",
+                  "PATCH",
+                  "DELETE"
+                ],
+                "type": "string"
+              },
+              "target_prefixes": {
+                "items": {
+                  "maxLength": 2048,
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "minItems": 1,
+                "type": "array"
+              },
+              "tool": {
+                "enum": [
+                  "http_request",
+                  "web_fetch"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool",
+              "operation",
+              "kind",
+              "target_prefixes",
+              "allowed_query_params",
+              "mutation_effects"
+            ],
+            "type": "object"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "type": "array"
+        },
+        "owner_alerts": {
+          "description": "create/update: true when the owner asked to be told what the mandate finds (e.g. tell me when it is down). Lets a review's WAIT carry owner_alert; grants no tool, target or effect.",
+          "type": "boolean"
+        },
+        "priority": {
+          "description": "Create only controller scheduling priority. Updates preserve the existing priority and ignore this field.",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "type": "string"
+        },
+        "reconciliation_resolution": {
+          "enum": [
+            "confirmed_effect_occurred",
+            "confirmed_no_effect",
+            "abandon_attempt"
+          ],
+          "type": "string"
+        },
+        "review_effort": {
+          "enum": [
+            "efficient",
+            "balanced",
+            "thorough"
+          ],
+          "type": "string"
+        },
+        "section": {
+          "enum": [
+            "summary",
+            "policy",
+            "history"
+          ],
+          "type": "string"
+        },
+        "source_goal_id": {
+          "description": "Create only. Optional provenance link to a personal goal created in this exact private owner session; omit it when no compatible goal exists. Updates preserve the existing binding and ignore this field.",
+          "maxLength": 256,
+          "type": "string"
+        },
+        "stop_conditions": {
+          "description": "Owner-facing reason to stop. Use one short plain-language condition per item.",
+          "items": {
+            "maxLength": 500,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
+        "strategy_skill": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "success_criteria": {
+          "description": "Owner-facing, observable success measure. Use one short plain-language result per item.",
+          "items": {
+            "maxLength": 500,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

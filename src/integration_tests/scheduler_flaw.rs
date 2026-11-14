@@ -11,9 +11,9 @@ mod scheduler_flaw_test {
     async fn test_scheduler_ignores_utc_timezone() {
         // 1. Setup isolated state store
         let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service = Arc::new(EmbeddingService::deterministic());
         let state: Arc<dyn StateStore> = Arc::new(
-            SqliteStateStore::new(
+            SqliteStateStore::for_tests(
                 db_file.path().to_str().unwrap(),
                 100,
                 None,

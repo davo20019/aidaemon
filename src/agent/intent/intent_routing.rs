@@ -9,64 +9,10 @@ pub(super) enum ConnectedApiIntent {
     WriteAction,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum ConnectedContentMode {
-    #[default]
-    None,
-    #[cfg(test)]
-    DraftOnly,
-    #[cfg(test)]
-    DeliverOnly,
-    #[cfg(test)]
-    DraftThenDeliver,
-}
+#[cfg(test)]
+use super::completion_contract::ConnectedContentMode;
 
-impl ConnectedContentMode {
-    pub(super) fn is_authoring_only(self) -> bool {
-        #[cfg(test)]
-        {
-            return matches!(self, Self::DraftOnly);
-        }
-        #[cfg(not(test))]
-        {
-            false
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn expects_live_delivery(self) -> bool {
-        matches!(self, Self::DeliverOnly | Self::DraftThenDeliver)
-    }
-}
-
-/// Check if a phrase appears as complete words in text (word-boundary matching).
-/// Splits on whitespace, trims surrounding punctuation (preserving apostrophes),
-/// then checks for consecutive word matches. Case-insensitive.
-///
-/// Works for single keywords ("deploy"), multi-word phrases ("set up"),
-/// and contractions ("i'll check").
-pub(crate) fn contains_keyword_as_words(text: &str, keyword: &str) -> bool {
-    let normalize = |w: &str| -> String {
-        w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
-            .to_lowercase()
-    };
-    let text_words: Vec<String> = text
-        .split_whitespace()
-        .map(normalize)
-        .filter(|w| !w.is_empty())
-        .collect();
-    let kw_words: Vec<String> = keyword
-        .split_whitespace()
-        .map(normalize)
-        .filter(|w| !w.is_empty())
-        .collect();
-    if kw_words.is_empty() {
-        return false;
-    }
-    text_words
-        .windows(kw_words.len())
-        .any(|window| window == kw_words.as_slice())
-}
+pub(crate) use aidaemon_tools::text::contains_keyword_as_words;
 
 /// Returns `true` when this turn is a background-output delivery injected by
 /// the terminal tool's re-engagement path (see `tools/terminal.rs`).
@@ -86,7 +32,6 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
     if is_observation_delivery_turn(user_text) {
         return IntentGateDecision {
             needs_tools: Some(false),
-            ..Default::default()
         };
     }
 
@@ -109,7 +54,6 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
     {
         return IntentGateDecision {
             needs_tools: Some(true),
-            ..Default::default()
         };
     }
 
@@ -948,7 +892,11 @@ mod intent_routing_path_override_tests {
 
     #[test]
     fn infer_intent_gate_forces_tools_for_unix_paths() {
-        let d = infer_intent_gate("/Users/alice/project/file.txt", "");
+        // An absolute path counts only when it reaches this machine's
+        // filesystem, so the path sits under a directory every host has
+        // (`/Users` exists on macOS only).
+        let path = std::env::temp_dir().join("alice/project/file.txt");
+        let d = infer_intent_gate(&path.display().to_string(), "");
         assert_eq!(d.needs_tools, Some(true));
     }
 

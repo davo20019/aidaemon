@@ -1,0 +1,56 @@
+[package]
+name = "aidaemon-channel-discord"
+description = "Discord adapter for aidaemon channels; implementation crate of the aidaemon SDK, no stability promise (use it through aidaemon-sdk)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-channel-discord"
+readme = "README.md"
+keywords = ["discord", "bot", "agent", "chat", "llm"]
+categories = ["asynchronous", "network-programming"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
+publish = false
+
+[features]
+# zlib-stream transport compression (`DiscordChannel::with_zlib_compression`).
+# tokio-tungstenite has no inflate of its own, so this is the crate's one
+# optional dependency; a build without the feature connects uncompressed.
+zlib = ["dep:flate2"]
+# The bot an application runs (`bot::DiscordBot`): access, sessions,
+# commands and files on the shared turn runner.
+bot = [
+    "dep:aidaemon-core",
+    "dep:aidaemon-events",
+    "dep:aidaemon-tools",
+    "dep:anyhow",
+    "dep:uuid",
+]
+
+[dependencies]
+aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels", features = ["http"] }
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core", optional = true }
+aidaemon-events = { version = "0.20.0", path = "../aidaemon-events", optional = true }
+aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools", optional = true }
+anyhow = { version = "1", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+async-trait = "0.1"
+flate2 = { version = "1", optional = true }
+futures = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "rustls"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "macros", "rt", "time", "net"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+tokio-util = "0.7"
+tracing = "0.1"
+
+[dev-dependencies]
+aidaemon-channels = { path = "../aidaemon-channels", features = ["conformance"] }
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+flate2 = "1"
+tokio = { version = "1", features = ["full"] }

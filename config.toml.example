@@ -26,9 +26,8 @@ backend = "local" # local | docker | ssh
 # workspace_root = "/absolute/path/to/workspace"
 # allow_outside_workspace = true # path tools: defaults true locally, false remotely
 
-# Docker is optional and requires a binary built with:
-#   cargo install aidaemon --features execution-docker
-# The backend creates/reuses one persistent container and bind-mounts a host
+# Docker is built in (the default `execution-docker` feature) and needed only
+# when this backend is selected. The backend creates/reuses one persistent container and bind-mounts a host
 # workspace. Network access is disabled unless explicitly enabled.
 # [execution.docker]
 # container = "aidaemon-execution"
@@ -116,6 +115,10 @@ smart = "anthropic/claude-sonnet-4"
 
 # Optional direct-provider fallback chain. These entries are tried in order
 # after the primary provider's own model fallback list is exhausted.
+# A provider whose account cannot answer (a subscription plan's usage
+# limit, a daily quota, no credit left, a rejected key) is skipped at once
+# for its other models, and stays skipped until its stated reset (or for a
+# few minutes when it states none), so the next entry here answers instead.
 # Keychain secret names use `provider_fallback_<index>_...`, for example:
 # `provider_fallback_0_api_key`, `provider_fallback_0_gateway_token`.
 #
@@ -170,6 +173,15 @@ working_memory_cap = 50
 # consolidation_interval_hours = 6  # How often to run memory consolidation (extract durable facts from conversations)
 # encryption_key = "keychain"       # Optional override; default startup uses AIDAEMON_ENCRYPTION_KEY from .env
 # encryption_key = "${AIDAEMON_ENCRYPTION_KEY}"
+# upgrade_backups = 2               # Snapshots kept in backups/ next to the database, one written
+#                                   # when a new aidaemon version first starts on it (0 = off)
+
+# Long-term memory for agent turns. "daemon" (default) is the built-in memory
+# in the state database; "sdk" uses the aidaemon-memory crate (build with
+# --features sdk-memory) and keeps its facts in a separate SQLite file.
+# [memory]
+# backend = "daemon"
+# path = "aidaemon-memory.db"
 
 # Exact user/assistant recall follows this canonical-event retention window.
 # Set messages_days = 0 for opt-in permanent active-database history.
@@ -181,8 +193,10 @@ working_memory_cap = 50
 # Optional per-model total context windows (input plus output tokens).
 # Use the exact model identifier configured under [provider.models].
 # [state.context_window]
-# summarize_token_threshold = 12000 # compact when unsummarized whole turns reach this estimate
-# summary_recent_tokens = 4000      # keep at least this much recent raw context
+# Compaction runs after a reply once the history fills 60% of the turn model's
+# window (a turn only waits for it at 80%). Both settings are optional caps.
+# summarize_token_threshold = 12000 # compact earlier than 60% of the window
+# summary_recent_tokens = 4000      # recent raw context kept (default: a quarter of the threshold)
 # [state.context_window.model_budgets]
 # local-model-name = 16384
 
@@ -219,6 +233,14 @@ daemon_ws_url = "wss://terminal.aidaemon.ai/v1/ws/daemon"
 # 3) alias roots below
 # [path_aliases]
 # projects = ["~/projects"]
+
+# Export run traces over OTLP/HTTP to LangSmith, Langfuse or a collector.
+# Nothing leaves unless an endpoint is set; spans carry names, timings and token
+# counts. capture_content adds prompts and replies, with secrets removed.
+# [telemetry]
+# otlp_endpoint = "https://api.smith.langchain.com/otel"
+# otlp_headers = { "x-api-key" = "keychain" }   # keychain name: otlp_header_x-api-key
+# capture_content = false
 
 [daemon]
 health_port = 8080
@@ -329,7 +351,12 @@ health_port = 8080
 # max_depth = 3            # max nesting levels for sub-agents
 # max_iterations = 10      # agentic loop iterations per sub-agent
 # max_response_chars = 8000
-# timeout_secs = 300       # 5 minute timeout per sub-agent
+# max_concurrent = 4         # plain sub-agents one request may run at once
+# max_per_request = 12       # plain sub-agents one request may start in total
+# coordination = true        # refuse stale file writes across one request's agents; false restores last-writer-wins
+# max_escalations_per_child = 3    # questions a child may put to the top-level agent itself
+# max_escalations_per_request = 12 # escalations of any kind in one request
+# timeout_secs = 300       # stop a sub-agent after 5 minutes without progress (never for running long)
 
 # [files]
 # Channel file inbox/outbox, LLM vision, and generated-image artifact storage.
@@ -386,6 +413,11 @@ health_port = 8080
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 # Prefer built-in read_file/write_file/search_files instead of MCP filesystem.
+# read_only_tools = ["read_text_file", "list_directory"]
+# Tools you declare read-only (by the server's own tool names) are judged as
+# reads: no approval card, and they run under read-only authority. Their
+# results are still untrusted content. A server's own readOnlyHint never
+# counts; only this list does. Servers added with manage_mcp have no list.
 
 # [health]
 # Scheduled uptime probes (http/port/command/file) with channel alerts. Off by default.
@@ -433,7 +465,6 @@ health_port = 8080
 #   scale 3x — while small/local models (gemma, llama, qwen, ...) keep the
 #   full supervision scaffolding. Hard safety caps (iteration/token/wall-clock,
 #   repetition guards, anti-fabrication checks) apply on every tier.
-#   Gate fires are logged under the `heuristic_telemetry` tracing target.
 #
 #   The auto list matches known frontier families only. If you run a capable
 #   open model it doesn't recognize (e.g. kimi-k2.5, large qwen/deepseek
@@ -459,11 +490,23 @@ record_decision_points = true
 max_events = 200
 include_raw_tool_args = false
 
-# [self_correction]
-# Controls the agent self-correction gate. All flags default to false (safe-off).
-# enabled = false                  # master switch — enables the correction retry loop
-# correction_bypass_enabled = false # allow trusted sessions to skip the correction gate
-# max_attempts = 3                 # maximum correction retries per task
+# The Client Gateway (/client/v1): lets your own apps (a terminal UI, a web
+# page) chat with the agent, watch every chat's turns and answer approvals.
+# Off by default; loopback only. Turn it on here or ask the agent to "enable
+# the client gateway", restart, then run `aidaemon tui` (terminal) or
+# `aidaemon web` (browser); the local token is minted on first use and saved
+# at ~/.aidaemon/client-token. Pair a phone or another browser
+# with /pair_device in a chat or `aidaemon pair`; the app's web build
+# (installed by install.sh into ~/.aidaemon/app-web) is served at
+# /client/v1/next/. /devices lists them, /revoke_device <id> cuts one off.
+# [client_gateway]
+# enabled = false
+# bind = "127.0.0.1"
+# port = 8788
+# retention_days = 7          # resume window; older clients get a snapshot
+# max_events = 100000
+# watch_risk_ceiling = "medium"
+# public_url = "https://aidaemon.example.ts.net"   # your HTTPS tunnel, for pairing links
 
 # Nodes are disabled by default. The Gateway binds only to loopback; publish
 # this narrow service through a separately managed HTTPS transport adapter.
@@ -538,3 +581,23 @@ provider = "macos_say"
 voice = "Samantha"
 sample_rate_hz = 22050
 timeout_seconds = 20
+
+# Optional decision layer: a backend that answers small closed questions
+# (how a message relates to earlier ones, which recalled facts matter, which
+# model tier a request needs) with a confidence. Off by default; with it off,
+# or on any failure, the daemon behaves exactly as without it.
+# Backends: "off", "provider" (your configured chat model, asked for JSON;
+# its confidence is self-reported, so decisions that need an honest
+# confidence stay in shadow) or "gemini" (Google's Decisions API,
+# calibrated confidence; input is sent to Google, and its free tier may use
+# it to improve Google's products).
+# [decisions]
+# backend = "gemini"
+# # Empty: the key of the first google_genai provider in [provider].
+# api_key = ""
+# [decisions.mode]   # off | shadow (record, never act) | on
+# turn_digest = "shadow"
+# resume = "shadow"
+# recall_filter = "shadow"
+# model_route = "off"
+# command_risk_second = "off"

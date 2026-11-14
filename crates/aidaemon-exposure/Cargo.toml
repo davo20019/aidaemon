@@ -1,0 +1,36 @@
+[package]
+name = "aidaemon-exposure"
+description = "Exposure adapters for aidaemon: publish a loopback gateway through a supervised tunnel (Cloudflare, Tailscale, a reverse proxy or a custom command) and feed its live HTTPS origin to the gateway; implementation crate of the aidaemon SDK, no stability promise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-exposure"
+readme = "README.md"
+keywords = ["agent", "tunnel", "gateway", "tailscale", "cloudflare"]
+categories = ["network-programming", "asynchronous"]
+publish = false
+
+[features]
+# Exposes `aidaemon_exposure::testing::FakeAdapter`.
+testing = []
+
+[dependencies]
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
+async-trait = "0.1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "process", "rt", "sync", "time", "io-util", "fs"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+aidaemon-exposure = { path = ".", features = ["testing"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+toml = "1"

@@ -1,0 +1,1645 @@
+//! Single self-editing status surface per turn. One message is created lazily on
+//! the first progress event and edited in place for every subsequent update, so a
+//! task shows one calm, updating line/checklist instead of many messages.
+//!
+//! Every card, the live one during a turn and the one a turn leaves behind,
+//! is drawn by [`render_card`] from one view: the plan's card, each helper's
+//! record ([`HelperView`]) and the turn's own typed [`Step`]. How a card ends
+//! with its turn is decided once, from that view ([`CardView::end`]): every
+//! channel path keeps or collapses the same card the same way.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use aidaemon_core::card::{
+    ActivityKind, CardEnd, HelperView, PlanCard, RunPhase, Step, SupersededBy,
+    finished_by_turn_line, run_attempts, superseded_line, superseded_runs,
+};
+use aidaemon_tools::status::StatusUpdate;
+
+use crate::hub::ChannelHub;
+
+/// Whether a plan card (a rendered checklist) shows every step finished.
+/// Such a card drops the turn's own step line: the work is done.
+pub fn is_completed_checklist(rendered: &str) -> bool {
+    rendered.trim_start().starts_with('✅')
+}
+
+/// One card's state, as every surface draws it.
+#[derive(Debug, Clone, Default)]
+pub struct CardView<'a> {
+    /// The plan's card, as the plan renders itself.
+    pub plan: Option<&'a PlanCard>,
+    /// Each helper's record, in the order they started, with how long its
+    /// latest step has run when that is known.
+    pub helpers: Vec<(HelperView, Option<Duration>)>,
+    /// The turn's own current step and how long it has run.
+    pub activity: Option<(&'a Step, Duration)>,
+    /// The work the turn finished itself after a helper ended, as the
+    /// runtime measured and worded it ("Finished by me after the helper:
+    /// …" and its measured line).
+    pub by_me: Option<&'a str>,
+    /// The request's total once the turn finished after its helpers.
+    pub request_total: Option<&'a str>,
+}
+
+impl CardView<'_> {
+    /// How this card ends with its turn ([`CardEnd::of`]).
+    pub fn end(&self) -> CardEnd {
+        CardEnd::of(self.plan, self.helpers.len())
+    }
+}
+
+/// The card for `view`: the plan (when there is one), each helper's header
+/// and its latest step while it runs (its measured time once it ended), and
+/// the turn's own step, each long step with how long it has run. A plan
+/// never hides the helpers or the step running now; a finished plan drops
+/// the turn's own step.
+pub fn render_card(view: &CardView<'_>) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    // A run a later attempt took its plan steps over from (a later run, or
+    // the turn itself) is history: one quiet line, never a failure in the
+    // header or the total (live 2026-11-13: "A helper didn't finish · 3 of 3
+    // done" and "1 didn't finish" over a Drupal step a second helper
+    // finished).
+    let records: Vec<&HelperView> = view.helpers.iter().map(|(helper, _)| helper).collect();
+    let superseded = superseded_runs(&records, view.plan);
+    let attempts = run_attempts(&records);
+    let current: Vec<&(HelperView, Option<Duration>)> = view
+        .helpers
+        .iter()
+        .zip(&superseded)
+        .filter(|(_, by)| by.is_none())
+        .map(|(helper, _)| helper)
+        .collect();
+    // A one-step plan is its step; with a run on the card that run is the
+    // step, so its line is the card's one line for it (live 2026-11-13: a
+    // background shell loop showed "Run your shell loop…" from its plan
+    // above "Running in the background: a shell loop" for the same work).
+    let shown_plan = view
+        .plan
+        .filter(|plan| plan.steps > 1 || view.helpers.is_empty());
+    let plan_shown = shown_plan.is_some();
+    if let Some(plan) = shown_plan {
+        parts.push(plan_with_run_header(plan, &current));
+    }
+    // The turn's own finishing work is the latest attempt at the steps of
+    // the helper it took over from: said once, on that helper's line, with
+    // its measured time.
+    let by_turn = superseded.contains(&Some(SupersededBy::Turn));
+    let by_me_measured = view.by_me.and_then(|line| line.trim().split_once('\n'));
+    for (index, (helper, elapsed)) in view.helpers.iter().enumerate() {
+        match superseded[index] {
+            Some(SupersededBy::Run(later)) => parts.push(superseded_line(
+                helper,
+                attempts[index],
+                records[later],
+                attempts[later],
+            )),
+            Some(SupersededBy::Turn) => {
+                let line = finished_by_turn_line(helper, attempts[index]);
+                parts.push(match by_me_measured {
+                    Some((_, measured)) => format!("{line}\n{}", measured.trim()),
+                    None => line,
+                })
+            }
+            None => parts.push(helper_block(helper, *elapsed)),
+        }
+    }
+    if let Some(total) = since_request_total(&view.helpers, &current) {
+        parts.push(total);
+    }
+    if let Some(finished) = finished_lines(view, plan_shown, by_turn) {
+        parts.push(finished);
+    }
+    let done = view
+        .plan
+        .is_some_and(|plan| is_completed_checklist(&plan.text));
+    if !done {
+        // While helpers are on the card, the turn's own handing-off step is
+        // its wait for them, not work of its own: their lines say what is
+        // being done (live 2026-11-13: "Asking a helper · 3 min so far"
+        // stood under two working helpers until the last of them ended).
+        let waiting_on_helpers = !view.helpers.is_empty();
+        if let Some((step, elapsed)) = view.activity.filter(|(step, _)| {
+            step.is_shown()
+                && !(waiting_on_helpers && matches!(step, Step::Doing(ActivityKind::Delegate)))
+        }) {
+            parts.push(format!("⏳ {}", line_with_elapsed(&step.words(), elapsed)));
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// The plan's card under the header its steps and the card's current runs
+/// give together ([`PlanCard::header_with_runs`]): the plan's own step marks
+/// stay as its records set them, only the header line is the card's.
+fn plan_with_run_header(plan: &PlanCard, current: &[&(HelperView, Option<Duration>)]) -> String {
+    let text = plan.text.trim_end();
+    let phases: Vec<RunPhase> = current.iter().map(|(helper, _)| helper.phase).collect();
+    let Some(header) = plan.header_with_runs(&phases) else {
+        return text.to_string();
+    };
+    match text.split_once('\n') {
+        Some((_, body)) => format!("{header}\n{body}"),
+        None => header,
+    }
+}
+
+/// With several helpers on the card, once every one ended: how long after
+/// the owner's request the last of them ended, from their run records, and
+/// how the current runs (those no later attempt superseded) ended. One
+/// current helper's own line already says it.
+fn since_request_total(
+    helpers: &[(HelperView, Option<Duration>)],
+    current: &[&(HelperView, Option<Duration>)],
+) -> Option<String> {
+    if current.len() < 2
+        || helpers
+            .iter()
+            .any(|(helper, _)| !helper.phase.is_terminal())
+    {
+        return None;
+    }
+    let last = helpers
+        .iter()
+        .map(|(helper, _)| helper.since_request.as_ref())
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .max_by_key(|since| since.secs)?;
+    // Counted from the current runs' phases: a run that failed or stopped
+    // is never "done" (live 2026-11-13: "All 2 done" over a CLI run its
+    // sandbox had refused), and a superseded try is not counted at all.
+    let count = |phase: RunPhase| {
+        current
+            .iter()
+            .filter(|(helper, _)| helper.phase == phase)
+            .count()
+    };
+    let by_owner = current
+        .iter()
+        .filter(|(helper, _)| helper.phase == RunPhase::Stopped && helper.stopped_by_owner)
+        .count();
+    let (failed, stopped) = (count(RunPhase::Failed), count(RunPhase::Stopped) - by_owner);
+    if failed == 0 && stopped == 0 && by_owner == 0 {
+        return Some(format!("All {} done {}.", current.len(), last.words.trim()));
+    }
+    let mut ended = Vec::new();
+    if failed > 0 {
+        ended.push(format!("{failed} failed"));
+    }
+    if stopped > 0 {
+        ended.push(format!("{stopped} didn't finish"));
+    }
+    if by_owner > 0 {
+        ended.push(format!("{by_owner} stopped by you"));
+    }
+    Some(format!(
+        "The last of them ended {}; {}.",
+        last.words.trim(),
+        ended.join(", ")
+    ))
+}
+
+/// The card's lines under the runs for a request the turn finished after
+/// its helpers. A plan on the card is the one list its header counts: the
+/// turn's own work there is a step's latest attempt, said on the line of the
+/// helper it took the step over from (`by_turn`), never a second ✅ row the
+/// count leaves out (live 2026-11-14: "Finished · 3 of 3 done" over four
+/// rows, the fourth "✅ Finished by me after the helper"). Work after a
+/// helper that no step names stays a measured note, without a step's mark.
+/// With no plan, [`finished_block`].
+fn finished_lines(view: &CardView<'_>, plan_shown: bool, by_turn: bool) -> Option<String> {
+    if !plan_shown {
+        return finished_block(view.by_me, view.request_total);
+    }
+    let lines: Vec<String> = [view.by_me.filter(|_| !by_turn), view.request_total]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// The card's lines for a request the turn finished after its helpers:
+/// the work it finished itself after a helper ("✅ Finished by me after the
+/// helper: …" and its measured line), then the request's total, both as the
+/// runtime measured and worded them.
+pub fn finished_block(by_me: Option<&str>, total: Option<&str>) -> Option<String> {
+    let lines: Vec<String> = [
+        by_me
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| format!("✅ {line}")),
+        total
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// Where a helper stands, in a few plain words: its latest step while it
+/// runs, else how it ended. For one-line replies that list helpers.
+pub fn helper_status_words(helper: &HelperView) -> String {
+    match (helper.phase, helper.step.as_ref()) {
+        (RunPhase::Running, Some(step)) if step.is_shown() => step.words(),
+        (RunPhase::Running, Some(_)) => "Working".to_string(),
+        (RunPhase::Running, None) => "Getting started".to_string(),
+        (RunPhase::Succeeded, _) => "Finished".to_string(),
+        (RunPhase::Stopped, _) if helper.stopped_by_owner => "Stopped by you".to_string(),
+        (RunPhase::Stopped, _) => "Didn't finish".to_string(),
+        (RunPhase::Failed, _) => "Failed".to_string(),
+    }
+}
+
+/// A helper's lines on a card: its header, then its latest step while it
+/// runs, or how long it took once it ended.
+fn helper_block(helper: &HelperView, elapsed: Option<Duration>) -> String {
+    let mut block = format!("{}: {}", helper.headline(), helper.label.trim());
+    // Why it failed or stopped, from its record, right under its header.
+    if let Some(reason) = helper
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| helper.phase.is_terminal() && !reason.is_empty())
+    {
+        block.push('\n');
+        block.push_str(reason);
+    }
+    match (helper.phase, helper.step.as_ref(), helper.took.as_deref()) {
+        (RunPhase::Running, Some(step), _) if step.is_shown() => {
+            block.push('\n');
+            block.push_str(&line_with_elapsed(
+                &step.words(),
+                elapsed.unwrap_or_default(),
+            ));
+        }
+        // Its one measured line, from its record: how long its work took
+        // and, when a request started it, when after that request it
+        // started and ended, each figure labelled. The card adds no time
+        // of its own.
+        (phase, _, Some(took)) if phase.is_terminal() => {
+            block.push('\n');
+            block.push_str(took.trim());
+        }
+        _ => {}
+    }
+    block
+}
+
+/// Abstraction over the chat surface so `LiveStatus` is testable without a bot.
+#[async_trait::async_trait]
+pub trait SurfaceSink: Send + Sync {
+    /// Create a new surface message; returns its channel message id (if any).
+    async fn create(&self, text: &str) -> anyhow::Result<Option<String>>;
+    /// Edit an existing surface message. `Ok(true)` edited, `Ok(false)` can't edit.
+    async fn edit(&self, message_id: &str, text: &str) -> anyhow::Result<bool>;
+    /// Delete an existing surface message. `Ok(true)` deleted, `Ok(false)` can't delete.
+    async fn delete(&self, message_id: &str) -> anyhow::Result<bool>;
+}
+
+/// Per-turn live-status state. Shared as `Arc<tokio::sync::Mutex<LiveStatus>>`
+/// between the status-consumer task and the turn runner, which owns how the
+/// card ends.
+pub struct LiveStatus {
+    message_id: Option<String>,
+    checklist: Option<PlanCard>,
+    /// The turn's own current step and when it began.
+    activity: Option<(Step, std::time::Instant)>,
+    /// Each helper's record, in the order they started, and when its
+    /// latest step began.
+    helpers: Vec<(HelperView, std::time::Instant)>,
+    /// The work the turn finished itself after a helper, and the
+    /// request's total, as the runtime measured them.
+    by_me: Option<String>,
+    request_total: Option<String>,
+    /// What the surface shows now, so an unchanged card is never re-sent.
+    shown: Option<String>,
+    edit_supported: bool,
+}
+
+/// How long a step must have run before its line says for how long.
+const ELAPSED_SHOWN_AFTER: Duration = Duration::from_secs(30);
+
+/// `line` with how long its step has run, in whole minutes once it passes
+/// `ELAPSED_SHOWN_AFTER` ("Running a command · 3 min so far"), so a long
+/// step reads as alive and the card changes at most once a minute.
+pub fn line_with_elapsed(line: &str, elapsed: Duration) -> String {
+    if elapsed < ELAPSED_SHOWN_AFTER {
+        return line.to_string();
+    }
+    let minutes = elapsed.as_secs() / 60;
+    if minutes == 0 {
+        format!("{line} · under a minute so far")
+    } else {
+        format!("{line} · {minutes} min so far")
+    }
+}
+
+impl LiveStatus {
+    pub fn new() -> Self {
+        Self {
+            message_id: None,
+            checklist: None,
+            activity: None,
+            helpers: Vec::new(),
+            by_me: None,
+            request_total: None,
+            shown: None,
+            edit_supported: true,
+        }
+    }
+
+    /// The card as it is now.
+    fn view(&self, with_activity: bool) -> CardView<'_> {
+        CardView {
+            plan: self.checklist.as_ref(),
+            helpers: self
+                .helpers
+                .iter()
+                .map(|(helper, since)| (helper.clone(), Some(since.elapsed())))
+                .collect(),
+            activity: with_activity
+                .then_some(self.activity.as_ref())
+                .flatten()
+                .map(|(step, since)| (step, since.elapsed())),
+            by_me: self.by_me.as_deref(),
+            request_total: self.request_total.as_deref(),
+        }
+    }
+
+    fn render(&self) -> Option<String> {
+        render_card(&self.view(true))
+    }
+
+    /// What the card would show now.
+    pub fn preview(&self) -> Option<String> {
+        self.render()
+    }
+
+    /// How this card ends with its turn: the one rule ([`CardView::end`]).
+    pub fn end(&self) -> CardEnd {
+        self.view(false).end()
+    }
+
+    /// Note one of the turn's status updates on the card; `true` when the
+    /// card should show it at once: the plan, a handoff and a helper's
+    /// start or end are never held back. Each step is its typed kind; a
+    /// tool ending is not a step, and between steps (the model choosing
+    /// the next one) the card keeps the latest step while the working
+    /// indicator says the turn is busy.
+    pub fn note(&mut self, update: &StatusUpdate) -> bool {
+        match update {
+            StatusUpdate::Checklist(plan) => {
+                self.note_checklist(plan.clone());
+                true
+            }
+            StatusUpdate::ToolStart { kind, .. } => {
+                self.note_activity(Step::Doing(*kind));
+                false
+            }
+            StatusUpdate::StepHandedOff { kind } => {
+                self.note_activity(Step::HandedOff(*kind));
+                true
+            }
+            StatusUpdate::Helper(helper) => self.note_helper(helper.clone()),
+            StatusUpdate::Finished { by_me, total } => {
+                self.by_me = by_me.clone();
+                self.request_total = total.clone();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Note the plan card without sending it.
+    pub fn note_checklist(&mut self, plan: PlanCard) {
+        self.checklist = Some(plan);
+    }
+
+    /// Note the turn's current step without sending it; the same step
+    /// keeps its start time.
+    pub fn note_activity(&mut self, step: Step) {
+        if self.activity.as_ref().map(|(shown, _)| shown) != Some(&step) {
+            self.activity = Some((step, std::time::Instant::now()));
+        }
+    }
+
+    /// Note a helper's record: one entry per helper (per run when the
+    /// record names its run, [`HelperView::same_helper`]), its latest step
+    /// keeping its start time while it stays the same. `true` when its
+    /// header changed (it is new, or it ended): a step alone can wait for
+    /// the next refresh.
+    pub fn note_helper(&mut self, helper: HelperView) -> bool {
+        match self
+            .helpers
+            .iter_mut()
+            .rev()
+            .find(|(known, _)| known.same_helper(&helper))
+        {
+            Some((known, _)) if *known == helper => false,
+            // A helper starting (its first record: running, no step yet)
+            // under the name of one that already ended is a new run, often
+            // a retry of the same step: its own entry, after the first.
+            Some((known, _))
+                if known.phase.is_terminal()
+                    && helper.phase == RunPhase::Running
+                    && helper.step.is_none() =>
+            {
+                self.helpers.push((helper, std::time::Instant::now()));
+                true
+            }
+            Some((known, since)) => {
+                // A late step never undoes how the helper ended.
+                if known.phase.is_terminal() && !helper.phase.is_terminal() {
+                    return false;
+                }
+                let header_changed = known.phase != helper.phase || known.took != helper.took;
+                if known.step != helper.step {
+                    *since = std::time::Instant::now();
+                }
+                *known = helper;
+                header_changed
+            }
+            None => {
+                self.helpers.push((helper, std::time::Instant::now()));
+                true
+            }
+        }
+    }
+
+    /// Send the card when what it would show changed since it was last
+    /// sent (a step's elapsed time included); `true` when it was sent.
+    pub async fn flush_if_changed(&mut self, sink: &dyn SurfaceSink) -> bool {
+        if self.render().is_none() || self.render() == self.shown {
+            return false;
+        }
+        self.flush(sink).await;
+        true
+    }
+
+    async fn flush(&mut self, sink: &dyn SurfaceSink) {
+        let Some(body) = self.render() else { return };
+        self.shown = Some(body.clone());
+        let body = crate::presentation::render_internal_markers(&body);
+        match (&self.message_id, self.edit_supported) {
+            (Some(id), true) => match sink.edit(id, &body).await {
+                Ok(true) => {}
+                _ => {
+                    // First edit failure: stop editing for the rest of the turn and
+                    // send a fresh message instead.
+                    self.edit_supported = false;
+                    if let Ok(Some(new_id)) = sink.create(&body).await {
+                        self.message_id = Some(new_id);
+                    }
+                }
+            },
+            (Some(_), false) => {
+                // Editing is disabled for this turn after an earlier failure: fall back
+                // to today's throttled send behavior — a fresh message per update, so
+                // progress is never lost (the consumer applies the 3s throttle).
+                if let Ok(Some(new_id)) = sink.create(&body).await {
+                    self.message_id = Some(new_id);
+                }
+            }
+            (None, _) => {
+                if let Ok(Some(id)) = sink.create(&body).await {
+                    self.message_id = Some(id);
+                }
+            }
+        }
+    }
+
+    pub async fn set_checklist(&mut self, sink: &dyn SurfaceSink, plan: PlanCard) {
+        self.note_checklist(plan);
+        self.flush(sink).await;
+    }
+
+    pub async fn set_activity(&mut self, sink: &dyn SurfaceSink, step: Step) {
+        self.note_activity(step);
+        self.flush(sink).await;
+    }
+
+    /// End the card with its turn, by the one rule ([`Self::end`]). The
+    /// turn's own step always goes. A card that is kept (a helper on it, or
+    /// a plan of more than one step) is settled to its final state and
+    /// stays as the record of the work; a background helper still running
+    /// settles it again when it ends. Any other card is removed: the reply
+    /// says what was done. Safe to call more than once.
+    pub async fn close(&mut self, sink: &dyn SurfaceSink) {
+        self.activity = None;
+        match self.end() {
+            CardEnd::Keep => {
+                let card = render_card(&self.view(false));
+                if card.is_none() || self.shown == card {
+                    return;
+                }
+                if let (Some(id), true, Some(body)) =
+                    (&self.message_id, self.edit_supported, card.as_deref())
+                {
+                    let body = crate::presentation::render_internal_markers(body);
+                    if matches!(sink.edit(id, &body).await, Ok(true)) {
+                        self.shown = card;
+                    }
+                }
+            }
+            CardEnd::Collapse => {
+                if let Some(id) = self.message_id.take() {
+                    let _ = sink.delete(&id).await;
+                }
+                self.shown = None;
+            }
+        }
+    }
+
+    /// The card's editable message id, when one exists and editing still
+    /// works this turn.
+    pub fn surface_message_id(&self) -> Option<String> {
+        if self.edit_supported {
+            self.message_id.clone()
+        } else {
+            None
+        }
+    }
+
+    /// The message showing this turn's kept card, when one is on screen
+    /// and still editable, so work that outlives the turn (a background
+    /// job settling its steps, a helper ending) can update the card.
+    pub fn kept_card_message_id(&self) -> Option<String> {
+        if self.end() == CardEnd::Collapse {
+            return None;
+        }
+        self.surface_message_id()
+    }
+}
+
+impl Default for LiveStatus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `SurfaceSink` backed by the long-lived `ChannelHub`. Survives the per-request
+/// status task being aborted, and is channel-agnostic (edit degrades to Ok(false)).
+pub struct HubSurfaceSink {
+    hub: Arc<ChannelHub>,
+    session_id: String,
+}
+
+impl HubSurfaceSink {
+    pub fn new(hub: Arc<ChannelHub>, session_id: String) -> Self {
+        Self { hub, session_id }
+    }
+}
+
+#[async_trait::async_trait]
+impl SurfaceSink for HubSurfaceSink {
+    async fn create(&self, text: &str) -> anyhow::Result<Option<String>> {
+        self.hub.send_text_tracked(&self.session_id, text).await
+    }
+    async fn edit(&self, message_id: &str, text: &str) -> anyhow::Result<bool> {
+        self.hub.edit_text(&self.session_id, message_id, text).await
+    }
+    async fn delete(&self, message_id: &str) -> anyhow::Result<bool> {
+        self.hub.delete_message(&self.session_id, message_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex as StdMutex;
+
+    use aidaemon_core::card::ActivityKind;
+
+    use super::*;
+
+    /// A request the turn finished after its helper: the card says the work
+    /// it finished itself after the helper and the request's total, as the
+    /// runtime measured and worded them, under the helper's own line.
+    #[test]
+    fn the_card_shows_work_finished_after_the_helper_and_the_total() {
+        let mut helper = HelperView::running("Drupal install", false, None);
+        helper.phase = RunPhase::Succeeded;
+        helper.took = Some("Took 7m 54s (12:30:56 PM to 12:38:50 PM ET).".into());
+        let card = render_card(&CardView {
+            helpers: vec![(helper, None)],
+            by_me: Some(
+                "Finished by me after the helper: Drupal install\nTook 2m 44s (12:38:50 PM to \
+                 12:41:34 PM ET).",
+            ),
+            request_total: Some(
+                "Answer sent 11m 10s after your request (12:30:24 PM to 12:41:34 PM ET).",
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            card.ends_with(
+                "✅ Finished by me after the helper: Drupal install\nTook 2m 44s (12:38:50 PM \
+                 to 12:41:34 PM ET).\nAnswer sent 11m 10s after your request (12:30:24 PM to \
+                 12:41:34 PM ET)."
+            ),
+            "{card}"
+        );
+        assert_eq!(finished_block(None, None), None);
+    }
+
+    /// A failed helper's card says why, from its record, under its header.
+    #[test]
+    fn a_failed_helpers_card_says_why() {
+        let mut helper = HelperView::running("measuring caches and app data", true, None);
+        helper.phase = RunPhase::Failed;
+        helper.reason = Some("Its program stopped with an error (exit status 1).".into());
+        helper.took = Some("Took 1m 6s.".into());
+        let card = render_card(&CardView {
+            helpers: vec![(helper, None)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            card.contains(
+                "measuring caches and app data\nIts program stopped with an error (exit status \
+                 1).\nTook 1m 6s."
+            ),
+            "{card}"
+        );
+    }
+
+    /// Records create/edit calls; create returns a fixed id, edit returns a flag.
+    struct FakeSink {
+        creates: StdMutex<Vec<String>>,
+        edits: StdMutex<Vec<(String, String)>>,
+        deletes: StdMutex<Vec<String>>,
+        edit_ok: bool,
+    }
+    impl FakeSink {
+        fn new(edit_ok: bool) -> Self {
+            Self {
+                creates: StdMutex::new(vec![]),
+                edits: StdMutex::new(vec![]),
+                deletes: StdMutex::new(vec![]),
+                edit_ok,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl SurfaceSink for FakeSink {
+        async fn create(&self, text: &str) -> anyhow::Result<Option<String>> {
+            self.creates.lock().unwrap().push(text.to_string());
+            Ok(Some("m1".to_string()))
+        }
+        async fn edit(&self, message_id: &str, text: &str) -> anyhow::Result<bool> {
+            self.edits
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            Ok(self.edit_ok)
+        }
+        async fn delete(&self, message_id: &str) -> anyhow::Result<bool> {
+            self.deletes.lock().unwrap().push(message_id.to_string());
+            Ok(true)
+        }
+    }
+
+    fn doing(kind: ActivityKind) -> Step {
+        Step::Doing(kind)
+    }
+
+    fn plan(text: &str, steps: usize) -> PlanCard {
+        PlanCard {
+            text: text.to_string(),
+            steps,
+            // Its step lines (after the header) marked done.
+            done: text
+                .lines()
+                .skip(1)
+                .filter(|line| line.starts_with('✅'))
+                .count(),
+            finished_steps: text
+                .lines()
+                .skip(1)
+                .filter(|line| !line.trim().is_empty())
+                .enumerate()
+                .filter(|(_, line)| line.starts_with('✅'))
+                .map(|(index, _)| index)
+                .collect(),
+            // A plan still being worked through says so in its header.
+            settled: !text.starts_with("📋") && !text.starts_with("⚙️") && !text.starts_with("🧭"),
+        }
+    }
+
+    fn ended(label: &str, phase: RunPhase, background: bool) -> HelperView {
+        HelperView {
+            run: None,
+            phase,
+            ..HelperView::running(label, background, None)
+        }
+    }
+
+    #[tokio::test]
+    async fn creates_once_then_edits_in_place() {
+        let sink = FakeSink::new(true);
+        let mut s = LiveStatus::new();
+        s.set_activity(&sink, doing(ActivityKind::Write)).await;
+        s.set_activity(&sink, doing(ActivityKind::Run)).await;
+        s.set_activity(&sink, doing(ActivityKind::Search)).await;
+        assert_eq!(sink.creates.lock().unwrap().len(), 1);
+        assert_eq!(sink.edits.lock().unwrap().len(), 2);
+        assert_eq!(sink.edits.lock().unwrap()[0].1, "⏳ Running a command");
+    }
+
+    /// Live 2026-11-14: "Finished in the background … Took 42s" stood on
+    /// the WordPress helper's line while that helper still ran: the card
+    /// found a helper's entry by its name, so another run's record under
+    /// the same name settled it. A record that names its run updates that
+    /// run's entry only; one with no run id is still found by its name.
+    #[test]
+    fn a_card_keys_each_helper_by_its_run_not_its_name() {
+        let mut s = LiveStatus::new();
+        let run = |id: &str, phase: RunPhase| HelperView {
+            phase,
+            took: phase.is_terminal().then(|| "Took 42s.".to_string()),
+            ..HelperView::running("WordPress install", true, None).of_run(Some(id))
+        };
+        assert!(s.note_helper(run("helper:real", RunPhase::Running)));
+        assert!(s.note_helper(run("helper:other", RunPhase::Running)));
+        assert!(s.note_helper(run("helper:other", RunPhase::Succeeded)));
+        assert_eq!(s.helpers.len(), 2);
+        let real = s
+            .helpers
+            .iter()
+            .find(|(view, _)| view.run.as_deref() == Some("helper:real"))
+            .unwrap();
+        assert_eq!(real.0.phase, RunPhase::Running);
+        assert_eq!(real.0.took, None);
+        assert!(s.note_helper(HelperView::running("Count A", true, None)));
+        assert!(!s.note_helper(HelperView::running("Count A", true, None)));
+        assert_eq!(s.helpers.len(), 3);
+    }
+
+    /// A plan card never hides the step running now or the helpers: each
+    /// helper has its own header, under the plan, with its latest step.
+    #[tokio::test]
+    async fn the_plan_card_shows_each_helper_and_the_step_running_now() {
+        let sink = FakeSink::new(true);
+        let mut s = LiveStatus::new();
+        s.set_checklist(&sink, plan("📋 Plan\n☐ a\n☐ b", 2)).await;
+        s.note_helper(HelperView::running("Count A", true, None));
+        s.note_helper(HelperView::running("Count B", true, None));
+        s.note_helper(HelperView::running(
+            "Count B",
+            true,
+            Some(doing(ActivityKind::Run)),
+        ));
+        s.set_activity(&sink, doing(ActivityKind::Read)).await;
+        assert_eq!(sink.creates.lock().unwrap().len(), 1);
+        let card = sink.edits.lock().unwrap().last().unwrap().1.clone();
+        assert_eq!(
+            card,
+            "📋 Plan\n☐ a\n☐ b\n\n⏳ Running in the background: Count A\n\n⏳ Running in the \
+             background: Count B\nRunning a command\n\n⏳ Reading files"
+        );
+        // Nothing changed: nothing is re-sent.
+        assert!(!s.flush_if_changed(&sink).await);
+        assert_eq!(sink.edits.lock().unwrap().len(), 1);
+        // The turn's own step goes when the turn ends; the helpers stay.
+        s.close(&sink).await;
+        assert_eq!(
+            sink.edits.lock().unwrap().last().unwrap().1,
+            "📋 Plan\n☐ a\n☐ b\n\n⏳ Running in the background: Count A\n\n⏳ Running in the \
+             background: Count B\nRunning a command"
+        );
+        assert_eq!(s.kept_card_message_id().as_deref(), Some("m1"));
+    }
+
+    /// Two helpers started together each get their own header on the card,
+    /// whatever order or batch their updates arrive in (live 2026-11-12:
+    /// only "Counter B" showed), and every line is a typed kind in plain
+    /// words: a tool ending and the model choosing its next step add
+    /// nothing.
+    #[test]
+    fn parallel_helpers_each_get_their_own_line() {
+        let mut live = LiveStatus::new();
+        assert!(live.note(&StatusUpdate::Helper(HelperView::running(
+            "Count A", true, None
+        ))));
+        assert!(live.note(&StatusUpdate::Helper(HelperView::running(
+            "Count B", true, None
+        ))));
+        assert!(!live.note(&StatusUpdate::Helper(HelperView::running(
+            "Count B",
+            true,
+            Some(Step::Doing(ActivityKind::Run)),
+        ))));
+        assert!(!live.note(&StatusUpdate::ToolComplete {
+            name: "reading a file".into(),
+            summary: "done".into(),
+        }));
+        assert!(live.note(&StatusUpdate::StepHandedOff {
+            kind: ActivityKind::Delegate,
+        }));
+        assert!(!live.note(&StatusUpdate::Thinking(3)));
+        assert_eq!(
+            live.preview().unwrap(),
+            "⏳ Running in the background: Count A\n\n⏳ Running in the background: \
+             Count B\nRunning a command\n\n⏳ Handed to a helper; it works in the background"
+        );
+    }
+
+    /// Live 2026-11-13: one background shell loop, a one-step plan for it.
+    /// The card named the work twice ("Run your shell loop…" from the plan,
+    /// then the run's own line). A one-step plan's step is the run, so the
+    /// card shows the run's line alone, while it runs and once it ended.
+    #[test]
+    fn a_one_step_plan_with_a_run_is_the_runs_one_line() {
+        let one_step = plan("⏳ Run your shell loop that prints 1 to 15", 1);
+        let running = HelperView::running("a shell loop", true, None);
+        let card = render_card(&CardView {
+            plan: Some(&one_step),
+            helpers: vec![(running.clone(), None)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(card, "⏳ Running in the background: a shell loop");
+        let ended = HelperView {
+            run: None,
+            took: Some("Took 30s (8:23:49 AM to 8:24:19 AM ET), started 13s after your request, so it ended 43s after your request.".into()),
+            ..ended("a shell loop", RunPhase::Succeeded, true)
+        };
+        let card = render_card(&CardView {
+            plan: Some(&plan("✅ Run your shell loop that prints 1 to 15", 1)),
+            helpers: vec![(ended, None)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            card,
+            "✅ Finished in the background: a shell loop\nTook 30s (8:23:49 AM to 8:24:19 AM \
+             ET), started 13s after your request, so it ended 43s after your request."
+        );
+        // Without a run the one-step plan is still drawn.
+        assert_eq!(
+            render_card(&CardView {
+                plan: Some(&one_step),
+                ..Default::default()
+            })
+            .unwrap(),
+            "⏳ Run your shell loop that prints 1 to 15"
+        );
+    }
+
+    /// How a card ends is decided once from its typed state: a helper on
+    /// it, or a plan of more than one step, keeps it; anything else
+    /// collapses. The rendered text never decides.
+    #[test]
+    fn a_cards_end_comes_from_its_typed_state() {
+        let mut live = LiveStatus::new();
+        live.note_activity(doing(ActivityKind::Run));
+        assert_eq!(live.end(), CardEnd::Collapse);
+        live.note_checklist(plan("✅ Remember X", 1));
+        assert_eq!(live.end(), CardEnd::Collapse);
+        live.note_checklist(plan("✅ Done · 2 of 2 steps\n\n✅ a\n✅ b", 2));
+        assert_eq!(live.end(), CardEnd::Keep);
+
+        let mut helpers = LiveStatus::new();
+        helpers.note_helper(ended("Count lines", RunPhase::Succeeded, false));
+        assert_eq!(helpers.end(), CardEnd::Keep);
+    }
+
+    /// A foreground turn whose helpers ran side by side keeps its card,
+    /// settled to each helper's final header and its measured time, after
+    /// the reply (live 2026-11-13: the card vanished at turn end).
+    #[tokio::test]
+    async fn a_card_with_helpers_is_kept_and_settled() {
+        let sink = FakeSink::new(true);
+        let mut live = LiveStatus::new();
+        live.note_helper(HelperView::running("Count lines", false, None));
+        live.note_helper(HelperView::running("Count words", false, None));
+        live.set_activity(&sink, Step::Doing(ActivityKind::Delegate))
+            .await;
+        live.note_helper(HelperView {
+            run: None,
+            took: Some("Took 21s (2:21:16 PM to 2:21:37 PM ET).".into()),
+            ..ended("Count lines", RunPhase::Succeeded, false)
+        });
+        live.note_helper(ended("Count words", RunPhase::Failed, false));
+        live.close(&sink).await;
+        assert!(sink.deletes.lock().unwrap().is_empty());
+        assert_eq!(
+            sink.edits.lock().unwrap().last().unwrap().1,
+            "✅ A helper finished: Count lines\nTook 21s (2:21:16 PM to 2:21:37 PM ET).\n\n❌ A \
+             helper failed: Count words"
+        );
+        assert_eq!(live.kept_card_message_id().as_deref(), Some("m1"));
+    }
+
+    /// An owner cancel is a stop, said plainly: "Stopped by you", never a
+    /// failure or "an error" (live 2026-11-14: "❌ A helper failed … It
+    /// stopped on an error: stopped by the owner").
+    #[tokio::test]
+    async fn a_helper_the_owner_stopped_reads_stopped_by_you() {
+        let sink = FakeSink::new(true);
+        let mut live = LiveStatus::new();
+        live.note_helper(HelperView::running("Install Claude Drupal", false, None));
+        live.set_activity(&sink, Step::Doing(ActivityKind::Delegate))
+            .await;
+        let stopped = HelperView {
+            run: None,
+            stopped_by_owner: true,
+            took: Some("Took 22s.".into()),
+            ..ended("Install Claude Drupal", RunPhase::Stopped, false)
+        };
+        assert_eq!(helper_status_words(&stopped), "Stopped by you");
+        live.note_helper(stopped);
+        live.close(&sink).await;
+        let card = sink.edits.lock().unwrap().last().unwrap().1.clone();
+        assert_eq!(card, "⏹️ Stopped by you: Install Claude Drupal\nTook 22s.");
+        for wrong in ["failed", "error", "\u{274c}"] {
+            assert!(!card.contains(wrong), "{card}");
+        }
+    }
+
+    /// The live turn (2026-11-13): two helpers installed a site each. The
+    /// header agrees with how each helper's run ended, and once both ended
+    /// the card says how long after the owner's request the last one did.
+    /// Live 2026-11-13: a plan set aside its two helper steps ("⚠️ Stopped
+    /// short · 2 of 4 done") while both helpers still ran, then both
+    /// succeeded. The header is drawn from the plan's counts and the runs'
+    /// phases together: while a run runs, the work continues; once the plan
+    /// and the runs agree it is done, the header says so as the total does.
+    #[test]
+    fn a_settled_plans_header_never_contradicts_its_runs() {
+        let running = |label: &str| HelperView::running(label, true, None);
+        let succeeded = |label: &str| HelperView {
+            run: None,
+            since_request: Some(aidaemon_core::card::SinceRequest {
+                secs: 213,
+                words: "3m 33s after your request (7:31:01 AM to 7:34:34 AM ET)".to_string(),
+            }),
+            ..ended(label, RunPhase::Succeeded, true)
+        };
+        let stopped_short = plan(
+            "⚠️ Stopped short · 2 of 4 done\n\n✅ Check\n\n⏭️ Drupal (not done)\n\n\
+             ⏭️ WordPress (not done)\n\n✅ Report",
+            4,
+        );
+        let card = render_card(&CardView {
+            plan: Some(&stopped_short),
+            helpers: vec![(running("Drupal"), None), (running("WordPress"), None)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            card.starts_with("⏳ Continuing in the background · 2 of 4 done"),
+            "{card}"
+        );
+        let done = plan(
+            "✅ Done · 4 of 4 steps\n\n✅ Check\n\n✅ Drupal\n\n✅ WordPress\n\n✅ Report",
+            4,
+        );
+        let card = render_card(&CardView {
+            plan: Some(&done),
+            helpers: vec![(succeeded("Drupal"), None), (succeeded("WordPress"), None)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(card.starts_with("✅ Done · 4 of 4 steps"), "{card}");
+        assert!(
+            card.ends_with("All 2 done 3m 33s after your request (7:31:01 AM to 7:34:34 AM ET)."),
+            "{card}"
+        );
+    }
+
+    #[test]
+    fn the_header_and_the_total_follow_the_helpers_run_records() {
+        let plan = plan("✅ Done · 3 of 3 steps\n\n✅ a\n\n✅ b\n\n✅ c", 3);
+        let helper = |label: &str, phase: RunPhase, secs: u64, at: &str| HelperView {
+            run: None,
+            took: Some(format!("Took {secs}s.")),
+            since_request: Some(aidaemon_core::card::SinceRequest {
+                secs,
+                words: format!("{secs}s after your request (5:37:00 AM to {at} AM ET)"),
+            }),
+            ..ended(label, phase, false)
+        };
+        let both_done = render_card(&CardView {
+            plan: Some(&plan),
+            helpers: vec![
+                (
+                    helper("Install Drupal", RunPhase::Succeeded, 310, "5:42:10"),
+                    None,
+                ),
+                (
+                    helper("Install WordPress", RunPhase::Succeeded, 300, "5:42:00"),
+                    None,
+                ),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            both_done.starts_with("✅ Done · 3 of 3 steps"),
+            "{both_done}"
+        );
+        // Each helper's line is its record's one measured line, nothing
+        // added to it.
+        assert!(
+            both_done.contains("Install Drupal\nTook 310s.\n"),
+            "{both_done}"
+        );
+        assert!(
+            both_done
+                .ends_with("All 2 done 310s after your request (5:37:00 AM to 5:42:10 AM ET)."),
+            "{both_done}"
+        );
+
+        let one_stopped = render_card(&CardView {
+            plan: Some(&plan),
+            helpers: vec![
+                (
+                    helper("Install Drupal", RunPhase::Stopped, 310, "5:42:10"),
+                    None,
+                ),
+                (
+                    helper("Install WordPress", RunPhase::Succeeded, 300, "5:42:00"),
+                    None,
+                ),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            one_stopped.starts_with("⚠️ A helper didn't finish · 3 of 3 done"),
+            "{one_stopped}"
+        );
+        assert!(!one_stopped.contains("✅ Done"), "{one_stopped}");
+        assert!(
+            one_stopped.ends_with(
+                "The last of them ended 310s after your request (5:37:00 AM to 5:42:10 AM ET); \
+                 1 didn't finish."
+            ),
+            "{one_stopped}"
+        );
+
+        // A failed run is never counted as done: the header and the total
+        // both say it failed.
+        let one_failed = render_card(&CardView {
+            helpers: vec![
+                (
+                    helper("Install Drupal", RunPhase::Succeeded, 310, "5:42:10"),
+                    None,
+                ),
+                (
+                    helper("Install WordPress", RunPhase::Failed, 30, "5:37:30"),
+                    None,
+                ),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!one_failed.contains("All 2 done"), "{one_failed}");
+        assert!(
+            one_failed.ends_with(
+                "The last of them ended 310s after your request (5:37:00 AM to 5:42:10 AM ET); \
+                 1 failed."
+            ),
+            "{one_failed}"
+        );
+
+        // While one still runs there is no total yet.
+        let running = render_card(&CardView {
+            helpers: vec![
+                (
+                    helper("Install Drupal", RunPhase::Succeeded, 310, "5:42:10"),
+                    None,
+                ),
+                (HelperView::running("Install WordPress", false, None), None),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!running.contains("All 2 done"), "{running}");
+    }
+
+    /// A step of a generic kind ("Checking things") says nothing: the card
+    /// shows the typed latest step, or none.
+    #[test]
+    fn a_generic_step_is_never_shown() {
+        for generic in [ActivityKind::Check, ActivityKind::Change] {
+            let step = Step::Doing(generic);
+            let card = render_card(&CardView {
+                helpers: vec![(
+                    HelperView::running("Install WordPress", false, Some(step.clone())),
+                    None,
+                )],
+                activity: Some((&step, Duration::from_secs(1))),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(!card.contains(&generic.words().to_string()), "{card}");
+        }
+    }
+
+    /// A single-step card with no helper is only progress: it is removed
+    /// once the reply is out, never turned into a message of its own.
+    #[tokio::test]
+    async fn a_single_step_card_collapses() {
+        let sink = FakeSink::new(true);
+        let mut live = LiveStatus::new();
+        live.set_activity(&sink, doing(ActivityKind::Read)).await;
+        live.close(&sink).await;
+        assert_eq!(*sink.deletes.lock().unwrap(), vec!["m1".to_string()]);
+
+        let sink = FakeSink::new(true);
+        let mut live = LiveStatus::new();
+        live.set_checklist(&sink, plan("⏳ Remember X", 1)).await;
+        live.set_checklist(&sink, plan("✅ Remember X", 1)).await;
+        live.close(&sink).await;
+        assert_eq!(*sink.deletes.lock().unwrap(), vec!["m1".to_string()]);
+        assert_eq!(live.kept_card_message_id(), None);
+    }
+
+    /// A plan of more than one step stays as the record of the work,
+    /// finished or not.
+    #[tokio::test]
+    async fn a_plan_of_several_steps_is_kept() {
+        for card in [
+            "⚠️ Stopped short · 1 of 2 done\n\n✅ Step 1\n⏭️ Step 2 (not done)",
+            "✅ Done · 2 of 2 steps\n\n✅ a\n✅ b",
+        ] {
+            let sink = FakeSink::new(true);
+            let mut live = LiveStatus::new();
+            live.set_checklist(&sink, plan(card, 2)).await;
+            live.close(&sink).await;
+            assert!(sink.deletes.lock().unwrap().is_empty(), "{card}");
+            assert_eq!(live.kept_card_message_id().as_deref(), Some("m1"));
+        }
+    }
+
+    /// The live card and the card a turn leaves behind are one renderer
+    /// over one view: the same plan and helper records draw the same card,
+    /// whichever path draws it.
+    #[tokio::test]
+    async fn the_live_and_the_kept_card_agree_for_the_same_records() {
+        let plan = plan(
+            "⏳ Continuing in the background · 0 of 1 done\n\n⏳ Count (running in the \
+             background)",
+            1,
+        );
+        let record = HelperView::running("Slow count", true, Some(Step::Output { lines: 13 }));
+        let sink = FakeSink::new(true);
+        let mut live = LiveStatus::new();
+        live.set_checklist(&sink, plan.clone()).await;
+        live.note_helper(record.clone());
+        live.set_activity(&sink, Step::HandedOff(ActivityKind::Delegate))
+            .await;
+        live.close(&sink).await;
+        let kept = sink.edits.lock().unwrap().last().unwrap().1.clone();
+        let drawn_after_the_turn = render_card(&CardView {
+            plan: Some(&plan),
+            helpers: vec![(record.clone(), None)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(kept, drawn_after_the_turn);
+
+        // Its end settles the card to the final header.
+        let ended = HelperView {
+            run: None,
+            phase: RunPhase::Succeeded,
+            step: None,
+            ..record
+        };
+        let mut live = LiveStatus::new();
+        live.note_helper(ended.clone());
+        assert_eq!(
+            live.preview(),
+            render_card(&CardView {
+                helpers: vec![(ended, None)],
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            live.preview().unwrap(),
+            "✅ Finished in the background: Slow count"
+        );
+    }
+
+    /// A running command reads as how much it printed, never what it
+    /// printed: its output is its own data and can carry a credential.
+    #[test]
+    fn a_running_command_reads_as_how_much_it_printed() {
+        assert_eq!(
+            Step::Output { lines: 3 }.words(),
+            "Running a command · 3 lines of output so far"
+        );
+        assert_eq!(
+            Step::Output { lines: 1 }.words(),
+            "Running a command · 1 line of output so far"
+        );
+        assert_eq!(Step::Output { lines: 0 }.words(), "Running a command");
+    }
+
+    /// Nothing the owner reads names a tool, an internal label or a raw
+    /// step: every line is plain words from a typed kind.
+    #[test]
+    fn no_owner_facing_line_carries_an_internal_label() {
+        use ActivityKind::*;
+        let kinds = [
+            Read, Search, Write, Run, Web, Delegate, Recall, Remember, Remind, Check, Change,
+        ];
+        let mut lines: Vec<String> = Vec::new();
+        for kind in kinds {
+            lines.push(Step::Doing(kind).words());
+            lines.push(Step::HandedOff(kind).words());
+        }
+        lines.push(Step::Output { lines: 42 }.words());
+        lines.push(Step::Reporting.words());
+        for phase in [
+            RunPhase::Running,
+            RunPhase::Succeeded,
+            RunPhase::Stopped,
+            RunPhase::Failed,
+        ] {
+            for background in [true, false] {
+                lines.push(
+                    render_card(&CardView {
+                        helpers: vec![(
+                            HelperView {
+                                run: None,
+                                label: "Count the letters".into(),
+                                phase,
+                                background,
+                                step: Some(Step::Doing(Search)),
+                                steps: Vec::new(),
+                                reason: None,
+                                stopped_by_owner: false,
+                                took: None,
+                                since_request: None,
+                            },
+                            None,
+                        )],
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                );
+            }
+        }
+        for line in &lines {
+            let lower = line.to_lowercase();
+            for internal in [
+                "tool",
+                "_",
+                "spawn",
+                "specialist",
+                "delegat",
+                "searching files",
+                "started in the background",
+                "finished reading",
+                "next step",
+                "...",
+            ] {
+                assert!(!lower.contains(internal), "{internal:?} in {line:?}");
+            }
+        }
+    }
+
+    /// A long step says for how long it has run, in whole minutes, so the
+    /// card changes at most once a minute.
+    #[test]
+    fn a_long_step_says_how_long_it_has_run() {
+        assert_eq!(
+            line_with_elapsed("Running a command", Duration::from_secs(10)),
+            "Running a command"
+        );
+        assert_eq!(
+            line_with_elapsed("Running a command", Duration::from_secs(45)),
+            "Running a command · under a minute so far"
+        );
+        assert_eq!(
+            line_with_elapsed("Running a command", Duration::from_secs(6 * 60 + 5)),
+            "Running a command · 6 min so far"
+        );
+    }
+
+    /// A step that handed its work on never reads as finished, and a late
+    /// step never undoes how a helper ended.
+    #[test]
+    fn a_handed_off_step_never_reads_as_finished() {
+        assert_eq!(
+            Step::HandedOff(ActivityKind::Delegate).words(),
+            "Handed to a helper; it works in the background"
+        );
+        assert_eq!(
+            Step::HandedOff(ActivityKind::Run).words(),
+            "Running a command · goes on in the background"
+        );
+        let mut live = LiveStatus::new();
+        live.note_helper(ended("Count", RunPhase::Succeeded, false));
+        live.note_helper(HelperView::running(
+            "Count",
+            false,
+            Some(doing(ActivityKind::Run)),
+        ));
+        assert_eq!(live.preview().unwrap(), "✅ A helper finished: Count");
+    }
+
+    #[tokio::test]
+    async fn keeps_sending_after_edit_fallback() {
+        let sink = FakeSink::new(false); // edits always fail
+        let mut s = LiveStatus::new();
+        s.set_activity(&sink, doing(ActivityKind::Read)).await; // create #1
+        s.set_activity(&sink, doing(ActivityKind::Run)).await; // edit fails -> create #2
+        s.set_activity(&sink, doing(ActivityKind::Web)).await; // still no edit -> create #3
+        assert_eq!(
+            sink.creates.lock().unwrap().len(),
+            3,
+            "post-fallback updates keep sending fresh messages; progress is never lost"
+        );
+        assert_eq!(
+            sink.edits.lock().unwrap().len(),
+            1,
+            "edit attempted once, then disabled"
+        );
+    }
+
+    /// A card left in the chat can still be edited after the turn (a
+    /// background job settling its steps); an activity line or a dropped
+    /// card leaves nothing to edit.
+    #[tokio::test]
+    async fn kept_card_stays_editable_after_the_turn() {
+        let sink = FakeSink::new(true);
+        let mut s = LiveStatus::new();
+        s.set_activity(&sink, doing(ActivityKind::Check)).await;
+        assert_eq!(s.kept_card_message_id(), None);
+        s.set_checklist(
+            &sink,
+            plan("⏳ Continuing in the background · 0 of 2 done", 2),
+        )
+        .await;
+        s.close(&sink).await;
+        assert_eq!(s.kept_card_message_id().as_deref(), Some("m1"));
+    }
+
+    /// Live 2026-11-13: a Drupal helper didn't finish, the parent started a
+    /// second helper for the same plan step and it finished. The step is
+    /// done, the header and the total say nothing failed, and the first try
+    /// is one quiet history line. The retry is linked by its typed plan
+    /// step, not its name: the two names differ.
+    /// A step's outcome is its latest attempt's, whoever made it: the turn
+    /// finishing a step after its helper stopped supersedes that helper's
+    /// end, so the header and total follow the steps (live 2026-11-14: "A
+    /// helper didn't finish · 5 of 5 done" over a Drupal setup the turn
+    /// finished itself, "Finished by me after the helper").
+    #[test]
+    fn the_turn_finishing_a_helpers_step_supersedes_its_end() {
+        let helper = |label: &str, phase: RunPhase, step: usize| {
+            HelperView {
+                run: None,
+                took: Some("Took 2m.".to_string()),
+                since_request: Some(aidaemon_core::card::SinceRequest {
+                    secs: 120,
+                    words: "2m after your request (11:36:00 AM to 11:38:00 AM ET)".to_string(),
+                }),
+                ..ended(label, phase, false)
+            }
+            .for_steps(&[step])
+        };
+        let helpers = vec![
+            (helper("Install WordPress", RunPhase::Succeeded, 0), None),
+            (helper("Install Drupal", RunPhase::Stopped, 1), None),
+        ];
+        let done = plan("✅ Done · 3 of 3 steps\n\n✅ a\n\n✅ b\n\n✅ c", 3);
+        let card = render_card(&CardView {
+            plan: Some(&done),
+            helpers: helpers.clone(),
+            by_me: Some(
+                "Finished by me after the helper: Install Drupal\nTook 1m (11:38:00 AM to \
+                 11:39:00 AM ET).",
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(card.starts_with("✅ Done · 3 of 3 steps"), "{card}");
+        assert!(!card.contains("A helper didn't finish"), "{card}");
+        assert!(
+            !card.contains("didn't finish,") && !card.contains("1 didn't finish"),
+            "{card}"
+        );
+        assert!(
+            card.contains(
+                "Install Drupal: first try didn't finish; I finished it myself\nTook 1m \
+                 (11:38:00 AM to 11:39:00 AM ET)."
+            ),
+            "{card}"
+        );
+        // The header counts the plan's rows, and the turn's work is one of
+        // them, not a row of its own.
+        assert!(!card.contains("Finished by me"), "{card}");
+
+        // Its step still open: the helper's end stands.
+        let open = plan("✅ Done · 2 of 3 steps\n\n✅ a\n\n⏹️ b\n\n✅ c", 3);
+        let card = render_card(&CardView {
+            plan: Some(&open),
+            helpers,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!card.contains("I finished it myself"), "{card}");
+        assert!(card.contains("1 didn't finish"), "{card}");
+    }
+
+    #[test]
+    fn a_retried_step_reads_done_with_its_first_try_as_history() {
+        let plan = plan("✅ Done · 3 of 3 steps\n\n✅ a\n\n✅ b\n\n✅ c", 3);
+        let helper = |label: &str, phase: RunPhase, secs: u64, at: &str, step: usize| {
+            HelperView {
+                run: None,
+                took: Some(format!("Took {secs}s.")),
+                since_request: Some(aidaemon_core::card::SinceRequest {
+                    secs,
+                    words: format!("{secs}s after your request (11:36:00 AM to {at} AM ET)"),
+                }),
+                ..ended(label, phase, false)
+            }
+            .for_steps(&[step])
+        };
+        let card = render_card(&CardView {
+            plan: Some(&plan),
+            helpers: vec![
+                (
+                    helper(
+                        "Install Claude Drupal site",
+                        RunPhase::Stopped,
+                        120,
+                        "11:38:44",
+                        1,
+                    ),
+                    None,
+                ),
+                (
+                    helper(
+                        "Install Claude WordPress site",
+                        RunPhase::Succeeded,
+                        230,
+                        "11:39:51",
+                        0,
+                    ),
+                    None,
+                ),
+                (
+                    helper(
+                        "Finish Claude Drupal site",
+                        RunPhase::Succeeded,
+                        510,
+                        "11:44:31",
+                        1,
+                    ),
+                    None,
+                ),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(card.starts_with("✅ Done · 3 of 3 steps"), "{card}");
+        assert!(!card.contains("A helper didn't finish"), "{card}");
+        assert!(
+            card.contains(
+                "Install Claude Drupal site: first try didn't finish; a second helper finished it"
+            ),
+            "{card}"
+        );
+        assert!(
+            card.ends_with("All 2 done 510s after your request (11:36:00 AM to 11:44:31 AM ET)."),
+            "{card}"
+        );
+
+        // While the second try runs, the first is already history.
+        let retrying = render_card(&CardView {
+            plan: Some(&plan),
+            helpers: vec![
+                (
+                    helper(
+                        "Install Claude Drupal site",
+                        RunPhase::Stopped,
+                        120,
+                        "11:38:44",
+                        1,
+                    ),
+                    None,
+                ),
+                (
+                    HelperView::running("Finish Claude Drupal site", false, None).for_steps(&[1]),
+                    None,
+                ),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            retrying.contains("first try didn't finish; a second helper is on it"),
+            "{retrying}"
+        );
+
+        // Without the typed link, the stopped run stands as it ended.
+        let unlinked = render_card(&CardView {
+            plan: Some(&plan),
+            helpers: vec![
+                (
+                    HelperView {
+                        run: None,
+                        steps: Vec::new(),
+                        ..helper(
+                            "Install Claude Drupal site",
+                            RunPhase::Stopped,
+                            120,
+                            "11:38:44",
+                            1,
+                        )
+                    },
+                    None,
+                ),
+                (
+                    helper(
+                        "Finish Claude Drupal site",
+                        RunPhase::Succeeded,
+                        510,
+                        "11:44:31",
+                        1,
+                    ),
+                    None,
+                ),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            unlinked.starts_with("⚠️ A helper didn't finish"),
+            "{unlinked}"
+        );
+    }
+
+    /// A retry started under the same name as the try that ended is a run
+    /// of its own on the card, not a late step of the first.
+    #[test]
+    fn a_retry_under_the_same_name_is_its_own_run() {
+        let mut live = LiveStatus::new();
+        live.note_helper(HelperView::running("Drupal install", false, None).for_steps(&[1]));
+        live.note_helper(ended("Drupal install", RunPhase::Stopped, false).for_steps(&[1]));
+        assert!(
+            live.note_helper(HelperView::running("Drupal install", false, None).for_steps(&[1]))
+        );
+        live.note_helper(ended("Drupal install", RunPhase::Succeeded, false).for_steps(&[1]));
+        let card = live.preview().unwrap();
+        assert!(
+            card.contains("Drupal install: first try didn't finish; a second helper finished it"),
+            "{card}"
+        );
+        assert!(
+            card.contains("✅ A helper finished: Drupal install"),
+            "{card}"
+        );
+    }
+
+    /// Live 2026-11-13: "Asking a helper · 3 min so far" stood under two
+    /// working helpers until the last of them ended. The turn waiting on its
+    /// helpers is not a step of its own: the line goes once a helper is on
+    /// the card, and the helpers' lines say what is being done.
+    #[test]
+    fn the_turns_own_handoff_line_ends_while_it_waits_on_helpers() {
+        let asking = doing(ActivityKind::Delegate);
+        let long = Duration::from_secs(190);
+        let before = render_card(&CardView {
+            activity: Some((&asking, long)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(before, "⏳ Asking a helper · 3 min so far");
+        let waiting = render_card(&CardView {
+            helpers: vec![(
+                HelperView::running("Install WordPress", false, Some(doing(ActivityKind::Run))),
+                Some(long),
+            )],
+            activity: Some((&asking, long)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!waiting.contains("Asking a helper"), "{waiting}");
+        assert!(waiting.contains("Running a command"), "{waiting}");
+        // Its own work after the wait is shown as usual.
+        let reading = doing(ActivityKind::Read);
+        let after = render_card(&CardView {
+            helpers: vec![(ended("Install WordPress", RunPhase::Succeeded, false), None)],
+            activity: Some((&reading, Duration::ZERO)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(after.ends_with("⏳ Reading files"), "{after}");
+    }
+}

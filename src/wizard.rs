@@ -324,7 +324,7 @@ pub fn run_low_latency_setup(config_path: &Path) -> anyhow::Result<()> {
     ];
     let hostname_mode = Select::new()
         .with_prompt("How do you want to assign public HTTPS hostnames?")
-        .items(&hostname_mode_items)
+        .items(hostname_mode_items)
         .default(0)
         .interact()?;
 
@@ -660,9 +660,9 @@ fn build_low_latency_plans_for_all_bots(
             .map(|v| v.trim().to_string())
             .unwrap_or_else(|| format!("/telegram/{}", bot.slug));
         let base_url = format!("https://{}.{}", label, normalized_domain);
-        // The public_url must include the path because teloxide sends it
-        // verbatim to Telegram's setWebhook. Without the path, Telegram
-        // delivers updates to "/" while our axum listener expects "/telegram/<slug>".
+        // The public_url must include the path: it goes verbatim to
+        // Telegram's setWebhook and the listener serves that path. Without
+        // it, Telegram delivers updates to "/" instead of "/telegram/<slug>".
         let public_url = format!("{}{}", base_url, path);
         plans.push(TelegramWebhookPlan {
             target: bot.target,
@@ -751,11 +751,7 @@ fn runtime_mode_label(environment: LowLatencyEnvironment) -> &'static str {
 }
 
 fn yes_no(value: bool) -> &'static str {
-    if value {
-        "yes"
-    } else {
-        "no"
-    }
+    if value { "yes" } else { "no" }
 }
 
 fn render_starter_persona(agent_name: &str, primary_role: &str, style: &str) -> String {
@@ -815,6 +811,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
         let candidate_config = crate::config::AgentConfig {
             name: candidate,
             persona_file: None,
+            engine: Default::default(),
         };
         match candidate_config.validated_name() {
             Ok(name) => break name,
@@ -843,7 +840,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     ];
     let style_index = Select::new()
         .with_prompt("Choose a communication style")
-        .items(&style_choices)
+        .items(style_choices)
         .default(0)
         .interact()?;
     let starter_persona = render_starter_persona(
@@ -1121,7 +1118,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     }
 
     // ── Whisper STT (optional) ──────────────────────────────────────────
-    let stt_probe = crate::stt_setup::probe_stt_environment();
+    let stt_probe = aidaemon_tools::stt_setup::probe_stt_environment();
     let mut stt_enabled = false;
     let mut stt_language = "en".to_string();
     let mut stt_probe_final = stt_probe.clone();
@@ -1133,7 +1130,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     println!();
     println!(
         "  {}",
-        crate::stt_setup::format_stt_probe_report(&stt_probe)
+        aidaemon_tools::stt_setup::format_stt_probe_report(&stt_probe)
     );
 
     if stt_probe.whisper_cli.is_some() {
@@ -1148,8 +1145,11 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
                 let model_path: String = Input::new()
                     .with_prompt("  Path to Whisper GGML model (.bin)")
                     .interact_text()?;
-                stt_probe_final =
-                    crate::stt_setup::SttProbe::resolve(None, Some(model_path.trim()), None);
+                stt_probe_final = aidaemon_tools::stt_setup::SttProbe::resolve(
+                    None,
+                    Some(model_path.trim()),
+                    None,
+                );
             }
             if !stt_probe_final.is_complete() {
                 println!("  STT stack incomplete — skipping (install ffmpeg and/or model).");
@@ -1297,7 +1297,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
         "\n# Uncomment to enable browser tool:\n# [browser]\n# enabled = true\n".to_string()
     };
     let stt_section =
-        crate::stt_setup::stt_config_section(&stt_probe_final, stt_enabled, &stt_language);
+        aidaemon_tools::stt_setup::stt_config_section(&stt_probe_final, stt_enabled, &stt_language);
 
     let agent_name_config = toml_string_literal(&agent_name);
     let config = format!(
@@ -1752,13 +1752,11 @@ fn assign_listen_ports(
             .listen_addr
             .as_deref()
             .and_then(parse_listen_port)
+            && all_port_usage.get(&existing_port).copied().unwrap_or(0) <= 1
+            && !assigned.values().any(|&port| port == existing_port)
         {
-            if all_port_usage.get(&existing_port).copied().unwrap_or(0) <= 1
-                && !assigned.values().any(|&port| port == existing_port)
-            {
-                assigned.insert(bot.target, existing_port);
-                continue;
-            }
+            assigned.insert(bot.target, existing_port);
+            continue;
         }
 
         let mut candidate = 8443u16;
@@ -2527,7 +2525,7 @@ pub(crate) async fn cloudflared_authenticated_zone_name() -> Result<Option<Strin
                 "failed to read cloudflared origin cert at `{}`: {}",
                 cert_path.display(),
                 err
-            ))
+            ));
         }
     };
     let payload = cert_content
@@ -2683,7 +2681,7 @@ async fn running_cloudflared_tunnel_pids(tunnel_name: &str) -> Result<Vec<u32>, 
             return Err(format!(
                 "failed to inspect existing cloudflared process: {}",
                 err
-            ))
+            ));
         }
     };
     if !output.status.success() {
@@ -2894,13 +2892,13 @@ pub(crate) async fn start_cloudflared_tunnel_background(
 #[cfg(test)]
 mod tests {
     use super::{
+        CloudflaredIngressRoute, SetupCommandSpec, TelegramBotTarget, TelegramWebhookPlan,
         apply_webhook_plans, assign_listen_ports, build_low_latency_plans_for_all_bots,
         cloudflare_models_probe_url, collect_telegram_bot_entries, hostname_matches_zone,
         is_cloudflare_ai_gateway_base, low_latency_cloudflared_ingress_routes_for_plans,
         normalize_domain_input, normalize_hostname_input, render_cloudflared_ingress_config,
         render_starter_persona, setup_route_dns_hosts, toml_string_literal,
-        write_starter_persona_if_missing, CloudflaredIngressRoute, SetupCommandSpec,
-        TelegramBotTarget, TelegramWebhookPlan,
+        write_starter_persona_if_missing,
     };
 
     #[test]
@@ -3149,10 +3147,7 @@ bot_token = "bot-2"
     fn hostname_matches_zone_checks_suffix_boundaries() {
         assert!(hostname_matches_zone("legacy.aidaemon.ai", "aidaemon.ai"));
         assert!(hostname_matches_zone("aidaemon.ai", "aidaemon.ai"));
-        assert!(!hostname_matches_zone(
-            "legacy.aidaemon.ai",
-            "davidloor.com"
-        ));
+        assert!(!hostname_matches_zone("legacy.aidaemon.ai", "example.com"));
     }
 
     #[test]

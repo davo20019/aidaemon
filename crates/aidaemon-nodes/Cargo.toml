@@ -1,0 +1,51 @@
+[package]
+name = "aidaemon-nodes"
+description = "Nodes for aidaemon agents: enrolled hardware companions with server-issued identity, their HTTP Gateway, store, OTA releases, speech, monitoring and the tools that read and command them; implementation crate of the aidaemon SDK, no stability promise (use it through aidaemon-sdk)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-nodes"
+readme = "README.md"
+keywords = ["agent", "iot", "devices", "gateway"]
+categories = ["network-programming", "asynchronous"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
+publish = false
+
+[dependencies]
+aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels" }
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
+aidaemon-events = { version = "0.20.0", path = "../aidaemon-events" }
+aidaemon-node-protocol = { version = "0.1.0", path = "../node-protocol" }
+aidaemon-secrets = { version = "0.20.0", path = "../aidaemon-secrets", default-features = false }
+aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools" }
+aidaemon-work = { version = "0.20.0", path = "../aidaemon-work" }
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.23"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+hmac = "0.13"
+p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
+rand = "0.10"
+reqwest = { version = "0.13", features = ["json", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+shellexpand = "3"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+aidaemon-channels = { path = "../aidaemon-channels", features = ["testing"] }
+aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }

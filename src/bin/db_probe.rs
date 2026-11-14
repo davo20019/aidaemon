@@ -643,8 +643,8 @@ mod tests {
 }
 
 async fn print_eval_task(pool: &SqlitePool, task_id: &str) -> anyhow::Result<()> {
-    use aidaemon::harness_eval::report::{format_eval_task_report, EvalTaskRow};
     use aidaemon::TaskEndData;
+    use aidaemon::harness_eval::report::{EvalTaskRow, format_eval_task_report};
 
     let row = sqlx::query(
         r#"
@@ -681,8 +681,8 @@ async fn print_eval_task(pool: &SqlitePool, task_id: &str) -> anyhow::Result<()>
 }
 
 async fn print_eval_summary(pool: &SqlitePool, hours: i64, root_only: bool) -> anyhow::Result<()> {
-    use aidaemon::harness_eval::report::{aggregate_summary, format_eval_summary_row, EvalTaskRow};
     use aidaemon::TaskEndData;
+    use aidaemon::harness_eval::report::{EvalTaskRow, aggregate_summary, format_eval_summary_row};
 
     let rows = sqlx::query(
         r#"
@@ -1018,6 +1018,201 @@ fn refusal_gate_label(tool: &str, message: &str) -> String {
     format!("{tool}: {label}")
 }
 
+/// Prompt-cache reuse of agent-turn model calls (no `call_purpose`), by
+/// model, split into a run's first call and its later ones. Later calls
+/// resend an append-only transcript, so their reuse should approach the
+/// share of input that the previous call already sent.
+async fn print_decisions(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
+    let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
+    println!("== Decision Layer (Last {} Hours) ==\n", hours);
+    let rows = sqlx::query(
+        "SELECT task_id, json_extract(data, '$.metadata') AS metadata
+         FROM events
+         WHERE event_type = 'decision_point' AND created_at >= ?
+           AND json_extract(data, '$.metadata.condition') = 'decision_layer'
+         ORDER BY id",
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+    // decision/backend -> (outcomes, latencies, per question (asked, trusted, acted))
+    type Questions = std::collections::BTreeMap<String, (u64, u64, u64)>;
+    type Group = (std::collections::BTreeMap<String, u64>, Vec<u64>, Questions);
+    let mut groups: std::collections::BTreeMap<(String, String), Group> = Default::default();
+    let mut digest_relationship: std::collections::HashMap<String, (String, f64)> =
+        Default::default();
+    for row in &rows {
+        let raw: String = row.try_get("metadata").unwrap_or_default();
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let text = |key: &str| {
+            meta.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string()
+        };
+        let entry = groups
+            .entry((
+                format!("{} ({})", text("decision"), text("mode")),
+                text("backend"),
+            ))
+            .or_default();
+        *entry.0.entry(text("outcome")).or_default() += 1;
+        if let Some(ms) = meta.get("latency_ms").and_then(|v| v.as_u64()) {
+            entry.1.push(ms);
+        }
+        if let Some(answers) = meta.get("answers").and_then(|v| v.as_object()) {
+            for (key, answer) in answers {
+                // Per-fact keys (f0, f1, ...) are one question kind.
+                let name = if text("decision") == "recall_filter" {
+                    "fact".to_string()
+                } else {
+                    key.clone()
+                };
+                let counts = entry.2.entry(name).or_default();
+                counts.0 += 1;
+                counts.1 += answer
+                    .get("trusted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false) as u64;
+                counts.2 += answer
+                    .get("acted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false) as u64;
+                if text("decision") == "turn_digest" && key == "relationship" {
+                    let task: String = row.try_get("task_id").unwrap_or_default();
+                    let value = answer.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                    let class = if value.starts_with("continuation") {
+                        "continuation"
+                    } else {
+                        value
+                    };
+                    let confidence = answer
+                        .get("confidence")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    digest_relationship.insert(task, (class.to_string(), confidence));
+                }
+            }
+        }
+    }
+    if groups.is_empty() {
+        println!("No decision-layer calls recorded.");
+        return Ok(());
+    }
+    for ((decision, backend), (outcomes, mut latencies, questions)) in groups {
+        latencies.sort_unstable();
+        let pct = |q: f64| {
+            latencies
+                .get(((latencies.len() as f64 - 1.0) * q).round() as usize)
+                .copied()
+                .unwrap_or(0)
+        };
+        let total: u64 = outcomes.values().sum();
+        println!(
+            "{decision} on {backend}: {total} calls, p50 {} ms, p95 {} ms",
+            pct(0.5),
+            pct(0.95)
+        );
+        println!(
+            "  outcomes: {}",
+            outcomes
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for (question, (asked, trusted, acted)) in questions {
+            println!(
+                "  {question:<22} asked {asked:>5}  over threshold {trusted:>5}  acted {acted:>5}"
+            );
+        }
+    }
+    // Shadow comparison: the digest's relationship class against the
+    // relationship the turn actually committed.
+    if !digest_relationship.is_empty() {
+        let finalized = sqlx::query(
+            "SELECT task_id, json_extract(data, '$.metadata.relationship') AS relationship
+             FROM events
+             WHERE event_type = 'decision_point' AND created_at >= ?
+               AND json_extract(data, '$.metadata.condition') = 'task_relationship_finalized'",
+        )
+        .bind(&cutoff)
+        .fetch_all(pool)
+        .await?;
+        let mut bands: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
+        for row in finalized {
+            let task: String = row.try_get("task_id").unwrap_or_default();
+            let committed: String = row.try_get("relationship").unwrap_or_default();
+            if let Some((class, confidence)) = digest_relationship.get(&task) {
+                let band = if *confidence >= 0.9 {
+                    ">=0.9"
+                } else if *confidence >= 0.6 {
+                    "0.6-0.9"
+                } else {
+                    "<0.6"
+                };
+                let entry = bands.entry(band).or_default();
+                entry.0 += 1;
+                entry.1 += (class == &committed) as u64;
+            }
+        }
+        println!("\nturn_digest relationship vs committed relationship, by confidence:");
+        for (band, (n, agree)) in bands {
+            println!("  {band:<8} {agree}/{n} agree");
+        }
+    }
+    Ok(())
+}
+
+async fn print_cache_reuse(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
+    let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
+    println!("== Prompt-Cache Reuse (Last {} Hours) ==", hours);
+    println!("(successful agent-turn calls; reuse = cached input / input)\n");
+    let rows = sqlx::query(
+        "SELECT COALESCE(json_extract(data, '$.final_model'), json_extract(data, '$.model')) AS model,
+                CASE WHEN json_extract(data, '$.iteration') = 1 THEN 'first' ELSE 'later' END AS position,
+                COUNT(*) AS calls,
+                SUM(COALESCE(json_extract(data, '$.cached_input_tokens'), 0) = 0) AS cold,
+                SUM(json_extract(data, '$.input_tokens')) AS input,
+                SUM(COALESCE(json_extract(data, '$.cached_input_tokens'), 0)) AS cached
+         FROM events
+         WHERE event_type = 'llm_call' AND created_at >= ?
+           AND json_extract(data, '$.call_purpose') IS NULL
+           AND json_extract(data, '$.failed') = 0
+         GROUP BY model, position
+         ORDER BY calls DESC",
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+    println!(
+        "{:<24} {:<6} {:>6} {:>6} {:>12} {:>12} {:>6}",
+        "model", "call", "calls", "cold", "input", "cached", "reuse"
+    );
+    for row in rows {
+        let input: i64 = row.try_get("input").unwrap_or(0);
+        let cached: i64 = row.try_get("cached").unwrap_or(0);
+        let reuse = if input > 0 {
+            format!("{:.0}%", cached as f64 * 100.0 / input as f64)
+        } else {
+            "-".to_string()
+        };
+        println!(
+            "{:<24} {:<6} {:>6} {:>6} {:>12} {:>12} {:>6}",
+            row.try_get::<String, _>("model").unwrap_or_default(),
+            row.try_get::<String, _>("position").unwrap_or_default(),
+            row.try_get::<i64, _>("calls").unwrap_or(0),
+            row.try_get::<i64, _>("cold").unwrap_or(0),
+            input,
+            cached,
+            reuse
+        );
+    }
+    Ok(())
+}
+
 async fn print_gate_outcomes(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
     let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
     println!("== Gate Outcomes (Last {} Hours) ==", hours);
@@ -1033,7 +1228,7 @@ async fn print_gate_outcomes(pool: &SqlitePool, hours: i64) -> anyhow::Result<()
          WHERE event_type = 'decision_point' AND created_at >= ? AND task_id IS NOT NULL
            AND json_extract(data, '$.code') IN ({placeholders})"
     );
-    let mut query = sqlx::query(&decision_sql).bind(&cutoff);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*decision_sql)).bind(&cutoff);
     for code in GATE_INTERVENTION_CODES {
         query = query.bind(*code);
     }
@@ -1214,10 +1409,10 @@ async fn print_fabrication_audit(pool: &SqlitePool, hours: i64) -> anyhow::Resul
         if material {
             material_tasks.insert(task_id.clone());
         }
-        if let Some(raw) = row.try_get::<Option<String>, _>("completion_proof")? {
-            if let Ok(proof) = serde_json::from_str::<aidaemon::TaskCompletionProofData>(&raw) {
-                proofs.insert(task_id, proof);
-            }
+        if let Some(raw) = row.try_get::<Option<String>, _>("completion_proof")?
+            && let Ok(proof) = serde_json::from_str::<aidaemon::TaskCompletionProofData>(&raw)
+        {
+            proofs.insert(task_id, proof);
         }
     }
 
@@ -1296,8 +1491,8 @@ async fn record_fixture_from_session(
     output: Option<&str>,
     include_text: bool,
 ) -> anyhow::Result<()> {
-    use aidaemon::harness_eval::fixture::{
-        record_fixture_from_events, recorded_fixtures_dir, RECORDED_FIXTURE_HEADER,
+    use aidaemon::harness_eval::recorder::{
+        RECORDED_SCENARIO_HEADER, record_scenario_from_events, recorded_scenarios_dir,
     };
 
     // Plain SELECT (no EventStore::new, which would run migrations against a
@@ -1336,25 +1531,28 @@ async fn record_fixture_from_session(
         });
     }
 
-    let mut fixture = record_fixture_from_events(session_id, &events, task_id)?;
+    let mut scenario = record_scenario_from_events(session_id, &events, task_id)?;
     if include_text {
-        if let Some(aidaemon::harness_eval::MockResponseSpec::Text { text }) =
-            fixture.mock_responses.last()
-        {
-            fixture.expect.response_contains = vec![text.chars().take(40).collect()];
+        let last_text = scenario.script.last().and_then(|reply| reply.text.clone());
+        if let Some(text) = last_text {
+            scenario.expect.final_text_contains_exact = vec![text.chars().take(40).collect()];
         }
     }
 
     let output_path = output
         .map(PathBuf::from)
-        .unwrap_or_else(|| recorded_fixtures_dir().join(format!("{}.yaml", fixture.name)));
+        .unwrap_or_else(|| recorded_scenarios_dir().join(format!("{}.yaml", scenario.name)));
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let yaml = serde_yaml::to_string(&fixture)?;
-    std::fs::write(&output_path, format!("{RECORDED_FIXTURE_HEADER}{yaml}"))?;
-    println!("Recorded draft fixture -> {}", output_path.display());
-    println!("Script its task_assessments before moving it into the suite.");
+    // One-line strings stay on one line, as serde_yaml wrote them.
+    let yaml = serde_saphyr::to_string_with_options(
+        &scenario,
+        serde_saphyr::ser_options! { folded_wrap_chars: usize::MAX },
+    )?;
+    std::fs::write(&output_path, format!("{RECORDED_SCENARIO_HEADER}{yaml}"))?;
+    println!("Recorded draft scenario -> {}", output_path.display());
+    println!("Check it against the trace before moving it into the suite.");
     Ok(())
 }
 
@@ -1416,6 +1614,8 @@ async fn main() -> anyhow::Result<()> {
     let handholding_summary = args.iter().any(|arg| arg == "--handholding-summary");
     let fabrication_audit = args.iter().any(|arg| arg == "--fabrication-audit");
     let gate_outcomes = args.iter().any(|arg| arg == "--gate-outcomes");
+    let cache_reuse = args.iter().any(|arg| arg == "--cache-reuse");
+    let decisions = args.iter().any(|arg| arg == "--decisions");
     let eval_hours = args
         .windows(2)
         .find(|w| w[0] == "--eval-hours")
@@ -1697,6 +1897,14 @@ async fn main() -> anyhow::Result<()> {
         print_fabrication_audit(&pool, eval_hours).await?;
         return Ok(());
     }
+    if cache_reuse {
+        print_cache_reuse(&pool, eval_hours).await?;
+        return Ok(());
+    }
+    if decisions {
+        print_decisions(&pool, eval_hours).await?;
+        return Ok(());
+    }
     if gate_outcomes {
         print_gate_outcomes(&pool, eval_hours).await?;
         return Ok(());
@@ -1941,8 +2149,10 @@ async fn main() -> anyhow::Result<()> {
             row.try_get::<Option<i64>, _>("success").unwrap_or(None),
             row.try_get::<Option<i64>, _>("exit_code").unwrap_or(None),
             row.get::<String, _>("started_at"),
-            row.try_get::<Option<String>, _>("completed_at").unwrap_or(None),
-            row.try_get::<Option<f64>, _>("duration_secs").unwrap_or(None),
+            row.try_get::<Option<String>, _>("completed_at")
+                .unwrap_or(None),
+            row.try_get::<Option<f64>, _>("duration_secs")
+                .unwrap_or(None),
             row.get::<String, _>("prompt_summary")
         );
     }
@@ -2328,8 +2538,10 @@ async fn main() -> anyhow::Result<()> {
                 row.try_get::<Option<i64>, _>("success").unwrap_or(None),
                 row.try_get::<Option<i64>, _>("exit_code").unwrap_or(None),
                 row.get::<String, _>("started_at"),
-                row.try_get::<Option<String>, _>("completed_at").unwrap_or(None),
-                row.try_get::<Option<f64>, _>("duration_secs").unwrap_or(None),
+                row.try_get::<Option<String>, _>("completed_at")
+                    .unwrap_or(None),
+                row.try_get::<Option<f64>, _>("duration_secs")
+                    .unwrap_or(None),
                 row.get::<String, _>("prompt_summary"),
                 row.try_get::<Option<String>, _>("output_summary")
                     .unwrap_or(None)
@@ -2413,24 +2625,38 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "- task_id={:?} iter={} model={} fell_back={} latency_ms={} prefill_ms={:?} decode_ms={:?} overhead_ms={:?} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} est_in_tok={:?} usage_evidence={:?} failed={} failure_kind={:?} provider_status={:?} at={}",
                 row.try_get::<Option<String>, _>("task_id").unwrap_or(None),
-                row.try_get::<Option<i64>, _>("iteration").unwrap_or(None).unwrap_or(0),
-                row.try_get::<Option<String>, _>("model").unwrap_or(None).unwrap_or_default(),
+                row.try_get::<Option<i64>, _>("iteration")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                row.try_get::<Option<String>, _>("model")
+                    .unwrap_or(None)
+                    .unwrap_or_default(),
                 row.try_get::<Option<i64>, _>("fell_back").unwrap_or(None) == Some(1),
                 latency_ms,
                 prefill_ms.map(|v| v.round() as i64),
                 decode_ms.map(|v| v.round() as i64),
                 overhead_ms,
-                row.try_get::<Option<i64>, _>("input_tokens").unwrap_or(None).unwrap_or(0),
-                row.try_get::<Option<i64>, _>("cached_input_tokens").unwrap_or(None),
-                row.try_get::<Option<i64>, _>("fresh_input_tokens").unwrap_or(None),
+                row.try_get::<Option<i64>, _>("input_tokens")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                row.try_get::<Option<i64>, _>("cached_input_tokens")
+                    .unwrap_or(None),
+                row.try_get::<Option<i64>, _>("fresh_input_tokens")
+                    .unwrap_or(None),
                 row.try_get::<Option<i64>, _>("cache_creation_input_tokens")
                     .unwrap_or(None),
-                row.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0),
-                row.try_get::<Option<i64>, _>("est_input_tokens").unwrap_or(None),
-                row.try_get::<Option<String>, _>("token_usage_evidence").unwrap_or(None),
+                row.try_get::<Option<i64>, _>("output_tokens")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                row.try_get::<Option<i64>, _>("est_input_tokens")
+                    .unwrap_or(None),
+                row.try_get::<Option<String>, _>("token_usage_evidence")
+                    .unwrap_or(None),
                 row.try_get::<Option<i64>, _>("failed").unwrap_or(None) == Some(1),
-                row.try_get::<Option<String>, _>("provider_error_kind").unwrap_or(None),
-                row.try_get::<Option<i64>, _>("provider_status").unwrap_or(None),
+                row.try_get::<Option<String>, _>("provider_error_kind")
+                    .unwrap_or(None),
+                row.try_get::<Option<i64>, _>("provider_status")
+                    .unwrap_or(None),
                 row.get::<String, _>("created_at"),
             );
         }
@@ -2512,21 +2738,44 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or_default();
                     println!(
                         "  contract: task_kind={} requires_observation={} evidence={} invocations={} allowed_tools={}",
-                        contract.get("task_kind").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                        contract.get("requires_observation").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                        contract
+                            .get("task_kind")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        contract
+                            .get("requires_observation")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
                         evidence.len(),
                         invocations.len(),
-                        contract.get("allowed_tool_names").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        contract
+                            .get("allowed_tool_names")
+                            .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
                     );
                     for (index, requirement) in evidence.iter().enumerate() {
                         println!(
                             "  evidence[{index}]: purpose={} authority={} temporal={} scopes={} target={} receipt={}",
-                            requirement.get("purpose").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                            requirement.get("minimum_authority").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                            requirement.get("temporal_scope").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                            requirement.get("acceptable_scopes").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
-                            requirement.get("target").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                            requirement.get("receipt").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                            requirement
+                                .get("purpose")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown"),
+                            requirement
+                                .get("minimum_authority")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown"),
+                            requirement
+                                .get("temporal_scope")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown"),
+                            requirement
+                                .get("acceptable_scopes")
+                                .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                            requirement
+                                .get("target")
+                                .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                            requirement
+                                .get("receipt")
+                                .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
                         );
                     }
                     for (index, predicate) in invocations.iter().enumerate() {
@@ -2536,28 +2785,63 @@ async fn main() -> anyhow::Result<()> {
                 if row.get::<String, _>("event_type") == "tool_call" {
                     println!(
                         "  claim: call_id={} stable_key={} obligations={} max_attempts={} max_invocations={} lineage={}",
-                        data.get("tool_call_id").and_then(serde_json::Value::as_str).unwrap_or("none"),
-                        data.get("stable_operation_key").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        data.get("obligation_ids").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
-                        data.get("max_operation_attempts").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        data.get("max_operation_invocations").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        data.get("operation_lineage").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("tool_call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("none"),
+                        data.get("stable_operation_key")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("obligation_ids")
+                            .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        data.get("max_operation_attempts")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("max_operation_invocations")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("operation_lineage")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
                     );
                 }
                 if let Some(receipt) = data.get("receipt") {
                     println!(
                         "  receipt: call_id={} outcome={} evidence={} exit_code={} http_status={} result_id={} completeness={}/{} preflight={} closes={} continues={}",
-                        data.get("tool_call_id").and_then(|value| value.as_str()).unwrap_or("none"),
-                        receipt.get("outcome_status").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                        receipt.get("outcome_evidence").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                        receipt.get("exit_code").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        receipt.get("http_status").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        receipt.pointer("/result_provenance/result_id").and_then(|value| value.as_str()).unwrap_or("none"),
-                        receipt.pointer("/result_provenance/model_view_completeness").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                        receipt.pointer("/result_provenance/durable_view_completeness").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                        receipt.pointer("/authorization_preflight/status").and_then(|value| value.as_str()).unwrap_or("none"),
-                        receipt.get("completion_obligation_ids").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
-                        receipt.get("continuation_obligation_ids").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        data.get("tool_call_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("none"),
+                        receipt
+                            .get("outcome_status")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown"),
+                        receipt
+                            .get("outcome_evidence")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown"),
+                        receipt
+                            .get("exit_code")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        receipt
+                            .get("http_status")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        receipt
+                            .pointer("/result_provenance/result_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("none"),
+                        receipt
+                            .pointer("/result_provenance/model_view_completeness")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown"),
+                        receipt
+                            .pointer("/result_provenance/durable_view_completeness")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown"),
+                        receipt
+                            .pointer("/authorization_preflight/status")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("none"),
+                        receipt
+                            .get("completion_obligation_ids")
+                            .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        receipt
+                            .get("continuation_obligation_ids")
+                            .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
                     );
                 }
                 let metadata = data.get("metadata");
@@ -2631,22 +2915,36 @@ async fn main() -> anyhow::Result<()> {
                 };
                 println!(
                     "- iter={} model={} fell_back={} attempts={} latency_ms={} prefill_ms={:?} decode_ms={:?} overhead_ms={:?} build_ms={} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} est_in_tok={}",
-                    row.try_get::<Option<i64>, _>("iteration").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("iteration")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
                     model_label,
                     fell_back,
-                    row.try_get::<Option<i64>, _>("attempts").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("attempts")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
                     latency_ms,
                     prefill_ms.map(|v| v.round() as i64),
                     decode_ms.map(|v| v.round() as i64),
                     overhead_ms,
-                    row.try_get::<Option<i64>, _>("build_ms").unwrap_or(None).unwrap_or(0),
-                    row.try_get::<Option<i64>, _>("input_tokens").unwrap_or(None).unwrap_or(0),
-                    row.try_get::<Option<i64>, _>("cached_input_tokens").unwrap_or(None),
-                    row.try_get::<Option<i64>, _>("fresh_input_tokens").unwrap_or(None),
+                    row.try_get::<Option<i64>, _>("build_ms")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("input_tokens")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("cached_input_tokens")
+                        .unwrap_or(None),
+                    row.try_get::<Option<i64>, _>("fresh_input_tokens")
+                        .unwrap_or(None),
                     row.try_get::<Option<i64>, _>("cache_creation_input_tokens")
                         .unwrap_or(None),
-                    row.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0),
-                    row.try_get::<Option<i64>, _>("est_input_tokens").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("output_tokens")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("est_input_tokens")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
                 );
             }
         }
@@ -2836,7 +3134,9 @@ async fn main() -> anyhow::Result<()> {
                 r.get::<i64, _>("is_paused"),
                 r.get::<i64, _>("is_one_shot"),
                 r.get::<String, _>("next_run_at"),
-                r.try_get::<Option<String>, _>("last_run_at").unwrap_or(None).unwrap_or_else(|| "never".to_string()),
+                r.try_get::<Option<String>, _>("last_run_at")
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "never".to_string()),
                 r.get::<String, _>("desc"),
             );
         }
@@ -2862,10 +3162,18 @@ async fn main() -> anyhow::Result<()> {
                 &r.get::<String, _>("goal_id")[..8],
                 r.get::<String, _>("status"),
                 r.get::<i64, _>("retry_count"),
-                r.try_get::<Option<String>, _>("agent_id").unwrap_or(None).unwrap_or_else(|| "none".to_string()),
+                r.try_get::<Option<String>, _>("agent_id")
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "none".to_string()),
                 &r.get::<String, _>("created_at")[..19],
-                r.try_get::<Option<String>, _>("started_at").unwrap_or(None).map(|s| s[..19].to_string()).unwrap_or_else(|| "none".to_string()),
-                r.try_get::<Option<String>, _>("completed_at").unwrap_or(None).map(|s| s[..19].to_string()).unwrap_or_else(|| "none".to_string()),
+                r.try_get::<Option<String>, _>("started_at")
+                    .unwrap_or(None)
+                    .map(|s| s[..19].to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                r.try_get::<Option<String>, _>("completed_at")
+                    .unwrap_or(None)
+                    .map(|s| s[..19].to_string())
+                    .unwrap_or_else(|| "none".to_string()),
                 r.get::<String, _>("desc"),
             );
         }
@@ -2879,7 +3187,9 @@ async fn main() -> anyhow::Result<()> {
 /// values are rendered as text without interpretation.
 async fn print_query_rows(pool: &SqlitePool, title: &str, sql: &str) -> anyhow::Result<()> {
     use sqlx::{Column, Row, TypeInfo, ValueRef};
-    let rows = sqlx::query(sql).fetch_all(pool).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await?;
     println!("== {title} ({}) ==", rows.len());
     for row in rows {
         let mut parts = Vec::new();

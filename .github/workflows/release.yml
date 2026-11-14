@@ -8,6 +8,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CODEX_CLI_VERSION: "0.151.0"
+  # The app (clients/app) toolchain: the web bundle needs the nsh CLI and the
+  # wasm-bindgen CLI matching the app's wasm-bindgen crate.
+  NSH_VERSION: "0.5.0"
+  NSH_LINUX_SHA256: "a422bbe5dc2a7ae3ff308ee56e05d73d5becc81f57adf11447fc570dcee65e0f"
+  WASM_BINDGEN_CLI_VERSION: "0.2.130"
   # Debug-profile async state machines on the agent loop are deep; libtest's
   # default 2 MiB test-thread stack sits within a few percent of what the
   # integration suite needs. Match the daemon's own worker stack budget.
@@ -21,7 +26,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
 
       - name: Install Linux dependencies
         run: |
@@ -81,31 +88,38 @@ jobs:
             os: ubuntu-latest
             name: linux-x86_64
             cross: false
+            app: true
 
           # TODO: Add linux-aarch64 when cross-compilation for fastembed/ONNX is resolved
           # - target: aarch64-unknown-linux-gnu
           #   os: ubuntu-latest
           #   name: linux-aarch64
           #   cross: true
+          #   # The app is not built under `cross` (its image has no GTK 4).
+          #   app: false
 
           - target: x86_64-apple-darwin
             os: macos-15
             name: macos-x86_64
             cross: false
+            app: true
 
           - target: aarch64-apple-darwin
             os: macos-14
             name: macos-aarch64
             cross: false
+            app: true
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # The toolchain comes from rust-toolchain.toml.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+          rustc --version
 
       - name: Install cross
         if: matrix.cross
@@ -116,6 +130,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+          # The app's desktop backend links GTK 4 (see the `app` job in ci.yml).
+          sudo apt-get install -y libgtk-4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev clang
 
       - name: Build (native)
         if: '!matrix.cross'
@@ -125,11 +141,28 @@ jobs:
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }}
 
+      # The app (`aidaemon app` / `aidaemon tui` launch it from beside the
+      # daemon). Its own Cargo workspace, so its target dir is clients/app/target.
+      # A failure here must not block the daemon release: the archive then
+      # ships without aidaemon-app and install.sh skips it.
+      - name: Build app
+        id: build_app
+        if: matrix.app
+        continue-on-error: true
+        run: cargo build --release --locked --target ${{ matrix.target }} --manifest-path clients/app/Cargo.toml
+
       - name: Package (Unix)
         run: |
-          cd target/${{ matrix.target }}/release
-          tar -czvf ../../../aidaemon-${{ matrix.name }}.tar.gz aidaemon
-          cd ../../..
+          set -euo pipefail
+          stage="$(mktemp -d)"
+          cp target/${{ matrix.target }}/release/aidaemon "$stage/"
+          app_bin="clients/app/target/${{ matrix.target }}/release/aidaemon-app"
+          if [ "${{ steps.build_app.outcome }}" = "success" ] && [ -f "$app_bin" ]; then
+            cp "$app_bin" "$stage/"
+          elif [ "${{ matrix.app }}" = "true" ]; then
+            echo "::warning::aidaemon-app did not build for ${{ matrix.name }}; the archive ships without it."
+          fi
+          tar -czvf aidaemon-${{ matrix.name }}.tar.gz -C "$stage" .
           shasum -a 256 aidaemon-${{ matrix.name }}.tar.gz > aidaemon-${{ matrix.name }}.tar.gz.sha256
 
       - name: Upload artifact
@@ -140,9 +173,73 @@ jobs:
             aidaemon-${{ matrix.name }}.tar.gz
             aidaemon-${{ matrix.name }}.tar.gz.sha256
 
+  # The app's web build, once: the daemon's gateway serves it from
+  # ~/.aidaemon/app-web at /client/v1/next/ (install.sh puts it there).
+  web-app:
+    name: Build web app
+    needs: [quality-gate]
+    runs-on: ubuntu-24.04
+    # Like the desktop app, the web bundle must not block the daemon release:
+    # without it the release has no aidaemon-app-web asset and install.sh
+    # skips it.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+          rustc --version
+
+      - name: Install wasm C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 llvm-18
+
+      - name: Install nsh CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/longbridge/nsh/releases/download/v${NSH_VERSION}/nsh-linux-x86_64.tar.gz" -o nsh.tar.gz
+          echo "${NSH_LINUX_SHA256}  nsh.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/nsh"
+          tar -xzf nsh.tar.gz -C "$HOME/nsh"
+          rm nsh.tar.gz
+          echo "$HOME/nsh/bin" >> "$GITHUB_PATH"
+
+      - name: Install wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version "${WASM_BINDGEN_CLI_VERSION}" --locked
+
+      - name: Build web bundle
+        working-directory: clients/app
+        env:
+          CC_wasm32_unknown_unknown: clang-18
+          AR_wasm32_unknown_unknown: llvm-ar-18
+        run: |
+          nsh --version
+          nsh package --target web
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          out=clients/app/.nsh/out/AIdaemon
+          test -f "$out/index.html"
+          # Everything nsh wrote, including its precompressed .br/.gz files.
+          tar -czvf aidaemon-app-web.tar.gz -C "$out" .
+          shasum -a 256 aidaemon-app-web.tar.gz > aidaemon-app-web.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aidaemon-app-web
+          path: |
+            aidaemon-app-web.tar.gz
+            aidaemon-app-web.tar.gz.sha256
+
   release:
     name: Create Release
-    needs: build
+    needs: [build, web-app]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -175,7 +272,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install && rustc --version
 
       - name: Validate tag matches crate version
         id: release_meta
@@ -203,6 +300,34 @@ jobs:
             echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CRATE_VERSION}."
             exit 1
           fi
+
+      - name: Check the SDK crates are ready to publish
+        id: sdk_gate
+        run: |
+          set -euo pipefail
+
+          # Publishing is permanent and owner-approved: the SDK crates carry
+          # `publish = false` until the owner removes it. While any does, this
+          # workflow skips the SDK crates and the daemon (cargo would refuse
+          # them anyway) and still ships binaries and Homebrew.
+          ready=true
+          if grep -lE '^publish = false' crates/aidaemon-*/Cargo.toml | grep -q .; then
+            ready=false
+          fi
+
+          version="$(sed -nE '/^\[workspace\.package\]/,/^\[/ s/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)"
+          test -n "$version"
+
+          if [ "$ready" = "true" ]; then
+            # The daemon must pin exactly the version being published.
+            if ! grep -qE "^aidaemon-core = \{ version = \"=${version}\"" Cargo.toml; then
+              echo "::error::The daemon's aidaemon-core pin does not match workspace version ${version}."
+              exit 1
+            fi
+          fi
+
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         run: |
@@ -273,6 +398,66 @@ jobs:
 
           publish_package "aidaemon-node-protocol" "$PROTOCOL_VERSION"
           publish_package "aidaemon-node-sdk" "$SDK_VERSION"
+
+          if [ "${{ steps.sdk_gate.outputs.ready }}" != "true" ]; then
+            echo "::notice::SDK crates still have publish = false; not publishing them or the daemon to crates.io. GitHub binaries and Homebrew are unaffected."
+            exit 0
+          fi
+
+          # Skip a version that is already on crates.io (a daemon release that
+          # does not change the SDK re-uses the published crates).
+          already_published() {
+            local code
+            code="$(curl -s -o /dev/null -w '%{http_code}' \
+              -A 'aidaemon-release (https://github.com/davo20019/aidaemon)' \
+              "https://crates.io/api/v1/crates/$1/$2")"
+            [ "$code" = "200" ]
+          }
+
+          # SDK crates in dependency order (each after everything it depends on;
+          # dev-dependencies do not count). The shared version is
+          # [workspace.package] version. To regenerate after adding a crate or
+          # a dependency edge: topologically sort the `aidaemon-*` packages of
+          #   cargo metadata --format-version 1 --no-deps
+          # over their non-dev dependencies, and add the crate to the
+          # sdk-docs and msrv lists in ci.yml.
+          SDK_CRATES=(
+            aidaemon-macros
+            aidaemon-client-protocol
+            aidaemon-secrets
+            aidaemon-core
+            aidaemon-agents
+            aidaemon-channels
+            aidaemon-decisions
+            aidaemon-eval
+            aidaemon-mcp
+            aidaemon-policies
+            aidaemon-providers
+            aidaemon-store-sqlite
+            aidaemon-tools
+            aidaemon-channel-discord
+            aidaemon-channel-slack
+            aidaemon-channel-telegram
+            aidaemon-events
+            aidaemon-client-gateway
+            aidaemon-tool-browser
+            aidaemon-memory
+            aidaemon-skills
+            aidaemon-terminal-bridge
+            aidaemon-work
+            aidaemon-nodes
+            aidaemon-runtime
+            aidaemon-sdk
+          )
+          WORKSPACE_VERSION="${{ steps.sdk_gate.outputs.version }}"
+          for crate in "${SDK_CRATES[@]}"; do
+            if already_published "$crate" "$WORKSPACE_VERSION"; then
+              echo "$crate $WORKSPACE_VERSION is already on crates.io; skipping."
+              continue
+            fi
+            publish_package "$crate" "$WORKSPACE_VERSION"
+          done
+
           publish_package "aidaemon" "${{ steps.release_meta.outputs.crate_version }}"
 
   update-homebrew:
@@ -333,6 +518,8 @@ jobs:
 
             def install
               bin.install "aidaemon"
+              # The app (`aidaemon app` / `aidaemon tui`); older archives lack it.
+              bin.install "aidaemon-app" if File.exist?("aidaemon-app")
             end
 
             test do

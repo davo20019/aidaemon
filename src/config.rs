@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -50,291 +50,99 @@ pub fn expand_env_vars(content: &str) -> anyhow::Result<String> {
     Ok(result.into_owned())
 }
 
-/// Returns true if keychain access is disabled via `AIDAEMON_NO_KEYCHAIN=1`.
-fn keychain_disabled() -> bool {
-    std::env::var("AIDAEMON_NO_KEYCHAIN").is_ok_and(|v| v == "1" || v == "true")
+/// The daemon's secret store: the OS keychain under the `aidaemon` service,
+/// or the runtime env file while `AIDAEMON_NO_KEYCHAIN` is `1` or `true`.
+pub fn secret_store() -> &'static std::sync::Arc<aidaemon_secrets::KeychainSecretStore> {
+    static STORE: std::sync::OnceLock<std::sync::Arc<aidaemon_secrets::KeychainSecretStore>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(|| {
+        std::sync::Arc::new(aidaemon_secrets::KeychainSecretStore::new(
+            aidaemon_secrets::KeychainSettings {
+                service: KEYCHAIN_SERVICE.to_string(),
+                disable_var: Some("AIDAEMON_NO_KEYCHAIN".to_string()),
+                env_file_vars: vec![
+                    crate::RUNTIME_ENV_FILE_ENV_KEY.to_string(),
+                    "AIDAEMON_ENV_FILE".to_string(),
+                ],
+                default_env_file: PathBuf::from(".env"),
+            },
+        ))
+    })
 }
 
+/// The daemon's secret store as a shared trait object, for the crates.
+pub fn shared_secret_store() -> std::sync::Arc<dyn aidaemon_secrets::SecretStore> {
+    secret_store().clone()
+}
+
+#[cfg(test)]
 fn resolve_env_file_path() -> PathBuf {
-    if let Ok(path) = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY) {
-        if !path.trim().is_empty() {
-            return PathBuf::from(path);
-        }
-    }
-    if let Ok(path) = std::env::var("AIDAEMON_ENV_FILE") {
-        if !path.trim().is_empty() {
-            return PathBuf::from(path);
-        }
-    }
-    PathBuf::from(".env")
+    secret_store().env_store().env_file_path()
 }
 
-fn env_file_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-fn is_env_key_assignment(line: &str, env_key: &str) -> bool {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        return false;
-    }
-    let Some((k, _)) = trimmed.split_once('=') else {
-        return false;
-    };
-    k.trim() == env_key
-}
-
-fn encode_env_value(value: &str) -> String {
-    let is_simple = value.bytes().all(|b| {
-        matches!(
-            b,
-            b'A'..=b'Z'
-                | b'a'..=b'z'
-                | b'0'..=b'9'
-                | b'_'
-                | b'-'
-                | b'.'
-                | b'/'
-                | b':'
-                | b'@'
-                | b'+'
-                | b'='
-        )
-    });
-    if is_simple {
-        return value.to_string();
-    }
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '$' => escaped.push_str("\\$"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            _ => escaped.push(ch),
-        }
-    }
-    format!("\"{}\"", escaped)
-}
-
-#[cfg(unix)]
-fn set_file_mode_0600(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_file_mode_0600(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
-fn upsert_env_secret(field_name: &str, value: &str) -> anyhow::Result<()> {
-    let _guard = env_file_lock()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Failed to lock env file writer"))?;
-    let env_path = resolve_env_file_path();
-    let env_key = field_name.to_uppercase();
-    let assignment = format!("{}={}", env_key, encode_env_value(value));
-
-    let mut lines: Vec<String> = if env_path.exists() {
-        std::fs::read_to_string(&env_path)?
-            .lines()
-            .map(|l| l.to_string())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut replaced = false;
-    for line in &mut lines {
-        if is_env_key_assignment(line, &env_key) {
-            *line = assignment.clone();
-            replaced = true;
-        }
-    }
-    if !replaced {
-        lines.push(assignment);
-    }
-
-    if let Some(parent) = env_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    let mut body = lines.join("\n");
-    if !body.is_empty() {
-        body.push('\n');
-    }
-    std::fs::write(&env_path, body)?;
-    set_file_mode_0600(&env_path)?;
-    Ok(())
-}
-
-fn remove_env_secret(field_name: &str) -> anyhow::Result<()> {
-    let _guard = env_file_lock()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Failed to lock env file writer"))?;
-    let env_path = resolve_env_file_path();
-    if !env_path.exists() {
-        return Ok(());
-    }
-
-    let env_key = field_name.to_uppercase();
-    let mut lines: Vec<String> = std::fs::read_to_string(&env_path)?
-        .lines()
-        .map(|l| l.to_string())
-        .collect();
-    let original_len = lines.len();
-    lines.retain(|line| !is_env_key_assignment(line, &env_key));
-
-    if lines.len() == original_len {
-        return Ok(());
-    }
-
-    let mut body = lines.join("\n");
-    if !body.is_empty() {
-        body.push('\n');
-    }
-    std::fs::write(&env_path, body)?;
-    set_file_mode_0600(&env_path)?;
-    Ok(())
-}
-
-fn decode_env_value_loose(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let inner = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-    {
-        &trimmed[1..trimmed.len().saturating_sub(1)]
-    } else {
-        trimmed
-    };
-
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('"') => out.push('"'),
-                Some('\\') => out.push('\\'),
-                Some('$') => out.push('$'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-fn read_env_secret_from_file(env_path: &Path, env_key: &str) -> anyhow::Result<Option<String>> {
-    if !env_path.exists() {
-        return Ok(None);
-    }
-
-    let mut found_via_dotenv: Option<String> = None;
-    if let Ok(iter) = dotenvy::from_path_iter(env_path) {
-        for entry in iter {
-            match entry {
-                Ok((key, value)) => {
-                    if key == env_key {
-                        found_via_dotenv = Some(value);
-                    }
-                }
-                Err(_) => {
-                    // Ignore malformed lines and continue parsing other entries.
-                    continue;
-                }
-            }
-        }
-    }
-    if found_via_dotenv.is_some() {
-        return Ok(found_via_dotenv);
-    }
-
-    let content = std::fs::read_to_string(env_path)?;
-    let mut found_via_loose_scan: Option<String> = None;
-    for line in content.lines() {
-        if is_env_key_assignment(line, env_key) {
-            if let Some((_, raw_value)) = line.split_once('=') {
-                found_via_loose_scan = Some(decode_env_value_loose(raw_value));
-            }
-        }
-    }
-    Ok(found_via_loose_scan)
-}
-
+/// Read a secret from the daemon's secret store. The value is registered
+/// for redaction on the way out (`aidaemon_secrets::Secret`).
 pub fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
-    let env_key = field_name.to_uppercase();
-
-    if keychain_disabled() {
-        let env_path = resolve_env_file_path();
-        if env_path.exists() {
-            if let Some(val) = read_env_secret_from_file(&env_path, &env_key)? {
-                if !val.is_empty() {
-                    return Ok(val);
-                }
-            }
-            anyhow::bail!(
-                "Keychain disabled and env var '{}' not found in '{}'",
-                env_key,
-                env_path.display()
-            );
-        }
-
-        if let Ok(val) = std::env::var(&env_key) {
-            if !val.is_empty() {
-                return Ok(val);
-            }
-        }
-
-        anyhow::bail!(
-            "Keychain disabled and env var '{}' not set for '{}'",
-            env_key,
-            field_name
-        );
-    }
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
-    entry
-        .get_password()
-        .map_err(|e| anyhow::anyhow!("Failed to read '{}' from OS keychain: {}", field_name, e))
+    aidaemon_secrets::SecretStore::get(secret_store().as_ref(), field_name)
+        .map(aidaemon_secrets::Secret::into_exposed)
 }
 
 /// Store a secret in the OS keychain under the `aidaemon` service.
 pub fn store_in_keychain(field_name: &str, value: &str) -> anyhow::Result<()> {
-    if keychain_disabled() {
-        return upsert_env_secret(field_name, value);
-    }
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
-    entry.set_password(value)?;
-    Ok(())
+    aidaemon_secrets::SecretStore::set(secret_store().as_ref(), field_name, value)
 }
 
 /// Delete a secret from the OS keychain.
 pub fn delete_from_keychain(field_name: &str) -> anyhow::Result<()> {
-    if keychain_disabled() {
-        return remove_env_secret(field_name);
-    }
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
-    entry
-        .delete_credential()
-        .map_err(|e| anyhow::anyhow!("Failed to delete '{}' from OS keychain: {}", field_name, e))
+    aidaemon_secrets::SecretStore::delete(secret_store().as_ref(), field_name)
+}
+
+/// The daemon's check of a whole config text before a tool writes it: TOML
+/// syntax, then `${ENV_VAR}` references expanded, then [`AppConfig`] and
+/// the checks startup makes (agent name, exposure). `"keychain"` sentinels
+/// are not resolved: the value may not be stored yet.
+pub fn check_config_text(content: &str) -> Result<(), String> {
+    let _doc: toml::Table = content
+        .parse()
+        .map_err(|e| format!("Invalid TOML syntax: {}", e))?;
+    let expanded = expand_env_vars(content).map_err(|e| format!("{}", e))?;
+    let config = toml::from_str::<AppConfig>(&expanded)
+        .map_err(|e| format!("Invalid config structure: {}", e))?;
+    config
+        .agent
+        .validated_name()
+        .map_err(|e| format!("Invalid agent configuration: {}", e))?;
+    config
+        .exposure
+        .validate(config.client_gateway.enabled, config.nodes.gateway.enabled)?;
+    Ok(())
+}
+
+/// The daemon's config file as the config-editing tools see it.
+pub fn config_file(path: impl Into<PathBuf>) -> aidaemon_tools::config_file::ConfigFile {
+    aidaemon_tools::config_file::ConfigFile::new(path, std::sync::Arc::new(check_config_text))
+}
+
+/// Where to export run traces. Nothing is exported unless an endpoint is
+/// set, and prompts and replies only with `capture_content`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TelemetryConfig {
+    /// OTLP/HTTP base URL, for example `https://api.smith.langchain.com/otel`.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    /// Request headers. A value of `keychain` is read from the OS keychain
+    /// under `otlp_header_<name>`.
+    #[serde(default)]
+    pub otlp_headers: HashMap<String, String>,
+    /// Also export prompts, replies and tool arguments, with secrets removed.
+    #[serde(default)]
+    pub capture_content: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
@@ -373,6 +181,14 @@ pub struct AppConfig {
     /// Individually enrolled, policy-constrained Node participants.
     #[serde(default)]
     pub nodes: NodesConfig,
+    /// The Client Gateway (`/client/v1`) for the owner's own apps. Off by
+    /// default; loopback only.
+    #[serde(default)]
+    pub client_gateway: aidaemon_client_gateway::ClientGatewayConfig,
+    /// Tunnels the daemon runs to publish the gateways (`[exposure.*]`).
+    /// None: nothing is exposed. Read at startup.
+    #[serde(default)]
+    pub exposure: aidaemon_exposure::ExposureConfig,
     #[serde(default)]
     pub path_aliases: PathAliasConfig,
     #[serde(default)]
@@ -404,10 +220,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub people: PeopleConfig,
     #[serde(default)]
-    // Used by subsequent plan tasks (3b P2+) that wire correction gate controllers.
-    #[allow(dead_code)]
-    pub self_correction: SelfCorrectionConfig,
-    #[serde(default)]
     pub oauth: OAuthConfig,
     #[serde(default)]
     pub http_auth: HashMap<String, HttpAuthProfile>,
@@ -419,353 +231,86 @@ pub struct AppConfig {
     pub tools: ToolsConfig,
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+    #[serde(default)]
+    pub authority: AuthorityConfig,
+    #[serde(default)]
+    pub decisions: DecisionsConfig,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct NodesConfig {
-    #[serde(default)]
-    pub gateway: NodeGatewayConfig,
-    #[serde(default)]
-    pub announcements: NodeAnnouncementsConfig,
-    #[serde(default)]
-    pub monitoring: NodeMonitoringConfig,
-    #[serde(default)]
-    pub ota: NodeOtaConfig,
-    #[serde(default)]
-    pub limits: NodeLimitsConfig,
-    #[serde(default)]
-    pub retention: NodeRetentionConfig,
-    #[serde(default)]
-    pub speech: NodeSpeechConfig,
+pub use aidaemon_runtime::settings::{DecisionMode, DecisionsConfig};
+
+impl AppConfig {
+    /// The API key of the first Gemini (`google_genai`) provider in the
+    /// provider chain (primary, then fallbacks in order), so one Gemini key
+    /// serves both model calls and the decision backend.
+    pub fn gemini_provider_api_key(&self) -> Option<String> {
+        fn find(provider: &ProviderConfig) -> Option<String> {
+            if provider.kind == ProviderKind::GoogleGenai && !provider.api_key.trim().is_empty() {
+                return Some(provider.api_key.trim().to_string());
+            }
+            provider.fallbacks.iter().find_map(find)
+        }
+        find(&self.provider)
+    }
 }
 
+pub use aidaemon_runtime::authority::OwnerLevel;
+
+/// `[authority]`: the explicit facts tool authority is resolved from.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct AuthorityConfig {
+    #[serde(default)]
+    pub owner_default: OwnerLevel,
+    /// Absolute directories whose files are the owner's own: reading them
+    /// does not mark the run as having seen untrusted content. The turn's
+    /// working directory and project scope are always trusted in addition.
+    #[serde(default)]
+    pub trusted_roots: Vec<String>,
+}
+
+/// Which long-term memory agent turns use.
 #[derive(Debug, Deserialize, Clone)]
-pub struct NodeOtaConfig {
-    /// Master switch. A Node still needs both the firmware.ota capability and
-    /// an explicit receive_ota authorization.
+pub struct MemoryConfig {
     #[serde(default)]
-    pub enabled: bool,
-    /// Reviewed detached-signature manifest generated by the firmware release tool.
+    pub backend: MemoryBackend,
+    /// SQLite file for the `sdk` backend.
+    #[serde(default = "default_sdk_memory_path")]
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
+    pub path: String,
+    /// Let a replacing memory system learn from the retained conversations.
+    /// It reads them once, in the background, and costs model calls.
     #[serde(default)]
-    pub manifest_path: String,
-    /// Immutable application image whose size and digest must match the manifest.
-    #[serde(default)]
-    pub image_path: String,
-    /// Base64url compressed P-256 SEC1 release verification key. This is public.
-    #[serde(default)]
-    pub release_public_key_sec1: String,
-    #[serde(default = "default_node_ota_max_image_bytes")]
-    pub max_image_bytes: usize,
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
+    pub learn_from_history: bool,
 }
 
-impl Default for NodeOtaConfig {
+impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            manifest_path: String::new(),
-            image_path: String::new(),
-            release_public_key_sec1: String::new(),
-            max_image_bytes: default_node_ota_max_image_bytes(),
+            backend: MemoryBackend::default(),
+            path: default_sdk_memory_path(),
+            learn_from_history: false,
         }
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct NodeMonitoringConfig {
-    /// Master opt-in for bounded history, deterministic rules and owner alerts.
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_node_monitor_history_hours")]
-    pub history_hours: u64,
-    #[serde(default = "default_node_monitor_history_rows")]
-    pub max_history_rows_per_capability: usize,
-    #[serde(default = "default_node_monitor_event_retention_days")]
-    pub event_retention_days: u64,
-    #[serde(default = "default_node_monitor_event_rows")]
-    pub max_events_per_monitor: usize,
-    #[serde(default = "default_node_monitor_scan_interval")]
-    pub scan_interval_seconds: u64,
-    #[serde(default = "default_node_monitor_max_monitors")]
-    pub max_monitors: usize,
-    #[serde(default = "default_node_monitor_duration_days")]
-    pub max_duration_days: u64,
-    #[serde(default = "default_node_monitor_stale_seconds")]
-    pub default_stale_after_seconds: u64,
-    #[serde(default = "default_node_monitor_offline_seconds")]
-    pub default_offline_after_seconds: u64,
+fn default_sdk_memory_path() -> String {
+    "aidaemon-memory.db".to_string()
 }
 
-impl Default for NodeMonitoringConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            history_hours: default_node_monitor_history_hours(),
-            max_history_rows_per_capability: default_node_monitor_history_rows(),
-            event_retention_days: default_node_monitor_event_retention_days(),
-            max_events_per_monitor: default_node_monitor_event_rows(),
-            scan_interval_seconds: default_node_monitor_scan_interval(),
-            max_monitors: default_node_monitor_max_monitors(),
-            max_duration_days: default_node_monitor_duration_days(),
-            default_stale_after_seconds: default_node_monitor_stale_seconds(),
-            default_offline_after_seconds: default_node_monitor_offline_seconds(),
-        }
-    }
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryBackend {
+    /// The daemon's own memory in its state database.
+    #[default]
+    Daemon,
+    /// The `aidaemon-memory` crate (needs the `sdk-memory` cargo feature).
+    Sdk,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct NodeAnnouncementsConfig {
-    /// Master opt-in for owner-initiated audio delivery to enrolled Nodes.
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_node_announcement_text_chars")]
-    pub max_text_chars: usize,
-    #[serde(default = "default_node_announcement_audio_bytes")]
-    pub max_audio_bytes: usize,
-    #[serde(default = "default_node_announcement_ttl")]
-    pub ttl_seconds: u64,
-    #[serde(default = "default_node_announcement_poll_interval")]
-    pub poll_interval_seconds: u64,
-    #[serde(default = "default_node_announcement_ack_wait")]
-    pub ack_wait_seconds: u64,
-    #[serde(default = "default_node_announcement_max_pending")]
-    pub max_pending_per_node: usize,
-}
-
-impl Default for NodeAnnouncementsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_text_chars: default_node_announcement_text_chars(),
-            max_audio_bytes: default_node_announcement_audio_bytes(),
-            ttl_seconds: default_node_announcement_ttl(),
-            poll_interval_seconds: default_node_announcement_poll_interval(),
-            ack_wait_seconds: default_node_announcement_ack_wait(),
-            max_pending_per_node: default_node_announcement_max_pending(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct NodeSpeechConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_node_speech_provider")]
-    pub provider: String,
-    #[serde(default = "default_node_speech_voice")]
-    pub voice: String,
-    #[serde(default = "default_node_speech_rate")]
-    pub sample_rate_hz: u32,
-    #[serde(default = "default_node_speech_timeout")]
-    pub timeout_seconds: u64,
-}
-
-impl Default for NodeSpeechConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            provider: default_node_speech_provider(),
-            voice: default_node_speech_voice(),
-            sample_rate_hz: default_node_speech_rate(),
-            timeout_seconds: default_node_speech_timeout(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct NodeGatewayConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_node_gateway_bind")]
-    pub bind: String,
-    #[serde(default = "default_node_gateway_port")]
-    pub port: u16,
-    #[serde(default = "default_node_session_ttl")]
-    pub session_ttl_seconds: u64,
-    #[serde(default = "default_node_challenge_ttl")]
-    pub challenge_ttl_seconds: u64,
-    #[serde(default = "default_node_heartbeat_interval")]
-    pub heartbeat_interval_seconds: u64,
-    #[serde(default = "default_node_pairing_ttl")]
-    pub pairing_ttl_seconds: u64,
-    /// Ordered public HTTPS origins for replaceable remote/LAN adapters that
-    /// route to this same loopback Gateway. Empty means "do not update Devices".
-    #[serde(default)]
-    pub advertised_endpoints: Vec<String>,
-}
-
-impl Default for NodeGatewayConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            bind: default_node_gateway_bind(),
-            port: default_node_gateway_port(),
-            session_ttl_seconds: default_node_session_ttl(),
-            challenge_ttl_seconds: default_node_challenge_ttl(),
-            heartbeat_interval_seconds: default_node_heartbeat_interval(),
-            pairing_ttl_seconds: default_node_pairing_ttl(),
-            advertised_endpoints: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct NodeLimitsConfig {
-    #[serde(default = "default_node_control_bytes")]
-    pub control_message_bytes: usize,
-    #[serde(default = "default_node_audio_bytes")]
-    pub audio_upload_bytes: usize,
-    #[serde(default = "default_node_image_bytes")]
-    pub image_upload_bytes: usize,
-    #[serde(default = "default_node_response_audio_bytes")]
-    pub response_audio_bytes: usize,
-    #[serde(default = "default_node_text_chars")]
-    pub text_chars: usize,
-    #[serde(default = "default_node_requests_per_minute")]
-    pub requests_per_minute: u32,
-    #[serde(default = "default_node_turns_per_minute")]
-    pub turns_per_minute: u32,
-    #[serde(default = "default_node_media_bytes_per_minute")]
-    pub media_bytes_per_minute: usize,
-}
-
-impl Default for NodeLimitsConfig {
-    fn default() -> Self {
-        Self {
-            control_message_bytes: default_node_control_bytes(),
-            audio_upload_bytes: default_node_audio_bytes(),
-            image_upload_bytes: default_node_image_bytes(),
-            response_audio_bytes: default_node_response_audio_bytes(),
-            text_chars: default_node_text_chars(),
-            requests_per_minute: default_node_requests_per_minute(),
-            turns_per_minute: default_node_turns_per_minute(),
-            media_bytes_per_minute: default_node_media_bytes_per_minute(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct NodeRetentionConfig {
-    /// Raw Node media is deleted after processing unless this is explicitly enabled.
-    #[serde(default)]
-    pub retain_raw_media: bool,
-    #[serde(default = "default_node_media_dir")]
-    pub media_dir: String,
-}
-
-impl Default for NodeRetentionConfig {
-    fn default() -> Self {
-        Self {
-            retain_raw_media: false,
-            media_dir: default_node_media_dir(),
-        }
-    }
-}
-
-fn default_node_gateway_bind() -> String {
-    "127.0.0.1".to_string()
-}
-fn default_node_gateway_port() -> u16 {
-    8787
-}
-fn default_node_session_ttl() -> u64 {
-    900
-}
-fn default_node_challenge_ttl() -> u64 {
-    60
-}
-fn default_node_heartbeat_interval() -> u64 {
-    30
-}
-fn default_node_pairing_ttl() -> u64 {
-    600
-}
-fn default_node_ota_max_image_bytes() -> usize {
-    2_621_440
-}
-fn default_node_announcement_text_chars() -> usize {
-    180
-}
-fn default_node_announcement_audio_bytes() -> usize {
-    1_000_000
-}
-fn default_node_announcement_ttl() -> u64 {
-    120
-}
-fn default_node_announcement_poll_interval() -> u64 {
-    3
-}
-fn default_node_announcement_ack_wait() -> u64 {
-    12
-}
-fn default_node_announcement_max_pending() -> usize {
-    4
-}
-fn default_node_monitor_history_hours() -> u64 {
-    24
-}
-fn default_node_monitor_history_rows() -> usize {
-    2_880
-}
-fn default_node_monitor_event_retention_days() -> u64 {
-    30
-}
-fn default_node_monitor_event_rows() -> usize {
-    1_000
-}
-fn default_node_monitor_scan_interval() -> u64 {
-    15
-}
-fn default_node_monitor_max_monitors() -> usize {
-    64
-}
-fn default_node_monitor_duration_days() -> u64 {
-    365
-}
-fn default_node_monitor_stale_seconds() -> u64 {
-    120
-}
-fn default_node_monitor_offline_seconds() -> u64 {
-    120
-}
-fn default_node_control_bytes() -> usize {
-    16 * 1024
-}
-fn default_node_audio_bytes() -> usize {
-    512 * 1024
-}
-fn default_node_image_bytes() -> usize {
-    512 * 1024
-}
-fn default_node_response_audio_bytes() -> usize {
-    2 * 1024 * 1024
-}
-fn default_node_text_chars() -> usize {
-    4096
-}
-fn default_node_requests_per_minute() -> u32 {
-    120
-}
-fn default_node_turns_per_minute() -> u32 {
-    10
-}
-fn default_node_media_bytes_per_minute() -> usize {
-    2 * 1024 * 1024
-}
-fn default_node_media_dir() -> String {
-    "~/.aidaemon/node-media".to_string()
-}
-fn default_node_speech_provider() -> String {
-    "macos_say".to_string()
-}
-fn default_node_speech_voice() -> String {
-    "Samantha".to_string()
-}
-fn default_node_speech_rate() -> u32 {
-    22_050
-}
-fn default_node_speech_timeout() -> u64 {
-    20
-}
+pub use aidaemon_nodes::config::NodesConfig;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentConfig {
@@ -775,6 +320,35 @@ pub struct AgentConfig {
     /// Optional Markdown persona file. Relative paths resolve next to config.toml.
     #[serde(default)]
     pub persona_file: Option<PathBuf>,
+    /// `[agent.engine]` settings for the SDK kernel that runs agent turns.
+    #[serde(default)]
+    pub engine: AgentEngineConfig,
+}
+
+/// `[agent.engine]`: configures the agent kernel.
+///
+/// ```toml
+/// [agent.engine]
+/// model = "gpt-6-sol"   # optional; pins every turn to a model the daemon's provider serves
+/// ```
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AgentEngineConfig {
+    /// Ignored: the SDK kernel is the only agent loop. Kept so older configs
+    /// with `kind = "legacy"` or `kind = "sdk"` still parse.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Pins every SDK turn to this model, served by the daemon's providers.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Ignored: the SDK engine uses the daemon's configured providers. Kept so
+    /// older configs still parse; when set, a `model` pin written for the
+    /// removed Anthropic engine client is ignored unless the provider is
+    /// Anthropic.
+    #[serde(default)]
+    pub api_key: String,
+    /// Model turns per agent turn before the run stops.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
 }
 
 impl AgentConfig {
@@ -803,6 +377,7 @@ impl Default for AgentConfig {
         Self {
             name: default_agent_name(),
             persona_file: None,
+            engine: AgentEngineConfig::default(),
         }
     }
 }
@@ -811,251 +386,9 @@ fn default_agent_name() -> String {
     "aidaemon".to_string()
 }
 
-/// Agent-visible execution workspace configuration.
-///
-/// Daemon control-plane state (configuration, SQLite, channel inbox transport,
-/// keychain access, and browser/computer-use sessions) always remains local.
-/// Only tools that inspect or mutate the agent's working environment use this
-/// backend.
-#[derive(Debug, Deserialize, Clone)]
-pub struct ExecutionConfig {
-    /// Selected backend: `local`, `docker`, or `ssh`.
-    #[serde(default = "default_execution_backend")]
-    pub backend: String,
-    /// Default working directory for relative agent-visible paths. For local
-    /// execution this defaults to the daemon working directory.
-    #[serde(default)]
-    pub workspace_root: Option<String>,
-    /// Allow path-based tools and explicit command working directories outside
-    /// `workspace_root`. This defaults to true only for the local backend to
-    /// preserve historical behavior. Shell commands retain the authority of
-    /// the selected OS account/container and are governed by terminal approval.
-    #[serde(default)]
-    pub allow_outside_workspace: Option<bool>,
-    #[cfg_attr(not(feature = "execution-docker"), allow(dead_code))]
-    #[serde(default)]
-    pub docker: DockerExecutionConfig,
-    #[serde(default)]
-    pub ssh: SshExecutionConfig,
-}
+pub use aidaemon_tools::execution::ExecutionConfig;
 
-impl Default for ExecutionConfig {
-    fn default() -> Self {
-        Self {
-            backend: default_execution_backend(),
-            workspace_root: None,
-            allow_outside_workspace: None,
-            docker: DockerExecutionConfig::default(),
-            ssh: SshExecutionConfig::default(),
-        }
-    }
-}
-
-impl ExecutionConfig {
-    pub fn normalized_backend(&self) -> anyhow::Result<String> {
-        let backend = self.backend.trim().to_ascii_lowercase();
-        match backend.as_str() {
-            "local" | "docker" | "ssh" => Ok(backend),
-            _ => anyhow::bail!(
-                "execution.backend must be one of: local, docker, ssh (got {:?})",
-                self.backend
-            ),
-        }
-    }
-
-    pub fn effective_allow_outside_workspace(&self) -> bool {
-        self.allow_outside_workspace
-            .unwrap_or_else(|| self.backend.trim().eq_ignore_ascii_case("local"))
-    }
-}
-
-fn default_execution_backend() -> String {
-    "local".to_string()
-}
-
-/// Local shadow-Git workspace checkpoints created before the first filesystem
-/// mutation in an agent turn.
-#[derive(Debug, Deserialize, Clone)]
-pub struct CheckpointConfig {
-    /// Opt in to local workspace checkpoints. Disabled by default while the
-    /// feature is in beta.
-    #[serde(default)]
-    pub enabled: bool,
-    /// External checkpoint store. Defaults to the platform data directory.
-    #[serde(default)]
-    pub storage_dir: Option<String>,
-    #[serde(default = "default_checkpoint_retention_days")]
-    pub retention_days: u64,
-    #[serde(default = "default_checkpoint_max_per_root")]
-    pub max_per_root: u32,
-    #[serde(default = "default_checkpoint_max_store_bytes")]
-    pub max_store_bytes: u64,
-    #[serde(default = "default_checkpoint_max_root_bytes")]
-    pub max_root_bytes: u64,
-    #[serde(default = "default_checkpoint_max_file_bytes")]
-    pub max_file_bytes: u64,
-    #[serde(default = "default_checkpoint_max_paths")]
-    pub max_paths: usize,
-    #[serde(default = "default_checkpoint_snapshot_timeout_secs")]
-    pub snapshot_timeout_secs: u64,
-}
-
-impl Default for CheckpointConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            storage_dir: None,
-            retention_days: default_checkpoint_retention_days(),
-            max_per_root: default_checkpoint_max_per_root(),
-            max_store_bytes: default_checkpoint_max_store_bytes(),
-            max_root_bytes: default_checkpoint_max_root_bytes(),
-            max_file_bytes: default_checkpoint_max_file_bytes(),
-            max_paths: default_checkpoint_max_paths(),
-            snapshot_timeout_secs: default_checkpoint_snapshot_timeout_secs(),
-        }
-    }
-}
-
-fn default_checkpoint_retention_days() -> u64 {
-    14
-}
-
-fn default_checkpoint_max_per_root() -> u32 {
-    30
-}
-
-fn default_checkpoint_max_store_bytes() -> u64 {
-    2 * 1024 * 1024 * 1024
-}
-
-fn default_checkpoint_max_root_bytes() -> u64 {
-    500 * 1024 * 1024
-}
-
-fn default_checkpoint_max_file_bytes() -> u64 {
-    10 * 1024 * 1024
-}
-
-fn default_checkpoint_max_paths() -> usize {
-    50_000
-}
-
-fn default_checkpoint_snapshot_timeout_secs() -> u64 {
-    10
-}
-
-#[cfg_attr(not(feature = "execution-docker"), allow(dead_code))]
-#[derive(Debug, Deserialize, Clone)]
-pub struct DockerExecutionConfig {
-    /// Persistent container name used for every tool call.
-    #[serde(default = "default_docker_container")]
-    pub container: String,
-    /// Image used when `create_if_missing` creates the persistent container.
-    #[serde(default = "default_docker_image")]
-    pub image: String,
-    /// Agent-visible workspace path inside the container.
-    #[serde(default = "default_remote_workspace_root")]
-    pub workspace_root: String,
-    /// Host directory bind-mounted at `workspace_root`. Relative paths resolve
-    /// next to config.toml. If omitted, the daemon working directory is used.
-    #[serde(default)]
-    pub host_workspace: Option<String>,
-    /// Create and start the persistent container when it does not exist.
-    #[serde(default = "default_true")]
-    pub create_if_missing: bool,
-    /// Docker network mode. Defaults to `none`; CLI agents that call cloud APIs
-    /// need an explicitly configured network such as `bridge`.
-    #[serde(default = "default_docker_network")]
-    pub network: String,
-    /// Optional Docker user (`uid:gid`, name, etc.) for `docker exec`.
-    #[serde(default)]
-    pub user: Option<String>,
-    /// Additional environment variable names copied from the daemon into
-    /// container executions. Values are never exposed in tool arguments.
-    #[serde(default)]
-    pub env_allowlist: Vec<String>,
-}
-
-impl Default for DockerExecutionConfig {
-    fn default() -> Self {
-        Self {
-            container: default_docker_container(),
-            image: default_docker_image(),
-            workspace_root: default_remote_workspace_root(),
-            host_workspace: None,
-            create_if_missing: true,
-            network: default_docker_network(),
-            user: None,
-            env_allowlist: Vec::new(),
-        }
-    }
-}
-
-fn default_docker_container() -> String {
-    "aidaemon-execution".to_string()
-}
-
-fn default_docker_image() -> String {
-    "ubuntu:24.04".to_string()
-}
-
-fn default_remote_workspace_root() -> String {
-    "/workspace".to_string()
-}
-
-fn default_docker_network() -> String {
-    "none".to_string()
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct SshExecutionConfig {
-    /// OpenSSH host or alias. Existing ~/.ssh/config, ssh-agent, ProxyJump,
-    /// known_hosts, and hardware-token settings are honored.
-    #[serde(default)]
-    pub host: String,
-    /// Persistent agent-visible directory on the SSH host.
-    #[serde(default = "default_ssh_workspace_root")]
-    pub workspace_root: String,
-    #[serde(default)]
-    pub port: Option<u16>,
-    /// Optional local identity file path. Prefer an OpenSSH alias/ssh-agent.
-    #[serde(default)]
-    pub identity_file: Option<String>,
-    /// Additional OpenSSH arguments, for example `["-J", "bastion"]`.
-    #[serde(default)]
-    pub extra_args: Vec<String>,
-    #[serde(default = "default_ssh_connect_timeout")]
-    pub connect_timeout_secs: u64,
-    /// Create workspace_root on startup when it is missing.
-    #[serde(default = "default_true")]
-    pub create_workspace: bool,
-    /// Environment variable names explicitly forwarded to remote executions.
-    #[serde(default)]
-    pub env_allowlist: Vec<String>,
-}
-
-impl Default for SshExecutionConfig {
-    fn default() -> Self {
-        Self {
-            host: String::new(),
-            workspace_root: default_ssh_workspace_root(),
-            port: None,
-            identity_file: None,
-            extra_args: Vec::new(),
-            connect_timeout_secs: default_ssh_connect_timeout(),
-            create_workspace: true,
-            env_allowlist: Vec::new(),
-        }
-    }
-}
-
-fn default_ssh_workspace_root() -> String {
-    "~/aidaemon-workspace".to_string()
-}
-
-fn default_ssh_connect_timeout() -> u64 {
-    10
-}
+pub use aidaemon_tools::checkpoints::CheckpointConfig;
 
 #[derive(Deserialize, Clone)]
 pub struct ProviderConfig {
@@ -1085,6 +418,7 @@ pub struct ProviderConfig {
     /// stream that dies after partial text is recovered via the
     /// truncation-recovery path instead of failing the whole call.
     #[serde(default)]
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub streaming: bool,
     /// Models whose final (no-tool-call) answers are re-issued through a
     /// tool-less, schema-constrained `{reasoning, response}` second pass
@@ -1136,40 +470,28 @@ impl ProviderConfig {
     }
 
     fn resolve_secrets_recursive(&mut self, key_prefix: Option<&str>) -> anyhow::Result<()> {
-        let api_key_key = key_prefix
-            .map(|prefix| format!("{}_api_key", prefix))
-            .unwrap_or_else(|| "api_key".to_string());
+        use aidaemon_secrets::names;
         if self.api_key == "keychain" {
-            self.api_key = resolve_from_keychain(&api_key_key)?;
+            self.api_key = resolve_from_keychain(&names::provider_field(key_prefix, "api_key"))?;
         }
 
-        let gateway_token_key = key_prefix
-            .map(|prefix| format!("{}_gateway_token", prefix))
-            .unwrap_or_else(|| "gateway_token".to_string());
         if self.gateway_token.as_deref() == Some("keychain") {
-            self.gateway_token = Some(resolve_from_keychain(&gateway_token_key)?);
+            self.gateway_token = Some(resolve_from_keychain(&names::provider_field(
+                key_prefix,
+                "gateway_token",
+            ))?);
         }
 
         if let Some(headers) = self.extra_headers.as_mut() {
             for (name, value) in headers.iter_mut() {
                 if value == "keychain" {
-                    let normalized_name = name
-                        .to_ascii_lowercase()
-                        .chars()
-                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                        .collect::<String>();
-                    let key = key_prefix
-                        .map(|prefix| format!("{}_header_{}", prefix, normalized_name))
-                        .unwrap_or_else(|| format!("provider_header_{}", normalized_name));
-                    *value = resolve_from_keychain(&key)?;
+                    *value = resolve_from_keychain(&names::provider_header(key_prefix, name))?;
                 }
             }
         }
 
         for (idx, fallback) in self.fallbacks.iter_mut().enumerate() {
-            let nested_prefix = key_prefix
-                .map(|prefix| format!("{}_fallback_{}", prefix, idx))
-                .unwrap_or_else(|| format!("provider_fallback_{}", idx));
+            let nested_prefix = names::provider_fallback_prefix(key_prefix, idx);
             fallback.resolve_secrets_recursive(Some(&nested_prefix))?;
         }
 
@@ -1177,18 +499,7 @@ impl ProviderConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderKind {
-    #[default]
-    OpenaiCompatible,
-    XaiNative,
-    GoogleGenai,
-    Anthropic,
-    /// ChatGPT Plus/Pro/Business subscription via Codex OAuth. Uses stored
-    /// OAuth credentials rather than `api_key`.
-    OpenaiChatgpt,
-}
+pub use aidaemon_providers::routing::{ModelsConfig, ProviderKind};
 
 fn default_true() -> bool {
     true
@@ -1225,6 +536,7 @@ pub struct SlotRoutingConfig {
     pub interactive_slot: u32,
     /// Slot used for all background/non-interactive calls. Default `1`.
     #[serde(default = "default_background_slot")]
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub background_slot: u32,
 }
 
@@ -1234,94 +546,6 @@ impl Default for SlotRoutingConfig {
             enabled: false,
             interactive_slot: 0,
             background_slot: default_background_slot(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct ModelsConfig {
-    /// Canonical default model used for normal requests.
-    /// TOML key: `provider.models.default`
-    #[serde(default, rename = "default")]
-    pub default_model: String,
-    /// Ordered fallback models used only when calls fail.
-    /// TOML key: `provider.models.fallback = [\"...\"]`
-    #[serde(default, rename = "fallback")]
-    pub fallback_models: Vec<String>,
-    /// Legacy key kept for backward compatibility.
-    #[serde(default)]
-    pub primary: String,
-    /// Legacy key kept for backward compatibility.
-    #[serde(default)]
-    pub fast: String,
-    /// Legacy key kept for backward compatibility.
-    #[serde(default)]
-    pub smart: String,
-}
-
-impl ModelsConfig {
-    /// Normalize legacy and new model keys into:
-    /// - `default_model`
-    /// - `fallback_models` (ordered, deduped, excluding default)
-    ///
-    /// Legacy fields (`primary`, `fast`, `smart`) remain populated for
-    /// compatibility with older code paths and existing config tooling.
-    pub fn apply_defaults(&mut self, provider_kind: &ProviderKind) {
-        let provider_default = match provider_kind {
-            ProviderKind::GoogleGenai => "gemini-3-flash-preview".to_string(),
-            ProviderKind::Anthropic => "claude-sonnet-4-20250514".to_string(),
-            ProviderKind::XaiNative => "grok-4".to_string(),
-            ProviderKind::OpenaiCompatible => "openai/gpt-4o".to_string(),
-            ProviderKind::OpenaiChatgpt => "gpt-5.6-terra".to_string(),
-        };
-
-        let default_model = if !self.default_model.trim().is_empty() {
-            self.default_model.trim().to_string()
-        } else if !self.primary.trim().is_empty() {
-            self.primary.trim().to_string()
-        } else {
-            provider_default
-        };
-
-        // If fallback[] was not explicitly provided, derive it from legacy tier keys.
-        if self.fallback_models.is_empty() {
-            for legacy in [&self.smart, &self.fast] {
-                let candidate = legacy.trim();
-                if candidate.is_empty() || candidate == default_model {
-                    continue;
-                }
-                if !self.fallback_models.iter().any(|m| m == candidate) {
-                    self.fallback_models.push(candidate.to_string());
-                }
-            }
-        } else {
-            // Sanitize explicit fallback[].
-            let mut deduped = Vec::new();
-            for raw in &self.fallback_models {
-                let candidate = raw.trim();
-                if candidate.is_empty() || candidate == default_model {
-                    continue;
-                }
-                if !deduped.iter().any(|m: &String| m == candidate) {
-                    deduped.push(candidate.to_string());
-                }
-            }
-            self.fallback_models = deduped;
-        }
-
-        self.default_model = default_model.clone();
-        self.primary = default_model.clone();
-
-        let first_fallback = self
-            .fallback_models
-            .first()
-            .cloned()
-            .unwrap_or_else(|| default_model.clone());
-        if self.fast.trim().is_empty() {
-            self.fast = first_fallback.clone();
-        }
-        if self.smart.trim().is_empty() {
-            self.smart = first_fallback;
         }
     }
 }
@@ -1579,14 +803,21 @@ pub struct StateConfig {
     /// remain in the database but are not included in the prompt.
     #[serde(default = "default_max_facts")]
     pub max_facts: usize,
-    /// Optional daily token budget. When set, cumulative daily usage is checked
-    /// before additional LLM work; productive runs may auto-extend temporarily,
-    /// otherwise further calls are rejected. Resets at midnight UTC.
+    /// Ignored: a global daily token cap is not enforced (logged once at
+    /// startup). Kept so older configs still parse. Per-goal daily budgets and
+    /// the per-task token budget still apply; cap total spend at the provider.
     #[serde(default)]
     pub daily_token_budget: Option<u64>,
     /// Retention policies for automatic cleanup of old data.
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// Snapshots of the database kept from before an upgrade: when a new
+    /// aidaemon version starts on an existing database, it first writes a
+    /// consistent copy (`VACUUM INTO`, encrypted like the database) to
+    /// `backups/` next to it and keeps this many of them, newest first.
+    /// `0` turns it off.
+    #[serde(default = "default_upgrade_backups")]
+    pub upgrade_backups: usize,
     /// Context window management (trimming, summarization, progressive facts).
     #[serde(default)]
     pub context_window: ContextWindowConfig,
@@ -1624,24 +855,38 @@ pub struct RetentionConfig {
     /// Delete net-negative error solutions older than N days (default: 90)
     #[serde(default = "default_retention_90")]
     pub error_solutions_days: u32,
-    /// Delete self-correction attempt rows older than N days (default: 30).
-    #[serde(default = "default_retention_30")]
-    pub self_correction_attempts_days: u32,
 }
 
 impl Default for RetentionConfig {
     fn default() -> Self {
+        let defaults = aidaemon_runtime::state::retention::RetentionPolicy::default();
         Self {
-            messages_days: 90,
-            diagnostic_events_days: 7,
-            superseded_facts_days: 90,
-            token_usage_aggregate_days: 30,
-            episodes_days: 365,
-            behavior_patterns_days: 90,
-            goals_days: 180,
-            procedures_days: 180,
-            error_solutions_days: 90,
-            self_correction_attempts_days: 30,
+            messages_days: defaults.messages_days,
+            diagnostic_events_days: defaults.diagnostic_events_days,
+            superseded_facts_days: defaults.superseded_facts_days,
+            token_usage_aggregate_days: defaults.token_usage_aggregate_days,
+            episodes_days: defaults.episodes_days,
+            behavior_patterns_days: defaults.behavior_patterns_days,
+            goals_days: defaults.goals_days,
+            procedures_days: defaults.procedures_days,
+            error_solutions_days: defaults.error_solutions_days,
+        }
+    }
+}
+
+impl RetentionConfig {
+    /// The retention policy these settings give.
+    pub fn policy(&self) -> aidaemon_runtime::state::retention::RetentionPolicy {
+        aidaemon_runtime::state::retention::RetentionPolicy {
+            messages_days: self.messages_days,
+            diagnostic_events_days: self.diagnostic_events_days,
+            superseded_facts_days: self.superseded_facts_days,
+            token_usage_aggregate_days: self.token_usage_aggregate_days,
+            episodes_days: self.episodes_days,
+            behavior_patterns_days: self.behavior_patterns_days,
+            goals_days: self.goals_days,
+            procedures_days: self.procedures_days,
+            error_solutions_days: self.error_solutions_days,
         }
     }
 }
@@ -1676,6 +921,7 @@ impl fmt::Debug for StateConfig {
             .field("max_facts", &self.max_facts)
             .field("daily_token_budget", &self.daily_token_budget)
             .field("retention", &self.retention)
+            .field("upgrade_backups", &self.upgrade_backups)
             .field("context_window", &self.context_window)
             .finish()
     }
@@ -1691,9 +937,14 @@ impl Default for StateConfig {
             max_facts: default_max_facts(),
             daily_token_budget: None,
             retention: RetentionConfig::default(),
+            upgrade_backups: default_upgrade_backups(),
             context_window: ContextWindowConfig::default(),
         }
     }
+}
+
+fn default_upgrade_backups() -> usize {
+    2
 }
 
 fn default_db_path() -> String {
@@ -1779,13 +1030,10 @@ impl fmt::Debug for TerminalConfig {
             .field("daemon_ws_url", &self.daemon_ws_url)
             .field(
                 "daemon_connect_token",
-                &self.daemon_connect_token.as_ref().map(|v| {
-                    if v.is_empty() {
-                        "\"\""
-                    } else {
-                        "[REDACTED]"
-                    }
-                }),
+                &self
+                    .daemon_connect_token
+                    .as_ref()
+                    .map(|v| if v.is_empty() { "\"\"" } else { "[REDACTED]" }),
             )
             .field(
                 "allow_static_token_fallback",
@@ -1881,15 +1129,7 @@ impl TerminalConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct PathAliasConfig {
-    /// Optional alias roots for "projects/..." paths.
-    /// Example:
-    /// [path_aliases]
-    /// projects = ["~/projects"]
-    #[serde(default)]
-    pub projects: Vec<String>,
-}
+pub use aidaemon_runtime::settings::PathAliasConfig;
 
 fn default_initial_timeout_secs() -> u64 {
     30
@@ -2011,7 +1251,9 @@ pub struct DaemonConfig {
     /// Set to "0.0.0.0" to listen on all interfaces.
     #[serde(default = "default_health_bind")]
     pub health_bind: String,
-    /// Enable the embedded web dashboard on the health server port (default: true).
+    /// Serve the OAuth callback and the mandate wake webhook (`/api/mandates/signals`,
+    /// token-authenticated) beside `/health` on the health server port (default: true).
+    /// The status page that used to live here is in the AIdaemon app.
     #[serde(default = "default_dashboard_enabled")]
     pub dashboard_enabled: bool,
     /// Watchdog configuration for detecting stuck agent tasks.
@@ -2046,189 +1288,31 @@ fn default_dashboard_enabled() -> bool {
     true
 }
 
-fn default_queue_capacity_approval() -> usize {
-    16
-}
-
-fn default_queue_capacity_media() -> usize {
-    16
-}
-
-fn default_queue_capacity_trigger_events() -> usize {
-    64
-}
-
-fn default_queue_warning_ratio() -> f32 {
-    0.75
-}
-
-fn default_queue_overload_ratio() -> f32 {
-    0.90
-}
-
-fn default_queue_adaptive_shedding() -> bool {
-    true
-}
-
-fn default_queue_fair_trigger_sessions() -> bool {
-    true
-}
-
-fn default_queue_fair_window_secs() -> u64 {
-    60
-}
-
-fn default_queue_fair_max_events_per_session() -> u32 {
-    4
-}
-
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-pub struct QueueLanePolicyConfig {
-    #[serde(default = "default_queue_adaptive_shedding")]
-    pub adaptive_shedding: bool,
-    #[serde(default = "default_queue_fair_trigger_sessions")]
-    pub fair_sessions: bool,
-    #[serde(default = "default_queue_fair_window_secs")]
-    pub fair_session_window_secs: u64,
-    #[serde(default = "default_queue_fair_max_events_per_session")]
-    pub fair_max_events_per_session: u32,
-}
-
-impl Default for QueueLanePolicyConfig {
-    fn default() -> Self {
-        Self {
-            adaptive_shedding: default_queue_adaptive_shedding(),
-            fair_sessions: default_queue_fair_trigger_sessions(),
-            fair_session_window_secs: default_queue_fair_window_secs(),
-            fair_max_events_per_session: default_queue_fair_max_events_per_session(),
-        }
-    }
-}
-
-impl QueueLanePolicyConfig {
-    pub fn normalized(&self) -> Self {
-        let mut lane = self.clone();
-        lane.fair_session_window_secs = lane.fair_session_window_secs.max(1);
-        lane.fair_max_events_per_session = lane.fair_max_events_per_session.max(1);
-        lane
-    }
-}
-
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct QueueLanePoliciesConfig {
-    #[serde(default)]
-    pub approval: QueueLanePolicyConfig,
-    #[serde(default)]
-    pub media: QueueLanePolicyConfig,
-    #[serde(default)]
-    pub trigger: QueueLanePolicyConfig,
-}
-
-impl QueueLanePoliciesConfig {
-    pub fn normalized(&self) -> Self {
-        Self {
-            approval: self.approval.normalized(),
-            media: self.media.normalized(),
-            trigger: self.trigger.normalized(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct QueuePolicyConfig {
-    #[serde(default = "default_queue_capacity_approval")]
-    pub approval_capacity: usize,
-    #[serde(default = "default_queue_capacity_media")]
-    pub media_capacity: usize,
-    #[serde(default = "default_queue_capacity_trigger_events")]
-    pub trigger_event_capacity: usize,
-    #[serde(default = "default_queue_warning_ratio")]
-    pub warning_ratio: f32,
-    #[serde(default = "default_queue_overload_ratio")]
-    pub overload_ratio: f32,
-    #[serde(default)]
-    pub lanes: QueueLanePoliciesConfig,
-
-    // Legacy shared overload knobs retained for backward compatibility.
-    #[serde(default)]
-    pub adaptive_shedding: Option<bool>,
-    #[serde(default)]
-    pub fair_trigger_sessions: Option<bool>,
-    #[serde(default)]
-    pub fair_trigger_session_window_secs: Option<u64>,
-    #[serde(default)]
-    pub fair_trigger_max_events_per_session: Option<u32>,
-}
-
-impl Default for QueuePolicyConfig {
-    fn default() -> Self {
-        Self {
-            approval_capacity: default_queue_capacity_approval(),
-            media_capacity: default_queue_capacity_media(),
-            trigger_event_capacity: default_queue_capacity_trigger_events(),
-            warning_ratio: default_queue_warning_ratio(),
-            overload_ratio: default_queue_overload_ratio(),
-            lanes: QueueLanePoliciesConfig::default(),
-            adaptive_shedding: None,
-            fair_trigger_sessions: None,
-            fair_trigger_session_window_secs: None,
-            fair_trigger_max_events_per_session: None,
-        }
-    }
-}
-
-impl QueuePolicyConfig {
-    pub fn normalized(&self) -> Self {
-        let mut policy = self.clone();
-        policy.approval_capacity = policy.approval_capacity.max(1);
-        policy.media_capacity = policy.media_capacity.max(1);
-        policy.trigger_event_capacity = policy.trigger_event_capacity.max(1);
-        policy.warning_ratio = if policy.warning_ratio.is_finite() {
-            policy.warning_ratio.clamp(0.0, 1.0)
-        } else {
-            default_queue_warning_ratio()
-        };
-        policy.overload_ratio = if policy.overload_ratio.is_finite() {
-            policy.overload_ratio.clamp(policy.warning_ratio, 1.0)
-        } else {
-            default_queue_overload_ratio().clamp(policy.warning_ratio, 1.0)
-        };
-
-        let default_lane = QueueLanePolicyConfig::default().normalized();
-        let legacy_lane = QueueLanePolicyConfig {
-            adaptive_shedding: policy
-                .adaptive_shedding
-                .unwrap_or(default_queue_adaptive_shedding()),
-            fair_sessions: policy
-                .fair_trigger_sessions
-                .unwrap_or(default_queue_fair_trigger_sessions()),
-            fair_session_window_secs: policy
-                .fair_trigger_session_window_secs
-                .unwrap_or(default_queue_fair_window_secs()),
-            fair_max_events_per_session: policy
-                .fair_trigger_max_events_per_session
-                .unwrap_or(default_queue_fair_max_events_per_session()),
-        }
-        .normalized();
-
-        policy.lanes = policy.lanes.normalized();
-        if policy.lanes.approval == default_lane {
-            policy.lanes.approval = legacy_lane.clone();
-        }
-        if policy.lanes.media == default_lane {
-            policy.lanes.media = legacy_lane.clone();
-        }
-        if policy.lanes.trigger == default_lane {
-            policy.lanes.trigger = legacy_lane;
-        }
-
-        policy
-    }
-}
+pub use aidaemon_channels::queue::QueuePolicyConfig;
+#[cfg(test)]
+use aidaemon_channels::queue::{QueueLanePoliciesConfig, QueueLanePolicyConfig};
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct TriggersConfig {
     pub email: Option<EmailTriggerConfig>,
+}
+
+impl TriggersConfig {
+    /// The trigger sources as `aidaemon_work::triggers` runs them.
+    pub fn settings(&self) -> aidaemon_work::triggers::TriggerSettings {
+        aidaemon_work::triggers::TriggerSettings {
+            email: self
+                .email
+                .as_ref()
+                .map(|email| aidaemon_work::triggers::EmailTriggerSettings {
+                    host: email.host.clone(),
+                    port: email.port,
+                    username: email.username.clone(),
+                    password: email.password.clone(),
+                    folder: email.folder.clone(),
+                }),
+        }
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -2257,37 +1341,9 @@ fn default_folder() -> String {
     "INBOX".to_string()
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct McpServerConfig {
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-}
+pub use aidaemon_mcp::registry::McpServerConfig;
 
-/// How browser sessions are isolated from one another with respect to cookies,
-/// cache, and other browsing state.
-///
-/// HONESTY CONTRACT: this enum must never claim isolation that isn't actually
-/// delivered. `Page` mode explicitly SHARES cookies across sessions;
-/// `BrowserContext` mode creates a real, per-session incognito browser context
-/// (no shared cookies/cache). The two modes are mutually exclusive with a
-/// shared persistent profile or an attached remote-debugging Chrome — see
-/// [`BrowserConfig::resolve_session_isolation`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(not(feature = "browser"), allow(dead_code))]
-pub enum SessionIsolation {
-    /// All sessions share one default browser context: cookies/cache are SHARED.
-    /// This is the only honest option when attached to a persistent profile or a
-    /// remote-debugging Chrome instance.
-    Page,
-    /// Each session gets its own incognito browser context: cookies/cache are
-    /// ISOLATED per session. Requires dedicated ephemeral browsing (no
-    /// `user_data_dir`, no `remote_debugging_port`).
-    BrowserContext,
-}
+pub use aidaemon_tool_browser::SessionIsolation;
 
 #[derive(Debug, Deserialize, Clone)]
 #[cfg_attr(not(feature = "browser"), allow(dead_code))]
@@ -2356,143 +1412,48 @@ impl Default for BrowserConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
-pub struct ComputerUseConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_cu_screenshot_max_width")]
-    pub screenshot_max_width: u32,
-    #[serde(default = "default_cu_screenshot_max_height")]
-    pub screenshot_max_height: u32,
-    #[serde(default = "default_cu_screenshot_max_bytes")]
-    pub screenshot_max_bytes: u64,
-    #[serde(default = "default_cu_ax_max_depth")]
-    pub ax_max_depth: u32,
-    #[serde(default = "default_cu_ax_max_nodes")]
-    pub ax_max_nodes: u32,
-    #[serde(default = "default_cu_action_timeout_secs")]
-    pub action_timeout_secs: u64,
-    #[serde(default = "default_cu_max_mutating_actions")]
-    pub max_mutating_actions: u32,
-    #[serde(default = "default_cu_max_consecutive_observations")]
-    pub max_consecutive_observations: u32,
-    #[serde(default = "default_cu_max_wall_clock_secs")]
-    pub max_wall_clock_secs: u64,
-    #[serde(default)]
-    pub always_allowed_apps: Vec<String>,
-    #[serde(default)]
-    pub mirror_screenshots_to_channel: bool,
-}
-
-fn default_cu_screenshot_max_width() -> u32 {
-    1280
-}
-fn default_cu_screenshot_max_height() -> u32 {
-    800
-}
-fn default_cu_screenshot_max_bytes() -> u64 {
-    2_000_000
-}
-fn default_cu_ax_max_depth() -> u32 {
-    12
-}
-fn default_cu_ax_max_nodes() -> u32 {
-    500
-}
-fn default_cu_action_timeout_secs() -> u64 {
-    10
-}
-fn default_cu_max_mutating_actions() -> u32 {
-    40
-}
-fn default_cu_max_consecutive_observations() -> u32 {
-    3
-}
-fn default_cu_max_wall_clock_secs() -> u64 {
-    600
-}
-
-impl Default for ComputerUseConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            screenshot_max_width: default_cu_screenshot_max_width(),
-            screenshot_max_height: default_cu_screenshot_max_height(),
-            screenshot_max_bytes: default_cu_screenshot_max_bytes(),
-            ax_max_depth: default_cu_ax_max_depth(),
-            ax_max_nodes: default_cu_ax_max_nodes(),
-            action_timeout_secs: default_cu_action_timeout_secs(),
-            max_mutating_actions: default_cu_max_mutating_actions(),
-            max_consecutive_observations: default_cu_max_consecutive_observations(),
-            max_wall_clock_secs: default_cu_max_wall_clock_secs(),
-            always_allowed_apps: Vec::new(),
-            mirror_screenshots_to_channel: false,
-        }
-    }
-}
-
-impl ComputerUseConfig {
-    #[cfg_attr(not(feature = "computer_use"), allow(dead_code))]
-    pub fn action_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.action_timeout_secs.clamp(1, 120))
-    }
-}
+pub use aidaemon_runtime::settings::ComputerUseConfig;
 
 impl BrowserConfig {
-    /// Resolved navigation/DOM-ready timeout, clamped to a sane bounded range
-    /// (1..=120s) so a typo'd or absurd config value can neither hang the tool
-    /// (huge value) nor make navigation give up before any page can load
-    /// (zero/tiny value).
-    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
-    pub fn nav_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.nav_timeout_secs.clamp(1, 120))
-    }
-
-    /// Resolved default `wait`-action element-poll timeout, clamped to 1..=120s.
-    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
-    pub fn element_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.element_timeout_secs.clamp(1, 120))
-    }
-
-    /// Resolved overall per-action ceiling (used by the click nav-race),
-    /// clamped to 1..=300s.
-    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
-    pub fn action_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.action_timeout_secs.clamp(1, 300))
-    }
-
-    /// Resolve the effective session-isolation mode, rejecting configurations
-    /// that would falsely claim per-session cookie isolation.
-    ///
-    /// HONESTY CONTRACT: a shared persistent profile (`user_data_dir`) or an
-    /// attached remote-debugging Chrome (`remote_debugging_port`) cannot give
-    /// per-session isolated cookies — they always share one cookie jar. So:
-    ///
-    /// - `Some(BrowserContext)` + shared/attached → **Err** (don't lie).
-    /// - `Some(Page)` → always `Ok(Page)` (honest: shared cookies).
-    /// - `Some(BrowserContext)` + ephemeral → `Ok(BrowserContext)`.
-    /// - `None` (auto): shared/attached → `Ok(Page)`; ephemeral →
-    ///   `Ok(BrowserContext)`.
-    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
-    pub fn resolve_session_isolation(&self) -> Result<SessionIsolation, String> {
-        let shared_or_attached =
-            self.user_data_dir.is_some() || self.remote_debugging_port.is_some();
-
-        match self.session_isolation {
-            Some(SessionIsolation::BrowserContext) if shared_or_attached => Err(
-                "browser.session_isolation = \"browser_context\" requires dedicated ephemeral \
-                 browsing, but a shared persistent profile (user_data_dir) or an attached \
-                 remote-debugging Chrome (remote_debugging_port) is configured. These share a \
-                 single cookie jar and CANNOT provide per-session isolated cookies. Either use \
-                 session_isolation = \"page\" (sessions share cookies), or remove user_data_dir \
-                 and remote_debugging_port to enable real per-session isolation."
-                    .to_string(),
-            ),
-            Some(mode) => Ok(mode),
-            None if shared_or_attached => Ok(SessionIsolation::Page),
-            None => Ok(SessionIsolation::BrowserContext),
+    /// What the browser tool takes from `[browser]`.
+    pub fn settings(&self) -> aidaemon_tool_browser::BrowserSettings {
+        aidaemon_tool_browser::BrowserSettings {
+            headless: self.headless,
+            screenshot_width: self.screenshot_width,
+            screenshot_height: self.screenshot_height,
+            remote_debugging_port: self.remote_debugging_port,
+            user_data_dir: self.user_data_dir.clone(),
+            profile: self.profile.clone(),
+            session_isolation: self.session_isolation,
+            nav_timeout_secs: self.nav_timeout_secs,
+            element_timeout_secs: self.element_timeout_secs,
+            action_timeout_secs: self.action_timeout_secs,
         }
+    }
+
+    /// Resolved navigation/DOM-ready timeout (see [`aidaemon_tool_browser::BrowserSettings::nav_timeout`]).
+    #[allow(dead_code)] // the browser tool reads its own settings
+    pub fn nav_timeout(&self) -> std::time::Duration {
+        self.settings().nav_timeout()
+    }
+
+    /// Resolved default `wait`-action element-poll timeout.
+    #[allow(dead_code)] // the browser tool reads its own settings
+    pub fn element_timeout(&self) -> std::time::Duration {
+        self.settings().element_timeout()
+    }
+
+    /// Resolved overall per-action ceiling.
+    #[allow(dead_code)] // the browser tool reads its own settings
+    pub fn action_timeout(&self) -> std::time::Duration {
+        self.settings().action_timeout()
+    }
+
+    /// The effective session-isolation mode, refusing configurations that
+    /// would falsely claim per-session cookie isolation.
+    #[allow(dead_code)] // the browser tool reads its own settings
+    pub fn resolve_session_isolation(&self) -> Result<SessionIsolation, String> {
+        self.settings().resolve_session_isolation()
     }
 }
 
@@ -2553,22 +1514,7 @@ fn default_skills_enabled() -> bool {
     true
 }
 
-/// Iteration limit configuration for agent loops.
-/// Controls how iteration limits are enforced (or not enforced).
-#[derive(Debug, Deserialize, Clone, Default)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum IterationLimitConfig {
-    /// No iteration limit - run until natural completion, token budget, or timeout.
-    /// This is the recommended default for complex tasks.
-    #[default]
-    Unlimited,
-    /// Soft limit with warnings but no forced termination.
-    /// Agent will be warned at `warn_at` iterations and continue until natural completion.
-    Soft { threshold: usize, warn_at: usize },
-    /// Legacy hard limit behavior (backward compatibility).
-    /// Agent will be forced to stop at `cap` iterations.
-    Hard { initial: usize, cap: usize },
-}
+pub use aidaemon_runtime::settings::IterationLimitConfig;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SubagentsConfig {
@@ -2584,20 +1530,44 @@ pub struct SubagentsConfig {
     pub max_iterations_cap: usize,
     #[serde(default = "default_subagents_max_response_chars")]
     pub max_response_chars: usize,
+    /// Seconds a sub-agent may go without progress (no tool call running,
+    /// no model reply or other event of its run) before it is stopped.
+    /// Never a limit on how long it works: a run is bounded by progress and
+    /// cost, so a long install that keeps making calls runs to its end.
     #[serde(default = "default_subagents_timeout_secs")]
     pub timeout_secs: u64,
     /// Iteration limit configuration. Defaults to Unlimited.
     /// If not set but max_iterations/max_iterations_cap are set, auto-migrates to Hard mode.
     #[serde(default)]
     pub iteration_limit: IterationLimitConfig,
-    /// Optional time limit per task in seconds. Default: 1800 (30 minutes).
-    #[serde(default = "default_task_timeout_secs")]
+    /// Accepted and ignored: a run is bounded by progress and cost (the
+    /// inactivity watchdog, per-call timeouts, limits and token budgets), not
+    /// by elapsed time, so legitimate long work is never cut off. Setting it
+    /// logs one warning at startup.
+    #[serde(default)]
     pub task_timeout_secs: Option<u64>,
     /// Token budget per task. When exceeded, productive runs may auto-extend
     /// temporarily; otherwise the agent gracefully summarizes and stops.
     /// Defaults to 500,000. Set to 0 to disable (unlimited).
     #[serde(default = "default_task_token_budget")]
     pub task_token_budget: Option<u64>,
+    /// Plain sub-agents one request may run at the same time, across its
+    /// whole tree. Task-lead executors have their own per-task limits.
+    #[serde(default = "default_subagents_max_concurrent")]
+    pub max_concurrent: usize,
+    /// Plain sub-agents one request may start in total, across its whole tree.
+    #[serde(default = "default_subagents_max_per_request")]
+    pub max_per_request: usize,
+    /// Track what the agents of one request read and change, refuse writes
+    /// made from a stale view, and let children ask the top-level agent.
+    #[serde(default = "default_subagents_coordination")]
+    pub coordination: bool,
+    /// Questions one child may put to the top-level agent itself.
+    #[serde(default = "default_subagents_max_escalations_per_child")]
+    pub max_escalations_per_child: usize,
+    /// Escalations of any kind one request may make.
+    #[serde(default = "default_subagents_max_escalations_per_request")]
+    pub max_escalations_per_request: usize,
     /// Optional directory of user-override specialist `.md` files.
     /// Default: `~/.aidaemon/specialists/` (resolved at construction time if absent).
     #[serde(default)]
@@ -2636,13 +1606,38 @@ impl Default for SubagentsConfig {
             max_response_chars: default_subagents_max_response_chars(),
             timeout_secs: default_subagents_timeout_secs(),
             iteration_limit: IterationLimitConfig::default(),
-            task_timeout_secs: default_task_timeout_secs(),
+            task_timeout_secs: None,
             task_token_budget: default_task_token_budget(),
+            max_concurrent: default_subagents_max_concurrent(),
+            max_per_request: default_subagents_max_per_request(),
+            coordination: default_subagents_coordination(),
+            max_escalations_per_child: default_subagents_max_escalations_per_child(),
+            max_escalations_per_request: default_subagents_max_escalations_per_request(),
             specialists_override_dir: None,
         }
     }
 }
 
+use aidaemon_runtime::authority::{
+    DEFAULT_SUBAGENTS_MAX_CONCURRENT, DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_CHILD,
+    DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_REQUEST, DEFAULT_SUBAGENTS_MAX_PER_REQUEST,
+};
+
+fn default_subagents_max_concurrent() -> usize {
+    DEFAULT_SUBAGENTS_MAX_CONCURRENT
+}
+fn default_subagents_max_per_request() -> usize {
+    DEFAULT_SUBAGENTS_MAX_PER_REQUEST
+}
+fn default_subagents_coordination() -> bool {
+    true
+}
+fn default_subagents_max_escalations_per_child() -> usize {
+    DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_CHILD
+}
+fn default_subagents_max_escalations_per_request() -> usize {
+    DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_REQUEST
+}
 fn default_subagents_enabled() -> bool {
     true
 }
@@ -2661,169 +1656,16 @@ fn default_subagents_max_response_chars() -> usize {
 fn default_subagents_timeout_secs() -> u64 {
     300
 }
-fn default_task_timeout_secs() -> Option<u64> {
-    Some(1800) // 30 minutes default
-}
 fn default_task_token_budget() -> Option<u64> {
     Some(500_000)
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct CliAgentsConfig {
-    #[serde(default = "default_cli_agents_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_cli_agents_timeout_secs")]
-    pub timeout_secs: u64,
-    #[serde(default = "default_cli_agents_max_output_chars")]
-    pub max_output_chars: usize,
-    #[serde(default)]
-    pub tools: HashMap<String, CliToolConfig>,
-}
+pub use aidaemon_runtime::tools::cli_agent::CliAgentsConfig;
 
-impl Default for CliAgentsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_cli_agents_enabled(),
-            timeout_secs: default_cli_agents_timeout_secs(),
-            max_output_chars: default_cli_agents_max_output_chars(),
-            tools: HashMap::new(),
-        }
-    }
-}
+#[allow(unused_imports)]
+pub use aidaemon_tools::web_search::{SearchBackendKind, SearchConfig};
 
-fn default_cli_agents_enabled() -> bool {
-    false
-}
-
-fn default_cli_agents_timeout_secs() -> u64 {
-    600
-}
-fn default_cli_agents_max_output_chars() -> usize {
-    16000
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct CliToolConfig {
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub max_output_chars: Option<usize>,
-}
-
-#[derive(Deserialize, Clone)]
-pub struct SearchConfig {
-    #[serde(default)]
-    pub backend: SearchBackendKind,
-    #[serde(default)]
-    pub api_key: String,
-    /// Base URL of a self-hosted SearxNG instance, wherever the user hosts it
-    /// (e.g. "http://localhost:8080" for the default Docker setup).
-    /// When set, SearxNG becomes available as a search backend.
-    #[serde(default)]
-    pub searxng_url: String,
-    /// When true (default), web_search queries every configured backend in
-    /// parallel and merges the results. When false, only `backend` is used.
-    #[serde(default = "default_true")]
-    pub parallel: bool,
-}
-
-impl Default for SearchConfig {
-    fn default() -> Self {
-        Self {
-            backend: SearchBackendKind::default(),
-            api_key: String::new(),
-            searxng_url: String::new(),
-            parallel: true,
-        }
-    }
-}
-
-impl fmt::Debug for SearchConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SearchConfig")
-            .field("backend", &self.backend)
-            .field("api_key", &redact(&self.api_key))
-            .field("searxng_url", &self.searxng_url)
-            .field("parallel", &self.parallel)
-            .finish()
-    }
-}
-
-#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchBackendKind {
-    #[default]
-    #[serde(alias = "duckduckgo")]
-    DuckDuckGo,
-    Brave,
-    Searxng,
-}
-
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct HealthConfig {
-    #[serde(default = "default_health_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_health_tick_interval_secs")]
-    pub tick_interval_secs: u64,
-    #[serde(default = "default_health_result_retention_days")]
-    pub result_retention_days: u32,
-    #[serde(default)]
-    pub probes: Vec<HealthProbeConfig>,
-}
-
-fn default_health_enabled() -> bool {
-    false
-}
-
-fn default_health_tick_interval_secs() -> u64 {
-    30
-}
-
-fn default_health_result_retention_days() -> u32 {
-    7
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct HealthProbeConfig {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub probe_type: String,
-    pub target: String,
-    pub schedule: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub config: HealthProbeConfigOptions,
-    #[serde(default)]
-    pub consecutive_failures_alert: Option<u32>,
-    #[serde(default)]
-    pub latency_threshold_ms: Option<u32>,
-    #[serde(default)]
-    pub alert_session_ids: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct HealthProbeConfigOptions {
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub expected_status: Option<u16>,
-    #[serde(default)]
-    pub expected_body: Option<String>,
-    #[serde(default)]
-    pub method: Option<String>,
-    #[serde(default)]
-    pub headers: Option<std::collections::HashMap<String, String>>,
-    #[serde(default)]
-    pub max_age_secs: Option<u64>,
-    #[serde(default)]
-    pub expected_exit_code: Option<i32>,
-}
+pub use aidaemon_work::health::HealthConfig;
 
 #[derive(Debug, Deserialize, Clone, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -2881,311 +1723,7 @@ pub struct UsersConfig {
     pub workspace_grants: Vec<WorkspaceGrant>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct FilesConfig {
-    #[serde(default = "default_files_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_inbox_dir")]
-    pub inbox_dir: String,
-    #[serde(default = "default_outbox_dirs")]
-    pub outbox_dirs: Vec<String>,
-    #[serde(default = "default_max_file_size_mb")]
-    pub max_file_size_mb: u64,
-    #[serde(default = "default_retention_hours")]
-    pub retention_hours: u64,
-    #[serde(default = "default_vision_enabled")]
-    pub vision_enabled: bool,
-    #[serde(default = "default_max_vision_image_mb")]
-    pub max_vision_image_mb: u64,
-    #[serde(default = "default_vision_mime_types")]
-    pub vision_mime_types: Vec<String>,
-    #[serde(default = "default_vision_model_patterns")]
-    pub vision_model_patterns: Vec<String>,
-    #[serde(default = "default_audio_enabled")]
-    pub audio_enabled: bool,
-    #[serde(default = "default_max_audio_mb")]
-    pub max_audio_mb: u64,
-    #[serde(default = "default_audio_mime_types")]
-    pub audio_mime_types: Vec<String>,
-    #[serde(default = "default_audio_model_patterns")]
-    pub audio_model_patterns: Vec<String>,
-    #[serde(default)]
-    pub stt: SttFilesConfig,
-}
-
-/// Local Whisper STT settings under `[files.stt]`.
-#[derive(Debug, Deserialize, Clone)]
-pub struct SttFilesConfig {
-    #[serde(default = "default_stt_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_stt_cli_path")]
-    pub cli_path: String,
-    #[serde(default = "default_stt_model_path")]
-    pub model_path: String,
-    #[serde(default = "default_stt_ffmpeg_path")]
-    pub ffmpeg_path: String,
-    #[serde(default = "default_stt_language")]
-    pub language: String,
-    #[serde(default = "default_stt_max_audio_mb")]
-    pub max_audio_mb: u64,
-    #[serde(default = "default_stt_timeout_secs")]
-    pub timeout_secs: u64,
-    #[serde(default = "default_stt_mime_types")]
-    pub mime_types: Vec<String>,
-}
-
-/// Vision/image encoding settings derived from `[files]` config.
-#[derive(Debug, Clone)]
-pub struct VisionConfig {
-    pub enabled: bool,
-    pub max_image_bytes: u64,
-    pub mime_types: Vec<String>,
-    #[cfg_attr(not(feature = "computer_use"), allow(dead_code))]
-    pub model_patterns: Vec<String>,
-}
-
-impl VisionConfig {
-    pub fn from_files(files: &FilesConfig) -> Self {
-        Self {
-            enabled: files.vision_enabled,
-            max_image_bytes: files.max_vision_image_mb.saturating_mul(1_048_576),
-            mime_types: files.vision_mime_types.clone(),
-            model_patterns: files.vision_model_patterns.clone(),
-        }
-    }
-
-    #[cfg_attr(not(feature = "computer_use"), allow(dead_code))]
-    pub fn model_supports_vision(&self, model: &str) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        let model_lower = model.to_ascii_lowercase();
-        self.model_patterns
-            .iter()
-            .any(|pattern| model_lower.contains(&pattern.to_ascii_lowercase()))
-    }
-
-    pub fn mime_allowed(&self, mime: &str) -> bool {
-        self.mime_types.iter().any(|allowed| allowed == mime)
-    }
-}
-
-/// Native audio input settings derived from `[files]` config.
-#[derive(Debug, Clone)]
-pub struct AudioConfig {
-    pub enabled: bool,
-    pub max_audio_bytes: u64,
-    pub mime_types: Vec<String>,
-    pub model_patterns: Vec<String>,
-}
-
-impl AudioConfig {
-    pub fn from_files(files: &FilesConfig) -> Self {
-        Self {
-            enabled: files.audio_enabled,
-            max_audio_bytes: files.max_audio_mb.saturating_mul(1_048_576),
-            mime_types: files.audio_mime_types.clone(),
-            model_patterns: files.audio_model_patterns.clone(),
-        }
-    }
-
-    pub fn mime_allowed(&self, mime: &str) -> bool {
-        self.mime_types.iter().any(|allowed| allowed == mime)
-    }
-
-    pub fn model_supports_audio(&self, model: &str) -> bool {
-        let model_lower = model.to_ascii_lowercase();
-        self.model_patterns
-            .iter()
-            .any(|pattern| model_lower.contains(&pattern.to_ascii_lowercase()))
-    }
-}
-
-/// Resolved Whisper STT settings for runtime use.
-#[derive(Debug, Clone)]
-pub struct SttConfig {
-    pub enabled: bool,
-    pub cli_path: std::path::PathBuf,
-    pub model_path: std::path::PathBuf,
-    pub ffmpeg_path: std::path::PathBuf,
-    pub language: String,
-    pub max_audio_bytes: u64,
-    pub timeout_secs: u64,
-    pub mime_types: Vec<String>,
-}
-
-impl SttConfig {
-    pub fn from_files(files: &FilesConfig) -> Self {
-        Self {
-            enabled: files.stt.enabled,
-            cli_path: std::path::PathBuf::from(
-                shellexpand::tilde(&files.stt.cli_path).into_owned(),
-            ),
-            model_path: std::path::PathBuf::from(
-                shellexpand::tilde(&files.stt.model_path).into_owned(),
-            ),
-            ffmpeg_path: std::path::PathBuf::from(
-                shellexpand::tilde(&files.stt.ffmpeg_path).into_owned(),
-            ),
-            language: files.stt.language.clone(),
-            max_audio_bytes: files.stt.max_audio_mb.saturating_mul(1_048_576),
-            timeout_secs: files.stt.timeout_secs,
-            mime_types: files.stt.mime_types.clone(),
-        }
-    }
-
-    pub fn mime_allowed(&self, mime: &str) -> bool {
-        self.mime_types.iter().any(|allowed| allowed == mime)
-    }
-}
-
-impl Default for SttFilesConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_stt_enabled(),
-            cli_path: default_stt_cli_path(),
-            model_path: default_stt_model_path(),
-            ffmpeg_path: default_stt_ffmpeg_path(),
-            language: default_stt_language(),
-            max_audio_mb: default_stt_max_audio_mb(),
-            timeout_secs: default_stt_timeout_secs(),
-            mime_types: default_stt_mime_types(),
-        }
-    }
-}
-
-impl Default for FilesConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_files_enabled(),
-            inbox_dir: default_inbox_dir(),
-            outbox_dirs: default_outbox_dirs(),
-            max_file_size_mb: default_max_file_size_mb(),
-            retention_hours: default_retention_hours(),
-            vision_enabled: default_vision_enabled(),
-            max_vision_image_mb: default_max_vision_image_mb(),
-            vision_mime_types: default_vision_mime_types(),
-            vision_model_patterns: default_vision_model_patterns(),
-            audio_enabled: default_audio_enabled(),
-            max_audio_mb: default_max_audio_mb(),
-            audio_mime_types: default_audio_mime_types(),
-            audio_model_patterns: default_audio_model_patterns(),
-            stt: SttFilesConfig::default(),
-        }
-    }
-}
-
-fn default_files_enabled() -> bool {
-    true
-}
-fn default_inbox_dir() -> String {
-    "~/.aidaemon/files/inbox".to_string()
-}
-fn default_outbox_dirs() -> Vec<String> {
-    vec!["~".to_string()]
-}
-fn default_max_file_size_mb() -> u64 {
-    10
-}
-fn default_retention_hours() -> u64 {
-    24
-}
-fn default_vision_enabled() -> bool {
-    true
-}
-fn default_max_vision_image_mb() -> u64 {
-    4
-}
-fn default_vision_mime_types() -> Vec<String> {
-    vec![
-        "image/jpeg".to_string(),
-        "image/png".to_string(),
-        "image/gif".to_string(),
-        "image/webp".to_string(),
-    ]
-}
-fn default_vision_model_patterns() -> Vec<String> {
-    vec![
-        "gpt-4o".to_string(),
-        "gpt-4".to_string(),
-        "gpt-5".to_string(),
-        "gpt-6".to_string(),
-        "o1".to_string(),
-        "o3".to_string(),
-        "o4".to_string(),
-        "gemini".to_string(),
-        "claude-3".to_string(),
-        "claude-sonnet".to_string(),
-        "claude-opus".to_string(),
-        "claude-haiku".to_string(),
-        "fable".to_string(),
-        "gemma".to_string(),
-        "llava".to_string(),
-        "qwen-vl".to_string(),
-        "qwen2-vl".to_string(),
-        "qwen2.5-vl".to_string(),
-        "qwen3-vl".to_string(),
-        "internvl".to_string(),
-        "vision".to_string(),
-        "pixtral".to_string(),
-        "mistral-large".to_string(),
-    ]
-}
-fn default_audio_enabled() -> bool {
-    true
-}
-fn default_max_audio_mb() -> u64 {
-    10
-}
-fn default_audio_mime_types() -> Vec<String> {
-    vec![
-        "audio/ogg".to_string(),
-        "audio/mpeg".to_string(),
-        "audio/mp3".to_string(),
-        "audio/wav".to_string(),
-        "audio/flac".to_string(),
-        "audio/aac".to_string(),
-    ]
-}
-fn default_audio_model_patterns() -> Vec<String> {
-    vec![
-        "audio".to_string(),
-        "gemini-2".to_string(),
-        "gemini-3".to_string(),
-    ]
-}
-fn default_stt_enabled() -> bool {
-    false
-}
-fn default_stt_cli_path() -> String {
-    "/opt/homebrew/bin/whisper-cli".to_string()
-}
-fn default_stt_model_path() -> String {
-    "~/models/whisper/ggml-medium.en.bin".to_string()
-}
-fn default_stt_ffmpeg_path() -> String {
-    "ffmpeg".to_string()
-}
-fn default_stt_language() -> String {
-    "en".to_string()
-}
-fn default_stt_max_audio_mb() -> u64 {
-    25
-}
-fn default_stt_timeout_secs() -> u64 {
-    120
-}
-fn default_stt_mime_types() -> Vec<String> {
-    vec![
-        "audio/ogg".to_string(),
-        "audio/mpeg".to_string(),
-        "audio/mp3".to_string(),
-        "audio/wav".to_string(),
-        "audio/flac".to_string(),
-        "audio/aac".to_string(),
-        "audio/webm".to_string(),
-    ]
-}
+pub use aidaemon_runtime::settings::{AudioConfig, FilesConfig, SttConfig, VisionConfig};
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct OAuthConfig {
@@ -3199,65 +1737,35 @@ pub struct OAuthConfig {
     pub providers: HashMap<String, OAuthProviderConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct OAuthProviderConfig {
-    #[serde(default)]
-    pub display_name: Option<String>,
-    pub auth_type: String,
-    pub authorize_url: String,
-    pub token_url: String,
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    #[serde(default)]
-    pub allowed_domains: Vec<String>,
-}
-
-/// Self-correction gate configuration.
-///
-/// Controls whether the agent is allowed to retry failed outputs through
-/// a correction loop. All flags default to `false` (safe-off) so existing
-/// deployments are unaffected until explicitly opted in.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(default)]
-pub struct SelfCorrectionConfig {
-    /// Master switch. When `false` the correction loop is skipped entirely.
-    pub enabled: bool,
-    /// Allow the correction gate to be bypassed for trusted sessions.
-    pub correction_bypass_enabled: bool,
-    /// Maximum number of correction attempts per task (default: 3).
-    pub max_attempts: usize,
-    /// Shadow-first activation. When `true` (default) the correction bridge
-    /// reconstructs intent, builds the context, and runs the gate but LOGS the
-    /// would-be remediation instead of executing/dispatching it. Full autonomous
-    /// execution requires a deliberate flip to `false` after observing shadow logs.
-    pub shadow_mode: bool,
-}
-
-impl Default for SelfCorrectionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            correction_bypass_enabled: false,
-            max_attempts: 3,
-            shadow_mode: true,
-        }
-    }
-}
+pub use aidaemon_tools::services::oauth::OAuthProviderConfig;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PeopleConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_people_auto_extract")]
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub auto_extract: bool,
     #[serde(default = "default_people_auto_extract_categories")]
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub auto_extract_categories: Vec<String>,
     #[serde(default = "default_people_restricted_categories")]
+    #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub restricted_categories: Vec<String>,
     #[serde(default = "default_people_fact_retention_days")]
     pub fact_retention_days: u32,
     #[serde(default = "default_people_reconnect_reminder_days")]
     pub reconnect_reminder_days: u32,
+}
+
+impl PeopleConfig {
+    /// The people upkeep's settings.
+    pub fn intelligence(&self) -> aidaemon_memory::people_intelligence::PeopleIntelligenceConfig {
+        aidaemon_memory::people_intelligence::PeopleIntelligenceConfig {
+            fact_retention_days: self.fact_retention_days,
+            reconnect_reminder_days: self.reconnect_reminder_days,
+        }
+    }
 }
 
 impl Default for PeopleConfig {
@@ -3301,223 +1809,9 @@ fn default_people_reconnect_reminder_days() -> u32 {
     30
 }
 
-#[derive(Deserialize, Clone, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum HttpAuthType {
-    Oauth1a,
-    Bearer,
-    Header,
-    Basic,
-}
+pub use aidaemon_tools::http_request::HttpAuthProfile;
 
-impl fmt::Debug for HttpAuthType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HttpAuthType::Oauth1a => write!(f, "oauth1a"),
-            HttpAuthType::Bearer => write!(f, "bearer"),
-            HttpAuthType::Header => write!(f, "header"),
-            HttpAuthType::Basic => write!(f, "basic"),
-        }
-    }
-}
-
-#[derive(Deserialize, Clone)]
-pub struct HttpAuthProfile {
-    pub auth_type: HttpAuthType,
-    pub allowed_domains: Vec<String>,
-    // OAuth 1.0a fields
-    #[serde(default)]
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub api_secret: Option<String>,
-    #[serde(default)]
-    pub access_token: Option<String>,
-    #[serde(default)]
-    pub access_token_secret: Option<String>,
-    #[serde(default)]
-    pub user_id: Option<String>,
-    // Bearer token
-    #[serde(default)]
-    pub token: Option<String>,
-    // Header auth
-    #[serde(default)]
-    pub header_name: Option<String>,
-    #[serde(default)]
-    pub header_value: Option<String>,
-    // Basic auth
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub password: Option<String>,
-}
-
-impl fmt::Debug for HttpAuthProfile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HttpAuthProfile")
-            .field("auth_type", &self.auth_type)
-            .field("allowed_domains", &self.allowed_domains)
-            .field("api_key", &redact_option(&self.api_key))
-            .field("api_secret", &redact_option(&self.api_secret))
-            .field("access_token", &redact_option(&self.access_token))
-            .field(
-                "access_token_secret",
-                &redact_option(&self.access_token_secret),
-            )
-            .field("user_id", &self.user_id)
-            .field("token", &redact_option(&self.token))
-            .field("header_name", &self.header_name)
-            .field("header_value", &redact_option(&self.header_value))
-            .field("username", &self.username)
-            .field("password", &redact_option(&self.password))
-            .finish()
-    }
-}
-
-impl HttpAuthProfile {
-    /// Collect all credential values for this profile (for stripping from error messages).
-    pub fn credential_values(&self) -> Vec<&str> {
-        let mut vals = Vec::new();
-        for v in [
-            &self.api_key,
-            &self.api_secret,
-            &self.access_token,
-            &self.access_token_secret,
-            &self.token,
-            &self.header_value,
-            &self.password,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !v.is_empty() {
-                vals.push(v.as_str());
-            }
-        }
-        vals
-    }
-}
-
-/// Context window management configuration.
-/// Controls conversation history trimming, summarization, and progressive fact extraction.
-#[derive(Debug, Deserialize, Clone)]
-pub struct ContextWindowConfig {
-    /// Enable context window management (default: true).
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Default total model context budget used by history fitting (default: 48000).
-    #[serde(default = "default_context_budget")]
-    pub default_budget: usize,
-    /// Per-model token budgets (model name → budget). Overrides default_budget.
-    #[serde(default)]
-    pub model_budgets: HashMap<String, usize>,
-    /// Maximum characters for tool results before truncation (default: 4000).
-    #[serde(default = "default_tool_result_chars")]
-    pub max_tool_result_chars: usize,
-    /// Per-model tool result character caps (model name → max chars).
-    /// Overrides `max_tool_result_chars` for the named model. Models listed
-    /// in `model_budgets` but not here get a cap scaled proportionally to
-    /// their budget.
-    #[serde(default)]
-    pub model_tool_result_chars: HashMap<String, usize>,
-    /// Legacy message-window setting retained for configuration compatibility.
-    /// Runtime compaction now protects recent raw context by token budget.
-    #[allow(dead_code)]
-    #[serde(default = "default_summary_window")]
-    pub summary_window: usize,
-    /// Enable progressive fact extraction after each interaction (default: true).
-    #[serde(default = "default_true")]
-    pub progressive_facts: bool,
-    /// Legacy message-count threshold retained for configuration compatibility.
-    /// Runtime compaction uses `summarize_token_threshold` instead.
-    #[allow(dead_code)]
-    #[serde(default = "default_summarize_threshold")]
-    pub summarize_threshold: usize,
-    /// Estimated unsummarized conversation tokens that trigger compaction.
-    #[serde(default = "default_summarize_token_threshold")]
-    pub summarize_token_threshold: usize,
-    /// Estimated tokens of recent whole turns to keep verbatim after compaction.
-    #[serde(default = "default_summary_recent_tokens")]
-    pub summary_recent_tokens: usize,
-}
-
-impl Default for ContextWindowConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            default_budget: default_context_budget(),
-            model_budgets: HashMap::new(),
-            max_tool_result_chars: default_tool_result_chars(),
-            model_tool_result_chars: HashMap::new(),
-            summary_window: default_summary_window(),
-            progressive_facts: true,
-            summarize_threshold: default_summarize_threshold(),
-            summarize_token_threshold: default_summarize_token_threshold(),
-            summary_recent_tokens: default_summary_recent_tokens(),
-        }
-    }
-}
-
-impl ContextWindowConfig {
-    /// Effective tool-result character cap for a specific model.
-    ///
-    /// Resolution order: explicit `model_tool_result_chars` entry → cap
-    /// scaled by the model's `model_budgets` ratio against `default_budget`
-    /// (floored so tiny budgets stay usable) → global `max_tool_result_chars`.
-    pub fn tool_result_chars_for(&self, model: &str) -> usize {
-        const MIN_TOOL_RESULT_CHARS: usize = 1_000;
-        if let Some(&chars) = self.model_tool_result_chars.get(model) {
-            return chars;
-        }
-        if let Some(&budget) = self.model_budgets.get(model) {
-            if let Some(scaled) = self
-                .max_tool_result_chars
-                .saturating_mul(budget)
-                .checked_div(self.default_budget)
-            {
-                return scaled.max(MIN_TOOL_RESULT_CHARS);
-            }
-        }
-        self.max_tool_result_chars
-    }
-
-    /// Token-pressure high-water mark, clamped for small model windows.
-    pub fn summarize_token_threshold_for(&self, model: &str) -> usize {
-        let model_budget = self
-            .model_budgets
-            .get(model)
-            .copied()
-            .unwrap_or(self.default_budget);
-        self.summarize_token_threshold
-            .min(model_budget.saturating_mul(3) / 5)
-            .max(512)
-    }
-
-    /// Raw recent-context overlap, also clamped so a summary can make progress.
-    pub fn summary_recent_tokens_for(&self, model: &str) -> usize {
-        self.summary_recent_tokens
-            .min(self.summarize_token_threshold_for(model) / 2)
-            .max(256)
-    }
-}
-
-fn default_context_budget() -> usize {
-    48000
-}
-fn default_tool_result_chars() -> usize {
-    4000
-}
-fn default_summary_window() -> usize {
-    6
-}
-fn default_summarize_threshold() -> usize {
-    12
-}
-fn default_summarize_token_threshold() -> usize {
-    12_000
-}
-fn default_summary_recent_tokens() -> usize {
-    4_000
-}
+pub use aidaemon_runtime::settings::ContextWindowConfig;
 
 fn default_heartbeat_tick() -> u64 {
     30
@@ -3527,64 +1821,14 @@ fn default_max_concurrent() -> usize {
     3
 }
 
-fn default_policy_shadow_mode() -> bool {
-    true
-}
-fn default_policy_enforce() -> bool {
-    true
-}
-fn default_tool_filter_enforce() -> bool {
-    true
-}
-fn default_uncertainty_clarify_enforce() -> bool {
-    false
-}
-fn default_context_refresh_enforce() -> bool {
-    true
-}
-fn default_learning_evidence_gate_enforce() -> bool {
-    true
-}
-fn default_autotune_shadow() -> bool {
-    true
-}
-fn default_autotune_enforce() -> bool {
-    true
-}
-fn default_uncertainty_threshold() -> f32 {
-    0.55
-}
-fn default_trust_tier() -> String {
-    "auto".to_string()
-}
-fn default_pre_execution_supervision() -> bool {
-    false
-}
-fn default_write_consistency_max_abs_global_delta() -> u64 {
-    3
-}
-fn default_write_consistency_max_session_mismatch_count() -> u64 {
-    0
-}
-fn default_write_consistency_max_stale_task_starts() -> u64 {
-    0
-}
-fn default_write_consistency_max_missing_message_id_events() -> u64 {
-    0
-}
 fn default_diagnostics_max_events() -> usize {
     200
 }
 
 fn default_disabled_tools() -> Vec<String> {
     vec![
-        "git_info".to_string(),
-        "git_commit".to_string(),
         "policy_metrics".to_string(),
-        "service_status".to_string(),
-        "project_inspect".to_string(),
         "read_channel_history".to_string(),
-        "tool_trace".to_string(),
     ]
 }
 
@@ -3592,11 +1836,12 @@ fn default_disabled_tools() -> Vec<String> {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ToolsConfig {
     /// Built-in tool machine names to omit at daemon startup (requires `/restart`).
-    /// Off by default: `git_info`, `git_commit` (use `run_command`/`terminal`), plus
-    /// `policy_metrics`, `service_status`, `project_inspect` (use
-    /// `read_file`/`search_files`/`terminal`), `read_channel_history` (Slack opt-in),
-    /// `tool_trace` (use `goal_trace` with `action: "tool_trace"` instead). Set `disabled = []`
-    /// to register everything. Example extras: `["goal_trace"]` to disable forensics entirely.
+    /// Off by default: `policy_metrics` and `read_channel_history` (Slack opt-in).
+    /// Names of retired tools (`git_info`, `git_commit`, `project_inspect`,
+    /// `service_status`) are accepted and ignored.
+    /// `goal_trace`, `policy_metrics` and `self_diagnose` also need
+    /// `[diagnostics] enabled = true`. Set `disabled = []` to register everything.
+    /// Example extras: `["goal_trace"]` to disable forensics entirely.
     #[serde(default = "default_disabled_tools")]
     pub disabled: Vec<String>,
 }
@@ -3611,7 +1856,16 @@ impl Default for ToolsConfig {
 
 impl ToolsConfig {
     pub fn is_enabled(&self, tool_name: &str) -> bool {
-        !self.disabled.iter().any(|name| name == tool_name)
+        // `self_diagnose` was registered as `diagnose`; a config that
+        // disabled it by that name keeps it disabled.
+        let legacy = match tool_name {
+            "self_diagnose" => Some("diagnose"),
+            _ => None,
+        };
+        !self
+            .disabled
+            .iter()
+            .any(|name| name == tool_name || Some(name.as_str()) == legacy)
     }
 }
 
@@ -3662,6 +1916,22 @@ pub struct DiagnosticsHarnessEvalConfig {
     pub warn_overall_below: f32,
     #[serde(default = "default_harness_warn_routing")]
     pub warn_routing_below: f32,
+}
+
+impl From<&DiagnosticsHarnessEvalConfig> for aidaemon_runtime::eval::HarnessEvalConfig {
+    fn from(cfg: &DiagnosticsHarnessEvalConfig) -> Self {
+        Self {
+            enabled: cfg.enabled,
+            weight_routing: cfg.weight_routing,
+            weight_progress: cfg.weight_progress,
+            weight_quality: cfg.weight_quality,
+            weight_cost: cfg.weight_cost,
+            cost_tier_cheap: cfg.cost_tier_cheap,
+            cost_tier_balanced: cfg.cost_tier_balanced,
+            cost_tier_strong: cfg.cost_tier_strong,
+            cost_tier_unknown: cfg.cost_tier_unknown,
+        }
+    }
 }
 
 impl Default for DiagnosticsHarnessEvalConfig {
@@ -3749,115 +2019,7 @@ impl Default for HeartbeatConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct WriteConsistencyConfig {
-    #[serde(default = "default_write_consistency_max_abs_global_delta")]
-    pub max_abs_global_delta: u64,
-    #[serde(default = "default_write_consistency_max_session_mismatch_count")]
-    pub max_session_mismatch_count: u64,
-    #[serde(default = "default_write_consistency_max_stale_task_starts")]
-    pub max_stale_task_starts: u64,
-    #[serde(default = "default_write_consistency_max_missing_message_id_events")]
-    pub max_missing_message_id_events: u64,
-}
-
-impl Default for WriteConsistencyConfig {
-    fn default() -> Self {
-        Self {
-            max_abs_global_delta: default_write_consistency_max_abs_global_delta(),
-            max_session_mismatch_count: default_write_consistency_max_session_mismatch_count(),
-            max_stale_task_starts: default_write_consistency_max_stale_task_starts(),
-            max_missing_message_id_events: default_write_consistency_max_missing_message_id_events(
-            ),
-        }
-    }
-}
-
-impl WriteConsistencyConfig {
-    pub fn thresholds(&self) -> crate::events::WriteConsistencyThresholds {
-        crate::events::WriteConsistencyThresholds {
-            max_abs_global_delta: self.max_abs_global_delta,
-            max_session_mismatch_count: self.max_session_mismatch_count,
-            max_stale_task_starts: self.max_stale_task_starts,
-            max_missing_message_id_events: self.max_missing_message_id_events,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct PolicyConfig {
-    #[serde(default = "default_policy_shadow_mode")]
-    pub policy_shadow_mode: bool,
-    /// Enforce policy-derived context budget caps. When false, message trimming
-    /// only respects the model provider budget.
-    #[serde(default = "default_policy_enforce")]
-    pub policy_enforce: bool,
-    #[serde(default = "default_tool_filter_enforce")]
-    pub tool_filter_enforce: bool,
-    #[serde(default = "default_uncertainty_clarify_enforce")]
-    pub uncertainty_clarify_enforce: bool,
-    #[serde(default = "default_context_refresh_enforce")]
-    pub context_refresh_enforce: bool,
-    #[serde(default = "default_learning_evidence_gate_enforce")]
-    pub learning_evidence_gate_enforce: bool,
-    #[serde(default = "default_autotune_shadow")]
-    pub autotune_shadow: bool,
-    #[serde(default = "default_autotune_enforce")]
-    pub autotune_enforce: bool,
-    #[serde(default = "default_uncertainty_threshold")]
-    pub uncertainty_clarify_threshold: f32,
-    /// Model trust tier override: "auto" (classify by model id), "guided"
-    /// (always enforce full supervision scaffolding), or "autonomous"
-    /// (supervision gates become telemetry-only). Default: "auto".
-    #[serde(default = "default_trust_tier")]
-    pub trust_tier: String,
-    /// Opt-in auxiliary supervision calls inside the tool loop for Guided-tier
-    /// models: the pre-execution plan, the pre-execution critique, and the
-    /// per-step re-planner. Each is an extra model call that can bounce the
-    /// proposed tool call into another full loop iteration. Live autonomy
-    /// traces showed these calls cost more failed finalizations (checklist
-    /// tools displacing the required operation, validation budgets consumed by
-    /// re-plans) than they prevented, so they are off by default. Anti-
-    /// fabrication guards, approval gates, and hard caps are unaffected.
-    #[serde(default = "default_pre_execution_supervision")]
-    pub pre_execution_supervision: bool,
-    #[serde(default)]
-    pub write_consistency: WriteConsistencyConfig,
-    /// Models that ignore a forced `tool_choice=required` (return text with
-    /// zero tool calls). For these the daemon never forces `required` during
-    /// deferred/no-tool recovery — forcing only burns tokens, and on some
-    /// stacks (llama.cpp + Gemma) degenerates into a ~8k-token repetition loop
-    /// until the token limit. Matched by exact model name. Runtime-learned
-    /// entries are added to (and persisted alongside) this seed list.
-    #[serde(default = "default_required_tool_choice_ignored_models")]
-    pub required_tool_choice_ignored_models: Vec<String>,
-}
-
-/// Known-bad models that ignore forced `tool_choice=required`. Seeded so a
-/// fresh config never re-arms the witnessed `gemma-4-26b` meltdown on restart.
-fn default_required_tool_choice_ignored_models() -> Vec<String> {
-    vec!["gemma-4-26b".to_string()]
-}
-
-impl Default for PolicyConfig {
-    fn default() -> Self {
-        Self {
-            policy_shadow_mode: default_policy_shadow_mode(),
-            policy_enforce: default_policy_enforce(),
-            tool_filter_enforce: default_tool_filter_enforce(),
-            uncertainty_clarify_enforce: default_uncertainty_clarify_enforce(),
-            context_refresh_enforce: default_context_refresh_enforce(),
-            learning_evidence_gate_enforce: default_learning_evidence_gate_enforce(),
-            autotune_shadow: default_autotune_shadow(),
-            autotune_enforce: default_autotune_enforce(),
-            uncertainty_clarify_threshold: default_uncertainty_threshold(),
-            trust_tier: default_trust_tier(),
-            pre_execution_supervision: default_pre_execution_supervision(),
-            write_consistency: WriteConsistencyConfig::default(),
-            required_tool_choice_ignored_models: default_required_tool_choice_ignored_models(),
-        }
-    }
-}
+pub use aidaemon_runtime::settings::PolicyConfig;
 
 impl AppConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -3869,6 +2031,9 @@ impl AppConfig {
         config.provider.apply_model_defaults_recursive();
         config.daemon.queue_policy = config.daemon.queue_policy.normalized();
         config.resolve_secrets()?;
+        if config.client_gateway.enabled {
+            config.client_gateway.bind_addr()?;
+        }
         if config.nodes.gateway.enabled {
             let address: std::net::IpAddr = config
                 .nodes
@@ -3890,34 +2055,19 @@ impl AppConfig {
             );
             let mut unique_endpoints = std::collections::HashSet::new();
             for endpoint in &config.nodes.gateway.advertised_endpoints {
-                anyhow::ensure!(
-                    endpoint.len() <= 192,
-                    "nodes.gateway.advertised_endpoints origins must not exceed 192 bytes"
-                );
-                let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
-                    anyhow::anyhow!(
-                        "nodes.gateway.advertised_endpoints must contain valid HTTPS origins"
-                    )
-                })?;
-                anyhow::ensure!(
-                    parsed.scheme() == "https" && parsed.host_str().is_some(),
-                    "nodes.gateway.advertised_endpoints must use HTTPS"
-                );
-                anyhow::ensure!(
-                    parsed.host_str().is_some()
-                        && parsed.username().is_empty()
-                        && parsed.password().is_none()
-                        && parsed.query().is_none()
-                        && parsed.fragment().is_none()
-                        && parsed.path() == "/",
-                    "nodes.gateway.advertised_endpoints must be HTTPS origins without credentials, paths, queries or fragments"
-                );
+                if let Err(error) = aidaemon_exposure::validate_https_origin(endpoint) {
+                    anyhow::bail!("nodes.gateway.advertised_endpoints {error}");
+                }
                 anyhow::ensure!(
                     unique_endpoints.insert(endpoint.trim_end_matches('/')),
                     "nodes.gateway.advertised_endpoints must be unique"
                 );
             }
         }
+        config
+            .exposure
+            .validate(config.client_gateway.enabled, config.nodes.gateway.enabled)
+            .map_err(|error| anyhow::anyhow!(error))?;
         if config.nodes.ota.enabled {
             anyhow::ensure!(
                 config.nodes.gateway.enabled,
@@ -4021,20 +2171,55 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// The configured API keys, tokens and passwords (static config only;
+    /// dynamically connected bots live in the state store). The kernel's
+    /// outbound secret scan refuses calls whose arguments carry one.
+    pub fn outbound_secret_values(&self) -> Vec<String> {
+        let mut values = Vec::new();
+        let mut providers = vec![&self.provider];
+        providers.extend(self.provider.fallbacks.iter());
+        for provider in providers {
+            values.push(provider.api_key.clone());
+            values.extend(provider.gateway_token.clone());
+        }
+        values.push(self.agent.engine.api_key.clone());
+        values.push(self.search.api_key.clone());
+        values.extend(
+            self.all_telegram_bots()
+                .into_iter()
+                .map(|bot| bot.bot_token),
+        );
+        #[cfg(feature = "discord")]
+        values.extend(self.all_discord_bots().into_iter().map(|bot| bot.bot_token));
+        #[cfg(feature = "slack")]
+        for bot in self.all_slack_bots() {
+            values.push(bot.bot_token);
+            values.push(bot.app_token);
+        }
+        if let Some(email) = &self.triggers.email {
+            values.push(email.password.clone());
+        }
+        for profile in self.http_auth.values() {
+            values.extend(profile.credential_values().into_iter().map(str::to_string));
+        }
+        values.retain(|value| !value.trim().is_empty() && value != "keychain");
+        values
+    }
+
     /// Get all Telegram bot configurations (merges legacy single + array).
     /// Legacy `[telegram]` becomes a bot named "default".
     pub fn all_telegram_bots(&self) -> Vec<TelegramBotConfig> {
         let mut bots = self.telegram_bots.clone();
 
         // Add legacy config as "default" if present and has a token
-        if let Some(ref legacy) = self.telegram {
-            if !legacy.bot_token.is_empty() {
-                bots.push(TelegramBotConfig {
-                    bot_token: legacy.bot_token.clone(),
-                    allowed_user_ids: legacy.allowed_user_ids.clone(),
-                    webhook: legacy.webhook.clone(),
-                });
-            }
+        if let Some(ref legacy) = self.telegram
+            && !legacy.bot_token.is_empty()
+        {
+            bots.push(TelegramBotConfig {
+                bot_token: legacy.bot_token.clone(),
+                allowed_user_ids: legacy.allowed_user_ids.clone(),
+                webhook: legacy.webhook.clone(),
+            });
         }
 
         bots
@@ -4045,14 +2230,14 @@ impl AppConfig {
     pub fn all_discord_bots(&self) -> Vec<DiscordBotConfig> {
         let mut bots = self.discord_bots.clone();
 
-        if let Some(ref legacy) = self.discord {
-            if !legacy.bot_token.is_empty() {
-                bots.push(DiscordBotConfig {
-                    bot_token: legacy.bot_token.clone(),
-                    allowed_user_ids: legacy.allowed_user_ids.clone(),
-                    guild_id: legacy.guild_id,
-                });
-            }
+        if let Some(ref legacy) = self.discord
+            && !legacy.bot_token.is_empty()
+        {
+            bots.push(DiscordBotConfig {
+                bot_token: legacy.bot_token.clone(),
+                allowed_user_ids: legacy.allowed_user_ids.clone(),
+                guild_id: legacy.guild_id,
+            });
         }
 
         bots
@@ -4083,40 +2268,49 @@ impl AppConfig {
     fn resolve_secrets(&mut self) -> anyhow::Result<()> {
         self.provider.resolve_secrets_recursive(None)?;
 
+        if self.agent.engine.api_key == "keychain" {
+            self.agent.engine.api_key = resolve_from_keychain("agent_engine_api_key")?;
+        }
+
         // Legacy telegram config
-        if let Some(ref mut telegram) = self.telegram {
-            if telegram.bot_token == "keychain" {
-                telegram.bot_token = resolve_from_keychain("bot_token")?;
-            }
+        if let Some(ref mut telegram) = self.telegram
+            && telegram.bot_token == "keychain"
+        {
+            telegram.bot_token = resolve_from_keychain("bot_token")?;
         }
 
         // Telegram bots array
         for (i, bot) in self.telegram_bots.iter_mut().enumerate() {
             if bot.bot_token == "keychain" {
-                let key = if i == 0 {
-                    "bot_token".to_string()
-                } else {
-                    format!("telegram_bot_token_{}", i)
-                };
+                let key = aidaemon_secrets::names::bot_token("bot_token", "telegram_bot_token", i);
                 bot.bot_token = resolve_from_keychain(&key)?;
             }
         }
 
-        if let Some(ref email) = self.triggers.email {
-            if email.password == "keychain" {
-                let password = resolve_from_keychain("email_password")?;
-                let mut email = email.clone();
-                email.password = password;
-                self.triggers.email = Some(email);
-            }
+        if let Some(ref email) = self.triggers.email
+            && email.password == "keychain"
+        {
+            let password = resolve_from_keychain("email_password")?;
+            let mut email = email.clone();
+            email.password = password;
+            self.triggers.email = Some(email);
         }
-        if let Some(ref key) = self.state.encryption_key {
-            if key == "keychain" {
-                self.state.encryption_key = Some(resolve_from_keychain("encryption_key")?);
-            }
+        if let Some(ref key) = self.state.encryption_key
+            && key == "keychain"
+        {
+            self.state.encryption_key = Some(resolve_from_keychain("encryption_key")?);
         }
         if self.search.api_key == "keychain" {
             self.search.api_key = resolve_from_keychain("search_api_key")?;
+        }
+        if self.decisions.api_key == "keychain" {
+            // A missing key turns the optional decision layer off; it never
+            // stops the daemon from starting.
+            self.decisions.api_key =
+                resolve_from_keychain("decisions_api_key").unwrap_or_else(|error| {
+                    tracing::warn!(%error, "decisions api key not found; decision layer disabled");
+                    String::new()
+                });
         }
         if self.terminal.daemon_connect_token.as_deref() == Some("keychain") {
             self.terminal.daemon_connect_token =
@@ -4125,18 +2319,18 @@ impl AppConfig {
 
         #[cfg(feature = "discord")]
         {
-            if let Some(ref mut discord) = self.discord {
-                if discord.bot_token == "keychain" {
-                    discord.bot_token = resolve_from_keychain("discord_bot_token")?;
-                }
+            if let Some(ref mut discord) = self.discord
+                && discord.bot_token == "keychain"
+            {
+                discord.bot_token = resolve_from_keychain("discord_bot_token")?;
             }
             for (i, bot) in self.discord_bots.iter_mut().enumerate() {
                 if bot.bot_token == "keychain" {
-                    let key = if i == 0 {
-                        "discord_bot_token".to_string()
-                    } else {
-                        format!("discord_bot_token_{}", i)
-                    };
+                    let key = aidaemon_secrets::names::bot_token(
+                        "discord_bot_token",
+                        "discord_bot_token",
+                        i,
+                    );
                     bot.bot_token = resolve_from_keychain(&key)?;
                 }
             }
@@ -4154,19 +2348,13 @@ impl AppConfig {
             }
             for (i, bot) in self.slack_bots.iter_mut().enumerate() {
                 if bot.app_token == "keychain" {
-                    let key = if i == 0 {
-                        "slack_app_token".to_string()
-                    } else {
-                        format!("slack_app_token_{}", i)
-                    };
+                    let key =
+                        aidaemon_secrets::names::bot_token("slack_app_token", "slack_app_token", i);
                     bot.app_token = resolve_from_keychain(&key)?;
                 }
                 if bot.bot_token == "keychain" {
-                    let key = if i == 0 {
-                        "slack_bot_token".to_string()
-                    } else {
-                        format!("slack_bot_token_{}", i)
-                    };
+                    let key =
+                        aidaemon_secrets::names::bot_token("slack_bot_token", "slack_bot_token", i);
                     bot.bot_token = resolve_from_keychain(&key)?;
                 }
             }
@@ -4184,11 +2372,9 @@ impl AppConfig {
                 ("password", &mut profile.password),
             ];
             for (field, value) in fields.iter_mut() {
-                if let Some(ref v) = value {
-                    if v == "keychain" {
-                        let keychain_key = format!("http_auth_{}_{}", name, field);
-                        **value = Some(resolve_from_keychain(&keychain_key)?);
-                    }
+                if value.as_deref() == Some("keychain") {
+                    let keychain_key = aidaemon_secrets::names::http_auth(name, field);
+                    **value = Some(resolve_from_keychain(&keychain_key)?);
                 }
             }
         }
@@ -4200,24 +2386,113 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::KeychainIsolation;
-    use once_cell::sync::Lazy;
+    use crate::testing::{EnvVars, KeychainIsolation};
+    use std::sync::LazyLock;
 
+    /// A config written before a policy key was retired must still parse:
+    /// `PolicyConfig` tolerates unknown keys rather than failing startup.
     #[test]
-    fn test_required_tool_choice_ignored_models_default_includes_gemma() {
-        let cfg = PolicyConfig::default();
-        assert!(
-            cfg.required_tool_choice_ignored_models
-                .iter()
-                .any(|m| m == "gemma-4-26b"),
-            "default PolicyConfig must seed the known-bad gemma-4-26b model"
-        );
+    fn policy_config_ignores_retired_keys() {
+        let cfg: PolicyConfig = toml::from_str(
+            r#"
+policy_enforce = false
+required_tool_choice_ignored_models = ["gemma-4-26b"]
+"#,
+        )
+        .expect("retired policy key must not break config parsing");
+        assert!(!cfg.policy_enforce);
     }
 
     #[test]
     fn watchdog_task_inactivity_timeout_defaults_to_300() {
         let cfg = WatchdogConfig::default();
         assert_eq!(cfg.task_inactivity_timeout_secs, 300);
+    }
+
+    #[test]
+    fn context_budget_follows_config_then_known_window_then_default() {
+        let mut config = ContextWindowConfig::default();
+        assert_eq!(config.context_budget_for("gpt-6-sol"), 231_200);
+        assert_eq!(config.context_budget_for("claude-opus-5-5"), 170_000);
+        assert_eq!(config.context_budget_for("models/gemini-3-pro"), 850_000);
+        assert_eq!(config.context_budget_for("Claude-Sonnet-5-5"), 170_000);
+        assert_eq!(
+            config.context_budget_for("my-local-model"),
+            config.default_budget
+        );
+        config.model_budgets.insert("gpt-6-sol".to_string(), 50_000);
+        assert_eq!(config.context_budget_for("gpt-6-sol"), 50_000);
+    }
+
+    /// Compaction follows each model's own window: a history that fits a
+    /// large-window model is left alone, the same history is compacted for a
+    /// small one, and a turn waits only near the window.
+    #[test]
+    fn compaction_thresholds_follow_each_models_window() {
+        let mut config = ContextWindowConfig::default();
+        assert_eq!(config.summarize_token_threshold_for("gpt-6-sol"), 138_720);
+        assert_eq!(
+            config.emergency_compaction_threshold_for("gpt-6-sol"),
+            184_960
+        );
+        assert_eq!(config.summary_recent_tokens_for("gpt-6-sol"), 34_680);
+        assert_eq!(
+            config.summarize_token_threshold_for("claude-opus-5-5"),
+            102_000
+        );
+        assert_eq!(
+            config.emergency_compaction_threshold_for("claude-opus-5-5"),
+            136_000
+        );
+        assert_eq!(
+            config.summarize_token_threshold_for("models/gemini-3-pro"),
+            510_000
+        );
+        config
+            .model_budgets
+            .insert("synthetic-local-32k".to_string(), 32_000);
+        assert_eq!(
+            config.summarize_token_threshold_for("synthetic-local-32k"),
+            19_200
+        );
+        assert_eq!(
+            config.emergency_compaction_threshold_for("synthetic-local-32k"),
+            25_600
+        );
+        assert_eq!(
+            config.summary_recent_tokens_for("synthetic-local-32k"),
+            4_800
+        );
+
+        // An explicit cap lowers the background threshold, never the point at
+        // which a turn waits.
+        config.summarize_token_threshold = 12_000;
+        config.summary_recent_tokens = 4_000;
+        assert_eq!(config.summarize_token_threshold_for("gpt-6-sol"), 12_000);
+        assert_eq!(config.summary_recent_tokens_for("gpt-6-sol"), 4_000);
+        assert_eq!(
+            config.emergency_compaction_threshold_for("gpt-6-sol"),
+            184_960
+        );
+    }
+
+    #[test]
+    fn a_reported_overflow_lowers_the_budget_and_never_raises_it() {
+        let config = ContextWindowConfig::default();
+        let model = "gpt-6-synthetic-overflow";
+        assert_eq!(config.context_budget_for(model), 231_200);
+        // No stated window: three quarters of the rejected attempt.
+        assert_eq!(
+            aidaemon_runtime::settings::record_context_overflow(model, None, 200_000),
+            150_000
+        );
+        assert_eq!(config.context_budget_for(model), 150_000);
+        // A larger stated window cannot raise it back.
+        assert_eq!(
+            aidaemon_runtime::settings::record_context_overflow(model, Some(400_000), 0),
+            150_000
+        );
+        assert_eq!(config.context_budget_for(model), 150_000);
     }
 
     #[test]
@@ -4268,13 +2543,14 @@ mod tests {
         );
     }
 
-    static ENV_EXPANSION_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
-    static TERMINAL_WEB_APP_URL_ENV_LOCK: Lazy<std::sync::Mutex<()>> =
-        Lazy::new(|| std::sync::Mutex::new(()));
-    static TERMINAL_BRIDGE_ENABLED_ENV_LOCK: Lazy<std::sync::Mutex<()>> =
-        Lazy::new(|| std::sync::Mutex::new(()));
-    static TERMINAL_STATIC_FALLBACK_ENV_LOCK: Lazy<std::sync::Mutex<()>> =
-        Lazy::new(|| std::sync::Mutex::new(()));
+    static ENV_EXPANSION_LOCK: LazyLock<std::sync::Mutex<()>> =
+        LazyLock::new(|| std::sync::Mutex::new(()));
+    static TERMINAL_WEB_APP_URL_ENV_LOCK: LazyLock<std::sync::Mutex<()>> =
+        LazyLock::new(|| std::sync::Mutex::new(()));
+    static TERMINAL_BRIDGE_ENABLED_ENV_LOCK: LazyLock<std::sync::Mutex<()>> =
+        LazyLock::new(|| std::sync::Mutex::new(()));
+    static TERMINAL_STATIC_FALLBACK_ENV_LOCK: LazyLock<std::sync::Mutex<()>> =
+        LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
     fn cli_agents_config_defaults_to_disabled() {
@@ -4286,6 +2562,35 @@ mod tests {
         )
         .unwrap();
         assert!(!config.cli_agents.enabled);
+    }
+
+    #[test]
+    fn retired_task_assessment_key_still_parses() {
+        let config = "[provider]\napi_key = \"test\"\n\n[agent]\ntask_assessment = \"off\"\n";
+        toml::from_str::<AppConfig>(config).expect("older configs keep parsing");
+    }
+
+    #[test]
+    fn authority_owner_default_parses_and_defaults_to_full() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.authority.owner_default, OwnerLevel::Full);
+        let config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test"
+
+            [authority]
+            owner_default = "unrestricted"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.authority.owner_default, OwnerLevel::Unrestricted);
     }
 
     #[test]
@@ -4316,15 +2621,7 @@ mod tests {
     #[test]
     fn tools_config_defaults_disable_low_value_base_tools() {
         let config = ToolsConfig::default();
-        for tool in [
-            "git_info",
-            "git_commit",
-            "policy_metrics",
-            "service_status",
-            "project_inspect",
-            "read_channel_history",
-            "tool_trace",
-        ] {
+        for tool in ["policy_metrics", "read_channel_history"] {
             assert!(
                 !config.is_enabled(tool),
                 "expected {tool} to be disabled by default"
@@ -4333,7 +2630,6 @@ mod tests {
         assert!(config.is_enabled("terminal"));
         assert!(config.is_enabled("check_environment"));
         assert!(config.is_enabled("goal_trace"));
-        assert!(!config.is_enabled("tool_trace"));
         assert!(config.is_enabled("search_files"));
     }
 
@@ -4360,17 +2656,18 @@ mod tests {
     #[serial_test::serial(env_vars)]
     fn expand_env_vars_replaces_set_variable() {
         let _guard = ENV_EXPANSION_LOCK.lock().unwrap();
-        std::env::set_var("AIDAEMON_TEST_VAR", "hello");
+        let mut env = EnvVars::default();
+        env.set("AIDAEMON_TEST_VAR", "hello");
         let result = expand_env_vars("key = \"${AIDAEMON_TEST_VAR}\"").unwrap();
         assert_eq!(result, "key = \"hello\"");
-        std::env::remove_var("AIDAEMON_TEST_VAR");
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn expand_env_vars_errors_on_missing() {
         let _guard = ENV_EXPANSION_LOCK.lock().unwrap();
-        std::env::remove_var("AIDAEMON_MISSING_VAR");
+        let mut env = EnvVars::default();
+        env.unset("AIDAEMON_MISSING_VAR");
         let result = expand_env_vars("key = \"${AIDAEMON_MISSING_VAR}\"");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -4388,13 +2685,12 @@ mod tests {
     #[serial_test::serial(env_vars)]
     fn expand_env_vars_handles_multiple() {
         let _guard = ENV_EXPANSION_LOCK.lock().unwrap();
-        std::env::set_var("AIDAEMON_TEST_A", "aaa");
-        std::env::set_var("AIDAEMON_TEST_B", "bbb");
+        let mut env = EnvVars::default();
+        env.set("AIDAEMON_TEST_A", "aaa");
+        env.set("AIDAEMON_TEST_B", "bbb");
         let result =
             expand_env_vars("a = \"${AIDAEMON_TEST_A}\"\nb = \"${AIDAEMON_TEST_B}\"").unwrap();
         assert_eq!(result, "a = \"aaa\"\nb = \"bbb\"");
-        std::env::remove_var("AIDAEMON_TEST_A");
-        std::env::remove_var("AIDAEMON_TEST_B");
     }
 
     #[test]
@@ -4496,8 +2792,9 @@ mod tests {
     #[serial_test::serial(env_vars)]
     fn expand_env_vars_reports_all_missing() {
         let _guard = ENV_EXPANSION_LOCK.lock().unwrap();
-        std::env::remove_var("AIDAEMON_MISS_X");
-        std::env::remove_var("AIDAEMON_MISS_Y");
+        let mut env = EnvVars::default();
+        env.unset("AIDAEMON_MISS_X");
+        env.unset("AIDAEMON_MISS_Y");
         let result = expand_env_vars("a = \"${AIDAEMON_MISS_X}\"\nb = \"${AIDAEMON_MISS_Y}\"");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -4509,21 +2806,18 @@ mod tests {
     #[serial_test::serial(env_vars)]
     fn terminal_web_app_url_defaults_to_hosted_terminal() {
         let _guard = TERMINAL_WEB_APP_URL_ENV_LOCK.lock().unwrap();
-        let old = std::env::var("AIDAEMON_TERMINAL_WEB_APP_URL").ok();
-        std::env::remove_var("AIDAEMON_TERMINAL_WEB_APP_URL");
+        let mut env = EnvVars::default();
+        env.unset("AIDAEMON_TERMINAL_WEB_APP_URL");
         let cfg = TerminalConfig::default();
         assert_eq!(cfg.effective_web_app_url(), "https://terminal.aidaemon.ai");
-        if let Some(old) = old {
-            std::env::set_var("AIDAEMON_TERMINAL_WEB_APP_URL", old);
-        }
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn terminal_web_app_url_env_override_wins() {
         let _guard = TERMINAL_WEB_APP_URL_ENV_LOCK.lock().unwrap();
-        let old = std::env::var("AIDAEMON_TERMINAL_WEB_APP_URL").ok();
-        std::env::set_var(
+        let mut env = EnvVars::default();
+        env.set(
             "AIDAEMON_TERMINAL_WEB_APP_URL",
             "https://terminal.dev.aidaemon.ai",
         );
@@ -4535,73 +2829,52 @@ mod tests {
             cfg.effective_web_app_url(),
             "https://terminal.dev.aidaemon.ai"
         );
-        if let Some(old) = old {
-            std::env::set_var("AIDAEMON_TERMINAL_WEB_APP_URL", old);
-        } else {
-            std::env::remove_var("AIDAEMON_TERMINAL_WEB_APP_URL");
-        }
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn terminal_bridge_enabled_defaults_to_true() {
         let _guard = TERMINAL_BRIDGE_ENABLED_ENV_LOCK.lock().unwrap();
-        let old = std::env::var("AIDAEMON_TERMINAL_BRIDGE_ENABLED").ok();
-        std::env::remove_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED");
+        let mut env = EnvVars::default();
+        env.unset("AIDAEMON_TERMINAL_BRIDGE_ENABLED");
         let cfg = TerminalConfig::default();
         assert!(cfg.effective_bridge_enabled());
-        if let Some(old) = old {
-            std::env::set_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED", old);
-        }
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn terminal_bridge_enabled_env_override_wins() {
         let _guard = TERMINAL_BRIDGE_ENABLED_ENV_LOCK.lock().unwrap();
-        let old = std::env::var("AIDAEMON_TERMINAL_BRIDGE_ENABLED").ok();
-        std::env::set_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED", "false");
+        let mut env = EnvVars::default();
+        env.set("AIDAEMON_TERMINAL_BRIDGE_ENABLED", "false");
         let cfg = TerminalConfig {
             bridge_enabled: true,
             ..TerminalConfig::default()
         };
         assert!(!cfg.effective_bridge_enabled());
-        if let Some(old) = old {
-            std::env::set_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED", old);
-        } else {
-            std::env::remove_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED");
-        }
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn terminal_static_fallback_defaults_to_disabled() {
         let _guard = TERMINAL_STATIC_FALLBACK_ENV_LOCK.lock().unwrap();
-        let old = std::env::var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK").ok();
-        std::env::remove_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK");
+        let mut env = EnvVars::default();
+        env.unset("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK");
         let cfg = TerminalConfig::default();
         assert!(!cfg.effective_allow_static_token_fallback());
-        if let Some(old) = old {
-            std::env::set_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK", old);
-        }
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn terminal_static_fallback_env_override_wins() {
         let _guard = TERMINAL_STATIC_FALLBACK_ENV_LOCK.lock().unwrap();
-        let old = std::env::var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK").ok();
-        std::env::set_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK", "true");
+        let mut env = EnvVars::default();
+        env.set("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK", "true");
         let cfg = TerminalConfig {
             allow_static_token_fallback: false,
             ..TerminalConfig::default()
         };
         assert!(cfg.effective_allow_static_token_fallback());
-        if let Some(old) = old {
-            std::env::set_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK", old);
-        } else {
-            std::env::remove_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK");
-        }
     }
 
     #[test]
@@ -4923,9 +3196,11 @@ smart = "claude-3-5-haiku-latest"
     }
 
     #[test]
-    fn task_timeout_default_is_30_minutes() {
+    fn task_timeout_is_accepted_but_unset_by_default() {
         let config = SubagentsConfig::default();
-        assert_eq!(config.task_timeout_secs, Some(1800));
+        assert_eq!(config.task_timeout_secs, None);
+        let parsed: SubagentsConfig = toml::from_str("task_timeout_secs = 600").unwrap();
+        assert_eq!(parsed.task_timeout_secs, Some(600));
     }
 
     #[test]
@@ -5397,58 +3672,10 @@ session_isolation = "incognito"
     }
 
     #[test]
-    fn test_self_correction_config_defaults_are_safe() {
-        let cfg = SelfCorrectionConfig::default();
-        assert!(!cfg.enabled, "enabled must default to false (safe-off)");
-        assert!(
-            !cfg.correction_bypass_enabled,
-            "correction_bypass_enabled must default to false (safe-off)"
-        );
-        assert_eq!(cfg.max_attempts, 3, "max_attempts must default to 3");
-        assert!(
-            cfg.shadow_mode,
-            "shadow_mode must default to true (shadow-first activation)"
-        );
-
-        // A config without [self_correction] section must still load and use defaults.
-        let toml = r#"
-[provider]
-kind = "openai_compatible"
-api_key = "test-key"
-
-[provider.models]
-primary = "gpt-4o"
-"#;
-        let app: AppConfig =
-            toml::from_str(toml).expect("parse app config without self_correction");
-        assert!(!app.self_correction.enabled);
-        assert!(!app.self_correction.correction_bypass_enabled);
-        assert_eq!(app.self_correction.max_attempts, 3);
-        assert!(app.self_correction.shadow_mode);
-
-        // shadow_mode = false parses (the deliberate full-autonomy flip).
-        let toml_live = r#"
-[provider]
-kind = "openai_compatible"
-api_key = "test-key"
-
-[provider.models]
-primary = "gpt-4o"
-
-[self_correction]
-enabled = true
-correction_bypass_enabled = true
-shadow_mode = false
-"#;
-        let app_live: AppConfig =
-            toml::from_str(toml_live).expect("parse app config with shadow_mode=false");
-        assert!(app_live.self_correction.enabled);
-        assert!(app_live.self_correction.correction_bypass_enabled);
-        assert!(!app_live.self_correction.shadow_mode);
-    }
-
-    #[test]
-    fn test_self_correction_config_parses_enabled_flags() {
+    fn config_with_removed_correction_sections_still_parses() {
+        // The self-correction feature was removed. An existing config.toml that
+        // still carries its `[self_correction]` section or the retention key for
+        // its attempts table must keep loading; the keys are simply ignored.
         let toml = r#"
 [provider]
 kind = "openai_compatible"
@@ -5461,10 +3688,13 @@ primary = "gpt-4o"
 enabled = true
 correction_bypass_enabled = true
 max_attempts = 5
+shadow_mode = false
+
+[state.retention]
+self_correction_attempts_days = 30
 "#;
-        let app: AppConfig = toml::from_str(toml).expect("parse app config with self_correction");
-        assert!(app.self_correction.enabled);
-        assert!(app.self_correction.correction_bypass_enabled);
-        assert_eq!(app.self_correction.max_attempts, 5);
+        let app: AppConfig =
+            toml::from_str(toml).expect("config with removed sections must still parse");
+        assert_eq!(app.state.retention.error_solutions_days, 90);
     }
 }

@@ -17,8 +17,7 @@ use crate::channels::{ChannelHub, SessionMap};
 use crate::config::AppConfig;
 use crate::daemon;
 use crate::health::HealthProbeManager;
-use crate::llm_runtime::SharedLlmRuntime;
-use crate::queue_policy::{should_shed_due_to_overload, SessionFairnessBudget};
+use crate::queue_policy::{SessionFairnessBudget, should_shed_due_to_overload};
 use crate::queue_telemetry::QueueTelemetry;
 use crate::traits::{MandateStore, SessionChannelStore, SettingsStore};
 use crate::triggers;
@@ -30,19 +29,19 @@ fn cleanup_inbox(dir: &str, retention: Duration) {
     };
     let cutoff = std::time::SystemTime::now() - retention;
     for entry in entries.flatten() {
-        if let Ok(meta) = entry.metadata() {
-            if let Ok(modified) = meta.modified() {
-                if modified < cutoff {
-                    let _ = std::fs::remove_file(entry.path());
-                    tracing::info!(file = %entry.path().display(), "Cleaned up expired inbox file");
-                }
-            }
+        if let Ok(meta) = entry.metadata()
+            && let Ok(modified) = meta.modified()
+            && modified < cutoff
+        {
+            let _ = std::fs::remove_file(entry.path());
+            tracing::info!(file = %entry.path().display(), "Cleaned up expired inbox file");
         }
     }
 }
 
 pub(crate) struct HeartbeatSetup {
     pub(crate) coordinator: Option<crate::heartbeat::HeartbeatCoordinator>,
+    /// The coordinator's job status, for the app's System area.
     pub(crate) telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>>,
 }
 
@@ -51,15 +50,46 @@ pub(crate) struct HeartbeatDependencies {
     pub(crate) pool: SqlitePool,
     pub(crate) event_store: Arc<crate::events::EventStore>,
     pub(crate) pruner: Arc<crate::events::Pruner>,
-    pub(crate) memory_manager: Arc<crate::memory::manager::MemoryManager>,
+    pub(crate) memory_jobs: Arc<aidaemon_memory::full::MemoryJobs>,
+    pub(crate) own_memory: bool,
+    pub(crate) memory_store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
+    pub(crate) memory_services: Vec<Arc<dyn aidaemon_core::Service>>,
     pub(crate) wake_rx: tokio::sync::mpsc::Receiver<()>,
     pub(crate) inbox_dir: String,
     pub(crate) skills_dir: Option<std::path::PathBuf>,
-    pub(crate) llm_runtime: SharedLlmRuntime,
+    pub(crate) side_calls: crate::llm_runtime::gateway::SideCallGateway,
     pub(crate) oauth_gateway: Option<crate::oauth::OAuthGateway>,
     pub(crate) watchdog_stale_threshold_secs: u64,
     pub(crate) goal_token_registry: crate::goal_tokens::GoalTokenRegistry,
     pub(crate) terminal_tool: Option<Arc<crate::tools::TerminalTool>>,
+    pub(crate) execution_backend: crate::execution::SharedExecutionBackend,
+}
+
+/// Goal review, which is work and always runs, then, when the daemon's own
+/// memory serves, the full memory system's jobs. Another memory system
+/// brings its own.
+pub(crate) fn register_memory_jobs(
+    heartbeat: &mut crate::heartbeat::HeartbeatCoordinator,
+    pool: SqlitePool,
+    memory_jobs: &Arc<aidaemon_memory::full::MemoryJobs>,
+    own_memory: bool,
+) {
+    heartbeat.register_job(
+        "goal_review",
+        Duration::from_secs(7 * 24 * 3600),
+        move || {
+            let pool = pool.clone();
+            async move { crate::memory::jobs_host::review_goals(&pool).await }
+        },
+    );
+    if !own_memory {
+        info!("Memory background tasks left to the configured memory system");
+        return;
+    }
+    for service in memory_jobs.services() {
+        heartbeat.add_service(service);
+    }
+    info!("Memory background tasks registered with heartbeat");
 }
 
 pub(crate) async fn init_heartbeat_coordinator(
@@ -71,18 +101,22 @@ pub(crate) async fn init_heartbeat_coordinator(
         pool,
         event_store,
         pruner,
-        memory_manager,
+        memory_jobs,
+        own_memory,
+        memory_store,
+        memory_services,
         wake_rx,
         inbox_dir,
         skills_dir,
-        llm_runtime,
+        side_calls,
         oauth_gateway,
         watchdog_stale_threshold_secs,
         goal_token_registry,
         terminal_tool,
+        execution_backend,
     } = dependencies;
-    let mut heartbeat_telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>> = None;
     let mut heartbeat_opt: Option<crate::heartbeat::HeartbeatCoordinator> = None;
+    let mut heartbeat_telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>> = None;
 
     if config.heartbeat.enabled {
         let telemetry = Arc::new(crate::heartbeat::HeartbeatTelemetry::new());
@@ -98,8 +132,10 @@ pub(crate) async fn init_heartbeat_coordinator(
         );
         heartbeat.set_task_inactivity_timeout(config.daemon.watchdog.task_inactivity_timeout_secs);
 
-        // Register memory manager jobs
-        memory_manager.register_heartbeat_jobs(&mut heartbeat);
+        register_memory_jobs(&mut heartbeat, pool.clone(), &memory_jobs, own_memory);
+        for service in memory_services {
+            heartbeat.add_service(service);
+        }
 
         if config.nodes.monitoring.enabled {
             let monitoring = crate::nodes::monitoring::NodeMonitoringService::new(
@@ -176,7 +212,12 @@ pub(crate) async fn init_heartbeat_coordinator(
             let p = pruner_hb.clone();
             async move {
                 info!("Running event pruning");
-                match p.prune().await {
+                let pass = if own_memory {
+                    p.prune().await
+                } else {
+                    p.retire_old_events().await
+                };
+                match pass {
                     Ok(stats) => {
                         info!(
                             deleted = stats.deleted,
@@ -232,7 +273,7 @@ pub(crate) async fn init_heartbeat_coordinator(
                 let pool = history_projection_pool.clone();
                 async move {
                     let stats =
-                        crate::state::sqlite::history_search::repair_and_backfill(&pool, 4).await?;
+                        aidaemon_runtime::history::search::repair_and_backfill(&pool, 4).await?;
                     if stats.projected > 0
                         || stats.orphans_removed > 0
                         || stats.fts_rebuilt
@@ -254,7 +295,7 @@ pub(crate) async fn init_heartbeat_coordinator(
 
         // Retention cleanup (daily)
         let retention_pool = pool.clone();
-        let retention_config = config.state.retention.clone();
+        let retention_config = config.state.retention.policy();
         heartbeat.register_job(
             "retention_cleanup",
             Duration::from_secs(24 * 3600),
@@ -264,6 +305,11 @@ pub(crate) async fn init_heartbeat_coordinator(
                 async move {
                     let retention_manager =
                         crate::memory::retention::RetentionManager::new(pool, cfg);
+                    let retention_manager = if own_memory {
+                        retention_manager
+                    } else {
+                        retention_manager.without_memory()
+                    };
                     info!("Running retention cleanup");
                     match retention_manager.run_all().await {
                         Ok(stats) => {
@@ -289,16 +335,34 @@ pub(crate) async fn init_heartbeat_coordinator(
             },
         );
 
+        // SQLite planner statistics (every 6 hours): only tables whose size
+        // changed a lot are re-analyzed, so a quiet database costs nothing.
+        let optimize_pool = pool.clone();
+        heartbeat.register_job(
+            "sqlite_optimize",
+            Duration::from_secs(6 * 3600),
+            move || {
+                let pool = optimize_pool.clone();
+                async move {
+                    aidaemon_store_sqlite::maintenance::optimize(
+                        &pool,
+                        aidaemon_store_sqlite::maintenance::Optimize::Periodic,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+                }
+            },
+        );
+
         // Skill promotion (every 12 hours)
         if let Some(sd) = skills_dir {
-            let promoter = Arc::new(crate::memory::skill_promotion::SkillPromoter::new(
+            let promoter = Arc::new(crate::skills::promotion::SkillPromoter::new(
                 state.clone(),
-                event_store.clone(),
-                llm_runtime.clone(),
+                Arc::new(side_calls.clone()),
                 sd,
                 config.policy.learning_evidence_gate_enforce,
             ));
-            heartbeat.register_deferrable_job(
+            heartbeat.register_job(
                 "skill_promotion",
                 Duration::from_secs(12 * 3600),
                 move || {
@@ -318,13 +382,14 @@ pub(crate) async fn init_heartbeat_coordinator(
         }
 
         // People intelligence (daily)
-        {
+        if own_memory {
             let people_intel =
                 Arc::new(crate::memory::people_intelligence::PeopleIntelligence::new(
                     state.clone(),
-                    config.people.clone(),
+                    memory_store,
+                    config.people.intelligence(),
                 ));
-            heartbeat.register_deferrable_job(
+            heartbeat.register_job(
                 "people_intelligence",
                 Duration::from_secs(24 * 3600),
                 move || {
@@ -354,9 +419,12 @@ pub(crate) async fn init_heartbeat_coordinator(
         heartbeat.register_job(
             "tool_result_cleanup",
             Duration::from_secs(3600),
-            move || async move {
-                crate::tools::result_spill::prune_spill_dir_for_backend().await;
-                Ok(())
+            move || {
+                let backend = execution_backend.clone();
+                async move {
+                    crate::tools::result_spill::prune_spill_dir_for_backend(&*backend).await;
+                    Ok(())
+                }
             },
         );
 
@@ -480,14 +548,16 @@ pub(crate) fn start_heartbeat_coordinator(
     heartbeat_opt: Option<crate::heartbeat::HeartbeatCoordinator>,
     hub: &Arc<ChannelHub>,
     agent: &Arc<Agent>,
-) {
-    if let Some(mut heartbeat) = heartbeat_opt {
+    shutdown: aidaemon_core::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    heartbeat_opt.map(|mut heartbeat| {
         let outbound: Arc<dyn crate::runtime_ports::OutboundRouter> = hub.clone();
         heartbeat.set_hub(Arc::downgrade(&outbound));
-        heartbeat.set_agent(Arc::downgrade(agent));
+        let agent: std::sync::Weak<crate::agent::Agent> = Arc::downgrade(agent);
+        heartbeat.set_agent(agent);
         info!("Heartbeat coordinator starting with hub and agent references");
-        heartbeat.start();
-    }
+        heartbeat.start(shutdown)
+    })
 }
 
 pub(crate) async fn restore_session_map(state: Arc<dyn SessionChannelStore>) -> SessionMap {
@@ -605,11 +675,7 @@ pub(crate) struct DashboardDependencies {
     pub(crate) state: Arc<dyn crate::traits::StateStore>,
     pub(crate) pool: SqlitePool,
     pub(crate) event_store: Arc<crate::events::EventStore>,
-    pub(crate) health_store: Option<Arc<crate::health::HealthProbeStore>>,
-    pub(crate) heartbeat_telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>>,
     pub(crate) oauth_gateway: Option<crate::oauth::OAuthGateway>,
-    pub(crate) write_consistency_thresholds: crate::events::WriteConsistencyThresholds,
-    pub(crate) queue_telemetry: Arc<QueueTelemetry>,
     pub(crate) heartbeat_wake_tx: tokio::sync::mpsc::Sender<()>,
 }
 
@@ -621,11 +687,7 @@ pub(crate) fn spawn_dashboard_or_health_server(
         state,
         pool,
         event_store,
-        health_store,
-        heartbeat_telemetry,
         oauth_gateway,
-        write_consistency_thresholds,
-        queue_telemetry,
         heartbeat_wake_tx,
     } = dependencies;
     let health_port = config.daemon.health_port;
@@ -641,18 +703,9 @@ pub(crate) fn spawn_dashboard_or_health_server(
                     mandate_store: state.clone(),
                     heartbeat_wake_tx,
                     event_store: Some(event_store),
-                    provider_kind: format!("{:?}", config.provider.kind),
-                    models: config.provider.models.clone(),
-                    started_at: std::time::Instant::now(),
                     dashboard_token: dashboard_token_info.token,
                     token_created_at: dashboard_token_info.created_at,
-                    daily_token_budget: config.state.daily_token_budget,
-                    health_store,
-                    heartbeat_telemetry,
                     oauth_gateway,
-                    policy_uncertainty_threshold: config.policy.uncertainty_clarify_threshold,
-                    write_consistency_thresholds,
-                    queue_telemetry,
                     auth_failures: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 };
                 let bind = health_bind.clone();

@@ -1,856 +1,22 @@
-use super::*;
-
-/// Telemetry captured during an LLM call with recovery, surfaced to the agent
-/// loop so it can be persisted as an `LlmCall` event. Populated via an out-param
-/// so the many return points in `call_llm_with_recovery` stay untouched.
-#[derive(Debug, Clone, Default)]
-pub(in crate::agent) struct LlmCallTelemetry {
-    /// Model that actually produced the successful response.
-    pub final_model: String,
-    /// Whether recovery cascaded to a different model/provider.
-    pub fell_back: bool,
-    /// Total provider calls attempted (1 = succeeded on the first try).
-    pub attempts: u32,
-}
-
-fn malformed_reason_label(
-    reason: Option<crate::providers::MalformedResponseReason>,
-) -> &'static str {
-    match reason {
-        Some(crate::providers::MalformedResponseReason::Parse) => "parse",
-        Some(crate::providers::MalformedResponseReason::Shape) => "shape",
-        None => "unknown",
-    }
-}
-
-// impl-Agent justification: LLM call recovery and fallback cascade over llm_runtime/model/billing_failed_models.
-impl Agent {
-    /// Pick a fallback model, skipping `failed_model` and any models in the `exclude` list.
-    /// Tries stored fallback first, then cycles through router ordered models
-    /// (`default` + `fallback[]`).
-    pub(super) async fn pick_fallback_excluding(
-        &self,
-        failed_model: &str,
-        exclude: &[&str],
-        router: Option<&Router>,
-    ) -> Option<String> {
-        let stored =
-            match tokio::time::timeout(Duration::from_secs(2), self.fallback_model.read()).await {
-                Ok(guard) => guard.clone(),
-                Err(_) => {
-                    warn!("Timed out acquiring fallback_model lock while picking fallback");
-                    self.llm_runtime.snapshot().primary_model()
-                }
-            };
-        if stored != failed_model && !exclude.contains(&stored.as_str()) {
-            return Some(stored);
-        }
-        // Stored fallback is the same or excluded — try router candidates.
-        if let Some(router) = router {
-            for candidate in router.all_models_ordered() {
-                if candidate != failed_model && !exclude.contains(&candidate.as_str()) {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
-    }
-
-    /// Per-attempt timeout for each individual provider call inside
-    /// cascade_fallback / billing retry.  Prevents a single hung provider
-    /// from blocking the entire recovery chain.
-    const CASCADE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
-
-    /// Try provider-local model fallbacks first, then configured alternate
-    /// providers and their model chains. On success, returns the response for
-    /// this call only (no persistent provider/model downgrade).
-    #[allow(clippy::too_many_arguments)]
-    async fn cascade_fallback(
-        &self,
-        provider: &Arc<dyn ModelProvider>,
-        router: Option<&Router>,
-        failed_model: &str,
-        messages: &[Value],
-        tool_defs: &[Value],
-        options: &ChatOptions,
-        last_err: &ProviderError,
-        telemetry: &mut LlmCallTelemetry,
-        pin_model: Option<&str>,
-    ) -> anyhow::Result<crate::traits::ProviderResponse> {
-        if pin_model.is_some() {
-            return Err(anyhow::anyhow!(
-                "{} (model pinned for active computer_use task — fallback disabled)",
-                last_err.recovery_failed_message()
-            ));
-        }
-        // Entering the cascade means the original call already failed.
-        telemetry.fell_back = true;
-        let mut tried: Vec<String> = vec![failed_model.to_string()];
-        let mut final_err = last_err.clone();
-        let mut attempt = 1;
-        let runtime_snapshot = self.llm_runtime.snapshot();
-        let primary_provider_kind = runtime_snapshot.provider_kind();
-        let failover_targets = runtime_snapshot.failover_targets();
-
-        loop {
-            let exclude_refs: Vec<&str> = tried.iter().map(|s| s.as_str()).collect();
-            let fallback = match self
-                .pick_fallback_excluding(failed_model, &exclude_refs, router)
-                .await
-            {
-                Some(fallback_model) => fallback_model,
-                None => break,
-            };
-
-            warn!(
-                provider_kind = ?primary_provider_kind,
-                model = %fallback,
-                attempt,
-                "Primary-provider fallback attempt"
-            );
-
-            telemetry.attempts += 1;
-            match tokio::time::timeout(
-                Self::CASCADE_ATTEMPT_TIMEOUT,
-                provider.chat_with_options(&fallback, messages, tool_defs, options),
-            )
-            .await
-            {
-                Ok(Ok(resp)) => {
-                    self.stamp_lastgood().await;
-                    telemetry.final_model = fallback;
-                    return Ok(resp);
-                }
-                Ok(Err(retry_err)) => match retry_err.downcast::<ProviderError>() {
-                    Ok(provider_err) => {
-                        final_err = provider_err;
-                        tried.push(fallback);
-                        attempt += 1;
-                    }
-                    Err(other) => return Err(other),
-                },
-                Err(_elapsed) => {
-                    warn!(
-                        model = %fallback,
-                        attempt,
-                        timeout_secs = Self::CASCADE_ATTEMPT_TIMEOUT.as_secs(),
-                        "Cascade fallback attempt timed out, trying next"
-                    );
-                    tried.push(fallback);
-                    attempt += 1;
-                }
-            }
-        }
-
-        for target in failover_targets {
-            for model in target.all_models_ordered() {
-                warn!(
-                    provider_kind = ?target.provider_kind(),
-                    model = %model,
-                    attempt,
-                    "Provider failover attempt"
-                );
-
-                telemetry.attempts += 1;
-                match tokio::time::timeout(
-                    Self::CASCADE_ATTEMPT_TIMEOUT,
-                    target
-                        .provider()
-                        .chat_with_options(&model, messages, tool_defs, options),
-                )
-                .await
-                {
-                    Ok(Ok(resp)) => {
-                        self.stamp_lastgood().await;
-                        telemetry.final_model = model;
-                        return Ok(resp);
-                    }
-                    Ok(Err(retry_err)) => match retry_err.downcast::<ProviderError>() {
-                        Ok(provider_err) => {
-                            final_err = provider_err;
-                            attempt += 1;
-                        }
-                        Err(other) => return Err(other),
-                    },
-                    Err(_elapsed) => {
-                        warn!(
-                            model = %model,
-                            attempt,
-                            timeout_secs = Self::CASCADE_ATTEMPT_TIMEOUT.as_secs(),
-                            "Provider failover attempt timed out, trying next"
-                        );
-                        attempt += 1;
-                    }
-                }
-            }
-        }
-
-        // Keep the typed provider error as the cause so callers (deferred
-        // retry, telemetry) can still classify it; the recovery message is the
-        // user-facing context.
-        let message = final_err.recovery_failed_message();
-        Err(anyhow::Error::new(final_err).context(message))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn retry_malformed_response<F>(
-        &self,
-        provider: &Arc<dyn ModelProvider>,
-        model: &str,
-        messages: &[Value],
-        tool_defs: &[Value],
-        options: &ChatOptions,
-        provider_label: &str,
-        max_retries: u32,
-        wait_for_attempt: F,
-        retry_strategy: &str,
-    ) -> anyhow::Result<Option<crate::traits::ProviderResponse>>
-    where
-        F: Fn(u32) -> u64,
-    {
-        for attempt in 0..max_retries {
-            let wait = wait_for_attempt(attempt);
-            info!(
-                wait_secs = wait,
-                attempt = attempt + 1,
-                max = max_retries,
-                strategy = retry_strategy,
-                "Retrying after malformed provider response"
-            );
-            tokio::time::sleep(Duration::from_secs(wait)).await;
-            match provider
-                .chat_with_options(model, messages, tool_defs, options)
-                .await
-            {
-                Ok(resp) => {
-                    self.stamp_lastgood().await;
-                    return Ok(Some(resp));
-                }
-                Err(retry_err) => {
-                    let retry_provider_err = match retry_err.downcast::<ProviderError>() {
-                        Ok(pe) => pe,
-                        Err(other) => return Err(other),
-                    };
-                    if retry_provider_err.kind == ProviderErrorKind::MalformedResponse {
-                        let retry_reason =
-                            malformed_reason_label(retry_provider_err.malformed_reason);
-                        record_llm_payload_invalid_metric(provider_label, model, retry_reason);
-                        continue;
-                    }
-                    return Err(anyhow::anyhow!(
-                        "{}",
-                        retry_provider_err.recovery_failed_message()
-                    ));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// When the provider rejects a multimodal payload, strip image/audio blocks and retry once.
-    ///
-    /// TODO(v2): tiered multimodal fallback — strip `input_audio` first and retry;
-    /// only strip `image_url` on a second failure so mixed photo+voice turns keep images.
-    async fn try_text_only_vision_fallback(
-        &self,
-        provider: &Arc<dyn ModelProvider>,
-        model: &str,
-        messages: &[Value],
-        tool_defs: &[Value],
-        options: &ChatOptions,
-    ) -> Option<crate::traits::ProviderResponse> {
-        if !crate::providers::multimodal::messages_contain_multimodal_blocks(messages) {
-            return None;
-        }
-        warn!(
-            model,
-            "Provider rejected multimodal payload; retrying once with text-only content"
-        );
-        let mut text_only = messages.to_vec();
-        crate::providers::multimodal::strip_multimodal_blocks_from_messages(&mut text_only);
-        match provider
-            .chat_with_options(model, &text_only, tool_defs, options)
-            .await
-        {
-            Ok(resp) => {
-                self.stamp_lastgood().await;
-                Some(resp)
-            }
-            Err(retry_err) => {
-                warn!(
-                    model,
-                    error = %retry_err,
-                    "Text-only vision fallback retry also failed"
-                );
-                None
-            }
-        }
-    }
-
-    /// How long a billing failure is cached before we re-try that model.
-    /// After this window the model is attempted again (credits may have been added).
-    const BILLING_FAIL_CACHE_TTL: Duration = Duration::from_secs(10 * 60); // 10 minutes
-
-    /// Settings KV key under which the runtime-learned set of models that
-    /// ignore forced `tool_choice=required` is persisted (JSON array).
-    const REQUIRED_TOOL_CHOICE_IGNORED_KEY: &'static str = "required_tool_choice_ignored_models";
-
-    /// Whether `model` has previously ignored a forced `tool_choice=required`
-    /// call (returned text with zero tool calls), meaning forcing it again
-    /// would only burn tokens — and on some stacks (llama.cpp + Gemma)
-    /// degenerate into a repetition loop until the token limit.
-    pub(crate) async fn required_tool_choice_ignored(&self, model: &str) -> bool {
-        self.required_tool_choice_ignored_models
-            .read()
-            .await
-            .contains(model)
-    }
-
-    /// Record that `model` ignored a forced `tool_choice=required` call.
-    /// Returns true when the model was newly flagged.
-    ///
-    /// On a newly-flagged model the updated set is also persisted to the
-    /// settings KV (JSON), so the flag survives daemon restarts and the
-    /// witnessed meltdown is never re-armed.
-    pub(crate) async fn record_required_tool_choice_ignored(&self, model: &str) -> bool {
-        let newly_flagged = self
-            .required_tool_choice_ignored_models
-            .write()
-            .await
-            .insert(model.to_string());
-
-        if newly_flagged {
-            // Snapshot under the read lock, then persist outside it.
-            let snapshot: Vec<String> = {
-                let set = self.required_tool_choice_ignored_models.read().await;
-                let mut v: Vec<String> = set.iter().cloned().collect();
-                v.sort();
-                v
-            };
-            self.persist_required_tool_choice_ignored(&snapshot).await;
-        }
-
-        newly_flagged
-    }
-
-    /// Persist the runtime-learned ignore-set to the settings KV as a JSON
-    /// array. Best-effort: a storage error is logged, never propagated.
-    pub(in crate::agent) async fn persist_required_tool_choice_ignored(&self, models: &[String]) {
-        match serde_json::to_string(models) {
-            Ok(json) => {
-                if let Err(e) = self
-                    .state
-                    .set_setting(Self::REQUIRED_TOOL_CHOICE_IGNORED_KEY, &json)
-                    .await
-                {
-                    warn!(error = %e, "Failed to persist required_tool_choice_ignored_models");
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to serialize required_tool_choice_ignored_models");
-            }
-        }
-    }
-
-    /// Test-only: clear the in-memory ignore-set so a subsequent
-    /// `load_required_tool_choice_ignored()` exercises the persisted-KV path.
-    #[cfg(test)]
-    pub(crate) async fn clear_required_tool_choice_ignored_in_memory(&self) {
-        self.required_tool_choice_ignored_models
-            .write()
-            .await
-            .clear();
-    }
-
-    /// Merge any persisted runtime-learned ignore-set entries into the
-    /// in-memory set (which was already seeded from config at construction).
-    /// Call once at startup, after the Agent is built. Best-effort.
-    pub(crate) async fn load_required_tool_choice_ignored(&self) {
-        let raw = match self
-            .state
-            .get_setting(Self::REQUIRED_TOOL_CHOICE_IGNORED_KEY)
-            .await
-        {
-            Ok(Some(raw)) => raw,
-            Ok(None) => return,
-            Err(e) => {
-                warn!(error = %e, "Failed to load required_tool_choice_ignored_models");
-                return;
-            }
-        };
-
-        match serde_json::from_str::<Vec<String>>(&raw) {
-            Ok(persisted) => {
-                let mut set = self.required_tool_choice_ignored_models.write().await;
-                for m in persisted {
-                    set.insert(m);
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to parse persisted required_tool_choice_ignored_models");
-            }
-        }
-    }
-
-    /// Attempt an LLM call with error-classified recovery:
-    /// - RateLimit → exponential backoff retries, then cascade fallback
-    /// - BadRequest/ServerError with vision blocks → text-only strip retry once
-    /// - Timeout/Network/ServerError → exponential backoff retries, then cascade fallback
-    /// - MalformedResponse(Parse) → exponential backoff retries, then cascade fallback
-    /// - MalformedResponse(Shape/Unknown) → single retry (no cascade fallback)
-    /// - NotFound → cascade fallback immediately
-    /// - Billing → cached skip + cascade fallback (avoids repeated 402s)
-    /// - Auth → return user-facing error immediately
-    ///
-    /// Cascade fallback now means:
-    /// 1. Other models on the current provider
-    /// 2. Configured failover providers and their model chains
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn call_llm_with_recovery(
-        &self,
-        provider: Arc<dyn ModelProvider>,
-        router: Option<Router>,
-        model: &str,
-        messages: &[Value],
-        tool_defs: &[Value],
-        options: &ChatOptions,
-        telemetry: &mut LlmCallTelemetry,
-        pin_model: Option<&str>,
-    ) -> anyhow::Result<crate::traits::ProviderResponse> {
-        // Default telemetry: first attempt, no fallback, on the requested model.
-        // Recovery paths below mutate this as they retry/cascade.
-        telemetry.final_model = model.to_string();
-        telemetry.fell_back = false;
-        telemetry.attempts = 1;
-
-        // --- Billing failure cache: skip models that recently 402'd ---
-        {
-            let cache = self.billing_failed_models.read().await;
-            if let Some(failed_at) = cache.get(model) {
-                if failed_at.elapsed() < Self::BILLING_FAIL_CACHE_TTL {
-                    info!(
-                        model,
-                        elapsed_secs = failed_at.elapsed().as_secs(),
-                        ttl_secs = Self::BILLING_FAIL_CACHE_TTL.as_secs(),
-                        "Skipping model — cached billing failure, cascading to fallback"
-                    );
-                    let billing_err = ProviderError {
-                        kind: ProviderErrorKind::Billing,
-                        status: Some(402),
-                        message: format!("Cached billing failure for {model}"),
-                        retry_after_secs: None,
-                        affordable_tokens: None,
-                        malformed_reason: None,
-                    };
-                    if options.single_attempt_fail_closed {
-                        let message = billing_err.user_message();
-                        return Err(anyhow::Error::new(billing_err).context(message));
-                    }
-                    return self
-                        .cascade_fallback(
-                            &provider,
-                            router.as_ref(),
-                            model,
-                            messages,
-                            tool_defs,
-                            options,
-                            &billing_err,
-                            telemetry,
-                            pin_model,
-                        )
-                        .await;
-                }
-            }
-        }
-
-        match provider
-            .chat_with_options(model, messages, tool_defs, options)
-            .await
-        {
-            Ok(resp) => {
-                // Config works — stamp as last known good (best-effort, non-blocking)
-                self.stamp_lastgood().await;
-                Ok(resp)
-            }
-            Err(e) => {
-                // Try to downcast to our classified ProviderError
-                let provider_err = match e.downcast::<ProviderError>() {
-                    Ok(pe) => pe,
-                    Err(other) => return Err(other), // not a provider error, propagate
-                };
-
-                warn!(
-                    kind = ?provider_err.kind,
-                    status = ?provider_err.status,
-                    "LLM call failed: {}",
-                    provider_err
-                );
-                let recovery_route =
-                    provider_err.recovery_route(options.single_attempt_fail_closed);
-                if recovery_route == ProviderRecoveryRoute::Fail {
-                    warn!(
-                        model,
-                        single_attempt_fail_closed = options.single_attempt_fail_closed,
-                        kind = ?provider_err.kind,
-                        "Provider recovery graph reached a terminal state"
-                    );
-                    return Err(provider_err.into());
-                }
-                let provider_label =
-                    provider_kind_metric_label(self.llm_runtime.snapshot().provider_kind());
-
-                match recovery_route {
-                    // --- Billing (402): try reduced max_tokens first, then cascade ---
-                    // If the 402 tells us how many tokens we can afford, retry the
-                    // same model with a reduced cap. This avoids falling back to a
-                    // weaker free model when the primary still has partial budget.
-                    ProviderRecoveryRoute::RetryReducedBudgetThenFallback => {
-                        const MIN_USEFUL_TOKENS: u32 = 512;
-                        if let Some(affordable) = provider_err.affordable_tokens {
-                            if affordable >= MIN_USEFUL_TOKENS
-                                && options.max_tokens_override.is_none()
-                            {
-                                // Leave a small margin so the request fits comfortably.
-                                let reduced = affordable.saturating_sub(100).max(MIN_USEFUL_TOKENS);
-                                info!(
-                                    model,
-                                    affordable,
-                                    reduced,
-                                    "Billing 402 with affordable tokens — retrying with reduced max_tokens"
-                                );
-                                let mut reduced_options = options.clone();
-                                reduced_options.max_tokens_override = Some(reduced);
-                                telemetry.attempts += 1;
-                                match tokio::time::timeout(
-                                    Self::CASCADE_ATTEMPT_TIMEOUT,
-                                    provider.chat_with_options(
-                                        model,
-                                        messages,
-                                        tool_defs,
-                                        &reduced_options,
-                                    ),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(resp)) => {
-                                        self.stamp_lastgood().await;
-                                        return Ok(resp);
-                                    }
-                                    Ok(Err(retry_err)) => {
-                                        warn!(
-                                            model,
-                                            reduced,
-                                            error = %retry_err,
-                                            "Reduced max_tokens retry also failed; cascading to fallback"
-                                        );
-                                    }
-                                    Err(_elapsed) => {
-                                        warn!(
-                                            model,
-                                            reduced,
-                                            timeout_secs = Self::CASCADE_ATTEMPT_TIMEOUT.as_secs(),
-                                            "Reduced max_tokens retry timed out; cascading to fallback"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // Cache the billing failure so subsequent iterations skip this model.
-                        {
-                            let mut cache = self.billing_failed_models.write().await;
-                            cache.insert(model.to_string(), Instant::now());
-                            // Prune expired entries while we hold the lock.
-                            cache.retain(|_, t| t.elapsed() < Self::BILLING_FAIL_CACHE_TTL);
-                        }
-
-                        warn!("Billing error on primary model, trying cascade fallback");
-                        self.cascade_fallback(
-                            &provider,
-                            router.as_ref(),
-                            model,
-                            messages,
-                            tool_defs,
-                            options,
-                            &provider_err,
-                            telemetry,
-                            pin_model,
-                        )
-                        .await
-                    }
-                    ProviderRecoveryRoute::AdaptRequestOnce => {
-                        if crate::providers::multimodal::messages_contain_multimodal_blocks(
-                            messages,
-                        ) {
-                            telemetry.attempts += 1;
-                        }
-                        if let Some(resp) = self
-                            .try_text_only_vision_fallback(
-                                &provider, model, messages, tool_defs, options,
-                            )
-                            .await
-                        {
-                            return Ok(resp);
-                        }
-                        if *options != ChatOptions::default() {
-                            warn!(
-                                model,
-                                response_mode = ?options.response_mode,
-                                tool_choice = ?options.tool_choice,
-                                "Provider rejected advanced chat options; retrying once with default options"
-                            );
-                            telemetry.attempts += 1;
-                            match provider.chat(model, messages, tool_defs).await {
-                                Ok(resp) => {
-                                    self.stamp_lastgood().await;
-                                    return Ok(resp);
-                                }
-                                Err(retry_err) => {
-                                    warn!(
-                                        model,
-                                        error = %retry_err,
-                                        "Fallback retry without advanced options also failed"
-                                    );
-                                }
-                            }
-                        }
-                        {
-                            let message = provider_err.user_message();
-                            Err(anyhow::Error::new(provider_err).context(message))
-                        }
-                    }
-
-                    // --- Rate limit: exponential backoff, then cascade fallback ---
-                    ProviderRecoveryRoute::RetryRateLimitThenFallback => {
-                        let base_wait = provider_err.retry_after_secs.unwrap_or(5);
-                        for attempt in 0..Self::MAX_LLM_RETRIES {
-                            let wait = crate::backoff::exponential_backoff(
-                                Duration::from_secs(base_wait),
-                                attempt,
-                                Duration::from_secs(120),
-                            )
-                            .as_secs();
-                            info!(
-                                wait_secs = wait,
-                                attempt = attempt + 1,
-                                max = Self::MAX_LLM_RETRIES,
-                                "Rate limited, waiting before retry"
-                            );
-                            tokio::time::sleep(Duration::from_secs(wait)).await;
-                            telemetry.attempts += 1;
-                            match provider
-                                .chat_with_options(model, messages, tool_defs, options)
-                                .await
-                            {
-                                Ok(resp) => {
-                                    self.stamp_lastgood().await;
-                                    return Ok(resp);
-                                }
-                                Err(_) => continue,
-                            }
-                        }
-                        // All retries exhausted — cascade through fallback models
-                        warn!("Rate limit retries exhausted, trying cascade fallback");
-                        self.cascade_fallback(
-                            &provider,
-                            router.as_ref(),
-                            model,
-                            messages,
-                            tool_defs,
-                            options,
-                            &provider_err,
-                            telemetry,
-                            pin_model,
-                        )
-                        .await
-                    }
-
-                    // --- Timeout / Network / Server: exponential backoff, then cascade ---
-                    ProviderRecoveryRoute::RetryTransientThenFallback => {
-                        if provider_err.kind == ProviderErrorKind::ServerError {
-                            if let Some(resp) = self
-                                .try_text_only_vision_fallback(
-                                    &provider, model, messages, tool_defs, options,
-                                )
-                                .await
-                            {
-                                return Ok(resp);
-                            }
-                        }
-                        // Before any tool work has committed, a transient
-                        // outage is cheap to wait out: use the longer bounded
-                        // ladder (2+4+8+16+30s ≈ 60s, jittered). Once work has
-                        // committed, keep the short ladder so a half-done task
-                        // closes from its receipts instead of idling.
-                        let max_retries = if options.uncommitted_work {
-                            Self::MAX_LLM_RETRIES_UNCOMMITTED
-                        } else {
-                            Self::MAX_LLM_RETRIES
-                        };
-                        for attempt in 0..max_retries {
-                            let wait = crate::backoff::jittered_delay(
-                                crate::backoff::exponential_backoff(
-                                    Duration::from_secs(Self::RETRY_BASE_DELAY_SECS),
-                                    attempt,
-                                    Duration::from_secs(Self::TRANSIENT_RETRY_MAX_DELAY_SECS),
-                                ),
-                                0.2,
-                            );
-                            info!(
-                                wait_secs = wait.as_secs(),
-                                attempt = attempt + 1,
-                                max = max_retries,
-                                uncommitted_work = options.uncommitted_work,
-                                "Retrying after transient error"
-                            );
-                            tokio::time::sleep(wait).await;
-                            telemetry.attempts += 1;
-                            match provider
-                                .chat_with_options(model, messages, tool_defs, options)
-                                .await
-                            {
-                                Ok(resp) => {
-                                    self.stamp_lastgood().await;
-                                    return Ok(resp);
-                                }
-                                Err(_) => continue,
-                            }
-                        }
-                        // All retries exhausted — cascade through fallback models
-                        warn!("Transient error retries exhausted, trying cascade fallback");
-                        self.cascade_fallback(
-                            &provider,
-                            router.as_ref(),
-                            model,
-                            messages,
-                            tool_defs,
-                            options,
-                            &provider_err,
-                            telemetry,
-                            pin_model,
-                        )
-                        .await
-                    }
-
-                    // --- Malformed payload: reason-aware recovery ---
-                    ProviderRecoveryRoute::RetryMalformedThenFallback
-                    | ProviderRecoveryRoute::RetryMalformedThenFail => {
-                        let reason = malformed_reason_label(provider_err.malformed_reason);
-                        record_llm_payload_invalid_metric(provider_label, model, reason);
-
-                        if recovery_route == ProviderRecoveryRoute::RetryMalformedThenFallback {
-                            // Parse failures can be transient (gateway/proxy/body corruption).
-                            // Use the same resilient policy as other transient provider failures.
-                            let retry_result = self
-                                .retry_malformed_response(
-                                    &provider,
-                                    model,
-                                    messages,
-                                    tool_defs,
-                                    options,
-                                    provider_label,
-                                    Self::MAX_LLM_RETRIES,
-                                    |attempt| {
-                                        crate::backoff::exponential_backoff(
-                                            Duration::from_secs(Self::RETRY_BASE_DELAY_SECS),
-                                            attempt,
-                                            Duration::MAX,
-                                        )
-                                        .as_secs()
-                                    },
-                                    "parse_exponential_backoff",
-                                )
-                                .await?;
-                            if let Some(resp) = retry_result {
-                                return Ok(resp);
-                            }
-                            warn!("Malformed parse retries exhausted, trying cascade fallback");
-                            return self
-                                .cascade_fallback(
-                                    &provider,
-                                    router.as_ref(),
-                                    model,
-                                    messages,
-                                    tool_defs,
-                                    options,
-                                    &provider_err,
-                                    telemetry,
-                                    pin_model,
-                                )
-                                .await;
-                        }
-
-                        // Shape/unknown malformed responses are likely deterministic schema issues.
-                        // Retry once quickly, then fail fast without model cascade.
-                        let retry_result = self
-                            .retry_malformed_response(
-                                &provider,
-                                model,
-                                messages,
-                                tool_defs,
-                                options,
-                                provider_label,
-                                Self::MAX_MALFORMED_PAYLOAD_RETRIES,
-                                |_| Self::MALFORMED_PAYLOAD_RETRY_DELAY_SECS,
-                                "shape_or_unknown_single_retry",
-                            )
-                            .await?;
-                        if let Some(resp) = retry_result {
-                            return Ok(resp);
-                        }
-
-                        {
-                            let message = provider_err.user_message();
-                            Err(anyhow::Error::new(provider_err).context(message))
-                        }
-                    }
-
-                    // --- NotFound (bad model name): cascade fallback immediately ---
-                    ProviderRecoveryRoute::Fallback => {
-                        warn!(
-                            bad_model = model,
-                            "Model not found, trying cascade fallback"
-                        );
-                        self.cascade_fallback(
-                            &provider,
-                            router.as_ref(),
-                            model,
-                            messages,
-                            tool_defs,
-                            options,
-                            &provider_err,
-                            telemetry,
-                            pin_model,
-                        )
-                        .await
-                    }
-
-                    ProviderRecoveryRoute::Fail => {
-                        unreachable!("terminal provider recovery routes return before dispatch")
-                    }
-                }
-            }
-        }
-    }
-}
+//! A turn's model calls with the daemon's recovery live in `aidaemon-runtime`
+//! ([`aidaemon_runtime::llm::turn_calls`]).
 
 #[cfg(test)]
+pub(in crate::agent) use aidaemon_runtime::llm::turn_calls::*;
+#[cfg(test)]
 mod tests {
+    use aidaemon_runtime::host::TurnHost as _;
     use std::sync::Arc;
     use std::time::Instant;
 
-    use async_trait::async_trait;
     use serde_json::Value;
     use tokio::sync::Mutex;
 
     use crate::llm_runtime::ProviderRuntimeTarget;
     use crate::providers::ProviderError;
-    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::testing::{MockProvider, setup_test_agent};
     use crate::traits::store_prelude::*;
-    use crate::traits::{
-        ChatOptions, Goal, Mandate, MandateAuthority, ModelProvider, ProviderResponse, Task,
-    };
+    use crate::traits::{ChatOptions, Goal, Mandate, MandateAuthority, ProviderResponse, Task};
 
     struct ScriptedProvider {
         responses: Mutex<Vec<anyhow::Result<ProviderResponse>>>,
@@ -870,19 +36,10 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl ModelProvider for ScriptedProvider {
-        async fn chat(
-            &self,
-            model: &str,
-            messages: &[Value],
-            tools: &[Value],
-        ) -> anyhow::Result<ProviderResponse> {
-            self.chat_with_options(model, messages, tools, &ChatOptions::default())
-                .await
-        }
+    crate::testing::chat_json_provider!(ScriptedProvider);
 
-        async fn chat_with_options(
+    impl ScriptedProvider {
+        async fn respond(
             &self,
             model: &str,
             _messages: &[Value],
@@ -895,10 +52,6 @@ mod tests {
                 return Err(ProviderError::from_status(500, "script exhausted").into());
             }
             responses.remove(0)
-        }
-
-        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-            Ok(vec!["scripted-model".to_string()])
         }
     }
 
@@ -926,6 +79,49 @@ mod tests {
         );
     }
 
+    /// A test agent whose side calls go through a gateway over `provider`,
+    /// and the event store that gateway records into.
+    async fn agent_with(
+        provider: crate::llm_runtime::ModelBackend,
+    ) -> (crate::testing::TestHarness, Arc<crate::events::EventStore>) {
+        let mut harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("build test harness");
+        let (gateway, events) =
+            crate::llm_runtime::gateway::test_support::gateway_with(provider).await;
+        harness.agent.set_test_side_calls(gateway);
+        (harness, events)
+    }
+
+    #[tokio::test]
+    async fn interpretation_is_recorded_and_falls_back_to_none_on_failure() {
+        use crate::llm_runtime::gateway::test_support::{
+            failed_calls, ok_calls, provider_answering, provider_failing,
+        };
+
+        let (harness, events) = agent_with(provider_answering("12 files matched.")).await;
+        assert_eq!(
+            harness
+                .agent
+                .interpret_background_result("rg -c TODO", "12")
+                .await
+                .as_deref(),
+            Some("12 files matched.")
+        );
+        assert_eq!(ok_calls(&events, "background_interpretation").await, 1);
+
+        let (harness, events) = agent_with(provider_failing("503")).await;
+        assert_eq!(
+            harness
+                .agent
+                .interpret_background_result("rg -c TODO", "12")
+                .await,
+            None
+        );
+        assert!(failed_calls(&events, "background_interpretation").await >= 1);
+        assert_eq!(ok_calls(&events, "background_interpretation").await, 0);
+    }
+
     #[tokio::test]
     async fn interpret_background_result_falls_back_to_none_on_empty() {
         // Empty model output → None, so the caller falls back to the raw result
@@ -944,6 +140,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hanging_primary_falls_back_within_its_own_deadline() {
+        /// Never answers.
+        struct Hanging;
+
+        #[async_trait::async_trait]
+        impl aidaemon_core::Provider for Hanging {
+            fn name(&self) -> &str {
+                "hanging"
+            }
+
+            async fn complete(
+                &self,
+                _: &aidaemon_core::ModelRequest,
+            ) -> Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError> {
+                std::future::pending().await
+            }
+        }
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("build test harness");
+        let alternate = Arc::new(ScriptedProvider::with_results(vec![Ok(
+            MockProvider::text_response("Answered by the failover provider"),
+        )]));
+        let hanging: crate::llm_runtime::ModelBackend = Arc::new(Hanging);
+        harness.agent.llm_runtime().swap(
+            hanging.clone(),
+            None,
+            crate::config::ProviderKind::OpenaiCompatible,
+            "primary-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                alternate.clone() as crate::llm_runtime::ModelBackend,
+                None,
+                crate::config::ProviderKind::Anthropic,
+                "secondary-model".to_string(),
+            )],
+            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+        );
+
+        // No other model on the hanging provider: the chain is the primary,
+        // then the failover provider.
+        *harness.agent.fallback_model_lock().write().await = "primary-model".to_string();
+
+        let mut telemetry = super::LlmCallTelemetry::default();
+        let started = std::time::Instant::now();
+        let response = super::call_llm_with_recovery(
+            &harness.agent,
+            hanging,
+            None,
+            "primary-model",
+            &[],
+            &[],
+            &ChatOptions::default(),
+            &mut telemetry,
+            None,
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect("the failover provider answers");
+        assert_eq!(
+            response.content.as_deref(),
+            Some("Answered by the failover provider")
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the primary must give up at its own deadline, took {:?}",
+            started.elapsed()
+        );
+        assert!(telemetry.fell_back);
+        assert_eq!(telemetry.final_model, "secondary-model");
+        assert_eq!(alternate.models_called().await, vec!["secondary-model"]);
+    }
+
+    #[tokio::test]
     async fn recovery_can_failover_to_another_provider() {
         let harness = setup_test_agent(MockProvider::new())
             .await
@@ -959,34 +229,35 @@ mod tests {
             MockProvider::text_response("Recovered via failover provider"),
         )]));
 
-        harness.agent.llm_runtime.swap(
-            primary_provider.clone() as Arc<dyn ModelProvider>,
+        harness.agent.llm_runtime().swap(
+            primary_provider.clone() as crate::llm_runtime::ModelBackend,
             None,
             crate::config::ProviderKind::OpenaiCompatible,
             "primary-model".to_string(),
             vec![ProviderRuntimeTarget::new(
-                alternate_provider.clone() as Arc<dyn ModelProvider>,
+                alternate_provider.clone() as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::Anthropic,
                 "secondary-model".to_string(),
             )],
+            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
         );
 
         let mut telemetry = super::LlmCallTelemetry::default();
-        let resp = harness
-            .agent
-            .call_llm_with_recovery(
-                primary_provider as Arc<dyn ModelProvider>,
-                None,
-                "primary-model",
-                &[],
-                &[],
-                &ChatOptions::default(),
-                &mut telemetry,
-                None,
-            )
-            .await
-            .expect("recover via alternate provider");
+        let resp = super::call_llm_with_recovery(
+            &harness.agent,
+            primary_provider as crate::llm_runtime::ModelBackend,
+            None,
+            "primary-model",
+            &[],
+            &[],
+            &ChatOptions::default(),
+            &mut telemetry,
+            None,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("recover via alternate provider");
 
         assert_eq!(
             resp.content.as_deref(),
@@ -1003,6 +274,147 @@ mod tests {
             "expected multiple attempts, got {}",
             telemetry.attempts
         );
+    }
+
+    fn plan_cap(resets_at: std::time::SystemTime) -> ProviderError {
+        let mut error = ProviderError::from_status(429, "The usage limit has been reached");
+        error.kind = crate::providers::ProviderErrorKind::QuotaExhausted;
+        error.resets_at = Some(resets_at);
+        error
+    }
+
+    /// A capped plan: the primary account's other models are not sent (its
+    /// guard answers for them), no backoff is spent, and another provider
+    /// answers.
+    #[tokio::test]
+    async fn a_capped_plan_moves_to_another_provider_without_waiting() {
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("build test harness");
+        let reset = std::time::SystemTime::now() + std::time::Duration::from_secs(7200);
+        let primary_inner = Arc::new(ScriptedProvider::with_results(vec![
+            Err(plan_cap(reset).into()),
+            Ok(MockProvider::text_response(
+                "the capped account must not be sent",
+            )),
+        ]));
+        let primary: crate::llm_runtime::ModelBackend =
+            Arc::new(aidaemon_core::QuotaGuard::from_arc(primary_inner.clone()));
+        let alternate = Arc::new(ScriptedProvider::with_results(vec![Ok(
+            MockProvider::text_response("answered by the other provider"),
+        )]));
+        let router = crate::router::Router::new(crate::config::ModelsConfig {
+            default_model: "plan-model".into(),
+            fallback_models: vec!["plan-model-small".into(), "plan-model-mini".into()],
+            ..Default::default()
+        });
+        harness.agent.llm_runtime().swap(
+            primary.clone(),
+            Some(router.clone()),
+            crate::config::ProviderKind::OpenaiChatgpt,
+            "plan-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                alternate.clone() as crate::llm_runtime::ModelBackend,
+                None,
+                crate::config::ProviderKind::Anthropic,
+                "other-model".to_string(),
+            )],
+            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+        );
+
+        let started = Instant::now();
+        let mut telemetry = super::LlmCallTelemetry::default();
+        let response = super::call_llm_with_recovery(
+            &harness.agent,
+            primary,
+            Some(router),
+            "plan-model",
+            &[],
+            &[],
+            &ChatOptions::default(),
+            &mut telemetry,
+            None,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("another provider answers");
+
+        assert_eq!(
+            response.content.as_deref(),
+            Some("answered by the other provider")
+        );
+        assert_eq!(
+            primary_inner.models_called().await,
+            vec!["plan-model".to_string()]
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(telemetry.final_model, "other-model");
+    }
+
+    /// When every other provider fails too, the plan cap and its reset are
+    /// the reported failure, and what the fallback said follows it.
+    #[tokio::test]
+    async fn a_capped_plan_is_the_reported_failure_when_fallbacks_fail() {
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("build test harness");
+        let reset = std::time::SystemTime::now() + std::time::Duration::from_secs(7200);
+        let primary: crate::llm_runtime::ModelBackend =
+            Arc::new(aidaemon_core::QuotaGuard::from_arc(Arc::new(
+                ScriptedProvider::with_results(vec![Err(plan_cap(reset).into())]),
+            )));
+        let broke = Arc::new(ScriptedProvider::with_results(vec![Err(
+            ProviderError::from_status(402, "insufficient credits").into(),
+        )]));
+        harness.agent.llm_runtime().swap(
+            primary.clone(),
+            None,
+            crate::config::ProviderKind::OpenaiChatgpt,
+            "plan-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                broke as crate::llm_runtime::ModelBackend,
+                None,
+                crate::config::ProviderKind::OpenaiCompatible,
+                "broke-model".to_string(),
+            )],
+            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+        );
+
+        let mut telemetry = super::LlmCallTelemetry::default();
+        let error = super::call_llm_with_recovery(
+            &harness.agent,
+            primary,
+            None,
+            "plan-model",
+            &[],
+            &[],
+            &ChatOptions::default(),
+            &mut telemetry,
+            None,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect_err("every provider fails");
+
+        let typed = error
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(
+            typed.kind,
+            crate::providers::ProviderErrorKind::QuotaExhausted
+        );
+        assert_eq!(typed.resets_at, Some(reset));
+        let message = error.to_string();
+        assert!(
+            // "resets at 14:00" or, past midnight, "resets on Nov 8 at 00:00".
+            message.contains("usage limit has been reached; it resets "),
+            "{message}"
+        );
+        assert!(
+            message.contains("fallback providers also failed"),
+            "{message}"
+        );
+        assert!(message.contains("billing"), "{message}");
     }
 
     #[tokio::test]
@@ -1087,16 +499,18 @@ mod tests {
                 .unwrap()
                 .0
         );
-        assert!(harness
-            .state
-            .mark_mandate_run_token_lease_dispatched(
-                &run.id,
-                &mandate.id,
-                mandate.version,
-                "one-provider-attempt",
-            )
-            .await
-            .unwrap());
+        assert!(
+            harness
+                .state
+                .mark_mandate_run_token_lease_dispatched(
+                    &run.id,
+                    &mandate.id,
+                    mandate.version,
+                    "one-provider-attempt",
+                )
+                .await
+                .unwrap()
+        );
         let provider = Arc::new(ScriptedProvider::with_results(vec![
             Err(ProviderError::from_status(500, "ambiguous provider failure").into()),
             Ok(MockProvider::text_response("retry must not run")),
@@ -1108,19 +522,19 @@ mod tests {
         };
         let mut telemetry = super::LlmCallTelemetry::default();
 
-        let result = harness
-            .agent
-            .call_llm_with_recovery(
-                provider.clone() as Arc<dyn ModelProvider>,
-                None,
-                "primary-model",
-                &[],
-                &[],
-                &options,
-                &mut telemetry,
-                None,
-            )
-            .await;
+        let result = super::call_llm_with_recovery(
+            &harness.agent,
+            provider.clone() as crate::llm_runtime::ModelBackend,
+            None,
+            "primary-model",
+            &[],
+            &[],
+            &options,
+            &mut telemetry,
+            None,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
 
         assert!(result.is_err());
         assert_eq!(provider.models_called().await.len(), 1);
@@ -1145,21 +559,22 @@ mod tests {
         let alternate = Arc::new(ScriptedProvider::with_results(vec![Ok(
             MockProvider::text_response("fallback must not run"),
         )]));
-        harness.agent.llm_runtime.swap(
-            primary.clone() as Arc<dyn ModelProvider>,
+        harness.agent.llm_runtime().swap(
+            primary.clone() as crate::llm_runtime::ModelBackend,
             None,
             crate::config::ProviderKind::OpenaiCompatible,
             "primary-model".to_string(),
             vec![ProviderRuntimeTarget::new(
-                alternate.clone() as Arc<dyn ModelProvider>,
+                alternate.clone() as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::Anthropic,
                 "secondary-model".to_string(),
             )],
+            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
         );
         harness
             .agent
-            .billing_failed_models
+            .billing_failed_models()
             .write()
             .await
             .insert("primary-model".to_string(), Instant::now());
@@ -1170,10 +585,66 @@ mod tests {
         };
         let mut telemetry = super::LlmCallTelemetry::default();
 
-        let result = harness
-            .agent
-            .call_llm_with_recovery(
-                primary.clone() as Arc<dyn ModelProvider>,
+        let result = super::call_llm_with_recovery(
+            &harness.agent,
+            primary.clone() as crate::llm_runtime::ModelBackend,
+            None,
+            "primary-model",
+            &[],
+            &[],
+            &options,
+            &mut telemetry,
+            None,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(primary.models_called().await.is_empty());
+        assert!(alternate.models_called().await.is_empty());
+    }
+
+    /// A budget-fenced call (one physical attempt per model) still reaches
+    /// the configured fallback when the primary refused before doing any
+    /// work; an error that may have been paid for still ends the call.
+    #[tokio::test]
+    async fn fenced_call_falls_back_only_past_an_unspent_refusal() {
+        async fn run(primary_error: ProviderError) -> (bool, usize, usize, bool) {
+            let harness = setup_test_agent(MockProvider::new())
+                .await
+                .expect("build test harness");
+            // The primary account's other models answer the same way.
+            let primary = Arc::new(ScriptedProvider::with_results(
+                (0..8)
+                    .map(|_| Err(primary_error.clone().into()))
+                    .collect::<Vec<_>>(),
+            ));
+            let alternate = Arc::new(ScriptedProvider::with_results(vec![Ok(
+                MockProvider::text_response("from the fallback"),
+            )]));
+            harness.agent.llm_runtime().swap(
+                primary.clone() as crate::llm_runtime::ModelBackend,
+                None,
+                crate::config::ProviderKind::OpenaiCompatible,
+                "primary-model".to_string(),
+                vec![ProviderRuntimeTarget::new(
+                    alternate.clone() as crate::llm_runtime::ModelBackend,
+                    None,
+                    crate::config::ProviderKind::Anthropic,
+                    "secondary-model".to_string(),
+                )],
+                crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+            );
+            let options = ChatOptions {
+                max_tokens_override: Some(100),
+                single_attempt_fail_closed: true,
+                fallback_when_unspent: true,
+                ..ChatOptions::default()
+            };
+            let mut telemetry = super::LlmCallTelemetry::default();
+            let result = super::call_llm_with_recovery(
+                &harness.agent,
+                primary.clone() as crate::llm_runtime::ModelBackend,
                 None,
                 "primary-model",
                 &[],
@@ -1181,11 +652,93 @@ mod tests {
                 &options,
                 &mut telemetry,
                 None,
+                std::time::Duration::from_secs(60),
             )
             .await;
+            let spent_nothing = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<ProviderError>())
+                .is_some_and(|error| error.spent_nothing);
+            (
+                result.is_ok(),
+                primary.models_called().await.len().min(1),
+                alternate.models_called().await.len(),
+                spent_nothing,
+            )
+        }
 
-        assert!(result.is_err());
-        assert!(primary.models_called().await.is_empty());
-        assert!(alternate.models_called().await.is_empty());
+        let mut quota = ProviderError::from_status(429, "usage limit reached");
+        quota.kind = crate::providers::ProviderErrorKind::QuotaExhausted;
+        assert_eq!(run(quota).await, (true, 1, 1, false));
+        assert_eq!(
+            run(ProviderError::from_status(401, "bad key")).await,
+            (true, 1, 1, false)
+        );
+        let (ok, primary, alternate, spent_nothing) =
+            run(ProviderError::from_status(503, "overloaded")).await;
+        assert_eq!((ok, primary, alternate), (false, 1, 0));
+        assert!(!spent_nothing, "a server error may have been paid for");
+    }
+
+    /// Mandate reviews are postponed only while no configured model can
+    /// answer: one used-up account is not enough when another can.
+    #[tokio::test]
+    async fn no_model_can_answer_only_when_every_account_is_cooling_down() {
+        use aidaemon_core::Provider as _;
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("build test harness");
+        let used_up = |reset: std::time::SystemTime| {
+            Arc::new(aidaemon_core::QuotaGuard::new(
+                aidaemon_core::testing::ScriptedProvider::with_results(vec![Err(
+                    aidaemon_core::ProviderError::QuotaExhausted {
+                        message: "limit".into(),
+                        resets_at: Some(reset),
+                        per_model: false,
+                        in_stream: false,
+                    },
+                )]),
+            ))
+        };
+        let soon = std::time::SystemTime::now() + std::time::Duration::from_secs(600);
+        let later = soon + std::time::Duration::from_secs(600);
+        let primary = used_up(later);
+        let alternate = used_up(soon);
+        harness.agent.llm_runtime().swap(
+            primary.clone() as crate::llm_runtime::ModelBackend,
+            None,
+            crate::config::ProviderKind::OpenaiCompatible,
+            "primary-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                alternate.clone() as crate::llm_runtime::ModelBackend,
+                None,
+                crate::config::ProviderKind::Anthropic,
+                "secondary-model".to_string(),
+            )],
+            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+        );
+        let request = |model: &str| aidaemon_core::ModelRequest {
+            model: model.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            harness.agent.llm_runtime().snapshot().next_answer_at(),
+            None
+        );
+        let _ = primary.complete(&request("primary-model")).await;
+        assert_eq!(
+            harness.agent.llm_runtime().snapshot().next_answer_at(),
+            None,
+            "the alternate can"
+        );
+        let _ = alternate.complete(&request("secondary-model")).await;
+        let at = harness
+            .agent
+            .llm_runtime()
+            .snapshot()
+            .next_answer_at()
+            .expect("nobody can");
+        assert!(at <= soon && at > soon - std::time::Duration::from_secs(5));
     }
 }

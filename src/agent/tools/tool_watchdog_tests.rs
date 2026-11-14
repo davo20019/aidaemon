@@ -1,5 +1,5 @@
 use super::*;
-use crate::testing::{setup_test_agent, MockProvider};
+use crate::testing::{MockProvider, setup_test_agent};
 use crate::traits::store_prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
@@ -26,11 +26,21 @@ impl Tool for SlowTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        Ok("done".to_string())
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok("done".to_string())
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
+
+impl crate::traits::ToolSemantics for SlowTool {}
 
 struct SlowCliAgentTool;
 
@@ -55,14 +65,33 @@ impl Tool for SlowCliAgentTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        Ok("ok".to_string())
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok("ok".to_string())
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl crate::traits::ToolSemantics for SlowCliAgentTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            manages_own_timeout: true,
+            ..Default::default()
+        }
     }
 }
 
 struct EchoSpawnAgentTool;
 
+/// Stands in for `http_request`, a tool a mandate may delegate, and records
+/// each mutation it is allowed to make.
 struct MandateMutationSpy {
     calls: Arc<AtomicUsize>,
     saw_mandate_preapproval: Arc<AtomicBool>,
@@ -78,7 +107,7 @@ struct MandateTestFence {
 #[async_trait::async_trait]
 impl Tool for MandateMutationSpy {
     fn name(&self) -> &str {
-        "mandate_mutation_spy"
+        "http_request"
     }
 
     fn description(&self) -> &str {
@@ -98,6 +127,24 @@ impl Tool for MandateMutationSpy {
         })
     }
 
+    async fn execute(
+        &self,
+        arguments: &str,
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let exec_ctx = facts.clone();
+
+        self.saw_mandate_preapproval
+            .store(exec_ctx.mandate_preapproved, AtomicOrdering::SeqCst);
+        let _ = arguments;
+        self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            "mutated".to_string(),
+        ))
+    }
+}
+
+impl crate::traits::ToolSemantics for MandateMutationSpy {
     fn call_semantics(&self, _arguments: &str) -> crate::traits::ToolCallSemantics {
         crate::traits::ToolCallSemantics::mutation_with(
             crate::traits::ToolMutationEffects::REMOTE_MUTATION,
@@ -106,24 +153,6 @@ impl Tool for MandateMutationSpy {
             crate::traits::ToolTargetHintKind::Url,
             "https://api.x.com/2/tweets",
         )
-    }
-
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        self.calls.fetch_add(1, AtomicOrdering::SeqCst);
-        Ok("mutated".to_string())
-    }
-
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        exec_ctx: crate::traits::ToolExecutionContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-        self.saw_mandate_preapproval
-            .store(exec_ctx.mandate_preapproved, AtomicOrdering::SeqCst);
-        self.call(arguments)
-            .await
-            .map(crate::traits::ToolCallOutcome::from_output)
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -155,13 +184,14 @@ async fn install_active_test_mandate(
     let goal = Goal::new_continuous("Synthetic mandate", "owner-session", None, None);
     let authority = MandateAuthority {
         allow_observations: true,
-        allowed_tools: vec!["mandate_mutation_spy".to_string()],
+        allowed_tools: vec!["http_request".to_string()],
         allowed_mutation_effects: vec!["remote_mutation".to_string()],
         allowed_target_prefixes: vec!["https://api.x.com/2/".to_string()],
         operation_scopes: Vec::new(),
         max_mutating_actions_per_cycle: 1,
         max_mutating_actions_per_rolling_24h: 8,
         min_seconds_between_mutations: 900,
+        owner_alerts: false,
     };
     let mut mandate = Mandate::new(
         &goal.id,
@@ -308,10 +338,13 @@ async fn install_active_test_mandate(
     );
     let calls = Arc::new(AtomicUsize::new(0));
     let saw_mandate_preapproval = Arc::new(AtomicBool::new(false));
-    harness.agent.tools.push(Arc::new(MandateMutationSpy {
-        calls: Arc::clone(&calls),
-        saw_mandate_preapproval: Arc::clone(&saw_mandate_preapproval),
-    }));
+    harness
+        .agent
+        .test_tools_mut()
+        .push(Arc::new(MandateMutationSpy {
+            calls: Arc::clone(&calls),
+            saw_mandate_preapproval: Arc::clone(&saw_mandate_preapproval),
+        }));
     (
         mandate,
         decision,
@@ -342,7 +375,7 @@ fn test_mandate_grant(
     match crate::mandates::authority::authorize_mandate_action(
         mandate,
         decision,
-        "mandate_mutation_spy",
+        "http_request",
         arguments,
         &semantics,
         &chrono::Utc::now(),
@@ -368,7 +401,7 @@ fn test_mandate_reservation(
         task_id: fence.worker_task_id.clone(),
         task_attempt_id: fence.worker_attempt.id.clone(),
         tool_call_id: format!("watchdog-mandate-call-{sequence}"),
-        tool_name: "mandate_mutation_spy".to_string(),
+        tool_name: "http_request".to_string(),
         mutation_effects: vec!["remote_mutation".to_string()],
         targets: vec![crate::traits::MandateMutationTarget {
             kind: "url".to_string(),
@@ -383,6 +416,10 @@ fn mandate_tool_ctx<'a>(
     grant: Option<&'a crate::traits::MandateAuthorityGrant>,
 ) -> ToolExecCtx<'a> {
     ToolExecCtx {
+        file_fence: None,
+        produced_files: None,
+        mcp_tool: None,
+        owner_approval_by_kernel: false,
         session_id: "owner-session",
         task_id: None,
         status_tx: None,
@@ -392,12 +429,13 @@ fn mandate_tool_ctx<'a>(
         trusted: false,
         user_role: UserRole::Owner,
         workspace_grant: None,
-        correction_preapproved: false,
-        suppress_trusted_session: false,
         mandate_authority: grant,
         tool_call_id: grant.and_then(|value| value.tool_call_id.as_deref()),
         mutation_forbidden: false,
         scope_escalation: None,
+        turn_authority: None,
+        trust_roots: None,
+        lone_root_call: false,
     }
 }
 
@@ -426,18 +464,37 @@ impl Tool for EchoSpawnAgentTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(arguments.to_string())
+    /// Echoes the arguments and the dispatcher's typed facts.
+    async fn execute(
+        &self,
+        arguments: &str,
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
+
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            json!({
+                "arguments": serde_json::from_str::<Value>(arguments)?,
+                "project_scope": facts.project_scope,
+                "session_id": facts.session_id,
+                "tool_call_id": facts.tool_call_id,
+            })
+            .to_string(),
+        ))
     }
 }
+
+impl crate::traits::ToolSemantics for EchoSpawnAgentTool {}
 
 #[tokio::test]
 async fn execute_tool_watchdog_times_out_slow_tool() {
     let mut harness = setup_test_agent(MockProvider::new())
         .await
         .expect("setup test harness");
-    harness.agent.tools.push(Arc::new(SlowTool));
-    harness.agent.limits.llm_call_timeout = Some(Duration::from_millis(30));
+    harness.agent.test_tools_mut().push(Arc::new(SlowTool));
+    harness
+        .agent
+        .set_test_llm_call_timeout(Some(Duration::from_millis(30)));
 
     let result = harness
         .agent
@@ -445,6 +502,10 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
             "slow_tool",
             "{}",
             &ToolExecCtx {
+                file_fence: None,
+                produced_files: None,
+                mcp_tool: None,
+                owner_approval_by_kernel: false,
                 session_id: "test-session",
                 task_id: Some("task-1"),
                 status_tx: None,
@@ -454,12 +515,13 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
                 trusted: false,
                 user_role: UserRole::Owner,
                 workspace_grant: None,
-                correction_preapproved: false,
-                suppress_trusted_session: false,
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
                 scope_escalation: None,
+                turn_authority: None,
+                trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
@@ -482,8 +544,13 @@ async fn execute_tool_watchdog_skips_cli_agent() {
     let mut harness = setup_test_agent(MockProvider::new())
         .await
         .expect("setup test harness");
-    harness.agent.tools.push(Arc::new(SlowCliAgentTool));
-    harness.agent.limits.llm_call_timeout = Some(Duration::from_millis(30));
+    harness
+        .agent
+        .test_tools_mut()
+        .push(Arc::new(SlowCliAgentTool));
+    harness
+        .agent
+        .set_test_llm_call_timeout(Some(Duration::from_millis(30)));
 
     let result = harness
         .agent
@@ -491,6 +558,10 @@ async fn execute_tool_watchdog_skips_cli_agent() {
             "cli_agent",
             "{}",
             &ToolExecCtx {
+                file_fence: None,
+                produced_files: None,
+                mcp_tool: None,
+                owner_approval_by_kernel: false,
                 session_id: "test-session",
                 task_id: Some("task-3"),
                 status_tx: None,
@@ -500,12 +571,13 @@ async fn execute_tool_watchdog_skips_cli_agent() {
                 trusted: false,
                 user_role: UserRole::Owner,
                 workspace_grant: None,
-                correction_preapproved: false,
-                suppress_trusted_session: false,
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
                 scope_escalation: None,
+                turn_authority: None,
+                trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
@@ -521,7 +593,9 @@ async fn execute_tool_watchdog_allows_fast_tool() {
         .expect("setup test harness");
     // system_info runs multiple subprocesses; allow a bit of slack to avoid
     // flakiness on slower/loaded machines.
-    harness.agent.limits.llm_call_timeout = Some(Duration::from_secs(5));
+    harness
+        .agent
+        .set_test_llm_call_timeout(Some(Duration::from_secs(5)));
 
     let result = harness
         .agent
@@ -529,6 +603,10 @@ async fn execute_tool_watchdog_allows_fast_tool() {
             "system_info",
             "{}",
             &ToolExecCtx {
+                file_fence: None,
+                produced_files: None,
+                mcp_tool: None,
+                owner_approval_by_kernel: false,
                 session_id: "test-session",
                 task_id: Some("task-2"),
                 status_tx: None,
@@ -538,12 +616,13 @@ async fn execute_tool_watchdog_allows_fast_tool() {
                 trusted: false,
                 user_role: UserRole::Owner,
                 workspace_grant: None,
-                correction_preapproved: false,
-                suppress_trusted_session: false,
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
                 scope_escalation: None,
+                turn_authority: None,
+                trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
@@ -556,11 +635,14 @@ async fn execute_tool_watchdog_allows_fast_tool() {
 }
 
 #[tokio::test]
-async fn execute_tool_watchdog_injects_project_scope_and_causal_tool_call_id() {
+async fn execute_tool_watchdog_hands_project_scope_and_causal_tool_call_id() {
     let mut harness = setup_test_agent(MockProvider::new())
         .await
         .expect("setup test harness");
-    harness.agent.tools.push(Arc::new(EchoSpawnAgentTool));
+    harness
+        .agent
+        .test_tools_mut()
+        .push(Arc::new(EchoSpawnAgentTool));
 
     let result = harness
         .agent
@@ -568,42 +650,53 @@ async fn execute_tool_watchdog_injects_project_scope_and_causal_tool_call_id() {
             "spawn_agent",
             r#"{"mission":"delegate log analysis","task":"inspect the logs","_project_scope":"/tmp/spoofed"}"#,
             &ToolExecCtx {
+                file_fence: None,
+                produced_files: None,
+                mcp_tool: None,
+                owner_approval_by_kernel: false,
                 session_id: "test-session",
                 task_id: Some("task-4"),
                 status_tx: None,
                 channel_visibility: ChannelVisibility::Private,
                 channel_id: None,
-                project_scope: Some("/Users/davidloor/Library/Logs/aidaemon"),
+                project_scope: Some("/tmp/aidaemon-test/logs"),
                 trusted: false,
                 user_role: UserRole::Owner,
                 workspace_grant: None,
-                correction_preapproved: false,
-                suppress_trusted_session: false,
                 mandate_authority: None,
                 tool_call_id: Some("call-parent-synthetic"),
                 mutation_forbidden: false,
                 scope_escalation: None,
+                turn_authority: None,
+                trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
         .expect("spawn_agent call should succeed");
 
-    let payload: Value = serde_json::from_str(&result).expect("spawn_agent args should be JSON");
+    let payload: Value = serde_json::from_str(&result).expect("spawn_agent echo should be JSON");
     assert_eq!(
-        payload.get("_project_scope").and_then(Value::as_str),
-        Some("/Users/davidloor/Library/Logs/aidaemon")
+        payload["project_scope"].as_str(),
+        Some("/tmp/aidaemon-test/logs"),
+        "the turn's scope, not the model's"
     );
     assert_eq!(
-        payload.get("mission").and_then(Value::as_str),
+        payload["arguments"]["mission"].as_str(),
         Some("delegate log analysis")
     );
+    assert_eq!(payload["session_id"].as_str(), Some("test-session"));
     assert_eq!(
-        payload.get("_session_id").and_then(Value::as_str),
-        Some("test-session")
-    );
-    assert_eq!(
-        payload.get("_tool_call_id").and_then(Value::as_str),
+        payload["tool_call_id"].as_str(),
         Some("call-parent-synthetic")
+    );
+    assert!(
+        payload["arguments"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with('_')),
+        "{payload}"
     );
 }
 
@@ -617,13 +710,17 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
     let arguments = r#"{"text":"useful update"}"#;
     let semantics = harness
         .agent
-        .tools
+        .tools()
         .iter()
-        .find(|tool| tool.name() == "mandate_mutation_spy")
+        .find(|tool| tool.name() == "http_request")
         .unwrap()
         .call_semantics(arguments);
 
     let base_ctx = |grant| ToolExecCtx {
+        file_fence: None,
+        produced_files: None,
+        mcp_tool: None,
+        owner_approval_by_kernel: false,
         session_id: "owner-session",
         task_id: None,
         status_tx: None,
@@ -633,12 +730,13 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
         trusted: false,
         user_role: UserRole::Owner,
         workspace_grant: None,
-        correction_preapproved: false,
-        suppress_trusted_session: false,
         mandate_authority: grant,
         tool_call_id: grant.and_then(|value| value.tool_call_id.as_deref()),
         mutation_forbidden: false,
         scope_escalation: None,
+        turn_authority: None,
+        trust_roots: None,
+        lone_root_call: false,
     };
 
     let executor_read = harness
@@ -655,19 +753,21 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
 
     let missing = harness
         .agent
-        .execute_tool_with_watchdog("mandate_mutation_spy", arguments, &base_ctx(None))
+        .execute_tool_with_watchdog("http_request", arguments, &base_ctx(None))
         .await
         .unwrap_err();
-    assert!(missing
-        .to_string()
-        .contains("no action-bound mandate grant"));
+    assert!(
+        missing
+            .to_string()
+            .contains("no action-bound mandate grant")
+    );
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
     assert!(!saw_mandate_preapproval.load(AtomicOrdering::SeqCst));
 
     let mut grant = match crate::mandates::authority::authorize_mandate_action(
         &mandate,
         &decision,
-        "mandate_mutation_spy",
+        "http_request",
         arguments,
         &semantics,
         &chrono::Utc::now(),
@@ -683,7 +783,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
     let changed = harness
         .agent
         .execute_tool_with_watchdog(
-            "mandate_mutation_spy",
+            "http_request",
             r#"{"text":"different update"}"#,
             &base_ctx(Some(&grant)),
         )
@@ -695,7 +795,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
 
     let result = harness
         .agent
-        .execute_tool_with_watchdog("mandate_mutation_spy", arguments, &base_ctx(Some(&grant)))
+        .execute_tool_with_watchdog("http_request", arguments, &base_ctx(Some(&grant)))
         .await
         .unwrap();
     assert_eq!(result, "mutated");
@@ -707,7 +807,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
 
     let replay = harness
         .agent
-        .execute_tool_with_watchdog("mandate_mutation_spy", arguments, &base_ctx(Some(&grant)))
+        .execute_tool_with_watchdog("http_request", arguments, &base_ctx(Some(&grant)))
         .await
         .unwrap_err();
     assert!(
@@ -727,7 +827,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
     harness.state.update_mandate(&revised).await.unwrap();
     let revoked = harness
         .agent
-        .execute_tool_with_watchdog("mandate_mutation_spy", arguments, &base_ctx(Some(&grant)))
+        .execute_tool_with_watchdog("http_request", arguments, &base_ctx(Some(&grant)))
         .await
         .unwrap_err();
     assert!(
@@ -770,11 +870,7 @@ async fn mandate_task_lead_mutation_is_denied_without_burning_quota() {
 
     let error = harness
         .agent
-        .execute_tool_with_watchdog(
-            "mandate_mutation_spy",
-            arguments,
-            &mandate_tool_ctx(Some(&grant)),
-        )
+        .execute_tool_with_watchdog("http_request", arguments, &mandate_tool_ctx(Some(&grant)))
         .await
         .unwrap_err();
     assert!(
@@ -782,12 +878,14 @@ async fn mandate_task_lead_mutation_is_denied_without_burning_quota() {
         "unexpected role-boundary error: {error}"
     );
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
-    assert!(harness
-        .state
-        .list_mandate_mutation_attempts_for_run(&run.id)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        harness
+            .state
+            .list_mandate_mutation_attempts_for_run(&run.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         harness
             .state
@@ -811,7 +909,7 @@ async fn mandate_executor_cannot_use_task_lead_control_plane() {
 
     for (tool, arguments) in [
         (
-            "manage_mandates",
+            "mandate_review",
             r#"{"action":"record_decision","outcome":"wait","rationale":"escape"}"#,
         ),
         (
@@ -837,12 +935,14 @@ async fn mandate_executor_cannot_use_task_lead_control_plane() {
     }
 
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
-    assert!(harness
-        .state
-        .list_mandate_mutation_attempts_for_run(&run.id)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        harness
+            .state
+            .list_mandate_mutation_attempts_for_run(&run.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -855,15 +955,15 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
     let arguments = r#"{"text":"must require fresh deliberation"}"#;
     let semantics = harness
         .agent
-        .tools
+        .tools()
         .iter()
-        .find(|tool| tool.name() == "mandate_mutation_spy")
+        .find(|tool| tool.name() == "http_request")
         .unwrap()
         .call_semantics(arguments);
     let mut grant = match crate::mandates::authority::authorize_mandate_action(
         &mandate,
         &decision,
-        "mandate_mutation_spy",
+        "http_request",
         arguments,
         &semantics,
         &chrono::Utc::now(),
@@ -874,38 +974,48 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
         }
     };
     grant.tool_call_id = Some("watchdog-mandate-call-2".to_string());
-    assert!(harness
-        .state
-        .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &run, &fence, 2))
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        harness
+            .state
+            .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &run, &fence, 2))
+            .await
+            .unwrap()
+            .is_some()
+    );
 
-    assert!(harness
-        .state
-        .transition_mandate_status(
-            &mandate.id,
-            crate::traits::MandateStatus::Active,
-            crate::traits::MandateStatus::Paused,
-        )
-        .await
-        .unwrap());
-    assert!(harness
-        .state
-        .transition_mandate_status(
-            &mandate.id,
-            crate::traits::MandateStatus::Paused,
-            crate::traits::MandateStatus::Active,
-        )
-        .await
-        .unwrap());
+    assert!(
+        harness
+            .state
+            .transition_mandate_status(
+                &mandate.id,
+                crate::traits::MandateStatus::Active,
+                crate::traits::MandateStatus::Paused,
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        harness
+            .state
+            .transition_mandate_status(
+                &mandate.id,
+                crate::traits::MandateStatus::Paused,
+                crate::traits::MandateStatus::Active,
+            )
+            .await
+            .unwrap()
+    );
 
     let blocked = harness
         .agent
         .execute_tool_with_watchdog(
-            "mandate_mutation_spy",
+            "http_request",
             arguments,
             &ToolExecCtx {
+                file_fence: None,
+                produced_files: None,
+                mcp_tool: None,
+                owner_approval_by_kernel: false,
                 session_id: "owner-session",
                 task_id: None,
                 status_tx: None,
@@ -915,12 +1025,13 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
                 trusted: false,
                 user_role: UserRole::Owner,
                 workspace_grant: None,
-                correction_preapproved: false,
-                suppress_trusted_session: false,
                 mandate_authority: Some(&grant),
                 tool_call_id: grant.tool_call_id.as_deref(),
                 mutation_forbidden: false,
                 scope_escalation: None,
+                turn_authority: None,
+                trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
@@ -939,25 +1050,25 @@ async fn mandate_dispatch_rejects_a_blocked_run_even_with_a_live_attempt_and_gra
     let arguments = r#"{"text":"must not run while blocked"}"#;
     let mut grant = test_mandate_grant(&mandate, &decision, arguments);
     grant.tool_call_id = Some("watchdog-mandate-call-3".to_string());
-    assert!(harness
-        .state
-        .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &run, &fence, 3))
-        .await
-        .unwrap()
-        .is_some());
-    assert!(harness
-        .state
-        .finish_goal_run(&run.id, "blocked", Some("owner input required"))
-        .await
-        .unwrap());
+    assert!(
+        harness
+            .state
+            .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &run, &fence, 3))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        harness
+            .state
+            .finish_goal_run(&run.id, "blocked", Some("owner input required"))
+            .await
+            .unwrap()
+    );
 
     let error = harness
         .agent
-        .execute_tool_with_watchdog(
-            "mandate_mutation_spy",
-            arguments,
-            &mandate_tool_ctx(Some(&grant)),
-        )
+        .execute_tool_with_watchdog("http_request", arguments, &mandate_tool_ctx(Some(&grant)))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("stale, blocked"));
@@ -974,17 +1085,21 @@ async fn stale_mandate_child_cannot_rebind_to_the_next_goal_run() {
     let arguments = r#"{"text":"belongs only to cycle n"}"#;
     let mut grant = test_mandate_grant(&mandate, &decision, arguments);
     grant.tool_call_id = Some("watchdog-mandate-call-4".to_string());
-    assert!(harness
-        .state
-        .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &old_run, &fence, 4,))
-        .await
-        .unwrap()
-        .is_some());
-    assert!(harness
-        .state
-        .finish_goal_run(&old_run.id, "completed", Some("cycle n closed"))
-        .await
-        .unwrap());
+    assert!(
+        harness
+            .state
+            .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &old_run, &fence, 4,))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        harness
+            .state
+            .finish_goal_run(&old_run.id, "completed", Some("cycle n closed"))
+            .await
+            .unwrap()
+    );
     let next_root = uuid::Uuid::new_v4().to_string();
     let next_run = harness
         .state
@@ -995,11 +1110,7 @@ async fn stale_mandate_child_cannot_rebind_to_the_next_goal_run() {
 
     let error = harness
         .agent
-        .execute_tool_with_watchdog(
-            "mandate_mutation_spy",
-            arguments,
-            &mandate_tool_ctx(Some(&grant)),
-        )
+        .execute_tool_with_watchdog("http_request", arguments, &mandate_tool_ctx(Some(&grant)))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("stale, blocked"));
@@ -1016,34 +1127,34 @@ async fn mandate_dispatch_rejects_a_lost_root_task_attempt() {
     let arguments = r#"{"text":"must not outlive its lease"}"#;
     let mut grant = test_mandate_grant(&mandate, &decision, arguments);
     grant.tool_call_id = Some("watchdog-mandate-call-5".to_string());
-    assert!(harness
-        .state
-        .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &run, &fence, 5))
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        harness
+            .state
+            .reserve_mandate_action_attempt(&test_mandate_reservation(&grant, &run, &fence, 5))
+            .await
+            .unwrap()
+            .is_some()
+    );
     let patch = crate::traits::TaskAttemptPatch {
         status: "blocked".to_string(),
         blocker: Some("lease owner stopped".to_string()),
         ..Default::default()
     };
-    assert!(harness
-        .state
-        .patch_task_from_attempt(
-            &fence.root_attempt.id,
-            &fence.root_attempt.lease_token,
-            &patch,
-        )
-        .await
-        .unwrap());
+    assert!(
+        harness
+            .state
+            .patch_task_from_attempt(
+                &fence.root_attempt.id,
+                &fence.root_attempt.lease_token,
+                &patch,
+            )
+            .await
+            .unwrap()
+    );
 
     let error = harness
         .agent
-        .execute_tool_with_watchdog(
-            "mandate_mutation_spy",
-            arguments,
-            &mandate_tool_ctx(Some(&grant)),
-        )
+        .execute_tool_with_watchdog("http_request", arguments, &mandate_tool_ctx(Some(&grant)))
         .await
         .unwrap_err();
     assert!(
@@ -1052,4 +1163,118 @@ async fn mandate_dispatch_rejects_a_lost_root_task_attempt() {
         "unexpected root-attempt revocation error: {error}"
     );
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+}
+
+/// The instance the kernel bridged and judged for a turn: it records that it
+/// ran, so a test can tell it from the registry's tool of the same name.
+struct JudgedMcpStandIn(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl Tool for JudgedMcpStandIn {
+    fn name(&self) -> &str {
+        "fake__echo"
+    }
+
+    fn description(&self) -> &str {
+        "The judged instance of an MCP tool"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "fake__echo",
+            "description": "The judged instance of an MCP tool",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": true}
+        })
+    }
+
+    async fn execute(
+        &self,
+        _args: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok("ran the judged instance".to_string())
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl crate::traits::ToolSemantics for JudgedMcpStandIn {}
+
+fn kernel_mcp_ctx<'a>(mcp_tool: Option<&'a Arc<dyn Tool>>) -> ToolExecCtx<'a> {
+    ToolExecCtx {
+        file_fence: None,
+        produced_files: None,
+        mcp_tool,
+        owner_approval_by_kernel: true,
+        ..mandate_tool_ctx(None)
+    }
+}
+
+/// A kernel call runs the MCP instance judged at turn start, even when the
+/// registry now holds a different tool under the same name (a server
+/// reloaded mid-turn): the registry's tool never runs.
+#[tokio::test]
+async fn kernel_call_runs_the_judged_mcp_instance_not_the_registrys() {
+    let mut harness = setup_test_agent(MockProvider::new())
+        .await
+        .expect("setup test harness");
+    let registry = crate::testing::fake_mcp_registry(harness.state.clone()).await;
+    assert!(registry.find_tool("fake__echo").await.is_some());
+    harness.agent.set_test_mcp_registry(registry);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let judged: Arc<dyn Tool> = Arc::new(JudgedMcpStandIn(ran.clone()));
+
+    let outcome = harness
+        .agent
+        .execute_tool_with_watchdog_outcome(
+            "fake__echo",
+            r#"{"text":"synthetic registry echo"}"#,
+            &kernel_mcp_ctx(Some(&judged)),
+        )
+        .await
+        .expect("the judged instance runs");
+
+    assert_eq!(ran.load(AtomicOrdering::SeqCst), 1);
+    assert!(
+        outcome.output.contains("ran the judged instance"),
+        "{}",
+        outcome.output
+    );
+    assert!(
+        !outcome.output.contains("synthetic registry echo"),
+        "the registry's tool ran: {}",
+        outcome.output
+    );
+}
+
+/// A kernel call for which the kernel judged no MCP tool runs nothing,
+/// even though the registry holds a tool under that name.
+#[tokio::test]
+async fn kernel_call_without_a_judged_mcp_tool_runs_nothing() {
+    let mut harness = setup_test_agent(MockProvider::new())
+        .await
+        .expect("setup test harness");
+    let registry = crate::testing::fake_mcp_registry(harness.state.clone()).await;
+    assert!(registry.find_tool("fake__echo").await.is_some());
+    harness.agent.set_test_mcp_registry(registry);
+
+    let result = harness
+        .agent
+        .execute_tool_with_watchdog_outcome(
+            "fake__echo",
+            r#"{"text":"synthetic registry echo"}"#,
+            &kernel_mcp_ctx(None),
+        )
+        .await;
+
+    match result {
+        Err(error) => assert!(
+            error.downcast_ref::<UnknownToolError>().is_some(),
+            "{error}"
+        ),
+        Ok(outcome) => panic!("an unjudged MCP tool ran: {}", outcome.output),
+    }
 }

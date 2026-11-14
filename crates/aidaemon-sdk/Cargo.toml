@@ -1,0 +1,159 @@
+[package]
+name = "aidaemon-sdk"
+description = "Build agents in Rust on the aidaemon kernel: one crate, a feature per subsystem (providers, tools, policies, memory, channels)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-sdk"
+readme = "README.md"
+keywords = ["agent", "llm", "ai", "sdk", "async"]
+categories = ["asynchronous", "development-tools"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
+publish = false
+
+[features]
+default = ["providers", "tools", "policies", "agents", "sqlite", "macros", "memory", "secrets"]
+macros = ["dep:aidaemon-macros"]
+providers = ["dep:aidaemon-providers"]
+tools = ["dep:aidaemon-tools"]
+policies = ["dep:aidaemon-policies"]
+# Secret stores; every value they hand out is redacted from runs.
+secrets = ["dep:aidaemon-secrets"]
+# The OS credential store behind `secrets::KeychainSecretStore`.
+keychain = ["secrets", "aidaemon-secrets/keychain"]
+otel = ["policies", "aidaemon-policies/otel"]
+agents = ["dep:aidaemon-agents"]
+sqlite = ["dep:aidaemon-store-sqlite"]
+mcp = ["dep:aidaemon-mcp"]
+eval = ["dep:aidaemon-eval"]
+memory = ["dep:aidaemon-memory", "dep:tokio"]
+events = ["dep:aidaemon-events"]
+work = ["events", "dep:aidaemon-work"]
+fastembed = ["memory", "aidaemon-memory/fastembed"]
+channels = ["dep:aidaemon-channels"]
+telegram = ["channels", "dep:aidaemon-channel-telegram"]
+slack = ["channels", "dep:aidaemon-channel-slack"]
+discord = ["channels", "dep:aidaemon-channel-discord"]
+conformance = ["channels", "aidaemon-channels/conformance"]
+# aidaemon's own agent host and turn engine (`runtime::host`), as the daemon runs them.
+runtime = ["dep:aidaemon-runtime", "sqlite"]
+testing = ["aidaemon-core/testing", "aidaemon-channels?/testing", "dep:tokio", "tokio/test-util"]
+full = ["macros", "providers", "tools", "policies", "secrets", "keychain", "agents", "sqlite", "mcp", "eval", "testing", "memory", "events", "work", "telegram", "slack", "discord", "otel", "conformance", "runtime"]
+
+[dependencies]
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
+aidaemon-macros = { version = "0.20.0", path = "../aidaemon-macros", optional = true }
+async-trait = "0.1"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "time", "macros"], optional = true }
+aidaemon-providers = { version = "0.20.0", path = "../aidaemon-providers", optional = true }
+aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools", optional = true }
+aidaemon-policies = { version = "0.20.0", path = "../aidaemon-policies", optional = true }
+aidaemon-secrets = { version = "0.20.0", path = "../aidaemon-secrets", optional = true, default-features = false }
+aidaemon-agents = { version = "0.20.0", path = "../aidaemon-agents", optional = true }
+aidaemon-store-sqlite = { version = "0.20.0", path = "../aidaemon-store-sqlite", optional = true }
+aidaemon-mcp = { version = "0.20.0", path = "../aidaemon-mcp", optional = true }
+aidaemon-eval = { version = "0.20.0", path = "../aidaemon-eval", optional = true }
+aidaemon-memory = { version = "0.20.0", path = "../aidaemon-memory", optional = true }
+aidaemon-events = { version = "0.20.0", path = "../aidaemon-events", optional = true }
+aidaemon-work = { version = "0.20.0", path = "../aidaemon-work", optional = true }
+aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels", optional = true }
+aidaemon-channel-telegram = { version = "0.20.0", path = "../aidaemon-channel-telegram", optional = true }
+aidaemon-channel-slack = { version = "0.20.0", path = "../aidaemon-channel-slack", optional = true }
+aidaemon-channel-discord = { version = "0.20.0", path = "../aidaemon-channel-discord", optional = true }
+aidaemon-runtime = { version = "0.20.0", path = "../aidaemon-runtime", optional = true }
+
+[dev-dependencies]
+axum = "0.8"
+futures = "0.3"
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+tempfile = "3"
+chrono = "0.4"
+
+[[test]]
+name = "store_secrets_redacted"
+required-features = ["secrets", "testing"]
+
+[[test]]
+name = "web_fetch_egress"
+required-features = ["tools", "policies", "testing"]
+
+[[example]]
+name = "coding_agent"
+required-features = ["providers", "tools", "policies", "sqlite"]
+
+[[example]]
+name = "support_triage"
+required-features = ["providers", "policies", "testing"]
+
+[[test]]
+name = "tool_macro"
+required-features = ["macros", "testing"]
+
+[[test]]
+name = "structured_output"
+required-features = ["testing"]
+
+[[test]]
+name = "preset"
+required-features = ["macros", "testing", "tools", "sqlite"]
+
+[[example]]
+name = "quickstart"
+required-features = ["macros", "testing"]
+
+[[example]]
+name = "custom_tool"
+required-features = ["macros", "testing"]
+
+[[example]]
+name = "approvals"
+required-features = ["macros", "testing"]
+
+[[example]]
+name = "resume_after_crash"
+required-features = ["macros", "testing", "sqlite"]
+
+[[example]]
+name = "sub_agent"
+required-features = ["macros", "testing", "agents"]
+
+[[example]]
+name = "memory_swap"
+required-features = ["testing", "memory"]
+
+[[example]]
+name = "channel_bot"
+required-features = ["macros", "testing", "channels"]
+
+[[example]]
+name = "scheduled_worker"
+required-features = ["testing"]
+
+[[example]]
+name = "own_channel"
+required-features = ["macros", "testing", "channels"]
+
+[[example]]
+name = "sse_server"
+required-features = ["macros", "testing"]
+
+[[example]]
+name = "otel_traces"
+required-features = ["macros", "testing", "otel"]
+
+[[test]]
+name = "behavior"
+required-features = ["testing", "macros", "agents", "channels", "memory"]

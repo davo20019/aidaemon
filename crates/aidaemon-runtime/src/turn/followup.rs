@@ -1,0 +1,1237 @@
+//! Follow-up / task-switch classification for incoming user turns.
+//!
+//! Moved verbatim from `runtime/history.rs` (Phase 4 decoupling); logic is
+//! unchanged. Owns [`FollowupMode`], [`TurnContextReason`], and the
+//! `looks_like_*` / `classify_followup_mode` family.
+
+#[cfg(test)]
+use super::completion_contract::HTTP_URL_RE;
+#[cfg(test)]
+use super::completion_contract::looks_like_question_request;
+use super::project_scope::extract_project_scopes_from_text;
+#[cfg(test)]
+use super::project_scope::token_looks_like_filesystem_path;
+use aidaemon_events::traits::Message;
+#[cfg(test)]
+use aidaemon_tools::text::contains_keyword_as_words;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowupMode {
+    NewTask,
+    Followup,
+    ClarificationAnswer,
+}
+
+impl FollowupMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FollowupMode::NewTask => "new_task",
+            FollowupMode::Followup => "followup",
+            FollowupMode::ClarificationAnswer => "clarification_answer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnContextReason {
+    DefaultNewTask,
+    InternalContinuation,
+    #[cfg(test)]
+    ExplicitFollowup,
+    ClarificationAnswer,
+    ContextDependentQuestion,
+    #[cfg(test)]
+    FollowupOverrideStandalone,
+    FollowupOverrideMismatchPreflight,
+    CarryoverSanitized,
+}
+
+impl TurnContextReason {
+    pub fn as_code(&self) -> &'static str {
+        match self {
+            TurnContextReason::DefaultNewTask => "default_new_task",
+            TurnContextReason::InternalContinuation => "internal_continuation",
+            #[cfg(test)]
+            TurnContextReason::ExplicitFollowup => "explicit_followup",
+            TurnContextReason::ClarificationAnswer => "clarification_answer",
+            TurnContextReason::ContextDependentQuestion => "context_dependent_question",
+            #[cfg(test)]
+            TurnContextReason::FollowupOverrideStandalone => "followup_override_standalone",
+            TurnContextReason::FollowupOverrideMismatchPreflight => {
+                "followup_override_mismatch_preflight"
+            }
+            TurnContextReason::CarryoverSanitized => "carryover_sanitized",
+        }
+    }
+}
+
+/// A short request whose meaning is specifically "repeat the previous attempt."
+/// These turns must retain the prior task contract; treating them as standalone
+/// questions is how "Can you try one more time?" lost an outstanding PDF
+/// delivery obligation in the live incident.
+#[cfg(test)]
+pub fn looks_like_retry_followup(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 120 {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    !looks_like_explicit_task_switch(&lower)
+        && text_contains_any_phrase(
+            &lower,
+            &[
+                "retry",
+                "redo",
+                "rerun",
+                "re-run",
+                "try again",
+                "try one more time",
+                "one more time",
+                "do it again",
+            ],
+        )
+}
+
+pub fn find_previous_turns(
+    history: &[Message],
+    current_user_text: &str,
+) -> (Option<String>, Option<String>) {
+    // History includes the current user message (already persisted). Walk backwards to find:
+    // - previous assistant message (optional; usually a clarifying question)
+    // - previous user message (the original request)
+    let mut saw_current_user = false;
+    let mut prev_assistant: Option<String> = None;
+    let mut prev_user: Option<String> = None;
+    for msg in history.iter().rev() {
+        match msg.role.as_str() {
+            "user" => {
+                if !saw_current_user {
+                    saw_current_user = true;
+                    continue;
+                }
+                if let Some(content) = msg.content.as_deref() {
+                    let trimmed = content.trim();
+                    if !trimmed.is_empty() {
+                        prev_user = Some(trimmed.to_string());
+                        break;
+                    }
+                }
+            }
+            "assistant" if saw_current_user && prev_assistant.is_none() => {
+                if let Some(content) = msg.content.as_deref() {
+                    let trimmed = content.trim();
+                    if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case(current_user_text) {
+                        prev_assistant = Some(trimmed.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (prev_assistant, prev_user)
+}
+
+#[cfg(test)]
+pub fn assistant_message_looks_like_clarifying_question(message: &str) -> bool {
+    // Question punctuation is the language feature here. Do not maintain a
+    // phrase vocabulary whose omissions can silently lose the open-question
+    // lifecycle; only a final model-authored question opens this provisional
+    // dialogue edge. Durable mandate/approval questions use typed state.
+    message.trim_end().ends_with('?')
+}
+
+#[cfg(test)]
+pub fn looks_like_explicit_task_switch(lower_text: &str) -> bool {
+    lower_text.starts_with("new task")
+        || lower_text.starts_with("different task")
+        || lower_text.starts_with("instead ")
+        || lower_text.starts_with("forget that")
+        || lower_text.starts_with("ignore that")
+}
+
+#[cfg(test)]
+fn looks_like_style_followup(lower_text: &str) -> bool {
+    let style_markers = [
+        "do what you consider",
+        "do what you think",
+        "as you see fit",
+        "you decide",
+        "your call",
+        "best judgment",
+        "best judgement",
+        "whatever you think",
+    ];
+    style_markers.iter().any(|m| lower_text.contains(m))
+}
+
+/// Detect strong followup indicators that override the length heuristic.
+/// These are phrases that unambiguously reference prior conversation context,
+/// e.g. "follow-up on the newsletter you just created".
+#[cfg(test)]
+fn has_strong_followup_indicators(lower_text: &str) -> bool {
+    // Explicit followup phrases
+    let followup_phrases = [
+        "follow-up on",
+        "follow up on",
+        "following up on",
+        "back to the",
+        "back to what you",
+        "continuing from",
+        "continuation of",
+        "regarding what you",
+        "about what you just",
+    ];
+    if followup_phrases.iter().any(|p| lower_text.contains(p)) {
+        return true;
+    }
+    // Recency markers that reference something the agent just did
+    let recency_refs = [
+        "you just created",
+        "you just made",
+        "you just wrote",
+        "you just generated",
+        "you just built",
+        "you just saved",
+        "we just discussed",
+        "we just talked about",
+        "the one you just",
+        "the file you just",
+        "the script you just",
+        "that you just",
+    ];
+    recency_refs.iter().any(|r| lower_text.contains(r))
+}
+
+#[cfg(test)]
+pub fn looks_like_context_dependent_followup_question(lower_text: &str) -> bool {
+    if !looks_like_question_request(lower_text) || lower_text.chars().count() > 160 {
+        return false;
+    }
+
+    // This classifier only handles generic status/explanation carry-over.
+    // Provider transcript assembly preserves the adjacent prior exchange for
+    // every turn, so conversational correctness does not depend on enumerating
+    // every possible follow-up intent here.
+    let status_followup_prefixes = [
+        "did you ",
+        "were you able",
+        "have you ",
+        "what did you find",
+        "which one",
+        "which ones",
+        "what happened",
+        "how many",
+        "why did",
+        "why was",
+        "why were",
+    ];
+    let shared_context_markers = [
+        "those",
+        "these",
+        "them",
+        "earlier",
+        "before",
+        "previous",
+        "last",
+        "again",
+        "already",
+        "the api",
+        "the result",
+        "the results",
+        "the output",
+        "the response",
+        "our chat",
+        "the convo",
+        "the conversation",
+        "you just",
+        "you sent",
+        "you found",
+        "you pulled",
+    ];
+    if status_followup_prefixes
+        .iter()
+        .any(|prefix| lower_text.starts_with(prefix))
+    {
+        return text_contains_any_phrase(lower_text, &shared_context_markers);
+    }
+
+    let explanation_followup_prefixes = [
+        "what does",
+        "what do",
+        "can you explain",
+        "could you explain",
+        "can you clarify",
+        "could you clarify",
+        "can you help me understand",
+        "could you help me understand",
+    ];
+    if !explanation_followup_prefixes
+        .iter()
+        .any(|prefix| lower_text.starts_with(prefix))
+    {
+        return false;
+    }
+
+    let deictic_markers = ["it", "that", "this", "these", "those", "them"];
+    let explanation_cues = [
+        "mean",
+        "means",
+        "explain",
+        "clarify",
+        "understand",
+        "interpret",
+    ];
+
+    text_contains_any_phrase(lower_text, &explanation_cues)
+        && (text_contains_any_phrase(lower_text, &deictic_markers)
+            || text_contains_any_phrase(lower_text, &shared_context_markers))
+}
+
+/// Detect messages that explicitly reference a prior unanswered request:
+/// "You didn't respond my question", "answer my question", "you ignored my request".
+/// These are meta-commentary about the prior interaction and must keep context.
+#[cfg(test)]
+pub fn looks_like_unanswered_request_reference(lower: &str) -> bool {
+    if lower.chars().count() > 120 {
+        return false;
+    }
+    let complaint_cues = [
+        "didn't respond",
+        "didn't answer",
+        "did not respond",
+        "did not answer",
+        "didn't reply",
+        "did not reply",
+        "never responded",
+        "never answered",
+        "never replied",
+        "ignored",
+        "skipped",
+        "didn't address",
+        "did not address",
+        "what about",
+    ];
+    let response_verbs = ["answer", "respond", "reply", "address"];
+    let prior_request_references = [
+        "my question",
+        "my request",
+        "my message",
+        "my earlier question",
+        "my earlier request",
+        "my last question",
+        "my last request",
+        "what i asked",
+        "the question i asked",
+        "the request i made",
+    ];
+
+    let references_prior_request = prior_request_references
+        .iter()
+        .any(|phrase| contains_keyword_as_words(lower, phrase));
+    if !references_prior_request {
+        return false;
+    }
+
+    let has_complaint_cue = complaint_cues
+        .iter()
+        .any(|phrase| contains_keyword_as_words(lower, phrase));
+    let asks_for_response = response_verbs
+        .iter()
+        .any(|phrase| contains_keyword_as_words(lower, phrase));
+
+    has_complaint_cue || asks_for_response
+}
+
+#[cfg(test)]
+fn looks_like_artifact_inspection_request(lower_text: &str) -> bool {
+    let mentions_artifact = text_contains_any_phrase(
+        lower_text,
+        &[
+            "doc",
+            "document",
+            "file",
+            "attachment",
+            "attached",
+            "screenshot",
+            "image",
+            "photo",
+            "picture",
+            "pdf",
+            "note",
+        ],
+    );
+    if !mentions_artifact {
+        return false;
+    }
+
+    text_contains_any_phrase(
+        lower_text,
+        &[
+            "check", "read", "review", "inspect", "look at", "open", "analyze", "analyse", "fix",
+            "issue", "problem", "error",
+        ],
+    )
+}
+
+#[cfg(test)]
+pub fn looks_like_standalone_goal_request(lower_text: &str) -> bool {
+    let word_count = lower_text.split_whitespace().count();
+    if word_count < 8 {
+        return false;
+    }
+
+    let asks_for_uninterrupted_execution = contains_keyword_as_words(lower_text, "dont ask")
+        || contains_keyword_as_words(lower_text, "don't ask")
+        || contains_keyword_as_words(lower_text, "without asking")
+        || contains_keyword_as_words(lower_text, "just do it");
+
+    let has_action_verb = [
+        "compare",
+        "analyze",
+        "analyse",
+        "build",
+        "create",
+        "write",
+        "read",
+        "parse",
+        "scan",
+        "search",
+        "find",
+        "clean",
+        "delete",
+        "install",
+        "fix",
+        "refactor",
+        "audit",
+        "summarize",
+        "review",
+    ]
+    .iter()
+    .any(|kw| contains_keyword_as_words(lower_text, kw));
+
+    let has_scope_detail = lower_text.contains('/')
+        || lower_text.contains(".json")
+        || lower_text.contains("all my projects")
+        || lower_text.contains("across all")
+        || lower_text.contains("dependencies")
+        || lower_text.contains("versions")
+        || lower_text.contains("node_modules");
+
+    (asks_for_uninterrupted_execution && has_action_verb)
+        || (word_count >= 14 && has_action_verb && has_scope_detail)
+}
+
+#[cfg(test)]
+fn payload_has_self_contained_detail(text: &str) -> bool {
+    let meaningful_tokens = text
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\'' && c != '-')
+                .to_ascii_lowercase()
+        })
+        .filter(|token| !token.is_empty())
+        .filter(|token| {
+            !matches!(
+                token.as_str(),
+                "a" | "an"
+                    | "the"
+                    | "to"
+                    | "for"
+                    | "at"
+                    | "on"
+                    | "in"
+                    | "of"
+                    | "my"
+                    | "your"
+                    | "our"
+                    | "me"
+                    | "you"
+                    | "it"
+                    | "this"
+                    | "that"
+                    | "these"
+                    | "those"
+                    | "them"
+                    | "task"
+                    | "goal"
+                    | "job"
+                    | "schedule"
+                    | "scheduled"
+                    | "daily"
+                    | "every"
+                    | "day"
+                    | "weekdays"
+                    | "weekends"
+                    | "recurring"
+                    | "reminder"
+                    | "remind"
+                    | "set"
+                    | "setup"
+                    | "up"
+                    | "create"
+                    | "build"
+                    | "write"
+                    | "edit"
+                    | "update"
+                    | "delete"
+                    | "remove"
+                    | "deploy"
+                    | "publish"
+                    | "post"
+                    | "send"
+                    | "email"
+                    | "message"
+                    | "upload"
+                    | "install"
+                    | "connect"
+                    | "enable"
+                    | "disable"
+                    | "restart"
+                    | "reload"
+                    | "commit"
+                    | "push"
+                    | "can"
+                    | "could"
+                    | "would"
+                    | "please"
+            )
+        })
+        .count();
+
+    meaningful_tokens >= 3
+}
+
+/// Whether a token of the text resolves to a filesystem reference.
+#[cfg(test)]
+fn user_text_references_filesystem_path(user_text: &str) -> bool {
+    user_text.split_whitespace().any(|raw| {
+        let token = raw
+            .trim_matches(|c: char| {
+                c.is_ascii_whitespace()
+                    || matches!(
+                        c,
+                        '`' | '\'' | '"' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+                    )
+            })
+            .trim_end_matches(['.', '!', '?']);
+        !token.is_empty()
+            && aidaemon_tools::fs_utils::resolve_structural_filesystem_reference(
+                &*aidaemon_tools::testing::active_execution_backend(),
+                token,
+                &[],
+            )
+            .is_some()
+    })
+}
+
+#[cfg(test)]
+fn text_has_explicit_project_scope_cues(text: &str) -> bool {
+    [
+        "project",
+        "repo",
+        "repository",
+        "workspace",
+        "directory",
+        "folder",
+        "codebase",
+        "code base",
+        "work in",
+        "inside",
+        "under",
+    ]
+    .iter()
+    .any(|phrase| contains_keyword_as_words(text, phrase))
+}
+
+#[cfg(test)]
+pub fn looks_like_self_contained_mutation_request(current: &str, lower_text: &str) -> bool {
+    let trimmed = current.trim();
+    if trimmed.is_empty() || trimmed.split_whitespace().count() < 6 {
+        return false;
+    }
+
+    let has_mutation_cue = [
+        "set up", "setup", "create", "build", "write", "edit", "update", "delete", "remove",
+        "deploy", "publish", "post", "send", "email", "message", "upload", "install", "connect",
+        "enable", "disable", "restart", "reload", "commit", "push",
+    ]
+    .iter()
+    .any(|phrase| contains_keyword_as_words(lower_text, phrase));
+    if !has_mutation_cue {
+        return false;
+    }
+
+    let has_structured_target = looks_like_short_command_request(trimmed)
+        || HTTP_URL_RE.is_match(trimmed)
+        || user_text_references_filesystem_path(trimmed)
+        || text_has_explicit_project_scope_cues(lower_text)
+        || lower_text.contains(".json")
+        || lower_text.contains(".toml")
+        || lower_text.contains(".yaml")
+        || lower_text.contains(".yml")
+        || lower_text.contains(".md")
+        || lower_text.contains(".ts")
+        || lower_text.contains(".js")
+        || lower_text.contains(".rs");
+
+    has_structured_target && payload_has_self_contained_detail(trimmed)
+}
+
+#[cfg(test)]
+pub fn looks_like_short_command_request(current: &str) -> bool {
+    let trimmed = current.trim();
+    if trimmed.is_empty() || trimmed.ends_with('?') {
+        return false;
+    }
+
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() < 2 || words.len() > 12 {
+        return false;
+    }
+
+    let first = words
+        .first()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+    if !matches!(
+        first.as_str(),
+        "run"
+            | "build"
+            | "deploy"
+            | "publish"
+            | "commit"
+            | "push"
+            | "post"
+            | "restart"
+            | "reload"
+            | "check"
+            | "inspect"
+            | "debug"
+            | "review"
+            | "analyze"
+            | "analyse"
+            | "search"
+            | "find"
+            | "open"
+            | "show"
+    ) {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let has_cli_token = [
+        "build",
+        "deploy",
+        "publish",
+        "commit",
+        "push",
+        "post",
+        "wrangler",
+        "npm",
+        "pnpm",
+        "yarn",
+        "cargo",
+        "pytest",
+        "test",
+        "tests",
+        "git",
+        "docker",
+        "kubectl",
+        "logs",
+        "log",
+        "restart",
+        "reload",
+        "server",
+        "service",
+        "branch",
+        "repo",
+        "repository",
+        "diff",
+        "migration",
+        "migrations",
+        "schema",
+    ]
+    .iter()
+    .any(|kw| contains_keyword_as_words(&lower, kw));
+
+    let has_structured_target = words.iter().skip(1).any(|word| {
+        let token = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
+        !token.is_empty()
+            && (token_looks_like_filesystem_path(
+                &*aidaemon_tools::testing::active_execution_backend(),
+                token,
+            ) || token.starts_with('-')
+                || token.chars().any(|c| c.is_ascii_digit()))
+    }) || has_cli_token;
+    if !has_structured_target {
+        return false;
+    }
+
+    let deictic_only = words.iter().skip(1).all(|word| {
+        matches!(
+            word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\'' && c != '-')
+                .to_ascii_lowercase()
+                .as_str(),
+            "it" | "this" | "that" | "them" | "those" | "these" | "again" | "now" | "please"
+        )
+    });
+
+    !deictic_only
+}
+
+/// A self-contained imperative request: starts with a request verb and names
+/// its own object (no anaphoric reference back to the assistant's question).
+/// "Send me my Microsoft resume" is a new request even when the assistant just
+/// asked a clarifying question; "Post it." / "send that one" answer it.
+#[cfg(test)]
+pub fn looks_like_self_contained_imperative_request(trimmed: &str, lower: &str) -> bool {
+    if trimmed.split_whitespace().count() < 2 {
+        return false;
+    }
+    let Some(first) = lower.split_whitespace().next() else {
+        return false;
+    };
+    let first = first.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    const IMPERATIVE_REQUEST_VERBS: &[&str] = &[
+        "send", "give", "get", "fetch", "find", "search", "download", "upload", "create", "make",
+        "write", "draft", "post", "deploy", "build", "run", "open", "show", "list", "check",
+        "delete", "remove", "update", "install",
+    ];
+    if !IMPERATIVE_REQUEST_VERBS.contains(&first) {
+        return false;
+    }
+    const ANAPHORS: &[&str] = &["it", "that", "this", "those", "them", "one", "ones"];
+    !ANAPHORS
+        .iter()
+        .any(|anaphor| contains_keyword_as_words(lower, anaphor))
+}
+
+#[cfg(test)]
+pub fn text_contains_any_phrase(text: &str, phrases: &[&str]) -> bool {
+    phrases
+        .iter()
+        .any(|phrase| contains_keyword_as_words(text, phrase))
+}
+
+pub fn sanitize_carryover_blocks(input: &str) -> (String, bool) {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return (String::new(), false);
+    }
+    let markers = ["Original request:", "Assistant asked:", "Follow-up:"];
+    let mut sanitized = trimmed.to_string();
+    let mut changed = false;
+    for marker in markers {
+        if sanitized.contains(marker) {
+            changed = true;
+            sanitized = sanitized.replace(marker, "");
+        }
+    }
+    (sanitized.trim().to_string(), changed)
+}
+
+#[cfg(test)]
+pub fn classify_followup_mode(
+    current: &str,
+    prev_assistant: Option<&str>,
+) -> (FollowupMode, Vec<TurnContextReason>) {
+    let mut reasons = Vec::new();
+    let trimmed = current.trim();
+    if trimmed.is_empty() {
+        reasons.push(TurnContextReason::DefaultNewTask);
+        return (FollowupMode::NewTask, reasons);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    // Synthetic re-engagement messages from background command completions
+    // must always be follow-ups so the original task context is preserved.
+    if trimmed.starts_with("[Background command completed]")
+        || trimmed.starts_with("[Background command still running]")
+    {
+        reasons.push(TurnContextReason::ExplicitFollowup);
+        return (FollowupMode::Followup, reasons);
+    }
+
+    if looks_like_retry_followup(trimmed) {
+        reasons.push(TurnContextReason::ExplicitFollowup);
+        return (FollowupMode::Followup, reasons);
+    }
+
+    // Do not infer an artifact binding from English pronouns or format words.
+    // The model receives canonical history plus opaque resource handles and
+    // chooses the antecedent; execution then validates that exact handle.
+
+    // Strong followup indicators that should override the length heuristic.
+    // Phrases like "follow-up on the X you just created" clearly reference
+    // prior context regardless of message length.
+    if has_strong_followup_indicators(&lower) && !looks_like_explicit_task_switch(&lower) {
+        reasons.push(TurnContextReason::ExplicitFollowup);
+        return (FollowupMode::Followup, reasons);
+    }
+
+    let is_short = trimmed.chars().count() <= 260;
+    if !is_short || looks_like_explicit_task_switch(&lower) {
+        reasons.push(TurnContextReason::DefaultNewTask);
+        return (FollowupMode::NewTask, reasons);
+    }
+
+    if looks_like_standalone_goal_request(&lower) {
+        reasons.push(TurnContextReason::FollowupOverrideStandalone);
+        reasons.push(TurnContextReason::DefaultNewTask);
+        return (FollowupMode::NewTask, reasons);
+    }
+    if looks_like_self_contained_mutation_request(trimmed, &lower) {
+        reasons.push(TurnContextReason::FollowupOverrideStandalone);
+        reasons.push(TurnContextReason::DefaultNewTask);
+        return (FollowupMode::NewTask, reasons);
+    }
+    if looks_like_short_command_request(trimmed) {
+        reasons.push(TurnContextReason::FollowupOverrideStandalone);
+        reasons.push(TurnContextReason::DefaultNewTask);
+        return (FollowupMode::NewTask, reasons);
+    }
+
+    // An answer to the assistant's own clarifying question outranks the
+    // generic ack heuristics: "Yes do 1, 2" after a menu is an answer to that
+    // menu, not a followup to the session's open request. Misrouting it to
+    // Followup binds the turn to the (possibly stale) open_request instead of
+    // the question being answered (2026-07-11 incident). Self-contained
+    // imperatives that name their own object ("Send me my Microsoft resume")
+    // are NEW requests, not answers — binding them re-injects the previous
+    // topic's question into an unrelated turn (2026-07-12 incident).
+    if prev_assistant.is_some_and(|prev| {
+        assistant_message_looks_like_clarifying_question(prev)
+            && !trimmed.trim_end().ends_with('?')
+            && !looks_like_explicit_task_switch(&lower)
+            && !looks_like_artifact_inspection_request(&lower)
+            && !looks_like_self_contained_imperative_request(trimmed, &lower)
+    }) {
+        reasons.push(TurnContextReason::ClarificationAnswer);
+        return (FollowupMode::ClarificationAnswer, reasons);
+    }
+
+    let ack_like = contains_keyword_as_words(&lower, "yes")
+        || contains_keyword_as_words(&lower, "confirm")
+        || contains_keyword_as_words(&lower, "go ahead")
+        || contains_keyword_as_words(&lower, "do it")
+        || contains_keyword_as_words(&lower, "sure")
+        || contains_keyword_as_words(&lower, "ok")
+        || contains_keyword_as_words(&lower, "okay")
+        || contains_keyword_as_words(&lower, "sounds good")
+        || contains_keyword_as_words(&lower, "just use");
+    let concise_ack_like = ack_like && trimmed.chars().count() <= 80;
+    let explicit_followup = lower.starts_with("also ")
+        || lower.starts_with("and ")
+        || lower.starts_with("plus ")
+        || concise_ack_like
+        || looks_like_style_followup(&lower);
+    if explicit_followup {
+        reasons.push(TurnContextReason::ExplicitFollowup);
+        return (FollowupMode::Followup, reasons);
+    }
+
+    if prev_assistant.is_some() && looks_like_context_dependent_followup_question(&lower) {
+        reasons.push(TurnContextReason::ContextDependentQuestion);
+        return (FollowupMode::Followup, reasons);
+    }
+
+    // Messages that reference a prior unanswered request ("You didn't respond
+    // my question", "answer my question", "you ignored my request") must keep
+    // prior context so the LLM can find the original question.
+    if prev_assistant.is_some() && looks_like_unanswered_request_reference(&lower) {
+        reasons.push(TurnContextReason::ContextDependentQuestion);
+        return (FollowupMode::Followup, reasons);
+    }
+
+    reasons.push(TurnContextReason::DefaultNewTask);
+    (FollowupMode::NewTask, reasons)
+}
+
+pub fn has_project_scope_divergence_with_aliases(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
+    prev_user_text: &str,
+    current: &str,
+    alias_roots: &[String],
+) -> bool {
+    let mut prev_scopes = Vec::new();
+    let mut current_scopes = Vec::new();
+    extract_project_scopes_from_text(backend, prev_user_text, &mut prev_scopes, 6, alias_roots);
+    extract_project_scopes_from_text(backend, current, &mut current_scopes, 6, alias_roots);
+    if !prev_scopes.is_empty() && !current_scopes.is_empty() {
+        return !current_scopes
+            .iter()
+            .any(|scope| prev_scopes.iter().any(|prev| prev == scope));
+    }
+
+    // Plain-language project names are not identities. If either turn lacks
+    // an exact structural scope, semantic request assessment decides whether
+    // it is a continuation; a nickname mismatch cannot override that state.
+    false
+}
+
+#[cfg(test)]
+fn looks_like_followup_reply(current: &str, prev_assistant: Option<&str>) -> bool {
+    let trimmed = current.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let (mode, _) = classify_followup_mode(current, prev_assistant);
+    mode != FollowupMode::NewTask
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn has_project_scope_divergence_with_aliases(
+        prev_user_text: &str,
+        current: &str,
+        alias_roots: &[String],
+    ) -> bool {
+        super::has_project_scope_divergence_with_aliases(
+            &*aidaemon_tools::testing::active_execution_backend(),
+            prev_user_text,
+            current,
+            alias_roots,
+        )
+    }
+    use proptest::prelude::*;
+
+    #[test]
+    fn synthetic_background_messages_classify_as_followup() {
+        for prefix in [
+            "[Background command completed]",
+            "[Background command still running]",
+        ] {
+            let msg = format!(
+                "{}\nCommand: `npm run dev`\nOutput so far:\n✓ Ready in 2.8s",
+                prefix
+            );
+            let (mode, reasons) = classify_followup_mode(&msg, None);
+            assert_eq!(mode, FollowupMode::Followup, "prefix: {}", prefix);
+            assert!(reasons.contains(&TurnContextReason::ExplicitFollowup));
+        }
+    }
+
+    #[test]
+    fn retry_phrases_are_followups_not_standalone_questions() {
+        for retry in [
+            "Retry",
+            "Try again",
+            "Can you try one more time?",
+            "Please do it again.",
+        ] {
+            let (mode, reasons) = classify_followup_mode(retry, Some("The conversion failed."));
+            assert_eq!(mode, FollowupMode::Followup, "retry={retry:?}");
+            assert!(reasons.contains(&TurnContextReason::ExplicitFollowup));
+        }
+    }
+
+    #[test]
+    fn artifact_pronouns_do_not_create_a_deterministic_binding() {
+        let current = "Make it 1 page PDF instead.";
+        let previous = "Here's the two-page PDF: Headless WordPress in the Age of AI Agents.";
+        let (mode, _) = classify_followup_mode(current, Some(previous));
+
+        assert_eq!(mode, FollowupMode::NewTask);
+    }
+
+    #[test]
+    fn anaphoric_artifact_revision_without_antecedent_stays_new_task() {
+        let current = "Make it 1 page PDF instead.";
+        let (mode, reasons) = classify_followup_mode(current, None);
+
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::DefaultNewTask));
+    }
+
+    #[test]
+    fn explicit_instead_task_switch_stays_a_new_task() {
+        let current = "Instead make a new one-page PDF about rice farming.";
+        let (mode, _) = classify_followup_mode(current, Some("Previous PDF"));
+        assert_eq!(mode, FollowupMode::NewTask);
+    }
+
+    #[test]
+    fn self_contained_this_object_is_not_forced_into_followup() {
+        let current = "Make this repository compile.";
+        let (mode, _) = classify_followup_mode(current, Some("Here is yesterday's weather."));
+        assert_eq!(mode, FollowupMode::NewTask);
+    }
+
+    #[test]
+    fn previous_turn_resolution_uses_canonical_message_topology() {
+        fn message(role: &str, content: &str) -> Message {
+            Message {
+                content: Some(content.to_string()),
+                ..Message::new_runtime(uuid::Uuid::new_v4().to_string(), "session", role)
+            }
+        }
+
+        let history = vec![
+            message("user", "Send me the investor PDF."),
+            message("assistant", "The conversion failed."),
+            message("user", "Retry"),
+            message("assistant", "That converter also failed."),
+            message("user", "Can you try one more time?"),
+        ];
+        let (_, previous_user) = find_previous_turns(&history, "Can you try one more time?");
+        assert_eq!(previous_user.as_deref(), Some("Retry"));
+    }
+
+    #[test]
+    fn followup_detects_answer_to_clarifying_question() {
+        let followup =
+            "You are a senior designer and frontend developer. Do what you consider best.";
+        let prev = "Which elements do you want me to modernize?";
+        assert!(looks_like_followup_reply(followup, Some(prev)));
+    }
+    #[test]
+    fn followup_rejects_explicit_task_switch() {
+        let followup = "New task: build a dashboard from scratch.";
+        let prev = "Should I continue with this page or focus on another one?";
+        assert!(!looks_like_followup_reply(followup, Some(prev)));
+    }
+    #[test]
+    fn followup_rejects_standalone_request_with_do_it_suffix() {
+        let followup = "Compare the package.json files across all my projects in ~/projects. Which ones share dependencies? Don't ask questions, just do it.";
+        let prev = "Which directories are taking up the most space?";
+        assert!(!looks_like_followup_reply(followup, Some(prev)));
+    }
+    #[test]
+    fn followup_accepts_concise_do_it_ack() {
+        let followup = "Yes, do it.";
+        let prev = "Should I proceed with this change?";
+        assert!(looks_like_followup_reply(followup, Some(prev)));
+    }
+    #[test]
+    fn followup_accepts_answer_to_want_me_to_clarification() {
+        let current = "Post it.";
+        let prev = "Please answer directly: Want me to tweak this or post it?";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::ClarificationAnswer);
+        assert!(reasons.contains(&TurnContextReason::ClarificationAnswer));
+    }
+    #[test]
+    fn imperative_request_after_clarifying_question_is_new_task() {
+        // Live 2026-07-12: "Send me my Microsoft resume" right after the
+        // assistant's acme clarifying question got bound as the ANSWER to
+        // that question, so the new turn carried "Assistant asked: …acme…"
+        // and the model hunted the wrong resume. A self-contained imperative
+        // that names its own object is a new request, not an answer.
+        let current = "Send me my Microsoft resume";
+        let prev = "I found several other tailored resumes in your ~/projects/resume folder. \
+                    Is it possible the Acme resume is named differently, or should I look \
+                    for a specific file type?";
+        let (mode, _) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::NewTask);
+    }
+    #[test]
+    fn anaphoric_imperative_still_answers_the_question() {
+        // "Post it." names no object of its own — it refers to the question's
+        // subject and must keep binding as a clarification answer.
+        let current = "Post it.";
+        let prev = "Want me to tweak this or post it?";
+        let (mode, _) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::ClarificationAnswer);
+    }
+    #[test]
+    fn numbered_ack_after_clarifying_menu_is_clarification_answer() {
+        // Regression for the 2026-07-11 incident: "Yes do 1, 2" answers the
+        // menu the assistant just presented. The concise-ack branch must not
+        // outrank the clarification-answer branch, or the turn is routed into
+        // the open_request injection and binds to a stale request instead.
+        let current = "Yes do 1, 2";
+        let prev = "I couldn't find that resume.\n\nWould you like me to:\n\
+                    1. Search your entire machine?\n\
+                    2. Look in other common folders?\n\
+                    3. Send another recent resume instead?";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::ClarificationAnswer);
+        assert!(reasons.contains(&TurnContextReason::ClarificationAnswer));
+    }
+    #[test]
+    fn followup_accepts_context_dependent_status_question() {
+        let followup = "Did you find those 10 in the API?";
+        let prev = "I fetched the search results and sent the JSON export.";
+        let (mode, reasons) = classify_followup_mode(followup, Some(prev));
+        assert_eq!(mode, FollowupMode::Followup);
+        assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
+    }
+    #[test]
+    fn followup_accepts_context_dependent_explanation_question() {
+        let followup = "What does it mean?";
+        let prev = "I found several matching studies and sent the JSON export.";
+        let (mode, reasons) = classify_followup_mode(followup, Some(prev));
+        assert_eq!(mode, FollowupMode::Followup);
+        assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
+    }
+
+    #[test]
+    fn generic_explanation_question_without_context_markers_stays_new_task() {
+        let current = "Can you explain Rust ownership?";
+        let prev = "I fetched the search results and sent the JSON export.";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::DefaultNewTask));
+    }
+    #[test]
+    fn generic_short_question_without_context_markers_stays_new_task() {
+        let current = "What is the weather in Paris?";
+        let prev = "I fetched the search results and sent the JSON export.";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::DefaultNewTask));
+    }
+    #[test]
+    fn artifact_request_does_not_inherit_previous_topic_as_clarification_answer() {
+        let current = "Check the doc and fix the issue.";
+        let prev = "Would you like me to get more detailed information for any specific trial(s)?";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::DefaultNewTask));
+    }
+    #[test]
+    fn unanswered_request_complaint_classified_as_followup() {
+        let prev = "I searched for AI news and found several results.";
+        let current = "You didn't respond my question";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::Followup);
+        assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
+    }
+    #[test]
+    fn answer_my_question_classified_as_followup() {
+        let prev = "Here is the latest result excerpt.";
+        let current = "answer my question please";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::Followup);
+        assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
+    }
+    #[test]
+    fn ignored_my_request_classified_as_followup() {
+        let prev = "I posted the deployment logs.";
+        let current = "You ignored my request";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::Followup);
+        assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
+    }
+    #[test]
+    fn what_about_my_request_classified_as_followup() {
+        let prev = "I summarized the bug reports.";
+        let current = "What about my request?";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::Followup);
+        assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
+    }
+    #[test]
+    fn unanswered_request_reference_uses_word_boundaries() {
+        let prev = "I searched the docs and posted the summary.";
+        let current = "Please answer myquestion now";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::DefaultNewTask));
+    }
+    #[test]
+    fn unanswered_complaint_without_prev_assistant_stays_new_task() {
+        // No previous assistant message — can't be a followup
+        let current = "You didn't respond my question";
+        let (mode, reasons) = classify_followup_mode(current, None);
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::DefaultNewTask));
+    }
+    #[test]
+    fn command_style_reply_to_question_starts_new_task() {
+        let (mode, reasons) = classify_followup_mode(
+            "Run build, and deploy it",
+            Some("Do you have all the information from your facts?"),
+        );
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::FollowupOverrideStandalone));
+    }
+    #[test]
+    fn detailed_request_after_schedule_question_keeps_semantic_context() {
+        let current = "Can you set up a daily scheduled task at 6:00 am to publish the blog with honest reflections about recent errors and fixes.";
+        let (mode, reasons) =
+            classify_followup_mode(current, Some("Would you like me to schedule that?"));
+        assert_ne!(mode, FollowupMode::NewTask);
+        assert!(!reasons.contains(&TurnContextReason::FollowupOverrideStandalone));
+    }
+    #[test]
+    fn deictic_schedule_followup_stays_contextual() {
+        let current = "Schedule it for every day at 6am.";
+        let (mode, reasons) =
+            classify_followup_mode(current, Some("Would you like me to schedule that?"));
+        assert_ne!(mode, FollowupMode::NewTask);
+        assert!(!reasons.contains(&TurnContextReason::FollowupOverrideStandalone));
+    }
+    #[test]
+    fn short_command_request_requires_structured_target() {
+        assert!(looks_like_short_command_request("run cargo test"));
+        assert!(!looks_like_short_command_request("check that"));
+        assert!(!looks_like_short_command_request("show it again"));
+    }
+    #[test]
+    fn named_project_scope_divergence_breaks_followup_carryover() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let alias_root = root.path().join("projects-root");
+        let dogs = alias_root.join("dogs-project");
+        let blog = alias_root.join("blog.aidaemon.ai");
+        std::fs::create_dir_all(&dogs).expect("create dogs");
+        std::fs::create_dir_all(&blog).expect("create blog");
+        std::fs::write(dogs.join("package.json"), r#"{"name":"dogs"}"#).expect("dogs package");
+        std::fs::write(blog.join("wrangler.toml"), "name = \"blog\"\n").expect("blog wrangler");
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+
+        assert!(has_project_scope_divergence_with_aliases(
+            &format!("Deploy {}", dogs.display()),
+            &format!("Now deploy {}", blog.display()),
+            &alias_roots,
+        ));
+    }
+
+    #[test]
+    fn plain_project_names_cannot_override_semantic_continuation() {
+        assert!(!has_project_scope_divergence_with_aliases(
+            "Keep working on synthetic-dogs-project",
+            "Use synthetic-blog-project for that part",
+            &[],
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn sanitize_carryover_blocks_removes_known_markers(payload in ".*") {
+            let input = format!(
+                "Original request:\n{}\n\nAssistant asked:\n{}\n\nFollow-up:\n{}",
+                payload, payload, payload
+            );
+            let (sanitized, changed) = sanitize_carryover_blocks(&input);
+            prop_assert!(changed);
+            prop_assert!(!sanitized.contains("Original request:"));
+            prop_assert!(!sanitized.contains("Assistant asked:"));
+            prop_assert!(!sanitized.contains("Follow-up:"));
+        }
+    }
+    proptest! {
+        #[test]
+        fn standalone_cross_project_requests_do_not_classify_as_followup(
+            scope in "[a-z0-9_-]{3,20}",
+            verb in prop::sample::select(vec!["compare", "analyze", "scan", "review", "audit"]),
+        ) {
+            let current = format!(
+                "{} dependencies across all my projects in ~/projects/{}. Don't ask questions, just do it.",
+                verb, scope
+            );
+            let (mode, reasons) = classify_followup_mode(
+                &current,
+                Some("Which directories should I inspect?")
+            );
+            prop_assert_eq!(mode, FollowupMode::NewTask);
+            prop_assert!(reasons.contains(&TurnContextReason::FollowupOverrideStandalone));
+        }
+    }
+}

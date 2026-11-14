@@ -1,0 +1,69 @@
+{
+  "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only, except plain http to localhost or a local dev site (a site on this computer by another name asks the owner first); each profile's credentials are sent only to its bound domains. Pass only the real endpoint URL in `url`; keep `auth_profile`, `account_id`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Every authenticated mandate request requires account_id to exactly match the profile's configured user_id. Write operations require user approval.",
+  "name": "http_request",
+  "schema": {
+    "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only, except plain http to localhost or a local dev site (a site on this computer by another name asks the owner first); each profile's credentials are sent only to its bound domains. Pass only the real endpoint URL in `url`; keep `auth_profile`, `account_id`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Every authenticated mandate request requires account_id to exactly match the profile's configured user_id. Write operations require user approval.",
+    "name": "http_request",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "account_id": {
+          "description": "Expected stable remote account ID. Required for every authenticated mandate request (read or write) and must exactly match the selected auth profile's configured user_id. Do not embed this in the URL.",
+          "type": "string"
+        },
+        "auth_profile": {
+          "description": "Top-level auth profile name (e.g. 'twitter', 'stripe'). Do not embed this in the URL.",
+          "type": "string"
+        },
+        "body": {
+          "description": "Top-level request body (JSON string, form data, etc.). Do not embed this in the URL.",
+          "type": "string"
+        },
+        "content_type": {
+          "description": "Top-level Content-Type header (auto-detected if omitted)",
+          "type": "string"
+        },
+        "follow_redirects": {
+          "description": "Follow redirects (default true, max 5 hops)",
+          "type": "boolean"
+        },
+        "headers": {
+          "description": "Top-level additional non-auth request headers",
+          "type": "object"
+        },
+        "max_response_bytes": {
+          "description": "Maximum response size in bytes (default 10MB, max 50MB). Large responses are saved to a file you can read/jq; you do not need to lower this.",
+          "type": "integer"
+        },
+        "method": {
+          "description": "HTTP method",
+          "enum": [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE"
+          ],
+          "type": "string"
+        },
+        "query_params": {
+          "description": "Actual remote query parameters appended to the URL. Do not place tool control args here.",
+          "type": "object"
+        },
+        "timeout_secs": {
+          "description": "Request timeout in seconds (default 30, max 120)",
+          "type": "integer"
+        },
+        "url": {
+          "description": "Full endpoint URL: HTTPS, or plain http only for localhost or an owner-approved local dev site. Do NOT append tool arguments like auth_profile, account_id, headers, body, content_type, timeout_secs, follow_redirects, or max_response_bytes to this URL.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "url"
+      ],
+      "type": "object"
+    }
+  }
+}

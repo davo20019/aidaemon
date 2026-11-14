@@ -1,0 +1,84 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "system": {
+      "checks": [
+        {
+          "checked_ms": 1767225500000,
+          "consecutive_failures": 0,
+          "latency_ms": 120,
+          "name": "Synthetic site",
+          "paused": false,
+          "status": "healthy",
+          "target": "https://h.example.invalid"
+        }
+      ],
+      "fallback_models": [
+        "model-b"
+      ],
+      "jobs": [
+        {
+          "consecutive_failures": 0,
+          "every_secs": 3600,
+          "last_success_ms": 1767225000000,
+          "name": "consolidation",
+          "running": false
+        }
+      ],
+      "model": "model-a",
+      "model_calls": {
+        "failed": 1,
+        "fell_back": 0,
+        "max_ms": 6100,
+        "p50_ms": 1200,
+        "p95_ms": 4800,
+        "total": 14
+      },
+      "queues": [
+        {
+          "capacity": 64,
+          "depth": 0,
+          "dropped": 0,
+          "failed": 0,
+          "name": "triggers",
+          "overloaded": false
+        }
+      ],
+      "runs": [
+        {
+          "description": "Send the synthetic weekly summary",
+          "finished_ms": 1767225120000,
+          "goal_id": "g-1",
+          "outcome": "Sent the summary to Jordan Lee",
+          "session_id": "telegram:synthetic-user-1",
+          "started_ms": 1767225000000,
+          "status": "completed"
+        }
+      ],
+      "schedules": [
+        {
+          "description": "Send the synthetic weekly summary",
+          "goal_id": "g-1",
+          "next_run_ms": 1767600000000,
+          "one_shot": false,
+          "paused": false,
+          "schedule": "every monday at 9",
+          "status": "active"
+        }
+      ],
+      "uptime_secs": 3600,
+      "usage": [
+        {
+          "day": "2026-01-01",
+          "input_tokens": 12000,
+          "model": "model-a",
+          "output_tokens": 900,
+          "requests": 14
+        }
+      ],
+      "version": "0.0.0-synthetic"
+    },
+    "type": "system"
+  },
+  "type": "ack"
+}

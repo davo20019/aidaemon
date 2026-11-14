@@ -1,0 +1,26 @@
+name: completion_retry
+description: >
+  A three-part task where the email step fails once (relay timeout) and
+  succeeds when retried. A good run retries and gets all three parts done
+  instead of stopping with the failure unresolved. A plain-kernel
+  regression: the receipt completion check it was aimed at showed no gain
+  here (5/5 with and without) and was removed.
+tags: ["kit:order"]
+input: >
+  Close out order ORD-77: mark it shipped, email the customer that it is on
+  the way with tracking number TRK-5521, and add a note to the order log
+  that the customer was emailed.
+script:
+  - tool_calls: [{ name: mark_shipped, arguments: { order: ORD-77 } }]
+  - tool_calls: [{ name: email_customer, arguments: { order: ORD-77, message: "Your order is on the way. Tracking: TRK-5521" } }]
+  - tool_calls: [{ name: email_customer, arguments: { order: ORD-77, message: "Your order is on the way. Tracking: TRK-5521" } }]
+  - tool_calls: [{ name: add_order_note, arguments: { order: ORD-77, note: Customer emailed tracking TRK-5521 } }]
+  - text: ORD-77 is marked shipped, the customer was emailed the tracking number (on the second try), and the note is in the log.
+expect:
+  status: completed
+  tools_used: [mark_shipped, add_order_note]
+  receipt_statuses: { email_customer: [failed, succeeded] }
+live_expect:
+  status: completed
+  tools_used: [mark_shipped, add_order_note]
+  receipt_statuses: { email_customer: [failed, succeeded] }

@@ -1,0 +1,15 @@
+[
+  {
+    "created_at_ms": 1767225600000,
+    "device_id": "dv-1",
+    "kind": "web",
+    "last_seen_ms": 1767225700000,
+    "name": "Synthetic Phone",
+    "revoked": false,
+    "scopes": [
+      "observe",
+      "chat",
+      "approve"
+    ]
+  }
+]

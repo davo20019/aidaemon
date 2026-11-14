@@ -1,0 +1,52 @@
+[package]
+name = "aidaemon-memory"
+description = "Swappable long-term memory for aidaemon agents: the MemoryStore traits plus SQLite and embedding implementations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-memory"
+readme = "README.md"
+keywords = ["agent", "memory", "llm", "embeddings", "sqlite"]
+categories = ["asynchronous", "database"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
+publish = false
+
+[features]
+default = []
+# Local ONNX embeddings (AllMiniLM-L6-v2) via fastembed. Downloads the model
+# on first use, so it is off by default; `HashEmbedder` works offline.
+fastembed = ["dep:fastembed"]
+# Exposes `aidaemon_memory::conformance`, the `MemoryStore` conformance kit
+# for authors of custom stores.
+conformance = ["aidaemon-core/testing"]
+
+[dependencies]
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
+aidaemon-policies = { version = "0.20.0", path = "../aidaemon-policies" }
+aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools" }
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+fastembed = { version = "7", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"], optional = true }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+hex = "0.4"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+aidaemon-memory = { path = ".", features = ["conformance"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

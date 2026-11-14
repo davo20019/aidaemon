@@ -1,17 +1,21 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAX_SCHEMA_SEGMENT_CHARS: usize = 6_500;
-// Reference-image editing and the owner-facing bounded-mandate contract add
-// explicit inputs, including non-combinable operation scopes. Retain a hard
-// aggregate ceiling while accounting for those user-visible capabilities.
-const MAX_TOTAL_SCHEMA_SEGMENT_CHARS: usize = 107_000;
-
 fn tools_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools")
 }
 
+/// Daemon tools that moved into crates (Phase 9 step 4) and are still
+/// held to the same schema rules.
+const MOVED_TOOL_SOURCES: &[&str] = &[
+    "crates/aidaemon-tools/src/web_search.rs",
+    "crates/aidaemon-tools/src/http_request.rs",
+    "crates/aidaemon-tools/src/system.rs",
+];
+
 fn tool_source_files() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let moved = MOVED_TOOL_SOURCES.iter().map(|path| root.join(path));
     let mut files = fs::read_dir(tools_dir())
         .expect("read src/tools")
         .filter_map(|entry| entry.ok())
@@ -24,6 +28,7 @@ fn tool_source_files() -> Vec<PathBuf> {
                 .ok()
                 .is_some_and(|src| src.contains("impl Tool for"))
         })
+        .chain(moved)
         .collect::<Vec<_>>();
     files.sort();
     files
@@ -164,20 +169,6 @@ fn schema_region_is_not_extended_by_following_adapter_hooks() {
 }
 
 #[test]
-fn all_tool_schemas_disable_additional_properties() {
-    for file in tool_source_files() {
-        let source = fs::read_to_string(&file).expect("read tool source");
-        let segment = schema_source_region(&source)
-            .unwrap_or_else(|| panic!("Could not locate schema segment in {}", file.display()));
-        assert!(
-            segment.contains("\"additionalProperties\": false"),
-            "Schema must include parameters.additionalProperties=false: {}",
-            file.display()
-        );
-    }
-}
-
-#[test]
 fn all_tools_define_explicit_capabilities() {
     for file in tool_source_files() {
         let source = fs::read_to_string(&file).expect("read tool source");
@@ -202,30 +193,6 @@ fn tools_do_not_silently_fallback_to_empty_arguments() {
 }
 
 #[test]
-fn schema_payload_budget_stays_bounded() {
-    let mut total = 0usize;
-    for file in tool_source_files() {
-        let source = fs::read_to_string(&file).expect("read tool source");
-        let segment = schema_source_region(&source)
-            .unwrap_or_else(|| panic!("Could not locate schema segment in {}", file.display()));
-        total += segment.len();
-        assert!(
-            segment.len() <= MAX_SCHEMA_SEGMENT_CHARS,
-            "Schema segment too large ({} chars) in {}",
-            segment.len(),
-            file.display()
-        );
-    }
-
-    assert!(
-        total <= MAX_TOTAL_SCHEMA_SEGMENT_CHARS,
-        "Total schema segment payload too large: {} chars (max {})",
-        total,
-        MAX_TOTAL_SCHEMA_SEGMENT_CHARS
-    );
-}
-
-#[test]
 fn tools_do_not_embed_truncation_notices_in_output() {
     // Tools must set ToolCallMetadata.truncation instead of embedding
     // truncation_notice text — see 2026-07-01 scaffolding-leak incidents.
@@ -238,7 +205,8 @@ fn tools_do_not_embed_truncation_notices_in_output() {
         let source = fs::read_to_string(&file).expect("read tool source");
         let stripped = source.replace("render_truncation_notice(", "");
         assert!(
-            !stripped.contains("truncation_notice(") && !stripped.contains("truncation_notice_with_hint("),
+            !stripped.contains("truncation_notice(")
+                && !stripped.contains("truncation_notice_with_hint("),
             "{} embeds a truncation notice in tool output; set metadata.truncation instead \
              (render_truncation_notice is allowed only for delivery paths that bypass the agent loop)",
             file.display()

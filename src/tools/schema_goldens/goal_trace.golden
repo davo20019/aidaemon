@@ -1,0 +1,48 @@
+{
+  "description": "Goal/task traces and tool-call timelines. Omit goal_id for recent-goal list.",
+  "name": "goal_trace",
+  "schema": {
+    "description": "Goal/task traces and tool-call timelines. Omit goal_id for recent-goal list.",
+    "name": "goal_trace",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "goal_trace",
+            "tool_trace"
+          ],
+          "type": "string"
+        },
+        "goal_id": {
+          "description": "Goal or mandate ID. Required for goal_trace; optional for tool_trace with task_id",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Max events; default 30, max 200",
+          "type": "integer"
+        },
+        "max_activities_per_task": {
+          "description": "Max per task; default 6, max 20",
+          "type": "integer"
+        },
+        "max_tasks": {
+          "description": "Max tasks; default 20, max 100",
+          "type": "integer"
+        },
+        "task_id": {
+          "description": "Task ID (tool_trace)",
+          "type": "string"
+        },
+        "tool_name": {
+          "description": "Tool filter (tool_trace)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

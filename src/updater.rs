@@ -11,9 +11,9 @@ use tracing::{error, info, warn};
 
 use crate::channels::ChannelHub;
 use crate::config::{UpdateConfig, UpdateMode};
+use crate::tools::ApprovalBroker;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
-use crate::tools::ApprovalBroker;
 use crate::types::ApprovalResponse;
 
 const REPO_OWNER: &str = "davo20019";
@@ -67,16 +67,15 @@ impl Updater {
             .build()?
             .fetch()?;
 
-        if let Some(latest) = releases.first() {
-            let latest_version = latest.version.trim_start_matches('v');
+        if let Some(latest) = releases.latest() {
+            let latest_version = latest.version().trim_start_matches('v');
             if let (Ok(current), Ok(latest_parsed)) = (
                 semver::Version::parse(CURRENT_VERSION),
                 semver::Version::parse(latest_version),
-            ) {
-                if latest_parsed > current {
-                    let notes = latest.body.as_deref().unwrap_or("No release notes.");
-                    return Ok(Some((latest_version.to_string(), notes.to_string())));
-                }
+            ) && latest_parsed > current
+            {
+                let notes = latest.body().unwrap_or("No release notes.");
+                return Ok(Some((latest_version.to_string(), notes.to_string())));
             }
         }
 
@@ -110,7 +109,7 @@ impl Updater {
             .repo_owner(REPO_OWNER)
             .repo_name(REPO_NAME)
             .bin_name(BIN_NAME)
-            .identifier(&target_asset)
+            .asset_identifier(&target_asset)
             .current_version(CURRENT_VERSION)
             .no_confirm(true)
             .show_download_progress(false)
@@ -186,6 +185,8 @@ impl Updater {
         let send_result = self
             .approval_tx
             .send(ApprovalRequest {
+                expires_at_ms: None,
+                card: None,
                 command: description,
                 session_id,
                 risk_level: RiskLevel::High,

@@ -1,0 +1,14 @@
+{
+  "description": "Get system information for the configured execution environment, including hostname, OS, uptime, and memory",
+  "name": "system_info",
+  "schema": {
+    "description": "Get system information for the configured execution environment, including hostname, OS, uptime, and memory",
+    "name": "system_info",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,71 @@
+[package]
+name = "aidaemon-tools"
+description = "Ready-made tools for aidaemon agents (files, search, sandboxed shell, web, checklist); implementation crate of the aidaemon SDK, no stability promise (use it through aidaemon-sdk)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-tools"
+readme = "README.md"
+keywords = ["agent", "tools", "llm", "shell", "sandbox"]
+categories = ["development-tools", "asynchronous"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
+publish = false
+
+[features]
+# Helpers for calling tools directly from tests.
+testing = []
+# Local workspace checkpoints (shadow-Git snapshots with their SQLite tables).
+checkpoints = ["dep:sqlx"]
+# The persistent Docker container execution backend.
+docker = []
+# OAuth connections (`services::oauth`): flows, token refresh, tokens in a
+# `SecretStore`.
+oauth = ["dep:aidaemon-secrets", "reqwest/json", "reqwest/form"]
+
+[dependencies]
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
+aidaemon-policies = { version = "0.20.0", path = "../aidaemon-policies" }
+aidaemon-secrets = { version = "0.20.0", path = "../aidaemon-secrets", default-features = false, optional = true }
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.23"
+dirs = "7"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+futures = "0.3"
+globset = "0.4"
+hmac = "0.13"
+htmd = "0.5"
+ignore = "0.4"
+llm_readability = "0.0"
+rand = "0.10"
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "deflate", "brotli"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.11"
+sha2 = "0.11"
+hex = "0.4"
+shell-words = "1.1"
+shellexpand = "3"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"], optional = true }
+thiserror = "2"
+toml = "1.2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["net", "process", "fs", "io-util", "time", "macros", "rt", "sync"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+axum = "0.8"
+proptest = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["net", "process", "fs", "io-util", "time", "macros", "rt", "rt-multi-thread", "net", "test-util"] }

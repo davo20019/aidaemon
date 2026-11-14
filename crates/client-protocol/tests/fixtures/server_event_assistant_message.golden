@@ -1,0 +1,11 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "session_id": "app:6c1f",
+    "text": "Got it, I'll start on that as soon as this finishes.",
+    "type": "assistant_message"
+  },
+  "seq": 4,
+  "session_id": "app:6c1f",
+  "type": "event"
+}

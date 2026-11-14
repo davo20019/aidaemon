@@ -1,0 +1,649 @@
+//! Shared presentation rules for outbound chat text.
+//!
+//! Keep channel messages readable here instead of teaching every notification
+//! producer how to lay out a mobile-friendly card.
+
+use regex::{Captures, Regex};
+use std::sync::LazyLock as Lazy;
+
+const MAX_INLINE_STEP_CHARS: usize = 180;
+const MAX_SCHEDULED_FAILURE_CHARS: usize = 900;
+
+static URL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"https?://[^\s<>]+").expect("valid outbound URL regex"));
+static LOCAL_PATH_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?m)(^|[\s(])((?:~/|/)[^\s,;]+)").expect("valid local path regex"));
+static TASK_COUNT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^\d+\s*/\s*\d+\s+tasks?\s+(?:completed|done)\.?$")
+        .expect("valid task-count regex")
+});
+
+/// Replace the daemon's internal markers (refusal prefixes, redaction
+/// placeholders, file-inbox paths) with what the owner reads instead. The
+/// last check on every outbound message: a marker that reaches it got past
+/// the boundary that should have rendered it, so it is logged.
+pub fn render_internal_markers(text: &str) -> String {
+    let (rendered, found) = aidaemon_tools::internal_markers::render_for_owner(text);
+    if !found.is_empty() {
+        tracing::warn!(
+            markers = ?found,
+            "Replaced internal markers in an outbound chat message"
+        );
+    }
+    rendered
+}
+
+static TASK_NUMBER_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(^|[\s(])#(\d{1,6})\b").expect("valid task-number regex"));
+
+/// Replace `#<id>` where `id` is one of this chat's task numbers (`tasks`:
+/// id and description, from the task registry) with a short label of the
+/// task: the numbers are the daemon's bookkeeping, not something the owner
+/// tracks. Any other `#<n>` (an issue, a heading) stays.
+pub fn render_task_numbers(text: &str, tasks: &[(u64, String)]) -> String {
+    if tasks.is_empty() || !text.contains('#') {
+        return text.to_string();
+    }
+    let mut replaced = 0usize;
+    let rendered = TASK_NUMBER_RE.replace_all(text, |caps: &Captures<'_>| {
+        let lead = &caps[1];
+        let label = caps[2]
+            .parse::<u64>()
+            .ok()
+            .and_then(|id| tasks.iter().find(|(task, _)| *task == id))
+            .map(|(_, description)| word_preview(description, 40));
+        match label {
+            Some(label) => {
+                replaced += 1;
+                format!("{lead}\"{label}\"")
+            }
+            None => caps[0].to_string(),
+        }
+    });
+    if replaced > 0 {
+        tracing::warn!(
+            replaced,
+            "Replaced task numbers with task labels in an outbound chat message"
+        );
+    }
+    rendered.into_owned()
+}
+
+/// Prepare arbitrary agent-originated Markdown for a chat surface.
+pub fn prepare_chat_message(text: &str) -> String {
+    let cleaned = aidaemon_tools::sanitize::strip_leaked_control_markers(text);
+    let cleaned = render_internal_markers(&cleaned);
+    let mut lines = Vec::new();
+    let mut previous_blank = false;
+
+    for raw_line in cleaned.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !previous_blank && !lines.is_empty() {
+                lines.push(String::new());
+            }
+            previous_blank = true;
+            continue;
+        }
+
+        // Orchestration steps can contain the user's entire multi-paragraph
+        // instruction. They are useful in the task ledger, not in a chat card.
+        if is_verbose_step_echo(trimmed) || is_probable_bold_task_prompt(trimmed) {
+            continue;
+        }
+
+        lines.push(style_known_label(line));
+        previous_blank = false;
+    }
+
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines.join("\n").trim().to_string()
+}
+
+/// Apply a consistent status card to queued notifications.
+pub fn present_notification(notification_type: &str, message: &str) -> String {
+    let prepared = prepare_chat_message(message);
+    if prepared.is_empty() || has_status_heading(&prepared) {
+        return prepared;
+    }
+
+    let heading = match notification_type {
+        "completed" => "✅ **Completed**",
+        "failed" => "❌ **Run failed**",
+        "escalation"
+        | "mandate_ask"
+        | "mandate_reconciliation_required"
+        | "mandate_objective_control_required" => "⚠️ **Action needed**",
+        "stalled" => "⏸️ **Work paused**",
+        "token_alert" => "⚠️ **Budget alert**",
+        "evergreen_alert" => "⚠️ **Schedule needs attention**",
+        "mandate_paused" | "mandate_stopped" => "⏸️ **Automation paused**",
+        "mandate_review_failed" | "mandate_reconciliation" | "mandate_ask_timeout" => {
+            "⚠️ **Automation update**"
+        }
+        "mandate_action" => "✅ **Automation update**",
+        "mandate_alert" => "🚨 **Automation alert**",
+        "node_monitor_alert" => "🚨 **Node alert**",
+        "node_monitor_recovery" => "✅ **Node recovered**",
+        "node_monitor_ended" | "node_monitor_suspended" => "⏸️ **Node monitoring**",
+        "progress" | "status_update" => "🔄 **Update**",
+        _ => "ℹ️ **Update**",
+    };
+    let body = trim_redundant_lead(notification_type, &prepared);
+    if body.is_empty() {
+        heading.to_string()
+    } else {
+        format!("{heading}\n\n{body}")
+    }
+}
+
+/// Whether a scheduled run's work had ended when its card was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledRunProgress {
+    /// The run's work is over; the card reports its outcome.
+    Finished,
+    /// The run handed long work to the background: it is still going, and its
+    /// result arrives later.
+    StillRunning,
+}
+
+/// Render a recurring scheduled-run result as a compact mobile card.
+///
+/// Executor results deliberately retain detailed paths, commands, versions, and
+/// verification evidence in the durable task ledger. A chat notification has a
+/// different job: state the outcome, link the deliverable, and make the schedule
+/// state obvious. Keeping that boundary here prevents raw execution transcripts
+/// from becoming the default Telegram experience. The card claims only what
+/// the run's typed state shows: never "complete" while its work still runs,
+/// and no checks it did not report.
+pub fn present_scheduled_run_notification(
+    notification_type: &str,
+    message: &str,
+    recurring: bool,
+    progress: ScheduledRunProgress,
+) -> String {
+    let prepared = prepare_chat_message(message);
+    let links = presentable_urls(&prepared);
+    let schedule_note = recurring.then_some("_It will run again on its schedule._");
+
+    if notification_type == "completed" && progress == ScheduledRunProgress::StillRunning {
+        return "⏳ **Scheduled run still going**\n\nI'll tell you when it's done.".to_string();
+    }
+
+    if notification_type == "completed" {
+        let outcome = concise_scheduled_outcome(&prepared);
+        let mut sections = vec!["✅ **Scheduled run complete**".to_string()];
+        sections.push(if outcome.is_empty() {
+            "It finished.".to_string()
+        } else {
+            outcome
+        });
+
+        for (index, (url, host)) in links.iter().take(2).enumerate() {
+            let label = if links.len() == 1 {
+                format!("Open {host}")
+            } else {
+                format!("Open result {} · {host}", index + 1)
+            };
+            sections.push(format!("🔗 [{label}]({url})"));
+        }
+        if let Some(schedule_note) = schedule_note {
+            sections.push(schedule_note.to_string());
+        }
+        return sections.join("\n\n");
+    }
+
+    let heading = if notification_type == "failed" {
+        "⚠️ **Scheduled run needs attention**"
+    } else {
+        "ℹ️ **Scheduled run update**"
+    };
+    let cleaned = shorten_local_paths(&prepared);
+    let detail = truncate_chars(cleaned.trim(), MAX_SCHEDULED_FAILURE_CHARS);
+    match (detail.is_empty(), schedule_note) {
+        (true, Some(schedule_note)) => format!("{heading}\n\n{schedule_note}"),
+        (true, None) => heading.to_string(),
+        (false, Some(schedule_note)) => format!("{heading}\n\n{detail}\n\n{schedule_note}"),
+        (false, None) => format!("{heading}\n\n{detail}"),
+    }
+}
+
+fn presentable_urls(text: &str) -> Vec<(String, String)> {
+    let mut urls = Vec::new();
+    for found in URL_RE.find_iter(text) {
+        let candidate = found
+            .as_str()
+            .trim_end_matches(['.', ',', ';', ':', ')', ']', '}']);
+        let Ok(parsed) = url::Url::parse(candidate) else {
+            continue;
+        };
+        let Some(host) = parsed.host_str() else {
+            continue;
+        };
+        let private_host = host.eq_ignore_ascii_case("localhost")
+            || host == "127.0.0.1"
+            || host == "::1"
+            || host.ends_with(".local");
+        if private_host || urls.iter().any(|(existing, _)| existing == candidate) {
+            continue;
+        }
+        urls.push((candidate.to_string(), host.to_string()));
+    }
+    urls
+}
+
+fn concise_scheduled_outcome(text: &str) -> String {
+    let without_urls = URL_RE.replace_all(text, "");
+    let shortened = shorten_local_paths(&without_urls);
+    for line in shortened.lines().map(str::trim) {
+        // Headings and lead-in labels ("Goal completed:") introduce the
+        // outcome; they are not it.
+        if line.is_empty()
+            || has_status_heading(line)
+            || TASK_COUNT_RE.is_match(line)
+            || (line.starts_with("**") && line.ends_with("**"))
+            || line.ends_with(':')
+        {
+            continue;
+        }
+        let sentence = first_sentence(line);
+        if !sentence.is_empty() {
+            return truncate_chars(sentence, 320);
+        }
+    }
+    String::new()
+}
+
+fn first_sentence(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(byte, b'.' | b'!' | b'?')
+            && bytes.get(index + 1).is_none_or(u8::is_ascii_whitespace)
+        {
+            return text[..=index].trim();
+        }
+    }
+    text.trim()
+}
+
+fn shorten_local_paths(text: &str) -> String {
+    LOCAL_PATH_RE
+        .replace_all(text, |captures: &Captures<'_>| {
+            let prefix = captures.get(1).map_or("", |m| m.as_str());
+            let original = captures.get(2).map_or("", |m| m.as_str());
+            let trimmed = original.trim_end_matches(['.', ')', ']', '}']);
+            let suffix = &original[trimmed.len()..];
+            let filename = std::path::Path::new(trimmed)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("local file");
+            format!("{prefix}`{filename}`{suffix}")
+        })
+        .into_owned()
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated = text
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn is_verbose_step_echo(line: &str) -> bool {
+    line.strip_prefix("Step:")
+        .or_else(|| line.strip_prefix("**Step:**"))
+        .is_some_and(|step| step.trim().chars().count() > MAX_INLINE_STEP_CHARS)
+}
+
+fn is_probable_bold_task_prompt(line: &str) -> bool {
+    if !line.starts_with("**") || !line.ends_with("**") || line.chars().count() <= 220 {
+        return false;
+    }
+    let lower = line.to_ascii_lowercase();
+    [
+        "create", "read", "write", "run", "deploy", "verify", "exactly",
+    ]
+    .iter()
+    .filter(|word| lower.contains(*word))
+    .count()
+        >= 3
+}
+
+fn style_known_label(line: &str) -> String {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("**") {
+        return line.to_string();
+    }
+    for label in [
+        "Blocked",
+        "Step",
+        "Needed to continue",
+        "Needed",
+        "Resume",
+        "Live",
+        "Source",
+        "Verification",
+        "Status",
+        "Version",
+        "ID",
+    ] {
+        let prefix = format!("{label}:");
+        if let Some(value) = trimmed.strip_prefix(&prefix) {
+            return format!("**{label}:**{}", value);
+        }
+    }
+    line.to_string()
+}
+
+fn has_status_heading(message: &str) -> bool {
+    let first = message.lines().next().unwrap_or_default().trim_start();
+    [
+        "✅ **",
+        "❌ **",
+        "⚠️ **",
+        "⏸️ **",
+        "🔄 **",
+        "⏳ **",
+        "🔁 **",
+        "ℹ️ **",
+    ]
+    .iter()
+    .any(|prefix| first.starts_with(prefix))
+}
+
+fn trim_redundant_lead<'a>(notification_type: &str, message: &'a str) -> &'a str {
+    let prefixes: &[&str] = match notification_type {
+        "completed" => &["Goal completed:", "Goal completed.", "Completed:"],
+        "failed" => &["Goal failed:", "Run failed:", "Failed:"],
+        "stalled" => &["Goal stalled:", "Work stalled:"],
+        _ => &[],
+    };
+    for prefix in prefixes {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            return rest.trim();
+        }
+    }
+    message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_presentation_removes_long_step_echo_and_styles_labels() {
+        let prompt = "Create, read, write, run, deploy, and verify exactly one post. ".repeat(8);
+        let input = format!(
+            "The deploy failed.\nStep: {prompt}\nNeeded: Fix the build.\nResume: /work unblock 12345678 <resolution>"
+        );
+
+        let output = prepare_chat_message(&input);
+
+        assert!(!output.contains("Create, read"));
+        assert!(output.contains("**Needed:** Fix the build."));
+        assert!(output.contains("**Resume:** /work unblock"));
+    }
+
+    #[test]
+    fn notifications_get_one_consistent_heading() {
+        assert_eq!(
+            present_notification("completed", "Goal completed:\n\nPublished the post."),
+            "✅ **Completed**\n\nPublished the post."
+        );
+        assert_eq!(
+            present_notification("escalation", "⚠️ **Action needed**\n\nFix it."),
+            "⚠️ **Action needed**\n\nFix it."
+        );
+    }
+
+    #[test]
+    fn long_bold_task_prompt_is_removed() {
+        let prompt = format!(
+            "**{}**",
+            "Create, read, write, deploy, and verify exactly one post. ".repeat(8)
+        );
+        let output = prepare_chat_message(&format!("Published the post.\n\n{prompt}\n\nHTTP 200."));
+        assert_eq!(output, "Published the post.\n\nHTTP 200.");
+    }
+
+    #[test]
+    fn scheduled_completion_is_compact_and_hides_local_path() {
+        let input = "Published /Users/synthetic/projects/blog/src/content/posts/2026-08-12-example.md. \
+                     Evidence was repository guidance and clean git status. npm run deploy built \
+                     successfully with Vite 7.3.1 and uploaded 5 assets. Exact public URL \
+                     https://blog.example.com/posts/example/ returned HTTP 200.";
+
+        let output = present_scheduled_run_notification(
+            "completed",
+            input,
+            true,
+            ScheduledRunProgress::Finished,
+        );
+
+        assert!(output.starts_with("✅ **Scheduled run complete**"));
+        assert!(output.contains("Published `2026-08-12-example.md`."));
+        assert!(
+            output.contains("[Open blog.example.com](https://blog.example.com/posts/example/)")
+        );
+        assert!(!output.contains("Checks"));
+        assert!(output.contains("_It will run again on its schedule._"));
+        assert!(!output.contains("/Users/synthetic"));
+        assert!(!output.contains("Vite 7.3.1"));
+        assert!(!output.contains("uploaded 5 assets"));
+    }
+
+    #[test]
+    fn scheduled_completion_skips_lead_in_labels() {
+        let input = "Goal completed:\n\n**Deliver the scheduled reminder now.**\nPrepared \
+                     reminder: Check the oven now. No rescheduling.";
+
+        let output = present_scheduled_run_notification(
+            "completed",
+            input,
+            false,
+            ScheduledRunProgress::Finished,
+        );
+
+        assert!(output.contains("Check the oven"), "{output}");
+        assert!(!output.contains("Goal completed:"), "{output}");
+    }
+
+    #[test]
+    fn scheduled_completion_skips_task_count_and_internal_urls() {
+        let input = "2/2 tasks completed.\n\n**Publish the article**\nPublished the article. \
+                     Previewed at http://localhost:4173/ and deployed to \
+                     https://blog.example.com/posts/article/.";
+
+        let output = present_scheduled_run_notification(
+            "completed",
+            input,
+            true,
+            ScheduledRunProgress::Finished,
+        );
+
+        assert!(output.contains("Published the article."));
+        assert!(output.contains("https://blog.example.com/posts/article/"));
+        assert!(!output.contains("localhost"));
+        assert!(!output.contains("2/2 tasks"));
+    }
+
+    #[test]
+    fn a_run_still_going_is_never_called_complete() {
+        let input = "⏳ **Still on it**\n\nThis is taking a little longer, so it's running \
+                     in the background now.";
+
+        let output = present_scheduled_run_notification(
+            "completed",
+            input,
+            true,
+            ScheduledRunProgress::StillRunning,
+        );
+
+        assert_eq!(
+            output,
+            "⏳ **Scheduled run still going**\n\nI'll tell you when it's done."
+        );
+    }
+
+    #[test]
+    fn a_status_card_inside_the_result_is_not_taken_as_its_outcome() {
+        let input = "⏳ **Still on it**\nPublished the weekly post.";
+
+        let output = present_scheduled_run_notification(
+            "completed",
+            input,
+            false,
+            ScheduledRunProgress::Finished,
+        );
+
+        assert!(output.contains("Published the weekly post."), "{output}");
+        assert!(!output.contains("Still on it"), "{output}");
+    }
+
+    #[test]
+    fn scheduled_failure_keeps_actionable_detail_but_shortens_paths() {
+        let input = "Deployment failed while reading /Users/synthetic/projects/blog/wrangler.toml.\n\nNeeded: refresh the deployment token.";
+
+        let output = present_scheduled_run_notification(
+            "failed",
+            input,
+            true,
+            ScheduledRunProgress::Finished,
+        );
+
+        assert!(output.starts_with("⚠️ **Scheduled run needs attention**"));
+        assert!(output.contains("`wrangler.toml`"));
+        assert!(output.contains("refresh the deployment token"));
+        assert!(!output.contains("/Users/synthetic"));
+        assert!(output.contains("_It will run again on its schedule._"));
+    }
+}
+
+/// `text` cut to at most `max_chars` characters (the ellipsis included) at
+/// the last whole word, so a preview never ends mid-word. A single word
+/// longer than the limit is cut where it must be.
+pub fn word_preview(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let budget = max_chars.saturating_sub(1);
+    let head: String = text.chars().take(budget).collect();
+    // Cut at a space only when the word after it was split.
+    let next_is_break = text.chars().nth(budget).is_some_and(char::is_whitespace);
+    let kept = if next_is_break {
+        head.as_str()
+    } else {
+        head.rfind(char::is_whitespace)
+            .map(|at| &head[..at])
+            .filter(|kept| !kept.trim().is_empty())
+            .unwrap_or(head.as_str())
+    };
+    format!("{}…", kept.trim_end())
+}
+
+/// The reply to a message that arrives while a task runs in its session.
+/// A message that joins the work (`waits_for_own_turn` false) is taken in
+/// at the running task's next step that can act on it (one offering tools)
+/// when it is from the same sender (`TaskRegistry::take_steering_messages`);
+/// one with attachments or read as unrelated to the work, or one no model
+/// call answered, runs as its own turn once the current one ends, and this
+/// notice is edited into [`queued_message_starting`] then.
+pub fn queued_message_notice(waits_for_own_turn: bool) -> String {
+    if waits_for_own_turn {
+        "📥 Got it – I'll get to this right after what I'm doing now.".to_string()
+    } else {
+        "📥 Got it – I'll add this to what I'm doing now.".to_string()
+    }
+}
+
+/// What a queued message's notice says once its own turn starts.
+pub fn queued_message_starting(text: &str) -> String {
+    format!("▶️ Now on: \"{}\"", word_preview(text, 50))
+}
+
+#[cfg(test)]
+mod owner_facing_tests {
+    use super::{prepare_chat_message, render_task_numbers};
+
+    #[test]
+    fn this_chat_s_task_numbers_become_task_labels() {
+        let tasks = vec![
+            (12, "Install a WordPress demo site".to_string()),
+            (14, "Install a Drupal demo site".to_string()),
+        ];
+        assert_eq!(
+            render_task_numbers("Both #12 and #14 are done (#14 took longer).", &tasks),
+            "Both \"Install a WordPress demo site\" and \"Install a Drupal demo site\" are \
+             done (\"Install a Drupal demo site\" took longer)."
+        );
+        // Not one of this chat's tasks, or not a task reference: unchanged.
+        assert_eq!(
+            render_task_numbers("Fixed issue #7 and step#12.", &tasks),
+            "Fixed issue #7 and step#12."
+        );
+        assert_eq!(render_task_numbers("Done #12.", &[]), "Done #12.");
+    }
+
+    #[test]
+    fn a_reply_never_shows_the_daemon_s_markers() {
+        let reply = prepare_chat_message(
+            "I could not send it: [OWNER DECLINED] The file [REDACTED:File path] is still at \
+             ~/.aidaemon/files/inbox/dd4dc47d_screenshot.png.",
+        );
+        assert_eq!(
+            reply,
+            "I could not send it: you declined that The file a file is still at screenshot.png."
+        );
+    }
+}
+
+#[cfg(test)]
+mod queued_notice_tests {
+    use super::{queued_message_notice, queued_message_starting};
+
+    #[test]
+    fn the_notice_is_short_and_says_what_will_happen() {
+        assert_eq!(
+            queued_message_notice(false),
+            "📥 Got it – I'll add this to what I'm doing now."
+        );
+        assert_eq!(
+            queued_message_notice(true),
+            "📥 Got it – I'll get to this right after what I'm doing now."
+        );
+        assert_eq!(
+            queued_message_starting(&"x".repeat(80)),
+            format!("▶️ Now on: \"{}…\"", "x".repeat(49))
+        );
+    }
+
+    #[test]
+    fn a_preview_ends_on_a_whole_word() {
+        use super::word_preview;
+        let request = "Every day at 7:13 am, send me a one-line synthetic test reminder \
+                       that says: daily-check beta.";
+        assert_eq!(
+            word_preview(request, 80),
+            "Every day at 7:13 am, send me a one-line synthetic test reminder that says:…"
+        );
+        assert_eq!(word_preview("short request", 80), "short request");
+        assert_eq!(
+            word_preview(&"y".repeat(90), 10),
+            format!("{}…", "y".repeat(9))
+        );
+        assert_eq!(
+            queued_message_starting(request),
+            "▶️ Now on: \"Every day at 7:13 am, send me a one-line…\""
+        );
+    }
+}

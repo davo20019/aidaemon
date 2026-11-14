@@ -1,0 +1,17 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "next_cursor": "1",
+    "sessions": [
+      {
+        "channel": "app",
+        "id": "app:6c1f",
+        "last_activity_ms": 1767225600000,
+        "title": "Synthetic report for Alice Rivera",
+        "writable": true
+      }
+    ],
+    "type": "sessions"
+  },
+  "type": "ack"
+}

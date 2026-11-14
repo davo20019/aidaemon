@@ -2,11 +2,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::config::AppConfig;
-use crate::memory::embeddings::EmbeddingService;
-use crate::nodes::domain::{NodeAction, CHILD_COMPANION_POLICY};
-use crate::state::SqliteStateStore;
+use crate::nodes::domain::{CHILD_COMPANION_POLICY, NodeAction};
 use anyhow::Context;
-use sqlx::{Row, SqlitePool};
+use sqlx::SqlitePool;
 
 pub fn handle_node_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
     if matches!(
@@ -25,17 +23,8 @@ pub fn handle_node_command(args: &[String], config_path: &Path) -> anyhow::Resul
         let resolved =
             crate::startup::db_security::resolve_db_path(config_path, &config.state.db_path);
         config.state.db_path = resolved.to_string_lossy().into_owned();
-        let embeddings =
-            Arc::new(EmbeddingService::new().map_err(|error| {
-                anyhow::anyhow!("Failed to initialize database support: {error}")
-            })?);
-        let state = SqliteStateStore::new(
-            &config.state.db_path,
-            config.state.working_memory_cap,
-            config.state.encryption_key.as_deref(),
-            embeddings,
-        )
-        .await?;
+        let embeddings = Arc::new(crate::startup::stores::daemon_embeddings()?);
+        let state = crate::startup::stores::open_daemon_state(&config, embeddings).await?;
         let store = Arc::new(super::store::NodeStore::new(
             state.pool(),
             super::auth::load_or_create_instance_key()?,
@@ -295,21 +284,8 @@ async fn resolve_monitor_owner_session(
         !allowed.is_empty(),
         "No Telegram owner is configured; pass --session explicitly"
     );
-    let rows = sqlx::query(
-        "SELECT session_id FROM session_channels
-         WHERE channel_name = 'telegram' OR channel_name LIKE 'telegram:%'
-         ORDER BY updated_at DESC",
-    )
-    .fetch_all(pool)
-    .await?;
-    let candidate = rows
-        .into_iter()
-        .map(|row| row.get::<String, _>("session_id"))
-        .find(|session| {
-            crate::session::telegram_chat_id_from_session(session)
-                .is_some_and(|chat_id| allowed.contains(&chat_id))
-        });
-    candidate
+    super::monitoring::latest_owner_telegram_session(pool, &allowed)
+        .await?
         .context("Could not resolve a private Telegram owner session; pass --session explicitly")
 }
 
@@ -369,7 +345,9 @@ fn print_monitor_help() {
     println!("  list");
     println!("  history <monitor_id> [--since-hours N] [--limit N]");
     println!("  pause|resume|cancel <monitor_id>");
-    println!("Owner session is resolved from the most recently active configured private Telegram Channel; use --session only for explicit local administration.");
+    println!(
+        "Owner session is resolved from the most recently active configured private Telegram Channel; use --session only for explicit local administration."
+    );
 }
 
 #[cfg(test)]

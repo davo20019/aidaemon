@@ -1,0 +1,13 @@
+name: simple_greeting_orchestrator
+description: Simple greeting falls through orchestrator path into LLM loop
+input: Hi there
+setup:
+  session_id: eval_greeting_orch_01
+  orchestrator: true
+script:
+  - text: Hello! How can I help?
+expect:
+  ext:
+    orchestration_route: default_continue
+    outcome: succeeded
+    llm_calls_min: 1

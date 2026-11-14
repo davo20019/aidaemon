@@ -1,69 +1,74 @@
 pub mod approval;
-pub mod background_deliverable;
-#[cfg(feature = "browser")]
-pub mod browser;
+#[cfg(feature = "slack")]
 #[cfg(feature = "slack")]
 mod channel_history;
-mod cli_agent;
+pub(crate) use aidaemon_runtime::tools::cli_agent;
 #[cfg(feature = "computer_use")]
-#[allow(dead_code)]
-pub mod computer_use;
-mod config_manager;
+pub use aidaemon_runtime::tools::computer_use;
+pub(crate) mod config_manager;
+#[allow(unused_imports)]
+pub(crate) use aidaemon_tools::consequential;
 mod diagnose;
-pub mod file_delivery;
+/// SDK tools as daemon tools (no SDK tool is wrapped yet; 8.4 moves them).
+#[allow(dead_code)]
+mod file_policy;
+pub use file_policy::DaemonPaths;
+pub(crate) use file_policy::daemon_file_policy;
+#[cfg(test)]
+pub(crate) use file_policy::{guarded_call, guarded_call_protecting};
 mod goal_trace;
-mod health_probe;
 pub mod image_generation;
-mod manage_mandates;
+pub(crate) mod manage_automations;
+pub(crate) mod manage_mandates;
 mod manage_memories;
-mod manage_people;
-pub(crate) mod memory;
 pub(crate) mod objective_status;
 mod policy_metrics;
-pub mod result_spill;
-pub mod sanitize;
+pub use aidaemon_tools::result_spill;
+pub use aidaemon_tools::sanitize;
+mod schedule_task;
 mod scheduled_goal_runs;
 mod search_history;
 mod send_file;
-mod share_memory;
+mod set_reminder;
 pub mod spawn;
-mod system;
-pub mod terminal;
-mod tool_trace;
+pub use aidaemon_runtime::tools::terminal;
 pub mod track_requirements;
 pub mod web_fetch;
 mod web_search;
 
-pub use approval::ApprovalBroker;
 #[cfg(feature = "browser")]
-pub use browser::BrowserTool;
+pub use aidaemon_tool_browser::BrowserTool;
+pub use approval::ApprovalBroker;
 #[cfg(feature = "slack")]
-pub use channel_history::ReadChannelHistoryTool;
+#[cfg(feature = "slack")]
+pub use channel_history::{ReadChannelHistoryTool, SlackBotTokens};
 pub use cli_agent::CliAgentTool;
 #[cfg(feature = "computer_use")]
 pub use computer_use::ComputerUseTool;
 pub use config_manager::ConfigManagerTool;
+mod escalate;
+pub use aidaemon_memory::full::tools::{ManagePeopleTool, RememberFactTool};
+pub use aidaemon_tools::http_request;
+pub use aidaemon_tools::system::SystemInfoTool;
+pub use aidaemon_work::health::HealthProbeTool;
 pub use diagnose::DiagnoseTool;
+#[cfg(test)]
+pub use escalate::EscalateToParentTool;
 pub use goal_trace::GoalTraceTool;
-pub use health_probe::HealthProbeTool;
+pub use http_request::HttpRequestTool;
 pub use image_generation::GenerateImageTool;
+pub use manage_automations::ManageAutomationsTool;
 pub use manage_mandates::ManageMandatesTool;
 pub use manage_memories::ManageMemoriesTool;
-pub use manage_people::ManagePeopleTool;
-pub use memory::RememberFactTool;
 pub use policy_metrics::PolicyMetricsTool;
-pub use scheduled_goal_runs::ScheduledGoalRunsTool;
+pub use schedule_task::ScheduleTaskTool;
 pub use search_history::SearchHistoryTool;
 pub use send_file::SendFileTool;
-pub use share_memory::ShareMemoryTool;
+pub use set_reminder::SetReminderTool;
 pub use spawn::SpawnAgentTool;
-pub use system::SystemInfoTool;
 pub use terminal::TerminalTool;
-pub use tool_trace::ToolTraceTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
-mod http_request;
-pub use http_request::HttpRequestTool;
 mod manage_api;
 pub use manage_api::ManageApiTool;
 mod manage_http_auth;
@@ -71,52 +76,37 @@ pub use manage_http_auth::ManageHttpAuthTool;
 mod manage_oauth;
 pub use manage_oauth::ManageOAuthTool;
 pub mod manage_mcp;
-mod manage_skills;
-pub mod skill_registry;
-mod skill_resources;
-mod use_skill;
 
-mod manage_cli_agents;
-pub use manage_cli_agents::ManageCliAgentsTool;
+pub use aidaemon_runtime::tools::manage_cli_agents::ManageCliAgentsTool;
 pub mod manage_goal_tasks;
+#[cfg(test)]
 pub use manage_goal_tasks::ManageGoalTasksTool;
 pub mod report_blocker;
+pub use aidaemon_client_gateway::client_view::ClientViewTool;
+pub use aidaemon_skills::tools::{ManageSkillsTool, SkillResourcesTool, UseSkillTool};
+pub use aidaemon_tools::command_risk;
 pub use manage_mcp::ManageMcpTool;
-pub use manage_skills::ManageSkillsTool;
-pub use report_blocker::ReportBlockerTool;
-pub use skill_resources::SkillResourcesTool;
-pub use use_skill::UseSkillTool;
-pub mod command_patterns;
-pub mod command_risk;
-pub mod daemon_guard;
-mod semantic_command_risk;
 
 // Deterministic tools
-pub(crate) mod fs_utils;
+pub(crate) use aidaemon_tools::fs_utils;
 mod read_file;
-pub use read_file::ReadFileTool;
-pub(crate) use read_file::{render_read_file_output, render_read_file_output_within};
+pub use crate::startup::tool_config::ReadFileTool;
 mod write_file;
-pub use write_file::WriteFileTool;
+pub use crate::startup::tool_config::WriteFileTool;
 mod edit_file;
-pub use edit_file::EditFileTool;
+pub use crate::startup::tool_config::EditFileTool;
 mod search_files;
-pub use search_files::SearchFilesTool;
-mod project_inspect;
-pub use project_inspect::ProjectInspectTool;
-pub(crate) mod run_command;
-pub use run_command::RunCommandTool;
-mod git_info;
-pub(crate) mod process_control;
-pub use git_info::GitInfoTool;
-mod git_commit;
-pub use git_commit::GitCommitTool;
-mod list_checkpoints;
-pub use list_checkpoints::ListCheckpointsTool;
-mod check_environment;
-pub use check_environment::CheckEnvironmentTool;
-mod service_status;
-pub use service_status::ServiceStatusTool;
+pub use crate::startup::tool_config::SearchFilesTool;
+pub use aidaemon_tools::check_environment::CheckEnvironmentTool;
+pub use aidaemon_tools::checkpoints::ListCheckpointsTool;
 
 #[cfg(test)]
+mod catalog_lint_tests;
+#[cfg(test)]
+mod execution_backend_injection_tests;
+#[cfg(test)]
+mod schema_golden_tests;
+#[cfg(test)]
 mod schema_lint_tests;
+#[cfg(test)]
+mod work_schema_golden_tests;

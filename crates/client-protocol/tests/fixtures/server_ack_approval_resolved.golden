@@ -1,0 +1,9 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "approval_id": "a-7f3e-1",
+    "outcome": "denied",
+    "type": "approval_resolved"
+  },
+  "type": "ack"
+}

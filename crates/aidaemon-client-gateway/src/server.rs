@@ -1,0 +1,979 @@
+//! The gateway's routes: the WebSocket at `/client/v1/ws`, and the HTTP
+//! mode for clients that cannot hold a socket (watches, scripts):
+//! `POST /client/v1/commands` and the long-poll `GET /client/v1/events`.
+
+// Handlers return a refusal as the response itself (`Result<_, Response>`).
+#![allow(clippy::result_large_err)]
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use aidaemon_client_protocol::{
+    Capability, ChallengeRequest, ClientFrame, ClientKind, ErrorCode, Event, EventsPage,
+    OfferRequest, PairingDecision, ProtocolError, ProtocolVersion, RedeemRequest, Scope,
+    ServerFrame, SessionRequest,
+};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
+use tokio::sync::{broadcast, mpsc};
+use tracing::{debug, info};
+
+use crate::pairing::Principal;
+use crate::{Caller, ClientGateway};
+
+/// The largest frame or request body accepted.
+const MAX_BODY: usize = 256 * 1024;
+/// How long a socket may take to say hello.
+const HELLO_WITHIN: Duration = Duration::from_secs(10);
+/// A socket that says nothing for this long (clients ping every 25 s) is
+/// closed; the client reconnects with `resume_from`.
+const IDLE_LIMIT: Duration = Duration::from_secs(60);
+/// Log rows read per page when replaying.
+const REPLAY_PAGE: u32 = 500;
+/// The longest a long-poll waits.
+const MAX_WAIT: Duration = Duration::from_secs(25);
+
+/// The gateway's routes.
+pub fn router(gateway: Arc<ClientGateway>) -> Router {
+    Router::new()
+        .route("/client/v1/ws", get(websocket))
+        .route("/client/v1/commands", post(http_command))
+        .route("/client/v1/events", get(http_events))
+        .route("/client/v1/pairing/offers", post(create_offer))
+        .route("/client/v1/pairing/offers/{offer_id}", get(offer_status))
+        .route(
+            "/client/v1/pairing/offers/{offer_id}/decision",
+            post(decide_offer),
+        )
+        .route("/client/v1/enrollments/redeem", post(redeem))
+        .route("/client/v1/enrollments/{offer_id}", get(enrollment))
+        .route("/client/v1/sessions/challenge", post(challenge))
+        .route("/client/v1/sessions", post(open_session))
+        .route("/client/v1/devices", get(devices))
+        .route("/client/v1/devices/{device_id}/revoke", post(revoke_device))
+        .route("/client/v1/app", get(web_page))
+        .route("/client/v1/app/", get(web_page))
+        .route("/client/v1/next", get(app_root))
+        .route("/client/v1/next/", get(app_index))
+        .route("/client/v1/next/{*path}", get(app_file))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
+        .with_state(gateway)
+}
+
+/// Listen on the configured loopback address until the process ends.
+pub async fn serve(gateway: Arc<ClientGateway>) -> anyhow::Result<()> {
+    let addr = gateway.config.bind_addr()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!(%addr, "Client Gateway listening");
+    axum::serve(listener, router(gateway)).await?;
+    Ok(())
+}
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+}
+
+fn principal(gateway: &ClientGateway, token: Option<&str>) -> Option<Principal> {
+    gateway.principal(token?)
+}
+
+/// The caller with this token, or the response refusing it.
+fn authenticate(gateway: &ClientGateway, headers: &HeaderMap) -> Result<Principal, Response> {
+    principal(gateway, bearer(headers))
+        .ok_or_else(|| error_response(ErrorCode::Unauthorized, "A valid client token is required"))
+}
+
+fn status_of(code: ErrorCode) -> StatusCode {
+    match code {
+        ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
+        ErrorCode::Forbidden => StatusCode::FORBIDDEN,
+        ErrorCode::NotFound => StatusCode::NOT_FOUND,
+        ErrorCode::Conflict => StatusCode::CONFLICT,
+        ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        ErrorCode::Invalid | ErrorCode::VersionUnsupported => StatusCode::BAD_REQUEST,
+        ErrorCode::Internal | ErrorCode::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn error_response(code: ErrorCode, message: &str) -> Response {
+    (
+        status_of(code),
+        Json(ServerFrame::Error {
+            request_id: None,
+            error: ProtocolError::new(code, message),
+        }),
+    )
+        .into_response()
+}
+
+/// A frame as `caller` gets it: compact clients get no turn streaming and
+/// approvals without their detail. `None`: not sent at all.
+fn fit(frame: &ServerFrame, compact: bool) -> Option<ServerFrame> {
+    if !compact {
+        return Some(frame.clone());
+    }
+    use aidaemon_client_protocol::CommandResult;
+    let mut frame = frame.clone();
+    match &mut frame {
+        ServerFrame::Event { event, .. } => match event {
+            Event::TurnDelta { .. } | Event::TurnStatus { .. } => return None,
+            Event::ApprovalRequested { approval } => {
+                *approval = approval.clone().compact();
+            }
+            _ => {}
+        },
+        ServerFrame::Snapshot { state, .. }
+        | ServerFrame::Ack {
+            result: CommandResult::Snapshot { state, .. },
+            ..
+        } => {
+            state.pending_approvals = std::mem::take(&mut state.pending_approvals)
+                .into_iter()
+                .map(|a| a.compact())
+                .collect();
+        }
+        _ => {}
+    }
+    Some(frame)
+}
+
+/// The caller an HTTP request names: `X-Aidaemon-Client` (its kind),
+/// `X-Aidaemon-Device` and `X-Aidaemon-Capabilities` (comma-separated).
+/// A watch is compact unless it says otherwise.
+fn http_caller(headers: &HeaderMap, principal: Principal) -> Caller {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let kind = header("x-aidaemon-client")
+        .and_then(|kind| serde_json::from_value(serde_json::Value::String(kind)).ok());
+    let capabilities: Vec<Capability> = header("x-aidaemon-capabilities")
+        .map(|list| {
+            list.split(',')
+                .filter_map(|c| {
+                    serde_json::from_value(serde_json::Value::String(c.trim().to_string())).ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    caller_of(kind, header("x-aidaemon-device"), &capabilities, principal)
+}
+
+fn caller_of(
+    kind: Option<ClientKind>,
+    device: Option<String>,
+    capabilities: &[Capability],
+    principal: Principal,
+) -> Caller {
+    Caller {
+        compact: capabilities.contains(&Capability::Compact) || kind == Some(ClientKind::Watch),
+        kind,
+        device,
+        principal,
+        view_connection: None,
+    }
+}
+
+fn refusal(error: ProtocolError) -> Response {
+    (
+        status_of(error.code),
+        Json(ServerFrame::Error {
+            request_id: None,
+            error,
+        }),
+    )
+        .into_response()
+}
+
+fn reply<T: serde::Serialize>(result: Result<T, ProtocolError>) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => refusal(error),
+    }
+}
+
+/// Only the owner's local token may pair and revoke devices.
+fn owner_only(gateway: &ClientGateway, headers: &HeaderMap) -> Result<(), Response> {
+    let principal = authenticate(gateway, headers)?;
+    if principal.is_owner() {
+        Ok(())
+    } else {
+        Err(error_response(
+            ErrorCode::Forbidden,
+            "Only the owner's local token may manage devices",
+        ))
+    }
+}
+
+fn body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Response> {
+    serde_json::from_slice(bytes)
+        .map_err(|error| error_response(ErrorCode::Invalid, &error.to_string()))
+}
+
+async fn create_offer(
+    State(gateway): State<Arc<ClientGateway>>,
+    headers: HeaderMap,
+    bytes: axum::body::Bytes,
+) -> Response {
+    if let Err(refused) = owner_only(&gateway, &headers) {
+        return refused;
+    }
+    let request: OfferRequest = if bytes.is_empty() {
+        OfferRequest::default()
+    } else {
+        match body(&bytes) {
+            Ok(request) => request,
+            Err(refused) => return refused,
+        }
+    };
+    reply(gateway.pairing.offer(request.confirm_in_session).await)
+}
+
+async fn offer_status(
+    State(gateway): State<Arc<ClientGateway>>,
+    headers: HeaderMap,
+    Path(offer_id): Path<String>,
+) -> Response {
+    if let Err(refused) = owner_only(&gateway, &headers) {
+        return refused;
+    }
+    reply(gateway.pairing.enrollment(&offer_id).await)
+}
+
+async fn decide_offer(
+    State(gateway): State<Arc<ClientGateway>>,
+    headers: HeaderMap,
+    Path(offer_id): Path<String>,
+    bytes: axum::body::Bytes,
+) -> Response {
+    if let Err(refused) = owner_only(&gateway, &headers) {
+        return refused;
+    }
+    let decision: PairingDecision = match body(&bytes) {
+        Ok(decision) => decision,
+        Err(refused) => return refused,
+    };
+    reply(gateway.pairing.decide(&offer_id, decision.approve).await)
+}
+
+async fn redeem(State(gateway): State<Arc<ClientGateway>>, bytes: axum::body::Bytes) -> Response {
+    let request: RedeemRequest = match body(&bytes) {
+        Ok(request) => request,
+        Err(refused) => return refused,
+    };
+    match gateway.pairing.redeem(request).await {
+        Ok(enrollment) => (StatusCode::ACCEPTED, Json(enrollment)).into_response(),
+        Err(error) => refusal(error),
+    }
+}
+
+async fn enrollment(
+    State(gateway): State<Arc<ClientGateway>>,
+    Path(offer_id): Path<String>,
+) -> Response {
+    reply(gateway.pairing.enrollment(&offer_id).await)
+}
+
+async fn challenge(
+    State(gateway): State<Arc<ClientGateway>>,
+    bytes: axum::body::Bytes,
+) -> Response {
+    let request: ChallengeRequest = match body(&bytes) {
+        Ok(request) => request,
+        Err(refused) => return refused,
+    };
+    reply(gateway.pairing.challenge(&request.device_id).await)
+}
+
+async fn open_session(
+    State(gateway): State<Arc<ClientGateway>>,
+    bytes: axum::body::Bytes,
+) -> Response {
+    let request: SessionRequest = match body(&bytes) {
+        Ok(request) => request,
+        Err(refused) => return refused,
+    };
+    reply(
+        gateway
+            .pairing
+            .open_session(&request.challenge_id, &request.signature)
+            .await,
+    )
+}
+
+async fn devices(State(gateway): State<Arc<ClientGateway>>, headers: HeaderMap) -> Response {
+    if let Err(refused) = owner_only(&gateway, &headers) {
+        return refused;
+    }
+    reply(gateway.pairing.devices().await)
+}
+
+async fn revoke_device(
+    State(gateway): State<Arc<ClientGateway>>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Response {
+    if let Err(refused) = owner_only(&gateway, &headers) {
+        return refused;
+    }
+    if let Err(error) = gateway.pairing.revoke(&device_id).await {
+        return refusal(error);
+    }
+    reply(gateway.pairing.devices().await)
+}
+
+/// Shown at `/client/v1/app` when no web build of the app is installed.
+/// Self-contained: no scripts and no external assets.
+const NOT_INSTALLED_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIdaemon</title>
+<style>
+body { font: 16px/1.5 system-ui, sans-serif; max-width: 36rem; margin: 3rem auto; padding: 0 1rem; color: #1f2328; background: #fff; }
+code { font-family: ui-monospace, monospace; font-size: 0.9em; background: #f0f1f3; padding: 0.1em 0.3em; border-radius: 4px; }
+@media (prefers-color-scheme: dark) { body { color: #e6e6e6; background: #16181c; } code { background: #2a2d33; } }
+</style>
+</head>
+<body>
+<h1>The AIdaemon web app is not installed</h1>
+<p>This daemon serves the web app from <code>~/.aidaemon/app-web</code>, and nothing is there yet.</p>
+<p>To get it, re-run the install script, which installs the web app with each release:</p>
+<p><code>curl -sSfL https://get.aidaemon.ai | bash</code></p>
+<p>Or build it from a checkout: in <code>clients/app</code> run <code>nsh package --target web</code> and copy the contents of <code>.nsh/out/AIdaemon/</code> to <code>~/.aidaemon/app-web</code>.</p>
+<p>Then reload this page.</p>
+</body>
+</html>
+"#;
+
+async fn web_page(State(gateway): State<Arc<ClientGateway>>) -> Response {
+    // With the app's web build served, links to this path (pairing links,
+    // bookmarks) open it; the browser keeps the `#offer=…`.
+    if gateway
+        .config
+        .app_dir
+        .as_deref()
+        .is_some_and(|d| !d.trim().is_empty())
+    {
+        return axum::response::Redirect::temporary("/client/v1/next/").into_response();
+    }
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'",
+            ),
+        ],
+        NOT_INSTALLED_PAGE,
+    )
+        .into_response()
+}
+
+/// The nsh app's web build: `app_dir` from the config, read file by file.
+/// Only plain relative paths inside the directory are served.
+async fn app_root() -> Response {
+    axum::response::Redirect::permanent("/client/v1/next/").into_response()
+}
+
+async fn app_index(State(gateway): State<Arc<ClientGateway>>, headers: HeaderMap) -> Response {
+    serve_app_file(&gateway, "index.html", &headers).await
+}
+
+async fn app_file(
+    State(gateway): State<Arc<ClientGateway>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    serve_app_file(&gateway, &path, &headers).await
+}
+
+async fn serve_app_file(gateway: &ClientGateway, path: &str, request: &HeaderMap) -> Response {
+    let Some(dir) = gateway
+        .config
+        .app_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(relative) = app_path(path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let root = std::path::Path::new(dir);
+    let file = root.join(&relative);
+    // Symlinks must stay inside the directory too.
+    let (Ok(root), Ok(real)) = (
+        tokio::fs::canonicalize(root).await,
+        tokio::fs::canonicalize(&file).await,
+    ) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !real.starts_with(&root) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // The build ships Brotli and gzip copies beside each file.
+    let accepts = request
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let mut encoding = None;
+    let mut bytes = None;
+    for (name, suffix) in [("br", ".br"), ("gzip", ".gz")] {
+        if accepts
+            .split(',')
+            .any(|e| e.trim().split(';').next() == Some(name))
+            && let Ok(found) = tokio::fs::read(format!("{}{suffix}", real.display())).await
+        {
+            encoding = Some(name);
+            bytes = Some(found);
+            break;
+        }
+    }
+    let bytes = match bytes {
+        Some(bytes) => bytes,
+        None => match tokio::fs::read(&real).await {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        },
+    };
+    let mut headers = vec![(axum::http::header::CONTENT_TYPE, content_type(&relative))];
+    if let Some(encoding) = encoding {
+        headers.push((axum::http::header::CONTENT_ENCODING, encoding));
+        headers.push((axum::http::header::VARY, "accept-encoding"));
+    }
+    // The page names its files by content hash: they never change, and the
+    // page itself is always checked, so a new build shows on the next load.
+    if relative.ends_with(".html") || relative.ends_with(".webmanifest") {
+        headers.push((axum::http::header::CACHE_CONTROL, "no-cache"));
+    } else if relative
+        .split('/')
+        .next_back()
+        .is_some_and(|name| name.split('.').count() >= 3)
+    {
+        headers.push((
+            axum::http::header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable",
+        ));
+    }
+    if relative.ends_with(".html") {
+        headers.push((
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' ws: wss:; \
+             style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:",
+        ));
+    }
+    let mut response = (StatusCode::OK, bytes).into_response();
+    for (name, value) in headers {
+        if let Ok(value) = value.parse() {
+            response.headers_mut().insert(name, value);
+        }
+    }
+    response
+}
+
+/// `path` as plain relative components, or `None` for anything that could
+/// leave the directory.
+fn app_path(path: &str) -> Option<String> {
+    let path = path.trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    let parts: Vec<&str> = path.split('/').collect();
+    let plain = parts
+        .iter()
+        .all(|part| !part.is_empty() && *part != "." && *part != ".." && !part.contains('\\'));
+    plain.then(|| parts.join("/"))
+}
+
+fn content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or_default() {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "wasm" => "application/wasm",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn http_command(
+    State(gateway): State<Arc<ClientGateway>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let principal = match authenticate(&gateway, &headers) {
+        Ok(principal) => principal,
+        Err(refused) => return refused,
+    };
+    let frame: ClientFrame = match serde_json::from_slice(&body) {
+        Ok(frame) => frame,
+        Err(error) => return error_response(ErrorCode::Invalid, &error.to_string()),
+    };
+    let ClientFrame::Command {
+        request_id,
+        command,
+    } = frame
+    else {
+        return error_response(ErrorCode::Invalid, "Send a command frame");
+    };
+    let caller = http_caller(&headers, principal);
+    let reply = gateway.command(&request_id, command, &caller).await;
+    let reply = fit(&reply, caller.compact).unwrap_or(reply);
+    Json(reply).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct EventsQuery {
+    /// The last `seq` applied; absent: start from a snapshot.
+    since: Option<u64>,
+    /// Seconds to wait for an event when there is none (at most 25).
+    #[serde(default)]
+    wait: u64,
+    #[serde(default = "default_page")]
+    limit: u32,
+}
+
+fn default_page() -> u32 {
+    REPLAY_PAGE
+}
+
+async fn http_events(
+    State(gateway): State<Arc<ClientGateway>>,
+    headers: HeaderMap,
+    Query(query): Query<EventsQuery>,
+) -> Response {
+    let principal = match authenticate(&gateway, &headers) {
+        Ok(principal) => principal,
+        Err(refused) => return refused,
+    };
+    if !principal.may(Scope::Observe) {
+        return error_response(ErrorCode::Forbidden, "This device may not read events");
+    }
+    let caller = http_caller(&headers, principal);
+    let limit = query.limit.clamp(1, REPLAY_PAGE);
+    let since = match query.since {
+        Some(since) if gateway.bus.can_resume(since).await => since,
+        _ => {
+            let (seq, state) = gateway.snapshot().await;
+            let frame = ServerFrame::Snapshot { seq, state };
+            let frames = fit(&frame, caller.compact).into_iter().collect();
+            return Json(EventsPage {
+                frames,
+                next_since: seq,
+            })
+            .into_response();
+        }
+    };
+    // Subscribe before reading, so an event logged in between wakes us.
+    let mut live = gateway.bus.subscribe();
+    let mut frames = gateway.bus.after(since, limit).await.unwrap_or_default();
+    if frames.is_empty() && query.wait > 0 {
+        let wait = Duration::from_secs(query.wait).min(MAX_WAIT);
+        let _ = tokio::time::timeout(wait, async {
+            loop {
+                match live.recv().await {
+                    Ok(frame) if matches!(*frame, ServerFrame::Event { seq: Some(_), .. }) => {
+                        return;
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        })
+        .await;
+        frames = gateway.bus.after(since, limit).await.unwrap_or_default();
+    }
+    let next_since = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            ServerFrame::Event { seq, .. } => *seq,
+            _ => None,
+        })
+        .max()
+        .unwrap_or(since);
+    let frames = frames
+        .iter()
+        .filter_map(|frame| fit(frame, caller.compact))
+        .collect();
+    Json(EventsPage { frames, next_since }).into_response()
+}
+
+async fn websocket(
+    State(gateway): State<Arc<ClientGateway>>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    // A token in the header is checked now; without one, `hello` must
+    // carry it.
+    let by_header = match bearer(&headers) {
+        Some(token) => match principal(&gateway, Some(token)) {
+            Some(principal) => Some(principal),
+            None => {
+                return error_response(ErrorCode::Unauthorized, "A valid client token is required");
+            }
+        },
+        None => None,
+    };
+    upgrade
+        .max_message_size(MAX_BODY)
+        .on_upgrade(move |socket| async move {
+            if let Err(error) = run_socket(gateway, socket, by_header).await {
+                debug!(%error, "Client socket closed");
+            }
+        })
+}
+
+async fn send(socket: &mut WebSocket, frame: &ServerFrame) -> anyhow::Result<()> {
+    let text = serde_json::to_string(frame)?;
+    socket.send(Message::Text(text.into())).await?;
+    Ok(())
+}
+
+async fn refuse(socket: &mut WebSocket, code: ErrorCode, message: &str) -> anyhow::Result<()> {
+    send(
+        socket,
+        &ServerFrame::Error {
+            request_id: None,
+            error: ProtocolError::new(code, message),
+        },
+    )
+    .await?;
+    let _ = socket.send(Message::Close(None)).await;
+    anyhow::bail!("{message}")
+}
+
+async fn run_socket(
+    gateway: Arc<ClientGateway>,
+    mut socket: WebSocket,
+    by_header: Option<Principal>,
+) -> anyhow::Result<()> {
+    let hello = match tokio::time::timeout(HELLO_WITHIN, socket.recv()).await {
+        Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str::<ClientFrame>(&text).ok(),
+        _ => None,
+    };
+    let Some(ClientFrame::Hello {
+        version,
+        client,
+        capabilities,
+        resume_from,
+        token,
+    }) = hello
+    else {
+        return refuse(&mut socket, ErrorCode::Invalid, "Say hello first").await;
+    };
+    let Some(principal) = by_header.or_else(|| principal(&gateway, token.as_deref())) else {
+        return refuse(
+            &mut socket,
+            ErrorCode::Unauthorized,
+            "A valid client token is required",
+        )
+        .await;
+    };
+    if !principal.may(Scope::Observe) {
+        return refuse(
+            &mut socket,
+            ErrorCode::Forbidden,
+            "This device may not read events",
+        )
+        .await;
+    }
+    if !ProtocolVersion::CURRENT.compatible_with(version) {
+        return refuse(
+            &mut socket,
+            ErrorCode::VersionUnsupported,
+            &format!(
+                "This daemon speaks protocol {}.x",
+                ProtocolVersion::CURRENT.major
+            ),
+        )
+        .await;
+    }
+    let revoked = principal.revoked.clone();
+    let mut caller = caller_of(
+        Some(client.kind),
+        client.device.clone(),
+        &capabilities,
+        principal,
+    );
+    // A socket that can be moved gets its own outbox for view actions.
+    let mut view = capabilities
+        .contains(&Capability::ViewActions)
+        .then(|| gateway.views.connect());
+    caller.view_connection = view.as_ref().map(|view| view.id);
+
+    // Subscribe before reading the log, so nothing falls between them.
+    let mut live = gateway.bus.subscribe();
+    let latest = gateway.bus.latest().await;
+    send(
+        &mut socket,
+        &ServerFrame::Welcome {
+            version: ProtocolVersion::CURRENT,
+            server_capabilities: vec![Capability::Compact, Capability::ViewActions],
+            owner: gateway.owner(),
+            latest_seq: latest,
+        },
+    )
+    .await?;
+
+    // Catch up: everything after the client's seq, or a snapshot.
+    let mut sent = match resume_from {
+        Some(seq) if gateway.bus.can_resume(seq).await => seq,
+        _ => {
+            let (seq, state) = gateway.snapshot().await;
+            if let Some(frame) = fit(&ServerFrame::Snapshot { seq, state }, caller.compact) {
+                send(&mut socket, &frame).await?;
+            }
+            seq
+        }
+    };
+    sent = replay(&gateway, &mut socket, sent, caller.compact).await?;
+
+    let (replies_tx, mut replies) = mpsc::channel::<ServerFrame>(64);
+    let mut last_heard = tokio::time::Instant::now();
+    loop {
+        let idle = tokio::time::sleep_until(last_heard + IDLE_LIMIT);
+        tokio::select! {
+            incoming = socket.recv() => {
+                let Some(Ok(message)) = incoming else { return Ok(()) };
+                last_heard = tokio::time::Instant::now();
+                let text = match message {
+                    Message::Text(text) => text,
+                    Message::Close(_) => return Ok(()),
+                    _ => continue,
+                };
+                match serde_json::from_str::<ClientFrame>(&text) {
+                    Ok(ClientFrame::Ping) => send(&mut socket, &ServerFrame::Pong).await?,
+                    Ok(ClientFrame::Command { request_id, command }) => {
+                        // Commands run beside the event stream; each sends
+                        // exactly one reply.
+                        let gateway = gateway.clone();
+                        let caller = caller.clone();
+                        let replies = replies_tx.clone();
+                        tokio::spawn(async move {
+                            let reply = gateway.command(&request_id, command, &caller).await;
+                            let _ = replies.send(reply).await;
+                        });
+                    }
+                    Ok(ClientFrame::Hello { .. }) => {
+                        send(&mut socket, &ServerFrame::Error {
+                            request_id: None,
+                            error: ProtocolError::new(ErrorCode::Invalid, "Already said hello"),
+                        }).await?;
+                    }
+                    Err(error) => {
+                        send(&mut socket, &ServerFrame::Error {
+                            request_id: None,
+                            error: ProtocolError::new(ErrorCode::Invalid, error.to_string()),
+                        }).await?;
+                    }
+                }
+            }
+            Some(frame) = async {
+                match view.as_mut() {
+                    Some(view) => view.outbox.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                send(&mut socket, &frame).await?;
+            }
+            Some(reply) = replies.recv() => {
+                if let Some(reply) = fit(&reply, caller.compact) {
+                    send(&mut socket, &reply).await?;
+                }
+            }
+            frame = live.recv() => match frame {
+                Ok(frame) => {
+                    match &*frame {
+                        // Already sent from the log.
+                        ServerFrame::Event { seq: Some(seq), .. } if *seq <= sent => continue,
+                        // A gap means frames were missed: read them from the log.
+                        ServerFrame::Event { seq: Some(seq), .. } if *seq > sent + 1 => {
+                            sent = replay(&gateway, &mut socket, sent, caller.compact).await?;
+                            continue;
+                        }
+                        ServerFrame::Event { seq: Some(seq), .. } => sent = *seq,
+                        _ => {}
+                    }
+                    if let Some(frame) = fit(&frame, caller.compact) {
+                        send(&mut socket, &frame).await?;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    sent = replay(&gateway, &mut socket, sent, caller.compact).await?;
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
+            _ = idle => {
+                let _ = socket.send(Message::Close(None)).await;
+                return Ok(());
+            }
+            _ = revoked.cancelled() => {
+                send(&mut socket, &ServerFrame::Error {
+                    request_id: None,
+                    error: ProtocolError::new(ErrorCode::Unauthorized, "This device was revoked"),
+                }).await?;
+                let _ = socket.send(Message::Close(None)).await;
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Send every logged event after `sent`; returns the last `seq` sent.
+async fn replay(
+    gateway: &ClientGateway,
+    socket: &mut WebSocket,
+    mut sent: u64,
+    compact: bool,
+) -> anyhow::Result<u64> {
+    loop {
+        let frames = gateway.bus.after(sent, REPLAY_PAGE).await?;
+        if frames.is_empty() {
+            return Ok(sent);
+        }
+        for frame in &frames {
+            if let ServerFrame::Event { seq: Some(seq), .. } = frame {
+                sent = *seq;
+            }
+            if let Some(frame) = fit(frame, compact) {
+                send(socket, &frame).await?;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn app_paths_stay_inside_the_directory() {
+        use super::app_path;
+        assert_eq!(app_path("").as_deref(), Some("index.html"));
+        assert_eq!(app_path("nsh.wasm").as_deref(), Some("nsh.wasm"));
+        assert_eq!(
+            app_path("assets/fonts/a.woff2").as_deref(),
+            Some("assets/fonts/a.woff2")
+        );
+        for escape in ["../config.toml", "a/../../b", "a//b", "./x", "a\\..\\b"] {
+            assert_eq!(app_path(escape), None, "{escape}");
+        }
+    }
+
+    use super::*;
+
+    /// Every route this listener mounts sits under `/client/v1`: an exposure
+    /// adapter forwards the whole port, so nothing else may be served here.
+    #[test]
+    fn every_route_is_under_the_service_prefix() {
+        let source = include_str!("server.rs");
+        let body = source
+            .split("pub fn router(gateway: Arc<ClientGateway>) -> Router {")
+            .nth(1)
+            .expect("router() is in this file")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let routes: Vec<&str> = body
+            .split(".route(")
+            .skip(1)
+            .map(|rest| rest.trim_start().trim_start_matches('"'))
+            .collect();
+        assert!(!routes.is_empty());
+        for route in routes {
+            assert!(
+                route.starts_with("/client/v1/"),
+                "route outside /client/v1: {}",
+                route.lines().next().unwrap_or_default()
+            );
+        }
+        assert!(!body.contains(".nest(") && !body.contains(".fallback("));
+    }
+    use aidaemon_client_protocol::{Approval, ApprovalDecision, ApprovalKind, Risk, TurnStatus};
+
+    fn approval() -> Approval {
+        Approval {
+            id: "a1".into(),
+            session_id: "app:s".into(),
+            kind: ApprovalKind::Command,
+            risk: Risk::Medium,
+            summary: "Run the synthetic report".into(),
+            detail: Some("report --all".into()),
+            card: None,
+            warnings: Vec::new(),
+            options: vec![ApprovalDecision::ApproveOnce, ApprovalDecision::Deny],
+            requested_at_ms: 1,
+            expires_at_ms: None,
+            channel: None,
+        }
+    }
+
+    fn event(event: Event) -> ServerFrame {
+        ServerFrame::Event {
+            seq: Some(1),
+            at_ms: 1,
+            session_id: None,
+            event,
+        }
+    }
+
+    #[test]
+    fn compact_drops_streaming_and_approval_detail() {
+        let status = ServerFrame::Event {
+            seq: None,
+            at_ms: 1,
+            session_id: None,
+            event: Event::TurnStatus {
+                turn_id: "t".into(),
+                status: TurnStatus::Thinking,
+            },
+        };
+        assert!(fit(&status, true).is_none());
+        assert!(fit(&status, false).is_some());
+        let asked = event(Event::ApprovalRequested {
+            approval: approval(),
+        });
+        let Some(ServerFrame::Event {
+            event: Event::ApprovalRequested { approval },
+            ..
+        }) = fit(&asked, true)
+        else {
+            panic!("kept");
+        };
+        assert_eq!(approval.detail, None);
+        assert_eq!(approval.summary, "Run the synthetic report");
+    }
+
+    #[test]
+    fn a_watch_is_compact_by_default() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-aidaemon-client", "watch".parse().unwrap());
+        headers.insert("x-aidaemon-device", "Synthetic Watch".parse().unwrap());
+        let caller = http_caller(&headers, Principal::owner());
+        assert!(caller.compact);
+        assert_eq!(caller.kind, Some(ClientKind::Watch));
+        assert_eq!(caller.device.as_deref(), Some("Synthetic Watch"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-aidaemon-capabilities", "compact, goals".parse().unwrap());
+        assert!(http_caller(&headers, Principal::owner()).compact);
+        assert!(!http_caller(&HeaderMap::new(), Principal::owner()).compact);
+    }
+}

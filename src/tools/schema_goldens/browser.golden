@@ -1,0 +1,110 @@
+{
+  "description": "Control a persistent browser for JavaScript/login-required pages and interactive website tasks. For readable public research, prefer web_search/web_fetch; use browser when those cannot access the content. Validated public navigation and read-only inspection do not require approval; opening a site on this computer asks the owner once per site; page mutations may require approval, and execute_js always requires one-time approval. Use only opaque tab IDs returned by the tool.",
+  "name": "browser",
+  "schema": {
+    "description": "Control a persistent browser for JavaScript/login-required pages and interactive website tasks. For readable public research, prefer web_search/web_fetch; use browser when those cannot access the content. Validated public navigation and read-only inspection do not require approval; opening a site on this computer asks the owner once per site; page mutations may require approval, and execute_js always requires one-time approval. Use only opaque tab IDs returned by the tool.",
+    "name": "browser",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "The browser action to perform",
+          "enum": [
+            "navigate",
+            "screenshot",
+            "render_pdf",
+            "click",
+            "fill",
+            "get_text",
+            "inspect_page",
+            "scroll",
+            "execute_js",
+            "wait",
+            "list_tabs",
+            "get_console_logs",
+            "get_network_errors",
+            "new_tab",
+            "switch_tab",
+            "close_tab",
+            "set_mode",
+            "close"
+          ],
+          "type": "string"
+        },
+        "amount": {
+          "description": "Distance in pixels for 'scroll' (default: 700)",
+          "maximum": 5000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "condition": {
+          "description": "Condition for 'wait' (default: present). present=in DOM; visible=laid out & not hidden; enabled=not disabled; hidden=absent or hidden; text_contains=element text contains 'text'.",
+          "enum": [
+            "present",
+            "visible",
+            "enabled",
+            "hidden",
+            "text_contains"
+          ],
+          "type": "string"
+        },
+        "deliver": {
+          "description": "For 'screenshot': true declares this capture the deliverable the owner's request asked for: it is sent now, or, in a helper's run, once when the run ends (the last such capture of each page). Default false: the capture is saved and kept for you to look at, not sent. Leave it false for any capture that checks a page (it may have redirected or not be ready); set it only when you know the page is the one asked for, or send a kept capture later with send_file.",
+          "type": "boolean"
+        },
+        "direction": {
+          "description": "Direction for 'scroll' (default: down)",
+          "enum": [
+            "up",
+            "down"
+          ],
+          "type": "string"
+        },
+        "full_page": {
+          "description": "For 'screenshot' WITHOUT a selector: capture the entire scrollable page instead of just the visible viewport (default false). Full-page captures of long pages may be too large to deliver and will be rejected — prefer the default viewport or a selector.",
+          "type": "boolean"
+        },
+        "output_filename": {
+          "description": "Plain .pdf filename for 'render_pdf' (default: source basename with .pdf); directories are not allowed",
+          "type": "string"
+        },
+        "script": {
+          "description": "JavaScript code to execute (for 'execute_js' action)",
+          "type": "string"
+        },
+        "selector": {
+          "description": "Stable CSS selector for click/fill/get_text/wait/screenshot. Prefer id, data-*, name, or aria attributes. Never convert a querySelectorAll array index into :nth-of-type(); DOM indexes go stale and :nth-of-type is sibling-relative. Re-observe after page changes.",
+          "type": "string"
+        },
+        "source_path": {
+          "description": "Local .html or .htm source path for 'render_pdf'",
+          "type": "string"
+        },
+        "tab_id": {
+          "description": "Opaque tab id from list_tabs/new_tab (required for 'switch_tab' and 'close_tab'; optional for 'get_console_logs' and 'get_network_errors' — defaults to the active tab)",
+          "type": "string"
+        },
+        "text": {
+          "description": "Needle for the 'wait' action's 'text_contains' condition (the substring to wait for in the element's text)",
+          "type": "string"
+        },
+        "timeout_secs": {
+          "description": "Timeout in seconds for 'wait' action (default from config, clamped 1..=120)",
+          "type": "integer"
+        },
+        "url": {
+          "description": "URL to navigate to (for 'navigate', or optionally for 'new_tab')",
+          "type": "string"
+        },
+        "value": {
+          "description": "Text to type (for 'fill') or mode to set (for 'set_mode': 'visible' or 'headless')",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

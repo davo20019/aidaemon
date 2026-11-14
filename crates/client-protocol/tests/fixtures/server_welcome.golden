@@ -1,0 +1,14 @@
+{
+  "latest_seq": 42,
+  "owner": {
+    "name": "Alice Rivera"
+  },
+  "server_capabilities": [
+    "compact"
+  ],
+  "type": "welcome",
+  "version": {
+    "major": 1,
+    "minor": 3
+  }
+}

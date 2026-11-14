@@ -1,0 +1,95 @@
+{
+  "description": "Run shell commands in local, Docker, or SSH workspaces. Dangerous or uncertain commands require owner approval. Check or kill long-running commands later; use write_file instead of shell redirection. If a chain (&&, ||, ;, |) has a dangerous segment, refuse the whole chain and ask which operation the user wants.",
+  "name": "terminal",
+  "schema": {
+    "description": "Run shell commands in local, Docker, or SSH workspaces. Dangerous or uncertain commands require owner approval. Check or kill long-running commands later; use write_file instead of shell redirection. If a chain (&&, ||, ;, |) has a dangerous segment, refuse the whole chain and ask which operation the user wants.",
+    "name": "terminal",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "run, check, or kill",
+          "enum": [
+            "run",
+            "check",
+            "kill"
+          ],
+          "type": "string"
+        },
+        "background": {
+          "description": "Run finite work (a build, a count, a long script) in the background: after a ~1.5s startup check this turn ends and the result is sent to the user when the command finishes. Do not wait for it, poll it or start another command to watch it. A command that exits within the startup check is reported synchronously.",
+          "type": "boolean"
+        },
+        "checklist_items": {
+          "description": "The indices of your checklist items this command carries out, so a change it makes settles them.",
+          "items": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "command": {
+          "description": "One shell command for action=run. Use this when exact native shell exit semantics are required. Mutually exclusive with script.",
+          "type": "string"
+        },
+        "description": {
+          "description": "A few plain words naming what this command does, shown to the owner while it runs (e.g. 'running the site installer', 'counting script'). Never the command itself.",
+          "type": "string"
+        },
+        "detach": {
+          "description": "Launch-and-return for a long-lived process that never ends by itself (server, tunnel, watcher): after a ~1.5s startup check the command is handed to background tracking (background_started=true, detached=true, pid returned) and survives task end until explicitly killed. A command that exits within the startup check is reported synchronously with its exit code. For finite work use background instead.",
+          "type": "boolean"
+        },
+        "network": {
+          "description": "Allow outbound network for this run (deploys, package installs, API calls). Confined runs have no network by default; set true when the command needs it. Prompts the user for approval unless already granted for this command.",
+          "type": "boolean"
+        },
+        "pid": {
+          "description": "Process ID for check/kill",
+          "type": "integer"
+        },
+        "read_paths": {
+          "description": "Additional exact readable files/directories for a confined run. Paths outside the task scope (e.g. a deploy tool's config dir under $HOME) are allowed but prompt the user for approval; credential stores such as ~/.ssh or ~/.aws never are.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "read_roots": {
+          "description": "Typed directory roots whose descendants the confined run may read",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "script": {
+          "description": "A multi-step POSIX shell workflow for action=run, passed through stdin to /bin/sh -eu -s so a failed step stops later steps without nested command-string quoting. Mutually exclusive with command.",
+          "type": "string"
+        },
+        "working_dir": {
+          "description": "Explicit execution directory for action=run; relative command paths resolve from this directory",
+          "type": "string"
+        },
+        "write_paths": {
+          "description": "Exact files the confined run may create or change (e.g. /tmp/out/result.txt). Never list a file under write_roots: roots are prepared as directories before launch, so a file declared there would be created as a directory and the write would fail. Existing directories you need to write into may also be listed here; use write_roots for directories that must be created.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "write_roots": {
+          "description": "Directories (never files) whose descendants the confined run may create or change. A root that does not exist yet is created as a directory before launch, so list only directories here; put exact output files in write_paths.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "description": "Read the latest authenticated environmental sensor readings reported by an enrolled AIdaemon Node. Use when the owner asks for the K10 temperature or humidity.",
+  "name": "read_node_sensors",
+  "schema": {
+    "description": "Read the latest server-received temperature and humidity values from an enrolled AIdaemon Node, including reading age. This reads stored sensor state; it does not activate a microphone, camera, or actuator.",
+    "name": "read_node_sensors",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "node": {
+          "description": "Optional Node display name. Omit when exactly one active Node is enrolled.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

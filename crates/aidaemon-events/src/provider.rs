@@ -1,0 +1,322 @@
+use serde_json::Value;
+
+use crate::conversation::ToolCall;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorKind {
+    /// 401/403 — bad API key or permissions.
+    Auth,
+    /// 402 — billing/quota exhausted.
+    Billing,
+    /// 429 — rate limited; check retry_after_secs.
+    RateLimit,
+    /// A usage quota (a subscription plan's cap, a daily allowance) is used
+    /// up until `resets_at`; waiting seconds does not help.
+    QuotaExhausted,
+    /// 400 — malformed request (e.g. missing thought_signature, invalid schema).
+    BadRequest,
+    /// 404 or "model not found" — bad model name.
+    NotFound,
+    /// 408, request timeout, or provider took too long.
+    Timeout,
+    /// Connection refused, DNS failure, reset, etc.
+    Network,
+    /// 500/502/503/504 — provider-side outage.
+    ServerError,
+    /// Provider returned a malformed success payload.
+    /// Recovery is reason-aware (parse may be transient; shape is often deterministic).
+    MalformedResponse,
+    /// Anything else.
+    Unknown,
+}
+
+impl ProviderErrorKind {
+    /// Provider/account/platform failures that should preserve autonomous work
+    /// for a later retry rather than count as semantic no-progress. Request
+    /// shape and malformed-response failures are deliberately excluded.
+    pub fn is_infrastructure_failure(self) -> bool {
+        matches!(
+            self,
+            Self::Auth
+                | Self::Billing
+                | Self::QuotaExhausted
+                | Self::RateLimit
+                | Self::NotFound
+                | Self::Timeout
+                | Self::Network
+                | Self::ServerError
+        )
+    }
+}
+
+/// Structured response mode requested for a provider call.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[allow(dead_code)]
+pub enum ResponseMode {
+    /// Default free-form text / tool-call behavior.
+    #[default]
+    Text,
+    /// Provider should return a JSON object response.
+    JsonObject,
+    /// Provider should enforce a specific JSON schema.
+    JsonSchema {
+        /// Schema name identifier for provider telemetry/debugging.
+        name: String,
+        /// Draft-compatible JSON schema object.
+        schema: Value,
+        /// Strict schema enforcement if supported by provider.
+        strict: bool,
+    },
+}
+
+/// Tool-call behavior requested for a provider call.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[allow(dead_code)]
+pub enum ToolChoiceMode {
+    /// Provider decides whether to call tools.
+    #[default]
+    Auto,
+    /// Disable all tool calls.
+    None,
+    /// Require at least one tool call.
+    Required,
+    /// Require a specific tool name.
+    Specific(String),
+}
+
+/// Per-call provider control surface used by the agent loop.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChatOptions {
+    pub response_mode: ResponseMode,
+    pub tool_choice: ToolChoiceMode,
+    /// Override the provider's configured max_tokens for this call only.
+    /// Used for billing-aware retry: when a 402 tells us how many tokens
+    /// we can afford, we retry with a reduced cap instead of cascading.
+    pub max_tokens_override: Option<u32>,
+    /// Override the provider's configured reasoning_effort for this call only.
+    /// Used for truncation recovery: when a thinking model spends all tokens on
+    /// reasoning with no usable output, the retry reduces effort to "low".
+    pub reasoning_effort_override: Option<String>,
+    /// Security-sensitive callers can require exactly one physical provider
+    /// attempt. Any provider error must return immediately instead of retrying,
+    /// cascading, or stripping controls; otherwise failed attempts can consume
+    /// unknowable tokens outside a hard aggregate budget.
+    pub single_attempt_fail_closed: bool,
+    /// With `single_attempt_fail_closed`, a failover chain may still move to
+    /// its next model after an error that proves the attempt used nothing
+    /// (a refused quota, bad credentials, an unknown model, no credit).
+    /// Anything that may have been paid for still ends the call.
+    pub fallback_when_unspent: bool,
+    /// True when the current request has committed no tool work yet. A
+    /// transient provider outage at that point costs nothing to wait out, so
+    /// the recovery ladder may use a longer bounded backoff window before it
+    /// gives up; once work has committed the ladder stays short so a
+    /// half-done task closes from its receipts quickly.
+    pub uncommitted_work: bool,
+    /// llama.cpp KV-cache slot pin (`id_slot`) for this call only.
+    ///
+    /// `None` (the default) means "use the provider's background slot" when slot
+    /// routing is enabled, and "omit the field entirely" when it is disabled.
+    /// The interactive generation loop sets `Some(interactive_slot)` to keep the
+    /// conversation's KV cache warm against background-task eviction.
+    pub id_slot: Option<u32>,
+    /// The conversation this call belongs to, for providers that route
+    /// prompt-cache lookups by key.
+    pub cache_key: Option<String>,
+}
+
+/// Token usage statistics from an LLM API response.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    /// Input tokens served from a provider-side cache, when reported.
+    pub cached_input_tokens: Option<u32>,
+    /// Input tokens newly written into a provider-side cache, when reported.
+    pub cache_creation_input_tokens: Option<u32>,
+    pub model: String,
+    /// Server-reported prefill (prompt evaluation) wall time in milliseconds,
+    /// when the backend exposes it (llama.cpp `timings.prompt_ms`). Lets us
+    /// split end-to-end `latency_ms` into prefill vs decode instead of inferring
+    /// it from token counts.
+    pub prompt_ms: Option<f64>,
+    /// Server-reported decode (token generation) wall time in milliseconds,
+    /// when the backend exposes it (llama.cpp `timings.predicted_ms`).
+    pub decode_ms: Option<f64>,
+}
+
+impl TokenUsage {
+    pub fn fresh_input_tokens(&self) -> Option<u32> {
+        self.cached_input_tokens
+            .map(|cached| self.input_tokens.saturating_sub(cached))
+    }
+
+    /// Tokens to charge against work/cost budgets for this call: fresh input
+    /// (cache-read tokens excluded — on a prefix-caching backend they are
+    /// re-read from KV cache, not recomputed) plus output. Falls back to full
+    /// input when the backend does not report cache info, so budgets never
+    /// undercount blindly.
+    ///
+    /// This keeps daily/per-run goal budgets measuring real incremental work
+    /// instead of re-billing the (~95%+ cached) system-prompt prefix on every
+    /// turn, which otherwise made multi-turn goals hit their cap on near-free
+    /// cache reads.
+    pub fn budget_tokens(&self) -> u64 {
+        let input = self.fresh_input_tokens().unwrap_or(self.input_tokens);
+        input as u64 + self.output_tokens as u64
+    }
+}
+
+#[cfg(test)]
+mod token_usage_budget_tests {
+    use super::TokenUsage;
+
+    #[test]
+    fn budget_tokens_excludes_cached_prefix_reads() {
+        // 15k prompt, 14.8k of it a cache hit -> only 200 fresh + 300 output is work.
+        let u = TokenUsage {
+            input_tokens: 15_000,
+            output_tokens: 300,
+            cached_input_tokens: Some(14_800),
+            ..Default::default()
+        };
+        assert_eq!(u.budget_tokens(), 500);
+    }
+
+    #[test]
+    fn budget_tokens_falls_back_to_full_input_without_cache_info() {
+        let u = TokenUsage {
+            input_tokens: 15_000,
+            output_tokens: 300,
+            cached_input_tokens: None,
+            ..Default::default()
+        };
+        assert_eq!(u.budget_tokens(), 15_300);
+    }
+}
+
+/// The LLM's response: either content text, tool calls, or both.
+#[derive(Debug, Clone)]
+pub struct ProviderResponse {
+    pub content: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: Option<TokenUsage>,
+    /// Internal reasoning from thinking models (e.g. Gemini thought parts).
+    /// Not shown to users directly but available as fallback when content is empty.
+    pub thinking: Option<String>,
+    /// Optional provider-specific note about why no useful output was returned
+    /// (for example Gemini finishReason/safety blocking metadata).
+    pub response_note: Option<String>,
+}
+
+/// A record of token usage from the database.
+#[derive(Debug, Clone)]
+pub struct TokenUsageRecord {
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    #[allow(dead_code)] // Used for diagnostics and future cost reports
+    pub cached_input_tokens: Option<i64>,
+    #[allow(dead_code)] // Used for diagnostics and future cost reports
+    pub cache_creation_input_tokens: Option<i64>,
+    #[allow(dead_code)] // Used by reconciliation/reporting paths that need correlation IDs.
+    pub call_id: Option<String>,
+    #[allow(dead_code)] // Used for database queries
+    pub created_at: String,
+}
+
+/// Token usage persistence.
+#[async_trait::async_trait]
+pub trait TokenUsageStore: Send + Sync {
+    /// Record token usage from an LLM call.
+    #[allow(dead_code)]
+    async fn record_token_usage(
+        &self,
+        _session_id: &str,
+        _usage: &TokenUsage,
+        _call_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(()) // default no-op
+    }
+
+    /// Get token usage records since a given datetime string (ISO 8601).
+    async fn get_token_usage_since(&self, _since: &str) -> anyhow::Result<Vec<TokenUsageRecord>> {
+        Ok(vec![]) // default no-op
+    }
+
+    /// Get token usage grouped by session_id since a given datetime.
+    /// Returns Vec of (session_id, total_input_tokens, total_output_tokens, request_count).
+    #[allow(dead_code)] // Used by token usage tooling when that tool is enabled.
+    async fn get_token_usage_by_session(
+        &self,
+        _since: &str,
+    ) -> anyhow::Result<Vec<(String, i64, i64, i64)>> {
+        Ok(vec![]) // default no-op
+    }
+
+    /// Create (once) and read the immutable token budget for one mandate
+    /// decision run. Implementations must validate the exact active mandate
+    /// authority epoch and running goal-run fence. Returning success without
+    /// durable enforcement would make autonomous execution fail open, so the
+    /// default is deliberately unsupported.
+    async fn ensure_mandate_run_token_budget(
+        &self,
+        _goal_run_id: &str,
+        _mandate_id: &str,
+        _mandate_version: i64,
+        _budget_per_cycle: i64,
+    ) -> anyhow::Result<(i64, i64)> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
+
+    /// Try to serialize one model call across every worker in a mandate run.
+    /// Returns `(acquired, tokens_used, budget_per_cycle)`. `acquired = false`
+    /// means either another call holds the lease or the immutable cycle budget
+    /// is exhausted; callers distinguish those states from the counters.
+    async fn try_acquire_mandate_run_token_lease(
+        &self,
+        _goal_run_id: &str,
+        _mandate_id: &str,
+        _mandate_version: i64,
+        _lease_token: &str,
+        _lease_secs: i64,
+    ) -> anyhow::Result<(bool, i64, i64)> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
+
+    /// Mark the exact acquired lease as physically dispatched and
+    /// pessimistically reserve its entire remaining cycle balance. This must
+    /// commit before provider I/O begins.
+    async fn mark_mandate_run_token_lease_dispatched(
+        &self,
+        _goal_run_id: &str,
+        _mandate_id: &str,
+        _mandate_version: i64,
+        _lease_token: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
+
+    /// Atomically replace a dispatched call's pessimistic reservation with
+    /// trusted actual usage and release the exact call lease. Returns
+    /// `(tokens_used, budget_per_cycle)`.
+    async fn settle_mandate_run_token_lease(
+        &self,
+        _goal_run_id: &str,
+        _lease_token: &str,
+        _delta_tokens: i64,
+    ) -> anyhow::Result<(i64, i64)> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
+
+    /// Release a call lease only when the caller proves provider dispatch never
+    /// began. A stale/mismatched lease must not release a newer worker's call.
+    async fn release_mandate_run_token_lease(
+        &self,
+        _goal_run_id: &str,
+        _lease_token: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
+}

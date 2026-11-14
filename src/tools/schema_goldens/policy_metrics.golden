@@ -1,0 +1,22 @@
+{
+  "description": "Read runtime policy/agent-loop metrics. Use this when the user asks about routing behavior, no-progress loops, or token cost of failed tasks.",
+  "name": "policy_metrics",
+  "schema": {
+    "description": "Read runtime policy/agent-loop metrics. Use this when the user asks about routing behavior, no-progress loops, or token cost of failed tasks.",
+    "name": "policy_metrics",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "description": "Output format. json returns machine-readable JSON (default). summary returns a concise text summary.",
+          "enum": [
+            "json",
+            "summary"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

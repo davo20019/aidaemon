@@ -1,0 +1,18 @@
+{
+  "Version": "1.90.0-synthetic",
+  "BackendState": "Running",
+  "Self": {
+    "ID": "nSynthetic1",
+    "HostName": "synthetic-host",
+    "DNSName": "synthetic-host.example-tailnet.ts.net.",
+    "OS": "macOS",
+    "TailscaleIPs": ["100.64.0.1"],
+    "Online": true
+  },
+  "MagicDNSSuffix": "example-tailnet.ts.net",
+  "CurrentTailnet": {
+    "Name": "example-tailnet",
+    "MagicDNSSuffix": "example-tailnet.ts.net",
+    "MagicDNSEnabled": true
+  }
+}

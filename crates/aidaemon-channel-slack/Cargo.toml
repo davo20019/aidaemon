@@ -1,0 +1,59 @@
+[package]
+name = "aidaemon-channel-slack"
+description = "Slack adapter for aidaemon channels; implementation crate of the aidaemon SDK, no stability promise (use it through aidaemon-sdk)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-channel-slack"
+readme = "README.md"
+keywords = ["slack", "bot", "agent", "chat", "llm"]
+categories = ["asynchronous", "network-programming"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
+publish = false
+
+[features]
+# The bot an application runs (`bot::SlackBot`): access, owners, workspace
+# grants, sessions, commands and files on the shared turn runner.
+bot = [
+    "dep:aidaemon-core",
+    "dep:aidaemon-events",
+    "dep:aidaemon-tools",
+    "dep:anyhow",
+    "dep:chrono",
+    "dep:regex",
+    "dep:shell-words",
+    "dep:uuid",
+    "reqwest/query",
+]
+
+[dependencies]
+aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels", features = ["http"] }
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core", optional = true }
+aidaemon-events = { version = "0.20.0", path = "../aidaemon-events", optional = true }
+aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools", optional = true }
+anyhow = { version = "1", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+regex = { version = "1", optional = true }
+shell-words = { version = "1", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+async-trait = "0.1"
+futures = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "macros", "rt", "time", "net"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+tokio-util = "0.7"
+tracing = "0.1"
+
+[dev-dependencies]
+aidaemon-channels = { path = "../aidaemon-channels", features = ["conformance"] }
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
+tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time", "net", "io-util"] }

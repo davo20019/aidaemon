@@ -18,7 +18,7 @@ fn reply_defers_file_access_detects_upload_requests() {
 #[test]
 fn reply_defers_file_access_ignores_real_answers() {
     for reply in [
-        "The offer letter is from WebFirst for a Lead Developer position starting in July.",
+        "The offer letter is from Globex for a Lead Developer position starting in July.",
         "I found the file and read it — here's the summary.",
         "Done. The script now parses the path argument correctly.",
     ] {
@@ -32,7 +32,7 @@ fn reply_defers_file_access_ignores_real_answers() {
 #[test]
 fn user_text_references_file_detects_filenames_and_paths() {
     for text in [
-        "Can you read the file and tell me what it's about? David Loor  WebFirst Offer Letter Lead Developer (1).pdf",
+        "Can you read the file and tell me what it's about? Jordan Lee  Globex Offer Letter Lead Developer (1).pdf",
         "summarize ~/Downloads/report.docx",
         "what's in /tmp/output.log",
         "check notes.md please",
@@ -94,26 +94,39 @@ fn test_user_text_references_filesystem_path_ignores_fractions_and_shorthand() {
 
 #[test]
 fn test_user_text_references_filesystem_path_detects_common_paths_and_files() {
+    // An absolute path counts only when it reaches this machine's filesystem,
+    // so the path sits under a directory every host has (`/Users` exists on
+    // macOS only).
+    let absolute = std::env::temp_dir().join("alice/project/file.txt");
     assert!(user_text_references_filesystem_path(
-        "/Users/alice/project/file.txt"
+        &absolute.display().to_string()
     ));
     assert!(user_text_references_filesystem_path("~/project/file.txt"));
     assert!(user_text_references_filesystem_path(
         "How many projects are at ~/projects?"
     ));
     assert!(user_text_references_filesystem_path(
-        "src/agent/main_loop.rs"
-    ));
-    assert!(user_text_references_filesystem_path("Cargo.toml"));
-    assert!(user_text_references_filesystem_path(
         r"C:\\Users\\alice\\file.txt"
     ));
+}
+
+/// Since cf00042c a relative reference resolves only against a workspace the
+/// run was given (or a configured project root), never the daemon's own cwd:
+/// with neither, `src/...` or a bare file name names no filesystem target.
+#[test]
+fn test_user_text_references_filesystem_path_needs_a_workspace_for_relative_paths() {
+    for text in ["src/agent/runtime/llm.rs", "Cargo.toml"] {
+        assert!(
+            !user_text_references_filesystem_path(text),
+            "relative reference resolved without a workspace: {text}"
+        );
+    }
 }
 
 #[test]
 fn test_user_explicitly_requests_local_file_inspection_detects_explicit_requests() {
     assert!(user_explicitly_requests_local_file_inspection(
-        "Inspect Cargo.toml and read src/main.rs"
+        "Inspect /tmp/synthetic-project/Cargo.toml and read /tmp/synthetic-project/src/main.rs"
     ));
     assert!(user_explicitly_requests_local_file_inspection(
         "Search the repo for OAuth callback code"
@@ -222,10 +235,9 @@ fn test_classify_stall_detects_deferred_no_tool_loop() {
         explicit_positive_signals: 0,
         explicit_negative_signals: 0,
         task_outcome: None,
-        replay_notes: Vec::new(),
     };
 
-    let (label, suggestion) = Agent::classify_stall(&learning_ctx);
+    let (label, suggestion) = crate::agent::graceful::classify_stall(&learning_ctx);
     assert_eq!(label, "Deferred No-Tool Loop");
     assert!(suggestion.contains("Automatic tool and model recovery"));
     assert!(!suggestion.contains('?'));

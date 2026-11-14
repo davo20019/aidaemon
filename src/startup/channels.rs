@@ -6,14 +6,14 @@ use tracing::{info, warn};
 use crate::channels::DiscordChannel;
 #[cfg(feature = "slack")]
 use crate::channels::SlackChannel;
-use crate::channels::{ChannelHub, ChannelRuntimeDeps, TelegramChannel};
+use crate::channels::{ChannelHub, ChannelRuntimeDeps, TelegramBot, new_telegram_bot};
 use crate::config::AppConfig;
-use crate::traits::Channel;
+use crate::traits::HubChannel;
 
 pub struct ChannelBundle {
-    pub channels: Vec<Arc<dyn Channel>>,
-    pub telegram_bots: Vec<Arc<TelegramChannel>>,
-    pub dynamic_telegram_bots: Vec<Arc<TelegramChannel>>,
+    pub channels: Vec<Arc<dyn HubChannel>>,
+    pub telegram_bots: Vec<Arc<TelegramBot>>,
+    pub dynamic_telegram_bots: Vec<Arc<TelegramBot>>,
     #[cfg(feature = "discord")]
     pub discord_bots: Vec<Arc<DiscordChannel>>,
     #[cfg(feature = "discord")]
@@ -53,62 +53,72 @@ impl ChannelBundle {
     }
 
     pub async fn send_startup_notifications(&self, config: &AppConfig) {
-        if let Some(first_tg) = self.telegram_bots.first() {
-            if let Some(first_config) = config.all_telegram_bots().first() {
-                if !first_config.allowed_user_ids.is_empty() {
-                    let mode = if first_config.webhook.enabled {
-                        "webhook"
-                    } else {
-                        "polling"
-                    };
-                    let msg = format!("aidaemon is online ({})", mode);
-                    for user_id in &first_config.allowed_user_ids {
-                        let _ = first_tg.send_text(&user_id.to_string(), &msg).await;
-                    }
-                }
+        if let Some(first_tg) = self.telegram_bots.first()
+            && let Some(first_config) = config.all_telegram_bots().first()
+            && !first_config.allowed_user_ids.is_empty()
+        {
+            let mode = if first_config.webhook.enabled {
+                "webhook"
+            } else {
+                "polling"
+            };
+            let msg = format!("aidaemon is online ({})", mode);
+            for user_id in &first_config.allowed_user_ids {
+                let _ = first_tg.send_text(&user_id.to_string(), &msg).await;
             }
         }
     }
 
-    pub fn spawn_all(self) {
+    /// The first Telegram bot and its allowed users, who get the startup
+    /// notification and any other startup warning.
+    pub fn startup_recipients(
+        &self,
+        config: &AppConfig,
+    ) -> Option<(Arc<crate::channels::TelegramBot>, Vec<u64>)> {
+        let bot = self.telegram_bots.first()?.clone();
+        let users = config.all_telegram_bots().first()?.allowed_user_ids.clone();
+        Some((bot, users))
+    }
+
+    /// Run every bot as a service until `shutdown` is cancelled.
+    pub fn spawn_all(self, shutdown: aidaemon_core::CancellationToken) {
+        use aidaemon_core::{FnService, Schedule, ServiceHost};
+
+        // A bot reconnects by itself; `start_with_retry` never returns.
+        macro_rules! bot_service {
+            ($host:ident, $kind:literal, $bots:expr) => {
+                for (index, bot) in $bots.into_iter().enumerate() {
+                    let service = FnService::new(
+                        format!("{}_bot_{index}", $kind),
+                        Schedule::Continuous,
+                        move || {
+                            let bot = bot.clone();
+                            async move {
+                                bot.start_with_retry().await;
+                                Ok(())
+                            }
+                        },
+                    );
+                    $host = $host.service(std::sync::Arc::new(service));
+                }
+            };
+        }
+
+        let mut host =
+            ServiceHost::new(std::time::Duration::from_secs(5)).grace(std::time::Duration::ZERO);
         #[cfg(feature = "discord")]
         {
-            for dc in self.discord_bots {
-                tokio::spawn(async move {
-                    dc.start_with_retry().await;
-                });
-            }
-            for dc in self.dynamic_discord_bots {
-                tokio::spawn(async move {
-                    dc.start_with_retry().await;
-                });
-            }
+            bot_service!(host, "discord", self.discord_bots);
+            bot_service!(host, "discord_dynamic", self.dynamic_discord_bots);
         }
-
         #[cfg(feature = "slack")]
         {
-            for sc in self.slack_bots {
-                tokio::spawn(async move {
-                    sc.start_with_retry().await;
-                });
-            }
-            for sc in self.dynamic_slack_bots {
-                tokio::spawn(async move {
-                    sc.start_with_retry().await;
-                });
-            }
+            bot_service!(host, "slack", self.slack_bots);
+            bot_service!(host, "slack_dynamic", self.dynamic_slack_bots);
         }
-
-        for tg in self.dynamic_telegram_bots {
-            tokio::spawn(async move {
-                tg.start_with_retry().await;
-            });
-        }
-        for tg in self.telegram_bots {
-            tokio::spawn(async move {
-                tg.start_with_retry().await;
-            });
-        }
+        bot_service!(host, "telegram_dynamic", self.dynamic_telegram_bots);
+        bot_service!(host, "telegram", self.telegram_bots);
+        tokio::spawn(host.run(shutdown));
     }
 }
 
@@ -159,8 +169,8 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
     let make_telegram = |bot_token: &str,
                          allowed_user_ids: Vec<u64>,
                          webhook: crate::config::TelegramWebhookConfig|
-     -> Arc<TelegramChannel> {
-        Arc::new(TelegramChannel::new(
+     -> Arc<TelegramBot> {
+        Arc::new(new_telegram_bot(
             bot_token,
             allowed_user_ids,
             webhook,
@@ -175,17 +185,16 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
     let defaults = &config.telegram_webhook_defaults;
     let mut occupied_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
     for bot_config in config.all_telegram_bots() {
-        if bot_config.webhook.enabled {
-            if let Some(addr) = &bot_config.webhook.listen_addr {
-                if let Some(port) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
-                    occupied_ports.insert(port);
-                }
-            }
+        if bot_config.webhook.enabled
+            && let Some(addr) = &bot_config.webhook.listen_addr
+            && let Some(port) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok())
+        {
+            occupied_ports.insert(port);
         }
     }
 
     let mut seen_bot_credentials = std::collections::HashSet::new();
-    let telegram_bots: Vec<Arc<TelegramChannel>> = config
+    let telegram_bots: Vec<Arc<TelegramBot>> = config
         .all_telegram_bots()
         .into_iter()
         .filter_map(|bot_config| {
@@ -225,7 +234,7 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                         allowed_user_ids: Vec<u64>,
                         guild_id: Option<u64>|
      -> Arc<DiscordChannel> {
-        Arc::new(DiscordChannel::new(
+        Arc::new(crate::channels::discord::new_discord_bot(
             bot_token,
             allowed_user_ids,
             discord_owner_ids.clone(),
@@ -262,7 +271,7 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                       allowed_user_ids: Vec<String>,
                       use_threads: bool|
      -> Arc<SlackChannel> {
-        Arc::new(SlackChannel::new(
+        Arc::new(crate::channels::slack::new_slack_bot(
             app_token,
             bot_token,
             allowed_user_ids,
@@ -291,7 +300,7 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
         })
         .collect();
 
-    let mut dynamic_telegram_bots: Vec<Arc<TelegramChannel>> = Vec::new();
+    let mut dynamic_telegram_bots: Vec<Arc<TelegramBot>> = Vec::new();
     #[cfg(feature = "discord")]
     let mut dynamic_discord_bots: Vec<Arc<DiscordChannel>> = Vec::new();
     #[cfg(feature = "slack")]
@@ -307,7 +316,10 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                             "telegram",
                             &bot.bot_token,
                         ) {
-                            warn!(bot_id = bot.id, "Skipping duplicate dynamic Telegram bot credential already registered from config or state");
+                            warn!(
+                                bot_id = bot.id,
+                                "Skipping duplicate dynamic Telegram bot credential already registered from config or state"
+                            );
                             continue;
                         }
                         let allowed_user_ids: Vec<u64> = parse_u64_ids(&bot.allowed_user_ids);
@@ -339,7 +351,10 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                             "discord",
                             &bot.bot_token,
                         ) {
-                            warn!(bot_id = bot.id, "Skipping duplicate dynamic Discord bot credential already registered from config or state");
+                            warn!(
+                                bot_id = bot.id,
+                                "Skipping duplicate dynamic Discord bot credential already registered from config or state"
+                            );
                             continue;
                         }
                         let allowed_user_ids: Vec<u64> = parse_u64_ids(&bot.allowed_user_ids);
@@ -367,7 +382,10 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                             "slack",
                             &bot.bot_token,
                         ) {
-                            warn!(bot_id = bot.id, "Skipping duplicate dynamic Slack bot credential already registered from config or state");
+                            warn!(
+                                bot_id = bot.id,
+                                "Skipping duplicate dynamic Slack bot credential already registered from config or state"
+                            );
                             continue;
                         }
                         if let Some(app_token) = &bot.app_token {
@@ -405,31 +423,35 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
         }
     }
 
-    let mut channels: Vec<Arc<dyn Channel>> = telegram_bots
+    let mut channels: Vec<Arc<dyn HubChannel>> = telegram_bots
         .iter()
-        .map(|t| t.clone() as Arc<dyn Channel>)
+        .map(|t| t.clone() as Arc<dyn HubChannel>)
         .collect();
     channels.extend(
         dynamic_telegram_bots
             .iter()
-            .map(|t| t.clone() as Arc<dyn Channel>),
+            .map(|t| t.clone() as Arc<dyn HubChannel>),
     );
     #[cfg(feature = "discord")]
     {
-        channels.extend(discord_bots.iter().map(|d| d.clone() as Arc<dyn Channel>));
+        channels.extend(
+            discord_bots
+                .iter()
+                .map(|d| d.clone() as Arc<dyn HubChannel>),
+        );
         channels.extend(
             dynamic_discord_bots
                 .iter()
-                .map(|d| d.clone() as Arc<dyn Channel>),
+                .map(|d| d.clone() as Arc<dyn HubChannel>),
         );
     }
     #[cfg(feature = "slack")]
     {
-        channels.extend(slack_bots.iter().map(|s| s.clone() as Arc<dyn Channel>));
+        channels.extend(slack_bots.iter().map(|s| s.clone() as Arc<dyn HubChannel>));
         channels.extend(
             dynamic_slack_bots
                 .iter()
-                .map(|s| s.clone() as Arc<dyn Channel>),
+                .map(|s| s.clone() as Arc<dyn HubChannel>),
         );
     }
 

@@ -1,0 +1,30 @@
+{
+  "description": "Schedule work you do on your own at a time or on a cadence: each run carries out `task` with the user's access, once the user confirms. A plain reminder message is set_reminder; seeing, changing or stopping it is manage_automations.",
+  "name": "schedule_task",
+  "schema": {
+    "description": "Schedule work you do on your own at a time or on a cadence: each run carries out `task` with the user's access, once the user confirms. A plain reminder message is set_reminder; seeing, changing or stopping it is manage_automations.",
+    "name": "schedule_task",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "The short name the user gave it, exactly as given; omit when none.",
+          "type": "string"
+        },
+        "task": {
+          "description": "The instruction each run carries out.",
+          "type": "string"
+        },
+        "when": {
+          "description": "e.g. 'in 2 hours', 'tomorrow at 9am', 'every weekday at 8am'",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task",
+        "when"
+      ],
+      "type": "object"
+    }
+  }
+}

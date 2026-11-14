@@ -1,0 +1,27 @@
+{
+  "boot_id": "boot_fixture_001",
+  "uptime_ms": 42000,
+  "runtime_version": "0.1.0",
+  "firmware_version": "0.1.0",
+  "free_internal_heap": 210000,
+  "largest_internal_allocation": 180000,
+  "psram_free": 7000000,
+  "recovery": {
+    "schema": "aidaemon.runtime.recovery.v1",
+    "reset_reason": "software",
+    "previous_stage": "online",
+    "previous_uptime_ms": 3600000,
+    "planned_restart_reason": "ota_install",
+    "consecutive_unhealthy_resets": 0,
+    "connectivity_restart_count": 0,
+    "safe_mode": false,
+    "watchdog_ready": true,
+    "watchdog_timeout_seconds": 90
+  },
+  "capabilities": [
+    { "capability_id": "input.audio.push_to_talk", "version": 1, "limits": { "max_duration_ms": 7000 } },
+    { "capability_id": "input.camera.explicit_still", "version": 1, "limits": { "max_bytes": 524288 } },
+    { "capability_id": "output.audio", "version": 1, "limits": {} },
+    { "capability_id": "output.display.face", "version": 1, "limits": {} }
+  ]
+}

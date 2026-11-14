@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Context;
-use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::layer::{Context as LayerContext, Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
 
 const DEFAULT_MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_LOG_BACKUPS: usize = 4;
@@ -231,8 +233,46 @@ pub(crate) fn init(default_filter: &str) -> anyhow::Result<()> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
+        .finish()
+        .with(SqlCipherKeyRedaction)
         .try_init()
         .map_err(|error| anyhow::anyhow!("failed to initialize tracing: {error}"))
+}
+
+/// Drops sqlx statement-log events that carry the SQLCipher key.
+///
+/// sqlx runs every connect-time pragma as one statement and logs the full SQL
+/// when it is slow. Key derivation makes `PRAGMA key = '...'` slow, so the
+/// database key was written to the daemon log in plaintext. sqlx has no
+/// per-pragma log switch, so suppress those events here.
+struct SqlCipherKeyRedaction;
+
+impl<S: tracing::Subscriber> Layer<S> for SqlCipherKeyRedaction {
+    fn event_enabled(&self, event: &tracing::Event<'_>, _ctx: LayerContext<'_, S>) -> bool {
+        if !event.metadata().target().starts_with("sqlx") {
+            return true;
+        }
+        let mut visitor = KeyPragmaVisitor(false);
+        event.record(&mut visitor);
+        !visitor.0
+    }
+}
+
+struct KeyPragmaVisitor(bool);
+
+fn mentions_key_pragma(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("pragma key") || lower.contains("pragma rekey")
+}
+
+impl tracing::field::Visit for KeyPragmaVisitor {
+    fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
+        self.0 |= mentions_key_pragma(value);
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0 |= mentions_key_pragma(&format!("{value:?}"));
+    }
 }
 
 fn rotating_file_writer() -> anyhow::Result<BoxMakeWriter> {
@@ -260,6 +300,39 @@ fn rotating_file_writer() -> anyhow::Result<BoxMakeWriter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlcipher_key_pragma_events_are_suppressed() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> Layer<S> for Count {
+            fn on_event(&self, _event: &tracing::Event<'_>, _ctx: LayerContext<'_, S>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry()
+            .with(Count(seen.clone()))
+            .with(SqlCipherKeyRedaction);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: "sqlx::query",
+                summary = "PRAGMA key = 'synthetic-secret'; …",
+                "slow statement"
+            );
+            tracing::warn!(
+                target: "sqlx::query",
+                statement = "PRAGMA rekey = 'synthetic-secret'",
+                "slow statement"
+            );
+            tracing::warn!(target: "sqlx::query", summary = "INSERT INTO events …", "slow statement");
+            tracing::warn!(target: "aidaemon::other", note = "PRAGMA key mentioned", "unrelated");
+        });
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn size_rotation_is_bounded_and_preserves_recent_backups() {

@@ -1,0 +1,256 @@
+{
+  "description": "People in the owner's life. remember: store people, names, aliases, family and places in personal memory, which recall reads (always on). The other actions are the contacts book (People Intelligence).",
+  "name": "manage_people",
+  "schema": {
+    "description": "People in the owner's life. remember: store people, names, aliases, family and places in personal memory, which recall reads (always on). The other actions are the contacts book (People Intelligence).",
+    "name": "manage_people",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "remember",
+            "enable",
+            "disable",
+            "status",
+            "add",
+            "list",
+            "view",
+            "brief",
+            "upcoming",
+            "reconnect",
+            "update",
+            "remove",
+            "add_fact",
+            "remove_fact",
+            "link",
+            "export",
+            "purge",
+            "audit",
+            "confirm"
+          ],
+          "type": "string"
+        },
+        "category": {
+          "description": "Fact category; avoid health/finance",
+          "type": "string"
+        },
+        "communication_style": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "fact_id": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "integer"
+        },
+        "inactive_days": {
+          "type": "integer"
+        },
+        "key": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "string"
+        },
+        "person_name": {
+          "description": "Person for add_fact/remove_fact/link",
+          "type": "string"
+        },
+        "personal_memory": {
+          "additionalProperties": false,
+          "description": "remember: entities with call-local ids, then aliases, facts and relationships that refer to those ids. The owner is local_id \"owner\".",
+          "properties": {
+            "aliases": {
+              "description": "Other names an entity goes by.",
+              "items": {
+                "properties": {
+                  "alias_type": {
+                    "description": "Kind of alias.",
+                    "enum": [
+                      "legal_name_variant",
+                      "preferred_name",
+                      "nickname",
+                      "username",
+                      "online_handle",
+                      "account_name"
+                    ],
+                    "type": "string"
+                  },
+                  "entity_local_id": {
+                    "description": "The entity's local_id.",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "The alias.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "entity_local_id",
+                  "value",
+                  "alias_type"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "correction": {
+              "description": "The owner is correcting an earlier value.",
+              "type": "boolean"
+            },
+            "entities": {
+              "description": "Each person, organization, project, place or account mentioned.",
+              "items": {
+                "properties": {
+                  "canonical_name": {
+                    "description": "Name as the owner gave it.",
+                    "type": "string"
+                  },
+                  "canonical_name_confirmed": {
+                    "description": "The owner stated this exact name.",
+                    "type": "boolean"
+                  },
+                  "entity_type": {
+                    "description": "What it is.",
+                    "enum": [
+                      "person",
+                      "organization",
+                      "project",
+                      "place",
+                      "account"
+                    ],
+                    "type": "string"
+                  },
+                  "is_reference": {
+                    "description": "Resolve existing alias/name; false declares.",
+                    "type": "boolean"
+                  },
+                  "local_id": {
+                    "description": "Id used by this call only.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "local_id",
+                  "entity_type",
+                  "canonical_name"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "facts": {
+              "description": "Attributes of an entity (birthday, residence, ...).",
+              "items": {
+                "properties": {
+                  "display_value": {
+                    "description": "Value as written, when it differs.",
+                    "type": "string"
+                  },
+                  "predicate": {
+                    "description": "snake_case attribute, e.g. birthday.",
+                    "type": "string"
+                  },
+                  "subject_local_id": {
+                    "description": "The entity's local_id.",
+                    "type": "string"
+                  },
+                  "valid_from": {
+                    "description": "RFC3339 or date it became true.",
+                    "type": "string"
+                  },
+                  "valid_to": {
+                    "description": "When it stopped being true.",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "Normalized value.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "subject_local_id",
+                  "predicate",
+                  "value"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "relationships": {
+              "description": "Typed links between entities.",
+              "items": {
+                "properties": {
+                  "relationship_type": {
+                    "description": "source → target.",
+                    "enum": [
+                      "PARENT_OF",
+                      "CHILD_OF",
+                      "LIVES_WITH",
+                      "LIVES_IN",
+                      "USES_ALIAS",
+                      "USES_HANDLE",
+                      "HAS_ACCOUNT"
+                    ],
+                    "type": "string"
+                  },
+                  "source_local_id": {
+                    "description": "From entity.",
+                    "type": "string"
+                  },
+                  "target_local_id": {
+                    "description": "To entity.",
+                    "type": "string"
+                  },
+                  "valid_from": {
+                    "description": "When it began.",
+                    "type": "string"
+                  },
+                  "valid_to": {
+                    "description": "When it ended.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source_local_id",
+                  "relationship_type",
+                  "target_local_id"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "platform_id": {
+          "type": "string"
+        },
+        "relationship": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        },
+        "within_days": {
+          "description": "days ahead",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

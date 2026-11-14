@@ -1,0 +1,54 @@
+{
+  "description": "Store or forget stable facts about the owner and their environment, not task research, generated content, goals, or schedules. Other people, family and relationships: manage_people remember.",
+  "name": "remember_fact",
+  "schema": {
+    "description": "Store or forget stable facts about the owner and their environment, not task research, generated content, goals, or schedules. Other people, family and relationships: manage_people remember.",
+    "name": "remember_fact",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "delete": {
+          "description": "Forget category/key; value is ignored.",
+          "type": "boolean"
+        },
+        "facts": {
+          "items": {
+            "properties": {
+              "category": {
+                "type": "string"
+              },
+              "delete": {
+                "description": "Forget this fact; value is ignored.",
+                "type": "boolean"
+              },
+              "key": {
+                "type": "string"
+              },
+              "value": {
+                "description": "Stored as written, including \"none\".",
+                "type": "string"
+              }
+            },
+            "required": [
+              "category",
+              "key"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "key": {
+          "type": "string"
+        },
+        "value": {
+          "description": "Stored as written, including \"none\".",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

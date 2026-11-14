@@ -1,0 +1,126 @@
+{
+  "description": "API credentials. kind=profile: manual auth profiles (bearer, header, basic, oauth1a), verify. kind=oauth: OAuth connections and providers; inspect first, connect reauthorizes, bind_account proves identity. Secrets never in args: owner runs `aidaemon keychain set <key>`. New API end to end: manage_api.",
+  "name": "manage_auth",
+  "schema": {
+    "description": "API credentials. kind=profile: manual auth profiles (bearer, header, basic, oauth1a), verify. kind=oauth: OAuth connections and providers; inspect first, connect reauthorizes, bind_account proves identity. Secrets never in args: owner runs `aidaemon keychain set <key>`. New API end to end: manage_api.",
+    "name": "manage_auth",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "account_id": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "account_id_pointer": {
+          "type": "string"
+        },
+        "action": {
+          "enum": [
+            "list",
+            "describe",
+            "upsert",
+            "remove",
+            "verify",
+            "connect",
+            "bind_account",
+            "set_credentials",
+            "refresh",
+            "providers",
+            "describe_provider",
+            "register_provider",
+            "remove_provider"
+          ],
+          "type": "string"
+        },
+        "allowed_domains": {
+          "description": "Auth hosts",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "auth_type": {
+          "enum": [
+            "oauth1a",
+            "bearer",
+            "header",
+            "basic",
+            "oauth2_pkce",
+            "oauth2_authorization_code",
+            "oauth2_client_credentials"
+          ],
+          "type": "string"
+        },
+        "authorize_url": {
+          "type": "string"
+        },
+        "client_id": {
+          "type": "string"
+        },
+        "confirm_disconnect": {
+          "description": "Must be true with remove; use connect to reauthorize",
+          "type": "boolean"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "header_name": {
+          "description": "header auth",
+          "type": "string"
+        },
+        "identity_url": {
+          "type": "string"
+        },
+        "kind": {
+          "description": "profile: actions list, describe, upsert, remove, verify. oauth: actions connect, list, bind_account, remove, set_credentials, refresh, providers, describe_provider, register_provider, remove_provider.",
+          "enum": [
+            "profile",
+            "oauth"
+          ],
+          "type": "string"
+        },
+        "method": {
+          "enum": [
+            "GET",
+            "HEAD"
+          ],
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "scopes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "service": {
+          "type": "string"
+        },
+        "timeout_secs": {
+          "type": "integer"
+        },
+        "token_url": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "user_id": {
+          "description": "OAuth1a account ID; pause/revoke mandates before rebind, then reconfirm.",
+          "type": "string"
+        },
+        "username": {
+          "description": "basic",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

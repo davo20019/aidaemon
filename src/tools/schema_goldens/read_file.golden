@@ -1,0 +1,52 @@
+{
+  "description": "Read file contents with line numbers and metadata. Read a fitting file in full once; for large files, search first and then read one exact non-overlapping range.",
+  "name": "read_file",
+  "schema": {
+    "description": "Read file contents with line numbers and metadata. Use this instead of terminal cat/head/tail. Read a file in full once when it fits the limit; oversized reads return the first page plus an exact continuation call to follow. For a large file with a known target, use search_files first, then read one exact surrounding range. Sequential ranges must not overlap; previously covered content is replayed from the task-local artifact.",
+    "name": "read_file",
+    "parameters": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "tail_lines",
+              "start_line"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "tail_lines",
+              "end_line"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "end_line": {
+          "description": "End line number (1-based, inclusive). Omit to read to end.",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Path to the file (supports ~ expansion)",
+          "type": "string"
+        },
+        "start_line": {
+          "description": "Start line number (1-based, inclusive). Omit to start from beginning.",
+          "type": "integer"
+        },
+        "tail_lines": {
+          "description": "Read the last N lines of the file. Useful for large logs.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  }
+}

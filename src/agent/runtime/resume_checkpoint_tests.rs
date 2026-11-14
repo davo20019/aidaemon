@@ -1,6 +1,6 @@
 use super::*;
 use crate::events::ToolOutcomeEvidenceSource;
-use crate::testing::{setup_test_agent, MockProvider};
+use crate::testing::{MockProvider, setup_test_agent};
 use crate::types::{ChannelContext, UserRole};
 use serde_json::json;
 
@@ -25,9 +25,11 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
     let session_id = "resume_session";
     let orphan_task_id = "task-orphan-1";
 
-    let emitter =
-        crate::events::EventEmitter::new(harness.agent.event_store.clone(), session_id.to_string())
-            .with_task_id(orphan_task_id.to_string());
+    let emitter = crate::events::EventEmitter::new(
+        harness.agent.event_store().clone(),
+        session_id.to_string(),
+    )
+    .with_task_id(orphan_task_id.to_string());
 
     emitter
         .emit(
@@ -38,6 +40,7 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
                 parent_task_id: None,
                 user_message: Some("Build website and deploy".to_string()),
                 turn_id: None,
+                spawned_by: None,
             },
         )
         .await
@@ -247,7 +250,7 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
 
     let orphan_events = harness
         .agent
-        .event_store
+        .event_store()
         .query_task_events_for_session(session_id, orphan_task_id)
         .await
         .unwrap();
@@ -277,7 +280,7 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
 
     let starts = harness
         .agent
-        .event_store
+        .event_store()
         .query_events_by_types(session_id, &[EventType::TaskStart], 10)
         .await
         .unwrap();
@@ -304,9 +307,11 @@ async fn recovery_task_end_uses_checkpoint_turn_id_not_resume_turn() {
     let session_id = "resume_turn_session";
     let orphan_task_id = "task-orphan-turnid";
 
-    let emitter =
-        crate::events::EventEmitter::new(harness.agent.event_store.clone(), session_id.to_string())
-            .with_task_id(orphan_task_id.to_string());
+    let emitter = crate::events::EventEmitter::new(
+        harness.agent.event_store().clone(),
+        session_id.to_string(),
+    )
+    .with_task_id(orphan_task_id.to_string());
     emitter
         .emit(
             EventType::TaskStart,
@@ -316,6 +321,7 @@ async fn recovery_task_end_uses_checkpoint_turn_id_not_resume_turn() {
                 parent_task_id: None,
                 user_message: Some("do the work".to_string()),
                 turn_id: Some("turn-old".to_string()),
+                spawned_by: None,
             },
         )
         .await
@@ -341,7 +347,7 @@ async fn recovery_task_end_uses_checkpoint_turn_id_not_resume_turn() {
 
     let orphan_events = harness
         .agent
-        .event_store
+        .event_store()
         .query_task_events_for_session(session_id, orphan_task_id)
         .await
         .unwrap();
@@ -380,7 +386,7 @@ async fn normal_task_stamps_active_turn_on_conversation_and_task_events() {
 
     let events = harness
         .agent
-        .event_store
+        .event_store()
         .query_events(session_id, chrono::Utc::now() - chrono::Duration::days(1))
         .await
         .unwrap();

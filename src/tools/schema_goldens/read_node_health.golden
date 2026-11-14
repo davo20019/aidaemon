@@ -1,0 +1,18 @@
+{
+  "description": "Read an enrolled AIdaemon Node's latest authenticated heartbeat, reported capabilities, current gateway authorizations, and bounded Runtime recovery evidence.",
+  "name": "read_node_health",
+  "schema": {
+    "description": "Inspect stored Node connection freshness, Runtime/firmware versions, reported protocol capabilities and limits, current gateway authorizations, bounded resource health, and the most recent Runtime recovery report. Use this before claiming that a Companion control is supported or unavailable. This is evidence reported during an authenticated Node Session; it cannot contact or restart an offline Device.",
+    "name": "read_node_health",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "node": {
+          "description": "Optional Node display name. Omit when exactly one active Node is enrolled.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

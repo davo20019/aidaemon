@@ -1,0 +1,479 @@
+//! Event consolidation: the host's side of learning from finished work.
+//!
+//! The host decides which of a session's events may teach anything
+//! (isolated sessions and suppressed tasks may not), writes the rest as the
+//! memory crate's task trace, and hands it to the crate's learner. After
+//! that the events are marked, so retention can remove them.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use aidaemon_memory::stores::MemoryStores;
+use aidaemon_memory::trajectory::{
+    CompletedPlan, DecisionDetails, DecisionPoint, ProcedureEnhancer, TaskEnding, TaskLearner,
+    TraceEvent,
+};
+use chrono::{Duration, Utc};
+use tracing::{info, warn};
+
+use aidaemon_events::conversation::MessageAnnotation;
+use aidaemon_events::{
+    DecisionPointData, ErrorData, TaskEndData, TaskStartData, ToolCallData, ToolResultData,
+    UserMessageData,
+};
+use aidaemon_events::{Event, EventStore, EventType, TaskOutcome};
+use aidaemon_memory::Embedder;
+use aidaemon_work::plans::{PlanStore, StepStatus};
+
+use crate::llm::SharedLlmRuntime;
+use crate::llm::gateway::SideCallGateway;
+use crate::llm::side_calls::SideCall;
+
+/// Statistics from a consolidation run
+#[derive(Debug, Default)]
+pub struct ConsolidationResult {
+    pub events_processed: usize,
+    pub events_consolidated: usize,
+    pub procedures_created: usize,
+    pub error_solutions_created: usize,
+    pub expertise_updated: usize,
+    pub behavior_patterns_recorded: usize,
+    pub episodes_created: usize,
+}
+
+impl ConsolidationResult {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, other: &ConsolidationResult) {
+        self.events_processed += other.events_processed;
+        self.events_consolidated += other.events_consolidated;
+        self.procedures_created += other.procedures_created;
+        self.error_solutions_created += other.error_solutions_created;
+        self.expertise_updated += other.expertise_updated;
+        self.behavior_patterns_recorded += other.behavior_patterns_recorded;
+        self.episodes_created += other.episodes_created;
+    }
+}
+
+/// Statistics from daily consolidation
+#[derive(Debug, Default)]
+pub struct DailyConsolidationStats {
+    pub sessions_processed: usize,
+    pub total_result: ConsolidationResult,
+    pub failures: usize,
+}
+
+/// Extracts learnings from events and stores in long-term memory
+pub struct Consolidator {
+    event_store: Arc<EventStore>,
+    plan_store: Arc<PlanStore>,
+    pool: sqlx::SqlitePool,
+    memory: Arc<dyn MemoryStores>,
+    llm_runtime: Option<SharedLlmRuntime>,
+    embedding_service: Option<Arc<dyn Embedder>>,
+    /// Runs the procedure enhancer's model calls.
+    side_calls: SideCallGateway,
+    learning_evidence_gate_enforce: bool,
+}
+
+impl Consolidator {
+    pub fn new(
+        event_store: Arc<EventStore>,
+        plan_store: Arc<PlanStore>,
+        pool: sqlx::SqlitePool,
+        memory: Arc<dyn MemoryStores>,
+        llm_runtime: Option<SharedLlmRuntime>,
+        side_calls: SideCallGateway,
+        embedding_service: Option<Arc<dyn Embedder>>,
+    ) -> Self {
+        Self {
+            event_store,
+            plan_store,
+            pool,
+            memory,
+            llm_runtime,
+            embedding_service,
+            side_calls,
+            learning_evidence_gate_enforce: false,
+        }
+    }
+
+    pub fn with_learning_evidence_gate(mut self, enforce: bool) -> Self {
+        self.learning_evidence_gate_enforce = enforce;
+        self
+    }
+
+    /// Mark a session's events as handled without learning from them, which
+    /// also makes them eligible for retention.
+    pub async fn retire_session(&self, session_id: &str) -> anyhow::Result<ConsolidationResult> {
+        let event_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM events
+             WHERE session_id = ? AND consolidated_at IS NULL",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        if event_ids.is_empty() {
+            return Ok(ConsolidationResult::empty());
+        }
+        self.event_store.mark_consolidated(&event_ids).await?;
+        info!(
+            session_id,
+            events = event_ids.len(),
+            "Marked events consolidated without learning"
+        );
+        Ok(ConsolidationResult {
+            events_processed: event_ids.len(),
+            events_consolidated: event_ids.len(),
+            ..Default::default()
+        })
+    }
+    /// Consolidate events for a session into long-term memory
+    pub async fn consolidate_session(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<ConsolidationResult> {
+        // Resolve isolation before deserializing any event payload. This also
+        // makes malformed legacy JSON fail closed: the provenance resolver
+        // classifies the session as isolated, and we can retire its rows by ID
+        // without asking EventStore to parse the unreadable payload.
+        let memory_isolated = aidaemon_events::is_memory_isolated_worker_session(session_id)
+            || aidaemon_events::session_has_mandate_execution_provenance(&self.pool, session_id)
+                .await?;
+        if memory_isolated {
+            return self.retire_session(session_id).await;
+        }
+
+        // Get unconsolidated events, then remove every task whose durable
+        // capability policy suppresses automatic memory. Canonical events stay
+        // available for history/audit; they are merely retired from learning.
+        let all_events = self.event_store.query_unconsolidated(session_id).await?;
+        let suppressed_task_ids: std::collections::HashSet<String> = sqlx::query_scalar(
+            "SELECT DISTINCT task_id FROM events
+             WHERE session_id = ? AND event_type = 'memory_policy_compiled'
+               AND task_id IS NOT NULL
+               AND json_extract(data, '$.access') = 'suppressed'",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect();
+        let allowed_task_ids: std::collections::HashSet<String> = sqlx::query_scalar(
+            "SELECT DISTINCT task_id FROM events
+             WHERE session_id = ? AND event_type = 'memory_policy_compiled'
+               AND task_id IS NOT NULL
+               AND json_extract(data, '$.access') = 'allowed'",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect();
+        let (suppressed_events, policy_eligible): (Vec<_>, Vec<_>) =
+            all_events.into_iter().partition(|event| {
+                event
+                    .task_id
+                    .as_ref()
+                    .is_some_and(|task_id| suppressed_task_ids.contains(task_id))
+            });
+        let events = policy_eligible
+            .into_iter()
+            .filter(|event| {
+                event
+                    .task_id
+                    .as_ref()
+                    .is_none_or(|task_id| allowed_task_ids.contains(task_id))
+            })
+            .collect::<Vec<_>>();
+        if !suppressed_events.is_empty() {
+            let ids = suppressed_events
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>();
+            self.event_store.mark_consolidated(&ids).await?;
+        }
+
+        if events.is_empty() {
+            return Ok(ConsolidationResult {
+                events_processed: suppressed_events.len(),
+                events_consolidated: suppressed_events.len(),
+                ..Default::default()
+            });
+        }
+
+        let plans = self.completed_plans(session_id, &suppressed_task_ids).await;
+        let report = self.learner().learn(&trace_events(&events), &plans).await;
+
+        // Note: Episode creation is handled exclusively by the memory jobs (LLM-quality episodes)
+        let event_ids: Vec<i64> = events.iter().map(|e| e.id).collect();
+        self.event_store.mark_consolidated(&event_ids).await?;
+
+        let result = ConsolidationResult {
+            events_processed: events.len() + suppressed_events.len(),
+            events_consolidated: suppressed_events.len() + event_ids.len(),
+            procedures_created: report.procedures,
+            error_solutions_created: report.error_solutions,
+            expertise_updated: report.expertise_updates,
+            behavior_patterns_recorded: report.failure_patterns,
+            ..Default::default()
+        };
+        info!(
+            session_id,
+            events = result.events_consolidated,
+            procedures = result.procedures_created,
+            error_solutions = result.error_solutions_created,
+            behavior_patterns = result.behavior_patterns_recorded,
+            "Session consolidation complete"
+        );
+
+        Ok(result)
+    }
+
+    /// The memory crate's learner, with the daemon's embeddings and, when
+    /// it has a model, a procedure enhancer that calls through the gateway.
+    fn learner(&self) -> TaskLearner {
+        let mut learner = TaskLearner::new(self.memory.clone())
+            .with_evidence_gate(self.learning_evidence_gate_enforce);
+        if let Some(embeddings) = &self.embedding_service {
+            learner = learner.with_embedder(embeddings.clone());
+        }
+        if let Some(runtime) = &self.llm_runtime {
+            // The side-call gateway picks the model; this value is not sent.
+            let model = runtime.snapshot().primary_model();
+            let provider = self.side_calls.provider(SideCall::ProcedureEnhancement);
+            learner = learner.with_enhancer(ProcedureEnhancer::new(provider, model));
+        }
+        learner
+    }
+
+    /// The session's plans finished in the last day, without suppressed
+    /// tasks' ones. A lookup failure means no plans, not a failed pass.
+    async fn completed_plans(
+        &self,
+        session_id: &str,
+        suppressed_task_ids: &HashSet<String>,
+    ) -> Vec<CompletedPlan> {
+        let since = Utc::now() - Duration::hours(24);
+        let Ok(plans) = self.plan_store.get_completed_since(session_id, since).await else {
+            return Vec::new();
+        };
+        plans
+            .into_iter()
+            .filter(|plan| {
+                !plan
+                    .task_id
+                    .as_ref()
+                    .is_some_and(|task_id| suppressed_task_ids.contains(task_id))
+            })
+            .map(|plan| CompletedPlan {
+                completed_steps: plan
+                    .steps
+                    .iter()
+                    .filter(|step| step.status == StepStatus::Completed)
+                    .map(|step| step.description.clone())
+                    .collect(),
+                id: plan.id,
+                description: plan.description,
+            })
+            .collect()
+    }
+}
+
+/// Consolidates old event sessions so the configured retention manager can
+/// later remove eligible rows. It does not own retention policy.
+pub struct Pruner {
+    event_store: Arc<EventStore>,
+    consolidator: Arc<Consolidator>,
+    retention_days: u32,
+}
+
+impl Pruner {
+    pub fn new(
+        event_store: Arc<EventStore>,
+        consolidator: Arc<Consolidator>,
+        retention_days: u32,
+    ) -> Self {
+        Self {
+            event_store,
+            consolidator,
+            retention_days,
+        }
+    }
+
+    /// Consolidate old events. Deletion is exclusively owned by
+    /// `RetentionManager`, including the `messages_days = 0` permanent mode.
+    pub async fn prune(&self) -> anyhow::Result<PruneStats> {
+        self.pass(true).await
+    }
+
+    /// Hand old events to retention without learning from them, for when
+    /// another memory system does the learning.
+    pub async fn retire_old_events(&self) -> anyhow::Result<PruneStats> {
+        self.pass(false).await
+    }
+
+    async fn pass(&self, learn: bool) -> anyhow::Result<PruneStats> {
+        let cutoff = Utc::now() - Duration::days(self.retention_days as i64);
+
+        // First, consolidate any old unconsolidated events
+        let old_sessions = self
+            .event_store
+            .get_sessions_with_old_unconsolidated_events(cutoff)
+            .await?;
+
+        let mut consolidation_errors = 0;
+        for session_id in old_sessions {
+            let handled = if learn {
+                self.consolidator.consolidate_session(&session_id).await
+            } else {
+                self.consolidator.retire_session(&session_id).await
+            };
+            if let Err(e) = handled {
+                warn!(
+                    "Failed to consolidate before prune for {}: {}",
+                    session_id, e
+                );
+                consolidation_errors += 1;
+            }
+        }
+
+        info!(
+            deleted = 0,
+            retention_days = self.retention_days,
+            "Event consolidation pass complete; retention manager owns deletion"
+        );
+
+        Ok(PruneStats {
+            deleted: 0,
+            consolidation_errors,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct PruneStats {
+    pub deleted: u64,
+    pub consolidation_errors: usize,
+}
+
+fn task_ending(outcome: TaskOutcome) -> TaskEnding {
+    match outcome {
+        TaskOutcome::Succeeded => TaskEnding::Succeeded,
+        TaskOutcome::Partial => TaskEnding::Partial,
+        TaskOutcome::Failed => TaskEnding::Failed,
+    }
+}
+
+/// How each task's last end event says it ended; `None` when that event
+/// cannot be read. Only events indexed under the task count.
+fn last_task_endings(events: &[Event]) -> HashMap<&str, Option<TaskEnding>> {
+    let mut endings = HashMap::new();
+    for event in events {
+        if event.event_type != EventType::TaskEnd {
+            continue;
+        }
+        if let Some(task_id) = &event.task_id {
+            let ending = event
+                .parse_data::<TaskEndData>()
+                .ok()
+                .map(|data| task_ending(data.effective_outcome()));
+            endings.insert(task_id.as_str(), ending);
+        }
+    }
+    endings
+}
+
+/// This session's events as the SDK memory crate's task trace. Error
+/// messages lose the daemon's own scaffolding lines (untrusted-data
+/// envelopes, truncation notices), which would otherwise make unrelated
+/// errors share a pattern.
+fn trace_events(events: &[Event]) -> Vec<TraceEvent> {
+    let endings = last_task_endings(events);
+    events
+        .iter()
+        .filter_map(|event| match event.event_type {
+            EventType::TaskStart => {
+                let data = event.parse_data::<TaskStartData>().ok()?;
+                Some(TraceEvent::TaskStarted {
+                    task_id: event.task_id.clone().unwrap_or(data.task_id),
+                    description: data.description,
+                })
+            }
+            EventType::ToolCall => {
+                let data = event.parse_data::<ToolCallData>().ok()?;
+                // A row missing its indexed tool name is an old partial
+                // record: its name counts, its arguments are not offered.
+                let whole = event.tool_name.as_deref() == Some(data.name.as_str());
+                Some(TraceEvent::ToolCalled {
+                    task_id: event.task_id.clone(),
+                    arguments: whole.then_some(data.arguments),
+                    name: data.name,
+                    summary: data.summary,
+                })
+            }
+            EventType::ToolResult => {
+                let data = event.parse_data::<ToolResultData>().ok()?;
+                Some(TraceEvent::ToolReturned {
+                    task_id: event.task_id.clone(),
+                    succeeded: data.succeeded(),
+                    name: data.name,
+                    result: data.result,
+                })
+            }
+            EventType::Error => {
+                let data = event.parse_data::<ErrorData>().ok()?;
+                let message = data
+                    .message
+                    .lines()
+                    .filter(|line| !crate::message_content::is_internal_scaffolding_line(line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Some(TraceEvent::Failed {
+                    task_id: event.task_id.clone(),
+                    message,
+                    tool: data.tool_name,
+                })
+            }
+            EventType::TaskEnd => {
+                let data = event.parse_data::<TaskEndData>().ok()?;
+                let task_id = event
+                    .task_id
+                    .clone()
+                    .or_else(|| (!data.task_id.is_empty()).then(|| data.task_id.clone()))?;
+                Some(TraceEvent::TaskEnded {
+                    task_id,
+                    outcome: task_ending(data.effective_outcome()),
+                    duration_secs: data.duration_secs as f64,
+                })
+            }
+            EventType::UserMessage => {
+                let data = event.parse_data::<UserMessageData>().ok()?;
+                (!data
+                    .annotations
+                    .contains(&MessageAnnotation::InternalContinuation))
+                .then_some(TraceEvent::UserMessage {
+                    content: data.content,
+                    at: event.created_at,
+                })
+            }
+            EventType::DecisionPoint => {
+                let task_id = event.task_id.clone()?;
+                let data = event.parse_data::<DecisionPointData>().ok()?;
+                let task_ending = endings.get(task_id.as_str()).copied().flatten();
+                Some(TraceEvent::DecisionPoint(DecisionPoint {
+                    task_id,
+                    code: data
+                        .code
+                        .unwrap_or_else(|| data.decision_type.as_str().to_string()),
+                    warning: data.severity.is_warning_or_higher(),
+                    details: DecisionDetails::from_metadata(&data.metadata),
+                    task_ending,
+                }))
+            }
+            _ => None,
+        })
+        .collect()
+}

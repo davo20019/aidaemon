@@ -1,209 +1,18 @@
 //! Common utility functions used across the codebase.
 
-/// Returns the largest byte index ≤ `byte_limit` that falls on a UTF-8 char boundary.
-///
-/// Use this when you need to slice a string by approximate byte length without panicking.
-/// The returned index is safe to use with `&s[..index]`.
-pub fn floor_char_boundary(s: &str, byte_limit: usize) -> usize {
-    if byte_limit >= s.len() {
-        return s.len();
-    }
-    let mut i = byte_limit;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
+pub use aidaemon_tools::text::{
+    floor_char_boundary, truncation_notice, truncation_notice_with_hint,
+};
 
-/// Truncates a string to at most `max_chars` characters, adding "..." if truncated.
-///
-/// This function is UTF-8 safe and respects character boundaries, avoiding panics
-/// when truncating strings that contain multi-byte characters (like emojis).
-///
-/// # Arguments
-/// * `s` - The string to truncate
-/// * `max_chars` - Maximum number of characters (not bytes) in the result, including the "..." suffix
-///
-/// # Examples
-/// ```
-/// use aidaemon::utils::truncate_str;
-///
-/// assert_eq!(truncate_str("hello", 10), "hello");
-/// assert_eq!(truncate_str("hello world", 8), "hello...");
-/// assert_eq!(truncate_str("🦀🦀🦀🦀🦀", 4), "🦀...");
-/// ```
-pub fn truncate_str(s: &str, max_chars: usize) -> String {
-    truncate_impl(s, max_chars, "...")
-}
+pub use aidaemon_events::text::{truncate_str, truncate_with_note};
 
-/// Truncates a string to at most `max_chars` characters, adding "\n... (truncated)" if truncated.
-///
-/// Similar to [`truncate_str`], but uses a more verbose suffix suitable for multi-line
-/// CLI output where the truncation should be clearly visible on its own line.
-///
-/// This function is UTF-8 safe and respects character boundaries.
-///
-/// # Arguments
-/// * `s` - The string to truncate
-/// * `max_chars` - Maximum number of characters (not bytes) before the suffix
-pub fn truncate_with_note(s: &str, max_chars: usize) -> String {
-    truncate_impl(s, max_chars, "\n... (truncated)")
-}
+pub use aidaemon_runtime::turn::helpers::render_truncation_notice;
 
-/// Internal implementation for string truncation.
-fn truncate_impl(s: &str, max_chars: usize, suffix: &str) -> String {
-    // Fast path: if string is short enough, return as-is
-    // We check byte length first as a cheap filter before counting chars
-    if s.len() <= max_chars {
-        // Byte length is <= max_chars, so char count must also be <= max_chars
-        // (each char is at least 1 byte)
-        return s.to_string();
-    }
+pub use aidaemon_runtime::context_budget::compact_embedded_json;
 
-    // Count actual characters
-    let char_count = s.chars().count();
-    if char_count <= max_chars {
-        return s.to_string();
-    }
+pub use aidaemon_runtime::message_content::is_internal_scaffolding_line;
 
-    let suffix_len = suffix.chars().count();
-
-    // Need to truncate - reserve space for suffix
-    if max_chars <= suffix_len {
-        // If max_chars is less than or equal to suffix length, just return truncated suffix
-        return suffix.chars().take(max_chars).collect();
-    }
-
-    // Take max_chars - suffix_len characters and append suffix
-    let truncated: String = s.chars().take(max_chars - suffix_len).collect();
-    format!("{}{}", truncated, suffix)
-}
-
-/// Build an explicit, instructional truncation notice for tool output that was
-/// cut down before re-entering the model context. A passive marker like
-/// "(truncated)" is routinely ignored — the model fills the gap and fabricates
-/// the omitted content (e.g. inventing the rest of a user list). This notice
-/// states how much is missing and forbids enumerating what isn't visible.
-pub fn truncation_notice(shown_chars: usize, total_chars: usize) -> String {
-    truncation_notice_with_hint(
-        shown_chars,
-        total_chars,
-        "If the user needs the full result, tell them it is longer than you can see \
-         and re-run with a narrower filter, a count (e.g. `wc -l`), or pagination.",
-    )
-}
-
-/// Like [`truncation_notice`], but with a tool-specific remediation sentence —
-/// the right next step differs per tool (re-run with `wc -l` for terminal,
-/// re-fetch with a larger `max_chars` for web_fetch, etc.).
-pub fn truncation_notice_with_hint(
-    shown_chars: usize,
-    total_chars: usize,
-    remediation_hint: &str,
-) -> String {
-    let omitted = total_chars.saturating_sub(shown_chars);
-    format!(
-        "[⚠ OUTPUT TRUNCATED — {shown} of {total} characters shown; {omitted} omitted and \
-         NOT visible to you. Do NOT enumerate, list, count, or quote any item that is not \
-         literally present in the text you can see — inventing the omitted content is an \
-         error. {hint}]",
-        shown = shown_chars,
-        total = total_chars,
-        omitted = omitted,
-        hint = remediation_hint,
-    )
-}
-
-/// Render the model-facing truncation notice from structured metadata.
-/// Exactly one call site in the agent loop renders this; tools must not
-/// embed it in their returned output.
-pub fn render_truncation_notice(info: &crate::traits::TruncationInfo) -> String {
-    match info.remediation_hint.as_deref() {
-        Some(hint) => truncation_notice_with_hint(info.shown_chars, info.total_chars, hint),
-        None => truncation_notice(info.shown_chars, info.total_chars),
-    }
-}
-
-/// Losslessly compact a pretty-printed JSON block embedded in tool-result
-/// text (headers/prefix + JSON body + suffix). Pretty-printed JSON costs
-/// ~2.5-3x the tokens of its compact form with identical information — on a
-/// small-context local model that difference is the compose step timing out
-/// versus answering. Returns `Some(new_text)` only when a parseable JSON
-/// block was found AND compaction actually shrank the text; any doubt
-/// (unparseable, truncated, already compact) returns `None` and the caller
-/// keeps the original.
-pub fn compact_embedded_json(text: &str) -> Option<String> {
-    let start = text.find(['{', '['])?;
-    let open = text.as_bytes()[start] as char;
-    let close = if open == '{' { '}' } else { ']' };
-    let end = text.rfind(close)?;
-    if end <= start {
-        return None;
-    }
-    let candidate = &text[start..=end];
-    let value: serde_json::Value = serde_json::from_str(candidate).ok()?;
-    let compact = value.to_string();
-    if compact.chars().count() >= candidate.chars().count() {
-        return None;
-    }
-    let mut rebuilt = String::with_capacity(text.len() - candidate.len() + compact.len());
-    rebuilt.push_str(&text[..start]);
-    rebuilt.push_str(&compact);
-    rebuilt.push_str(&text[end + close.len_utf8()..]);
-    Some(rebuilt)
-}
-
-/// Whether a line is harness-injected scaffolding (truncation notices,
-/// \[SYSTEM] coaching, diagnostics, untrusted-data envelopes) rather than real
-/// tool output. Such lines are addressed to the model and must never be
-/// mistaken for error content or shipped to the user.
-pub fn is_internal_scaffolding_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.contains("OUTPUT TRUNCATED")
-        || trimmed.starts_with("[SYSTEM]")
-        || trimmed.starts_with("[DIAGNOSTIC]")
-        || trimmed.starts_with("[TOOL STATS]")
-        || trimmed.starts_with("[UNTRUSTED EXTERNAL DATA")
-        || trimmed.starts_with("[END UNTRUSTED")
-}
-
-/// Extract a JSON object from LLM output, handling code fences and preamble text.
-/// Tries direct parse first, then falls back to finding `{...}` bounds.
-pub fn extract_json_object(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    let candidate = if trimmed.starts_with("```") {
-        trimmed
-            .trim_start_matches("```json")
-            .trim_start_matches("```JSON")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim()
-            .to_string()
-    } else {
-        trimmed.to_string()
-    };
-    if serde_json::from_str::<serde_json::Value>(&candidate)
-        .ok()
-        .is_some_and(|v| v.is_object())
-    {
-        return Some(candidate);
-    }
-
-    let start = raw.find('{')?;
-    let end = raw.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    let sliced = raw[start..=end].trim().to_string();
-    if serde_json::from_str::<serde_json::Value>(&sliced)
-        .ok()
-        .is_some_and(|v| v.is_object())
-    {
-        Some(sliced)
-    } else {
-        None
-    }
-}
+pub use aidaemon_runtime::turn::helpers::extract_json_object;
 
 #[cfg(test)]
 mod tests {
@@ -221,7 +30,7 @@ mod tests {
         // Live repro (task 6331508b): a pretty-printed clinical-trials JSON
         // response stayed inline (under the spill cap) and its whitespace
         // inflation helped time out the compose call.
-        let pretty = "HTTP 200 OK\ncontent-type: application/json\n\n[\n  {\n    \"nctId\": \"NCT00000000\",\n    \"title\": \"Synthetic Study\",\n    \"locations\": [\n      {\n        \"city\": \"Fairfax\",\n        \"state\": \"Virginia\"\n      }\n    ]\n  }\n]\n";
+        let pretty = "HTTP 200 OK\ncontent-type: application/json\n\n[\n  {\n    \"nctId\": \"NCT00000000\",\n    \"title\": \"Synthetic Study\",\n    \"locations\": [\n      {\n        \"city\": \"Springfield\",\n        \"state\": \"Virginia\"\n      }\n    ]\n  }\n]\n";
         let compacted = compact_embedded_json(pretty).expect("compaction applies");
         assert!(compacted.chars().count() < pretty.chars().count());
         assert!(compacted.starts_with("HTTP 200 OK"), "prefix preserved");

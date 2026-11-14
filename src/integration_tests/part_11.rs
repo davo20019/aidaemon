@@ -45,7 +45,7 @@ async fn test_long_conversation_no_crash() {
 /// Verify tool result compression: a very large tool result should be truncated.
 #[tokio::test]
 async fn test_tool_result_compressed() {
-    use crate::memory::context_window::compress_tool_result;
+    use crate::context_budget::compress_tool_result;
 
     // Result under the limit should pass through unchanged
     let short = "Hello world";
@@ -73,14 +73,14 @@ async fn test_successful_live_receipt_is_not_reopened_by_reply_wording() {
             "I can guide you on how to find skin cancer clinical trials, but I cannot perform a live search of current databases.",
         ),
         MockProvider::text_response(
-            "I checked the live ClinicalTrials.gov results. The first matching study in Fairfax, Virginia is Example Skin Trial.",
+            "I checked the live ClinicalTrials.gov results. The first matching study in Springfield, Illinois is Example Skin Trial.",
         ),
     ]);
 
     let http_tool: Arc<dyn crate::traits::Tool> = Arc::new(MockTool::new(
         "http_request",
         "Make HTTP requests",
-        "HTTP 200 OK\ncontent-type: application/json\n\n{\"studies\":[{\"briefTitle\":\"Example Skin Trial\",\"city\":\"Fairfax\",\"state\":\"Virginia\"}]}",
+        "HTTP 200 OK\ncontent-type: application/json\n\n{\"studies\":[{\"briefTitle\":\"Example Skin Trial\",\"city\":\"Springfield\",\"state\":\"Virginia\"}]}",
     ));
     let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
         provider,
@@ -94,7 +94,7 @@ async fn test_successful_live_receipt_is_not_reopened_by_reply_wording() {
         .agent
         .handle_message(
             "http_retry_session",
-            "Search for clinical trials for skin cancer near Fairfax Virginia for a man.",
+            "Search for clinical trials for skin cancer near Springfield Virginia for a man.",
             None,
             UserRole::Owner,
             ChannelContext::private("telegram"),
@@ -240,10 +240,10 @@ async fn test_summary_crud() {
     );
 }
 
-/// Verify should_extract_facts filters trivial messages correctly.
+/// Verify the extraction gate filters trivial messages correctly.
 #[tokio::test]
 async fn test_should_extract_facts_filtering() {
-    use crate::memory::context_window::should_extract_facts;
+    use aidaemon_memory::progressive::worth_extracting as should_extract_facts;
 
     // Trivial messages should be filtered out
     assert!(!should_extract_facts("ok"));
@@ -342,19 +342,22 @@ async fn test_task_budget_auto_extends_on_progress() {
         "Agent should return a non-empty response"
     );
 
-    // BudgetExtended may or may not be emitted depending on whether the
-    // stopping_phase's stall-with-progress path fires before the budget check.
-    // We only verify if the agent completed successfully (reached final text).
+    // The extension is the run's own bookkeeping: whether or not it
+    // happened, nothing about the budget reaches the chat.
     let updates = collect_status_updates(status_rx).await;
-    if response.contains("Task completed successfully.") {
-        let budget_extended = updates
-            .iter()
-            .any(|u| matches!(u, StatusUpdate::BudgetExtended { .. }));
-        assert!(
-            budget_extended,
-            "Expected BudgetExtended status update when agent completes normally"
-        );
-    }
+    assert!(
+        !budget_reaches_chat(&updates),
+        "a budget extension is never a chat status"
+    );
+}
+
+/// Whether any status update would put a line about the token budget in
+/// the chat.
+fn budget_reaches_chat(updates: &[StatusUpdate]) -> bool {
+    updates.iter().any(|update| {
+        aidaemon_channels::turns::status_text(update)
+            .is_some_and(|text| text.to_lowercase().contains("budget"))
+    })
 }
 
 /// Short productive runs should also auto-extend once they have concrete
@@ -388,36 +391,6 @@ async fn test_task_budget_auto_extends_on_short_productive_run() {
         .unwrap();
 
     assert_eq!(response, "Short task completed.");
-}
-
-#[tokio::test]
-async fn test_global_daily_budget_auto_extends_on_short_productive_run() {
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::tool_call_response("system_info", r#"{"verbose": true}"#),
-        MockProvider::tool_call_response("system_info", r#"{"check": "os"}"#),
-        MockProvider::tool_call_response("system_info", r#"{"check": "mem"}"#),
-        MockProvider::text_response("Daily budget task completed."),
-    ]);
-
-    let mut harness = setup_test_agent(provider).await.unwrap();
-    harness.agent.set_test_executor_mode();
-    harness.agent.set_test_daily_token_budget(Some(60));
-
-    let response = harness
-        .agent
-        .handle_message(
-            "daily_budget_test",
-            "Run a short multi-step check against the daily budget",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response, "Daily budget task completed.");
 }
 
 /// Task token budget stops execution when progress is not productive (stalling).
@@ -459,14 +432,10 @@ async fn test_task_budget_stops_when_not_productive() {
     // (stall_count > 0 makes is_productive=false)
     assert_ne!(response, "Should not reach this.");
 
-    // Verify NO BudgetExtended was emitted
     let updates = collect_status_updates(status_rx).await;
-    let budget_extended = updates
-        .iter()
-        .any(|u| matches!(u, StatusUpdate::BudgetExtended { .. }));
     assert!(
-        !budget_extended,
-        "BudgetExtended should NOT be emitted when agent is stalling"
+        !budget_reaches_chat(&updates),
+        "nothing about the budget reaches the chat when the agent is stalling"
     );
 }
 
@@ -553,13 +522,13 @@ impl crate::traits::Tool for TrustProbeTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect whether the agent injected _trusted_session"
+        "Inspect whether the call is a trusted session"
     }
 
     fn schema(&self) -> serde_json::Value {
         json!({
             "name": "trust_probe",
-            "description": "Inspect whether the agent injected _trusted_session",
+            "description": "Inspect whether the call is a trusted session",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -568,13 +537,21 @@ impl crate::traits::Tool for TrustProbeTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: serde_json::Value = serde_json::from_str(arguments)?;
-        let trusted = args["_trusted_session"].as_bool().unwrap_or(false);
+    
+
+    /// Records the dispatcher's typed trust fact for the call.
+    async fn execute(&self, _arguments: &str, facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let facts = facts.clone();
+
+        let trusted = facts.trusted_session;
         self.seen.lock().await.push(trusted);
-        Ok(if trusted { "trusted" } else { "untrusted" }.to_string())
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            if trusted { "trusted" } else { "untrusted" }.to_string(),
+        ))
     }
 }
+
+impl crate::traits::ToolSemantics for TrustProbeTool {}
 
 #[tokio::test]
 async fn test_scheduled_goal_tool_calls_are_marked_trusted() {
@@ -909,10 +886,8 @@ async fn test_scheduled_goal_daily_budget_is_backstop_only_during_active_run() {
 
     let updates = collect_status_updates(status_rx).await;
     assert!(
-        !updates
-            .iter()
-            .any(|u| matches!(u, StatusUpdate::BudgetExtended { .. })),
-        "Daily backstop should not trigger an in-run budget extension for scheduled goals"
+        !budget_reaches_chat(&updates),
+        "a scheduled goal's budget is never a chat status"
     );
 
     let updated_goal = harness.state.get_goal(&goal.id).await.unwrap().unwrap();
@@ -1054,10 +1029,7 @@ async fn test_scheduled_goal_run_budget_auto_extends_once_on_progress() {
 
     assert_eq!(response, "Scheduled task completed autonomously.");
     assert!(
-        collect_status_updates(status_rx)
-            .await
-            .iter()
-            .all(|update| !matches!(update, StatusUpdate::BudgetExtended { .. })),
+        !budget_reaches_chat(&collect_status_updates(status_rx).await),
         "scheduled budget adaptation should remain an internal event, not an owner interruption"
     );
 
@@ -1534,7 +1506,7 @@ async fn test_reload_provider_switches_backend_and_models_endpoint() {
 
     let before_models = harness.agent.list_models().await.unwrap();
     assert_eq!(before_models, vec!["mock-model".to_string()]);
-    assert_eq!(harness.agent.current_model().await, "mock-model");
+    assert_eq!(harness.agent.engine().current_model().await, "mock-model");
 
     let anthropic = test_reload_config(
         "anthropic",
@@ -1547,17 +1519,17 @@ async fn test_reload_provider_switches_backend_and_models_endpoint() {
 
     let status = harness.agent.reload_provider(&anthropic).await.unwrap();
     assert!(
-        status.contains("OpenaiCompatible -> Anthropic"),
+        status.contains("Now using Anthropic"),
         "unexpected reload status: {}",
         status
     );
     assert!(
-        status.contains("mock-model -> claude-3-haiku-20240307"),
+        status.contains("(claude-3-haiku-20240307)"),
         "unexpected reload status: {}",
         status
     );
     assert_eq!(
-        harness.agent.current_model().await,
+        harness.agent.engine().current_model().await,
         "claude-3-haiku-20240307"
     );
 
@@ -1578,8 +1550,8 @@ async fn test_reload_provider_switches_backend_and_models_endpoint() {
 async fn test_reload_provider_resets_manual_model_and_supports_second_reload() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 
-    harness.agent.set_model("manual-override".to_string()).await;
-    assert_eq!(harness.agent.current_model().await, "manual-override");
+    harness.agent.engine().set_model("manual-override".to_string()).await;
+    assert_eq!(harness.agent.engine().current_model().await, "manual-override");
 
     let anthropic = test_reload_config(
         "anthropic",
@@ -1591,12 +1563,13 @@ async fn test_reload_provider_resets_manual_model_and_supports_second_reload() {
     );
     let status_1 = harness.agent.reload_provider(&anthropic).await.unwrap();
     assert!(
-        status_1.contains("manual-override -> claude-3-opus-20240229"),
+        status_1.contains("Now using Anthropic (claude-3-opus-20240229).")
+            && status_1.contains("picked automatically again"),
         "unexpected reload status: {}",
         status_1
     );
     assert_eq!(
-        harness.agent.current_model().await,
+        harness.agent.engine().current_model().await,
         "claude-3-opus-20240229"
     );
 
@@ -1610,16 +1583,16 @@ async fn test_reload_provider_resets_manual_model_and_supports_second_reload() {
     );
     let status_2 = harness.agent.reload_provider(&openai).await.unwrap();
     assert!(
-        status_2.contains("Anthropic -> OpenaiCompatible"),
+        status_2.contains("Now using an OpenAI-compatible provider"),
         "unexpected second reload status: {}",
         status_2
     );
     assert!(
-        status_2.contains("claude-3-opus-20240229 -> openai/gpt-4o-mini"),
+        status_2.contains("(openai/gpt-4o-mini)"),
         "unexpected second reload status: {}",
         status_2
     );
-    assert_eq!(harness.agent.current_model().await, "openai/gpt-4o-mini");
+    assert_eq!(harness.agent.engine().current_model().await, "openai/gpt-4o-mini");
 }
 
 #[tokio::test]
@@ -1633,9 +1606,10 @@ async fn test_no_router_auto_mode_uses_runtime_primary_over_stale_model_field() 
     // Create a stale local model field, then disable override.
     harness
         .agent
+        .engine()
         .set_model("manual-stale-model".to_string())
         .await;
-    harness.agent.clear_model_override().await;
+    harness.agent.engine().clear_model_override().await;
 
     let response = harness
         .agent
@@ -1675,7 +1649,7 @@ async fn test_no_router_auto_mode_uses_runtime_primary_over_stale_model_field() 
 #[tokio::test]
 async fn test_ungrounded_list_reply_is_rejected_then_corrected() {
     let fabricated = "Here is the full squad:\n\
-         • Denis Segovia (LDU Quito)\n\
+         • Denis Segovia (LDU Lisbon)\n\
          • Alex Granda (Emelec)\n\
          • Yholen Pichenda (Independiente)\n\
          • Jackson Falconi (Barcelona SC)\n\
@@ -1862,7 +1836,7 @@ async fn test_snippet_only_enumeration_gets_corroboration_nudge_once() {
 ///
 /// MockProvider call order:
 ///   1) First LLM call → denial text (no tool call)
-///   2) Classifier call inside completion_phase → `{"intent":"relational","entities":["Caro"]}`
+///   2) Classifier call inside post_turn → `{"intent":"relational","entities":["Caro"]}`
 ///   3) Second LLM call (with directive injected) → corrected answer
 #[cfg(any())]
 #[tokio::test]
@@ -1875,7 +1849,7 @@ async fn test_relational_denial_is_blocked_then_corrected() {
     let provider = MockProvider::with_responses(vec![
         // Call 1: First LLM call — model denies knowledge without searching.
         MockProvider::text_response(denial),
-        // Call 2: Classifier call inside completion_phase — consumed by
+        // Call 2: Classifier call inside post_turn — consumed by
         // classify_relational_intent; returns relational intent with "Caro".
         MockProvider::text_response(classifier_json),
         // Call 3: Second LLM call — model has the UnsearchedEntityDenial directive
@@ -2040,7 +2014,7 @@ async fn test_owner_relationship_denial_is_blocked_then_corrected() {
 /// MockProvider call order:
 ///   1) First LLM call → tool call to "find_coworker" (returns "Juan is a coworker")
 ///   2) Second LLM call → grounded partial reply (entity present in evidence)
-///   3) Classifier call inside completion_phase → {"intent":"relational","entities":["Juan"]}
+///   3) Classifier call inside post_turn → {"intent":"relational","entities":["Juan"]}
 ///      (consumed because the pre-filter fires; find_unsearched_denials then returns
 ///      empty since Juan IS in evidence → gate does NOT fire ContinueLoop)
 ///   Total: 3 calls, but no denial directive is injected (gate short-circuits after

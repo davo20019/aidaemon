@@ -1,142 +1,232 @@
-use std::collections::{HashMap, HashSet};
+//! The daemon's side of the Telegram bot ([`TelegramBot`], in
+//! `aidaemon-channel-telegram`): its config file, the shared slash commands
+//! on its stores, its own commands (`/setkey`, `/connect`, `/bots`, `/setup`,
+//! `/restart`) and the terminal surface (`aidaemon_channel_telegram::terminal`)
+//! on its settings store.
+
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
-use futures::future::BoxFuture;
-use teloxide::error_handlers::{ErrorHandler, LoggingErrorHandler};
-use teloxide::prelude::*;
-use teloxide::types::{
-    BotCommand, ButtonRequest, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
-    KeyboardButton, KeyboardMarkup, LinkPreviewOptions, ParseMode, WebAppInfo,
+use super::telegram_api::{Bot, CallbackQuery, ChatId};
+pub(crate) use aidaemon_channel_telegram::bot::TelegramBot;
+use aidaemon_channel_telegram::bot::{
+    HostCommand, KeyChoice, TelegramHost, TelegramWebhookSettings, determine_role,
 };
-use teloxide::update_listeners::webhooks;
-use teloxide::RequestError;
+use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, info, warn};
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 
-use super::approval_render;
-use super::commands::{shared_commands, CommandCategory, CommandDef};
-use super::formatting::{
-    build_help_text, html_escape, markdown_to_telegram_html, markdown_to_telegram_plain_fallback,
-    sanitize_filename, split_message,
-};
-use super::telegram_bootstrap_signing::{
-    random_terminal_bootstrap_nonce, sign_terminal_tenant_bot_bootstrap_proof,
-    terminal_tenant_bot_bootstrap_url,
-};
+use super::commands::{CommandCategory, CommandDef};
 #[cfg(feature = "discord")]
-use crate::channels::{spawn_discord_channel, DiscordChannel};
+use crate::channels::spawn_discord_channel;
 #[cfg(feature = "slack")]
-use crate::channels::{spawn_slack_channel, SlackChannel};
-use crate::channels::{ChannelHub, ChannelRuntimeDeps, SessionMap};
-use crate::config::{AppConfig, TelegramWebhookConfig};
-use crate::runtime_ports::{ChannelAgentRuntime, InboundMessageRequest};
-use crate::tasks::{QueueOutcome, QueuedMessage, TaskRegistry};
+use crate::channels::spawn_slack_channel;
+use crate::channels::{ChannelHub, ChannelRuntimeDeps};
+use crate::config::TelegramWebhookConfig;
+#[cfg(test)]
+use crate::runtime_ports::DaemonAgentRuntime;
+#[cfg(test)]
+use crate::tasks::TaskRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::traits::{Channel, ChannelCapabilities, StateStore};
-use crate::types::{
-    ApprovalResponse, ChannelContext, ChannelVisibility, MediaKind, MediaMessage, StatusUpdate,
-    UserRole,
-};
+use crate::traits::{HubChannel, StateStore};
+use crate::types::{ApprovalResponse, UserRole};
+use aidaemon_channel_telegram::terminal::TelegramTerminal;
 
-fn disabled_link_preview() -> LinkPreviewOptions {
-    LinkPreviewOptions {
-        is_disabled: true,
-        url: None,
-        prefer_small_media: false,
-        prefer_large_media: false,
-        show_above_text: false,
+/// A Telegram bot on the daemon's services.
+pub(crate) fn new_telegram_bot(
+    bot_token: &str,
+    allowed_user_ids: Vec<u64>,
+    webhook: TelegramWebhookConfig,
+    owner_user_ids: Vec<u64>,
+    runtime: ChannelRuntimeDeps,
+    terminal_web_app_url: String,
+    terminal_allowed_prefixes: Vec<String>,
+) -> TelegramBot {
+    let webhook = TelegramWebhookSettings {
+        enabled: webhook.enabled,
+        public_url: webhook.public_url,
+        listen_addr: webhook.listen_addr,
+        path: webhook.path,
+        max_connections: webhook.max_connections,
+        drop_pending_updates: webhook.drop_pending_updates,
+    };
+    let host = Arc::new(DaemonTelegramHost {
+        runtime: runtime.clone(),
+        terminal: TelegramTerminal::new(
+            runtime.state.clone(),
+            terminal_web_app_url,
+            terminal_allowed_prefixes,
+            crate::startup::terminal_bridge::local_agent_start(),
+        ),
+    });
+    TelegramBot::new(
+        bot_token,
+        allowed_user_ids,
+        webhook,
+        owner_user_ids,
+        runtime.bot_deps(),
+        host,
+    )
+}
+
+/// Spawn a Telegram bot in a background task.
+/// This is a separate function to avoid async type inference cycles.
+pub(crate) fn spawn_telegram_channel(channel: Arc<TelegramBot>) {
+    tokio::spawn(async move {
+        channel.start_with_retry().await;
+    });
+}
+
+/// The daemon's services behind one Telegram bot.
+pub(crate) struct DaemonTelegramHost {
+    runtime: ChannelRuntimeDeps,
+    /// `/agent`, `/terminal` and the Mini App handoff.
+    terminal: TelegramTerminal,
+}
+
+impl DaemonTelegramHost {
+    fn cx<'a>(&'a self, tg: &'a Arc<TelegramBot>) -> Cx<'a> {
+        Cx {
+            tg,
+            bot: tg.bot().clone(),
+            bot_token: tg.bot_token().to_string(),
+            allowed_user_ids: tg.allowed_user_ids(),
+            owner_user_ids: tg.owner_user_ids().to_vec(),
+            state: self.runtime.state.clone(),
+            config_path: self.runtime.config_path.clone(),
+            runtime: &self.runtime,
+            terminal: &self.terminal,
+        }
+    }
+
+    /// Test the key against its provider and save it only if it is accepted.
+    async fn install_key(&self, slot_id: &str, label: &str, key: &str) -> String {
+        use super::set_key::{KeyCheck, KeySlot, check_key, key_targets, save_key};
+        let slot = KeySlot::from_id(slot_id);
+        let target = tokio::fs::read_to_string(&self.runtime.config_path)
+            .await
+            .ok()
+            .and_then(|text| key_targets(&text).ok())
+            .and_then(|targets| {
+                targets
+                    .into_iter()
+                    .find(|target| Some(target.slot) == slot && target.label() == *label)
+            });
+        let Some(target) = target else {
+            return format!("The config changed, so {label} was not updated. Run /setkey again.");
+        };
+        match check_key(&target, key).await {
+            KeyCheck::Rejected(detail) => {
+                format!("{label}: the provider rejected that key ({detail}). Nothing was changed.")
+            }
+            KeyCheck::Unverified(detail) => {
+                format!("{label}: I couldn't verify that key ({detail}). Nothing was changed.")
+            }
+            KeyCheck::Accepted => match save_key(&self.runtime.config_path, target.slot, key).await
+            {
+                Err(error) => format!("{label}: the key works, but saving it failed: {error}"),
+                Ok(stored) => {
+                    let ctx = self.command_context();
+                    let reload = ctx.reload_config().await.unwrap_or_else(|error| error);
+                    super::set_key::key_saved_reply(&target.provider_name(), stored, &reload)
+                }
+            },
+        }
+    }
+
+    /// The keys `/setkey` offers.
+    async fn key_choices(&self) -> Result<Vec<KeyChoice>, String> {
+        let targets = tokio::fs::read_to_string(&self.runtime.config_path)
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|text| super::set_key::key_targets(&text))
+            .map_err(|error| format!("Could not read the config: {error}"))?;
+        Ok(targets
+            .iter()
+            .map(|target| KeyChoice {
+                id: target.slot.id(),
+                label: target.label(),
+            })
+            .collect())
+    }
+
+    fn command_context(&self) -> super::commands::CommandContext {
+        self.runtime.command_context()
     }
 }
 
-pub struct TelegramChannel {
-    /// Bot username fetched from Telegram API (e.g., "coding_bot", "debug_bot").
-    /// Populated on first start() call via getMe. Uses StdRwLock for sync access in trait methods.
-    bot_username: StdRwLock<String>,
-    /// Cached channel name for the trait's name() method (e.g., "telegram" or "telegram:my_bot").
-    cached_channel_name: StdRwLock<String>,
-    /// Stable namespace used when building session IDs.
-    /// Once set for a process lifetime, it must not change to avoid
-    /// splitting conversation history mid-run.
-    session_namespace: StdRwLock<Option<String>>,
+/// One bot and the daemon's services, for the daemon's own commands.
+struct Cx<'a> {
+    tg: &'a Arc<TelegramBot>,
     bot: Bot,
     bot_token: String,
-    webhook: TelegramWebhookConfig,
-    allowed_user_ids: StdRwLock<Vec<u64>>,
-    /// Telegram user IDs recognized as owners (from `users.owner_ids.telegram`).
+    allowed_user_ids: &'a StdRwLock<Vec<u64>>,
     owner_user_ids: Vec<u64>,
-    agent: Arc<dyn ChannelAgentRuntime>,
-    config_path: PathBuf,
-    /// Pending approvals keyed by a unique callback ID.
-    pending_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalResponse>>>,
-    /// Shared session map — maps session_id to channel name.
-    session_map: SessionMap,
-    /// Task registry for tracking background agent work.
-    task_registry: Arc<TaskRegistry>,
-    /// Whether file transfer is enabled.
-    files_enabled: bool,
-    /// Directory for saving inbound files.
-    inbox_dir: PathBuf,
-    /// Max file size in MB for inbound files.
-    max_file_size_mb: u64,
-    /// State store for querying token usage.
     state: Arc<dyn StateStore>,
-    /// Reference to the channel hub for dynamic bot registration.
-    /// Set after construction via set_channel_hub().
-    channel_hub: StdRwLock<Option<Weak<ChannelHub>>>,
-    /// Seconds of no heartbeat before declaring the agent stuck (0 = disabled).
-    watchdog_stale_threshold_secs: u64,
-    /// URL for the Telegram Mini App terminal frontend.
-    terminal_web_app_url: String,
-    /// Terminal-lite session manager.
-    terminal_lite: crate::terminal_lite::TerminalLiteManager,
+    config_path: PathBuf,
+    runtime: &'a ChannelRuntimeDeps,
+    terminal: &'a TelegramTerminal,
 }
 
-#[derive(Debug, Default)]
-struct SetupLoginResult {
-    success: bool,
-    timed_out: bool,
-    error: Option<String>,
-    lines: Vec<String>,
-    urls: Vec<String>,
+impl Cx<'_> {
+    async fn session_id(&self, chat_id: i64) -> String {
+        self.tg.session_id(chat_id).await
+    }
+
+    async fn get_bot_username(&self) -> String {
+        self.tg.get_bot_username().await
+    }
+
+    async fn request_approval(
+        &self,
+        session_id: &str,
+        command: &str,
+        risk_level: RiskLevel,
+        warnings: &[String],
+        permission_mode: PermissionMode,
+        one_time_only: bool,
+    ) -> anyhow::Result<ApprovalResponse> {
+        self.tg
+            .request_approval(
+                session_id,
+                command,
+                risk_level,
+                warnings,
+                permission_mode,
+                one_time_only,
+            )
+            .await
+    }
+
+    fn runtime_deps(&self) -> ChannelRuntimeDeps {
+        self.runtime.clone()
+    }
+
+    fn channel_hub_weak(&self) -> Option<Weak<ChannelHub>> {
+        self.tg.channel_hub().map(|hub| Arc::downgrade(&hub))
+    }
 }
 
-use crate::wizard::CloudflaredZoneValidation;
-
-use crate::cli_agent_flags::{self, AGENT_FLAGS_CACHE_TTL_SECS, SUPPORTED_TERMINAL_AGENTS};
-
-const DEFAULT_TERMINAL_AGENT: &str = "codex";
-const TELEGRAM_EXPANDABLE_TRIGGER_CHARS: usize = 1_800;
-const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
-const TELEGRAM_EXPANDABLE_WRAPPER_LEN: usize = "<blockquote expandable></blockquote>".len();
-const TELEGRAM_WEBAPP_TYPE_AGENT_MESSAGE: &str = "aidaemon.telegram.agent_message.v1";
-const TELEGRAM_WEBAPP_TYPE_CONTINUE_COMPUTER: &str = "aidaemon.telegram.open_on_computer.v1";
-const TELEGRAM_WEBAPP_MAX_TEXT_CHARS: usize = 2_000;
-static LOW_LATENCY_RESTART_SCHEDULED: AtomicBool = AtomicBool::new(false);
-
-enum TelegramWebAppAction {
-    AgentMessage(String),
-    ContinueOnComputer { relay_session_id: Option<String> },
-}
-
-/// All commands available in the Telegram channel (shared + Telegram-specific).
-///
-/// Used to register Telegram's `/` command menu via `setMyCommands` and to
-/// generate `/help` output.
-fn telegram_commands() -> Vec<CommandDef> {
-    let mut cmds = shared_commands();
-    cmds.extend(vec![
+/// The daemon's commands, after the shared ones, in the "/" menu.
+fn daemon_commands() -> Vec<CommandDef> {
+    vec![
         CommandDef {
             name: "restart",
             description: "Restart the daemon",
             usage: None,
             category: CommandCategory::Restart,
+        },
+        CommandDef {
+            name: "setkey",
+            description: "Replace a provider's API key (works with no model available)",
+            usage: Some("/setkey"),
+            category: CommandCategory::Connect,
         },
         CommandDef {
             name: "connect",
@@ -156,146 +246,204 @@ fn telegram_commands() -> Vec<CommandDef> {
             usage: None,
             category: CommandCategory::Connect,
         },
-        CommandDef {
-            name: "agent",
-            description: "Start or manage CLI agent sessions",
-            usage: Some("/agent [codex|claude|gemini|opencode] [dir]"),
-            category: CommandCategory::Terminal,
-        },
-        CommandDef {
-            name: "terminal",
-            description: "Terminal bridge commands",
-            usage: Some("/terminal [lite|start|open]"),
-            category: CommandCategory::Terminal,
-        },
-        CommandDef {
-            name: "help",
-            description: "Show available commands",
-            usage: None,
-            category: CommandCategory::Core,
-        },
-    ]);
-    cmds
+    ]
 }
 
-fn interpret_terminal_bot_sync_response(
-    status: reqwest::StatusCode,
-    content_type: Option<&str>,
-    body: &[u8],
-) -> (Result<(), String>, bool) {
-    let retryable_status =
-        status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-    let parsed = match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            let content_type = content_type.unwrap_or("unknown");
-            return (
-                Err(format!(
-                    "terminal bot sync returned non-JSON response (status {}, content-type {}, {} bytes): {}",
-                    status,
-                    content_type,
-                    body.len(),
-                    error
-                )),
-                retryable_status || status.is_success(),
+#[async_trait]
+impl TelegramHost for DaemonTelegramHost {
+    fn commands(&self) -> Vec<CommandDef> {
+        let mut commands = daemon_commands();
+        commands.extend(TelegramTerminal::commands());
+        commands.extend(self.command_context().extension_commands());
+        commands
+    }
+
+    async fn dispatch_shared(
+        &self,
+        cmd: &str,
+        args: &str,
+        session_id: &str,
+        sender_id: Option<&str>,
+        user_role: UserRole,
+    ) -> Option<String> {
+        self.command_context()
+            .dispatch(cmd, args, session_id, sender_id, user_role)
+            .await
+    }
+
+    async fn handle_command(
+        &self,
+        tg: &Arc<TelegramBot>,
+        cmd: &str,
+        arg: &str,
+        msg: &super::telegram_api::Message,
+    ) -> HostCommand {
+        if self.terminal.handle_command(tg, cmd, arg, msg).await {
+            return HostCommand::Handled;
+        }
+        let cx = self.cx(tg);
+        let bot = cx.bot.clone();
+        let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
+        HostCommand::Reply(match cmd {
+            "/restart" => {
+                let _ = bot.send_message(msg.chat.id, "Restarting...").await;
+                info!("Restart requested via Telegram");
+                restart_process();
+                // If exec fails, we're still alive
+                "Restart failed. You may need to restart manually.".to_string()
+            }
+            "/connect" => cx.handle_connect_command(arg, user_id).await,
+            "/setup" => cx.handle_setup_command(arg, user_id, msg.chat.id.0).await,
+            "/bots" => cx.handle_bots_command().await,
+            _ => return HostCommand::NotMine,
+        })
+    }
+
+    /// `/setup` may wait for an approval button.
+    fn runs_detached(&self, cmd: &str) -> bool {
+        cmd == "/setup"
+    }
+
+    async fn handle_callback(
+        &self,
+        tg: &Arc<TelegramBot>,
+        q: &CallbackQuery,
+        data: &str,
+        user_id: u64,
+    ) -> bool {
+        self.terminal.handle_callback(tg, q, data, user_id).await
+    }
+
+    async fn key_choices(&self) -> Result<Vec<KeyChoice>, String> {
+        DaemonTelegramHost::key_choices(self).await
+    }
+
+    async fn install_key(&self, id: &str, label: &str, key: &str) -> String {
+        DaemonTelegramHost::install_key(self, id, label, key).await
+    }
+
+    async fn intercept_text(
+        &self,
+        _tg: &Arc<TelegramBot>,
+        chat_id: i64,
+        user_id: u64,
+        user_role: UserRole,
+        text: &str,
+    ) -> Option<String> {
+        self.terminal
+            .intercept_text(chat_id, user_id, user_role, text)
+            .await
+    }
+
+    async fn continue_on_computer(
+        &self,
+        tg: &Arc<TelegramBot>,
+        msg: &super::telegram_api::Message,
+        user_id: u64,
+        relay_session_id: Option<String>,
+    ) {
+        self.terminal
+            .continue_on_computer(tg, msg, user_id, relay_session_id)
+            .await;
+    }
+
+    async fn owner_claimed(&self, tg: &Arc<TelegramBot>, allowed: &[u64]) -> Option<String> {
+        let cx = self.cx(tg);
+        let user_id = allowed.first().copied().unwrap_or(0);
+        // Persist to config.toml so it survives restarts
+        if let Err(e) = cx.persist_allowed_user_ids(allowed).await {
+            warn!(
+                user_id,
+                "Failed to persist auto-claimed user ID to config: {}", e
             );
         }
-    };
-    if status.is_success() && parsed.get("ok").and_then(|value| value.as_bool()) == Some(true) {
-        return (Ok(()), false);
+        #[cfg(feature = "terminal-bridge")]
+        {
+            let mut bridge_hotstart_failed = false;
+            match crate::config::AppConfig::load(&cx.config_path) {
+                Ok(config) => {
+                    if config.terminal.effective_bridge_enabled()
+                        && !crate::startup::terminal_bridge::spawn_if_configured(
+                            &config,
+                            cx.state.clone(),
+                        )
+                    {
+                        bridge_hotstart_failed = true;
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        user_id,
+                        error = %err,
+                        "Failed to reload config for terminal bridge hot-start after auto-claim"
+                    );
+                    bridge_hotstart_failed = true;
+                }
+            }
+            if bridge_hotstart_failed {
+                return Some(
+                    "I couldn't auto-enable the /agent bridge right now. If /agent doesn't open, run /restart."
+                        .to_string(),
+                );
+            }
+        }
+        None
     }
 
-    let message = parsed
-        .get("message")
-        .and_then(|value| value.as_str())
-        .or_else(|| parsed.get("error").and_then(|value| value.as_str()))
-        .unwrap_or("unknown error");
-    (
-        Err(format!(
-            "terminal bot sync failed (status {}): {}",
-            status,
-            crate::tools::sanitize::redact_secrets(message)
-        )),
-        retryable_status,
-    )
+    async fn on_start(&self, tg: &Arc<TelegramBot>, label: &str) {
+        self.terminal.sync_bot_token(tg, Some(label)).await;
+    }
+
+    async fn set_next_message_private(
+        &self,
+        session_id: &str,
+        sender_id: Option<&str>,
+        on: bool,
+    ) -> anyhow::Result<()> {
+        crate::agent::memory_plugin::set_next_message_private(
+            self.runtime.state.as_ref(),
+            session_id,
+            sender_id,
+            on,
+        )
+        .await
+    }
 }
 
-impl TelegramChannel {
-    pub fn new(
-        bot_token: &str,
-        allowed_user_ids: Vec<u64>,
-        webhook: TelegramWebhookConfig,
-        owner_user_ids: Vec<u64>,
-        runtime: ChannelRuntimeDeps,
-        terminal_web_app_url: String,
-        terminal_allowed_prefixes: Vec<String>,
-    ) -> Self {
-        let bot = Bot::new(bot_token);
-        let terminal_allowed_prefixes = terminal_allowed_prefixes
-            .into_iter()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .filter(|value| !value.is_empty())
-            .collect::<HashSet<_>>();
-        Self {
-            bot_username: StdRwLock::new("telegram".to_string()),
-            cached_channel_name: StdRwLock::new("telegram".to_string()),
-            session_namespace: StdRwLock::new(None),
-            bot,
-            bot_token: bot_token.to_string(),
-            webhook,
-            allowed_user_ids: StdRwLock::new(allowed_user_ids),
-            owner_user_ids,
-            agent: runtime.agent,
-            config_path: runtime.config_path,
-            pending_approvals: Mutex::new(HashMap::new()),
-            session_map: runtime.session_map,
-            task_registry: runtime.task_registry,
-            files_enabled: runtime.files_enabled,
-            inbox_dir: runtime.inbox_dir,
-            max_file_size_mb: runtime.max_file_size_mb,
-            state: runtime.state,
-            channel_hub: StdRwLock::new(None),
-            watchdog_stale_threshold_secs: runtime.watchdog_stale_threshold_secs,
-            terminal_web_app_url,
-            terminal_lite: crate::terminal_lite::TerminalLiteManager::new(
-                terminal_allowed_prefixes,
-            ),
+#[derive(Debug, Default)]
+struct SetupLoginResult {
+    success: bool,
+    timed_out: bool,
+    error: Option<String>,
+    lines: Vec<String>,
+    urls: Vec<String>,
+}
+
+use crate::wizard::CloudflaredZoneValidation;
+
+static LOW_LATENCY_RESTART_SCHEDULED: AtomicBool = AtomicBool::new(false);
+
+/// Replace the current process with a fresh instance of itself.
+fn restart_process() {
+    use std::os::unix::process::CommandExt;
+
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("Failed to get current exe path: {}", e);
+            return;
         }
-    }
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
 
-    fn runtime_deps(&self) -> ChannelRuntimeDeps {
-        ChannelRuntimeDeps {
-            agent: self.agent.clone(),
-            config_path: self.config_path.clone(),
-            session_map: self.session_map.clone(),
-            task_registry: self.task_registry.clone(),
-            files_enabled: self.files_enabled,
-            inbox_dir: self.inbox_dir.clone(),
-            max_file_size_mb: self.max_file_size_mb,
-            state: self.state.clone(),
-            watchdog_stale_threshold_secs: self.watchdog_stale_threshold_secs,
-        }
-    }
+    tracing::info!(exe = %exe.display(), "Exec-ing new process");
 
-    /// Set the channel hub reference for dynamic bot registration.
-    /// Called after the hub is constructed in core.rs.
-    pub fn set_channel_hub(&self, hub: Weak<ChannelHub>) {
-        if let Ok(mut guard) = self.channel_hub.write() {
-            *guard = Some(hub);
-        }
-    }
+    // This replaces the current process — does not return on success
+    let err = std::process::Command::new(&exe).args(&args).exec();
+    tracing::error!("exec failed: {}", err);
+}
 
-    async fn send_compact_or_full_reply(
-        &self,
-        bot: &Bot,
-        chat_id: ChatId,
-        markdown: &str,
-    ) -> anyhow::Result<()> {
-        send_full_or_expandable_reply(bot, chat_id, markdown)
-            .await
-            .map(|_| ())
-    }
-
+impl Cx<'_> {
     /// Persist the current allowed_user_ids list to config.toml.
     /// Handles both `[telegram]` and `[[telegram_bots]]` config formats.
     async fn persist_allowed_user_ids(&self, ids: &[u64]) -> anyhow::Result<()> {
@@ -314,11 +462,11 @@ impl TelegramChannel {
             telegram.insert("allowed_user_ids".to_string(), ids_toml.clone());
             updated = true;
         }
-        if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut()) {
-            if let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
-                first.insert("allowed_user_ids".to_string(), ids_toml);
-                updated = true;
-            }
+        if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut())
+            && let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut())
+        {
+            first.insert("allowed_user_ids".to_string(), ids_toml);
+            updated = true;
         }
 
         if !updated {
@@ -329,1814 +477,6 @@ impl TelegramChannel {
         tokio::fs::write(&self.config_path, &new_content).await?;
         info!("Persisted allowed_user_ids to config.toml");
         Ok(())
-    }
-
-    /// Get the bot's username, fetching from Telegram API if not cached.
-    async fn get_bot_username(&self) -> String {
-        // Check if already fetched (not the default "telegram" placeholder)
-        {
-            let guard = self
-                .bot_username
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if *guard != "telegram" {
-                return guard.clone();
-            }
-        }
-
-        // Fetch from Telegram API
-        match self.bot.get_me().await {
-            Ok(me) => {
-                let username = me
-                    .username
-                    .clone()
-                    .unwrap_or_else(|| "telegram".to_string());
-                // Update both bot_username and cached_channel_name
-                if let Ok(mut guard) = self.bot_username.write() {
-                    *guard = username.clone();
-                }
-                // Channel name is "telegram" for single bot or "telegram:{username}" for multi-bot
-                let channel_name = if username == "telegram" {
-                    "telegram".to_string()
-                } else {
-                    format!("telegram:{}", username)
-                };
-                if let Ok(mut guard) = self.cached_channel_name.write() {
-                    *guard = channel_name;
-                }
-                info!(username = %username, "Fetched bot username from Telegram");
-                username
-            }
-            Err(e) => {
-                warn!("Failed to fetch bot username: {}, using 'telegram'", e);
-                "telegram".to_string()
-            }
-        }
-    }
-
-    fn cached_bot_label(&self) -> Option<String> {
-        let guard = self
-            .bot_username
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let username = guard.trim();
-        if username.is_empty() || username == "telegram" {
-            None
-        } else {
-            Some(username.to_string())
-        }
-    }
-
-    async fn sync_terminal_tenant_bot_token(
-        &self,
-        bot_token: &str,
-        user_id: u64,
-        label: Option<&str>,
-    ) -> Result<(), String> {
-        let url = terminal_tenant_bot_bootstrap_url(&self.terminal_web_app_url)?;
-        let client = reqwest::Client::builder()
-            .user_agent("aidaemon-terminal-bot-bootstrap/1.0")
-            .timeout(Duration::from_secs(8))
-            .build()
-            .map_err(|err| format!("failed to build HTTP client: {}", err))?;
-        let mut last_error = "terminal bot sync did not run".to_string();
-        for attempt in 0..3_u64 {
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|err| format!("failed to read system clock: {}", err))?
-                .as_secs() as i64;
-            let nonce = random_terminal_bootstrap_nonce(16);
-            let sig = sign_terminal_tenant_bot_bootstrap_proof(bot_token, user_id, ts, &nonce)?;
-            let mut payload = serde_json::json!({
-                "user_id": user_id,
-                "bot_token": bot_token,
-                "ts": ts,
-                "nonce": nonce,
-                "sig": sig,
-            });
-            if let Some(label) = label
-                .map(|value| value.trim())
-                .filter(|value| !value.is_empty())
-            {
-                if let Some(map) = payload.as_object_mut() {
-                    map.insert(
-                        "label".to_string(),
-                        serde_json::Value::String(label.to_string()),
-                    );
-                }
-            }
-
-            let response = match client.post(url.clone()).json(&payload).send().await {
-                Ok(response) => response,
-                Err(error) => {
-                    last_error = format!("terminal bot sync request failed: {error}");
-                    if attempt == 2 {
-                        return Err(last_error);
-                    }
-                    let jitter = rand::random::<u64>() % 150;
-                    tokio::time::sleep(Duration::from_millis(150 * (attempt + 1) + jitter)).await;
-                    continue;
-                }
-            };
-            let status = response.status();
-            let content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let body = match response.bytes().await {
-                Ok(body) => body,
-                Err(error) => {
-                    last_error = format!(
-                        "terminal bot sync response body failed (status {status}): {error}"
-                    );
-                    if attempt == 2 {
-                        return Err(last_error);
-                    }
-                    let jitter = rand::random::<u64>() % 150;
-                    tokio::time::sleep(Duration::from_millis(150 * (attempt + 1) + jitter)).await;
-                    continue;
-                }
-            };
-            let (result, retryable) = interpret_terminal_bot_sync_response(
-                status,
-                content_type.as_deref(),
-                body.as_ref(),
-            );
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) => last_error = error,
-            }
-            if !retryable || attempt == 2 {
-                return Err(last_error);
-            }
-            let jitter = rand::random::<u64>() % 150;
-            tokio::time::sleep(Duration::from_millis(150 * (attempt + 1) + jitter)).await;
-        }
-        Err(last_error)
-    }
-
-    async fn sync_terminal_tenant_bot_token_for_allowed_users(&self, label: Option<&str>) {
-        let allowed_user_ids = self
-            .allowed_user_ids
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        for user_id in allowed_user_ids {
-            if let Err(err) = self
-                .sync_terminal_tenant_bot_token(&self.bot_token, user_id, label)
-                .await
-            {
-                warn!(
-                    error = %err,
-                    user_id,
-                    "Failed to auto-sync Telegram bot token during channel startup"
-                );
-            }
-        }
-    }
-
-    /// Build the session ID for a chat, prefixing with bot username.
-    /// Uses a stable namespace to avoid mid-run session ID drift.
-    async fn session_id(&self, chat_id: i64) -> String {
-        let namespace = self.session_namespace().await;
-        if namespace == "default" {
-            chat_id.to_string()
-        } else {
-            format!("{}:{}", namespace, chat_id)
-        }
-    }
-
-    async fn session_namespace(&self) -> String {
-        {
-            let guard = self
-                .session_namespace
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(existing) = guard.as_ref() {
-                return existing.clone();
-            }
-        }
-
-        let username = self.get_bot_username().await;
-        let namespace = if username == "telegram" || username == "default" {
-            fallback_session_namespace_from_token(&self.bot_token)
-        } else {
-            username
-        };
-
-        let mut guard = self
-            .session_namespace
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.is_none() {
-            *guard = Some(namespace.clone());
-        }
-        guard.as_ref().cloned().unwrap_or(namespace)
-    }
-
-    /// Get the channel identifier for the session map.
-    async fn channel_name(&self) -> String {
-        let username = self.get_bot_username().await;
-        if username == "default" {
-            "telegram".to_string()
-        } else {
-            format!("telegram:{}", username)
-        }
-    }
-
-    /// Start the Telegram dispatcher with automatic retry on crash.
-    /// Uses exponential backoff: 5s → 10s → 20s → 40s → 60s cap.
-    /// Resets backoff to initial after a stable run (60s+).
-    pub async fn start_with_retry(self: Arc<Self>) {
-        // Fetch bot username once at startup
-        let bot_username = self.get_bot_username().await;
-
-        let mut backoff = crate::backoff::ChannelReconnectBackoff::new(
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-            Duration::from_secs(60),
-        );
-
-        loop {
-            info!(name = %bot_username, "Starting Telegram dispatcher");
-            let started = tokio::time::Instant::now();
-            self.clone().start().await;
-            let ran_for = started.elapsed();
-
-            let delay = backoff.next_jittered_delay(ran_for, 0.10);
-
-            warn!(
-                name = %bot_username,
-                backoff_secs = delay.as_secs(),
-                ran_for_secs = ran_for.as_secs(),
-                "Telegram dispatcher stopped, restarting"
-            );
-            tokio::time::sleep(delay).await;
-        }
-    }
-
-    pub async fn start(self: Arc<Self>) {
-        let bot_username = self.get_bot_username().await;
-        info!(name = %bot_username, "Starting Telegram channel");
-        self.sync_terminal_tenant_bot_token_for_allowed_users(Some(bot_username.as_str()))
-            .await;
-
-        // Register commands with Telegram so they appear in the "/" menu.
-        let bot_commands: Vec<BotCommand> = telegram_commands()
-            .iter()
-            .map(|c| BotCommand::new(c.name, c.description))
-            .collect();
-        if let Err(e) = self.bot.set_my_commands(bot_commands).await {
-            warn!(error = %e, "Failed to register bot commands with Telegram");
-        }
-
-        let handler = dptree::entry()
-            .branch(Update::filter_message().endpoint({
-                let channel = Arc::clone(&self);
-                move |msg: teloxide::types::Message, bot: Bot| {
-                    let channel = Arc::clone(&channel);
-                    async move {
-                        channel.handle_message(msg, bot).await;
-                        respond(())
-                    }
-                }
-            }))
-            .branch(Update::filter_callback_query().endpoint({
-                let channel = Arc::clone(&self);
-                move |q: CallbackQuery, bot: Bot| {
-                    let channel = Arc::clone(&channel);
-                    async move {
-                        channel.handle_callback(q, bot).await;
-                        respond(())
-                    }
-                }
-            }));
-
-        let mut dispatcher = Dispatcher::builder(self.bot.clone(), handler)
-            .enable_ctrlc_handler()
-            .build();
-
-        if let Some((listen_addr, webhook_opts)) = self.build_webhook_options(&bot_username) {
-            info!(
-                name = %bot_username,
-                listen_addr = %listen_addr,
-                "Starting Telegram webhook listener"
-            );
-            match webhooks::axum_to_router(self.bot.clone(), webhook_opts).await {
-                Ok((listener, stop_flag, router)) => {
-                    match tokio::net::TcpListener::bind(listen_addr).await {
-                        Ok(tcp_listener) => {
-                            tokio::spawn(async move {
-                                if let Err(err) = axum::serve(tcp_listener, router)
-                                    .with_graceful_shutdown(stop_flag)
-                                    .await
-                                {
-                                    warn!(error = %err, "Telegram webhook server stopped with error");
-                                }
-                            });
-                            dispatcher
-                                .dispatch_with_listener(
-                                    listener,
-                                    LoggingErrorHandler::with_custom_text(
-                                        "An error from the Telegram webhook listener",
-                                    ),
-                                )
-                                .await;
-                            return;
-                        }
-                        Err(err) => {
-                            warn!(
-                                name = %bot_username,
-                                listen_addr = %listen_addr,
-                                error = %err,
-                                hint = "for multi-bot webhook mode, use a unique listen_addr per bot",
-                                "Failed to bind Telegram webhook listener, falling back to long polling"
-                            );
-                            let _ = self.bot.delete_webhook().send().await;
-                        }
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        name = %bot_username,
-                        error = %err,
-                        "Failed to initialize Telegram webhook mode, falling back to long polling"
-                    );
-                    let _ = self.bot.delete_webhook().send().await;
-                }
-            }
-        }
-
-        // Clear any stale webhook before starting long polling. If a webhook
-        // was previously set (e.g., via `/setup lowlatency apply`) but we're
-        // now falling back to polling, Telegram will keep sending updates to
-        // the old webhook URL and getUpdates will return nothing.
-        info!(name = %bot_username, "Clearing any existing webhook before starting long polling");
-        if let Err(err) = self.bot.delete_webhook().send().await {
-            warn!(
-                name = %bot_username,
-                error = %err,
-                "Failed to delete webhook before long polling (updates may not arrive)"
-            );
-        }
-
-        // Long polling. Use an explicit polling listener + a loud error handler
-        // (teloxide's default logs under a target our filter drops, which is how
-        // a wedged getUpdates went silent). A watchdog runs alongside: if
-        // getUpdates keeps failing past the threshold, it returns, which drops
-        // the dispatch future and lets `start_with_retry` reconnect with a fresh
-        // getUpdates connection instead of staying silently dead.
-        let error_count = Arc::new(AtomicU64::new(0));
-        let err_handler = Arc::new(PollingErrorHandler {
-            bot_username: bot_username.clone(),
-            error_count: Arc::clone(&error_count),
-        });
-        let listener = teloxide::update_listeners::polling_default(self.bot.clone()).await;
-        tokio::select! {
-            _ = dispatcher.dispatch_with_listener(listener, err_handler) => {}
-            _ = poll_health_watchdog(error_count, bot_username.clone()) => {}
-        }
-    }
-
-    fn build_webhook_options(
-        &self,
-        bot_username: &str,
-    ) -> Option<(std::net::SocketAddr, webhooks::Options)> {
-        if !self.webhook.enabled {
-            return None;
-        }
-
-        let public_url_raw = self
-            .webhook
-            .public_url
-            .as_ref()
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty());
-        let Some(public_url_raw) = public_url_raw else {
-            warn!(
-                name = %bot_username,
-                "Telegram webhook enabled but `public_url` is empty; using long polling"
-            );
-            return None;
-        };
-        let public_url = match reqwest::Url::parse(public_url_raw) {
-            Ok(value) => value,
-            Err(err) => {
-                warn!(
-                    name = %bot_username,
-                    error = %err,
-                    public_url = %public_url_raw,
-                    "Invalid Telegram webhook public URL; using long polling"
-                );
-                return None;
-            }
-        };
-        if public_url.scheme() != "https" {
-            warn!(
-                name = %bot_username,
-                public_url = %public_url_raw,
-                "Telegram webhook public URL must use HTTPS; using long polling"
-            );
-            return None;
-        }
-
-        let listen_addr_raw = self
-            .webhook
-            .listen_addr
-            .as_ref()
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty());
-        let Some(listen_addr_raw) = listen_addr_raw else {
-            warn!(
-                name = %bot_username,
-                "Telegram webhook enabled but `listen_addr` is empty; using long polling"
-            );
-            return None;
-        };
-        let listen_addr = match listen_addr_raw.parse::<std::net::SocketAddr>() {
-            Ok(value) => value,
-            Err(err) => {
-                warn!(
-                    name = %bot_username,
-                    listen_addr = %listen_addr_raw,
-                    error = %err,
-                    "Invalid Telegram webhook listen address; using long polling"
-                );
-                return None;
-            }
-        };
-
-        // Teloxide sends the URL verbatim to Telegram's setWebhook, so we
-        // must include the path in the URL. The `opts.path()` call only sets
-        // the local axum route, NOT the URL registered with Telegram.
-        let path = self
-            .webhook
-            .path
-            .as_ref()
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-            .map(|v| v.to_string());
-        let webhook_url = if let Some(ref path) = path {
-            let current_path = public_url.path().trim_end_matches('/');
-            // Only append if the URL doesn't already include the path
-            if current_path.is_empty() || current_path == "/" {
-                let mut url = public_url.clone();
-                url.set_path(path);
-                url
-            } else {
-                public_url
-            }
-        } else {
-            public_url
-        };
-        let mut opts = webhooks::Options::new(listen_addr, webhook_url);
-        if let Some(path) = path {
-            opts = opts.path(path);
-        }
-        if let Some(max_connections) = self.webhook.max_connections {
-            if (1..=100).contains(&max_connections) {
-                opts = opts.max_connections(max_connections);
-            } else {
-                warn!(
-                    name = %bot_username,
-                    max_connections,
-                    "Telegram webhook `max_connections` must be 1..=100; ignoring"
-                );
-            }
-        }
-        if self.webhook.drop_pending_updates {
-            opts = opts.drop_pending_updates();
-        }
-        Some((listen_addr, opts))
-    }
-
-    /// How long a resolved approval card stays visible before it is auto-deleted,
-    /// so an answered prompt doesn't linger and get mistaken for one that still
-    /// needs action. On by default (10s); override with the
-    /// `AIDAEMON_APPROVAL_DISMISS_SECS` env var, or set it to `0` to keep
-    /// resolved cards in the chat.
-    fn resolved_approval_dismiss_delay() -> Option<Duration> {
-        let secs = std::env::var("AIDAEMON_APPROVAL_DISMISS_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(10);
-        (secs > 0).then(|| Duration::from_secs(secs))
-    }
-
-    /// Handle callback query from inline keyboard buttons.
-    async fn handle_callback(&self, q: CallbackQuery, bot: Bot) {
-        // Authorization check: only allowed users can approve/deny commands.
-        // Fail-closed: deny if no users configured or user not in list.
-        let user_id = q.from.id.0;
-        let is_authorized = {
-            let allowed = self
-                .allowed_user_ids
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            !allowed.is_empty() && allowed.contains(&user_id)
-        };
-        if !is_authorized {
-            warn!(user_id, "Unauthorized callback from user");
-            let _ = bot
-                .answer_callback_query(q.id)
-                .text(format!("Unauthorized. Your ID: {}", user_id))
-                .await;
-            return;
-        }
-
-        let data = match q.data {
-            Some(ref d) => d.clone(),
-            None => return,
-        };
-
-        if data == "agent:share" || data.starts_with("agent:share:") {
-            let explicit_relay_session_id = data
-                .strip_prefix("agent:share:")
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(|v| v.to_string());
-            let _ = bot
-                .answer_callback_query(q.id.clone())
-                .text("Generating share code...")
-                .await;
-            if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(m)) = q.message {
-                self.send_agent_share_code(&bot, m.chat.id, user_id, explicit_relay_session_id)
-                    .await;
-            } else {
-                let _ = bot
-                    .answer_callback_query(q.id)
-                    .text("Open the chat and run /agent share.")
-                    .show_alert(true)
-                    .await;
-            }
-            return;
-        }
-
-        // Parse callback data: "approve:{once|session|always|deny}:{id}",
-        // "goal:{confirm|cancel}:{id}", or the structurally distinct
-        // "autopilot:{confirm|edit|cancel}:{id}".
-        let parts: Vec<&str> = data.splitn(3, ':').collect();
-        if parts.len() != 3
-            || !matches!(parts[0], "approve" | "goal" | "autopilot")
-            || parts[2].is_empty()
-        {
-            let _ = bot
-                .answer_callback_query(q.id)
-                .text("This action is no longer valid. Please run the command again.")
-                .show_alert(true)
-                .await;
-            return;
-        }
-
-        let prefix = parts[0];
-        let action = parts[1];
-        let approval_id = parts[2];
-
-        let (response, label) = if matches!(prefix, "goal" | "autopilot") {
-            match action {
-                "confirm" => (
-                    ApprovalResponse::AllowOnce,
-                    if prefix == "autopilot" {
-                        "Autopilot enabled ✅"
-                    } else {
-                        "Goal approved ✅"
-                    }
-                    .to_string(),
-                ),
-                "cancel" | "edit" => (
-                    ApprovalResponse::Deny,
-                    if prefix == "autopilot" && action == "edit" {
-                        "Edit Autopilot permissions"
-                    } else if prefix == "autopilot" {
-                        "Autopilot cancelled"
-                    } else {
-                        "Goal cancelled"
-                    }
-                    .to_string(),
-                ),
-                _ => {
-                    let _ = bot
-                        .answer_callback_query(q.id)
-                        .text("This confirmation action is no longer valid.")
-                        .show_alert(true)
-                        .await;
-                    return;
-                }
-            }
-        } else {
-            let response = match action {
-                "once" => ApprovalResponse::AllowOnce,
-                "session" => ApprovalResponse::AllowSession,
-                "always" => ApprovalResponse::AllowAlways,
-                "deny" => ApprovalResponse::Deny,
-                _ => {
-                    let _ = bot
-                        .answer_callback_query(q.id)
-                        .text("This approval action is no longer valid.")
-                        .show_alert(true)
-                        .await;
-                    return;
-                }
-            };
-            let (icon, label) = approval_render::response_status(&response);
-            (response, format!("{icon} {label}"))
-        };
-
-        // Send the response (check pending before updating the message)
-        let mut pending = self.pending_approvals.lock().await;
-        let response_tx = pending.remove(approval_id);
-        drop(pending);
-
-        let Some(response_tx) = response_tx else {
-            warn!(approval_id, "Stale approval callback (no pending request)");
-            let _ = bot
-                .answer_callback_query(q.id.clone())
-                .text("Approval expired. Please run the command again.")
-                .show_alert(true)
-                .await;
-            if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(m)) = q.message {
-                let original = m.text().unwrap_or("");
-                if !original.contains("Approval expired") {
-                    let _ = bot
-                        .edit_message_text(
-                            m.chat.id,
-                            m.id,
-                            format!(
-                                "{}\n\n⚠️ Approval expired or daemon restarted. Run the command again to create a new approval prompt.",
-                                original
-                            ),
-                        )
-                        .await;
-                }
-            }
-            return;
-        };
-
-        // Acknowledge the callback and update the message
-        let _ = bot.answer_callback_query(q.id).text(&label).await;
-
-        if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(m)) = q.message {
-            let original = m.text().unwrap_or("");
-            let updated = if matches!(prefix, "goal" | "autopilot") {
-                let status = if prefix == "autopilot" && action == "edit" {
-                    "✏️ Autopilot not activated\nSend the accounts, actions, limits, or guardrails you want changed."
-                } else if matches!(response, ApprovalResponse::Deny) {
-                    if prefix == "autopilot" {
-                        "❌ Autopilot cancelled\nNo new autonomy was activated."
-                    } else {
-                        "❌ Goal cancelled\nNothing was activated."
-                    }
-                } else {
-                    if prefix == "autopilot" {
-                        "✅ Autopilot enabled\nActivation is continuing now."
-                    } else {
-                        "✅ Goal approved\nActivation is continuing now."
-                    }
-                };
-                format!("{}\n\n{status}", original.trim_end())
-            } else {
-                approval_render::finalize_approval_message(original, &response)
-            };
-            let _ = bot.edit_message_text(m.chat.id, m.id, updated).await;
-
-            // Auto-dismiss the resolved card after a short delay so an answered
-            // approval doesn't linger and get mistaken for one still awaiting a
-            // response. This runs only after the user has responded, so a
-            // still-pending prompt is never removed out from under them.
-            if !matches!(prefix, "goal" | "autopilot") {
-                if let Some(delay) = Self::resolved_approval_dismiss_delay() {
-                    let bot = bot.clone();
-                    let chat_id = m.chat.id;
-                    let msg_id = m.id;
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let _ = bot.delete_message(chat_id, msg_id).await;
-                    });
-                }
-            }
-        }
-
-        let _ = response_tx.send(response);
-    }
-
-    async fn handle_command(&self, text: &str, msg: &teloxide::types::Message, bot: &Bot) {
-        let parts: Vec<&str> = text.splitn(2, ' ').collect();
-        let cmd_raw = parts[0];
-        let cmd = cmd_raw.split('@').next().unwrap_or(cmd_raw);
-        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
-
-        if cmd == "/terminal" || cmd == "/agent" {
-            self.handle_terminal_command(arg, msg, bot, cmd).await;
-            return;
-        }
-
-        // Try the shared command dispatcher first.
-        let ctx = crate::channels::commands::CommandContext {
-            agent: Arc::clone(&self.agent),
-            state: Arc::clone(&self.state),
-            task_registry: Arc::clone(&self.task_registry),
-            config_path: self.config_path.clone(),
-        };
-        let session_id = self.session_id(msg.chat.id.0).await;
-        let user_id = msg.from.as_ref().map(|user| user.id.0).unwrap_or(0);
-        let user_role = determine_role(&self.owner_user_ids, user_id);
-        if let Some(reply) = ctx.dispatch(cmd, arg, &session_id, user_role).await {
-            for chunk in split_message(&reply, 4096) {
-                let _ = bot.send_message(msg.chat.id, chunk).await;
-            }
-            return;
-        }
-
-        // Channel-specific commands.
-        let reply = match cmd {
-            "/restart" => {
-                let _ = bot.send_message(msg.chat.id, "Restarting...").await;
-                info!("Restart requested via Telegram");
-                restart_process();
-                // If exec fails, we're still alive
-                "Restart failed. You may need to restart manually.".to_string()
-            }
-            "/connect" => {
-                self.handle_connect_command(arg, msg.from.as_ref().map(|u| u.id.0).unwrap_or(0))
-                    .await
-            }
-            "/setup" => {
-                self.handle_setup_command(
-                    arg,
-                    msg.from.as_ref().map(|u| u.id.0).unwrap_or(0),
-                    msg.chat.id.0,
-                )
-                .await
-            }
-            "/bots" => self.handle_bots_command().await,
-            "/help" | "/start" => build_help_text(&telegram_commands(), "/"),
-            _ => format!(
-                "Unknown command: {}\nType /help for available commands.",
-                cmd_raw
-            ),
-        };
-
-        for chunk in split_message(&reply, 4096) {
-            let _ = bot.send_message(msg.chat.id, chunk).await;
-        }
-    }
-
-    fn terminal_help_text() -> String {
-        "Terminal mode (owner only)\n\n\
-         Usage:\n\
-         /terminal\n\
-         /terminal <codex|claude|gemini|opencode> [working_dir]\n\
-         /terminal <codex|claude|gemini|opencode> [working_dir] [agent_flags...]\n\
-         /terminal <codex|claude|gemini|opencode> [working_dir] -- [agent_flags...]\n\
-         /terminal start <agent> [working_dir]\n\
-         /terminal start <agent> [working_dir] [agent_flags...]\n\
-         /terminal start <agent> [working_dir] -- [agent_flags...]\n\
-         /terminal lite [start] [working_dir]\n\
-         /terminal lite status\n\
-         /terminal lite stop\n\
-         /terminal open\n\
-         /terminal help\n\n\
-         Examples:\n\
-         /terminal codex\n\
-         /terminal codex --chrome\n\
-         /terminal codex ~/projects/aidaemon --chrome --dangerously-skip-permissions\n\
-         /terminal codex ~/projects/aidaemon -- --chrome --dangerously-skip-permissions\n\
-         /terminal opencode ~/projects/aidaemon\n\
-         /terminal lite ~/projects/aidaemon\n\
-         /terminal claude ~/projects/aidaemon\n\
-         /terminal codex \"~/projects/my app\""
-            .to_string()
-    }
-
-    fn agent_help_text() -> String {
-        "Agent session mode (owner only)\n\n\
-         Usage:\n\
-         /agent\n\
-         /agent <codex|claude|gemini|opencode> [working_dir]\n\
-         /agent <codex|claude|gemini|opencode> [working_dir] [agent_flags...]\n\
-         /agent <codex|claude|gemini|opencode> [working_dir] -- [agent_flags...]\n\
-         /agent start <agent> [working_dir]\n\
-         /agent start <agent> [working_dir] [agent_flags...]\n\
-         /agent flags <agent> [refresh]\n\
-         /agent defaults\n\
-         /agent defaults set <agent> [agent_flags...]\n\
-         /agent defaults clear [agent|all]\n\
-         /agent share [relay_session_id]\n\
-         /agent resume <code>\n\
-         /agent open\n\
-         /agent help\n\n\
-         Examples:\n\
-         /agent codex\n\
-         /agent codex --chrome\n\
-         /agent codex ~/projects/aidaemon --chrome --dangerously-skip-permissions\n\
-         /agent claude ~/projects/aidaemon\n\
-         /agent opencode ~/projects/aidaemon\n\
-         /agent flags codex\n\
-         /agent flags codex refresh\n\
-         /agent share\n\
-         /agent resume ABCDEFGHJKLM\n\
-         /agent defaults set codex --chrome --dangerously-skip-permissions\n\n\
-         Tip: add `--no-default-flags` to bypass saved flags once.\n\n\
-         For chat-based shell mode, use:\n\
-         /terminal lite [working_dir]"
-            .to_string()
-    }
-
-    async fn handle_agent_flags_command(
-        &self,
-        args: Vec<String>,
-        msg: &teloxide::types::Message,
-        bot: &Bot,
-        user_id: u64,
-    ) {
-        if args.is_empty() {
-            let _ = bot
-                .send_message(
-                    msg.chat.id,
-                    "Usage: /agent flags <agent> [refresh]\nExamples:\n/agent flags codex\n/agent flags codex refresh\n\nSupported agents: codex, claude, gemini, opencode",
-                )
-                .await;
-            return;
-        }
-
-        let (agent_raw, refresh) = if args
-            .first()
-            .map(|v| v.eq_ignore_ascii_case("refresh"))
-            .unwrap_or(false)
-        {
-            (args.get(1).cloned().unwrap_or_default(), true)
-        } else {
-            let refresh = args
-                .get(1)
-                .map(|v| v.eq_ignore_ascii_case("refresh"))
-                .unwrap_or(false);
-            (args[0].clone(), refresh)
-        };
-
-        let Some(agent) = cli_agent_flags::normalize_terminal_agent_name(&agent_raw) else {
-            let _ = bot
-                .send_message(
-                    msg.chat.id,
-                    "Unknown agent. Use codex/claude/gemini/opencode.",
-                )
-                .await;
-            return;
-        };
-
-        let namespace = self.session_namespace().await;
-        if !refresh {
-            if let Some(cached) =
-                cli_agent_flags::load_agent_flags_cache(&*self.state, &namespace, user_id, &agent)
-                    .await
-            {
-                let age = chrono::Utc::now().timestamp() - cached.updated_at_unix;
-                if (0..=AGENT_FLAGS_CACHE_TTL_SECS).contains(&age) {
-                    let pages = cli_agent_flags::format_agent_flag_docs(&agent, &cached.docs, true);
-                    for page in pages {
-                        send_markdown_chunks_or_fallback(bot, msg.chat.id, &page).await;
-                    }
-                    return;
-                }
-            }
-        }
-
-        let _ = bot
-            .send_message(msg.chat.id, format!("Discovering flags for {}...", agent))
-            .await;
-
-        match cli_agent_flags::discover_agent_flags(&agent).await {
-            Ok(docs) => {
-                let _ = cli_agent_flags::save_agent_flags_cache(
-                    &*self.state,
-                    &namespace,
-                    user_id,
-                    &agent,
-                    &docs,
-                )
-                .await;
-                let pages = cli_agent_flags::format_agent_flag_docs(&agent, &docs, false);
-                for page in pages {
-                    send_markdown_chunks_or_fallback(bot, msg.chat.id, &page).await;
-                }
-            }
-            Err(err) => {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!("Failed to discover flags for {}: {}", agent, err),
-                    )
-                    .await;
-            }
-        }
-    }
-
-    async fn handle_agent_defaults_command(
-        &self,
-        mut args: Vec<String>,
-        msg: &teloxide::types::Message,
-        bot: &Bot,
-        user_id: u64,
-    ) {
-        let subcommand = args
-            .first()
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_else(|| "show".to_string());
-
-        if !args.is_empty() {
-            args.remove(0);
-        }
-
-        if subcommand == "set" {
-            let Some(agent_raw) = args.first() else {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        "Usage: /agent defaults set <agent> [agent_flags...]",
-                    )
-                    .await;
-                return;
-            };
-            let Some(agent) = cli_agent_flags::normalize_terminal_agent_name(agent_raw) else {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        "Unknown agent. Use codex/claude/gemini/opencode.",
-                    )
-                    .await;
-                return;
-            };
-            let cleaned = cli_agent_flags::normalize_terminal_agent_args(
-                args.into_iter().skip(1).collect::<Vec<_>>(),
-            );
-            let (cleaned, rewrote_permission_flag) =
-                crate::normalize_terminal_agent_permission_aliases(Some(agent.as_str()), cleaned);
-            if cleaned.is_empty() {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        "No flags provided. Example: /agent defaults set codex --chrome",
-                    )
-                    .await;
-                return;
-            }
-            let namespace = self.session_namespace().await;
-            let mut defaults = cli_agent_flags::load_terminal_agent_defaults(
-                &*self.state,
-                &namespace,
-                msg.chat.id.0,
-                user_id,
-            )
-            .await;
-            defaults.insert(agent.clone(), cleaned.clone());
-            match cli_agent_flags::save_terminal_agent_defaults(
-                &*self.state,
-                &namespace,
-                msg.chat.id.0,
-                user_id,
-                &defaults,
-            )
-            .await
-            {
-                Ok(_) => {
-                    let saved_message = if rewrote_permission_flag {
-                        format!(
-                            "Saved default flags for {}:\n`{}`\n\nNormalized `--allow-dangerously-skip-permissions` to `--dangerously-skip-permissions` for Claude.",
-                            agent,
-                            cleaned.join(" ")
-                        )
-                    } else {
-                        format!(
-                            "Saved default flags for {}:\n`{}`",
-                            agent,
-                            cleaned.join(" ")
-                        )
-                    };
-                    let _ = bot.send_message(msg.chat.id, saved_message).await;
-                }
-                Err(err) => {
-                    warn!(error = %err, "Failed to save /agent defaults");
-                    let _ = bot
-                        .send_message(msg.chat.id, "Failed to save defaults.")
-                        .await;
-                }
-            }
-            return;
-        }
-
-        if subcommand == "clear" {
-            let namespace = self.session_namespace().await;
-            let mut defaults = cli_agent_flags::load_terminal_agent_defaults(
-                &*self.state,
-                &namespace,
-                msg.chat.id.0,
-                user_id,
-            )
-            .await;
-            if defaults.is_empty() {
-                let _ = bot.send_message(msg.chat.id, "No saved defaults.").await;
-                return;
-            }
-
-            let target = args
-                .first()
-                .map(|s| s.to_ascii_lowercase())
-                .unwrap_or_else(|| "all".to_string());
-            if target == "all" {
-                defaults.clear();
-                if cli_agent_flags::save_terminal_agent_defaults(
-                    &*self.state,
-                    &namespace,
-                    msg.chat.id.0,
-                    user_id,
-                    &defaults,
-                )
-                .await
-                .is_ok()
-                {
-                    let _ = bot
-                        .send_message(msg.chat.id, "Cleared all agent defaults.")
-                        .await;
-                } else {
-                    let _ = bot
-                        .send_message(msg.chat.id, "Failed to clear defaults.")
-                        .await;
-                }
-                return;
-            }
-
-            let Some(agent) = cli_agent_flags::normalize_terminal_agent_name(&target) else {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        "Usage: /agent defaults clear [agent|all]\nAgents: codex/claude/gemini/opencode",
-                    )
-                    .await;
-                return;
-            };
-            if defaults.remove(&agent).is_none() {
-                let _ = bot
-                    .send_message(msg.chat.id, format!("No saved defaults for {}.", agent))
-                    .await;
-                return;
-            }
-            if cli_agent_flags::save_terminal_agent_defaults(
-                &*self.state,
-                &namespace,
-                msg.chat.id.0,
-                user_id,
-                &defaults,
-            )
-            .await
-            .is_ok()
-            {
-                let _ = bot
-                    .send_message(msg.chat.id, format!("Cleared defaults for {}.", agent))
-                    .await;
-            } else {
-                let _ = bot
-                    .send_message(msg.chat.id, "Failed to clear defaults.")
-                    .await;
-            }
-            return;
-        }
-
-        let namespace = self.session_namespace().await;
-        let defaults = cli_agent_flags::load_terminal_agent_defaults(
-            &*self.state,
-            &namespace,
-            msg.chat.id.0,
-            user_id,
-        )
-        .await;
-        if defaults.is_empty() {
-            let _ = bot
-                .send_message(
-                    msg.chat.id,
-                    "No saved agent defaults yet.\nUse `/agent defaults set <agent> [flags...]`.",
-                )
-                .await;
-            return;
-        }
-        let mut lines = vec!["Saved agent defaults for this chat:".to_string()];
-        for agent in SUPPORTED_TERMINAL_AGENTS {
-            if let Some(args) = defaults.get(*agent) {
-                lines.push(format!("- {}: `{}`", agent, args.join(" ")));
-            }
-        }
-        lines.push("Clear with `/agent defaults clear [agent|all]`.".to_string());
-        let _ = bot.send_message(msg.chat.id, lines.join("\n")).await;
-    }
-
-    async fn handle_terminal_lite_command(
-        &self,
-        args: Vec<String>,
-        msg: &teloxide::types::Message,
-        bot: &Bot,
-        user_id: u64,
-    ) {
-        let reply = self
-            .terminal_lite
-            .start_session(msg.chat.id.0, user_id, args)
-            .await;
-        let _ = bot.send_message(msg.chat.id, reply).await;
-    }
-
-    async fn handle_terminal_lite_input(
-        &self,
-        chat_id: i64,
-        user_id: u64,
-        user_role: UserRole,
-        text: &str,
-    ) -> Option<String> {
-        self.terminal_lite
-            .handle_input(chat_id, user_id, user_role, text)
-            .await
-    }
-
-    async fn handle_terminal_command(
-        &self,
-        arg: &str,
-        msg: &teloxide::types::Message,
-        bot: &Bot,
-        invoked_cmd: &str,
-    ) {
-        let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
-        if determine_role(&self.owner_user_ids, user_id) != UserRole::Owner {
-            let _ = bot
-                .send_message(
-                    msg.chat.id,
-                    format!("Only the owner can use {} in this chat.", invoked_cmd),
-                )
-                .await;
-            return;
-        }
-
-        let trimmed = arg.trim();
-        let mut tokens = if trimmed.is_empty() {
-            Vec::new()
-        } else {
-            shell_words::split(trimmed).unwrap_or_else(|_| {
-                trimmed
-                    .split_whitespace()
-                    .map(std::string::ToString::to_string)
-                    .collect()
-            })
-        };
-
-        if invoked_cmd == "/agent"
-            && matches!(
-                tokens.first().map(|s| s.to_ascii_lowercase()).as_deref(),
-                Some("defaults")
-            )
-        {
-            tokens.remove(0);
-            self.handle_agent_defaults_command(tokens, msg, bot, user_id)
-                .await;
-            return;
-        }
-
-        if invoked_cmd == "/agent"
-            && matches!(
-                tokens.first().map(|s| s.to_ascii_lowercase()).as_deref(),
-                Some("flags")
-            )
-        {
-            tokens.remove(0);
-            self.handle_agent_flags_command(tokens, msg, bot, user_id)
-                .await;
-            return;
-        }
-
-        if matches!(
-            tokens.first().map(|s| s.to_ascii_lowercase()).as_deref(),
-            Some("lite")
-        ) {
-            if invoked_cmd == "/agent" {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        "Lite mode stays under `/terminal lite`.\nUse `/agent ...` for full Codex/Claude/Gemini sessions.",
-                    )
-                    .await;
-                return;
-            }
-            tokens.remove(0);
-            self.handle_terminal_lite_command(tokens, msg, bot, user_id)
-                .await;
-            return;
-        }
-
-        if let Some(first) = tokens.first() {
-            let first = first.to_ascii_lowercase();
-            if first == "help" {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        if invoked_cmd == "/agent" {
-                            Self::agent_help_text()
-                        } else {
-                            Self::terminal_help_text()
-                        },
-                    )
-                    .await;
-                return;
-            }
-            if matches!(first.as_str(), "status" | "interrupt" | "stop") {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!(
-                            "Use the Mini App toolbar for status/interrupt/stop in v1.\nRun {} open to reconnect.",
-                            invoked_cmd
-                        ),
-                    )
-                    .await;
-                return;
-            }
-        }
-
-        if invoked_cmd == "/agent"
-            && matches!(
-                tokens.first().map(|s| s.to_ascii_lowercase()).as_deref(),
-                Some("resume")
-            )
-        {
-            tokens.remove(0);
-            let code = tokens
-                .first()
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-                .map(|v| v.to_string());
-            self.send_agent_resume_prompt(bot, msg.chat.id, user_id, code)
-                .await;
-            return;
-        }
-
-        if invoked_cmd == "/agent"
-            && matches!(
-                tokens.first().map(|s| s.to_ascii_lowercase()).as_deref(),
-                Some("share")
-            )
-        {
-            tokens.remove(0);
-            let relay_session_id = tokens
-                .first()
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-                .map(|v| v.to_string());
-            self.send_agent_share_code(bot, msg.chat.id, user_id, relay_session_id)
-                .await;
-            return;
-        }
-
-        let mut start_requested = false;
-        if let Some(first) = tokens.first() {
-            let first = first.to_ascii_lowercase();
-            if first == "open" || first == "start" {
-                start_requested = first == "start";
-                tokens.remove(0);
-            }
-        }
-
-        let mut agent: Option<String> = None;
-        let mut cwd_parts: Vec<String> = Vec::new();
-        let mut agent_args: Vec<String> = Vec::new();
-        let mut rewrote_permission_flag = false;
-        let mut had_explicit_arg_delimiter = false;
-        let mut used_saved_args = false;
-        let mut saved_args_updated = false;
-
-        // Backward-compat: `/terminal ... -- [flags...]`
-        if let Some(idx) = tokens.iter().position(|t| t == "--") {
-            had_explicit_arg_delimiter = true;
-            if idx + 1 < tokens.len() {
-                agent_args.extend(
-                    tokens[(idx + 1)..]
-                        .iter()
-                        .map(|value| value.trim().to_string())
-                        .filter(|value| !value.is_empty() && !value.contains('\0')),
-                );
-            }
-            tokens.truncate(idx);
-        }
-
-        if let Some(first) = tokens.first() {
-            let candidate = first.to_ascii_lowercase();
-            if SUPPORTED_TERMINAL_AGENTS.contains(&candidate.as_str()) {
-                agent = Some(candidate);
-                tokens.remove(0);
-            } else if first.starts_with('/')
-                || first.starts_with('~')
-                || first.starts_with('.')
-                || first.contains('/')
-            {
-                agent = Some(DEFAULT_TERMINAL_AGENT.to_string());
-            } else if first.starts_with('-') {
-                // Flags-only launch defaults to codex.
-                agent = Some(DEFAULT_TERMINAL_AGENT.to_string());
-            } else {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!(
-                            "Unknown terminal agent: `{}`\n\n{}",
-                            first,
-                            if invoked_cmd == "/agent" {
-                                Self::agent_help_text()
-                            } else {
-                                Self::terminal_help_text()
-                            }
-                        ),
-                    )
-                    .await;
-                return;
-            }
-            if had_explicit_arg_delimiter {
-                for token in tokens {
-                    let trimmed = token.trim();
-                    if trimmed.is_empty() || trimmed.contains('\0') {
-                        continue;
-                    }
-                    cwd_parts.push(trimmed.to_string());
-                }
-            } else if let Some(flag_idx) = tokens.iter().position(|token| token.starts_with('-')) {
-                for token in &tokens[..flag_idx] {
-                    let trimmed = token.trim();
-                    if trimmed.is_empty() || trimmed.contains('\0') {
-                        continue;
-                    }
-                    cwd_parts.push(trimmed.to_string());
-                }
-                for token in &tokens[flag_idx..] {
-                    let trimmed = token.trim();
-                    if trimmed.is_empty() || trimmed.contains('\0') {
-                        continue;
-                    }
-                    agent_args.push(trimmed.to_string());
-                }
-            } else {
-                for token in tokens {
-                    let trimmed = token.trim();
-                    if trimmed.is_empty() || trimmed.contains('\0') {
-                        continue;
-                    }
-                    cwd_parts.push(trimmed.to_string());
-                }
-            }
-        } else if start_requested {
-            agent = Some(DEFAULT_TERMINAL_AGENT.to_string());
-        } else if !agent_args.is_empty() {
-            // Flags imply a terminal launch context; default agent to codex.
-            agent = Some(DEFAULT_TERMINAL_AGENT.to_string());
-        }
-        agent_args = cli_agent_flags::normalize_terminal_agent_args(agent_args);
-        let skip_saved_defaults = cli_agent_flags::strip_no_default_flag(&mut agent_args);
-        let (normalized_agent_args, rewrote) =
-            crate::normalize_terminal_agent_permission_aliases(agent.as_deref(), agent_args);
-        agent_args = normalized_agent_args;
-        rewrote_permission_flag |= rewrote;
-
-        let namespace = self.session_namespace().await;
-        if invoked_cmd == "/agent" && agent_args.is_empty() && !skip_saved_defaults {
-            if let Some(agent_name) = agent.as_deref() {
-                let defaults = cli_agent_flags::load_terminal_agent_defaults(
-                    &*self.state,
-                    &namespace,
-                    msg.chat.id.0,
-                    user_id,
-                )
-                .await;
-                if let Some(saved) = defaults.get(agent_name) {
-                    agent_args = cli_agent_flags::normalize_terminal_agent_args(saved.clone());
-                    let (normalized_agent_args, rewrote) =
-                        crate::normalize_terminal_agent_permission_aliases(
-                            agent.as_deref(),
-                            agent_args,
-                        );
-                    agent_args = normalized_agent_args;
-                    rewrote_permission_flag |= rewrote;
-                    used_saved_args = !agent_args.is_empty();
-                }
-            }
-        } else if invoked_cmd == "/agent" && !agent_args.is_empty() {
-            if let Some(agent_name) = agent.as_deref() {
-                let mut defaults = cli_agent_flags::load_terminal_agent_defaults(
-                    &*self.state,
-                    &namespace,
-                    msg.chat.id.0,
-                    user_id,
-                )
-                .await;
-                let changed = defaults.get(agent_name) != Some(&agent_args);
-                if changed {
-                    defaults.insert(agent_name.to_string(), agent_args.clone());
-                    if let Err(err) = cli_agent_flags::save_terminal_agent_defaults(
-                        &*self.state,
-                        &namespace,
-                        msg.chat.id.0,
-                        user_id,
-                        &defaults,
-                    )
-                    .await
-                    {
-                        warn!(error = %err, "Failed to persist /agent default flags");
-                    } else {
-                        saved_args_updated = true;
-                    }
-                }
-            }
-        }
-
-        let cwd = if cwd_parts.is_empty() {
-            None
-        } else {
-            Some(cwd_parts.join(" "))
-        };
-        let has_launch_intent = agent.is_some() || cwd.is_some() || !agent_args.is_empty();
-        #[cfg(not(feature = "terminal-bridge"))]
-        let _ = has_launch_intent;
-
-        let current_bot_label = self.cached_bot_label();
-        let mini_app_sync_warning = match self
-            .sync_terminal_tenant_bot_token(&self.bot_token, user_id, current_bot_label.as_deref())
-            .await
-        {
-            Ok(()) => None,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    user_id,
-                    invoked_cmd,
-                    "Failed to auto-sync Telegram bot token before opening Mini App"
-                );
-                Some(
-                    "Mini App auth sync did not complete. If Telegram shows an auth mismatch, retry once or save the token in the app."
-                        .to_string(),
-                )
-            }
-        };
-
-        #[cfg(feature = "terminal-bridge")]
-        let prestarted_relay_session_id = if invoked_cmd == "/agent" && has_launch_intent {
-            match crate::terminal_bridge::request_local_start_session(
-                agent.as_deref().unwrap_or(DEFAULT_TERMINAL_AGENT),
-                cwd.as_deref(),
-                &agent_args,
-            )
-            .await
-            {
-                Ok(session_id) => Some(session_id),
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        chat_id = msg.chat.id.0,
-                        invoked_cmd,
-                        "Failed to pre-start local bridge session for Telegram Mini App"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        #[cfg(not(feature = "terminal-bridge"))]
-        let prestarted_relay_session_id: Option<String> = None;
-
-        let mut web_app_url = match reqwest::Url::parse(self.terminal_web_app_url.trim()) {
-            Ok(url) => url,
-            Err(err) => {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!(
-                            "Terminal web app URL is invalid in config: {}\nCurrent value: {}",
-                            err, self.terminal_web_app_url
-                        ),
-                    )
-                    .await;
-                return;
-            }
-        };
-
-        if web_app_url.scheme() != "https" {
-            let _ = bot
-                .send_message(
-                    msg.chat.id,
-                    format!(
-                        "Terminal web app URL must use HTTPS. Current value: {}",
-                        self.terminal_web_app_url
-                    ),
-                )
-                .await;
-            return;
-        }
-
-        let telegram_session_id = self.session_id(msg.chat.id.0).await;
-        {
-            let mut query = web_app_url.query_pairs_mut();
-            query.append_pair("telegram_session_id", &telegram_session_id);
-            if let Some(agent) = agent.as_deref() {
-                query.append_pair("agent", agent);
-            }
-            if let Some(cwd) = cwd.as_deref() {
-                if !cwd.trim().is_empty() {
-                    query.append_pair("cwd", cwd);
-                }
-            }
-            if let Some(relay_session_id) = prestarted_relay_session_id.as_deref() {
-                query.append_pair("relay_session_id", relay_session_id);
-            }
-            for arg in &agent_args {
-                query.append_pair("arg", arg);
-            }
-            if start_requested {
-                query.append_pair("autostart", "1");
-            }
-        }
-
-        let mini_app_host = web_app_url.host_str().unwrap_or("unknown");
-        let mini_app_base = if let Some(port) = web_app_url.port() {
-            format!("{}://{}:{}", web_app_url.scheme(), mini_app_host, port)
-        } else {
-            format!("{}://{}", web_app_url.scheme(), mini_app_host)
-        };
-
-        let mut summary_lines = vec![
-            if invoked_cmd == "/agent" {
-                "🤖 <b>Agent Session</b>".to_string()
-            } else {
-                "🖥️ <b>Terminal Mode</b>".to_string()
-            },
-            String::new(),
-            format!(
-                "Mini App host: <code>{}</code>",
-                html_escape(&mini_app_base)
-            ),
-        ];
-        if let Some(agent) = agent.as_deref() {
-            summary_lines.push(format!("Agent: <code>{}</code>", html_escape(agent)));
-        } else {
-            summary_lines.push(format!(
-                "Agent: choose in app (default {})",
-                DEFAULT_TERMINAL_AGENT
-            ));
-        }
-        if let Some(cwd) = cwd.as_deref() {
-            let folder_name = Path::new(cwd)
-                .file_name()
-                .and_then(|value| value.to_str())
-                .filter(|value| !value.is_empty())
-                .unwrap_or("custom");
-            summary_lines.push(format!(
-                "Working dir: <code>{}</code> (full path sent only to Mini App)",
-                html_escape(folder_name)
-            ));
-        }
-        if !agent_args.is_empty() {
-            summary_lines.push(format!(
-                "Agent args: <code>{}</code> (values sent only to Mini App)",
-                agent_args.len()
-            ));
-            if used_saved_args {
-                summary_lines.push(
-                    "Using saved defaults for this chat. Add <code>--no-default-flags</code> to bypass once."
-                        .to_string(),
-                );
-            } else if saved_args_updated {
-                summary_lines.push("Saved as new defaults for this chat and agent.".to_string());
-            }
-            if rewrote_permission_flag {
-                summary_lines.push(
-                    "Normalized <code>--allow-dangerously-skip-permissions</code> to <code>--dangerously-skip-permissions</code> for Claude."
-                        .to_string(),
-                );
-            }
-        }
-        if prestarted_relay_session_id.is_some() {
-            summary_lines.push(
-                "Prepared a local relay session in advance so the Mini App can attach immediately."
-                    .to_string(),
-            );
-        }
-        summary_lines.push(String::new());
-        summary_lines.push(
-            if invoked_cmd == "/agent" {
-                "Tap 📱 Open in Mini App to launch the encrypted agent UI."
-            } else {
-                "Tap 🖥️ Open Terminal to launch the encrypted session UI."
-            }
-            .to_string(),
-        );
-        if let Some(warning) = mini_app_sync_warning.as_deref() {
-            summary_lines.push(warning.to_string());
-        }
-        if invoked_cmd == "/agent" {
-            summary_lines.push(
-                "💻 Continue on Computer sends a one-time resume code (expires in about 5 minutes)."
-                    .to_string(),
-            );
-        }
-
-        let open_button = InlineKeyboardButton::web_app(
-            if invoked_cmd == "/agent" {
-                "📱 Open in Mini App"
-            } else {
-                "🖥️ Open Terminal"
-            },
-            WebAppInfo {
-                url: web_app_url.clone(),
-            },
-        );
-        let keyboard = if invoked_cmd == "/agent" {
-            InlineKeyboardMarkup::new(vec![vec![
-                open_button,
-                InlineKeyboardButton::callback("💻 Continue on Computer", "agent:share"),
-            ]])
-        } else {
-            InlineKeyboardMarkup::new(vec![vec![open_button]])
-        };
-
-        let html_message = summary_lines.join("\n");
-        let plain_message = format!(
-            "{}\nMini App host: {}\n\nUse the Open button to launch. Continue on Computer generates a one-time code that expires in about 5 minutes.",
-            if invoked_cmd == "/agent" {
-                "Agent session"
-            } else {
-                "Terminal mode"
-            },
-            mini_app_base
-        );
-
-        if bot
-            .send_message(msg.chat.id, html_message)
-            .parse_mode(ParseMode::Html)
-            .reply_markup(keyboard.clone())
-            .await
-            .is_err()
-        {
-            let _ = bot
-                .send_message(msg.chat.id, plain_message)
-                .reply_markup(keyboard)
-                .await;
-        }
-
-        if invoked_cmd == "/agent" {
-            let reply_keyboard =
-                KeyboardMarkup::new(vec![vec![KeyboardButton::new("📱 Open in Mini App")
-                    .request(ButtonRequest::WebApp(WebAppInfo {
-                        url: web_app_url.clone(),
-                    }))]])
-                .resize_keyboard()
-                .one_time_keyboard();
-
-            let _ = bot
-                .send_message(
-                    msg.chat.id,
-                    "Tip: if in-app handoff buttons look disabled, open from this keyboard button. Telegram only enables Mini App send-back in keyboard launch mode.",
-                )
-                .reply_markup(reply_keyboard)
-                .await;
-        }
-    }
-
-    /// Handle an incoming file/photo/audio/video/voice message.
-    /// Downloads the file, saves to inbox, and returns attachment metadata.
-    async fn handle_file_message(
-        &self,
-        msg: &teloxide::types::Message,
-        bot: &Bot,
-    ) -> anyhow::Result<crate::traits::MessageAttachment> {
-        // Extract file_id, file_size, filename, and mime_type from the message
-        let (file_id, file_size, filename, mime_type) = if let Some(doc) = msg.document() {
-            (
-                doc.file.id.clone(),
-                doc.file.size as u64,
-                doc.file_name
-                    .clone()
-                    .unwrap_or_else(|| "document".to_string()),
-                doc.mime_type
-                    .as_ref()
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "application/octet-stream".to_string()),
-            )
-        } else if let Some(photos) = msg.photo() {
-            // Last photo in the array is the largest
-            let photo = photos
-                .last()
-                .ok_or_else(|| anyhow::anyhow!("Empty photo array"))?;
-            (
-                photo.file.id.clone(),
-                photo.file.size as u64,
-                "photo.jpg".to_string(),
-                "image/jpeg".to_string(),
-            )
-        } else if let Some(audio) = msg.audio() {
-            (
-                audio.file.id.clone(),
-                audio.file.size as u64,
-                audio
-                    .file_name
-                    .clone()
-                    .unwrap_or_else(|| "audio.mp3".to_string()),
-                audio
-                    .mime_type
-                    .as_ref()
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "audio/mpeg".to_string()),
-            )
-        } else if let Some(video) = msg.video() {
-            (
-                video.file.id.clone(),
-                video.file.size as u64,
-                video
-                    .file_name
-                    .clone()
-                    .unwrap_or_else(|| "video.mp4".to_string()),
-                video
-                    .mime_type
-                    .as_ref()
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "video/mp4".to_string()),
-            )
-        } else if let Some(voice) = msg.voice() {
-            (
-                voice.file.id.clone(),
-                voice.file.size as u64,
-                "voice.ogg".to_string(),
-                voice
-                    .mime_type
-                    .as_ref()
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "audio/ogg".to_string()),
-            )
-        } else {
-            anyhow::bail!("Unsupported message type. I can process text, files, photos, audio, video, and voice messages.");
-        };
-
-        // Check file size before downloading
-        let max_bytes = self.max_file_size_mb * 1_048_576;
-        if file_size > max_bytes {
-            anyhow::bail!(
-                "File too large ({:.1} MB). Maximum is {} MB.",
-                file_size as f64 / 1_048_576.0,
-                self.max_file_size_mb
-            );
-        }
-
-        // Get file info from Telegram
-        let file = bot.get_file(file_id).await?;
-        let file_path_on_server = file.path;
-
-        // Download via HTTP (simpler than teloxide's Download trait)
-        let download_url = format!(
-            "https://api.telegram.org/file/bot{}/{}",
-            self.bot_token, file_path_on_server
-        );
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .unwrap_or_default();
-        let response = client.get(&download_url).send().await?;
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "Failed to download file from Telegram: HTTP {}",
-                response.status()
-            );
-        }
-        let bytes = response.bytes().await?;
-
-        let (filename, mime_type) = if msg.photo().is_some() {
-            super::attachments::telegram_photo_filename_and_mime(&bytes)
-        } else {
-            (filename, mime_type)
-        };
-
-        // Sanitize filename: strip path separators, null bytes, limit length
-        let sanitized = sanitize_filename(&filename);
-        let uuid_prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let dest_name = format!("{}_{}", uuid_prefix, sanitized);
-        let dest_path = self.inbox_dir.join(&dest_name);
-
-        // Ensure inbox directory exists
-        std::fs::create_dir_all(&self.inbox_dir)?;
-
-        // Write file
-        std::fs::write(&dest_path, &bytes)?;
-
-        info!(
-            file = %dest_path.display(),
-            size = bytes.len(),
-            mime = %mime_type,
-            "Saved inbound file"
-        );
-
-        Ok(super::attachments::message_attachment(
-            dest_path,
-            sanitized,
-            mime_type,
-            bytes.len() as u64,
-        ))
     }
 
     /// Handle /setup command for owner-only operational setup workflows.
@@ -2235,7 +575,7 @@ impl TelegramChannel {
                         return format!(
                             "Could not request approval for cloudflared re-authentication: {}\nRun `cloudflared tunnel login` manually if needed.",
                             err
-                        )
+                        );
                     }
                 };
                 if matches!(login_approval, ApprovalResponse::Deny) {
@@ -2347,12 +687,11 @@ impl TelegramChannel {
                     }
                 }
                 let wrangler_present = crate::wizard::command_exists("wrangler").await;
-                if !wrangler_present {
-                    if let Some(spec) =
+                if !wrangler_present
+                    && let Some(spec) =
                         crate::wizard::installer_for_missing_tool("wrangler", has_brew, has_npm)
-                    {
-                        install_specs.push(("wrangler".to_string(), spec));
-                    }
+                {
+                    install_specs.push(("wrangler".to_string(), spec));
                 }
 
                 let mut install_report = String::new();
@@ -2388,7 +727,7 @@ impl TelegramChannel {
                             return format!(
                                 "{}\n\nCould not request approval for dependency installation: {}\nRun manual next steps above, then /restart to apply webhook listeners.",
                                 apply_text, err
-                            )
+                            );
                         }
                     };
 
@@ -2458,7 +797,7 @@ impl TelegramChannel {
                             return format!(
                                 "{}\n\nCould not request approval for cloudflared authentication: {}\nRun `cloudflared tunnel login` manually, then rerun /setup lowlatency apply <base-domain>.",
                                 apply_text, err
-                            )
+                            );
                         }
                     };
                     if matches!(login_approval, ApprovalResponse::Deny) {
@@ -2544,7 +883,7 @@ impl TelegramChannel {
                                     zone_name,
                                     mismatched_hosts.join(", "),
                                     err
-                                )
+                                );
                             }
                         };
                         if matches!(approval, ApprovalResponse::Deny) {
@@ -2749,7 +1088,7 @@ impl TelegramChannel {
                         return format!(
                             "{}\n\nCould not request approval for automatic Cloudflare setup: {}\nRun manual next steps above, then /restart to apply webhook listeners.",
                             apply_text, err
-                        )
+                        );
                     }
                 };
                 if matches!(approval, ApprovalResponse::Deny) {
@@ -2930,7 +1269,7 @@ impl TelegramChannel {
                     "failed to inspect cloudflared cert at `{}`: {}",
                     cert_path.display(),
                     err
-                ))
+                ));
             }
         };
         if !metadata.is_file() {
@@ -2975,7 +1314,7 @@ impl TelegramChannel {
                         "failed to inspect cloudflared backup path `{}`: {}",
                         backup_path.display(),
                         err
-                    ))
+                    ));
                 }
             }
 
@@ -2988,7 +1327,7 @@ impl TelegramChannel {
                         cert_path.display(),
                         backup_path.display(),
                         err
-                    ))
+                    ));
                 }
             }
         }
@@ -3401,7 +1740,8 @@ impl TelegramChannel {
         );
 
         let mini_app_sync_warning = match self
-            .sync_terminal_tenant_bot_token(token, user_id, Some(bot_username.as_str()))
+            .terminal
+            .sync_tenant_bot_token(token, user_id, Some(bot_username.as_str()))
             .await
         {
             Ok(()) => None,
@@ -3420,46 +1760,46 @@ impl TelegramChannel {
         };
 
         // Try to spawn the bot immediately if we have a hub reference
-        let hub_ref = self.channel_hub.read().ok().and_then(|g| g.clone());
-        if let Some(weak_hub) = hub_ref {
-            if let Some(hub) = weak_hub.upgrade() {
-                // Create the new channel with same config as this one
-                let new_channel = Arc::new(TelegramChannel::new(
-                    token,
-                    self.allowed_user_ids
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone(),
-                    TelegramWebhookConfig::default(),
-                    self.owner_user_ids.clone(),
-                    self.runtime_deps(),
-                    self.terminal_web_app_url.clone(),
-                    self.terminal_lite.allowed_prefixes(),
-                ));
+        let hub_ref = self.channel_hub_weak();
+        if let Some(weak_hub) = hub_ref
+            && let Some(hub) = weak_hub.upgrade()
+        {
+            // Create the new channel with same config as this one
+            let new_channel = Arc::new(new_telegram_bot(
+                token,
+                self.allowed_user_ids
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+                TelegramWebhookConfig::default(),
+                self.owner_user_ids.clone(),
+                self.runtime_deps(),
+                self.terminal.web_app_url().to_string(),
+                self.terminal.lite_allowed_prefixes(),
+            ));
 
-                // Give the new channel a reference to the hub too
-                new_channel.set_channel_hub(weak_hub);
+            // Give the new channel a reference to the hub too
+            new_channel.set_channel_hub(weak_hub);
 
-                // Register with the hub
-                let channel_name = hub
-                    .register_channel(new_channel.clone() as Arc<dyn Channel>)
-                    .await;
-                info!(channel = %channel_name, "Registered new Telegram bot with hub");
+            // Register with the hub
+            let channel_name = hub
+                .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
+                .await;
+            info!(channel = %channel_name, "Registered new Telegram bot with hub");
 
-                // Spawn the bot in the background using helper to avoid type cycles
-                spawn_telegram_channel(new_channel);
+            // Spawn the bot in the background using helper to avoid type cycles
+            spawn_telegram_channel(new_channel);
 
-                return format!(
-                    "✓ Bot @{} connected and started!\n\n\
+            return format!(
+                "✓ Bot @{} connected and started!\n\n\
                     The bot is now active and ready to receive messages.\n\
                     Use /bots to see all connected bots.{}",
-                    bot_username,
-                    mini_app_sync_warning
-                        .as_deref()
-                        .map(|value| format!("\n\n{}", value))
-                        .unwrap_or_default()
-                );
-            }
+                bot_username,
+                mini_app_sync_warning
+                    .as_deref()
+                    .map(|value| format!("\n\n{}", value))
+                    .unwrap_or_default()
+            );
         }
 
         // Fallback: hub not available, require restart
@@ -3523,38 +1863,38 @@ impl TelegramChannel {
         );
 
         // Try to spawn the bot immediately if we have a hub reference
-        let hub_ref = self.channel_hub.read().ok().and_then(|g| g.clone());
-        if let Some(weak_hub) = hub_ref {
-            if let Some(hub) = weak_hub.upgrade() {
-                // Create the new Discord channel with empty allowed_user_ids —
-                // the bot will auto-claim the first DM user.
-                let new_channel = Arc::new(DiscordChannel::new(
-                    token,
-                    vec![], // Empty: auto-claim on first DM
-                    vec![], // Owner set on auto-claim
-                    None,   // No guild_id for dynamic bots
-                    self.runtime_deps(),
-                ));
+        let hub_ref = self.channel_hub_weak();
+        if let Some(weak_hub) = hub_ref
+            && let Some(hub) = weak_hub.upgrade()
+        {
+            // Create the new Discord channel with empty allowed_user_ids —
+            // the bot will auto-claim the first DM user.
+            let new_channel = Arc::new(super::discord::new_discord_bot(
+                token,
+                vec![], // Empty: auto-claim on first DM
+                vec![], // Owner set on auto-claim
+                None,   // No guild_id for dynamic bots
+                self.runtime_deps(),
+            ));
 
-                // Give the new channel a reference to the hub
-                new_channel.set_channel_hub(weak_hub);
+            // Give the new channel a reference to the hub
+            new_channel.set_channel_hub(weak_hub);
 
-                // Register with the hub
-                let channel_name = hub
-                    .register_channel(new_channel.clone() as Arc<dyn Channel>)
-                    .await;
-                info!(channel = %channel_name, "Registered new Discord bot with hub");
+            // Register with the hub
+            let channel_name = hub
+                .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
+                .await;
+            info!(channel = %channel_name, "Registered new Discord bot with hub");
 
-                // Spawn the bot in the background
-                spawn_discord_channel(new_channel);
+            // Spawn the bot in the background
+            spawn_discord_channel(new_channel);
 
-                return format!(
-                    "✓ Discord bot {} connected and started!\n\n\
+            return format!(
+                "✓ Discord bot {} connected and started!\n\n\
                     Send a DM to the bot on Discord to claim it as yours.\n\
                     Use /bots to see all connected bots.",
-                    bot_name
-                );
-            }
+                bot_name
+            );
         }
 
         // Fallback: hub not available, require restart
@@ -3628,39 +1968,39 @@ impl TelegramChannel {
         );
 
         // Try to spawn the bot immediately if we have a hub reference
-        let hub_ref = self.channel_hub.read().ok().and_then(|g| g.clone());
-        if let Some(weak_hub) = hub_ref {
-            if let Some(hub) = weak_hub.upgrade() {
-                // Create the new Slack channel with same config as this Telegram channel
-                let new_channel = Arc::new(SlackChannel::new(
-                    app_token,
-                    bot_token,
-                    allowed_user_ids_str, // Slack uses String user IDs
-                    Vec::new(),           // Empty preserves legacy allowed-user owner behavior
-                    Vec::new(),           // Dynamic bot starts without delegated workspaces
-                    false,                // use_threads default
-                    self.runtime_deps(),
-                ));
+        let hub_ref = self.channel_hub_weak();
+        if let Some(weak_hub) = hub_ref
+            && let Some(hub) = weak_hub.upgrade()
+        {
+            // Create the new Slack channel with same config as this Telegram channel
+            let new_channel = Arc::new(super::slack::new_slack_bot(
+                app_token,
+                bot_token,
+                allowed_user_ids_str, // Slack uses String user IDs
+                Vec::new(),           // Empty preserves legacy allowed-user owner behavior
+                Vec::new(),           // Dynamic bot starts without delegated workspaces
+                false,                // use_threads default
+                self.runtime_deps(),
+            ));
 
-                // Give the new channel a reference to the hub
-                new_channel.set_channel_hub(weak_hub);
+            // Give the new channel a reference to the hub
+            new_channel.set_channel_hub(weak_hub);
 
-                // Register with the hub
-                let channel_name = hub
-                    .register_channel(new_channel.clone() as Arc<dyn Channel>)
-                    .await;
-                info!(channel = %channel_name, "Registered new Slack bot with hub");
+            // Register with the hub
+            let channel_name = hub
+                .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
+                .await;
+            info!(channel = %channel_name, "Registered new Slack bot with hub");
 
-                // Spawn the bot in the background
-                spawn_slack_channel(new_channel);
+            // Spawn the bot in the background
+            spawn_slack_channel(new_channel);
 
-                return format!(
-                    "✓ Slack bot {} ({}) connected and started!\n\n\
+            return format!(
+                "✓ Slack bot {} ({}) connected and started!\n\n\
                     The bot is now active and ready to receive messages.\n\
                     Use /bots to see all connected bots.",
-                    bot_name, team_name
-                );
-            }
+                bot_name, team_name
+            );
         }
 
         // Fallback: hub not available, require restart
@@ -3707,13 +2047,8 @@ impl TelegramChannel {
                     let bot_info = match bot.channel_type.as_str() {
                         "telegram" => {
                             // Try to get username for display
-                            let test_bot = Bot::new(&bot.bot_token);
-                            match test_bot.get_me().await {
-                                Ok(me) => {
-                                    let username = me
-                                        .username
-                                        .clone()
-                                        .unwrap_or_else(|| "unknown".to_string());
+                            match super::connect::validate_telegram_token(&bot.bot_token).await {
+                                Ok(username) => {
                                     format!("• telegram:@{} (id: {})", username, bot.id)
                                 }
                                 Err(_) => format!("• telegram:<invalid token> (id: {})", bot.id),
@@ -3745,2406 +2080,15 @@ impl TelegramChannel {
             )
         }
     }
-
-    fn parse_web_app_action(raw: &str) -> Option<TelegramWebAppAction> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let parsed: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-        Self::parse_web_app_action_value(&parsed)
-    }
-
-    fn parse_web_app_action_value(value: &serde_json::Value) -> Option<TelegramWebAppAction> {
-        match value {
-            serde_json::Value::String(inner) => {
-                let trimmed = inner.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                let nested: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-                Self::parse_web_app_action_value(&nested)
-            }
-            serde_json::Value::Array(items) => {
-                items.iter().find_map(Self::parse_web_app_action_value)
-            }
-            serde_json::Value::Object(map) => {
-                let action_type = map
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .unwrap_or("");
-
-                let relay_session_id = map
-                    .get("relay_session_id")
-                    .or_else(|| map.get("relaySessionId"))
-                    .or_else(|| map.get("relay_session"))
-                    .or_else(|| map.get("relaySession"))
-                    .or_else(|| map.get("session"))
-                    .or_else(|| map.get("session_id"))
-                    .or_else(|| map.get("sessionId"))
-                    .or_else(|| map.get("sid"))
-                    .and_then(|v| {
-                        if let Some(raw) = v.as_str() {
-                            let trimmed = raw.trim();
-                            if trimmed.is_empty() {
-                                None
-                            } else {
-                                Some(trimmed.to_string())
-                            }
-                        } else if let Some(obj) = v.as_object() {
-                            obj.get("id")
-                                .or_else(|| obj.get("session_id"))
-                                .or_else(|| obj.get("sessionId"))
-                                .and_then(|inner| inner.as_str())
-                                .map(str::trim)
-                                .filter(|inner| !inner.is_empty())
-                                .map(|inner| inner.to_string())
-                        } else {
-                            None
-                        }
-                    });
-
-                if action_type == TELEGRAM_WEBAPP_TYPE_CONTINUE_COMPUTER
-                    || action_type == "aidaemon.telegram.continue_on_computer.v1"
-                {
-                    return Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id });
-                }
-                if action_type == TELEGRAM_WEBAPP_TYPE_AGENT_MESSAGE {
-                    let text = map
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .unwrap_or("");
-                    if text.is_empty() {
-                        return None;
-                    }
-                    let clipped = text.chars().take(TELEGRAM_WEBAPP_MAX_TEXT_CHARS).collect();
-                    return Some(TelegramWebAppAction::AgentMessage(clipped));
-                }
-
-                // Some Telegram clients/wrappers may nest the actual payload under another key.
-                for key in ["data", "payload", "message", "web_app_data", "webAppData"] {
-                    if let Some(nested) = map.get(key) {
-                        if let Some(action) = Self::parse_web_app_action_value(nested) {
-                            return Some(action);
-                        }
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    async fn build_terminal_attach_handoff_message(
-        &self,
-        relay_session_id: &str,
-        user_id: u64,
-    ) -> anyhow::Result<String> {
-        let handoff = crate::agent_handoff::create_handoff_code(
-            self.state.as_ref(),
-            relay_session_id,
-            user_id,
-        )
-        .await?;
-        let command = format!("aidaemon attach {}", handoff.code);
-        let shell_token = |value: &str| -> String {
-            if !value.is_empty()
-                && value.chars().all(|ch| {
-                    ch.is_ascii_alphanumeric()
-                        || matches!(ch, '_' | '-' | '.' | '/' | ':' | '=' | '+' | ',' | '@')
-                })
-            {
-                value.to_string()
-            } else {
-                format!("'{}'", value.replace('\'', r"'\''"))
-            }
-        };
-        let exact_command = std::env::current_exe().ok().and_then(|exe| {
-            let exe_text = exe.to_string_lossy().trim().to_string();
-            if exe_text.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "{} attach {}",
-                    shell_token(&exe_text),
-                    handoff.code
-                ))
-            }
-        });
-        let command_section = if let Some(exact) = exact_command {
-            format!(
-                "Run this on your computer:\n\
-                 <pre>{}</pre>\n\n\
-                 If <code>aidaemon</code> points to an older install, run:\n\
-                 <pre>{}</pre>\n\n",
-                html_escape(&command),
-                html_escape(&exact)
-            )
-        } else {
-            format!(
-                "Run this on your computer:\n\
-                 <pre>{}</pre>\n\n",
-                html_escape(&command)
-            )
-        };
-        Ok(format!(
-            "🖥️ <b>Continue In Native Terminal</b>\n\n\
-             {}\
-             Session: <code>{}</code>\n\
-             Expires in about 5 minutes. Code is one-time use.",
-            command_section,
-            html_escape(relay_session_id)
-        ))
-    }
-
-    async fn resolve_continue_relay_session_id(
-        &self,
-        chat_id: i64,
-        relay_session_id: Option<String>,
-    ) -> Option<String> {
-        if let Some(value) = relay_session_id
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-        {
-            return Some(value);
-        }
-
-        let telegram_session_id = self.session_id(chat_id).await;
-        match crate::agent_handoff::resolve_relay_for_telegram_session(
-            self.state.as_ref(),
-            &telegram_session_id,
-        )
-        .await
-        {
-            Ok(Some(value)) => Some(value),
-            Ok(None) => None,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    telegram_session_id = %telegram_session_id,
-                    "Failed to resolve relay mapping for continue-on-computer"
-                );
-                None
-            }
-        }
-    }
-
-    async fn handle_continue_on_computer_action(
-        &self,
-        bot: &Bot,
-        msg: &teloxide::types::Message,
-        user_id: u64,
-        relay_session_id: Option<String>,
-    ) {
-        self.send_agent_share_code(bot, msg.chat.id, user_id, relay_session_id)
-            .await;
-    }
-
-    async fn send_agent_share_code(
-        &self,
-        bot: &Bot,
-        chat_id: ChatId,
-        user_id: u64,
-        relay_session_id: Option<String>,
-    ) {
-        let resolved_relay = if let Some(value) = relay_session_id
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-        {
-            Some(value)
-        } else {
-            let mapped = self
-                .resolve_continue_relay_session_id(chat_id.0, None)
-                .await;
-            if mapped.is_some() {
-                mapped
-            } else {
-                match crate::agent_handoff::get_last_active_relay_session_id(
-                    self.state.as_ref(),
-                    user_id,
-                )
-                .await
-                {
-                    Ok(value) => value,
-                    Err(err) => {
-                        warn!(
-                            error = %err,
-                            "Failed to load last active relay session id for /agent share"
-                        );
-                        None
-                    }
-                }
-            }
-        };
-
-        let Some(relay_session_id) = resolved_relay else {
-            let _ = bot
-                .send_message(
-                    chat_id,
-                    "Could not identify the active terminal session. Keep the Mini App session open and try Continue on Computer again.",
-                )
-                .await;
-            return;
-        };
-
-        match self
-            .build_terminal_attach_handoff_message(&relay_session_id, user_id)
-            .await
-        {
-            Ok(reply) => {
-                let _ = bot
-                    .send_message(chat_id, reply)
-                    .parse_mode(ParseMode::Html)
-                    .await;
-            }
-            Err(err) => {
-                warn!(error = %err, "Failed to create terminal attach handoff code");
-                let _ = bot
-                    .send_message(
-                        chat_id,
-                        "Failed to create continue-on-computer code. Please try again.",
-                    )
-                    .await;
-            }
-        }
-    }
-
-    async fn send_agent_resume_prompt(
-        &self,
-        bot: &Bot,
-        chat_id: ChatId,
-        user_id: u64,
-        code: Option<String>,
-    ) {
-        let Some(code) = code.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
-            let _ = bot
-                .send_message(chat_id, "Usage: /agent resume <code>")
-                .await;
-            return;
-        };
-
-        let handoff = match crate::agent_handoff::resolve_handoff_code(self.state.as_ref(), &code)
-            .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                let _ = bot
-                        .send_message(
-                            chat_id,
-                            format!(
-                                "Resume code is invalid or expired: {}. Generate a fresh code from your computer with `aidaemon share`.",
-                                err
-                            ),
-                        )
-                        .await;
-                return;
-            }
-        };
-
-        if handoff.owner_user_id != user_id {
-            let _ = bot
-                .send_message(
-                    chat_id,
-                    "That resume code belongs to a different Telegram user.",
-                )
-                .await;
-            return;
-        }
-
-        if let Err(err) =
-            crate::agent_handoff::consume_handoff_code(self.state.as_ref(), &code).await
-        {
-            let _ = bot
-                .send_message(
-                    chat_id,
-                    format!("Resume code could not be consumed: {}.", err),
-                )
-                .await;
-            return;
-        }
-
-        let relay_session_id = handoff.relay_session_id.trim().to_string();
-        let telegram_session_id = self.session_id(chat_id.0).await;
-        if let Err(err) = crate::agent_handoff::bind_telegram_session_to_relay(
-            self.state.as_ref(),
-            &telegram_session_id,
-            &relay_session_id,
-        )
-        .await
-        {
-            warn!(
-                error = %err,
-                relay_session_id = %relay_session_id,
-                telegram_session_id = %telegram_session_id,
-                "Failed to bind relay session from /agent resume"
-            );
-            let _ = bot
-                .send_message(
-                    chat_id,
-                    "Failed to bind the resume session. Please generate a new code and retry.",
-                )
-                .await;
-            return;
-        }
-
-        let current_bot_label = self.cached_bot_label();
-        let mini_app_sync_warning = match self
-            .sync_terminal_tenant_bot_token(&self.bot_token, user_id, current_bot_label.as_deref())
-            .await
-        {
-            Ok(()) => None,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    user_id,
-                    relay_session_id = %relay_session_id,
-                    "Failed to auto-sync Telegram bot token before /agent resume"
-                );
-                Some(
-                    "If Telegram reports an auth mismatch, retry once or save the token manually in the Mini App."
-                        .to_string(),
-                )
-            }
-        };
-
-        let mut web_app_url = match reqwest::Url::parse(&self.terminal_web_app_url) {
-            Ok(url) => url,
-            Err(err) => {
-                warn!(error = %err, "Invalid terminal_web_app_url during /agent resume");
-                let _ = bot
-                    .send_message(
-                        chat_id,
-                        "Resume code accepted. Run `/agent open` to continue in Mini App.",
-                    )
-                    .await;
-                return;
-            }
-        };
-        {
-            let mut query = web_app_url.query_pairs_mut();
-            query.append_pair("telegram_session_id", &telegram_session_id);
-            query.append_pair("relay_session_id", &relay_session_id);
-            query.append_pair("autostart", "1");
-        }
-
-        let keyboard = InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::web_app(
-                "📱 Open in Mini App",
-                WebAppInfo {
-                    url: web_app_url.clone(),
-                },
-            ),
-            InlineKeyboardButton::callback(
-                "💻 Continue on Computer",
-                format!("agent:share:{}", relay_session_id),
-            ),
-        ]]);
-
-        let _ = bot
-            .send_message(
-                chat_id,
-                format!(
-                    "✅ <b>Resume Code Accepted</b>\n\nSession: <code>{}</code>\nTap Open in Mini App to continue on your phone.{}",
-                    html_escape(&relay_session_id),
-                    mini_app_sync_warning
-                        .as_deref()
-                        .map(|value| format!("\n\n{}", html_escape(value)))
-                        .unwrap_or_default()
-                ),
-            )
-            .parse_mode(ParseMode::Html)
-            .reply_markup(keyboard)
-            .await;
-
-        let reply_keyboard =
-            KeyboardMarkup::new(vec![vec![KeyboardButton::new("📱 Open in Mini App")
-                .request(ButtonRequest::WebApp(WebAppInfo {
-                    url: web_app_url.clone(),
-                }))]])
-            .resize_keyboard()
-            .one_time_keyboard();
-
-        let _ = bot
-            .send_message(
-                chat_id,
-                "Tip: use this keyboard launch if Mini App send-back actions are unavailable in inline mode.",
-            )
-            .reply_markup(reply_keyboard)
-            .await;
-    }
-
-    async fn handle_message(self: &Arc<Self>, msg: teloxide::types::Message, bot: Bot) {
-        let transport_received_at = chrono::Utc::now();
-        let ingress_timing =
-            crate::runtime_ports::InboundMessageTiming::new(Some(msg.date), transport_received_at);
-        let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
-
-        // Authorization check with first-user auto-claim (DM only).
-        // When allowed_user_ids is empty, the FIRST user to send a private
-        // message becomes the owner. Group messages are rejected until an
-        // owner is established, preventing someone from claiming ownership
-        // by adding the bot to a group.
-        let is_private = matches!(msg.chat.kind, teloxide::types::ChatKind::Private(_));
-        let auth_result = {
-            let allowed = self
-                .allowed_user_ids
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if allowed.is_empty() {
-                if is_private {
-                    warn!(
-                        user_id,
-                        "No allowed_user_ids configured — auto-claiming first DM user as owner."
-                    );
-                    drop(allowed);
-                    let mut allowed = self
-                        .allowed_user_ids
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    check_auth(&mut allowed, user_id)
-                } else {
-                    // Group message before any owner is set — reject
-                    AuthResult::Unauthorized
-                }
-            } else if allowed.contains(&user_id) {
-                AuthResult::Authorized
-            } else {
-                AuthResult::Unauthorized
-            }
-        };
-
-        match auth_result {
-            AuthResult::AutoClaimed => {
-                // Persist to config.toml so it survives restarts
-                let ids = self
-                    .allowed_user_ids
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                if let Err(e) = self.persist_allowed_user_ids(&ids).await {
-                    warn!(
-                        user_id,
-                        "Failed to persist auto-claimed user ID to config: {}", e
-                    );
-                }
-                #[cfg(feature = "terminal-bridge")]
-                let mut bridge_hotstart_failed = false;
-                #[cfg(feature = "terminal-bridge")]
-                match AppConfig::load(&self.config_path) {
-                    Ok(config) => {
-                        if config.terminal.effective_bridge_enabled()
-                            && !crate::terminal_bridge::spawn_if_configured(
-                                &config,
-                                self.state.clone(),
-                            )
-                        {
-                            bridge_hotstart_failed = true;
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
-                            user_id,
-                            error = %err,
-                            "Failed to reload config for terminal bridge hot-start after auto-claim"
-                        );
-                        bridge_hotstart_failed = true;
-                    }
-                }
-                #[cfg(feature = "terminal-bridge")]
-                let mut welcome = "Hey! You're now set as the owner. Ask me anything, give me tasks, or just chat."
-                    .to_string();
-                #[cfg(not(feature = "terminal-bridge"))]
-                let welcome = "Hey! You're now set as the owner. Ask me anything, give me tasks, or just chat."
-                    .to_string();
-                #[cfg(feature = "terminal-bridge")]
-                if bridge_hotstart_failed {
-                    welcome.push_str(
-                        "\n\nI couldn't auto-enable the /agent bridge right now. If /agent doesn't open, run /restart.",
-                    );
-                }
-                let _ = bot.send_message(msg.chat.id, welcome).await;
-                // Fall through to process the message normally
-            }
-            AuthResult::Unauthorized => {
-                warn!(user_id, "Unauthorized user attempted access");
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!(
-                            "Unauthorized. Your Telegram user ID is <code>{}</code>.\n\n\
-                             To grant access, add it to <code>allowed_user_ids</code> in config.toml:\n\
-                             <pre>[telegram]\nallowed_user_ids = [{}]</pre>",
-                            user_id, user_id
-                        ),
-                    )
-                    .parse_mode(ParseMode::Html)
-                    .await;
-                return;
-            }
-            AuthResult::Authorized => {} // continue
-        }
-
-        let user_role = determine_role(&self.owner_user_ids, user_id);
-
-        let mut inbound_attachments = Vec::new();
-        let mut body_text = String::new();
-
-        if let Some(web_app_data) = msg.web_app_data() {
-            match Self::parse_web_app_action(&web_app_data.data) {
-                Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
-                    self.handle_continue_on_computer_action(&bot, &msg, user_id, relay_session_id)
-                        .await;
-                    return;
-                }
-                Some(TelegramWebAppAction::AgentMessage(text)) => body_text = text,
-                None => {
-                    let _ = bot
-                        .send_message(
-                            msg.chat.id,
-                            "Mini App payload was not recognized. Try opening a new terminal session with /agent open.",
-                        )
-                        .await;
-                    return;
-                }
-            }
-        } else if let Some(t) = msg.text() {
-            if let Some(action) = Self::parse_web_app_action(t) {
-                match action {
-                    TelegramWebAppAction::ContinueOnComputer { relay_session_id } => {
-                        self.handle_continue_on_computer_action(
-                            &bot,
-                            &msg,
-                            user_id,
-                            relay_session_id,
-                        )
-                        .await;
-                        return;
-                    }
-                    TelegramWebAppAction::AgentMessage(text) => body_text = text,
-                }
-            } else {
-                body_text = t.to_string();
-            }
-        } else if !self.files_enabled {
-            let _ = bot
-                .send_message(msg.chat.id, "I can only process text messages.")
-                .await;
-            return;
-        }
-
-        if self.files_enabled
-            && (msg.document().is_some()
-                || msg.photo().is_some()
-                || msg.audio().is_some()
-                || msg.video().is_some()
-                || msg.voice().is_some())
-        {
-            match self.handle_file_message(&msg, &bot).await {
-                Ok(attachment) => inbound_attachments.push(attachment),
-                Err(e) => {
-                    let _ = bot
-                        .send_message(msg.chat.id, format!("File error: {}", e))
-                        .await;
-                    return;
-                }
-            }
-            if body_text.is_empty() {
-                if let Some(caption) = msg.caption() {
-                    body_text = caption.to_string();
-                }
-            }
-        } else if body_text.is_empty() {
-            let _ = bot
-                .send_message(msg.chat.id, "I can only process text messages.")
-                .await;
-            return;
-        }
-
-        let text = if user_role == UserRole::Owner {
-            super::attachments::build_inbound_text(&body_text, &inbound_attachments)
-        } else {
-            super::attachments::build_inbound_text_without_local_paths(
-                &body_text,
-                &inbound_attachments,
-            )
-        };
-
-        // Handle slash commands.
-        // `/setup` is spawned in a separate task because `handle_setup_command`
-        // may call `request_approval`, which blocks waiting for a Telegram
-        // callback query.  Teloxide dispatches updates per-chat sequentially,
-        // so running it inline would deadlock: the callback can't be delivered
-        // until the message handler returns, but the message handler is waiting
-        // for that callback.
-        if text.starts_with('/') {
-            // Slash commands `return` before the message dedup gate below, so a
-            // duplicate Telegram delivery of the same update (same message id)
-            // would execute the command twice — e.g. two "Context cleared."
-            // replies, a double `/cancel`. Apply the same msg.id-keyed dedup
-            // here. Distinct sends (different message ids) are never deduped, so
-            // intentional repeats still work.
-            let cmd_session_id = self.session_id(msg.chat.id.0).await;
-            let cmd_dedup_key = msg.id.0.to_string();
-            if !self
-                .task_registry
-                .mark_seen(&cmd_session_id, &text, Some(&cmd_dedup_key))
-                .await
-            {
-                debug!(session_id = %cmd_session_id, "Dropped duplicate slash command");
-                return;
-            }
-            let is_setup = {
-                let cmd = text.split_whitespace().next().unwrap_or("");
-                let cmd = cmd.split('@').next().unwrap_or(cmd);
-                cmd == "/setup"
-            };
-            if is_setup {
-                let channel = Arc::clone(self);
-                let text = text.clone();
-                let msg = msg.clone();
-                let bot = bot.clone();
-                tokio::spawn(async move {
-                    channel.handle_command(&text, &msg, &bot).await;
-                });
-            } else {
-                self.handle_command(&text, &msg, &bot).await;
-            }
-            return;
-        }
-
-        if let Some(lite_reply) = self
-            .handle_terminal_lite_input(msg.chat.id.0, user_id, user_role, &text)
-            .await
-        {
-            for chunk in split_message(&lite_reply, 4096) {
-                let _ = bot.send_message(msg.chat.id, chunk).await;
-            }
-            return;
-        }
-
-        // Use chat ID as session ID, prefixed with bot name if multi-bot
-        let session_id = self.session_id(msg.chat.id.0).await;
-        let channel_id = crate::session::derive_channel_id_from_session(&session_id);
-
-        // Register this session with the channel hub so outbound messages
-        // (approvals, media, notifications) route back to this Telegram bot.
-        {
-            let channel_name = self.channel_name().await;
-            {
-                let mut map = self.session_map.write().await;
-                map.insert(session_id.clone(), channel_name.clone());
-            }
-            let _ = self
-                .state
-                .save_session_channel(&session_id, &channel_name)
-                .await;
-        }
-
-        // Build channel context from Telegram chat type
-        let channel_ctx = {
-            use teloxide::types::{ChatKind, PublicChatKind};
-            let visibility = match &msg.chat.kind {
-                ChatKind::Private(_) => ChannelVisibility::Private,
-                ChatKind::Public(public) => match &public.kind {
-                    PublicChatKind::Group => ChannelVisibility::PrivateGroup,
-                    PublicChatKind::Supergroup(sg) => {
-                        if sg.username.is_some() {
-                            ChannelVisibility::Public
-                        } else {
-                            ChannelVisibility::PrivateGroup
-                        }
-                    }
-                    PublicChatKind::Channel(_) => ChannelVisibility::Public,
-                },
-            };
-            ChannelContext {
-                visibility,
-                platform: "telegram".to_string(),
-                channel_name: msg.chat.title().map(|s| s.to_string()),
-                channel_id,
-                workspace_id: None,
-                sender_name: msg.from.as_ref().map(|u| match &u.last_name {
-                    Some(last) => format!("{} {}", u.first_name, last),
-                    None => u.first_name.clone(),
-                }),
-                sender_id: msg.from.as_ref().map(|u| format!("telegram:{}", u.id.0)),
-                channel_member_names: vec![],
-                user_id_map: std::collections::HashMap::new(),
-                workspace_grant: None,
-                trusted: false,
-            }
-        };
-
-        // Handle cancel/stop commands - these bypass the queue
-        let text_lower = text.to_lowercase();
-        if text_lower == "cancel" || text_lower == "stop" || text_lower == "abort" {
-            if user_role != UserRole::Owner {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        "Only the owner can cancel running work in this session.",
-                    )
-                    .await;
-                return;
-            }
-            let cancelled = self
-                .task_registry
-                .cancel_running_for_session(&session_id)
-                .await;
-            let queued_work_preserved = self.task_registry.queue_len(&session_id).await;
-            let cancelled_goals = self
-                .agent
-                .cancel_active_goals_for_session(&session_id)
-                .await;
-            if cancelled.is_empty() {
-                if cancelled_goals.is_empty() {
-                    let _ = bot
-                        .send_message(msg.chat.id, "No running task to cancel.")
-                        .await;
-                } else if cancelled_goals.len() == 1 {
-                    let _ = bot
-                        .send_message(
-                            msg.chat.id,
-                            format!("⏹️ Cancelled goal: {}", cancelled_goals[0]),
-                        )
-                        .await;
-                } else {
-                    let _ = bot
-                        .send_message(
-                            msg.chat.id,
-                            format!(
-                                "⏹️ Cancelled {} goals:\n{}",
-                                cancelled_goals.len(),
-                                cancelled_goals
-                                    .iter()
-                                    .map(|d| format!("- {}", d))
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            ),
-                        )
-                        .await;
-                }
-            } else {
-                let desc = cancelled
-                    .first()
-                    .map(|(_, d)| d.as_str())
-                    .unwrap_or("unknown");
-                let mut response = format!("⏹️ Cancelled: {}", desc);
-                if queued_work_preserved > 0 {
-                    response.push_str(&format!(
-                        " ({} queued request(s) will continue in order)",
-                        queued_work_preserved
-                    ));
-                }
-                if !cancelled_goals.is_empty() {
-                    response.push_str(&format!(" (+{} goal(s) cancelled)", cancelled_goals.len()));
-                }
-                let _ = bot.send_message(msg.chat.id, response).await;
-            }
-            return;
-        }
-
-        // Stable per-message identity for dedup. Telegram's `message_id` is
-        // unique per chat and reused on webhook/poll redeliveries, but a user
-        // re-typing the same text gets a NEW message_id — so this drops genuine
-        // duplicates while letting a deliberate re-ask through.
-        let dedup_key = msg.id.0.to_string();
-
-        // Check if a task is already running - if so, queue this message
-        if self.task_registry.has_running_task(&session_id).await {
-            // Atomic check-and-queue: if the task finished between the
-            // has_running_task() check above and this call, the registry
-            // reports NoRunningTask and we fall through to direct processing
-            // instead of stranding the message in an undrained queue.
-            match self
-                .task_registry
-                .queue_message_if_running(
-                    &session_id,
-                    QueuedMessage::new(
-                        &text,
-                        user_role,
-                        channel_ctx.clone(),
-                        inbound_attachments.clone(),
-                    )
-                    .with_ingress_timing(ingress_timing.clone()),
-                    Some(&dedup_key),
-                )
-                .await
-            {
-                QueueOutcome::Queued(queue_pos) => {
-                    // Only notify the user for the first 3 queued messages to avoid spam
-                    // (long messages fragmented by Telegram Web can produce 10+ fragments).
-                    if queue_pos <= 3 {
-                        let current_task = self
-                            .task_registry
-                            .get_running_task_description(&session_id)
-                            .await
-                            .unwrap_or_else(|| "processing".to_string());
-                        let preview: String = text.chars().take(50).collect();
-                        let suffix = if text.len() > 50 { "..." } else { "" };
-                        let _ = bot
-                            .send_message(
-                                msg.chat.id,
-                                format!(
-                                    "📥 Queued ({}): \"{}{}\" | Currently: {}",
-                                    queue_pos, preview, suffix, current_task
-                                ),
-                            )
-                            .await;
-                    }
-                    return;
-                }
-                QueueOutcome::Duplicate => {
-                    // Duplicate message detected — silently ignore
-                    debug!(session_id, "Dropped duplicate queued message");
-                    return;
-                }
-                QueueOutcome::NoRunningTask => {
-                    info!(
-                        session_id,
-                        "Task finished during queue attempt — processing message directly"
-                    );
-                    // Fall through to direct processing below.
-                }
-            }
-        }
-
-        // Dedup gate: atomically mark this message as "seen" so concurrent
-        // webhook handlers for the same text don't ALL start direct processing.
-        if !self
-            .task_registry
-            .mark_seen(&session_id, &text, Some(&dedup_key))
-            .await
-        {
-            debug!(
-                session_id,
-                "Dropped duplicate message (direct processing race)"
-            );
-            return;
-        }
-
-        info!(session_id, "Received message from user {}", user_id);
-
-        // Create heartbeat for watchdog — agent bumps this on every activity point.
-        let heartbeat = Arc::new(AtomicU64::new(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        ));
-
-        // Send typing indicator immediately, then repeat every 3s while agent works.
-        // Telegram's typing indicator expires after ~5s, so 3s keeps it continuous
-        // even if the occasional send_chat_action call fails silently.
-        // Also monitors the heartbeat: if it goes stale, notify user and stop typing.
-        let typing_bot = bot.clone();
-        let typing_chat_id = msg.chat.id;
-        let typing_cancel = tokio_util::sync::CancellationToken::new();
-        let typing_token = typing_cancel.clone();
-        let heartbeat_for_typing = heartbeat.clone();
-        let stale_threshold_secs = self.watchdog_stale_threshold_secs;
-        tokio::spawn(async move {
-            // Hard maximum: stop typing after 30 minutes regardless of heartbeat/cancel.
-            // Prevents infinite typing loops from leaked heartbeat keepers.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
-            loop {
-                let _ = typing_bot
-                    .send_chat_action(typing_chat_id, ChatAction::Typing)
-                    .await;
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(3)) => {
-                        if stale_threshold_secs > 0 {
-                            let last_hb = heartbeat_for_typing.load(Ordering::Relaxed);
-                            let now = SystemTime::now().duration_since(UNIX_EPOCH)
-                                .unwrap_or_default().as_secs();
-                            if now.saturating_sub(last_hb) > stale_threshold_secs {
-                                break; // Stop typing indicator
-                            }
-                        }
-                        if tokio::time::Instant::now() >= deadline {
-                            tracing::warn!(chat_id = %typing_chat_id, "Typing indicator reached 30-minute hard limit");
-                            break;
-                        }
-                    }
-                    _ = typing_token.cancelled() => break,
-                }
-            }
-        });
-
-        // Upgrade the channel hub weak reference while `self` is still in scope.
-        // The hub is needed for the live-status surface (Task 4/5).
-        let status_hub = self
-            .channel_hub
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().and_then(|weak| weak.upgrade()));
-
-        // Status update channel — agent emits updates, we display them rate-limited.
-        let (status_tx, status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(16);
-        let is_dm = channel_ctx.visibility == ChannelVisibility::Private;
-
-        // Build the single live-status surface (owner + hub-backed sink) when the hub
-        // is available. The normal core.rs startup path wires the hub before any channel
-        // traffic arrives, so the None branch is purely defensive.
-        let (live_owner, live_sink): (
-            Option<std::sync::Arc<tokio::sync::Mutex<crate::channels::live_status::LiveStatus>>>,
-            Option<std::sync::Arc<crate::channels::live_status::HubSurfaceSink>>,
-        ) = if let Some(hub) = status_hub.clone() {
-            let owner = std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::channels::live_status::LiveStatus::new(),
-            ));
-            let sink = std::sync::Arc::new(crate::channels::live_status::HubSurfaceSink::new(
-                hub,
-                session_id.clone(),
-            ));
-            (Some(owner), Some(sink))
-        } else {
-            warn!(
-                session_id = %session_id,
-                "Telegram status surface disabled: ChannelHub is not wired"
-            );
-            (None, None)
-        };
-
-        let status_task = match (&live_owner, &live_sink) {
-            (Some(owner), Some(sink)) => tokio::spawn(run_status_consumer(
-                status_rx,
-                owner.clone(),
-                sink.clone(),
-                bot.clone(),
-                msg.chat.id,
-                is_dm,
-            )),
-            _ => {
-                // Fallback: hub unavailable — legacy consumer keeps basic progress
-                // visible so user requests still work in degraded mode.
-                tokio::spawn(run_legacy_status_consumer(
-                    status_rx,
-                    bot.clone(),
-                    msg.chat.id,
-                    is_dm,
-                ))
-            }
-        };
-
-        // Register this task for tracking and cancellation.
-        let description: String = text.chars().take(80).collect();
-        let (task_id, cancel_token) = self.task_registry.register(&session_id, &description).await;
-        // Associate the typing indicator with this task so cancel_running_for_session
-        // also stops the typing loop (fixes typing persisting after cancel/panic).
-        self.task_registry
-            .set_typing_cancel(task_id, typing_cancel.clone())
-            .await;
-        let registry = Arc::clone(&self.task_registry);
-
-        // Spawn the agent work in a separate task so the dispatcher can continue
-        // processing other updates (especially callback queries for tool approval).
-        let agent = Arc::clone(&self.agent);
-        let chat_id = msg.chat.id;
-        tokio::spawn(async move {
-            // Drop guard: if this task panics, ensure the typing indicator stops.
-            // Without this, a panic in handle_message() would skip the explicit
-            // typing_cancel.cancel() call, leaving the typing loop running.
-            // Uses Arc<Mutex<>> so the guard always tracks the *current* typing token
-            // even when queued messages replace it.
-            let typing_guard_token = Arc::new(std::sync::Mutex::new(typing_cancel.clone()));
-            struct TypingGuard(Arc<std::sync::Mutex<tokio_util::sync::CancellationToken>>);
-            impl Drop for TypingGuard {
-                fn drop(&mut self) {
-                    if let Ok(token) = self.0.lock() {
-                        token.cancel();
-                    }
-                }
-            }
-            let _typing_guard = TypingGuard(typing_guard_token.clone());
-
-            let mut current_text = text;
-            let mut current_attachments = inbound_attachments;
-            let mut current_user_role = user_role;
-            let mut current_channel_ctx = channel_ctx;
-            let mut current_task_id = task_id;
-            let mut current_cancel_token = cancel_token;
-            let mut current_status_tx = status_tx;
-            let mut current_typing_cancel = typing_cancel;
-            let mut current_status_task = status_task;
-            let mut current_heartbeat = heartbeat;
-            let mut current_ingress_timing = Some(ingress_timing);
-            // live_owner/live_sink are carried through all queue-drain iterations so
-            // that Task 6 can finalize the surface after the agent reply is ready.
-            let live_owner = live_owner;
-            let live_sink = live_sink;
-            // Hard wall-clock deadline: no single message handling can exceed this,
-            // regardless of heartbeat or LLM watchdog state. This catches hangs in
-            // non-LLM code paths (DB queries, bootstrap phase, etc.) that the
-            // heartbeat-based watchdog cannot detect.
-            let task_wall_deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
-
-            loop {
-                if let Some(timing) = current_ingress_timing.as_mut() {
-                    timing.mark_dispatched_now();
-                }
-                let result = tokio::select! {
-                    r = agent.handle_inbound_message(InboundMessageRequest {
-                        session_id: session_id.clone(),
-                        user_text: current_text.clone(),
-                        attachments: current_attachments.clone(),
-                        status_tx: Some(current_status_tx.clone()),
-                        user_role: current_user_role,
-                        channel_ctx: current_channel_ctx.clone(),
-                        heartbeat: Some(current_heartbeat.clone()),
-                        ingress_timing: current_ingress_timing.clone(),
-                    }) => r,
-                    _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
-                    stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 4), if stale_threshold_secs > 0 => {
-                        Err(anyhow::anyhow!(
-                            "Task auto-cancelled due to inactivity ({} minute{} without progress).",
-                            stale_mins,
-                            if stale_mins == 1 { "" } else { "s" }
-                        ))
-                    },
-                    _ = tokio::time::sleep_until(task_wall_deadline) => {
-                        tracing::error!(session_id = %session_id, "Task hit 20-minute hard wall-clock limit");
-                        Err(anyhow::anyhow!("Task exceeded maximum wall-clock time (20 minutes). This may indicate a hang."))
-                    },
-                };
-                current_typing_cancel.cancel();
-                // Abort the status display task to prevent blocking if a background
-                // CLI agent monitoring task still holds a status_tx clone.
-                current_status_task.abort();
-
-                // Track whether this iteration ended in error (for deferred finalization).
-                let mut task_error: Option<String> = None;
-
-                match result {
-                    Ok(envelope) => {
-                        let _ = agent
-                            .record_response_delivery(
-                                &session_id,
-                                envelope.delivery(
-                                    "telegram",
-                                    crate::events::ResponseDeliveryState::Queued,
-                                    Vec::new(),
-                                    None,
-                                ),
-                            )
-                            .await;
-                        let reply = crate::channels::prepare_chat_message(&envelope.text);
-                        // NOTE: Task intentionally stays "running" during response
-                        // sending. This prevents a race condition where incoming
-                        // messages see no running task (has_running_task = false),
-                        // skip the queue, and spawn concurrent tasks — silently
-                        // dropping themselves. Finalized below before queue check.
-                        let mut delivery_state =
-                            crate::events::ResponseDeliveryState::PlatformAcknowledged;
-                        let mut platform_message_ids = Vec::new();
-                        let mut delivery_error = None;
-                        if !reply.trim().is_empty() {
-                            let background_handoff = envelope.disposition
-                                == crate::events::AssistantResponseDisposition::BackgroundHandoff;
-                            // Progress edits are not terminal delivery: Telegram
-                            // can acknowledge editMessageText while a connected
-                            // client delays rendering the update. Ordinary final
-                            // answers therefore use a fresh sendMessage, which
-                            // creates a new delivery event for clients. Only the
-                            // explicitly nonterminal background-handoff surface
-                            // remains editable for later progress/completion.
-                            let handled = if background_handoff {
-                                if let (Some(live_owner), Some(live_sink)) =
-                                    (live_owner.as_ref(), live_sink.as_ref())
-                                {
-                                    use crate::channels::live_status::SurfaceSink;
-                                    let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                                    live_owner
-                                        .lock()
-                                        .await
-                                        .finalize_text(sink_ref, &reply)
-                                        .await
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            };
-                            // A delivered background handoff becomes the
-                            // session's status surface. Registered before reset()
-                            // clears the surface id below.
-                            if handled && background_handoff {
-                                if let (Some(hub), Some(live_owner)) =
-                                    (status_hub.as_ref(), live_owner.as_ref())
-                                {
-                                    if let Some(id) = live_owner.lock().await.surface_message_id() {
-                                        platform_message_ids.push(id.clone());
-                                        hub.register_background_status_surface(&session_id, &id)
-                                            .await;
-                                    }
-                                }
-                            }
-                            if handled {
-                                delivery_state = crate::events::ResponseDeliveryState::Edited;
-                                if platform_message_ids.is_empty() {
-                                    if let Some(live_owner) = live_owner.as_ref() {
-                                        if let Some(id) =
-                                            live_owner.lock().await.surface_message_id()
-                                        {
-                                            platform_message_ids.push(id);
-                                        }
-                                    }
-                                }
-                            }
-                            if !handled {
-                                match send_full_or_expandable_reply(&bot, chat_id, &reply).await {
-                                    Ok(message_ids) => {
-                                        platform_message_ids.extend(message_ids);
-                                        if let (Some(live_owner), Some(live_sink)) =
-                                            (live_owner.as_ref(), live_sink.as_ref())
-                                        {
-                                            use crate::channels::live_status::SurfaceSink;
-                                            let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                                            live_owner.lock().await.clear(sink_ref).await;
-                                        }
-                                        if background_handoff {
-                                            if let (Some(hub), Some(id)) =
-                                                (status_hub.as_ref(), platform_message_ids.last())
-                                            {
-                                                hub.register_background_status_surface(
-                                                    &session_id,
-                                                    id,
-                                                )
-                                                .await;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to send Telegram message: {}", e);
-                                        delivery_state =
-                                            crate::events::ResponseDeliveryState::Failed;
-                                        delivery_error = Some("telegram_send_failed".to_string());
-                                    }
-                                }
-                            }
-                        } else if let (Some(live_owner), Some(live_sink)) =
-                            (live_owner.as_ref(), live_sink.as_ref())
-                        {
-                            // Empty reply: resolve any live surface so it doesn't stay
-                            // stuck on "⏳ Running…" forever.
-                            use crate::channels::live_status::SurfaceSink;
-                            let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                            live_owner.lock().await.clear(sink_ref).await;
-                        }
-                        let _ = agent
-                            .record_response_delivery(
-                                &session_id,
-                                envelope.delivery(
-                                    "telegram",
-                                    delivery_state,
-                                    platform_message_ids,
-                                    delivery_error,
-                                ),
-                            )
-                            .await;
-                        if let Some(live_owner) = live_owner.as_ref() {
-                            live_owner.lock().await.reset();
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg = e.to_string();
-                        let is_stale_watchdog =
-                            error_msg.starts_with("Task auto-cancelled due to inactivity");
-                        // Cancellation is a terminal transition, but it must
-                        // still pass through finalize_and_drain below. Returning
-                        // here strands the FIFO and lets a later direct message
-                        // leapfrog queued work.
-                        if error_msg == "Task cancelled" {
-                            task_error = Some(error_msg);
-                            info!("Task #{} cancelled", current_task_id);
-                        } else {
-                            // Other errors: defer fail() so the task stays "running"
-                            // while we send the error message (same race-prevention
-                            // logic as the Ok path).
-                            task_error = Some(error_msg.clone());
-                            if is_stale_watchdog {
-                                info!("Task #{} auto-cancelled by stale watchdog", current_task_id);
-                                let _ =
-                                    bot.send_message(chat_id, format!("⚠️ {}", error_msg)).await;
-                            } else {
-                                warn!("Agent error: {}", e);
-                            }
-                            if !is_stale_watchdog {
-                                // Terminal failures use a fresh platform message
-                                // for the same reason as successful final answers:
-                                // a progress-message edit is not a client-visible
-                                // delivery receipt.
-                                let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
-                            }
-                            if let (Some(live_owner), Some(live_sink)) =
-                                (live_owner.as_ref(), live_sink.as_ref())
-                            {
-                                use crate::channels::live_status::SurfaceSink;
-                                let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                                live_owner.lock().await.clear(sink_ref).await;
-                            }
-                            if let Some(live_owner) = live_owner.as_ref() {
-                                live_owner.lock().await.reset();
-                            }
-                        }
-                    }
-                }
-
-                if let Some(error) = task_error.as_ref() {
-                    let status = if error == "Task cancelled" {
-                        crate::events::TaskStatus::Cancelled
-                    } else {
-                        crate::events::TaskStatus::Failed
-                    };
-                    if let Err(terminalize_error) = agent
-                        .terminalize_supervised_task(&session_id, status, error.clone())
-                        .await
-                    {
-                        warn!(%terminalize_error, "Failed to persist supervised task termination");
-                    }
-                }
-
-                // Finalize the current task AFTER sending the response/error,
-                // and drain the queue in the SAME critical section: a message
-                // arriving concurrently is then either drained here or sees
-                // NoRunningTask and processes directly — never stranded in a
-                // queue nothing will drain.
-                if let Some(queued) = registry
-                    .finalize_and_drain(current_task_id, &session_id, task_error.as_deref())
-                    .await
-                {
-                    // Small delay to ensure previous message is fully committed to DB
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-
-                    info!(
-                        session_id,
-                        "Processing queued message: {}",
-                        queued.text.chars().take(50).collect::<String>()
-                    );
-                    let _ = bot
-                        .send_message(
-                            chat_id,
-                            format!(
-                                "▶️ Processing queued: \"{}\"",
-                                queued.text.chars().take(50).collect::<String>()
-                            ),
-                        )
-                        .await;
-
-                    // Set up for next iteration
-                    current_text = queued.text;
-                    current_user_role = queued.user_role;
-                    current_channel_ctx = queued.channel_ctx;
-                    current_attachments = queued.attachments;
-                    current_ingress_timing = queued.ingress_timing;
-                    let desc: String = current_text.chars().take(80).collect();
-                    let (new_task_id, new_cancel_token) =
-                        registry.register(&session_id, &desc).await;
-                    current_task_id = new_task_id;
-                    current_cancel_token = new_cancel_token;
-
-                    // Create new status channel for the queued turn.
-                    let (new_status_tx, new_status_rx) =
-                        tokio::sync::mpsc::channel::<StatusUpdate>(16);
-                    current_status_tx = new_status_tx;
-
-                    // Reset the live surface and spawn a fresh consumer for the
-                    // queued turn, reusing the same owner/sink (Task 6 will finalize).
-                    current_status_task = match (&live_owner, &live_sink) {
-                        (Some(owner), Some(sink)) => {
-                            owner.lock().await.reset();
-                            tokio::spawn(run_status_consumer(
-                                new_status_rx,
-                                owner.clone(),
-                                sink.clone(),
-                                bot.clone(),
-                                chat_id,
-                                is_dm,
-                            ))
-                        }
-                        _ => {
-                            // Legacy fallback: hub unavailable — shared legacy consumer
-                            // so queued turns still show progress in degraded mode.
-                            tokio::spawn(run_legacy_status_consumer(
-                                new_status_rx,
-                                bot.clone(),
-                                chat_id,
-                                is_dm,
-                            ))
-                        }
-                    };
-
-                    // Fresh heartbeat for queued message
-                    let new_heartbeat = Arc::new(AtomicU64::new(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    ));
-                    current_heartbeat = new_heartbeat.clone();
-
-                    // New typing indicator with watchdog
-                    let typing_bot = bot.clone();
-                    let new_typing_cancel = tokio_util::sync::CancellationToken::new();
-                    current_typing_cancel = new_typing_cancel.clone();
-                    // Associate typing token with the new queued task for cancel support
-                    registry
-                        .set_typing_cancel(current_task_id, new_typing_cancel.clone())
-                        .await;
-                    // Update the drop guard to track the new typing token
-                    if let Ok(mut guard_token) = typing_guard_token.lock() {
-                        *guard_token = new_typing_cancel.clone();
-                    }
-                    let heartbeat_for_queued = new_heartbeat;
-                    tokio::spawn(async move {
-                        let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
-                        loop {
-                            let _ = typing_bot
-                                .send_chat_action(chat_id, ChatAction::Typing)
-                                .await;
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_secs(3)) => {
-                                    if stale_threshold_secs > 0 {
-                                        let last_hb = heartbeat_for_queued.load(Ordering::Relaxed);
-                                        let now = SystemTime::now().duration_since(UNIX_EPOCH)
-                                            .unwrap_or_default().as_secs();
-                                        if now.saturating_sub(last_hb) > stale_threshold_secs {
-                                            break;
-                                        }
-                                    }
-                                    if tokio::time::Instant::now() >= deadline {
-                                        tracing::warn!(chat_id = %chat_id, "Queued typing indicator reached 30-minute hard limit");
-                                        break;
-                                    }
-                                }
-                                _ = new_typing_cancel.cancelled() => break,
-                            }
-                        }
-                    });
-                } else {
-                    // No more queued messages, exit loop
-                    break;
-                }
-            }
-        });
-    }
 }
 
-fn fallback_session_namespace_from_token(bot_token: &str) -> String {
-    let raw_id = bot_token
-        .split_once(':')
-        .map(|(id, _)| id)
-        .unwrap_or(bot_token)
-        .trim();
-    let sanitized_id: String = raw_id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect();
-    if sanitized_id.is_empty() {
-        "telegram".to_string()
-    } else {
-        format!("tg{}", sanitized_id)
-    }
-}
-
-#[async_trait]
-impl Channel for TelegramChannel {
-    fn name(&self) -> String {
-        self.cached_channel_name
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    fn capabilities(&self) -> ChannelCapabilities {
-        ChannelCapabilities {
-            markdown: true,
-            inline_buttons: true,
-            media: true,
-            max_message_len: 4096,
-        }
-    }
-
-    async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
-        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
-        self.send_compact_or_full_reply(&self.bot, ChatId(chat_id), text)
-            .await
-    }
-
-    async fn send_text_tracked(
-        &self,
-        session_id: &str,
-        text: &str,
-    ) -> anyhow::Result<Option<String>> {
-        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
-        // Render markdown → Telegram HTML so the live surface displays formatted
-        // content (the final reply is edited into this message at turn end, and it
-        // carries markdown). Fall back to a plain send if Telegram rejects the
-        // HTML. The returned message id is captured for later in-place editing.
-        let html = markdown_to_telegram_html(text);
-        let msg = match retry_telegram_rate_limit(|| {
-            self.bot
-                .send_message(ChatId(chat_id), &html)
-                .parse_mode(ParseMode::Html)
-                .link_preview_options(disabled_link_preview())
-        })
-        .await
-        {
-            Ok(m) => m,
-            Err(_) => {
-                retry_telegram_rate_limit(|| {
-                    self.bot
-                        .send_message(ChatId(chat_id), text)
-                        .link_preview_options(disabled_link_preview())
-                })
-                .await?
-            }
-        };
-        Ok(Some(msg.id.0.to_string()))
-    }
-
-    async fn edit_text(
-        &self,
-        session_id: &str,
-        message_id: &str,
-        text: &str,
-    ) -> anyhow::Result<bool> {
-        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
-        let mid: i32 = match message_id.parse() {
-            Ok(v) => v,
-            Err(_) => return Ok(false),
-        };
-        // Render markdown → Telegram HTML so an edited-in final reply displays
-        // formatted (matches the normal send path). Fall back to a plain edit if
-        // Telegram rejects the HTML (a rare conversion edge), so an edit is never
-        // lost to a formatting error.
-        let html = markdown_to_telegram_html(text);
-        match self
-            .bot
-            .edit_message_text(ChatId(chat_id), teloxide::types::MessageId(mid), &html)
-            .parse_mode(ParseMode::Html)
-            .link_preview_options(disabled_link_preview())
-            .await
-        {
-            Ok(_) => Ok(true),
-            // Telegram rejects an edit whose text is identical to the current
-            // message — that's benign (nothing to change), so treat it as success.
-            Err(e) if e.to_string().contains("message is not modified") => Ok(true),
-            Err(_) => match self
-                .bot
-                .edit_message_text(ChatId(chat_id), teloxide::types::MessageId(mid), text)
-                .link_preview_options(disabled_link_preview())
-                .await
-            {
-                Ok(_) => Ok(true),
-                Err(e) if e.to_string().contains("message is not modified") => Ok(true),
-                Err(e) => Err(e.into()),
-            },
-        }
-    }
-
-    async fn delete_message(&self, session_id: &str, message_id: &str) -> anyhow::Result<bool> {
-        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
-        let mid: i32 = match message_id.parse() {
-            Ok(v) => v,
-            Err(_) => return Ok(false),
-        };
-        retry_telegram_rate_limit(|| {
-            self.bot
-                .delete_message(ChatId(chat_id), teloxide::types::MessageId(mid))
-        })
-        .await
-        .map(|_| true)
-        .map_err(Into::into)
-    }
-
-    async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
-        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
-        match &media.kind {
-            MediaKind::Photo { data } => {
-                let photo = InputFile::memory(data.clone()).file_name("screenshot.png");
-                retry_telegram_rate_limit(|| {
-                    self.bot
-                        .send_photo(ChatId(chat_id), photo.clone())
-                        .caption(&media.caption)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send photo: {}", e))?;
-            }
-            MediaKind::Document {
-                file_path,
-                filename,
-            } => {
-                let doc = InputFile::file(file_path).file_name(filename.clone());
-                let mut req = self.bot.send_document(ChatId(chat_id), doc);
-                if !media.caption.is_empty() {
-                    req = req.caption(&media.caption);
-                }
-                retry_telegram_rate_limit(|| req.clone())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to send document: {}", e))?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn request_approval(
-        &self,
-        session_id: &str,
-        command: &str,
-        risk_level: RiskLevel,
-        warnings: &[String],
-        permission_mode: PermissionMode,
-        one_time_only: bool,
-    ) -> anyhow::Result<ApprovalResponse> {
-        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
-
-        info!(session_id, command, chat_id, risk = %risk_level, mode = %permission_mode, "Approval requested");
-
-        let approval_id = uuid::Uuid::new_v4().to_string();
-        let short_id = &approval_id[..8];
-
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-
-        // Store the response sender
-        {
-            let mut pending = self.pending_approvals.lock().await;
-            pending.insert(approval_id.clone(), response_tx);
-            info!(approval_id = %short_id, pending_count = pending.len(), "Stored pending approval");
-        }
-
-        // Determine which buttons to show based on permission_mode and risk_level
-        // - Default mode: Critical gets [Once, Session, Deny], others get [Once, Always, Deny]
-        // - Cautious mode: All get [Once, Session, Deny]
-        // - YOLO mode: All get [Once, Always, Deny]
-        let use_session_button =
-            approval_render::approval_use_session_button(permission_mode, risk_level);
-
-        let keyboard = approval_render::build_approval_keyboard(
-            &approval_id,
-            use_session_button,
-            one_time_only,
-        );
-
-        let text = approval_render::build_approval_message_text(
-            command,
-            risk_level,
-            warnings,
-            use_session_button,
-            one_time_only,
-        );
-
-        match self
-            .bot
-            .send_message(ChatId(chat_id), &text)
-            .parse_mode(ParseMode::Html)
-            .reply_markup(keyboard)
-            .await
-        {
-            Ok(_) => {
-                info!(approval_id = %short_id, "Approval message sent to Telegram");
-            }
-            Err(e) => {
-                warn!("Failed to send approval request: {}", e);
-                // Remove pending approval since we couldn't ask
-                let mut pending = self.pending_approvals.lock().await;
-                pending.remove(&approval_id);
-                return Err(anyhow::anyhow!(
-                    "Telegram approval request could not be delivered: {e}"
-                ));
-            }
-        }
-
-        // Wait for response with 5-minute timeout to prevent memory leak
-        info!(approval_id = %short_id, "Waiting for user approval response...");
-        match tokio::time::timeout(Duration::from_secs(300), response_rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => {
-                warn!(approval_id = %short_id, "Approval channel closed");
-                self.pending_approvals.lock().await.remove(&approval_id);
-                Err(anyhow::anyhow!("Telegram approval response channel closed"))
-            }
-            Err(_) => {
-                warn!(approval_id = %short_id, "Approval timed out after 5 minutes");
-                let mut pending = self.pending_approvals.lock().await;
-                pending.remove(&approval_id);
-                Err(anyhow::anyhow!("Telegram approval request timed out"))
-            }
-        }
-    }
-
-    async fn request_goal_confirmation(
-        &self,
-        session_id: &str,
-        goal_description: &str,
-        details: &[String],
-        style: crate::types::GoalConfirmationStyle,
-    ) -> anyhow::Result<bool> {
-        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
-
-        let approval_id = uuid::Uuid::new_v4().to_string();
-        let short_id = &approval_id[..8];
-
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-
-        {
-            let mut pending = self.pending_approvals.lock().await;
-            pending.insert(approval_id.clone(), response_tx);
-        }
-
-        let keyboard = approval_render::build_goal_confirmation_keyboard(&approval_id, style);
-        let pages =
-            approval_render::build_goal_confirmation_pages(goal_description, details, style);
-        let page_count = pages.len();
-
-        for (index, text) in pages.iter().enumerate() {
-            let request = self.bot.send_message(ChatId(chat_id), text);
-            let result = if index + 1 == page_count {
-                request.reply_markup(keyboard.clone()).await
-            } else {
-                request.await
-            };
-            if let Err(error) = result {
-                warn!(
-                    page = index + 1,
-                    page_count, "Failed to send goal confirmation: {}", error
-                );
-                let mut pending = self.pending_approvals.lock().await;
-                pending.remove(&approval_id);
-                return Err(anyhow::anyhow!(
-                    "Telegram goal confirmation page {}/{} could not be delivered: {error}",
-                    index + 1,
-                    page_count
-                ));
-            }
-        }
-        info!(approval_id = %short_id, page_count, "Goal confirmation message sent");
-
-        // Wait with 30-minute timeout (generous window to avoid race conditions
-        // when users confirm near the timeout boundary).
-        match tokio::time::timeout(Duration::from_secs(1800), response_rx).await {
-            Ok(Ok(response)) => Ok(matches!(
-                response,
-                ApprovalResponse::AllowOnce
-                    | ApprovalResponse::AllowSession
-                    | ApprovalResponse::AllowAlways
-            )),
-            Ok(Err(_)) => {
-                warn!(approval_id = %short_id, "Goal confirmation channel closed");
-                self.pending_approvals.lock().await.remove(&approval_id);
-                Err(anyhow::anyhow!(
-                    "Telegram goal confirmation response channel closed"
-                ))
-            }
-            Err(_) => {
-                warn!(approval_id = %short_id, "Goal confirmation timed out after 30 minutes");
-                let mut pending = self.pending_approvals.lock().await;
-                pending.remove(&approval_id);
-                Err(anyhow::anyhow!("Telegram goal confirmation timed out"))
-            }
-        }
-    }
-}
-
-/// Replace the current process with a fresh instance of itself.
-fn restart_process() {
-    use std::os::unix::process::CommandExt;
-
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::error!("Failed to get current exe path: {}", e);
-            return;
-        }
-    };
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    tracing::info!(exe = %exe.display(), "Exec-ing new process");
-
-    // This replaces the current process — does not return on success
-    let err = std::process::Command::new(&exe).args(&args).exec();
-    tracing::error!("exec failed: {}", err);
-}
-
-/// Send a message with HTML parse mode, falling back to plain text on failure.
-async fn send_html_or_fallback(
-    bot: &Bot,
-    chat_id: ChatId,
-    html: &str,
-    plain: &str,
-) -> Result<teloxide::types::Message, teloxide::RequestError> {
-    match retry_telegram_rate_limit(|| {
-        bot.send_message(chat_id, html)
-            .parse_mode(ParseMode::Html)
-            .link_preview_options(disabled_link_preview())
-    })
-    .await
-    {
-        Ok(message) => Ok(message),
-        Err(e) => {
-            warn!("HTML send failed, falling back to plain text: {}", e);
-            let message = retry_telegram_rate_limit(|| {
-                bot.send_message(chat_id, plain)
-                    .link_preview_options(disabled_link_preview())
-            })
-            .await?;
-            Ok(message)
-        }
-    }
-}
-
-async fn retry_telegram_rate_limit<Op, Req, T>(mut op: Op) -> Result<T, RequestError>
-where
-    Op: FnMut() -> Req,
-    Req: std::future::IntoFuture<Output = Result<T, RequestError>>,
-{
-    match op().into_future().await {
-        Ok(value) => Ok(value),
-        Err(RequestError::RetryAfter(after)) => {
-            let delay = crate::channels::rate_limit::bounded_retry_after(
-                after.duration(),
-                crate::channels::rate_limit::default_retry_after_cap(),
-            );
-            crate::channels::rate_limit::sleep_after_rate_limit("telegram", delay).await;
-            op().into_future().await
-        }
-        Err(err) => Err(err),
-    }
-}
-
-async fn send_markdown_chunks_or_fallback_result(
-    bot: &Bot,
-    chat_id: ChatId,
-    markdown: &str,
-) -> anyhow::Result<Vec<String>> {
-    let html = markdown_to_telegram_html(markdown);
-    let html_chunks = split_message(&html, 4096);
-    let plain_chunks = split_message(&markdown_to_telegram_plain_fallback(markdown), 4096);
-    let mut first_err: Option<anyhow::Error> = None;
-    let mut message_ids = Vec::new();
-
-    for (i, html_chunk) in html_chunks.iter().enumerate() {
-        let plain_chunk = plain_chunks
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or(html_chunk.as_str());
-        match send_html_or_fallback(bot, chat_id, html_chunk, plain_chunk).await {
-            Ok(message) => message_ids.push(message.id.to_string()),
-            Err(e) => {
-                warn!("Failed to send Telegram message: {}", e);
-                if first_err.is_none() {
-                    first_err = Some(anyhow::anyhow!("Failed to send Telegram message: {}", e));
-                }
-            }
-        }
-    }
-
-    if let Some(err) = first_err {
-        return Err(err);
-    }
-    Ok(message_ids)
-}
-
-/// Convert markdown to Telegram HTML and send with plain-text fallback.
-async fn send_markdown_chunks_or_fallback(bot: &Bot, chat_id: ChatId, markdown: &str) {
-    if let Err(e) = send_markdown_chunks_or_fallback_result(bot, chat_id, markdown).await {
-        warn!("Failed to send Telegram message: {}", e);
-    }
-}
-
-async fn send_full_or_expandable_reply(
-    bot: &Bot,
-    chat_id: ChatId,
-    markdown: &str,
-) -> anyhow::Result<Vec<String>> {
-    let plain = markdown_to_telegram_plain_fallback(markdown);
-    if plain.chars().count() > TELEGRAM_EXPANDABLE_TRIGGER_CHARS {
-        return send_expandable_blockquote_reply(bot, chat_id, markdown).await;
-    }
-    send_markdown_chunks_or_fallback_result(bot, chat_id, markdown).await
-}
-
-async fn send_expandable_blockquote_reply(
-    bot: &Bot,
-    chat_id: ChatId,
-    markdown: &str,
-) -> anyhow::Result<Vec<String>> {
-    let html_body = markdown_to_telegram_html(markdown);
-    let plain = markdown_to_telegram_plain_fallback(markdown);
-    let max_chunk = TELEGRAM_MAX_MESSAGE_LEN - TELEGRAM_EXPANDABLE_WRAPPER_LEN;
-    let html_chunks = split_message(&html_body, max_chunk);
-    let plain_chunks = split_message(&plain, max_chunk);
-    let mut first_err: Option<anyhow::Error> = None;
-    let mut message_ids = Vec::new();
-    for (i, html_chunk) in html_chunks.iter().enumerate() {
-        let wrapped = format!("<blockquote expandable>{}</blockquote>", html_chunk);
-        let plain_chunk = plain_chunks
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or(html_chunk.as_str());
-        match send_html_or_fallback(bot, chat_id, &wrapped, plain_chunk).await {
-            Ok(message) => message_ids.push(message.id.to_string()),
-            Err(e) => {
-                warn!("Failed to send expandable Telegram message: {}", e);
-                if first_err.is_none() {
-                    first_err = Some(anyhow::anyhow!("Failed to send Telegram message: {}", e));
-                }
-            }
-        }
-    }
-
-    if let Some(err) = first_err {
-        return Err(err);
-    }
-    Ok(message_ids)
-}
-
-/// Spawn a TelegramChannel in a background task.
-/// This is a separate function to avoid async type inference cycles.
-pub fn spawn_telegram_channel(channel: Arc<TelegramChannel>) {
-    tokio::spawn(async move {
-        channel.start_with_retry().await;
-    });
-}
-
-/// Result of the authorization check for an incoming message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthResult {
-    /// User is in the allow list — proceed normally.
-    Authorized,
-    /// No users were configured and this user was auto-claimed as owner.
-    AutoClaimed,
-    /// User is not allowed.
-    Unauthorized,
-}
-
-/// Pure authorization check against the allow list with first-user auto-claim.
-/// When `allowed` is empty, pushes `user_id` into it and returns `AutoClaimed`.
-pub fn check_auth(allowed: &mut Vec<u64>, user_id: u64) -> AuthResult {
-    if allowed.is_empty() {
-        allowed.push(user_id);
-        AuthResult::AutoClaimed
-    } else if allowed.contains(&user_id) {
-        AuthResult::Authorized
-    } else {
-        AuthResult::Unauthorized
-    }
-}
-
-/// Pure role determination: Owner when `owner_ids` is empty (all allowed users
-/// are owners) or when the user is explicitly listed; Guest otherwise.
-pub fn determine_role(owner_ids: &[u64], user_id: u64) -> UserRole {
-    if owner_ids.is_empty() || owner_ids.contains(&user_id) {
-        UserRole::Owner
-    } else {
-        UserRole::Guest
-    }
-}
-
-fn is_indicator_only_status(update: &StatusUpdate) -> bool {
-    matches!(update, StatusUpdate::Thinking(_))
-}
-
-/// Single status consumer used at both the primary and queue-drain sites.
-///
-/// Ordinary progress events are folded into the `LiveStatus` single-surface owner
-/// (one message created lazily and edited in place). BudgetExtended and explicitly
-/// typed user actions are must-deliver and sent as their own messages. Merely
-/// containing a URL does not make internal progress user-facing: task descriptions
-/// often contain URLs too.
-async fn run_status_consumer(
-    mut rx: tokio::sync::mpsc::Receiver<StatusUpdate>,
-    owner: std::sync::Arc<tokio::sync::Mutex<crate::channels::live_status::LiveStatus>>,
-    sink: std::sync::Arc<crate::channels::live_status::HubSurfaceSink>,
-    bot: Bot,
-    chat_id: ChatId,
-    is_dm: bool,
-) {
-    use crate::channels::live_status::SurfaceSink;
-    let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
-    let min_interval = Duration::from_secs(3);
-    while let Some(update) = rx.recv().await {
-        if is_indicator_only_status(&update) {
-            let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
-            continue;
-        }
-        let is_immediate = update.requires_immediate_delivery();
-        let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
-        // Non-DM channels: suppress progress except BudgetExtended (unchanged behaviour).
-        if !is_dm && !is_budget_ext {
-            continue;
-        }
-        // BudgetExtended and explicit user actions are must-deliver: send as
-        // their own message (never folded into the live surface).
-        if is_immediate {
-            let text = match &update {
-                StatusUpdate::BudgetExtended {
-                    old_budget,
-                    new_budget,
-                    extension,
-                    max_extensions,
-                } => format!(
-                    "💰 Auto-extended token budget {old_budget} → {new_budget} \
-                     ({extension}/{max_extensions}) — continuing."
-                ),
-                StatusUpdate::UserActionRequired { message } => message.clone(),
-                _ => String::new(),
-            };
-            if !text.is_empty() {
-                let _ = bot.send_message(chat_id, text).await;
-            }
-            continue;
-        }
-        // Ordinary progress → single live surface, gated by min_interval.
-        // Exception: the plan checklist is the highest-value content and edits in
-        // place, so it must never be dropped by the throttle. It typically arrives
-        // within a second of the track_requirements ToolStart (well inside
-        // min_interval), which previously discarded it and the plan never showed.
-        let now = tokio::time::Instant::now();
-        let is_checklist = matches!(&update, StatusUpdate::Checklist { .. });
-        if !is_checklist && now.duration_since(last_sent) < min_interval {
-            continue;
-        }
-        let sink_ref: &dyn SurfaceSink = sink.as_ref();
-        // Single-writer invariant: exactly one consumer task touches `owner` per
-        // turn and turns are sequential (the previous task is aborted before the
-        // next is spawned), so holding the lock across the network send below is
-        // safe — there is never a second writer to contend with.
-        match &update {
-            StatusUpdate::Checklist { text } => {
-                owner
-                    .lock()
-                    .await
-                    .set_checklist(sink_ref, text.clone())
-                    .await;
-            }
-            StatusUpdate::ToolStart { name, summary } => {
-                let line = if summary.is_empty() {
-                    format!("{name}…")
-                } else {
-                    format!("{name}: {summary}…")
-                };
-                owner.lock().await.set_activity(sink_ref, line).await;
-            }
-            StatusUpdate::ToolComplete { name, .. } => {
-                owner
-                    .lock()
-                    .await
-                    .set_activity(sink_ref, format!("{name}…"))
-                    .await;
-            }
-            StatusUpdate::PlanStepStart { description, .. }
-            | StatusUpdate::PlanStepComplete { description, .. } => {
-                owner
-                    .lock()
-                    .await
-                    .set_activity(sink_ref, description.clone())
-                    .await;
-            }
-            _ => {
-                continue; // other Plan*/Thinking variants: no separate message
-            }
-        }
-        last_sent = tokio::time::Instant::now();
-        let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
-    }
-}
-
-/// Legacy (pre-LiveStatus) status consumer used only when the `ChannelHub` is
-/// not wired and the single live surface is unavailable. Sends a fresh message
-/// per status update (heavyweight `StatusUpdate` match) with the historical
-/// `dm_status_count`/`MAX_DM_STATUS_MESSAGES` spam cap. This is the defensive
-/// fallback shared by both the primary and queue-drain sites.
-async fn run_legacy_status_consumer(
-    mut rx: tokio::sync::mpsc::Receiver<StatusUpdate>,
-    bot: Bot,
-    chat_id: ChatId,
-    is_dm: bool,
-) {
-    let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
-    let min_interval = Duration::from_secs(3);
-    let mut dm_status_count: u32 = 0;
-    const MAX_DM_STATUS_MESSAGES: u32 = 6;
-    while let Some(update) = rx.recv().await {
-        if is_indicator_only_status(&update) {
-            let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
-            continue;
-        }
-        // In non-DM channels, suppress progress chatter.
-        if !is_dm {
-            if matches!(&update, StatusUpdate::BudgetExtended { .. }) {
-                // Fall through — cost notifications must reach the user
-            } else {
-                continue;
-            }
-        }
-        let now = tokio::time::Instant::now();
-        // Explicit user actions and BudgetExtended notifications must always be
-        // delivered. Ordinary progress remains rate-limited even when the task
-        // description happens to include a URL.
-        let is_immediate = update.requires_immediate_delivery();
-        // Hard cap on DM status messages to prevent notification spam.
-        // BudgetExtended and explicit user actions always bypass the cap.
-        if !is_immediate && dm_status_count >= MAX_DM_STATUS_MESSAGES {
-            // After the cap, just send typing indicator instead
-            let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
-            continue;
-        }
-        if !is_immediate && now.duration_since(last_sent) < min_interval {
-            continue;
-        }
-        let text = match &update {
-            StatusUpdate::Thinking(_) => continue,
-            StatusUpdate::ToolStart { name, summary } => {
-                let mut chars = name.chars();
-                let cap_name = match chars.next() {
-                    None => String::new(),
-                    Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
-                };
-                if summary.is_empty() {
-                    format!("{}...", cap_name)
-                } else {
-                    format!("{}: {}...", cap_name, summary)
-                }
-            }
-            StatusUpdate::ToolProgress { name, chunk } => {
-                let preview: String = chunk.chars().take(100).collect();
-                if chunk.chars().count() > 100 {
-                    format!("📤 {}: {}...", name, preview)
-                } else {
-                    format!("📤 {}: {}", name, preview)
-                }
-            }
-            StatusUpdate::UserActionRequired { message } => message.clone(),
-            StatusUpdate::ToolComplete { name, summary } => {
-                format!("✓ {}: {}", name, summary)
-            }
-            StatusUpdate::ToolCancellable { name, task_id } => {
-                format!("⏳ {} started (task_id: {})", name, task_id)
-            }
-            StatusUpdate::ProgressSummary {
-                elapsed_mins,
-                summary,
-            } => {
-                format!("📊 Progress ({} min): {}", elapsed_mins, summary)
-            }
-            StatusUpdate::IterationWarning { current, threshold } => {
-                format!(
-                    "⚠️ Approaching soft limit: {} of {} iterations",
-                    current, threshold
-                )
-            }
-            StatusUpdate::PlanCreated {
-                description,
-                total_steps,
-                ..
-            } => {
-                format!("📋 Plan created: {} ({} steps)", description, total_steps)
-            }
-            StatusUpdate::PlanStepStart {
-                step_index,
-                total_steps,
-                description,
-                ..
-            } => {
-                format!(
-                    "▶️ Step {}/{}: {}",
-                    step_index + 1,
-                    total_steps,
-                    description
-                )
-            }
-            StatusUpdate::PlanStepComplete {
-                step_index,
-                total_steps,
-                description,
-                summary,
-                ..
-            } => {
-                let base = format!(
-                    "✅ Step {}/{} done: {}",
-                    step_index + 1,
-                    total_steps,
-                    description
-                );
-                if let Some(s) = summary {
-                    format!("{} - {}", base, s)
-                } else {
-                    base
-                }
-            }
-            StatusUpdate::PlanStepFailed {
-                step_index,
-                description,
-                error,
-                ..
-            } => {
-                format!(
-                    "❌ Step {} failed: {} - {}",
-                    step_index + 1,
-                    description,
-                    error
-                )
-            }
-            StatusUpdate::PlanComplete {
-                description,
-                total_steps,
-                duration_secs,
-                ..
-            } => {
-                let mins = duration_secs / 60;
-                let secs = duration_secs % 60;
-                format!(
-                    "🎉 Plan complete: {} ({} steps in {}m {}s)",
-                    description, total_steps, mins, secs
-                )
-            }
-            StatusUpdate::PlanAbandoned { description, .. } => {
-                format!("🚫 Plan abandoned: {}", description)
-            }
-            StatusUpdate::PlanRevised {
-                description,
-                reason,
-                new_total_steps,
-                ..
-            } => {
-                format!(
-                    "🔄 Plan revised: {} ({} steps) - {}",
-                    description, new_total_steps, reason
-                )
-            }
-            StatusUpdate::BudgetExtended {
-                old_budget,
-                new_budget,
-                extension,
-                max_extensions,
-            } => {
-                format!(
-                    "💰 Auto-extended token budget {} → {} ({}/{}) — continuing.",
-                    old_budget, new_budget, extension, max_extensions
-                )
-            }
-            StatusUpdate::Checklist { text } => text.clone(),
-        };
-        let _ = bot.send_message(chat_id, text).await;
-        dm_status_count += 1;
-        // Re-send typing indicator immediately after each status message.
-        // Telegram clears the typing indicator when a message is sent, so
-        // without this there's a visible gap until the typing loop's next
-        // 4-second tick.
-        let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
-        last_sent = tokio::time::Instant::now();
-    }
-}
-
-/// Tracks whether Telegram long-polling has been failing continuously long
-/// enough to be considered "wedged" — e.g. a persistent getUpdates 409 after a
-/// restart that teloxide's internal retry never recovers from. Pure and
-/// testable: the caller supplies the current cumulative error count and `now`.
-#[derive(Default)]
-struct PollHealth {
-    streak_started_at: Option<Instant>,
-    last_count: u64,
-}
-
-impl PollHealth {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns true when getUpdates has been erroring continuously for at least
-    /// `threshold`. A tick with no new errors clears the streak (teloxide
-    /// recovered on its own).
-    fn observe(&mut self, current_count: u64, now: Instant, threshold: Duration) -> bool {
-        if current_count > self.last_count {
-            let started = *self.streak_started_at.get_or_insert(now);
-            self.last_count = current_count;
-            now.saturating_duration_since(started) >= threshold
-        } else {
-            self.streak_started_at = None;
-            self.last_count = current_count;
-            false
-        }
-    }
-}
-
-/// Error handler for the Telegram polling listener. teloxide's default handler
-/// logs under the `teloxide` target, which our tracing filter drops — that's how
-/// a wedged getUpdates went completely silent. This logs loudly under our own
-/// target and counts errors so the watchdog can force a reconnect.
-struct PollingErrorHandler {
-    bot_username: String,
-    error_count: Arc<AtomicU64>,
-}
-
-impl<E: std::fmt::Debug> ErrorHandler<E> for PollingErrorHandler {
-    fn handle_error(self: Arc<Self>, error: E) -> BoxFuture<'static, ()> {
-        let n = self.error_count.fetch_add(1, Ordering::Relaxed) + 1;
-        // Loud on the first error, then periodically, so a sustained wedge is
-        // visible without flooding the log on every retry.
-        if n == 1 || n.is_multiple_of(10) {
-            warn!(
-                name = %self.bot_username,
-                consecutive_errors = n,
-                error = ?error,
-                "Telegram getUpdates polling error"
-            );
-        }
-        Box::pin(async {})
-    }
-}
-
-/// Watchdog that returns once Telegram polling has been failing continuously
-/// past the wedge threshold, so the caller (`start_with_retry`) can restart the
-/// dispatcher with a fresh getUpdates connection. A healthy or merely quiet bot
-/// keeps it parked indefinitely (it only trips on *sustained* errors).
-async fn poll_health_watchdog(error_count: Arc<AtomicU64>, bot_username: String) {
-    const TICK: Duration = Duration::from_secs(30);
-    const WEDGE_THRESHOLD: Duration = Duration::from_secs(120);
-    let mut health = PollHealth::new();
-    loop {
-        tokio::time::sleep(TICK).await;
-        let count = error_count.load(Ordering::Relaxed);
-        if health.observe(count, Instant::now(), WEDGE_THRESHOLD) {
-            warn!(
-                name = %bot_username,
-                total_errors = count,
-                threshold_secs = WEDGE_THRESHOLD.as_secs(),
-                "Telegram long-polling wedged (getUpdates failing continuously); restarting dispatcher to re-establish the connection"
-            );
-            return;
-        }
-    }
-}
+#[cfg(test)]
+#[path = "telegram_sdk_tests.rs"]
+mod sdk_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn terminal_bot_sync_response_accepts_success_json() {
-        let (result, retryable) = interpret_terminal_bot_sync_response(
-            reqwest::StatusCode::OK,
-            Some("application/json"),
-            br#"{"ok":true}"#,
-        );
-        assert!(result.is_ok());
-        assert!(!retryable);
-    }
-
-    #[test]
-    fn terminal_bot_sync_response_classifies_transient_non_json() {
-        let (result, retryable) = interpret_terminal_bot_sync_response(
-            reqwest::StatusCode::BAD_GATEWAY,
-            Some("text/html"),
-            b"upstream unavailable",
-        );
-        let error = result.unwrap_err();
-        assert!(error.contains("status 502 Bad Gateway"));
-        assert!(error.contains("content-type text/html"));
-        assert!(retryable);
-    }
-
-    #[test]
-    fn terminal_bot_sync_response_does_not_retry_auth_rejection() {
-        let (result, retryable) = interpret_terminal_bot_sync_response(
-            reqwest::StatusCode::UNAUTHORIZED,
-            Some("application/json"),
-            br#"{"ok":false,"error":"invalid proof"}"#,
-        );
-        assert!(result.unwrap_err().contains("invalid proof"));
-        assert!(!retryable);
-    }
-
-    #[test]
-    fn poll_health_flags_wedge_after_sustained_errors() {
-        let mut h = PollHealth::new();
-        let t0 = Instant::now();
-        let threshold = Duration::from_secs(120);
-        // Errors begin.
-        assert!(!h.observe(1, t0, threshold));
-        // Still erroring, but within the threshold — give teloxide time to recover.
-        assert!(!h.observe(3, t0 + Duration::from_secs(60), threshold));
-        // Errors sustained past the threshold — wedged, force a restart.
-        assert!(h.observe(5, t0 + Duration::from_secs(121), threshold));
-    }
-
-    #[test]
-    fn poll_health_clears_streak_when_errors_stop() {
-        let mut h = PollHealth::new();
-        let t0 = Instant::now();
-        let threshold = Duration::from_secs(120);
-        assert!(!h.observe(1, t0, threshold));
-        // A tick with no new errors means teloxide recovered: clear the streak.
-        assert!(!h.observe(1, t0 + Duration::from_secs(60), threshold));
-        // A later error starts a fresh streak, so it is not immediately a wedge
-        // even though wall-clock is now past t0 + threshold.
-        assert!(!h.observe(2, t0 + Duration::from_secs(130), threshold));
-    }
-
-    #[test]
-    fn thinking_status_uses_native_telegram_indicator_only() {
-        assert!(is_indicator_only_status(&StatusUpdate::Thinking(2)));
-    }
 
     #[test]
     fn normalize_agent_permission_aliases_maps_claude_allow_flag() {
@@ -6178,160 +2122,9 @@ mod tests {
     // --- check_auth ---
 
     #[test]
-    fn auth_empty_list_auto_claims_first_user() {
-        let mut allowed = vec![];
-        assert_eq!(check_auth(&mut allowed, 111), AuthResult::AutoClaimed);
-        assert_eq!(allowed, vec![111]);
-    }
-
-    #[test]
-    fn auth_allowed_user_is_authorized() {
-        let mut allowed = vec![111, 222];
-        assert_eq!(check_auth(&mut allowed, 222), AuthResult::Authorized);
-    }
-
-    #[test]
-    fn auth_unknown_user_is_unauthorized() {
-        let mut allowed = vec![111];
-        assert_eq!(check_auth(&mut allowed, 999), AuthResult::Unauthorized);
-        // List should not be modified
-        assert_eq!(allowed, vec![111]);
-    }
-
-    #[test]
-    fn auth_second_user_after_auto_claim_is_unauthorized() {
-        let mut allowed = vec![];
-        assert_eq!(check_auth(&mut allowed, 111), AuthResult::AutoClaimed);
-        assert_eq!(check_auth(&mut allowed, 222), AuthResult::Unauthorized);
-    }
-
-    #[test]
-    fn auth_same_user_after_auto_claim_is_authorized() {
-        let mut allowed = vec![];
-        assert_eq!(check_auth(&mut allowed, 111), AuthResult::AutoClaimed);
-        assert_eq!(check_auth(&mut allowed, 111), AuthResult::Authorized);
-    }
-
-    // --- determine_role ---
-
-    #[test]
-    fn role_no_owner_ids_defaults_to_owner() {
-        assert_eq!(determine_role(&[], 111), UserRole::Owner);
-    }
-
-    #[test]
-    fn role_user_in_owner_ids_is_owner() {
-        assert_eq!(determine_role(&[111, 222], 111), UserRole::Owner);
-    }
-
-    #[test]
-    fn role_user_not_in_owner_ids_is_guest() {
-        assert_eq!(determine_role(&[111], 222), UserRole::Guest);
-    }
-
-    #[test]
-    fn parse_web_app_action_handles_continue_on_computer() {
-        let payload = r#"{"type":"aidaemon.telegram.open_on_computer.v1"}"#;
-        match TelegramChannel::parse_web_app_action(payload) {
-            Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
-                assert!(relay_session_id.is_none());
-            }
-            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
-        }
-    }
-
-    #[test]
-    fn parse_web_app_action_extracts_agent_message() {
-        let payload = r#"{"type":"aidaemon.telegram.agent_message.v1","text":"Continue fixing the failing tests."}"#;
-        match TelegramChannel::parse_web_app_action(payload) {
-            Some(TelegramWebAppAction::AgentMessage(text)) => {
-                assert_eq!(text, "Continue fixing the failing tests.");
-            }
-            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
-        }
-    }
-
-    #[test]
-    fn parse_web_app_action_extracts_continue_session_id() {
-        let payload =
-            r#"{"type":"aidaemon.telegram.open_on_computer.v1","relay_session_id":"sess_123"}"#;
-        match TelegramChannel::parse_web_app_action(payload) {
-            Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
-                assert_eq!(relay_session_id.as_deref(), Some("sess_123"));
-            }
-            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
-        }
-    }
-
-    #[test]
-    fn parse_web_app_action_extracts_continue_session_id_camel_case() {
-        let payload =
-            r#"{"type":"aidaemon.telegram.open_on_computer.v1","relaySessionId":"sess_camel"}"#;
-        match TelegramChannel::parse_web_app_action(payload) {
-            Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
-                assert_eq!(relay_session_id.as_deref(), Some("sess_camel"));
-            }
-            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
-        }
-    }
-
-    #[test]
-    fn parse_web_app_action_extracts_continue_session_id_from_object() {
-        let payload =
-            r#"{"type":"aidaemon.telegram.open_on_computer.v1","session":{"id":"sess_obj"}}"#;
-        match TelegramChannel::parse_web_app_action(payload) {
-            Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
-                assert_eq!(relay_session_id.as_deref(), Some("sess_obj"));
-            }
-            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
-        }
-    }
-
-    #[test]
-    fn parse_web_app_action_accepts_legacy_session_id_key() {
-        let payload =
-            r#"{"type":"aidaemon.telegram.open_on_computer.v1","session_id":"sess_legacy"}"#;
-        match TelegramChannel::parse_web_app_action(payload) {
-            Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
-                assert_eq!(relay_session_id.as_deref(), Some("sess_legacy"));
-            }
-            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
-        }
-    }
-
-    #[test]
-    fn parse_web_app_action_accepts_nested_payload_string() {
-        let payload = r#"{"data":"{\"type\":\"aidaemon.telegram.open_on_computer.v1\",\"relay_session_id\":\"sess_nested\"}"}"#;
-        match TelegramChannel::parse_web_app_action(payload) {
-            Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
-                assert_eq!(relay_session_id.as_deref(), Some("sess_nested"));
-            }
-            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
-        }
-    }
-
-    #[test]
-    fn parse_web_app_action_rejects_unknown_payload() {
-        let payload = r#"{"type":"unknown","text":"hello"}"#;
-        assert!(TelegramChannel::parse_web_app_action(payload).is_none());
-    }
-
-    #[test]
-    fn fallback_session_namespace_uses_bot_id_prefix() {
-        let ns = fallback_session_namespace_from_token("123456789:ABCDEF");
-        assert_eq!(ns, "tg123456789");
-    }
-
-    #[test]
-    fn fallback_session_namespace_sanitizes_invalid_chars() {
-        let ns = fallback_session_namespace_from_token("12$34:^secret");
-        assert_eq!(ns, "tg1234");
-    }
-
-    #[test]
     fn strip_low_latency_next_steps_removes_manual_instructions() {
         let text = "Low-latency webhook config applied (local config only).\nBackup: config.toml.lowlatency.bak\n\nNext steps:\n1. step one\n2. step two\n";
-        let stripped = TelegramChannel::strip_low_latency_next_steps(text);
+        let stripped = Cx::strip_low_latency_next_steps(text);
         assert_eq!(
             stripped,
             "Low-latency webhook config applied (local config only).\nBackup: config.toml.lowlatency.bak"
@@ -6341,7 +2134,7 @@ mod tests {
     #[test]
     fn strip_low_latency_next_steps_leaves_text_without_marker() {
         let text = "Low-latency webhook config applied (local config only).\nBackup: config.toml.lowlatency.bak\n";
-        let stripped = TelegramChannel::strip_low_latency_next_steps(text);
+        let stripped = Cx::strip_low_latency_next_steps(text);
         assert_eq!(stripped, text);
     }
 
@@ -6351,7 +2144,7 @@ mod tests {
         let cert_path = dir.path().join("cert.pem");
         tokio::fs::write(&cert_path, "dummy-cert").await.unwrap();
 
-        let backup = TelegramChannel::backup_cloudflared_origin_cert_if_present(&cert_path)
+        let backup = Cx::backup_cloudflared_origin_cert_if_present(&cert_path)
             .await
             .unwrap()
             .unwrap();
@@ -6366,7 +2159,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cert_path = dir.path().join("cert.pem");
 
-        let backup = TelegramChannel::backup_cloudflared_origin_cert_if_present(&cert_path)
+        let backup = Cx::backup_cloudflared_origin_cert_if_present(&cert_path)
             .await
             .unwrap();
         assert!(backup.is_none());
@@ -6427,10 +2220,10 @@ allowed_user_ids = []
                 .map(|&id| toml::Value::Integer(id as i64))
                 .collect(),
         );
-        if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut()) {
-            if let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
-                first.insert("allowed_user_ids".to_string(), ids_toml);
-            }
+        if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut())
+            && let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut())
+        {
+            first.insert("allowed_user_ids".to_string(), ids_toml);
         }
         let new_content = toml::to_string_pretty(&toml::Value::Table(doc)).unwrap();
         tokio::fs::write(&config_path, &new_content).await.unwrap();

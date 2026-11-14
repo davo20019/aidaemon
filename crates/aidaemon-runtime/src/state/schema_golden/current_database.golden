@@ -1,0 +1,1597 @@
+table events on events
+CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            data TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            consolidated_at TEXT,
+            task_id TEXT,
+            tool_name TEXT,
+            turn_id TEXT
+        )
+
+index idx_events_turn on events
+CREATE INDEX idx_events_turn
+         ON events(session_id, turn_id, id)
+
+table session_context_boundaries on session_context_boundaries
+CREATE TABLE session_context_boundaries (
+            session_id TEXT PRIMARY KEY,
+            cleared_after_id INTEGER NOT NULL,
+            cleared_at TEXT NOT NULL
+        )
+
+index idx_events_session_time on events
+CREATE INDEX idx_events_session_time
+         ON events(session_id, created_at DESC)
+
+index idx_events_session_id on events
+CREATE INDEX idx_events_session_id
+         ON events(session_id, id)
+
+index idx_events_type on events
+CREATE INDEX idx_events_type ON events(event_type)
+
+index idx_events_task on events
+CREATE INDEX idx_events_task
+         ON events(task_id) WHERE task_id IS NOT NULL
+
+table task_lifecycle on task_lifecycle
+CREATE TABLE task_lifecycle (
+            session_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('running', 'terminal')),
+            status TEXT,
+            outcome TEXT,
+            version INTEGER NOT NULL DEFAULT 1,
+            start_event_id INTEGER,
+            terminal_event_id INTEGER,
+            started_at TEXT,
+            ended_at TEXT,
+            PRIMARY KEY(session_id, task_id),
+            FOREIGN KEY(start_event_id) REFERENCES events(id) ON DELETE SET NULL,
+            FOREIGN KEY(terminal_event_id) REFERENCES events(id) ON DELETE SET NULL
+        )
+
+index idx_task_lifecycle_session_state on task_lifecycle
+CREATE INDEX idx_task_lifecycle_session_state
+         ON task_lifecycle(session_id, state)
+
+index idx_events_consolidation on events
+CREATE INDEX idx_events_consolidation
+         ON events(consolidated_at) WHERE consolidated_at IS NULL
+
+index idx_events_prune on events
+CREATE INDEX idx_events_prune
+         ON events(created_at) WHERE consolidated_at IS NOT NULL
+
+table filesystem_checkpoints on filesystem_checkpoints
+CREATE TABLE filesystem_checkpoints (
+            id TEXT PRIMARY KEY,
+            scope_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            task_id TEXT,
+            turn_id TEXT,
+            backend_id TEXT NOT NULL,
+            root_path TEXT NOT NULL,
+            store_path TEXT NOT NULL,
+            pre_tree TEXT NOT NULL,
+            post_tree TEXT,
+            state TEXT NOT NULL,
+            origin_tool TEXT NOT NULL,
+            included_paths INTEGER NOT NULL DEFAULT 0,
+            included_bytes INTEGER NOT NULL DEFAULT 0,
+            excluded_paths INTEGER NOT NULL DEFAULT 0,
+            unsafe_reason TEXT,
+            rollback_of TEXT,
+            created_at TEXT NOT NULL,
+            finalized_at TEXT,
+            expires_at TEXT NOT NULL,
+            UNIQUE(scope_id, backend_id, root_path)
+        )
+
+index idx_filesystem_checkpoints_root_created on filesystem_checkpoints
+CREATE INDEX idx_filesystem_checkpoints_root_created
+         ON filesystem_checkpoints(root_path, created_at DESC)
+
+index idx_filesystem_checkpoints_task_state on filesystem_checkpoints
+CREATE INDEX idx_filesystem_checkpoints_task_state
+         ON filesystem_checkpoints(task_id, state)
+
+table checkpoint_restore_runs on checkpoint_restore_runs
+CREATE TABLE checkpoint_restore_runs (
+            id TEXT PRIMARY KEY,
+            checkpoint_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
+            next_index INTEGER NOT NULL DEFAULT 0,
+            safety_checkpoint_id TEXT,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            completed_at TEXT,
+            error TEXT
+        )
+
+index idx_events_tool_result_name_time on events
+CREATE INDEX idx_events_tool_result_name_time
+         ON events(tool_name, created_at DESC)
+         WHERE event_type = 'tool_result' AND tool_name IS NOT NULL
+
+table facts on facts
+CREATE TABLE facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        , superseded_at TEXT, recall_count INTEGER DEFAULT 0, last_recalled_at TEXT, channel_id TEXT, privacy TEXT DEFAULT 'global', embedding BLOB, first_seen_at TEXT, source_excerpt TEXT)
+
+table episodes on episodes
+CREATE TABLE episodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            topics TEXT,
+            emotional_tone TEXT,
+            outcome TEXT,
+            embedding BLOB,
+            importance REAL DEFAULT 0.5,
+            recall_count INTEGER DEFAULT 0,
+            last_recalled_at TEXT,
+            message_count INTEGER,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        , channel_id TEXT, start_event_id INTEGER, end_event_id INTEGER)
+
+index idx_episodes_session on episodes
+CREATE INDEX idx_episodes_session ON episodes(session_id)
+
+table user_profile on user_profile
+CREATE TABLE user_profile (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            verbosity_preference TEXT DEFAULT 'medium',
+            explanation_depth TEXT DEFAULT 'moderate',
+            tone_preference TEXT DEFAULT 'neutral',
+            emoji_preference TEXT DEFAULT 'none',
+            typical_session_length INTEGER,
+            active_hours TEXT,
+            common_workflows TEXT,
+            asks_before_acting INTEGER DEFAULT 0,
+            prefers_explanations INTEGER DEFAULT 1,
+            likes_suggestions INTEGER DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+
+table behavior_patterns on behavior_patterns
+CREATE TABLE behavior_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_type TEXT NOT NULL,
+            description TEXT NOT NULL,
+            trigger_context TEXT,
+            action TEXT,
+            confidence REAL DEFAULT 0.5,
+            occurrence_count INTEGER DEFAULT 1,
+            last_seen_at TEXT,
+            created_at TEXT NOT NULL
+        )
+
+table procedures on procedures
+CREATE TABLE procedures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            trigger_pattern TEXT NOT NULL,
+            trigger_embedding BLOB,
+            steps TEXT NOT NULL,
+            success_count INTEGER DEFAULT 1,
+            failure_count INTEGER DEFAULT 0,
+            avg_duration_secs REAL,
+            last_used_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+
+table expertise on expertise
+CREATE TABLE expertise (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT NOT NULL UNIQUE,
+            tasks_attempted INTEGER DEFAULT 0,
+            tasks_succeeded INTEGER DEFAULT 0,
+            tasks_failed INTEGER DEFAULT 0,
+            current_level TEXT DEFAULT 'novice',
+            confidence_score REAL DEFAULT 0.0,
+            common_errors TEXT,
+            last_task_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+
+table error_solutions on error_solutions
+CREATE TABLE error_solutions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            error_pattern TEXT NOT NULL,
+            error_embedding BLOB,
+            domain TEXT,
+            solution_summary TEXT NOT NULL,
+            solution_steps TEXT,
+            success_count INTEGER DEFAULT 1,
+            failure_count INTEGER DEFAULT 0,
+            last_used_at TEXT,
+            created_at TEXT NOT NULL
+        )
+
+index idx_error_solutions_unique on error_solutions
+CREATE UNIQUE INDEX idx_error_solutions_unique
+             ON error_solutions(error_pattern, domain, solution_summary)
+
+table people on people
+CREATE TABLE people (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            aliases_json TEXT NOT NULL DEFAULT '[]',
+            relationship TEXT,
+            platform_ids_json TEXT NOT NULL DEFAULT '{}',
+            notes TEXT,
+            communication_style TEXT,
+            language_preference TEXT,
+            last_interaction_at TEXT,
+            interaction_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table person_facts on person_facts
+CREATE TABLE person_facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+            category TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'agent',
+            confidence REAL NOT NULL DEFAULT 1.0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(person_id, category, key)
+        )
+
+index idx_people_name on people
+CREATE INDEX idx_people_name ON people(name)
+
+index idx_person_facts_person on person_facts
+CREATE INDEX idx_person_facts_person ON person_facts(person_id)
+
+index idx_person_facts_category on person_facts
+CREATE INDEX idx_person_facts_category ON person_facts(category)
+
+index idx_facts_channel on facts
+CREATE INDEX idx_facts_channel ON facts(channel_id)
+
+index idx_facts_privacy on facts
+CREATE INDEX idx_facts_privacy ON facts(privacy)
+
+index idx_episodes_session_end_event on episodes
+CREATE INDEX idx_episodes_session_end_event
+         ON episodes(session_id, end_event_id)
+
+index idx_facts_active_unique on facts
+CREATE UNIQUE INDEX idx_facts_active_unique
+         ON facts(category, key) WHERE superseded_at IS NULL
+
+index idx_people_name_unique on people
+CREATE UNIQUE INDEX idx_people_name_unique ON people(LOWER(name))
+
+table memory_spans on memory_spans
+CREATE TABLE memory_spans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            span_kind TEXT NOT NULL,
+            source_event_id INTEGER,
+            source_episode_id INTEGER UNIQUE,
+            session_id TEXT,
+            channel_id TEXT,
+            role TEXT,
+            content TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            privacy TEXT NOT NULL DEFAULT 'global',
+            observed_from TEXT,
+            observed_to TEXT,
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            deleted_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table memory_claims on memory_claims
+CREATE TABLE memory_claims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            claim_text TEXT NOT NULL,
+            source_fact_id INTEGER UNIQUE,
+            source_span_id INTEGER,
+            source_event_id INTEGER,
+            provenance TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 1.0 CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            channel_id TEXT,
+            privacy TEXT NOT NULL DEFAULT 'global',
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            superseded_by_claim_id INTEGER,
+            deleted_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY(source_span_id) REFERENCES memory_spans(id),
+            FOREIGN KEY(superseded_by_claim_id) REFERENCES memory_claims(id)
+        )
+
+table memory_entities on memory_entities
+CREATE TABLE memory_entities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            canonical_name TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            aliases_json TEXT NOT NULL DEFAULT '[]',
+            channel_id TEXT,
+            privacy TEXT NOT NULL DEFAULT 'global',
+            deleted_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')), status TEXT NOT NULL DEFAULT 'active', merged_into_entity_id INTEGER, is_owner INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(entity_type, canonical_name)
+        )
+
+table memory_aliases on memory_aliases
+CREATE TABLE memory_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id INTEGER NOT NULL,
+            alias_type TEXT NOT NULL,
+            value TEXT NOT NULL,
+            normalized_value TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            source TEXT NOT NULL,
+            provenance TEXT,
+            confidence REAL NOT NULL DEFAULT 1.0 CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            channel_id TEXT,
+            privacy TEXT NOT NULL DEFAULT 'private',
+            asserted_at TEXT NOT NULL,
+            confirmed_at TEXT,
+            last_confirmed_at TEXT,
+            valid_from TEXT,
+            valid_to TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(entity_id) REFERENCES memory_entities(id),
+            UNIQUE(entity_id, alias_type, normalized_value)
+        )
+
+table memory_entity_facts on memory_entity_facts
+CREATE TABLE memory_entity_facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject_entity_id INTEGER NOT NULL,
+            predicate TEXT NOT NULL,
+            value_type TEXT NOT NULL DEFAULT 'text',
+            value TEXT NOT NULL,
+            normalized_value TEXT NOT NULL,
+            display_value TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            source TEXT NOT NULL,
+            provenance TEXT,
+            confidence REAL NOT NULL DEFAULT 1.0 CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            source_fact_id INTEGER,
+            channel_id TEXT,
+            privacy TEXT NOT NULL DEFAULT 'private',
+            asserted_at TEXT NOT NULL,
+            confirmed_at TEXT,
+            last_confirmed_at TEXT,
+            valid_from TEXT,
+            valid_to TEXT,
+            supersedes_fact_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(subject_entity_id) REFERENCES memory_entities(id),
+            FOREIGN KEY(source_fact_id) REFERENCES facts(id),
+            FOREIGN KEY(supersedes_fact_id) REFERENCES memory_entity_facts(id)
+        )
+
+table memory_relationships on memory_relationships
+CREATE TABLE memory_relationships (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_entity_id INTEGER NOT NULL,
+            relationship_type TEXT NOT NULL,
+            target_entity_id INTEGER NOT NULL,
+            inverse_relationship_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'active',
+            source TEXT NOT NULL,
+            provenance TEXT,
+            confidence REAL NOT NULL DEFAULT 1.0 CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            source_fact_id INTEGER,
+            channel_id TEXT,
+            privacy TEXT NOT NULL DEFAULT 'private',
+            asserted_at TEXT NOT NULL,
+            confirmed_at TEXT,
+            last_confirmed_at TEXT,
+            valid_from TEXT,
+            valid_to TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(source_entity_id) REFERENCES memory_entities(id),
+            FOREIGN KEY(target_entity_id) REFERENCES memory_entities(id),
+            FOREIGN KEY(inverse_relationship_id) REFERENCES memory_relationships(id),
+            FOREIGN KEY(source_fact_id) REFERENCES facts(id)
+        )
+
+table memory_resolution_reviews on memory_resolution_reviews
+CREATE TABLE memory_resolution_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_kind TEXT NOT NULL,
+            normalized_reference TEXT,
+            candidate_entity_ids_json TEXT NOT NULL DEFAULT '[]',
+            payload_json TEXT NOT NULL,
+            source TEXT NOT NULL,
+            source_fact_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            resolved_at TEXT,
+            UNIQUE(review_kind, normalized_reference, payload_json, status)
+        )
+
+table memory_write_audit on memory_write_audit
+CREATE TABLE memory_write_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation TEXT NOT NULL,
+            entity_id INTEGER,
+            record_type TEXT NOT NULL,
+            record_id INTEGER,
+            prior_state_json TEXT,
+            new_state_json TEXT,
+            source TEXT NOT NULL,
+            source_fact_id INTEGER,
+            provenance TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(entity_id) REFERENCES memory_entities(id)
+        )
+
+table memory_edges on memory_edges
+CREATE TABLE memory_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_entity_id INTEGER NOT NULL,
+            target_entity_id INTEGER NOT NULL,
+            relation TEXT NOT NULL,
+            source_claim_id INTEGER,
+            confidence REAL NOT NULL DEFAULT 1.0 CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            channel_id TEXT,
+            privacy TEXT NOT NULL DEFAULT 'global',
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            deleted_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY(source_entity_id) REFERENCES memory_entities(id),
+            FOREIGN KEY(target_entity_id) REFERENCES memory_entities(id),
+            FOREIGN KEY(source_claim_id) REFERENCES memory_claims(id),
+            UNIQUE(source_entity_id, target_entity_id, relation, source_claim_id)
+        )
+
+table memory_embeddings on memory_embeddings
+CREATE TABLE memory_embeddings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_type TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            embedding_purpose TEXT NOT NULL,
+            embedding_model TEXT NOT NULL,
+            embedding_dim INTEGER NOT NULL CHECK(embedding_dim > 0),
+            content_hash TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            stale_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(owner_type, owner_id, embedding_purpose, embedding_model, content_hash)
+        )
+
+table memory_embedding_generation on memory_embedding_generation
+CREATE TABLE memory_embedding_generation (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            generation INTEGER NOT NULL
+        )
+
+trigger memory_embeddings_generation_insert on memory_embeddings
+CREATE TRIGGER memory_embeddings_generation_insert
+         AFTER INSERT ON memory_embeddings BEGIN
+            UPDATE memory_embedding_generation SET generation = generation + 1 WHERE id = 1;
+         END
+
+trigger memory_embeddings_generation_update on memory_embeddings
+CREATE TRIGGER memory_embeddings_generation_update
+         AFTER UPDATE ON memory_embeddings BEGIN
+            UPDATE memory_embedding_generation SET generation = generation + 1 WHERE id = 1;
+         END
+
+trigger memory_embeddings_generation_delete on memory_embeddings
+CREATE TRIGGER memory_embeddings_generation_delete
+         AFTER DELETE ON memory_embeddings BEGIN
+            UPDATE memory_embedding_generation SET generation = generation + 1 WHERE id = 1;
+         END
+
+index idx_memory_claims_active on memory_claims
+CREATE INDEX idx_memory_claims_active ON memory_claims(privacy, channel_id, valid_to, deleted_at)
+
+index idx_memory_spans_active on memory_spans
+CREATE INDEX idx_memory_spans_active ON memory_spans(privacy, channel_id, valid_to, deleted_at)
+
+index idx_memory_spans_source_event on memory_spans
+CREATE UNIQUE INDEX idx_memory_spans_source_event ON memory_spans(source_event_id) WHERE source_event_id IS NOT NULL
+
+index idx_memory_edges_source on memory_edges
+CREATE INDEX idx_memory_edges_source ON memory_edges(source_entity_id, valid_to, deleted_at)
+
+index idx_memory_edges_target on memory_edges
+CREATE INDEX idx_memory_edges_target ON memory_edges(target_entity_id, valid_to, deleted_at)
+
+index idx_memory_embeddings_lookup on memory_embeddings
+CREATE INDEX idx_memory_embeddings_lookup ON memory_embeddings(embedding_model, embedding_purpose, owner_type, stale_at)
+
+index idx_memory_embeddings_owner on memory_embeddings
+CREATE INDEX idx_memory_embeddings_owner ON memory_embeddings(owner_type, owner_id, stale_at)
+
+index idx_memory_entities_status on memory_entities
+CREATE INDEX idx_memory_entities_status ON memory_entities(entity_type, status, canonical_name)
+
+index idx_memory_entities_one_owner on memory_entities
+CREATE UNIQUE INDEX idx_memory_entities_one_owner ON memory_entities(is_owner) WHERE is_owner = 1 AND status = 'active'
+
+index idx_memory_aliases_lookup on memory_aliases
+CREATE INDEX idx_memory_aliases_lookup ON memory_aliases(normalized_value, alias_type, status)
+
+index idx_memory_aliases_entity on memory_aliases
+CREATE INDEX idx_memory_aliases_entity ON memory_aliases(entity_id, status)
+
+index idx_memory_entity_facts_subject on memory_entity_facts
+CREATE INDEX idx_memory_entity_facts_subject ON memory_entity_facts(subject_entity_id, predicate, status)
+
+index idx_memory_entity_facts_active_exact on memory_entity_facts
+CREATE UNIQUE INDEX idx_memory_entity_facts_active_exact ON memory_entity_facts(subject_entity_id, predicate, normalized_value) WHERE status = 'active' AND valid_to IS NULL
+
+index idx_memory_relationships_source on memory_relationships
+CREATE INDEX idx_memory_relationships_source ON memory_relationships(source_entity_id, relationship_type, status)
+
+index idx_memory_relationships_target on memory_relationships
+CREATE INDEX idx_memory_relationships_target ON memory_relationships(target_entity_id, relationship_type, status)
+
+index idx_memory_relationships_active_exact on memory_relationships
+CREATE UNIQUE INDEX idx_memory_relationships_active_exact ON memory_relationships(source_entity_id, relationship_type, target_entity_id) WHERE status = 'active' AND valid_to IS NULL
+
+index idx_memory_reviews_status on memory_resolution_reviews
+CREATE INDEX idx_memory_reviews_status ON memory_resolution_reviews(status, review_kind)
+
+index idx_memory_audit_entity on memory_write_audit
+CREATE INDEX idx_memory_audit_entity ON memory_write_audit(entity_id, created_at)
+
+trigger memory_claims_ai on memory_claims
+CREATE TRIGGER memory_claims_ai AFTER INSERT ON memory_claims BEGIN INSERT INTO memory_claims_fts(rowid, claim_text) VALUES (new.id, new.claim_text); END
+
+trigger memory_claims_ad on memory_claims
+CREATE TRIGGER memory_claims_ad AFTER DELETE ON memory_claims BEGIN INSERT INTO memory_claims_fts(memory_claims_fts, rowid, claim_text) VALUES ('delete', old.id, old.claim_text); END
+
+trigger memory_spans_ai on memory_spans
+CREATE TRIGGER memory_spans_ai AFTER INSERT ON memory_spans BEGIN INSERT INTO memory_spans_fts(rowid, content) VALUES (new.id, new.content); END
+
+trigger memory_spans_ad on memory_spans
+CREATE TRIGGER memory_spans_ad AFTER DELETE ON memory_spans BEGIN INSERT INTO memory_spans_fts(memory_spans_fts, rowid, content) VALUES ('delete', old.id, old.content); END
+
+table terminal_allowed_prefixes on terminal_allowed_prefixes
+CREATE TABLE terminal_allowed_prefixes (
+            prefix TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table terminal_backend_allowed_prefixes on terminal_backend_allowed_prefixes
+CREATE TABLE terminal_backend_allowed_prefixes (
+            backend_scope TEXT NOT NULL,
+            prefix TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (backend_scope, prefix)
+        )
+
+table command_patterns on command_patterns
+CREATE TABLE command_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern TEXT NOT NULL UNIQUE,
+            original_example TEXT NOT NULL,
+            approval_count INTEGER DEFAULT 1,
+            denial_count INTEGER DEFAULT 0,
+            last_approved_at TEXT,
+            last_denied_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table macros on macros
+CREATE TABLE macros (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trigger_tool TEXT NOT NULL,
+            trigger_args_pattern TEXT, 
+            next_tool TEXT NOT NULL,
+            next_args TEXT NOT NULL,
+            confidence REAL DEFAULT 0.0,
+            used_count INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+
+table token_usage on token_usage
+CREATE TABLE token_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            cached_input_tokens INTEGER,
+            cache_creation_input_tokens INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        , call_id TEXT)
+
+index idx_token_usage_call_id on token_usage
+CREATE INDEX idx_token_usage_call_id
+         ON token_usage(call_id)
+
+index idx_token_usage_created_at on token_usage
+CREATE INDEX idx_token_usage_created_at
+         ON token_usage(created_at)
+
+index idx_token_usage_session_created_at on token_usage
+CREATE INDEX idx_token_usage_session_created_at
+         ON token_usage(session_id, created_at)
+
+table token_usage_daily on token_usage_daily
+CREATE TABLE token_usage_daily (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            model TEXT NOT NULL,
+            total_input_tokens INTEGER NOT NULL,
+            total_output_tokens INTEGER NOT NULL,
+            request_count INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(date, model)
+        )
+
+table dynamic_bots on dynamic_bots
+CREATE TABLE dynamic_bots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_type TEXT NOT NULL,
+            bot_token TEXT NOT NULL,
+            app_token TEXT,
+            allowed_user_ids TEXT NOT NULL DEFAULT '[]',
+            extra_config TEXT DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table session_channels on session_channels
+CREATE TABLE session_channels (
+            session_id TEXT PRIMARY KEY,
+            channel_name TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table dynamic_skills on dynamic_skills
+CREATE TABLE dynamic_skills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            triggers_json TEXT NOT NULL DEFAULT '[]',
+            body TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'inline',
+            source_url TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            version TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        , resources_json TEXT NOT NULL DEFAULT '[]')
+
+table skill_drafts on skill_drafts
+CREATE TABLE skill_drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            triggers_json TEXT NOT NULL DEFAULT '[]',
+            body TEXT NOT NULL,
+            source_procedure TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table dynamic_mcp_servers on dynamic_mcp_servers
+CREATE TABLE dynamic_mcp_servers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            command TEXT NOT NULL,
+            args_json TEXT NOT NULL DEFAULT '[]',
+            env_keys_json TEXT NOT NULL DEFAULT '[]',
+            triggers_json TEXT NOT NULL DEFAULT '[]',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table dynamic_cli_agents on dynamic_cli_agents
+CREATE TABLE dynamic_cli_agents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            command TEXT NOT NULL,
+            args_json TEXT NOT NULL DEFAULT '[]',
+            description TEXT NOT NULL DEFAULT '',
+            timeout_secs INTEGER,
+            max_output_chars INTEGER,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table cli_agent_invocations on cli_agent_invocations
+CREATE TABLE cli_agent_invocations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT,
+            session_id TEXT NOT NULL,
+            agent_name TEXT NOT NULL,
+            prompt_summary TEXT NOT NULL,
+            working_dir TEXT,
+            started_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            exit_code INTEGER,
+            output_summary TEXT,
+            success INTEGER,
+            duration_secs REAL
+        )
+
+index idx_cli_agent_invocations_task_id on cli_agent_invocations
+CREATE INDEX idx_cli_agent_invocations_task_id
+         ON cli_agent_invocations(task_id)
+
+table oauth_connections on oauth_connections
+CREATE TABLE oauth_connections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            service TEXT NOT NULL UNIQUE,
+            auth_type TEXT NOT NULL,
+            username TEXT,
+            account_id TEXT,
+            scopes TEXT NOT NULL DEFAULT '[]',
+            token_expires_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table pending_oauth_flows on pending_oauth_flows
+CREATE TABLE pending_oauth_flows (
+            state TEXT PRIMARY KEY,
+            service TEXT NOT NULL,
+            code_verifier TEXT,
+            session_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+
+index idx_pending_oauth_flows_created_at on pending_oauth_flows
+CREATE INDEX idx_pending_oauth_flows_created_at ON pending_oauth_flows(created_at)
+
+table settings on settings
+CREATE TABLE settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table dialogue_states on dialogue_states
+CREATE TABLE dialogue_states (
+            session_id TEXT PRIMARY KEY,
+            state_json TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            active_task_id TEXT,
+            open_request_status TEXT,
+            awaiting_user_reply INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+
+index idx_dialogue_states_active_task on dialogue_states
+CREATE INDEX idx_dialogue_states_active_task ON dialogue_states(active_task_id)
+
+index idx_dialogue_states_open_request_status on dialogue_states
+CREATE INDEX idx_dialogue_states_open_request_status ON dialogue_states(open_request_status)
+
+table goals on goals
+CREATE TABLE goals (
+            id TEXT PRIMARY KEY,
+            description TEXT NOT NULL,
+            domain TEXT NOT NULL DEFAULT 'orchestration',
+            goal_type TEXT NOT NULL DEFAULT 'finite',
+            status TEXT NOT NULL DEFAULT 'active',
+            priority TEXT NOT NULL DEFAULT 'medium',
+            conditions TEXT,
+            context TEXT,
+            resources TEXT,
+            budget_per_check INTEGER,
+            budget_daily INTEGER,
+            tokens_used_today INTEGER NOT NULL DEFAULT 0,
+            tokens_used_day TEXT NOT NULL DEFAULT '1970-01-01',
+            last_useful_action TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            parent_goal_id TEXT,
+            session_id TEXT NOT NULL,
+            notified_at TEXT,
+            notification_attempts INTEGER NOT NULL DEFAULT 0,
+            dispatch_failures INTEGER NOT NULL DEFAULT 0,
+            progress_notes TEXT,
+            source_episode_id INTEGER REFERENCES episodes(id),
+            legacy_int_id INTEGER
+        , project_id TEXT NOT NULL DEFAULT 'default')
+
+table tasks on tasks
+CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            description TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            priority TEXT NOT NULL DEFAULT 'medium',
+            task_order INTEGER NOT NULL DEFAULT 0,
+            parallel_group TEXT,
+            depends_on TEXT,
+            agent_id TEXT,
+            context TEXT,
+            result TEXT,
+            error TEXT,
+            blocker TEXT,
+            idempotent INTEGER NOT NULL DEFAULT 0,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 3,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            started_at TEXT,
+            completed_at TEXT
+        , goal_run_id TEXT, current_attempt_id TEXT, worker_profile_id TEXT, workspace_policy TEXT NOT NULL DEFAULT 'shared', workspace_policy_explicit INTEGER NOT NULL DEFAULT 0, task_kind TEXT NOT NULL DEFAULT 'work', visibility TEXT NOT NULL DEFAULT 'internal', version INTEGER NOT NULL DEFAULT 0, updated_at TEXT)
+
+table task_activity on task_activity
+CREATE TABLE task_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            activity_type TEXT NOT NULL,
+            tool_name TEXT,
+            tool_args TEXT,
+            result TEXT,
+            success INTEGER,
+            tokens_used INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table goal_schedules on goal_schedules
+CREATE TABLE goal_schedules (
+            id TEXT PRIMARY KEY,
+            goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            cron_expr TEXT NOT NULL,
+            tz TEXT NOT NULL DEFAULT 'local',
+            original_schedule TEXT,
+            fire_policy TEXT NOT NULL DEFAULT 'coalesce',
+            is_one_shot INTEGER NOT NULL DEFAULT 0,
+            is_paused INTEGER NOT NULL DEFAULT 0,
+            last_run_at TEXT,
+            next_run_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table scheduled_run_state on scheduled_run_state
+CREATE TABLE scheduled_run_state (
+            goal_id TEXT PRIMARY KEY REFERENCES goals(id) ON DELETE CASCADE,
+            root_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            effective_budget_per_check INTEGER NOT NULL,
+            tokens_used INTEGER NOT NULL DEFAULT 0,
+            budget_extensions_count INTEGER NOT NULL DEFAULT 0,
+            health_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        , goal_run_id TEXT)
+
+table scheduled_recovery_state on scheduled_recovery_state
+CREATE TABLE scheduled_recovery_state (
+            goal_id TEXT PRIMARY KEY REFERENCES goals(id) ON DELETE CASCADE,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            failure_budget INTEGER NOT NULL DEFAULT 3 CHECK (failure_budget BETWEEN 1 AND 10),
+            disposition TEXT NOT NULL DEFAULT 'healthy'
+                CHECK (disposition IN ('healthy', 'recovering', 'escalated')),
+            latest_failure_kind TEXT,
+            last_failed_run_id TEXT REFERENCES goal_runs(id) ON DELETE SET NULL,
+            last_recovery_run_id TEXT REFERENCES goal_runs(id) ON DELETE SET NULL,
+            updated_at TEXT NOT NULL
+        , recovery_attempts INTEGER NOT NULL DEFAULT 0, last_recovery_attempt_at TEXT)
+
+table goal_run_recovery_links on goal_run_recovery_links
+CREATE TABLE goal_run_recovery_links (
+            failed_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            recovery_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            outcome_status TEXT NOT NULL
+                CHECK (outcome_status IN ('recovering', 'verified', 'failed')),
+            proof_receipt_ids_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (failed_run_id, recovery_run_id)
+        )
+
+table scheduled_recovery_paused_schedules on scheduled_recovery_paused_schedules
+CREATE TABLE scheduled_recovery_paused_schedules (
+            schedule_id TEXT PRIMARY KEY REFERENCES goal_schedules(id) ON DELETE CASCADE,
+            goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            paused_at TEXT NOT NULL
+        )
+
+table work_projects on work_projects
+CREATE TABLE work_projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            description TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table session_work_projects on session_work_projects
+CREATE TABLE session_work_projects (
+            session_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES work_projects(id) ON DELETE CASCADE,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table goal_runs on goal_runs
+CREATE TABLE goal_runs (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES work_projects(id) ON DELETE CASCADE,
+            goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            trigger_type TEXT NOT NULL,
+            schedule_id TEXT REFERENCES goal_schedules(id) ON DELETE SET NULL,
+            root_task_id TEXT,
+            status TEXT NOT NULL DEFAULT 'running',
+            outcome_summary TEXT,
+            started_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table mandates on mandates
+CREATE TABLE mandates (
+            id TEXT PRIMARY KEY,
+            goal_id TEXT NOT NULL UNIQUE REFERENCES goals(id) ON DELETE CASCADE,
+            source_goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,
+            name TEXT,
+            objective TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'paused', 'awaiting_input', 'completed', 'cancelled')),
+            autonomy_mode TEXT NOT NULL DEFAULT 'bounded'
+                CHECK (autonomy_mode IN ('bounded', 'autopilot')),
+            authority_json TEXT NOT NULL,
+            strategy_json TEXT,
+            objective_control_json TEXT,
+            suspension_json TEXT,
+            constraints_json TEXT NOT NULL DEFAULT '[]',
+            success_criteria_json TEXT NOT NULL DEFAULT '[]',
+            stop_conditions_json TEXT NOT NULL DEFAULT '[]',
+            min_review_secs INTEGER NOT NULL CHECK (min_review_secs > 0),
+            max_review_secs INTEGER NOT NULL CHECK (max_review_secs >= min_review_secs),
+            default_review_secs INTEGER NOT NULL
+                CHECK (default_review_secs BETWEEN min_review_secs AND max_review_secs),
+            review_effort TEXT NOT NULL DEFAULT 'balanced'
+                CHECK (review_effort IN ('efficient', 'balanced', 'thorough', 'legacy_custom')),
+            next_review_at TEXT NOT NULL,
+            review_lease_token TEXT,
+            review_lease_expires_at TEXT,
+            expires_at TEXT,
+            confirmed_at TEXT,
+            version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+            owner_principal_id TEXT NOT NULL,
+            created_by_session TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table mandate_principal_sessions on mandate_principal_sessions
+CREATE TABLE mandate_principal_sessions (
+            principal_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            linked_at TEXT NOT NULL,
+            linked_by_session TEXT NOT NULL,
+            PRIMARY KEY (principal_id, session_id)
+        )
+
+index idx_mandate_principal_sessions_session on mandate_principal_sessions
+CREATE INDEX idx_mandate_principal_sessions_session
+         ON mandate_principal_sessions(session_id, principal_id)
+
+table mandate_objective_measurements on mandate_objective_measurements
+CREATE TABLE mandate_objective_measurements (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            mandate_version INTEGER NOT NULL CHECK (mandate_version > 0),
+            goal_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            value_micros INTEGER NOT NULL,
+            confidence_bps INTEGER NOT NULL CHECK (confidence_bps BETWEEN 0 AND 10000),
+            evidence_receipt_ids_json TEXT NOT NULL,
+            attributed_intention_ids_json TEXT NOT NULL DEFAULT '[]',
+            observed_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (mandate_id, goal_run_id, observed_at)
+        )
+
+index idx_mandate_measurements_recent on mandate_objective_measurements
+CREATE INDEX idx_mandate_measurements_recent
+         ON mandate_objective_measurements(mandate_id, observed_at DESC)
+
+table mandate_ownership_transfers on mandate_ownership_transfers
+CREATE TABLE mandate_ownership_transfers (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL,
+            from_session_id TEXT NOT NULL,
+            to_session_id TEXT NOT NULL,
+            from_version INTEGER NOT NULL,
+            to_version INTEGER NOT NULL,
+            transferred_at TEXT NOT NULL
+        )
+
+table mandate_run_token_budgets on mandate_run_token_budgets
+CREATE TABLE mandate_run_token_budgets (
+            goal_run_id TEXT PRIMARY KEY REFERENCES goal_runs(id) ON DELETE CASCADE,
+            budget_per_cycle INTEGER NOT NULL CHECK (budget_per_cycle > 0),
+            tokens_used INTEGER NOT NULL DEFAULT 0 CHECK (tokens_used >= 0),
+            call_lease_token TEXT,
+            call_lease_expires_at TEXT,
+            call_dispatched INTEGER NOT NULL DEFAULT 0 CHECK (call_dispatched IN (0, 1)),
+            call_tokens_used_before INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            CHECK (
+                (call_lease_token IS NULL AND call_lease_expires_at IS NULL
+                    AND call_dispatched = 0 AND call_tokens_used_before IS NULL)
+                OR (call_lease_token IS NOT NULL AND call_lease_expires_at IS NOT NULL
+                    AND ((call_dispatched = 0 AND call_tokens_used_before IS NULL)
+                         OR (call_dispatched = 1 AND call_tokens_used_before IS NOT NULL)))
+            )
+        )
+
+table mandate_decision_cycles on mandate_decision_cycles
+CREATE TABLE mandate_decision_cycles (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            goal_run_id TEXT NOT NULL UNIQUE REFERENCES goal_runs(id) ON DELETE CASCADE,
+            mandate_version INTEGER NOT NULL,
+            outcome TEXT NOT NULL CHECK (outcome IN ('act', 'wait', 'ask', 'stop')),
+            origin TEXT NOT NULL DEFAULT 'deliberator'
+                CHECK (origin IN ('deliberator', 'runtime_fallback')),
+            activity_level TEXT NOT NULL DEFAULT 'quiet'
+                CHECK (activity_level IN ('quiet', 'active', 'urgent')),
+            rationale TEXT NOT NULL,
+            belief_snapshot TEXT,
+            evidence_receipt_ids_json TEXT NOT NULL DEFAULT '[]'
+                CHECK (json_valid(evidence_receipt_ids_json)),
+            question TEXT,
+            termination_kind TEXT
+                CHECK (termination_kind IS NULL OR termination_kind IN (
+                    'success_criteria_satisfied', 'stop_condition_met', 'safety_termination'
+                )),
+            termination_match TEXT,
+            reconsider_at TEXT,
+            action_attempts INTEGER NOT NULL DEFAULT 0 CHECK (action_attempts >= 0),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        , owner_alert TEXT)
+
+table intentions on intentions
+CREATE TABLE intentions (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            decision_cycle_id TEXT NOT NULL UNIQUE REFERENCES mandate_decision_cycles(id) ON DELETE CASCADE,
+            goal_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            description TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            value_criterion TEXT,
+            expected_benefit TEXT,
+            risk TEXT,
+            invalidation_criteria TEXT,
+            status TEXT NOT NULL DEFAULT 'committed',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT
+        )
+
+table mandate_learning_notes on mandate_learning_notes
+CREATE TABLE mandate_learning_notes (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            mandate_version INTEGER NOT NULL CHECK (mandate_version > 0),
+            learned_in_decision_cycle_id TEXT NOT NULL
+                REFERENCES mandate_decision_cycles(id) ON DELETE CASCADE,
+            summary TEXT NOT NULL,
+            evidence_receipt_ids_json TEXT NOT NULL CHECK (json_valid(evidence_receipt_ids_json)),
+            created_at TEXT NOT NULL,
+            UNIQUE(mandate_id, learned_in_decision_cycle_id, summary)
+        )
+
+index idx_mandate_learning_notes_recent on mandate_learning_notes
+CREATE INDEX idx_mandate_learning_notes_recent
+         ON mandate_learning_notes(mandate_id, created_at DESC)
+
+table mandate_strategy_revisions on mandate_strategy_revisions
+CREATE TABLE mandate_strategy_revisions (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            mandate_version INTEGER NOT NULL CHECK (mandate_version > 0),
+            decision_cycle_id TEXT NOT NULL
+                REFERENCES mandate_decision_cycles(id) ON DELETE CASCADE,
+            strategy_key TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('reinforce', 'explore', 'avoid', 'retire')),
+            guidance TEXT NOT NULL,
+            confidence_bps INTEGER NOT NULL CHECK (confidence_bps BETWEEN 0 AND 10000),
+            evidence_receipt_ids_json TEXT NOT NULL CHECK (json_valid(evidence_receipt_ids_json)),
+            created_at TEXT NOT NULL,
+            UNIQUE(decision_cycle_id, strategy_key)
+        )
+
+index idx_mandate_strategy_revisions_latest on mandate_strategy_revisions
+CREATE INDEX idx_mandate_strategy_revisions_latest
+         ON mandate_strategy_revisions(mandate_id, strategy_key, created_at DESC, id DESC)
+
+table mandate_wake_signals on mandate_wake_signals
+CREATE TABLE mandate_wake_signals (
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            mandate_version INTEGER NOT NULL CHECK (mandate_version > 0),
+            signal_digest TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN (
+                'mention', 'reply', 'reaction', 'metric_change',
+                'delivery_failure', 'external_change'
+            )),
+            source TEXT NOT NULL,
+            target_url TEXT NOT NULL,
+            account_id TEXT,
+            occurred_at TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            PRIMARY KEY(mandate_id, signal_digest)
+        )
+
+index idx_mandate_wake_signals_recent on mandate_wake_signals
+CREATE INDEX idx_mandate_wake_signals_recent
+         ON mandate_wake_signals(mandate_id, received_at DESC)
+
+table mandate_reconciliations on mandate_reconciliations
+CREATE TABLE mandate_reconciliations (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            suspended_version INTEGER NOT NULL CHECK (suspended_version > 0),
+            suspension_kind TEXT NOT NULL,
+            resolution TEXT NOT NULL CHECK (resolution IN (
+                'confirmed_effect_occurred', 'confirmed_no_effect', 'abandon_attempt'
+            )),
+            owner_guidance TEXT NOT NULL,
+            resolved_by_session TEXT NOT NULL,
+            resolved_at TEXT NOT NULL
+        )
+
+table mandate_mutation_attempts on mandate_mutation_attempts
+CREATE TABLE mandate_mutation_attempts (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            mandate_version INTEGER NOT NULL CHECK (mandate_version > 0),
+            decision_cycle_id TEXT NOT NULL REFERENCES mandate_decision_cycles(id) ON DELETE CASCADE,
+            goal_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            intention_id TEXT NOT NULL REFERENCES intentions(id) ON DELETE CASCADE,
+            root_task_id TEXT NOT NULL,
+            root_task_attempt_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            task_attempt_id TEXT NOT NULL,
+            reserved_action_attempt INTEGER NOT NULL CHECK (reserved_action_attempt > 0),
+            action_digest TEXT NOT NULL UNIQUE CHECK (length(action_digest) = 64),
+            tool_call_id TEXT NOT NULL UNIQUE,
+            tool_name TEXT NOT NULL,
+            mutation_effects_json TEXT NOT NULL CHECK (json_valid(mutation_effects_json)),
+            targets_json TEXT NOT NULL CHECK (json_valid(targets_json)),
+            account_identifiers_json TEXT NOT NULL CHECK (json_valid(account_identifiers_json)),
+            status TEXT NOT NULL DEFAULT 'reserved'
+                CHECK (status IN ('reserved', 'never_dispatched', 'succeeded', 'failed', 'ambiguous')),
+            outcome_evidence TEXT
+                CHECK (outcome_evidence IS NULL OR outcome_evidence IN ('tool_reported', 'structured_metadata')),
+            http_status INTEGER CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599),
+            exit_code INTEGER,
+            reserved_at TEXT NOT NULL,
+            dispatch_claimed_at TEXT,
+            completed_at TEXT,
+            UNIQUE (decision_cycle_id, reserved_action_attempt)
+        )
+
+index idx_mandates_due on mandates
+CREATE INDEX idx_mandates_due
+         ON mandates(status, next_review_at, review_lease_expires_at)
+
+index idx_mandate_cycles_mandate on mandate_decision_cycles
+CREATE INDEX idx_mandate_cycles_mandate
+         ON mandate_decision_cycles(mandate_id, created_at DESC)
+
+index idx_intentions_mandate on intentions
+CREATE INDEX idx_intentions_mandate
+         ON intentions(mandate_id, created_at DESC)
+
+index idx_mandate_mutations_quota on mandate_mutation_attempts
+CREATE INDEX idx_mandate_mutations_quota
+         ON mandate_mutation_attempts(mandate_id, reserved_at)
+
+index idx_mandate_mutations_run_status on mandate_mutation_attempts
+CREATE INDEX idx_mandate_mutations_run_status
+         ON mandate_mutation_attempts(goal_run_id, status)
+
+table worker_profiles on worker_profiles
+CREATE TABLE worker_profiles (
+            id TEXT PRIMARY KEY,
+            project_id TEXT REFERENCES work_projects(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            specialist TEXT NOT NULL,
+            model TEXT,
+            tools_json TEXT,
+            max_iterations INTEGER,
+            tool_budget INTEGER,
+            timeout_secs INTEGER,
+            max_concurrency INTEGER NOT NULL DEFAULT 1 CHECK (max_concurrency > 0),
+            workspace_policy TEXT NOT NULL DEFAULT 'shared',
+            memory_scope TEXT NOT NULL DEFAULT 'project',
+            version INTEGER NOT NULL DEFAULT 1,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, name)
+        )
+
+table task_attempts on task_attempts
+CREATE TABLE task_attempts (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            goal_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            worker_profile_id TEXT REFERENCES worker_profiles(id) ON DELETE SET NULL,
+            worker_instance_id TEXT NOT NULL,
+            lease_token TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            lease_expires_at TEXT NOT NULL,
+            last_heartbeat_at TEXT NOT NULL,
+            workspace_id TEXT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+
+table task_journal on task_journal
+CREATE TABLE task_journal (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES work_projects(id) ON DELETE CASCADE,
+            goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            goal_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+            attempt_id TEXT REFERENCES task_attempts(id) ON DELETE SET NULL,
+            entry_type TEXT NOT NULL,
+            actor_type TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            source_channel TEXT,
+            body TEXT NOT NULL,
+            payload TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table task_handoffs on task_handoffs
+CREATE TABLE task_handoffs (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            attempt_id TEXT NOT NULL REFERENCES task_attempts(id) ON DELETE CASCADE,
+            summary TEXT NOT NULL,
+            artifacts_json TEXT NOT NULL DEFAULT '[]',
+            verification_json TEXT NOT NULL DEFAULT '[]',
+            remaining_risk TEXT,
+            next_step TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table task_workspaces on task_workspaces
+CREATE TABLE task_workspaces (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            attempt_id TEXT NOT NULL REFERENCES task_attempts(id) ON DELETE CASCADE,
+            backend_id TEXT NOT NULL,
+            policy TEXT NOT NULL,
+            root_path TEXT NOT NULL,
+            branch_name TEXT,
+            base_ref TEXT,
+            head_ref TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            released_at TEXT
+        )
+
+table work_channel_links on work_channel_links
+CREATE TABLE work_channel_links (
+            goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            channel_session_id TEXT NOT NULL,
+            thread_ref TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (goal_id, channel_session_id)
+        )
+
+index idx_goals_project_status on goals
+CREATE INDEX idx_goals_project_status
+         ON goals(project_id, status)
+
+index idx_goal_runs_goal_started on goal_runs
+CREATE INDEX idx_goal_runs_goal_started
+         ON goal_runs(goal_id, started_at DESC)
+
+index idx_goal_runs_open on goal_runs
+CREATE INDEX idx_goal_runs_open
+         ON goal_runs(goal_id, status)
+         WHERE status IN ('pending', 'running', 'blocked')
+
+index idx_tasks_goal_run_status on tasks
+CREATE INDEX idx_tasks_goal_run_status
+         ON tasks(goal_run_id, status)
+
+index idx_task_attempts_one_active on task_attempts
+CREATE UNIQUE INDEX idx_task_attempts_one_active
+         ON task_attempts(task_id)
+         WHERE status IN ('claimed', 'running')
+
+index idx_task_attempts_lease on task_attempts
+CREATE INDEX idx_task_attempts_lease
+         ON task_attempts(status, lease_expires_at)
+
+index idx_task_journal_task_created on task_journal
+CREATE INDEX idx_task_journal_task_created
+         ON task_journal(task_id, created_at)
+
+index idx_task_handoffs_task_created on task_handoffs
+CREATE INDEX idx_task_handoffs_task_created
+         ON task_handoffs(task_id, created_at)
+
+index idx_task_workspaces_task on task_workspaces
+CREATE INDEX idx_task_workspaces_task
+         ON task_workspaces(task_id, created_at)
+
+index idx_goals_status on goals
+CREATE INDEX idx_goals_status ON goals(status)
+
+index idx_goals_session on goals
+CREATE INDEX idx_goals_session ON goals(session_id)
+
+index idx_goals_domain_status on goals
+CREATE INDEX idx_goals_domain_status ON goals(domain, status)
+
+index idx_tasks_goal on tasks
+CREATE INDEX idx_tasks_goal ON tasks(goal_id)
+
+index idx_tasks_status on tasks
+CREATE INDEX idx_tasks_status ON tasks(status)
+
+index idx_task_activity_task on task_activity
+CREATE INDEX idx_task_activity_task ON task_activity(task_id)
+
+index idx_task_activity_created_at on task_activity
+CREATE INDEX idx_task_activity_created_at ON task_activity(created_at)
+
+index idx_task_activity_task_created_at on task_activity
+CREATE INDEX idx_task_activity_task_created_at ON task_activity(task_id, created_at)
+
+index idx_goal_schedules_goal on goal_schedules
+CREATE INDEX idx_goal_schedules_goal ON goal_schedules(goal_id)
+
+index idx_goal_schedules_next_run on goal_schedules
+CREATE INDEX idx_goal_schedules_next_run
+         ON goal_schedules(next_run_at) WHERE is_paused = 0
+
+index idx_scheduled_run_state_root_task on scheduled_run_state
+CREATE INDEX idx_scheduled_run_state_root_task
+         ON scheduled_run_state(root_task_id)
+
+table notification_queue on notification_queue
+CREATE TABLE notification_queue (
+            id TEXT PRIMARY KEY,
+            goal_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            notification_type TEXT NOT NULL,
+            priority TEXT NOT NULL DEFAULT 'status_update',
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            delivered_at TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            expires_at TEXT
+        , task_id TEXT, action_token TEXT, untrusted INTEGER NOT NULL DEFAULT 0)
+
+index idx_notification_queue_pending on notification_queue
+CREATE INDEX idx_notification_queue_pending
+         ON notification_queue(delivered_at, priority, created_at)
+         WHERE delivered_at IS NULL
+
+table token_alert_state on token_alert_state
+CREATE TABLE token_alert_state (
+            scope_type TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            last_alert_at TEXT NOT NULL,
+            last_metric_tokens INTEGER NOT NULL DEFAULT 0,
+            last_metric_calls INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (scope_type, scope_id)
+        )
+
+table conversation_summaries on conversation_summaries
+CREATE TABLE conversation_summaries (
+            session_id TEXT PRIMARY KEY,
+            summary TEXT NOT NULL,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            last_message_id TEXT NOT NULL,
+            last_turn_seq INTEGER,
+            updated_at TEXT NOT NULL
+        )
+
+table prompt_snapshots on prompt_snapshots
+CREATE TABLE prompt_snapshots (
+            hash TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+
+table background_spawns on background_spawns
+CREATE TABLE background_spawns (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            mission TEXT NOT NULL,
+            started_at TEXT NOT NULL
+        )
+
+table task_dependencies on task_dependencies
+CREATE TABLE task_dependencies (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY(task_id, depends_on_task_id),
+            CHECK(task_id <> depends_on_task_id)
+        )
+
+index idx_task_dependencies_prerequisite on task_dependencies
+CREATE INDEX idx_task_dependencies_prerequisite
+         ON task_dependencies(depends_on_task_id, task_id)
+
+trigger trg_task_dependencies_no_cycle on task_dependencies
+CREATE TRIGGER trg_task_dependencies_no_cycle
+         BEFORE INSERT ON task_dependencies
+         WHEN EXISTS (
+            WITH RECURSIVE prerequisites(id) AS (
+                SELECT NEW.depends_on_task_id
+                UNION
+                SELECT edge.depends_on_task_id
+                FROM task_dependencies edge
+                JOIN prerequisites prior ON edge.task_id = prior.id
+            )
+            SELECT 1 FROM prerequisites WHERE id = NEW.task_id
+         )
+         BEGIN
+            SELECT RAISE(ABORT, 'task dependency cycle');
+         END
+
+table history_message_index on history_message_index
+CREATE TABLE history_message_index (
+            event_id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            task_id TEXT,
+            turn_id TEXT,
+            message_id TEXT,
+            role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+            created_at TEXT NOT NULL,
+            channel_id TEXT,
+            channel_visibility TEXT NOT NULL DEFAULT 'internal',
+            user_role TEXT,
+            source_kind TEXT NOT NULL DEFAULT 'root'
+        )
+
+index idx_history_session_event on history_message_index
+CREATE INDEX idx_history_session_event ON history_message_index(session_id, event_id)
+
+index idx_history_task_event on history_message_index
+CREATE INDEX idx_history_task_event ON history_message_index(task_id, event_id)
+
+index idx_history_channel_event on history_message_index
+CREATE INDEX idx_history_channel_event ON history_message_index(channel_id, event_id)
+
+index idx_history_source_event on history_message_index
+CREATE INDEX idx_history_source_event ON history_message_index(source_kind, event_id)
+
+table history_projection_state on history_projection_state
+CREATE TABLE history_projection_state (
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        )
+
+table state_schema_versions on state_schema_versions
+CREATE TABLE state_schema_versions (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+
+trigger memory_claims_au on memory_claims
+CREATE TRIGGER memory_claims_au AFTER UPDATE OF claim_text ON memory_claims WHEN old.claim_text IS NOT new.claim_text BEGIN INSERT INTO memory_claims_fts(memory_claims_fts, rowid, claim_text) VALUES ('delete', old.id, old.claim_text); INSERT INTO memory_claims_fts(rowid, claim_text) VALUES (new.id, new.claim_text); END
+
+trigger memory_spans_au on memory_spans
+CREATE TRIGGER memory_spans_au AFTER UPDATE OF content ON memory_spans WHEN old.content IS NOT new.content BEGIN INSERT INTO memory_spans_fts(memory_spans_fts, rowid, content) VALUES ('delete', old.id, old.content); INSERT INTO memory_spans_fts(rowid, content) VALUES (new.id, new.content); END
+
+rows events = 0
+rows session_context_boundaries = 0
+rows task_lifecycle = 0
+rows filesystem_checkpoints = 0
+rows checkpoint_restore_runs = 0
+rows facts = 0
+rows episodes = 0
+rows user_profile = 0
+rows behavior_patterns = 0
+rows procedures = 0
+rows expertise = 0
+rows error_solutions = 0
+rows people = 0
+rows person_facts = 0
+rows memory_spans = 0
+rows memory_claims = 0
+rows memory_entities = 0
+rows memory_aliases = 0
+rows memory_entity_facts = 0
+rows memory_relationships = 0
+rows memory_resolution_reviews = 0
+rows memory_write_audit = 0
+rows memory_edges = 0
+rows memory_embeddings = 0
+rows memory_embedding_generation = 1
+rows terminal_allowed_prefixes = 0
+rows terminal_backend_allowed_prefixes = 0
+rows command_patterns = 0
+rows macros = 0
+rows token_usage = 0
+rows token_usage_daily = 0
+rows dynamic_bots = 0
+rows session_channels = 0
+rows dynamic_skills = 0
+rows skill_drafts = 0
+rows dynamic_mcp_servers = 0
+rows dynamic_cli_agents = 0
+rows cli_agent_invocations = 0
+rows oauth_connections = 0
+rows pending_oauth_flows = 0
+rows settings = 0
+rows dialogue_states = 0
+rows goals = 0
+rows tasks = 0
+rows task_activity = 0
+rows goal_schedules = 0
+rows scheduled_run_state = 0
+rows scheduled_recovery_state = 0
+rows goal_run_recovery_links = 0
+rows scheduled_recovery_paused_schedules = 0
+rows work_projects = 1
+rows session_work_projects = 0
+rows goal_runs = 0
+rows mandates = 0
+rows mandate_principal_sessions = 0
+rows mandate_objective_measurements = 0
+rows mandate_ownership_transfers = 0
+rows mandate_run_token_budgets = 0
+rows mandate_decision_cycles = 0
+rows intentions = 0
+rows mandate_learning_notes = 0
+rows mandate_strategy_revisions = 0
+rows mandate_wake_signals = 0
+rows mandate_reconciliations = 0
+rows mandate_mutation_attempts = 0
+rows worker_profiles = 9
+rows task_attempts = 0
+rows task_journal = 0
+rows task_handoffs = 0
+rows task_workspaces = 0
+rows work_channel_links = 0
+rows notification_queue = 0
+rows token_alert_state = 0
+rows conversation_summaries = 0
+rows prompt_snapshots = 0
+rows background_spawns = 0
+rows task_dependencies = 0
+rows history_message_index = 0
+rows history_projection_state = 0
+rows state_schema_versions = 1
+version 1 unversioned_baseline

@@ -7,7 +7,7 @@ use crate::events::EventStore;
 use crate::health::HealthProbeStore;
 use crate::memory::embeddings::EmbeddingService;
 use crate::plans::PlanStore;
-use crate::state::SqliteStateStore;
+use crate::state::{SqliteStateStore, StoreOptions};
 use crate::traits::StateStore;
 use sqlx::SqlitePool;
 
@@ -15,6 +15,8 @@ pub struct StoreBundle {
     /// Domain-facing state contract. The concrete SQLite implementation stays
     /// inside this adapter module and is not leaked through startup wiring.
     pub state: Arc<dyn StateStore>,
+    /// The daemon's own memory, in the same database.
+    pub memory_store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     /// Shared relational handle used by infrastructure components that need a
     /// pool directly (events, plans, health, nodes, and checkpoints).
     pub pool: SqlitePool,
@@ -24,36 +26,70 @@ pub struct StoreBundle {
     pub health_store: Option<Arc<HealthProbeStore>>,
 }
 
-pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
-    let embedding_service = Arc::new(
-        EmbeddingService::new().map_err(|e| anyhow::anyhow!("Failed to init embeddings: {}", e))?,
-    );
+/// The embedder every daemon process uses: the real models, loaded on
+/// first use. Tests build their own (`EmbeddingService::deterministic`).
+pub fn daemon_embeddings() -> anyhow::Result<EmbeddingService> {
+    EmbeddingService::fastembed().map_err(|e| anyhow::anyhow!("Failed to init embeddings: {}", e))
+}
+
+/// Opens the daemon's state database as every daemon process does: in WAL
+/// mode ([`StoreOptions::DAEMON`]).
+pub async fn open_daemon_state(
+    config: &AppConfig,
+    embeddings: Arc<EmbeddingService>,
+) -> anyhow::Result<SqliteStateStore> {
+    SqliteStateStore::open(
+        &config.state.db_path,
+        config.state.working_memory_cap,
+        config.state.encryption_key.as_deref(),
+        embeddings,
+        StoreOptions::DAEMON,
+    )
+    .await
+}
+
+pub async fn build_stores(
+    config: &AppConfig,
+    paths: crate::execution::LexicalPaths,
+) -> anyhow::Result<StoreBundle> {
+    let embedding_service = Arc::new(daemon_embeddings()?);
     info!("Embedding service initialized (AllMiniLML6V2)");
 
+    // Before the migrations in `open_daemon_state` change the schema.
+    super::db_upkeep::snapshot_before_upgrade(&config.state).await;
     let state = Arc::new(
-        SqliteStateStore::new(
-            &config.state.db_path,
-            config.state.working_memory_cap,
-            config.state.encryption_key.as_deref(),
-            embedding_service.clone(),
-        )
-        .await?,
+        open_daemon_state(config, embedding_service.clone())
+            .await?
+            .with_secret_store(crate::config::secret_store().clone()),
     );
     info!("State store initialized ({})", config.state.db_path);
+    super::db_upkeep::record_started_version(&state.pool()).await;
+    super::db_upkeep::optimize_at_open(&state.pool()).await;
 
-    if let Ok(count) = state.backfill_episode_embeddings().await {
-        if count > 0 {
+    // Another memory system leaves the daemon's tables as they are.
+    let own_memory = config.memory.backend == crate::config::MemoryBackend::Daemon;
+    if own_memory {
+        if let Ok(count) = state.memory().backfill_episode_embeddings().await
+            && count > 0
+        {
             info!(count, "Backfilled missing episode embeddings");
         }
-    }
 
-    if let Ok(count) = state.backfill_fact_embeddings().await {
-        if count > 0 {
+        if let Ok(count) = state.memory().backfill_fact_embeddings().await
+            && count > 0
+        {
             info!(count, "Backfilled missing fact embeddings");
         }
     }
 
-    let event_store = Arc::new(EventStore::new(state.pool()).await?);
+    let event_store = Arc::new(
+        EventStore::on_paths(
+            state.pool(),
+            paths,
+            Arc::new(crate::events::DaemonEventHost),
+        )
+        .await?,
+    );
     info!("Event store initialized");
 
     let plan_store = Arc::new(PlanStore::new(state.pool()).await?);
@@ -76,11 +112,8 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
     // that migration off the channel-readiness critical path.
     let projection_state = state.clone();
     tokio::spawn(async move {
-        match crate::state::sqlite::history_search::repair_and_backfill(
-            &projection_state.pool(),
-            20,
-        )
-        .await
+        match aidaemon_runtime::history::search::repair_and_backfill(&projection_state.pool(), 20)
+            .await
         {
             Ok(stats)
                 if stats.projected > 0
@@ -103,8 +136,7 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
         // Continue large legacy backfills incrementally off the readiness
         // path. Each round is bounded and yields between batches.
         for _ in 0..20 {
-            match crate::state::sqlite::history_search::backfill(&projection_state.pool(), 20).await
-            {
+            match aidaemon_runtime::history::search::backfill(&projection_state.pool(), 20).await {
                 Ok((_, 0)) => break,
                 Ok((projected, pending)) => {
                     tracing::info!(projected, pending, "Continuing exact-history backfill");
@@ -116,58 +148,69 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
                 }
             }
         }
-        match projection_state.backfill_missing_memory_projections().await {
-            Ok((facts, episodes, spans, procedures, error_solutions))
-                if facts > 0
-                    || episodes > 0
-                    || spans > 0
-                    || procedures > 0
-                    || error_solutions > 0 =>
+        if own_memory {
+            match projection_state
+                .memory()
+                .backfill_missing_memory_projections()
+                .await
             {
-                tracing::info!(
-                    facts,
-                    episodes,
-                    spans,
-                    procedures,
-                    error_solutions,
-                    "Backfilled canonical memory projections"
-                );
-            }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(%error, "Canonical memory backfill deferred");
-            }
-        }
-        const STRUCTURED_BACKFILL_ATTEMPTS: usize = 3;
-        for attempt in 1..=STRUCTURED_BACKFILL_ATTEMPTS {
-            match projection_state.backfill_structured_personal_memory().await {
-                Ok(count) => {
-                    if count > 0 {
-                        tracing::info!(count, "Backfilled safe structured personal memories");
-                    }
-                    break;
-                }
-                Err(error) if attempt < STRUCTURED_BACKFILL_ATTEMPTS => {
+                Ok((facts, episodes, spans, procedures, error_solutions))
+                    if facts > 0
+                        || episodes > 0
+                        || spans > 0
+                        || procedures > 0
+                        || error_solutions > 0 =>
+                {
                     tracing::info!(
-                        %error,
-                        attempt,
-                        "Structured personal-memory backfill busy; retrying"
+                        facts,
+                        episodes,
+                        spans,
+                        procedures,
+                        error_solutions,
+                        "Backfilled canonical memory projections"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64))
-                        .await;
                 }
+                Ok(_) => {}
                 Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        attempts = STRUCTURED_BACKFILL_ATTEMPTS,
-                        "Structured personal-memory backfill deferred"
-                    );
+                    tracing::warn!(%error, "Canonical memory backfill deferred");
+                }
+            }
+            const STRUCTURED_BACKFILL_ATTEMPTS: usize = 3;
+            for attempt in 1..=STRUCTURED_BACKFILL_ATTEMPTS {
+                match projection_state
+                    .memory()
+                    .backfill_structured_personal_memory()
+                    .await
+                {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::info!(count, "Backfilled safe structured personal memories");
+                        }
+                        break;
+                    }
+                    Err(error) if attempt < STRUCTURED_BACKFILL_ATTEMPTS => {
+                        tracing::info!(
+                            %error,
+                            attempt,
+                            "Structured personal-memory backfill busy; retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64))
+                            .await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            attempts = STRUCTURED_BACKFILL_ATTEMPTS,
+                            "Structured personal-memory backfill deferred"
+                        );
+                    }
                 }
             }
         }
     });
 
     Ok(StoreBundle {
+        memory_store: state.memory_stores(),
         embedding_service,
         pool: state.pool(),
         state: state as Arc<dyn StateStore>,
@@ -175,4 +218,31 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
         plan_store,
         health_store,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::embeddings::EmbedderKind;
+
+    /// What a test build sees here is what the shipped daemon gets: the
+    /// journal and the models come from these functions, not from a cargo
+    /// feature a test build turns on.
+    #[tokio::test]
+    async fn the_daemon_store_journals_in_wal_with_the_real_models() {
+        let embeddings = daemon_embeddings().unwrap();
+        assert_eq!(embeddings.kind(), EmbedderKind::FastEmbed);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: AppConfig = toml::from_str("[provider]\napi_key = \"test-key\"\n").unwrap();
+        config.state.db_path = dir.path().join("state.db").display().to_string();
+        let state = open_daemon_state(&config, Arc::new(embeddings))
+            .await
+            .unwrap();
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&state.pool())
+            .await
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
 }

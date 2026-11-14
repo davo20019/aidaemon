@@ -1,0 +1,29 @@
+name: mutation_called_once_in_order
+description: >
+  Guards the duplicate-side-effect class: a mutating tool must run exactly once,
+  and only after the read that justifies it. tool_call_counts is an exact match;
+  tools_in_order is a subsequence (unrelated calls may interleave).
+input: Check my system info and remember the result
+setup:
+  session_id: eval_mutation_once_01
+script:
+  - tool_calls:
+      - name: system_info
+        arguments: "{}"
+  - tool_calls:
+      - name: remember_fact
+        arguments: '{"category":"project","key":"host_profile","value":"synthetic-host"}'
+  - text: Checked and saved.
+expect:
+  proposed:
+    tools_used:
+      - system_info
+      - remember_fact
+    tools_in_order:
+      - system_info
+      - remember_fact
+    tool_call_counts:
+      remember_fact: 1
+      system_info: 1
+  ext:
+    outcome: succeeded

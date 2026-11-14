@@ -1,0 +1,121 @@
+{
+  "description": "Deltas and status build a live turn; the completion replaces it with one assistant line.",
+  "frames": [
+    {
+      "at_ms": 1767225601000,
+      "event": {
+        "origin": "app",
+        "session_id": "app:s1",
+        "text": "Draft the synthetic report",
+        "type": "user_message"
+      },
+      "seq": 1,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225602000,
+      "event": {
+        "origin": "app",
+        "session_id": "app:s1",
+        "turn_id": "t1",
+        "type": "turn_started"
+      },
+      "seq": 2,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225600000,
+      "event": {
+        "text": "Draft",
+        "turn_id": "t1",
+        "type": "turn_delta"
+      },
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225600000,
+      "event": {
+        "status": {
+          "kind": "tool_started",
+          "name": "terminal",
+          "summary": "building the report"
+        },
+        "turn_id": "t1",
+        "type": "turn_status"
+      },
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225600000,
+      "event": {
+        "text": "ing...",
+        "turn_id": "t1",
+        "type": "turn_delta"
+      },
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225603000,
+      "event": {
+        "state": "completed",
+        "text": "Drafted the report.",
+        "turn_id": "t1",
+        "type": "turn_completed"
+      },
+      "seq": 3,
+      "session_id": "app:s1",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225600000,
+      "event": {
+        "text": " late",
+        "turn_id": "t1",
+        "type": "turn_delta"
+      },
+      "session_id": "app:s1",
+      "type": "event"
+    }
+  ],
+  "state": {
+    "approvals": {},
+    "last_seq": 3,
+    "notice": null,
+    "order": [
+      "app:s1"
+    ],
+    "sessions": {
+      "app:s1": {
+        "lines": [
+          {
+            "at_ms": 1767225601000,
+            "kind": "user",
+            "origin": "app",
+            "text": "Draft the synthetic report"
+          },
+          {
+            "kind": "activity",
+            "secs": 1,
+            "tools": [
+              "terminal"
+            ]
+          },
+          {
+            "at_ms": 1767225603000,
+            "kind": "assistant",
+            "text": "Drafted the report."
+          }
+        ],
+        "live": null,
+        "summary": null
+      }
+    },
+    "tasks": {},
+    "view_request": null
+  }
+}

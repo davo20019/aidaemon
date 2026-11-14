@@ -1,0 +1,58 @@
+[package]
+name = "aidaemon-work"
+description = "Goals, mandates, tasks and work coordination with a SQLite store; internal to aidaemon, no stability promise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-work"
+readme = "README.md"
+keywords = ["agent", "tasks", "goals", "sqlite", "llm"]
+categories = ["database", "asynchronous"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
+publish = false
+
+[features]
+# Test-only behaviour that dependents' test builds need, as `cfg(test)` cannot
+# reach across a crate boundary.
+testing = ["aidaemon-events/testing"]
+# The IMAP email trigger.
+email-trigger = ["dep:async-imap", "dep:async-native-tls", "dep:futures"]
+
+[dependencies]
+aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels" }
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
+aidaemon-events = { version = "0.20.0", path = "../aidaemon-events" }
+aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools" }
+anyhow = "1"
+async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"], optional = true }
+async-native-tls = { version = "0.6", default-features = false, features = ["runtime-tokio"], optional = true }
+async-trait = "0.1"
+croner = "4"
+dirs = "7"
+futures = { version = "0.3", optional = true }
+iana-time-zone = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+strum = { version = "0.28", features = ["derive"] }
+sha2 = "0.11"
+hex = "0.4"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "process", "net", "io-util", "macros"] }
+tokio-util = "0.7"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
+aidaemon-events = { path = "../aidaemon-events", features = ["testing"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }

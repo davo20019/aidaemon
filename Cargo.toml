@@ -1,7 +1,7 @@
 [package]
 name = "aidaemon"
 version = "0.12.9"
-edition = "2021"
+edition = "2024"
 description = "A personal AI agent that runs as a background daemon, accessible via Telegram, Slack, or Discord, with tool use, MCP integration, and persistent memory"
 license = "MIT"
 repository = "https://github.com/davo20019/aidaemon"
@@ -12,8 +12,57 @@ keywords = ["ai", "daemon", "telegram", "llm", "mcp"]
 categories = ["command-line-utilities"]
 exclude = ["*.db", "*.db-shm", "*.db-wal", ".env", "config.toml", "lcov.info", "*.profraw", "docs/", "task-75498c01f980/"]
 
+[workspace.package]
+# One shared version for every SDK crate (crates/aidaemon-*), separate from the
+# daemon's own. The daemon pins them exactly (`=0.20.x`).
+# aidaemon-node-protocol and aidaemon-node-sdk keep their own versions.
+version = "0.20.0"
+edition = "2024"
+# Floor set by the SDK crates' dependency tree with all features
+# (sqlx 0.9: 1.94); verified in CI by the MSRV job.
+rust-version = "1.94"
+license = "MIT"
+repository = "https://github.com/davo20019/aidaemon"
+homepage = "https://aidaemon.ai/"
+authors = ["David Loor <davo20019@gmail.com>"]
+
 [workspace]
-members = ["crates/node-protocol", "crates/node-sdk"]
+members = [
+    "crates/node-protocol",
+    "crates/node-sdk",
+    "crates/client-protocol",
+    "crates/aidaemon-client-core",
+    "crates/aidaemon-client-gateway",
+    "crates/aidaemon-core",
+    "crates/aidaemon-providers",
+    "crates/aidaemon-tools",
+    "crates/aidaemon-tool-browser",
+    "crates/aidaemon-store-sqlite",
+    "crates/aidaemon-mcp",
+    "crates/aidaemon-agents",
+    "crates/aidaemon-policies",
+    "crates/aidaemon-decisions",
+    "crates/aidaemon-eval",
+    "crates/aidaemon-memory",
+    "crates/aidaemon-events",
+    "crates/aidaemon-work",
+    "crates/aidaemon-runtime",
+    "crates/aidaemon-skills",
+    "crates/aidaemon-secrets",
+    "crates/aidaemon-nodes",
+    "crates/aidaemon-exposure",
+    "crates/aidaemon-terminal-bridge",
+    "crates/aidaemon-channels",
+    "crates/aidaemon-channel-telegram",
+    "crates/aidaemon-channel-slack",
+    "crates/aidaemon-channel-discord",
+    "crates/aidaemon-sdk",
+    "crates/aidaemon-macros",
+    "examples/parity-agent",
+]
+# The app (clients/app, nsh) is its own Cargo workspace: its dependencies
+# stay out of the daemon's builds, tests, clippy and publish.
+exclude = ["clients/app"]
 resolver = "2"
 
 [[bin]]
@@ -27,16 +76,15 @@ path = "src/bin/computer_use_probe.rs"
 required-features = ["computer_use-macos"]
 
 [dependencies]
-aidaemon-node-protocol = { version = "0.1.0", path = "crates/node-protocol" }
 shell-words = "1.1"
 tokio = { version = "1", features = ["full"] }
-teloxide = { version = "0.17", features = ["macros", "webhooks-axum"] }
-reqwest = { version = "0.12", features = ["json", "blocking", "gzip", "deflate", "brotli", "stream"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+reqwest = { version = "0.13", features = ["json", "query", "form", "blocking", "gzip", "deflate", "brotli", "stream"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
-toml = "0.8"
+serde-saphyr = "2.1"
+toml = "1.2"
+toml_edit = "0.25"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -44,82 +92,107 @@ dotenvy = "0.15"
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-strum = { version = "0.27", features = ["derive"] }
-async-imap = "0.10"
-async-native-tls = "0.5"
-async-std = { version = "1", features = ["attributes"] }
+strum = { version = "0.28", features = ["derive"] }
 futures = "0.3"
 axum = "0.8"
-dialoguer = "0.11"
-chromiumoxide = { version = "0.8", features = ["tokio-runtime"], default-features = false, optional = true }
+dialoguer = "0.12"
+# The pairing code as a QR code in the terminal (`aidaemon pair`).
+qrcode = { version = "0.14", default-features = false }
 shellexpand = "3"
-dirs = "6"
-fastembed = "4"
-tokio-util = "0.7.18"
+dirs = "7"
+tokio-util = "0.7.20"
 libc = "0.2"
-libsqlite3-sys = { version = "0.30", optional = true }
-llm_readability = "0.0"
-htmd = "0.1"
-croner = "3"
+libsqlite3-sys = { version = "0.37", optional = true }
+croner = "4"
 regex = "1"
-globset = "0.4"
-ignore = "0.4"
-fd-lock = "4"
-once_cell = "1"
 # Cross-platform per-process cumulative CPU time + disk I/O, used by the
 # background-process reaper to detect genuine progress (CPU/IO/output advancing)
 # vs. a truly-stalled process. Default features disabled — we only need the
 # `system` component (processes), not disks/networks/components.
-sysinfo = { version = "0.36", default-features = false, features = ["system"] }
-serenity = { version = "0.12", features = ["client", "gateway", "model", "cache", "rustls_backend"], default-features = false, optional = true }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"], optional = true }
-self_update = { version = "0.42", features = ["archive-tar", "compression-flate2"], default-features = false }
+# 0.38: sysinfo 0.39 and later need rustc 1.95, past the SDK crates' MSRV (1.94).
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+self_update = { version = "1.3", features = ["reqwest", "rustls", "github", "archive-tar", "compression-tar-gz"], default-features = false }
 semver = "1"
-zeroize = { version = "1", features = ["derive"] }
-hmac = "0.12"
-sha1 = "0.10"
-sha2 = "0.10"
-base64 = "0.22"
-rand = "0.8"
-serialport = { version = "4.8", default-features = false }
-hkdf = { version = "0.12", optional = true }
-p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
-aes-gcm = { version = "0.10", optional = true }
-portable-pty = { version = "0.8", optional = true }
+hmac = "0.13"
+sha2 = "0.11"
+hex = "0.4"
+base64 = "0.23"
+rand = "0.10"
+serialport = { version = "4.10", default-features = false }
+
+# The agent kernel (workspace crate).
+aidaemon-core = { version = "=0.20.0", path = "crates/aidaemon-core" }
+# The kernel's run journal and checkpoints, on the daemon's own pool.
+aidaemon-store-sqlite = { version = "=0.20.0", path = "crates/aidaemon-store-sqlite", features = ["client-events"] }
+aidaemon-policies = { version = "=0.20.0", path = "crates/aidaemon-policies" }
+aidaemon-decisions = { version = "=0.20.0", path = "crates/aidaemon-decisions", features = ["gemini"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"], optional = true }
+# Tool semantics (call descriptions, receipts metadata) live in the SDK.
+aidaemon-tools = { version = "=0.20.0", path = "crates/aidaemon-tools", features = ["checkpoints", "oauth"] }
+aidaemon-skills = { version = "=0.20.0", path = "crates/aidaemon-skills" }
+# Secrets: the keychain, its env-file mode and the account names.
+aidaemon-secrets = { version = "=0.20.0", path = "crates/aidaemon-secrets" }
+# Nodes: hardware companions, their Gateway, store and tools.
+aidaemon-nodes = { version = "=0.20.0", path = "crates/aidaemon-nodes" }
+# The Client Gateway (`/client/v1`) and its wire types, for the owner's apps.
+aidaemon-client-gateway = { version = "=0.20.0", path = "crates/aidaemon-client-gateway" }
+aidaemon-exposure = { version = "=0.20.0", path = "crates/aidaemon-exposure" }
+aidaemon-client-protocol = { version = "=0.20.0", path = "crates/client-protocol" }
+# The terminal bridge (`/agent` sessions and the local attach/share/start CLIs).
+aidaemon-terminal-bridge = { version = "=0.20.0", path = "crates/aidaemon-terminal-bridge", optional = true }
+aidaemon-tool-browser = { version = "=0.20.0", path = "crates/aidaemon-tool-browser" }
+aidaemon-providers = { version = "=0.20.0", path = "crates/aidaemon-providers", features = ["chatgpt-login"] }
+# The MCP transport; the daemon keeps its registry and result rendering.
+aidaemon-mcp = { version = "=0.20.0", path = "crates/aidaemon-mcp", features = ["registry"] }
+# Channel contract and platform adapters (formatting today; transport next).
+aidaemon-channels = { version = "=0.20.0", path = "crates/aidaemon-channels", features = ["http", "checkpoints"] }
+aidaemon-channel-telegram = { version = "=0.20.0", path = "crates/aidaemon-channel-telegram", features = ["bot", "terminal"] }
+aidaemon-channel-slack = { version = "=0.20.0", path = "crates/aidaemon-channel-slack", optional = true, features = ["bot"] }
+aidaemon-channel-discord = { version = "=0.20.0", path = "crates/aidaemon-channel-discord", optional = true, features = ["bot"] }
+# Long-term memory: shared primitives today; the `sdk` backend with `sdk-memory`.
+aidaemon-memory = { version = "=0.20.0", path = "crates/aidaemon-memory", features = ["fastembed"] }
+aidaemon-events = { version = "=0.20.0", path = "crates/aidaemon-events" }
+aidaemon-work = { version = "=0.20.0", path = "crates/aidaemon-work", features = ["email-trigger"] }
+# Sub-agent composition and the specialist profiles child sessions carry.
+aidaemon-agents = { version = "=0.20.0", path = "crates/aidaemon-agents" }
+aidaemon-runtime = { version = "=0.20.0", path = "crates/aidaemon-runtime" }
+aidaemon-sdk = { version = "=0.20.0", path = "crates/aidaemon-sdk", default-features = false, features = ["runtime"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# keyring v4 dropped feature flags and moved `Entry` to `keyring-core`. The
-# refactor is invasive (requires explicit `use_native_store` calls and
-# rewriting every `keyring::Entry::new(...)` site); staying on v3 until that
-# migration is scoped separately.
-keyring = { version = "3", features = ["apple-native"] }
-tikv-jemallocator = "0.6"
-axuielement = { version = "0.9", optional = true }
+tikv-jemallocator = "0.7"
 xcap = { version = "0.9", optional = true }
-enigo = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
-tikv-jemallocator = "0.6"
-
-[target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3", features = ["windows-native"] }
+tikv-jemallocator = "0.7"
 
 [features]
-default = ["discord", "slack", "encryption", "browser", "terminal-bridge"]
-browser = ["dep:chromiumoxide"]
-discord = ["dep:serenity"]
-slack = ["dep:tokio-tungstenite"]
-execution-docker = []
-terminal-bridge = [
-    "dep:tokio-tungstenite",
-    "dep:hkdf",
-    "dep:aes-gcm",
-    "dep:portable-pty",
-]
-encryption = ["libsqlite3-sys/bundled-sqlcipher"]
-computer_use = []
-computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo"]
+default = ["discord", "slack", "encryption", "browser", "terminal-bridge", "otel", "execution-docker"]
+browser = ["aidaemon-tool-browser/chromium"]
+discord = ["dep:aidaemon-channel-discord"]
+slack = ["dep:aidaemon-channel-slack"]
+# The Docker execution backend: code only (it drives the `docker` CLI, no
+# extra crates), so it is on by default and needs Docker only when used.
+execution-docker = ["aidaemon-tools/docker"]
+terminal-bridge = ["dep:aidaemon-terminal-bridge"]
+encryption = ["libsqlite3-sys/bundled-sqlcipher", "aidaemon-runtime/encryption"]
+computer_use = ["aidaemon-runtime/computer_use"]
+# Export runs to an OTLP backend when `[telemetry]` names one.
+otel = ["aidaemon-policies/otel", "dep:opentelemetry_sdk"]
+# The probe binary reads the window list itself (xcap).
+computer_use-macos = ["computer_use", "aidaemon-runtime/computer_use-macos", "dep:xcap"]
+# The aidaemon-memory crate as the memory plugin for agent turns.
+sdk-memory = ["aidaemon-memory/fastembed"]
+
+# Debug builds keep file:line for the workspace's own code (panics,
+# backtraces) and drop the rest of the debug info, which is rarely read and
+# made every artifact bigger. Daemon lib tests, Rust 1.100, Apple Silicon:
+# 4.0 GB with full debug info, 2.6 GB with this; one-file edit rebuild
+# ~50 s -> ~45 s. For a debugger session: CARGO_PROFILE_DEV_DEBUG=true.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 lto = true
@@ -127,13 +200,30 @@ codegen-units = 1
 strip = true
 
 [dev-dependencies]
+aidaemon-core = { path = "crates/aidaemon-core", features = ["testing"] }
+aidaemon-channels = { path = "crates/aidaemon-channels", features = ["testing"] }
+aidaemon-eval = { path = "crates/aidaemon-eval" }
+aidaemon-events = { path = "crates/aidaemon-events", features = ["testing"] }
+aidaemon-work = { path = "crates/aidaemon-work", features = ["testing"] }
+aidaemon-tools = { path = "crates/aidaemon-tools", features = ["testing"] }
+aidaemon-decisions = { path = "crates/aidaemon-decisions", features = ["gemini", "testing"] }
+aidaemon-runtime = { path = "crates/aidaemon-runtime", features = ["testing"] }
+aidaemon-memory = { path = "crates/aidaemon-memory", features = ["fastembed"] }
 tempfile = "3"
 proptest = "1"
 assert_cmd = "2"
-serial_test = "3"
+serial_test = "4"
 # `test-util` enables tokio's pausable fake clock (`#[tokio::test(start_paused = true)]`,
 # `tokio::time::advance`) used by the deterministic bounded-wait browser tests.
 tokio = { version = "1", features = ["test-util"] }
+# A real WebSocket client for the Client Gateway's tests, and a device key.
+tokio-tungstenite = "0.30"
+p256 = { version = "0.14", features = ["ecdsa"] }
+
+# libsqlite3-sys is never named in code: the `encryption` feature turns on its
+# bundled SQLCipher build under sqlx.
+[package.metadata.cargo-machete]
+ignored = ["libsqlite3-sys"]
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/aidaemon-{ target }{ archive-suffix }"

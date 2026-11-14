@@ -49,8 +49,7 @@ async fn test_memory_episodes_injected_into_prompt() {
 /// owner DM, while the full goal store remains available through tools.
 #[tokio::test]
 async fn test_relevant_active_goal_is_rendered_in_owner_prompt() {
-    let provider = MockProvider::new()
-        .with_task_assessments(vec![memory_allowed_task_assessment()]);
+    let provider = MockProvider::new();
     let harness = setup_test_agent(provider).await.unwrap();
 
     let mut goal = Goal::new_finite(
@@ -88,8 +87,8 @@ async fn test_relevant_active_goal_is_rendered_in_owner_prompt() {
         "The bounded relevant-memory tail should include the active goal"
     );
     assert!(
-        content.contains("scheduled_goals"),
-        "System prompt should reference scheduled_goals tool for on-demand access"
+        content.contains("manage_automations(action='list')"),
+        "System prompt should reference manage_automations for on-demand access"
     );
 }
 
@@ -305,8 +304,7 @@ async fn test_memory_failure_patterns_injected_into_public_prompt() {
 /// User profile: communication preferences affect the system prompt.
 #[tokio::test]
 async fn test_memory_user_profile_affects_prompt() {
-    let provider = MockProvider::new()
-        .with_task_assessments(vec![memory_allowed_task_assessment()]);
+    let provider = MockProvider::new();
     let harness = setup_test_agent(provider).await.unwrap();
 
     let profile = UserProfile {
@@ -394,8 +392,7 @@ async fn test_guest_dm_does_not_receive_owner_profile() {
 /// Minimal context: system prompt has capability summary + profile, NOT bulk data.
 #[tokio::test]
 async fn test_full_memory_stack_in_system_prompt() {
-    let provider = MockProvider::new()
-        .with_task_assessments(vec![memory_allowed_task_assessment()]);
+    let provider = MockProvider::new();
     let harness = setup_test_agent(provider).await.unwrap();
 
     // Seed user profile (this SHOULD still appear)
@@ -614,10 +611,19 @@ async fn test_tool_schemas_gemini_compatible() {
     let tools = &call_log[0].tools;
     assert!(!tools.is_empty(), "Expected tools in the LLM call");
 
-    // Run them through the Gemini convert_tools pipeline
-    let gemini = crate::providers::GoogleGenAiProvider::new("fake-key");
-    let converted = gemini.convert_tools_for_test(tools, false);
-    assert!(converted.is_some(), "convert_tools should return Some");
+    // Run them through the Gemini request builder.
+    let gemini = aidaemon_providers::GoogleGenai::builder()
+        .api_key("fake-key")
+        .build()
+        .unwrap();
+    let body = gemini.request_body(&crate::providers::sdk_backed::to_sdk_request(
+        "gemini-test",
+        &[serde_json::json!({"role": "user", "content": "hi"})],
+        tools,
+        &crate::traits::ChatOptions::default(),
+    ));
+    let converted = body.get("tools").cloned();
+    assert!(converted.is_some(), "the request should carry tools");
 
     // Recursively check no $schema anywhere in the output
     fn assert_no_schema(value: &serde_json::Value, path: &str) {

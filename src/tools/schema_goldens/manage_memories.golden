@@ -1,0 +1,77 @@
+{
+  "description": "Memories/goals. search=stored facts; search_episodes=generated summaries of past chats (exact messages: search_history). Store via remember_fact.",
+  "name": "manage_memories",
+  "schema": {
+    "description": "Memories/goals. search=stored facts; search_episodes=generated summaries of past chats (exact messages: search_history). Store via remember_fact.",
+    "name": "manage_memories",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "forget and set_privacy name one fact by category and key; the goal actions are personal goals.",
+          "enum": [
+            "list",
+            "health",
+            "repair",
+            "forget",
+            "set_privacy",
+            "search",
+            "search_episodes",
+            "create_personal_goal",
+            "list_goals",
+            "complete_goal",
+            "abandon_goal"
+          ],
+          "type": "string"
+        },
+        "category": {
+          "description": "forget/set_privacy: the fact's category; list: filter.",
+          "type": "string"
+        },
+        "goal": {
+          "description": "create_personal_goal: the goal.",
+          "type": "string"
+        },
+        "goal_id": {
+          "description": "complete_goal/abandon_goal: ID or unique prefix.",
+          "type": "string"
+        },
+        "key": {
+          "description": "forget/set_privacy: the fact's key.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Max results.",
+          "type": "integer"
+        },
+        "priority": {
+          "description": "create_personal_goal; default medium.",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "type": "string"
+        },
+        "privacy": {
+          "description": "set_privacy: who may see it.",
+          "enum": [
+            "global",
+            "channel",
+            "private"
+          ],
+          "type": "string"
+        },
+        "query": {
+          "description": "search: what to find. search_episodes: a topic, or omit for the latest chats.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

@@ -1,6 +1,5 @@
-use crate::memory::math::cosine_similarity;
-use crate::memory::scoring::score_message;
 use crate::traits::Message;
+use aidaemon_memory::cosine as cosine_similarity;
 use chrono::Utc;
 
 #[test]
@@ -30,7 +29,7 @@ fn test_scoring_heuristic() {
 
     // Short message "hello" gets penalty (-0.2)
     // User base (0.6) - 0.2 = 0.4
-    let score = score_message(&msg);
+    let score = aidaemon_memory::turn_importance(&msg.role, msg.content.as_deref());
     assert!(
         score < 0.5,
         "Short 'hello' should be low importance: {}",
@@ -41,25 +40,33 @@ fn test_scoring_heuristic() {
     msg.content = Some(
         "I am writing a longer message to test the length heuristic functionality properly.".into(),
     );
-    let score_medium = score_message(&msg);
+    let score_medium = aidaemon_memory::turn_importance(&msg.role, msg.content.as_deref());
     assert!(
         score_medium > 0.5,
         "Medium message should be normal importance: {}",
         score_medium
     );
 
-    // Keyword boost
-    msg.content = Some("this is a very important secret password".into());
-    let score_high = score_message(&msg);
+    // Long messages carry more; wording adds nothing.
+    msg.content = Some("a".repeat(250));
+    let score_high = aidaemon_memory::turn_importance(&msg.role, msg.content.as_deref());
     assert!(
         score_high >= 0.8,
-        "Score should be high for keywords: {}",
+        "A long message should be high importance: {}",
         score_high
+    );
+    msg.content = Some("this is a very important secret password".into());
+    assert_eq!(
+        aidaemon_memory::turn_importance(&msg.role, msg.content.as_deref()),
+        score_medium
     );
 
     // System role
     msg.role = "system".into();
-    assert_eq!(score_message(&msg), 0.0);
+    assert_eq!(
+        aidaemon_memory::turn_importance(&msg.role, msg.content.as_deref()),
+        0.0
+    );
 }
 
 #[test]
@@ -67,7 +74,7 @@ fn fact_lifetime_is_durable_unless_explicitly_transient() {
     #[derive(serde::Deserialize)]
     struct Row {
         #[serde(default)]
-        lifetime: crate::memory::FactLifetime,
+        lifetime: aidaemon_memory::task_learning::FactLifetime,
     }
     let parse = |json: &str| serde_json::from_str::<Row>(json).unwrap().lifetime;
     assert!(parse(r#"{"lifetime":"transient"}"#).is_transient());

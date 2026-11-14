@@ -1,0 +1,37 @@
+[package]
+name = "aidaemon-decisions"
+description = "Decision backends that answer closed questions with a confidence; internal to aidaemon, no stability promise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-decisions"
+readme = "README.md"
+keywords = ["agent", "decision", "llm", "gemini", "async"]
+categories = ["asynchronous", "development-tools"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
+publish = false
+
+[features]
+# `GeminiDecider`: Google's Decisions API (`gemini-decision-1`).
+gemini = ["dep:reqwest"]
+# `ScriptedDecider` and the conformance kit, for testing deciders and callers.
+testing = []
+
+[dependencies]
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
+
+[dev-dependencies]
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+aidaemon-decisions = { path = ".", features = ["testing", "gemini"] }
+tokio = { version = "1", features = ["full"] }

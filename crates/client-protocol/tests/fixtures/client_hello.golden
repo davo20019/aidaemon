@@ -1,0 +1,17 @@
+{
+  "capabilities": [
+    "compact"
+  ],
+  "client": {
+    "device": "Synthetic Watch 1",
+    "kind": "watch",
+    "name": "aidaemon-wear",
+    "version": "0.1.0"
+  },
+  "resume_from": 41,
+  "type": "hello",
+  "version": {
+    "major": 1,
+    "minor": 3
+  }
+}

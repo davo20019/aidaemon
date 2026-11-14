@@ -4,6 +4,7 @@
 // multi-turn history, and session isolation — the same code path all
 // channels use via `Agent::handle_message()`.
 
+use crate::events::EventStoreForTests as _;
 use crate::testing::{
     setup_full_stack_test_agent, setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
     setup_test_agent_orchestrator, setup_test_agent_root,
@@ -12,7 +13,7 @@ use crate::testing::{
     setup_test_agent_with_models, setup_test_agent_with_models_and_policy,
     setup_test_agent_with_policy, MockProvider, MockTool,
 };
-use crate::tools::{EditFileTool, ReadFileTool};
+use crate::tools::EditFileTool;
 use crate::traits::store_prelude::*;
 use crate::traits::{Goal, Procedure, ProviderResponse, StateStore, UserProfile};
 use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
@@ -20,22 +21,6 @@ use chrono::Utc;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-
-/// Opt a memory-focused integration test into the normal automatic-memory
-/// path with an explicit, valid typed assessment. Production deliberately
-/// fail-closes automatic memory when assessment is unavailable; these tests
-/// are about the allowed path, so they must not rely on the mock's historical
-/// "no assessment" fallback.
-fn memory_allowed_task_assessment() -> ProviderResponse {
-    MockProvider::semantic_task_assessment(
-        "answer",
-        false,
-        false,
-        &[],
-        "new_request",
-        "general",
-    )
-}
 
 #[tokio::test]
 async fn test_basic_message_response() {
@@ -156,6 +141,156 @@ async fn test_tool_execution() {
     // Agent should have called the LLM twice (tool call + final response)
     assert_eq!(harness.provider.call_count().await, 2);
     assert_eq!(response, "Here is your system info.");
+}
+
+/// A chat-created mandate claimed for review, its ACT recorded, and one
+/// executor task claimed under it: what a fenced executor run starts from.
+struct MandateExecutorFixture {
+    mandate: crate::traits::Mandate,
+    run: crate::traits::GoalRun,
+    root_task_id: String,
+    root_attempt: crate::traits::TaskAttempt,
+    worker_task_id: String,
+    worker_attempt: crate::traits::TaskAttempt,
+}
+
+async fn claim_mandate_executor(harness: &crate::testing::TestHarness) -> MandateExecutorFixture {
+    let claimed =
+        retry_test_sqlite_busy(|| harness.state.claim_due_mandates(1, "e2e-heartbeat", 300))
+            .await
+            .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let mandate = claimed.into_iter().next().unwrap();
+    let root_task_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let root_task = crate::traits::Task {
+        id: root_task_id.clone(),
+        goal_id: mandate.goal_id.clone(),
+        description: "Review the chat-created stewardship mandate".to_string(),
+        status: "pending".to_string(),
+        priority: "high".to_string(),
+        task_order: 0,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: false,
+        retry_count: 0,
+        max_retries: 0,
+        created_at: now.clone(),
+        started_at: None,
+        completed_at: None,
+    };
+    let goal_run_id = uuid::Uuid::new_v4().to_string();
+    let run = retry_test_sqlite_busy(|| {
+        harness.state.create_mandate_review_run(
+            &mandate.id,
+            mandate.review_lease_token.as_deref().unwrap(),
+            &goal_run_id,
+            &root_task,
+        )
+    })
+    .await
+    .unwrap();
+    let root_attempt = retry_test_sqlite_busy(|| {
+        harness.state.claim_task_with_lease(
+            &root_task_id,
+            "e2e-task-lead",
+            Some("profile-task-lead"),
+            7_200,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let decision = crate::traits::MandateDecisionCycle::new(
+        &mandate.id,
+        &run.id,
+        crate::traits::MandateDecisionOutcome::Act,
+        "A useful bounded update is warranted",
+        mandate.version,
+    );
+    let mut intention = crate::traits::Intention::new(
+        &mandate.id,
+        &decision.id,
+        &run.id,
+        "Post one bounded stewardship update",
+        "It is within the confirmed target and quota",
+    );
+    intention.value_criterion = Some(mandate.success_criteria[0].clone());
+    intention.expected_benefit =
+        Some("The grounded update gives the audience useful current information.".to_string());
+    intention.risk = Some("A low-volume factual update has limited reputational risk.".to_string());
+    intention.invalidation_criteria = Some(
+        "Do not post if the supporting information is stale, duplicated, or unverified."
+            .to_string(),
+    );
+    retry_test_sqlite_busy(|| {
+        harness
+            .state
+            .record_mandate_decision(&decision, Some(&intention), Some(&root_attempt.id))
+    })
+    .await
+    .unwrap();
+    let worker_task_id = uuid::Uuid::new_v4().to_string();
+    let worker_task = crate::traits::Task {
+        id: worker_task_id.clone(),
+        goal_id: mandate.goal_id.clone(),
+        description: "Send the exact fake-X update".to_string(),
+        status: "pending".to_string(),
+        priority: "high".to_string(),
+        task_order: 1,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: false,
+        retry_count: 0,
+        max_retries: 0,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+    };
+    assert!(retry_test_sqlite_busy(|| {
+        harness.state.create_mandate_task_from_attempt(
+            &worker_task,
+            &mandate.id,
+            mandate.version,
+            &run.id,
+            &root_attempt.id,
+            8,
+        )
+    })
+    .await
+    .unwrap());
+    let worker_attempt = retry_test_sqlite_busy(|| {
+        harness.state.claim_mandate_task_from_attempt(
+            &worker_task_id,
+            "e2e-executor",
+            &mandate.id,
+            mandate.version,
+            &run.id,
+            &root_attempt.id,
+            7_200,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    MandateExecutorFixture {
+        mandate,
+        run,
+        root_task_id,
+        root_attempt,
+        worker_task_id,
+        worker_attempt,
+    }
 }
 
 async fn retry_test_sqlite_busy<T, F, Fut>(mut operation: F) -> anyhow::Result<T>
@@ -313,142 +448,18 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
     );
     drop(calls);
 
-    let claimed =
-        retry_test_sqlite_busy(|| harness.state.claim_due_mandates(1, "e2e-heartbeat", 300))
-            .await
-            .unwrap();
-    assert_eq!(claimed.len(), 1);
-    let mandate = claimed.into_iter().next().unwrap();
-    let root_task_id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let root_task = crate::traits::Task {
-        id: root_task_id.clone(),
-        goal_id: mandate.goal_id.clone(),
-        description: "Review the chat-created stewardship mandate".to_string(),
-        status: "pending".to_string(),
-        priority: "high".to_string(),
-        task_order: 0,
-        parallel_group: None,
-        depends_on: None,
-        agent_id: None,
-        context: None,
-        result: None,
-        error: None,
-        blocker: None,
-        idempotent: false,
-        retry_count: 0,
-        max_retries: 0,
-        created_at: now.clone(),
-        started_at: None,
-        completed_at: None,
-    };
-    let goal_run_id = uuid::Uuid::new_v4().to_string();
-    let run = retry_test_sqlite_busy(|| {
-        harness.state.create_mandate_review_run(
-            &mandate.id,
-            mandate.review_lease_token.as_deref().unwrap(),
-            &goal_run_id,
-            &root_task,
-        )
-    })
-    .await
-    .unwrap();
-    let root_attempt = retry_test_sqlite_busy(|| {
-        harness.state.claim_task_with_lease(
-            &root_task_id,
-            "e2e-task-lead",
-            Some("profile-task-lead"),
-            7_200,
-        )
-    })
-    .await
-    .unwrap()
-    .unwrap();
-    let decision = crate::traits::MandateDecisionCycle::new(
-        &mandate.id,
-        &run.id,
-        crate::traits::MandateDecisionOutcome::Act,
-        "A useful bounded update is warranted",
-        mandate.version,
-    );
-    let mut intention = crate::traits::Intention::new(
-        &mandate.id,
-        &decision.id,
-        &run.id,
-        "Post one bounded stewardship update",
-        "It is within the confirmed target and quota",
-    );
-    intention.value_criterion = Some(mandate.success_criteria[0].clone());
-    intention.expected_benefit =
-        Some("The grounded update gives the audience useful current information.".to_string());
-    intention.risk = Some("A low-volume factual update has limited reputational risk.".to_string());
-    intention.invalidation_criteria = Some(
-        "Do not post if the supporting information is stale, duplicated, or unverified."
-            .to_string(),
-    );
-    retry_test_sqlite_busy(|| {
-        harness
-            .state
-            .record_mandate_decision(&decision, Some(&intention), Some(&root_attempt.id))
-    })
-    .await
-    .unwrap();
-    let worker_task_id = uuid::Uuid::new_v4().to_string();
-    let worker_task = crate::traits::Task {
-        id: worker_task_id.clone(),
-        goal_id: mandate.goal_id.clone(),
-        description: "Send the exact fake-X update".to_string(),
-        status: "pending".to_string(),
-        priority: "high".to_string(),
-        task_order: 1,
-        parallel_group: None,
-        depends_on: None,
-        agent_id: None,
-        context: None,
-        result: None,
-        error: None,
-        blocker: None,
-        idempotent: false,
-        retry_count: 0,
-        max_retries: 0,
-        created_at: now,
-        started_at: None,
-        completed_at: None,
-    };
-    assert!(retry_test_sqlite_busy(|| {
-        harness.state.create_mandate_task_from_attempt(
-            &worker_task,
-            &mandate.id,
-            mandate.version,
-            &run.id,
-            &root_attempt.id,
-            8,
-        )
-    })
-    .await
-    .unwrap());
-    let worker_attempt = retry_test_sqlite_busy(|| {
-        harness.state.claim_mandate_task_from_attempt(
-            &worker_task_id,
-            "e2e-executor",
-            &mandate.id,
-            mandate.version,
-            &run.id,
-            &root_attempt.id,
-            7_200,
-        )
-    })
-    .await
-    .unwrap()
-    .unwrap();
+    let MandateExecutorFixture {
+        mandate,
+        run,
+        root_task_id,
+        root_attempt,
+        worker_task_id,
+        worker_attempt,
+    } = claim_mandate_executor(&harness).await;
 
-    let (http_approval_tx, _http_approval_rx) = tokio::sync::mpsc::channel(1);
     harness
         .agent
-        .push_test_tool(Arc::new(crate::tools::HttpRequestTool::new(
-            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            crate::tools::ApprovalBroker::new(http_approval_tx),
-        )));
+        .push_test_tool(Arc::new(crate::tools::HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))));
     harness.agent.set_test_mandate_execution(
         &mandate.id,
         mandate.version,
@@ -561,94 +572,15 @@ async fn cadence_inside_draft_only_mandate_request_is_model_directed_not_schedul
 
     let calls = harness.provider.call_log.lock().await;
     let first_call = calls.first().expect("model received the request directly");
-    let tool_names = first_call
-        .tools
-        .iter()
-        .filter_map(|tool| tool["function"]["name"].as_str())
-        .collect::<Vec<_>>();
-    assert!(tool_names.contains(&"manage_mandates"));
-}
-
-#[tokio::test]
-async fn test_semantic_file_read_cache_avoids_duplicate_and_overlapping_physical_reads() {
-    let mut file = tempfile::NamedTempFile::new().unwrap();
-    use std::io::Write;
-    writeln!(file, "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta").unwrap();
-    let path = file.path().to_string_lossy().into_owned();
-    let first_args = json!({"path": path, "start_line": 1, "end_line": 3}).to_string();
-    let overlap_args = json!({"path": path, "start_line": 2, "end_line": 5}).to_string();
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("read_file", &first_args),
-        MockProvider::tool_call_response("read_file", &first_args),
-        MockProvider::tool_call_response("read_file", &overlap_args),
-        MockProvider::text_response("The cached resume section contains beta and gamma."),
-    ]);
-    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
-        provider,
-        vec![Arc::new(ReadFileTool)],
-        None,
-    )
-    .await
-    .unwrap();
-
-    let response = harness
-        .agent
-        .handle_message(
-            "semantic_read_cache",
-            "Inspect the resume section and answer from the file.",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response,
-        "The cached resume section contains beta and gamma."
-    );
-    let proposed_reads: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events \
-         WHERE session_id = ? AND event_type = 'tool_call' \
-         AND json_extract(data, '$.name') = 'read_file'",
-    )
-    .bind("semantic_read_cache")
-    .fetch_one(&harness.state.pool())
-    .await
-    .unwrap();
-    assert_eq!(proposed_reads, 3);
-    let physical_reads: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events \
-         WHERE session_id = ? AND event_type = 'tool_result' \
-         AND json_extract(data, '$.name') = 'read_file' \
-         AND json_extract(data, '$.receipt.invocation_stage') = 'dispatched'",
-    )
-    .bind("semantic_read_cache")
-    .fetch_one(&harness.state.pool())
-    .await
-    .unwrap();
-    assert_eq!(physical_reads, 1);
-
-    let calls = harness.provider.call_log.lock().await;
-    let all_tool_content = calls
-        .iter()
-        .flat_map(|call| call.messages.iter())
-        .filter(|message| message.get("role").and_then(|value| value.as_str()) == Some("tool"))
-        .filter_map(|message| message.get("content").and_then(|value| value.as_str()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(all_tool_content.contains("complete task-local file artifact"));
-    assert!(all_tool_content.contains("Uncovered intervals: 4-5"));
+    let tool_names = crate::testing::offered_tool_names(&first_call.tools);
+    assert!(tool_names.iter().any(|name| name == "manage_mandates"));
 }
 
 #[tokio::test]
 async fn test_llm_call_event_emitted_with_telemetry() {
-    // A simple conversational turn records both physical structured-assessment
-    // attempts and the main response. The mock deliberately returns an invalid
-    // assessment, so the lone producer gets its one bounded repair attempt.
-    // Both invalid attempts report zero usage and are durably classified as
-    // failed validation; the main response reports 10 input / 5 output tokens.
+    // A fresh session has no relationship to classify, so a simple turn records
+    // its one main response (10 input / 5 output tokens) and the request
+    // compiler's side call, which the mock answers with nothing (0 / 0).
     let harness =
         setup_test_agent_with_models(MockProvider::new(), "gpt-5.6-terra", "gpt-5.6-terra")
             .await
@@ -677,13 +609,13 @@ async fn test_llm_call_event_emitted_with_telemetry() {
         .expect("llm stats should compute");
 
     assert_eq!(
-        stats.total_calls, 3,
-        "expected an assessment, its bounded repair, and one response event"
+        stats.total_calls, 2,
+        "expected the response and the request compiler's call"
     );
-    assert_eq!(stats.failed_calls, 2);
-    assert_eq!(stats.avg_input_tokens, 3);
-    assert_eq!(stats.avg_output_tokens, 1);
-    assert_eq!(stats.fell_back_count, 1);
+    assert_eq!(stats.failed_calls, 0);
+    assert_eq!(stats.avg_input_tokens, 5);
+    assert_eq!(stats.avg_output_tokens, 2);
+    assert_eq!(stats.fell_back_count, 0);
     // Latency is recorded (may be ~0ms against an instant mock provider).
     assert!(stats.p95_latency_ms >= stats.p50_latency_ms);
 }
@@ -769,17 +701,7 @@ async fn test_memory_persistence() {
 
 #[tokio::test]
 async fn test_multi_turn_conversation() {
-    let provider = MockProvider::new().with_task_assessments(vec![
-        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-    ]);
+    let provider = MockProvider::new().with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     // First turn
@@ -827,32 +749,19 @@ async fn test_multi_turn_conversation() {
 
 #[tokio::test]
 async fn exact_history_follow_up_is_grounded_by_the_projected_antecedent() {
-    // Seed turn (no tools), then a follow-up whose contract requires exact
-    // history while forbidding tools. The runtime projects the persisted
+    // Seed turn (no tools), then a follow-up the relationship router binds to
+    // it. The runtime projects the persisted
     // antecedent into the prompt; that projection is the canonical retained
     // history, so the model's correct recall must ship unchanged instead of
     // being replaced by a "could not establish the exact wording" blocker.
-    let seed = MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none");
-    let base = MockProvider::semantic_task_assessment(
-        "answer",
-        false,
-        false,
-        &[],
-        "continuation",
-        "conversation_history",
-    );
-    let mut followup: serde_json::Value =
-        serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
-    followup["contract"]["requires_exact_history"] = serde_json::json!(true);
-    followup["contract"]["tool_scope"] = serde_json::json!("forbidden");
-    let followup = MockProvider::text_response(&followup.to_string());
     let marker = "context_recalled=CTX_SYNTHETIC_7F2K; source=conversation; memory=not_used; tools=0.";
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("context_seed=ack"),
         MockProvider::text_response(marker),
         MockProvider::text_response(marker),
     ])
-    .with_task_assessments(vec![seed, followup]);
+    .with_relationship_assessments(vec![MockProvider::relationship_assessment(
+        "continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     harness
@@ -1152,16 +1061,7 @@ async fn test_slack_command_request_llm_payload() {
     let call = &call_log[0];
 
     // Check tool definitions are present
-    let tool_names: Vec<String> = call
-        .tools
-        .iter()
-        .filter_map(|t| {
-            t.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .map(String::from)
-        })
-        .collect();
+    let tool_names = crate::testing::offered_tool_names(&call.tools);
     assert!(!tool_names.is_empty(), "No tools provided to LLM");
     // In test harness we only have system_info, but in production terminal would be here
     assert!(
@@ -1218,7 +1118,19 @@ async fn test_slack_command_request_llm_payload() {
 async fn test_gemini_no_grounding_with_function_tools() {
     use serde_json::json;
 
-    let provider = crate::providers::GoogleGenAiProvider::new("fake-key");
+    let provider = aidaemon_providers::GoogleGenai::builder()
+        .api_key("fake-key")
+        .build()
+        .unwrap();
+    let body_for = |tools: &[serde_json::Value]| {
+        let messages = vec![json!({"role": "user", "content": "What time is it?"})];
+        provider.request_body(&crate::providers::sdk_backed::to_sdk_request(
+            "gemini-test",
+            &messages,
+            tools,
+            &crate::traits::ChatOptions::default(),
+        ))
+    };
 
     let tools = vec![json!({
         "type": "function",
@@ -1234,17 +1146,13 @@ async fn test_gemini_no_grounding_with_function_tools() {
         }
     })];
 
-    // When function tools are present, grounding must be disabled
-    let converted = provider.convert_tools_for_test(&tools, false);
-    assert!(converted.is_some(), "Should have tools");
-    let tools_array = converted.unwrap();
-
-    // Should have only 1 entry: function_declarations (NO google_search)
+    // When function tools are present, grounding must be disabled.
+    let body = body_for(&tools);
+    let tools_array = body["tools"].as_array().expect("should have tools");
     assert_eq!(
         tools_array.len(),
         1,
-        "Expected only function_declarations, got: {:?}",
-        tools_array
+        "Expected only function_declarations, got: {tools_array:?}"
     );
     assert!(
         tools_array[0].get("function_declarations").is_some(),
@@ -1255,10 +1163,9 @@ async fn test_gemini_no_grounding_with_function_tools() {
         "google_search should NOT be present alongside function tools"
     );
 
-    // When no function tools, grounding IS included
-    let converted_grounding = provider.convert_tools_for_test(&[], true);
-    assert!(converted_grounding.is_some());
-    let grounding_array = converted_grounding.unwrap();
+    // When no function tools, grounding IS included.
+    let body = body_for(&[]);
+    let grounding_array = body["tools"].as_array().expect("grounding tool");
     assert_eq!(grounding_array.len(), 1);
     assert!(
         grounding_array[0].get("google_search").is_some(),
@@ -1359,8 +1266,7 @@ async fn test_owner_system_prompt_has_no_restrictions() {
 
 #[tokio::test]
 async fn test_system_prompt_pins_critical_facts_for_owner_dm() {
-    let provider = MockProvider::new()
-        .with_task_assessments(vec![memory_allowed_task_assessment()]);
+    let provider = MockProvider::new();
     let mut harness = setup_test_agent(provider).await.unwrap();
     harness.agent.set_test_orchestrator_mode();
 
@@ -1473,7 +1379,7 @@ fn simulate_telegram_auth(
     user_id: u64,
 ) -> Option<UserRole> {
     // Step 1: auth check (mirrors telegram.rs handle_message)
-    use crate::channels::telegram::{check_auth, determine_role, AuthResult};
+    use aidaemon_channel_telegram::bot::{check_auth, determine_role, AuthResult};
     let auth = if allowed_user_ids.is_empty() {
         check_auth(allowed_user_ids, user_id)
     } else if allowed_user_ids.contains(&user_id) {

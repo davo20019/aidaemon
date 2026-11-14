@@ -1,0 +1,20 @@
+name: turn_limit
+description: A run that keeps calling tools is stopped by the scenario's turn limit.
+input: Read every file in the notes folder.
+limits:
+  max_turns: 2
+script:
+  - tool_calls:
+      - { name: read_file, arguments: { path: notes/a.txt } }
+  - tool_calls:
+      - { name: read_file, arguments: { path: notes/b.txt } }
+expect:
+  status: limit_reached
+  tool_call_counts: { read_file: 2 }
+  max_turns: 2
+  no_failed_receipts: true
+# Live: the model may read one file or several, but the limit holds.
+live_expect:
+  max_turns: 2
+  tools_used: [read_file]
+  no_failed_receipts: true

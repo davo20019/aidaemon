@@ -37,6 +37,10 @@ telegram-autobot.js
 *.py
 __pycache__/
 *.json
+# Protocol fixtures compiled into tests (include_str!).
+!tests/fixtures/**/*.json
+# The Client Protocol's generated JSON Schema, which clients generate from.
+!schemas/**/*.json
 *.png
 *.txt
 *.pdf
@@ -60,6 +64,7 @@ menu_section.tsx
 !CLAUDE.md
 !AGENTS.md
 !CHANGELOG.md
+!CONTRIBUTING.md
 
 # Documentation (local only)
 docs/
@@ -87,3 +92,18 @@ hello_world.php
 # Machine-local cargo build tuning (disk-constrained dev box) — not for CI/contributors
 .cargo/
 .aidaemon-workspaces/
+
+# Plans are local working notes, not part of the repository
+crates/aidaemon-core/PLAN.md
+crates/aidaemon-core/PRODUCT_PLAN.md
+crates/aidaemon-core/plans/
+reports/*plan*.md
+
+# Specs, research, reports and design notes stay local (owner, 2026-11-12)
+research_notes/
+reports/
+crates/sdk-guide/
+crates/EXTENDING.md
+crates/PUBLISHING.md
+crates/aidaemon-core/DESIGN.md
+crates/aidaemon-eval/RESULTS.md

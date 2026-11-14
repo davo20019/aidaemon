@@ -62,13 +62,13 @@ Delegate complex tasks to **sub-agents** or external **CLI agents** (Claude, Gem
 SQLite-backed persistent memory with vector embeddings (AllMiniLML6V2). Background consolidation extracts durable facts from conversations. Semantic episode recall is the coarse discovery layer; `search_history` adds authorized FTS5 search over exact retained user/assistant messages, anchored context, task bookends, and signed forward/backward paging. Exact recall follows `state.retention.messages_days` (90 by default; `0` opts into permanent active-database history), independently of short-lived diagnostic events. Database encrypted at rest by default.
 
 ### Skills
-Trigger-based instructions that teach it new workflows. Load from files, URLs, or remote registries. Successful procedures auto-promote to skills after enough consistent use.
+Instructions that teach it new workflows, loaded when a task needs them or when you ask by name. Load from files, URLs, or remote registries. Successful procedures auto-promote to skills after enough consistent use.
 
 ### Automation
-Cron-style scheduled tasks with natural language time parsing. Email triggers via IMAP IDLE. Long-running goal tracking with task breakdown and multi-schedule support.
+Everything that runs on its own is an automation, of two kinds. **Scheduled** automations run a fixed instruction at set times: reminders and recurring tasks, with natural language time parsing and multi-schedule support. **Watching** automations work toward an objective within limits you approve, deciding each time whether to act, wait, ask you, or stop. Ask for what you want; the agent picks the kind. Your automations show in one list, each as the same five-line card (what, how often, what it can do, when it tells you, when it ends), and you pause, resume or cancel any of them by name. Email triggers via IMAP IDLE.
 
 ### Security
-Terminal command allowlists, inline approval flow (Allow Once / Allow Always / Deny), SSRF protection, input sanitization, encrypted state, secrets in OS keychain, and role-based access control. See the [security docs](https://docs.aidaemon.ai/) for the full model.
+Terminal command allowlists, inline approval flow (Allow Once / Allow Session / Allow Always / Deny), SSRF protection, input sanitization, encrypted state, secrets in OS keychain, and role-based access control. See the [security docs](https://docs.aidaemon.ai/) for the full model.
 
 ## Running as a Service
 
@@ -105,14 +105,9 @@ on one coherent filesystem. Configuration, encrypted state, channel transport,
 credentials, approvals, and browser/computer-use sessions remain on the daemon
 host.
 
-Docker support is deliberately optional so the default build remains a
-single-binary, Docker-free installation:
-
-```bash
-cargo install aidaemon --features execution-docker
-```
-
-The Docker backend creates or reuses one persistent container and defaults to
+The Docker backend is built in (the `execution-docker` feature, on by
+default; it drives the `docker` CLI and adds no dependencies), so Docker is
+needed only when `[execution] backend = "docker"` is set. The Docker backend creates or reuses one persistent container and defaults to
 no network access. The SSH backend uses the local OpenSSH client and honors
 existing host aliases, ssh-agent, ProxyJump, known-host, and hardware-key
 configuration. `allow_outside_workspace` confines path-based tools and command
@@ -155,6 +150,133 @@ covered, and checkpoints involving detached/background mutation are marked
 unsafe rather than offered for rollback. The external object store is
 owner-readable and contains plaintext copies of eligible source files; use
 retention and size limits appropriate for the machine.
+
+### Authority and untrusted content
+
+Pages, emails, other people's messages and files outside your own folders can
+contain text written to steer an AI agent. aidaemon tracks this. Once a turn
+has read content someone else wrote, any outward action it then tries (sending
+a message or email, posting, calling a remote API with your credentials,
+deleting outside your folders, changing configuration, running an unknown
+program on the host) is first checked by a separate model call that sees only
+your request and the proposed action, never the content that was read. If the
+action is not something your request asked for, it is refused and the agent
+is told why. Reading, editing files in your workspace and ordinary local work
+such as builds, tests and local git commits are not checked. Results from
+helper agents carry the same mark, and a chat stays marked while the turn that
+read the content is still in its context.
+
+```toml
+[authority]
+owner_default = "full"   # full | unrestricted
+# Your own folders: reading files here does not count as untrusted content.
+trusted_roots = ["~/projects"]
+```
+
+Your own folders are only the ones you grant on purpose: `[authority]
+trusted_roots`, the daemon's working directory, a scheduled goal's workspace
+set with `bind_workspace`, and a group chat's workspace grant. Path aliases
+(`[path_aliases] projects`) only help aidaemon find projects by name; they do
+not grant trust, so add a folder to `trusted_roots` if you want it trusted.
+A folder named only in a message or a goal's mission (for example "summarize
+~/Downloads/invoice.pdf") is not trusted: reading it counts as untrusted
+content, so the next outward action is checked. The broadest folders never
+count, even when configured or reached through a symlink: `/`, your home
+folder and its parents, and the shared temp folders. A symlink counts as the
+folder it points to. At startup the daemon logs the trusted roots it uses
+and any it dropped as too broad.
+
+With `owner_default = "full"` (the default) the check above applies to your
+own turns too. `unrestricted` skips the check on the owner's turns and only
+records each outward action taken after untrusted content; guests' turns are
+always checked.
+
+Chat commands (owner only) change one chat for four hours:
+
+- `/readonly` makes the chat read-only, including work already running and
+  the helper agents it started: aidaemon can look but not change anything.
+- `/mode full | unrestricted | readonly` switches the chat's mode; `/mode` on
+  its own shows the current one. `/mode full` ends a read-only or unrestricted
+  period early.
+
+To keep one message out of memory, send `/private` first (anyone can):
+aidaemon still uses what it knows to answer, but learns nothing from that
+message, now or later. `/private off` cancels. You can also just ask it not
+to remember something; the agent then marks that turn the same way.
+
+### Approvals
+
+Some actions wait for your OK. aidaemon sends you a card in the chat that
+says what the agent wants to do, how risky it is, and anything worth
+knowing. You are asked when the agent wants to:
+
+- send a web request that changes something (anything other than a plain
+  GET, HEAD or OPTIONS), including a live test of a new API connection;
+- run a terminal command that is not on your allowlist, unless aidaemon's
+  safety check looks at it and finds nothing risky. If the check flags it,
+  fails, takes too long or is not set up, you are asked;
+- run a terminal command that needs a look whatever the allowlist says:
+  reading sensitive files such as `~/.ssh`, starting a program that keeps
+  running in the background, running a new command detached from the task,
+  reaching outside the task's folders in a sandboxed terminal, or turning on
+  trust-all mode;
+- run any terminal command in a chat started by an automated trigger, such as
+  an incoming email.
+
+Trusted sessions run their web requests and terminal commands without
+cards: scheduled goals and tasks you set up, and automated events marked as
+trusted. In exchange, they cannot start programs that keep running in the
+background. One exception: terminal commands in a chat started by an
+automated trigger are always asked about, trusted or not. An Autopilot
+mandate's web requests are not asked about either: they run only when they
+match the action you granted the mandate. Before anything is asked, outgoing
+requests are checked for secrets such as API keys and tokens: a request
+carrying one is blocked, not asked about.
+
+How to answer:
+
+- **Allow Once** runs this one action.
+- **Allow Session** also allows the same action again without asking, until
+  the daemon restarts. For a web request this covers the same method to the
+  same address, from this chat and the helper agents it starts. For a terminal command it covers
+  commands that start the same way, from any chat.
+- **Allow Always** (terminal commands) saves the command's start to your
+  allowlist, so commands like it run without a card from now on.
+- **Deny** stops the action.
+
+Web request cards offer Allow Session. Terminal cards offer either Allow
+Session or Allow Always, depending on the terminal's permission mode and the
+command's risk (by default, Allow Session for critical commands and Allow
+Always for the rest). A card waits five minutes; no answer, or a card that
+could not be delivered, counts as Deny.
+
+A Deny holds for the rest of the task. The agent cannot get around it by
+trying another way: once you decline a POST to a site, a `curl` to that site
+from the terminal is refused too, and so is the same request from any helper
+agent the task starts. No new card is sent for these retries. If, after a
+Deny, the agent tries something that sends data out or deletes, and whose
+effects cannot be worked out in advance (an unfamiliar script, for example),
+you are asked again; it is never let through quietly. A task in which you
+declined something is recorded as only partly done, never as a success. A
+message you send while the task is still running joins that task, and the
+Deny still holds. Once the task has finished, your next message starts a new
+task, so you can change your mind and ask again.
+
+### Reaching the gateways from your other devices
+
+The Client Gateway (`/client/v1`, for `aidaemon tui`, `aidaemon web` and paired phones) and the Node Gateway (`/node/v1`) only listen on loopback. To reach them from elsewhere, let the daemon run the tunnel itself: it starts with the daemon, stops with it, restarts with backoff when it drops, and feeds its address into pairing links and Node heartbeats. The tunnel only moves bytes; devices still pair with their own keys.
+
+```toml
+[exposure.client_gateway]
+adapter = "tailscale"        # private to your tailnet; mode = "funnel" makes it public
+
+[exposure.node_gateway]
+adapter = "cloudflare"       # a named tunnel on your own hostname
+hostname = "nodes.example.com"
+tunnel = "my-tunnel"         # created with `cloudflared tunnel create`
+```
+
+Adapters: `tailscale` (`serve` or `funnel`), `cloudflare` (`named`, or `quick` for a throwaway `trycloudflare.com` address, Client Gateway only), `manual` (`url` of a reverse proxy you run) and `command` (any program that prints `{"url": "https://..."}` on its first line and keeps running; argv only, `{port}`, `{addr}` and `{service}` are filled in). The Node Gateway needs an address that survives restarts, so it refuses `quick` and a `command` without `stable = true`. `cloudflared` or `tailscale` must be on `PATH` (or set `binary`). Changes apply after a restart; `/exposure` shows each tunnel's state, address and last failure. The agent can set this up for you (`manage_config enable_exposure`, with your approval), except `command`, which only you can write.
 
 ### Customize your agent
 

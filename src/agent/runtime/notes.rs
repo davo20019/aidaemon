@@ -1,83 +1,13 @@
-//! Auxiliary note recording: persisting assistant/parent-visible notes into
-//! session history.
-//!
-//! Moved verbatim from `runtime/history.rs` (Phase 4 decoupling); logic is
-//! unchanged.
-
-use super::*;
-
-// impl-Agent justification: this is the concrete AssistantNoteSink port used by
-// channel delivery without exposing the rest of Agent.
-impl Agent {
-    /// Bind the next related owner turn to a delivered, content-free mandate
-    /// ASK notice. The actual generated question remains in mandate-local
-    /// storage and must be inspected with the management tool.
-    pub(crate) async fn record_mandate_owner_input_context(
-        &self,
-        session_id: &str,
-        mandate_id: &str,
-        mandate_version: i64,
-        notification_id: &str,
-    ) -> anyhow::Result<()> {
-        super::dialogue_state::record_mandate_owner_input(
-            self,
-            session_id,
-            mandate_id,
-            mandate_version,
-            notification_id,
-        )
-        .await
-    }
-
-    pub(crate) async fn record_auxiliary_assistant_note(
-        &self,
-        session_id: &str,
-        content: &str,
-    ) -> anyhow::Result<()> {
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            return Ok(());
-        }
-
-        let emitter = crate::events::EventEmitter::new(self.event_store.clone(), session_id);
-        let msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "assistant".to_string(),
-            content: Some(trimmed.to_string()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.2,
-            ..Message::runtime_defaults()
-        };
-        self.append_assistant_message_with_event(&emitter, &msg, "system", None, None)
-            .await
-    }
-
-    pub(crate) async fn record_parent_visible_result_note(
-        &self,
-        session_id: &str,
-        prefix: &str,
-        text: &str,
-    ) -> anyhow::Result<()> {
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Ok(());
-        }
-
-        let summary = format!("{}:\n\n{}", prefix, trimmed);
-        self.record_auxiliary_assistant_note(session_id, &summary)
-            .await
-    }
-}
+//! Session notes live in `aidaemon-runtime` ([`aidaemon_runtime::turn::notes`]).
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::TurnNotes;
+    use aidaemon_runtime::host::TurnHost as _;
+
     #[tokio::test]
     async fn delivered_mandate_ask_persists_typed_owner_input_context() {
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::{DialogueStateStore, QuestionKind};
 
         let harness = setup_test_agent(MockProvider::new())
@@ -134,7 +64,7 @@ mod tests {
     #[tokio::test]
     async fn parent_text_result_delivery_records_parent_visible_text() {
         use super::super::parent_delivery::ParentDeliveryKind;
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
@@ -175,11 +105,92 @@ mod tests {
             history
         );
     }
+    /// A notification delivered while no turn is running (a scheduled goal at
+    /// night) must still be in the conversation the owner's next message
+    /// sees. The history fetch is turn-anchored, so a note stamped with no
+    /// turn would never reach the model, and "tell me more" would be answered
+    /// from whatever came before it.
+    #[tokio::test]
+    async fn idle_goal_notification_reaches_the_next_turn() {
+        use super::super::parent_delivery::ParentDeliveryKind;
+        use crate::testing::MockProvider;
+
+        // Top-level chat agent (depth 0): the default harness is a delegated
+        // worker, whose transcript keeps no earlier dialogue at all.
+        let harness = crate::testing::setup_test_agent_with_models(
+            MockProvider::new(),
+            "mock-model",
+            "mock-model",
+        )
+        .await
+        .expect("setup harness");
+        let session_id = "telegram:test_bot:synthetic-owner-2";
+
+        harness
+            .agent
+            .handle_message(
+                session_id,
+                "Count the routes in the demo module.",
+                None,
+                crate::types::UserRole::Owner,
+                crate::types::ChannelContext::private("telegram"),
+                None,
+            )
+            .await
+            .expect("earlier unrelated turn");
+        assert!(
+            harness
+                .agent
+                .turn_runtime()
+                .current_turn_ids
+                .read()
+                .await
+                .get(session_id)
+                .is_none(),
+            "no turn may be running when the notification lands"
+        );
+
+        let notice = "Your automation \"Grow the synthetic newsletter\": a review failed \
+                      before it finished (usage limit reached).";
+        let outcome = harness
+            .agent
+            .deliver_parent_text_result(
+                None,
+                session_id,
+                notice,
+                ParentDeliveryKind::GoalNotification,
+            )
+            .await
+            .expect("record notification");
+        assert!(outcome.recorded);
+
+        let before = harness.provider.call_log.lock().await.len();
+        harness
+            .agent
+            .handle_message(
+                session_id,
+                "What happened there?",
+                None,
+                crate::types::UserRole::Owner,
+                crate::types::ChannelContext::private("telegram"),
+                None,
+            )
+            .await
+            .expect("follow-up turn");
+
+        let calls = harness.provider.call_log.lock().await;
+        let prompt = serde_json::to_string(&calls[before].messages).expect("serialize prompt");
+        assert!(
+            prompt.contains("Grow the synthetic newsletter"),
+            "the idle notification must be in the next turn's conversation: {prompt}"
+        );
+    }
+
     #[tokio::test]
     async fn parent_text_result_does_not_record_on_dropped_hub() {
         use super::super::parent_delivery::ParentDeliveryKind;
         use crate::channels::{ChannelHub, SessionMap};
-        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::testing::{MockProvider, setup_test_agent};
         use crate::traits::MessageStore;
         use std::collections::HashMap;
         use std::sync::{Arc, Weak};

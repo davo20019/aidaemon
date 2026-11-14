@@ -1,0 +1,641 @@
+//! Owner-authorized autonomous mandate policy.
+
+use serde_json::Value;
+
+use crate::traits::{MandateAuthority, ToolCallEffect, ToolCallSemantics};
+
+/// Whether the tool named `tool_name` is on the list a mandate never
+/// delegates. Where the tool itself is at hand, use [`is_non_delegable`],
+/// which also covers tools that declare opaque execution (MCP servers).
+pub fn is_non_delegable_tool(tool_name: &str) -> bool {
+    MandateAuthority::NON_DELEGABLE_TOOLS.contains(&tool_name)
+}
+
+/// Whether a mandate may never delegate `tool`: a listed tool, or one whose
+/// calls run inside an opaque process (`ToolDispatchFacts::opaque_execution`).
+pub fn is_non_delegable(tool: &dyn aidaemon_tools::OutcomeTool) -> bool {
+    tool.dispatch_facts().opaque_execution || is_non_delegable_tool(tool.name())
+}
+
+/// How much of a confirmed strategy's body the clean check reads.
+const VERIFIER_STRATEGY_CHARS: usize = 2_000;
+
+/// The owner's request for a mandate run, as the untrusted-call verifier reads
+/// it. Built only from the owner-confirmed policy row: the runtime's task text
+/// authorizes nothing, and late owner guidance never widens a mandate.
+pub fn verifier_request(mandate: &crate::traits::Mandate) -> String {
+    let strategy = mandate.strategy.as_ref().map(|strategy| {
+        serde_json::json!({
+            "description": strategy.description,
+            "body": aidaemon_events::text::truncate_str(&strategy.body, VERIFIER_STRATEGY_CHARS),
+        })
+    });
+    let statement = serde_json::json!({
+        "objective": mandate.objective,
+        "autonomy_mode": mandate.autonomy_mode,
+        "authority": mandate.authority,
+        "strategy": strategy,
+        "constraints": mandate.constraints,
+        "success_criteria": mandate.success_criteria,
+        "stop_conditions": mandate.stop_conditions,
+    });
+    format!(
+        "The owner confirmed this standing mandate (policy version {}). The assistant \
+         carries it out on its own over repeated reviews, so the owner does not ask for \
+         each action separately. An operation listed under authority, on a listed target, \
+         that serves the objective and respects the constraints is what the owner asked \
+         for; anything else is not. Mandate: {statement}",
+        mandate.version
+    )
+}
+
+/// Extract only explicit owner guidance from a controller goal's otherwise
+/// mixed context. This is the sole controller-context field allowed into a
+/// mandate child prompt. Keep both entry count and aggregate prompt size
+/// bounded even if older data predates the write-side limits.
+pub fn bounded_owner_guidance(goal_context: Option<&str>) -> Vec<String> {
+    const MAX_ENTRIES: usize = 10;
+    const MAX_ENTRY_TEXT: usize = 1_024;
+    const MAX_TOTAL_TEXT: usize = 8 * 1_024;
+
+    let Some(entries) = goal_context
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.get("owner_guidance").cloned())
+        .and_then(|value| value.as_array().cloned())
+    else {
+        return Vec::new();
+    };
+
+    let mut newest_first = Vec::new();
+    let mut total_chars = 0usize;
+    let mut total_bytes = 0usize;
+    for entry in entries.iter().rev().take(MAX_ENTRIES) {
+        let Some(raw) = entry
+            .get("guidance")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let remaining_chars = MAX_TOTAL_TEXT.saturating_sub(total_chars);
+        let remaining_bytes = MAX_TOTAL_TEXT.saturating_sub(total_bytes);
+        if remaining_chars == 0 || remaining_bytes == 0 {
+            break;
+        }
+        let max_chars = MAX_ENTRY_TEXT.min(remaining_chars);
+        let max_bytes = MAX_ENTRY_TEXT.min(remaining_bytes);
+        let mut guidance = String::new();
+        for character in raw.chars().take(max_chars) {
+            if guidance.len().saturating_add(character.len_utf8()) > max_bytes {
+                break;
+            }
+            guidance.push(character);
+        }
+        if guidance.is_empty() {
+            continue;
+        }
+        total_chars = total_chars.saturating_add(guidance.chars().count());
+        total_bytes = total_bytes.saturating_add(guidance.len());
+        newest_first.push(guidance);
+    }
+    newest_first.reverse();
+    newest_first
+}
+
+/// Every `mandate_review` action (only the internal deliberator has the
+/// tool), paired with its kernel class. This is the single source of truth
+/// consumed by the call classifier, the tool's call semantics, and the
+/// role-gate invariant test: a deliberator-reserved action that is not listed
+/// here is unreachable inside a mandate run.
+pub const DELIBERATOR_PROTOCOL_ACTIONS: &[(&str, MandateCallClass)] = &[
+    ("record_decision", MandateCallClass::RecordDecision),
+    ("record_measurement", MandateCallClass::RecordMeasurement),
+];
+
+/// Kernel class for a `mandate_review` action, or
+/// `None` when the action is not part of the deliberator protocol.
+pub fn deliberator_protocol_class(action: &str) -> Option<MandateCallClass> {
+    DELIBERATOR_PROTOCOL_ACTIONS
+        .iter()
+        .find(|(name, _)| *name == action)
+        .map(|(_, class)| *class)
+}
+
+/// Kernel classification for calls made while a mandate controller is the
+/// resolved goal. These are exact protocol names/actions, never language
+/// inference. Only governed mutations receive an action-budgeted grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MandateCallClass {
+    /// Read-only controller protocol state, available without broad read
+    /// authority (currently only the current run's task list).
+    ProtocolObservation,
+    /// Read-only evidence gathering; permitted before ACT when observations
+    /// are enabled.
+    Observation,
+    /// The single durable ACT/WAIT/ASK/STOP commit point.
+    RecordDecision,
+    /// The durable receipt-backed objective metric commit that a controlled
+    /// mandate requires before its decision.
+    RecordMeasurement,
+    /// Goal/task orchestration that is useful only after a current ACT. Child
+    /// actions remain independently governed by the same mandate.
+    ActControl,
+    /// A mutation that must pass the complete owner envelope and consume one
+    /// cycle attempt.
+    GovernedMutation,
+    /// Unknown/admin calls fail closed inside a mandate run.
+    Deny,
+}
+
+pub fn classify_mandate_call(
+    tool_name: &str,
+    arguments: &str,
+    semantics: &ToolCallSemantics,
+) -> MandateCallClass {
+    let action = serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+
+    if tool_name == crate::tools::mandate_review::MANDATE_REVIEW_TOOL {
+        return action
+            .as_deref()
+            .and_then(deliberator_protocol_class)
+            .unwrap_or(MandateCallClass::Deny);
+    }
+    // The owner's mandate tool changes policy; a run under that policy never
+    // calls it.
+    if tool_name == "manage_mandates" {
+        return MandateCallClass::Deny;
+    }
+    if tool_name == "manage_goal_tasks" {
+        return match action.as_deref() {
+            Some("list_tasks") => MandateCallClass::ProtocolObservation,
+            Some("create_task" | "claim_task") => MandateCallClass::ActControl,
+            // The mandate lifecycle is committed only through STOP/ASK and
+            // runtime finalization. Task mutations/claims are committed only
+            // through executor leases, never through a task-lead control call.
+            _ => MandateCallClass::Deny,
+        };
+    }
+    if tool_name == "spawn_agent" {
+        // Detached executors have a separate progress/completion notification
+        // path that can outlive the run fence and surface generated prose to
+        // the owner. Mandates use only synchronous, exactly claimed executor
+        // children so finalization remains the sole static notification path.
+        let synchronous = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|object| {
+                object
+                    .get("background")
+                    .and_then(Value::as_bool)
+                    .is_none_or(|background| !background)
+            });
+        return if synchronous {
+            MandateCallClass::ActControl
+        } else {
+            MandateCallClass::Deny
+        };
+    }
+    if tool_name == "report_blocker" {
+        return MandateCallClass::ActControl;
+    }
+    // These adapters own opaque nested execution loops. Allowing one as a
+    // single observation or mutation would let downstream effects escape
+    // target scoping and per-action accounting.
+    if is_non_delegable_tool(tool_name) {
+        return MandateCallClass::Deny;
+    }
+
+    if semantics.mutates_state()
+        || matches!(
+            semantics.effect,
+            ToolCallEffect::Mutation | ToolCallEffect::ObservationAndMutation
+        )
+    {
+        return MandateCallClass::GovernedMutation;
+    }
+    if semantics.effect == ToolCallEffect::Observation {
+        return MandateCallClass::Observation;
+    }
+    MandateCallClass::Deny
+}
+
+/// Enforce the mandate's two-role protocol independently of prompt/tool
+/// visibility. The task lead may observe, commit the decision, and orchestrate
+/// exact children; only a non-root executor may consume a mutation grant. An
+/// executor has one control-plane escape hatch: reporting its own blocker.
+pub fn role_allows_mandate_call(
+    class: MandateCallClass,
+    tool_name: &str,
+    is_task_lead: bool,
+) -> bool {
+    if is_task_lead {
+        return match class {
+            MandateCallClass::ProtocolObservation
+            | MandateCallClass::Observation
+            | MandateCallClass::RecordDecision
+            | MandateCallClass::RecordMeasurement => true,
+            MandateCallClass::ActControl => {
+                matches!(tool_name, "manage_goal_tasks" | "spawn_agent")
+            }
+            MandateCallClass::GovernedMutation | MandateCallClass::Deny => false,
+        };
+    }
+
+    matches!(class, MandateCallClass::GovernedMutation)
+        || (class == MandateCallClass::ActControl && tool_name == "report_blocker")
+}
+
+/// The next step a refused mandate call can actually take, by typed denial
+/// reason and role. One generic hint told an executor to record an ACT it
+/// cannot record, and told a run whose fence was gone to keep trying.
+pub fn mandate_denial_next_step(reason: &str, is_task_lead: bool) -> &'static str {
+    match reason {
+        "mandate_record_missing"
+        | "mandate_inactive"
+        | "mandate_expired"
+        | "mandate_execution_fence_lost"
+        | "mandate_run_missing"
+        | "invalid_mandate_run"
+        | "mandate_role_fence_missing"
+        | "mandate_worker_identity_mismatch"
+        | "mandate_version_mismatch"
+        | "invalid_mandate"
+        | "invalid_authority" => {
+            "This run can no longer act under the mandate and no retry will change that; \
+             stop calling tools and end with a short summary of what was done."
+        }
+        "mandate_task_lead_mutation_forbidden" => {
+            "A task lead never mutates: after a current ACT, create and claim the child task \
+             with manage_goal_tasks and spawn its executor with spawn_agent."
+        }
+        _ if !is_task_lead => {
+            "An executor only performs its granted mutation; it cannot observe or decide. \
+             Perform the mutation the task describes, or call report_blocker naming what is missing."
+        }
+        "act_decision_required" | "current_act_decision_required" | "decision_cycle_not_act" => {
+            "Record a current ACT with mandate_review record_decision before orchestrating, \
+             or record WAIT or ASK instead."
+        }
+        "cycle_budget_exhausted" | "invalid_cycle_budget" => {
+            "No mutation budget remains in this cycle; record WAIT with mandate_review."
+        }
+        "mandate_role_forbidden" => {
+            "This call is outside the task-lead protocol: observe, record the decision with \
+             mandate_review, or orchestrate the ACT's child task."
+        }
+        _ => {
+            "Choose a call inside the mandate's confirmed scopes, or record WAIT or ASK \
+             with mandate_review."
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::ToolMutationEffects;
+
+    /// The verifier reads the confirmed policy and nothing the run wrote.
+    #[test]
+    fn verifier_request_states_the_confirmed_policy() {
+        let mut mandate = crate::traits::Mandate::new(
+            "goal-synthetic",
+            None,
+            "Keep the Acme Corp account useful",
+            "telegram:synthetic-user-1",
+            MandateAuthority {
+                allowed_target_prefixes: vec!["https://api.example.invalid/posts".to_string()],
+                max_mutating_actions_per_cycle: 1,
+                ..Default::default()
+            },
+            900,
+            3600,
+            1800,
+        );
+        mandate.constraints = vec!["No engagement bait".to_string()];
+        mandate.strategy = Some(crate::traits::MandateStrategySnapshot {
+            skill_name: "voice".to_string(),
+            snapshot_version: 1,
+            content_sha256: String::new(),
+            description: "Plain factual voice".to_string(),
+            body: "b".repeat(9_000),
+            source: None,
+        });
+
+        let request = verifier_request(&mandate);
+
+        assert!(request.contains("The owner confirmed this standing mandate"));
+        assert!(request.contains("Keep the Acme Corp account useful"));
+        assert!(request.contains("https://api.example.invalid/posts"));
+        assert!(request.contains("No engagement bait"));
+        assert!(request.contains("Plain factual voice"));
+        assert!(!request.contains(&"b".repeat(2_001)), "the body is capped");
+    }
+
+    #[test]
+    fn mandate_denial_next_step_offers_only_what_the_role_can_do() {
+        let executor = mandate_denial_next_step("current_act_decision_required", false);
+        assert!(executor.contains("report_blocker"), "{executor}");
+        assert!(!executor.contains("record_decision"), "{executor}");
+
+        let lead = mandate_denial_next_step("current_act_decision_required", true);
+        assert!(lead.contains("record_decision"), "{lead}");
+        assert!(!lead.contains("report_blocker"), "{lead}");
+
+        let lead_mutation = mandate_denial_next_step("mandate_task_lead_mutation_forbidden", true);
+        assert!(lead_mutation.contains("spawn_agent"), "{lead_mutation}");
+
+        for terminal in ["mandate_execution_fence_lost", "mandate_inactive"] {
+            for is_task_lead in [true, false] {
+                let step = mandate_denial_next_step(terminal, is_task_lead);
+                assert!(step.contains("no retry"), "{terminal}: {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn owner_guidance_extraction_ignores_unrelated_controller_context() {
+        let context = serde_json::json!({
+            "relevant_facts": [{"value": "private"}],
+            "recent_messages": ["unrelated history"],
+            "owner_guidance": [
+                {"guidance": "Prefer thoughtful replies", "recorded_at": "2026-01-01"}
+            ]
+        });
+        assert_eq!(
+            bounded_owner_guidance(Some(&context.to_string())),
+            vec!["Prefer thoughtful replies"]
+        );
+    }
+
+    #[test]
+    fn owner_guidance_extraction_enforces_entry_and_aggregate_bounds() {
+        let entries = (0..12)
+            .map(|index| {
+                serde_json::json!({
+                    "guidance": format!("g{index:02}-{}", "x".repeat(1_100)),
+                    "recorded_at": "2026-01-01"
+                })
+            })
+            .collect::<Vec<_>>();
+        let context = serde_json::json!({"owner_guidance": entries});
+        let guidance = bounded_owner_guidance(Some(&context.to_string()));
+        assert_eq!(
+            guidance.len(),
+            8,
+            "8 KiB total bound should admit eight 1,024-byte entries"
+        );
+        assert!(guidance.iter().all(|entry| entry.chars().count() == 1_024));
+        assert!(
+            guidance
+                .first()
+                .is_some_and(|entry| entry.starts_with("g04-"))
+        );
+        assert!(
+            guidance
+                .last()
+                .is_some_and(|entry| entry.starts_with("g11-"))
+        );
+        assert!(
+            guidance
+                .iter()
+                .map(|entry| entry.chars().count())
+                .sum::<usize>()
+                <= 8 * 1_024
+        );
+        assert!(guidance.iter().map(String::len).sum::<usize>() <= 8 * 1_024);
+    }
+
+    #[test]
+    fn owner_guidance_extraction_enforces_utf8_byte_bounds() {
+        let context = serde_json::json!({
+            "owner_guidance": [{"guidance": "🦀".repeat(2_000)}]
+        });
+        let guidance = bounded_owner_guidance(Some(&context.to_string()));
+        assert_eq!(guidance.len(), 1);
+        assert_eq!(guidance[0].len(), 1_024);
+        assert_eq!(guidance[0].chars().count(), 256);
+    }
+
+    #[test]
+    fn every_deliberator_protocol_action_is_reachable_by_the_task_lead_only() {
+        for (action, expected_class) in DELIBERATOR_PROTOCOL_ACTIONS {
+            let class = classify_mandate_call(
+                "mandate_review",
+                &format!(r#"{{"action":"{action}"}}"#),
+                &ToolCallSemantics::administrative(),
+            );
+            assert_eq!(class, *expected_class, "action {action}");
+            assert!(
+                role_allows_mandate_call(class, "mandate_review", true),
+                "task lead must be able to invoke deliberator protocol action {action}"
+            );
+            assert!(
+                !role_allows_mandate_call(class, "mandate_review", false),
+                "executors must not invoke deliberator protocol action {action}"
+            );
+        }
+        assert_eq!(
+            classify_mandate_call(
+                "mandate_review",
+                r#"{"action":"record_measurement"}"#,
+                &ToolCallSemantics::administrative(),
+            ),
+            MandateCallClass::RecordMeasurement
+        );
+        // The owner's tool is never part of a review run.
+        assert_eq!(
+            classify_mandate_call(
+                "manage_mandates",
+                r#"{"action":"record_decision"}"#,
+                &ToolCallSemantics::administrative(),
+            ),
+            MandateCallClass::Deny
+        );
+    }
+
+    #[test]
+    fn exact_control_calls_do_not_become_general_authority() {
+        assert_eq!(
+            classify_mandate_call(
+                "mandate_review",
+                r#"{"action":"record_decision"}"#,
+                &ToolCallSemantics::administrative(),
+            ),
+            MandateCallClass::RecordDecision
+        );
+        assert_eq!(
+            classify_mandate_call(
+                "manage_mandates",
+                r#"{"action":"update"}"#,
+                &ToolCallSemantics::administrative(),
+            ),
+            MandateCallClass::Deny
+        );
+        assert_eq!(
+            classify_mandate_call(
+                "manage_goal_tasks",
+                r#"{"action":"list_tasks"}"#,
+                &ToolCallSemantics::observation(),
+            ),
+            MandateCallClass::ProtocolObservation
+        );
+        assert_eq!(
+            classify_mandate_call(
+                "manage_goal_tasks",
+                r#"{"action":"complete_goal"}"#,
+                &ToolCallSemantics::mutation(),
+            ),
+            MandateCallClass::Deny
+        );
+        assert_eq!(
+            classify_mandate_call(
+                "manage_goal_tasks",
+                r#"{"action":"create_task"}"#,
+                &ToolCallSemantics::mutation(),
+            ),
+            MandateCallClass::ActControl
+        );
+        assert_eq!(
+            classify_mandate_call(
+                "manage_goal_tasks",
+                r#"{"action":"claim_task"}"#,
+                &ToolCallSemantics::mutation(),
+            ),
+            MandateCallClass::ActControl
+        );
+        for action in [
+            "update_task",
+            "retry_task",
+            "resolve_blocker",
+            "complete_goal",
+            "fail_goal",
+        ] {
+            assert_eq!(
+                classify_mandate_call(
+                    "manage_goal_tasks",
+                    &format!(r#"{{"action":"{action}"}}"#),
+                    &ToolCallSemantics::mutation(),
+                ),
+                MandateCallClass::Deny,
+                "mandate task control action {action} must fail closed"
+            );
+        }
+        assert_eq!(
+            classify_mandate_call(
+                "http_request",
+                r#"{"method":"POST"}"#,
+                &ToolCallSemantics::mutation_with(ToolMutationEffects::REMOTE_MUTATION),
+            ),
+            MandateCallClass::GovernedMutation
+        );
+        assert_eq!(
+            classify_mandate_call(
+                "cli_agent",
+                r#"{"prompt":"do several things"}"#,
+                &ToolCallSemantics::mutation_with(ToolMutationEffects::UNSPECIFIED),
+            ),
+            MandateCallClass::Deny
+        );
+        assert_eq!(
+            classify_mandate_call(
+                "spawn_agent",
+                r#"{"mission":"run-bound","task":"exact task","background":false}"#,
+                &ToolCallSemantics::mutation(),
+            ),
+            MandateCallClass::ActControl
+        );
+        assert_eq!(
+            classify_mandate_call(
+                "spawn_agent",
+                r#"{"mission":"detached","task":"escape","background":true}"#,
+                &ToolCallSemantics::mutation(),
+            ),
+            MandateCallClass::Deny
+        );
+        for tool_name in [
+            "terminal",
+            "browser",
+            "computer_use",
+            "health_probe",
+            "manage_automations",
+            "schedule_task",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "search_files",
+            "send_file",
+            "check_environment",
+        ] {
+            assert_eq!(
+                classify_mandate_call(
+                    tool_name,
+                    r#"{"url":"https://api.x.com/2/tweets"}"#,
+                    &ToolCallSemantics::observation(),
+                ),
+                MandateCallClass::Deny,
+                "opaque adapter {tool_name} must fail closed even as an observation"
+            );
+        }
+    }
+
+    #[test]
+    fn mandate_roles_are_fail_closed_at_dispatch() {
+        assert!(role_allows_mandate_call(
+            MandateCallClass::RecordDecision,
+            "mandate_review",
+            true,
+        ));
+        assert!(role_allows_mandate_call(
+            MandateCallClass::ActControl,
+            "manage_goal_tasks",
+            true,
+        ));
+        assert!(role_allows_mandate_call(
+            MandateCallClass::ActControl,
+            "spawn_agent",
+            true,
+        ));
+        assert!(!role_allows_mandate_call(
+            MandateCallClass::GovernedMutation,
+            "http_request",
+            true,
+        ));
+        assert!(!role_allows_mandate_call(
+            MandateCallClass::ActControl,
+            "report_blocker",
+            true,
+        ));
+
+        assert!(role_allows_mandate_call(
+            MandateCallClass::GovernedMutation,
+            "http_request",
+            false,
+        ));
+        assert!(role_allows_mandate_call(
+            MandateCallClass::ActControl,
+            "report_blocker",
+            false,
+        ));
+        for (class, tool) in [
+            (MandateCallClass::RecordDecision, "mandate_review"),
+            (MandateCallClass::ProtocolObservation, "manage_goal_tasks"),
+            (MandateCallClass::Observation, "web_fetch"),
+            (MandateCallClass::ActControl, "manage_goal_tasks"),
+            (MandateCallClass::ActControl, "spawn_agent"),
+        ] {
+            assert!(
+                !role_allows_mandate_call(class, tool, false),
+                "executor unexpectedly received task-lead authority for {tool}"
+            );
+        }
+    }
+}

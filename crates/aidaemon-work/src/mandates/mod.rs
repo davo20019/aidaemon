@@ -1,0 +1,3407 @@
+pub mod budget;
+pub mod card;
+pub mod history;
+pub mod policy;
+pub mod validate;
+
+pub use aidaemon_events::mandate_grant::MandateAuthorityGrant;
+
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+
+use aidaemon_tools::semantics::ToolCallOperation;
+
+const MAX_MANDATE_OBJECTIVE_TEXT: usize = 2 * 1024;
+const MAX_MANDATE_POLICY_ENTRIES: usize = 16;
+const MAX_MANDATE_POLICY_ENTRY_TEXT: usize = 500;
+const MAX_MANDATE_POLICY_TEXT: usize = 8 * 1024;
+const MAX_MANDATE_AUTHORITY_JSON: usize = 16 * 1024;
+const MAX_DECISION_RATIONALE_TEXT: usize = 2 * 1024;
+const MAX_DECISION_OBSERVATIONS: usize = 8;
+const MAX_DECISION_OBSERVATION_TEXT: usize = 750;
+const MAX_DECISION_OBSERVATIONS_JSON: usize = 6 * 1024;
+const MAX_DECISION_QUESTION_TEXT: usize = 500;
+const MAX_INTENTION_DESCRIPTION_TEXT: usize = 1024;
+/// Longest intention metadata a mandate stores; the tool that writes it
+/// checks against the same limit.
+pub const MAX_INTENTION_METADATA_TEXT: usize = 4 * 1024;
+const MAX_MANDATE_STRATEGY_BODY_TEXT: usize = 16 * 1024;
+const MAX_MANDATE_LEARNING_NOTE_TEXT: usize = 1024;
+const MAX_MANDATE_EVIDENCE_REFS: usize = 16;
+
+fn text_within(value: &str, max: usize) -> bool {
+    value.chars().count() <= max && value.len() <= max
+}
+
+fn canonical_text_within(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.trim() == value && text_within(value, max)
+}
+
+fn canonical_scoped_resource_suffix(value: &str) -> bool {
+    if value.is_empty() || value.len() > 192 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+            index += 1;
+        } else if byte == b'%'
+            && index + 2 < bytes.len()
+            && bytes[index + 1].is_ascii_hexdigit()
+            && bytes[index + 2].is_ascii_hexdigit()
+            && !bytes[index + 1].is_ascii_lowercase()
+            && !bytes[index + 2].is_ascii_lowercase()
+        {
+            index += 3;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Owner-approved authority envelope for autonomous work.
+///
+/// A mandate delegates an objective and a bounded set of actions to the agent.
+/// It is deliberately separate from a personal goal (a desired outcome) and
+/// from an intention (the agent's revocable commitment for one decision cycle).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateStatus {
+    Active,
+    Paused,
+    AwaitingInput,
+    Completed,
+    Cancelled,
+}
+
+impl MandateStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::AwaitingInput => "awaiting_input",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "paused" => Some(Self::Paused),
+            "awaiting_input" => Some(Self::AwaitingInput),
+            "completed" => Some(Self::Completed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// Legal authority-epoch transitions. Terminal states never reopen.
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (
+                Self::Active,
+                Self::Paused | Self::AwaitingInput | Self::Completed | Self::Cancelled
+            ) | (Self::Paused, Self::Active | Self::Cancelled)
+                | (Self::AwaitingInput, Self::Active | Self::Cancelled)
+        )
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled)
+    }
+}
+
+impl std::fmt::Display for MandateStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Owner-selected operating posture for a mandate.
+///
+/// This is persisted policy, not a classification inferred from conversation
+/// text. `Autopilot` changes how the worker handles routine judgment and
+/// recovery inside the exact authority envelope; it never widens that
+/// envelope by itself.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateAutonomyMode {
+    #[default]
+    Bounded,
+    Autopilot,
+}
+
+impl MandateAutonomyMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bounded => "bounded",
+            Self::Autopilot => "autopilot",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "bounded" => Some(Self::Bounded),
+            "autopilot" => Some(Self::Autopilot),
+            _ => None,
+        }
+    }
+
+    pub const fn is_autopilot(self) -> bool {
+        matches!(self, Self::Autopilot)
+    }
+}
+
+impl std::fmt::Display for MandateAutonomyMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Mandate {
+    pub id: String,
+    /// Continuous orchestration goal used by the durable scheduler/executor.
+    pub goal_id: String,
+    /// Optional personal goal that motivated this delegation.
+    pub source_goal_id: Option<String>,
+    /// The short name the owner gave the mandate when creating it, as the
+    /// model passed it (never parsed from the objective). Shown in lists and
+    /// cards, and a selector for later actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub objective: String,
+    pub status: MandateStatus,
+    /// Explicit owner-confirmed operating posture. This is separate from the
+    /// authority envelope so selecting Autopilot cannot authorize a new tool,
+    /// operation, target, account, effect, or query parameter.
+    #[serde(default)]
+    pub autonomy_mode: MandateAutonomyMode,
+    pub authority: MandateAuthority,
+    /// Owner-confirmed, immutable strategy material. This may guide how the
+    /// objective is pursued, but it never contributes authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<MandateStrategySnapshot>,
+    /// Owner-confirmed measurable control loop. This is policy state, not a
+    /// promise that the external metric will improve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective_control: Option<MandateObjectiveControl>,
+    /// Typed reason for a non-active, non-terminal lifecycle state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspension: Option<MandateSuspension>,
+    pub constraints: Vec<String>,
+    pub success_criteria: Vec<String>,
+    pub stop_conditions: Vec<String>,
+    /// Lower and upper bounds for an agent-selected next review.
+    pub min_review_secs: i64,
+    pub max_review_secs: i64,
+    pub default_review_secs: i64,
+    /// Human-readable resource policy. Runtime token arithmetic is derived
+    /// internally from this effort level and the review cadence.
+    pub review_effort: String,
+    /// Durable next wake time for the MAPE-K deliberation loop.
+    pub next_review_at: String,
+    /// Short-lived single-writer lease used by heartbeat dispatch.
+    pub review_lease_token: Option<String>,
+    pub review_lease_expires_at: Option<String>,
+    pub expires_at: Option<String>,
+    /// Durable proof that the owner explicitly confirmed this delegation.
+    /// Pending-confirmation mandates keep this NULL and cannot be activated or
+    /// resumed through ordinary lifecycle transitions.
+    pub confirmed_at: Option<String>,
+    /// Authority epoch, incremented whenever owner-controlled configuration or
+    /// lifecycle state changes so stale decisions and updates fail closed.
+    pub version: i64,
+    /// Stable authorization principal. Session/bot routes may be linked or
+    /// moved without changing this identity or inferring equivalence from a
+    /// session-name suffix.
+    pub owner_principal_id: String,
+    pub created_by_session: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl Mandate {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        goal_id: &str,
+        source_goal_id: Option<String>,
+        objective: &str,
+        created_by_session: &str,
+        authority: MandateAuthority,
+        min_review_secs: i64,
+        max_review_secs: i64,
+        default_review_secs: i64,
+    ) -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
+        let next_review_at =
+            (chrono::Utc::now() + chrono::Duration::seconds(default_review_secs)).to_rfc3339();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal_id.to_string(),
+            source_goal_id,
+            name: None,
+            objective: objective.trim().to_string(),
+            status: MandateStatus::Active,
+            autonomy_mode: MandateAutonomyMode::Bounded,
+            authority,
+            strategy: None,
+            objective_control: None,
+            suspension: None,
+            constraints: Vec::new(),
+            success_criteria: Vec::new(),
+            stop_conditions: Vec::new(),
+            min_review_secs,
+            max_review_secs,
+            default_review_secs,
+            review_effort: "balanced".to_string(),
+            next_review_at,
+            review_lease_token: None,
+            review_lease_expires_at: None,
+            expires_at: None,
+            // `new` constructs an active mandate. Callers creating a deferred
+            // controller must explicitly clear this proof before persistence.
+            confirmed_at: Some(now.clone()),
+            version: 1,
+            owner_principal_id: aidaemon_events::session::stable_private_owner_principal_id(
+                created_by_session,
+            )
+            .unwrap_or_else(|| format!("principal:{}", uuid::Uuid::new_v4())),
+            created_by_session: created_by_session.to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    /// Whether the owner gave this mandate `name` (trimmed, ignoring case).
+    pub fn has_name(&self, name: &str) -> bool {
+        self.name
+            .as_deref()
+            .is_some_and(|own| own.trim().eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// When the next review will wake this mandate; `None` unless it is
+    /// active, because only active mandates are ever claimed.
+    pub fn scheduled_next_review(&self) -> Option<&str> {
+        self.is_active().then_some(self.next_review_at.as_str())
+    }
+
+    pub fn is_active(&self) -> bool {
+        if self.status != MandateStatus::Active || self.confirmed_at.is_none() {
+            return false;
+        }
+        match self.expires_at.as_deref() {
+            None => true,
+            Some(value) => chrono::DateTime::parse_from_rfc3339(value)
+                .is_ok_and(|expires| expires > chrono::Utc::now()),
+        }
+    }
+
+    pub fn clamp_review_secs(&self, requested: Option<i64>) -> i64 {
+        requested
+            .unwrap_or(self.default_review_secs)
+            .clamp(self.min_review_secs, self.max_review_secs)
+    }
+
+    /// Deterministic activity-to-cadence edge in the proactive review graph.
+    /// The result always remains inside the owner-confirmed bounds.
+    pub fn review_secs_for_activity(&self, activity: MandateActivityLevel) -> i64 {
+        let requested = match activity {
+            MandateActivityLevel::Quiet => self.default_review_secs,
+            MandateActivityLevel::Active => self.default_review_secs / 3,
+            MandateActivityLevel::Urgent => self.min_review_secs,
+        };
+        self.clamp_review_secs(Some(requested))
+    }
+
+    /// Choose the next durable review time without ever scheduling work past
+    /// the owner-approved expiry boundary.
+    pub fn bounded_next_review_at(
+        &self,
+        requested_secs: Option<i64>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> String {
+        let candidate = now + chrono::Duration::seconds(self.clamp_review_secs(requested_secs));
+        self.expires_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|expires| expires.with_timezone(&chrono::Utc))
+            .filter(|expires| *expires < candidate)
+            .unwrap_or(candidate)
+            .to_rfc3339()
+    }
+
+    /// Content bounds shared by every mandate ingestion path. Persistence
+    /// calls this again so callers cannot bypass the owner-facing tool schema.
+    pub fn validate_content_bounds(&self) -> Result<(), String> {
+        if !canonical_text_within(&self.objective, MAX_MANDATE_OBJECTIVE_TEXT) {
+            return Err(
+                "mandate objective must be canonical non-empty text of at most 2 KiB in both characters and bytes"
+                    .to_string(),
+            );
+        }
+        if !matches!(
+            self.review_effort.as_str(),
+            "efficient" | "balanced" | "thorough" | "legacy_custom"
+        ) {
+            return Err(
+                "mandate review_effort must be efficient, balanced, thorough, or legacy_custom"
+                    .to_string(),
+            );
+        }
+        if let Some(strategy) = self.strategy.as_ref() {
+            strategy.validate()?;
+        }
+        if let Some(control) = self.objective_control.as_ref() {
+            control.validate()?;
+        }
+        if let Some(suspension) = self.suspension.as_ref() {
+            suspension.validate()?;
+        }
+
+        let mut total_chars = 0usize;
+        let mut total_bytes = 0usize;
+        for (label, values) in [
+            ("constraints", &self.constraints),
+            ("success criteria", &self.success_criteria),
+            ("stop conditions", &self.stop_conditions),
+        ] {
+            if values.len() > MAX_MANDATE_POLICY_ENTRIES {
+                return Err(format!("mandate {label} cannot exceed 16 entries"));
+            }
+            for value in values {
+                if !canonical_text_within(value, MAX_MANDATE_POLICY_ENTRY_TEXT) {
+                    return Err(format!(
+                        "each mandate {label} entry must be canonical non-empty text of at most 500 characters and bytes"
+                    ));
+                }
+                total_chars = total_chars.saturating_add(value.chars().count());
+                total_bytes = total_bytes.saturating_add(value.len());
+            }
+        }
+        if total_chars > MAX_MANDATE_POLICY_TEXT || total_bytes > MAX_MANDATE_POLICY_TEXT {
+            return Err(
+                "mandate constraints, success criteria, and stop conditions exceed their combined 8 KiB character/byte bound"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveMetricDirection {
+    AtLeast,
+    AtMost,
+}
+
+/// A measured objective: a number the mandate works to move to a target.
+/// Values use caller-declared micro-units to avoid floating-point drift.
+///
+/// New mandates no longer set one; it is kept, read-only, for a mandate that
+/// was confirmed with one, so its reviews still record and read the metric.
+/// Settings older rows also carry (experiment cohort and window, minimum
+/// effect, stagnation and failure budgets) are ignored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateObjectiveControl {
+    pub schema_version: u16,
+    pub metric_name: String,
+    pub unit: String,
+    pub baseline_micros: i64,
+    pub target_micros: i64,
+    pub direction: ObjectiveMetricDirection,
+    /// Exact analytics endpoint or stable metric-source resource identity.
+    pub measurement_source: String,
+    pub measurement_cadence_secs: i64,
+    pub baseline_observed_at: String,
+}
+
+impl MandateObjectiveControl {
+    pub const SCHEMA_VERSION: u16 = 1;
+
+    /// Checks every setting. An error names the one setting that is wrong.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(format!(
+                "schema_version is {}; it must be {}",
+                self.schema_version,
+                Self::SCHEMA_VERSION
+            ));
+        }
+        for (field, value, max) in [
+            ("metric_name", &self.metric_name, 128),
+            ("unit", &self.unit, 64),
+        ] {
+            if !canonical_text_within(value, max) {
+                return Err(format!(
+                    "{field} must be plain text of 1 to {max} characters with no surrounding spaces"
+                ));
+            }
+        }
+        let source_valid = reqwest::Url::parse(&self.measurement_source)
+            .ok()
+            .is_some_and(|url| {
+                url.scheme() == "https"
+                    && url.host_str().is_some()
+                    && url.fragment().is_none()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+            })
+            || self
+                .measurement_source
+                .strip_prefix("metric_source:")
+                .is_some_and(canonical_scoped_resource_suffix);
+        if !source_valid {
+            return Err(
+                "measurement_source must be an HTTPS URL (no login details or #fragment) or an exact metric_source: identity"
+                    .to_string(),
+            );
+        }
+        const MAX_CADENCE_SECS: i64 = 30 * 24 * 60 * 60;
+        if !(60..=MAX_CADENCE_SECS).contains(&self.measurement_cadence_secs) {
+            return Err(format!(
+                "measurement_cadence_secs is {}; allowed: 60 to {MAX_CADENCE_SECS} (1 minute to 30 days)",
+                self.measurement_cadence_secs
+            ));
+        }
+        if chrono::DateTime::parse_from_rfc3339(&self.baseline_observed_at).is_err() {
+            return Err(format!(
+                "baseline_observed_at is {:?}; it must be an RFC 3339 time such as 2026-01-31T09:00:00Z",
+                self.baseline_observed_at
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn target_reached(&self, value_micros: i64) -> bool {
+        match self.direction {
+            ObjectiveMetricDirection::AtLeast => value_micros >= self.target_micros,
+            ObjectiveMetricDirection::AtMost => value_micros <= self.target_micros,
+        }
+    }
+
+    /// When the next measurement is due: one cadence after the latest
+    /// recorded observation, or one cadence after the baseline when nothing
+    /// has been measured yet. A value in the past means a measurement is due
+    /// now. Returns `None` only when neither timestamp parses.
+    pub fn next_measurement_at(&self, latest_observed_at: Option<&str>) -> Option<String> {
+        let anchor = latest_observed_at
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .or_else(|| chrono::DateTime::parse_from_rfc3339(&self.baseline_observed_at).ok())?;
+        let cadence = chrono::Duration::seconds(self.measurement_cadence_secs.max(0));
+        Some(
+            (anchor + cadence)
+                .with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+    }
+}
+
+/// One immutable observation of a measured objective. Receipt IDs prove the
+/// measurement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateObjectiveMeasurement {
+    pub id: String,
+    pub mandate_id: String,
+    pub mandate_version: i64,
+    pub goal_run_id: String,
+    pub value_micros: i64,
+    pub confidence_bps: u16,
+    pub evidence_receipt_ids: Vec<String>,
+    pub observed_at: String,
+    pub created_at: String,
+}
+
+impl MandateObjectiveMeasurement {
+    pub fn new(
+        mandate_id: &str,
+        mandate_version: i64,
+        goal_run_id: &str,
+        value_micros: i64,
+        confidence_bps: u16,
+        evidence_receipt_ids: Vec<String>,
+        observed_at: &str,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            mandate_id: mandate_id.to_string(),
+            mandate_version,
+            goal_run_id: goal_run_id.to_string(),
+            value_micros,
+            confidence_bps,
+            evidence_receipt_ids,
+            observed_at: observed_at.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mandate_version <= 0
+            || self.confidence_bps > 10_000
+            || self.evidence_receipt_ids.is_empty()
+            || self.evidence_receipt_ids.len() > MAX_MANDATE_EVIDENCE_REFS
+            || chrono::DateTime::parse_from_rfc3339(&self.observed_at).is_err()
+        {
+            return Err("objective measurement metadata is invalid".to_string());
+        }
+        for id in &self.evidence_receipt_ids {
+            if !canonical_text_within(id, 256) {
+                return Err("objective measurement identifiers are invalid".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A content-addressed copy of one owner-approved skill. The snapshot body is
+/// persisted so a later filesystem edit cannot silently change a live mandate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateStrategySnapshot {
+    pub skill_name: String,
+    pub snapshot_version: u16,
+    pub content_sha256: String,
+    pub description: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl MandateStrategySnapshot {
+    pub const SCHEMA_VERSION: u16 = 1;
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.snapshot_version != Self::SCHEMA_VERSION {
+            return Err("unsupported mandate strategy snapshot version".to_string());
+        }
+        if !canonical_text_within(&self.skill_name, 256) {
+            return Err(
+                "strategy skill_name must be canonical text of at most 256 bytes".to_string(),
+            );
+        }
+        if self.content_sha256.len() != 64
+            || !self
+                .content_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("strategy content_sha256 must be a 64-character hex digest".to_string());
+        }
+        if !text_within(&self.description, 1024)
+            || !canonical_text_within(&self.body, MAX_MANDATE_STRATEGY_BODY_TEXT)
+        {
+            return Err(
+                "strategy description/body exceed their bounded canonical form".to_string(),
+            );
+        }
+        if self
+            .source
+            .as_deref()
+            .is_some_and(|source| !canonical_text_within(source, 512))
+        {
+            return Err("strategy source exceeds its canonical 512-byte bound".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateSuspensionKind {
+    OwnerPaused,
+    AwaitingAnswer,
+    ReconciliationRequired,
+    ExecutionLeaseLost,
+    ReviewFailed,
+    AuthorityRevokedWithUnresolvedMutation,
+}
+
+impl MandateSuspensionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerPaused => "owner_paused",
+            Self::AwaitingAnswer => "awaiting_answer",
+            Self::ReconciliationRequired => "reconciliation_required",
+            Self::ExecutionLeaseLost => "execution_lease_lost",
+            Self::ReviewFailed => "review_failed",
+            Self::AuthorityRevokedWithUnresolvedMutation => {
+                "authority_revoked_with_unresolved_mutation"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateSuspension {
+    pub kind: MandateSuspensionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_cycle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_run_id: Option<String>,
+    pub created_at: String,
+}
+
+/// Whether one exact delegated adapter operation observes or mutates state.
+/// This is owner-approved policy data, not an inference from prose.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateOperationKind {
+    Observation,
+    Mutation,
+}
+
+/// One non-combinable authority tuple.
+///
+/// Keeping tool, adapter operation, effects, and targets in the same record
+/// prevents the unsafe Cartesian product created by independent allowlists
+/// (for example, GET on one URL accidentally authorizing POST to that URL).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct MandateOperationScope {
+    pub tool: String,
+    pub operation: ToolCallOperation,
+    pub kind: MandateOperationKind,
+    #[serde(default)]
+    pub target_prefixes: Vec<String>,
+    /// Query parameter names whose values may be selected at execution time.
+    ///
+    /// A query embedded in a URL target remains an exact authorization. This
+    /// separate list is the explicit owner-approved escape hatch for APIs such
+    /// as search, where the observation is bounded by endpoint and parameter
+    /// name but the value is deliberately chosen during each review.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_query_params: Vec<String>,
+    #[serde(default)]
+    pub mutation_effects: Vec<String>,
+}
+
+impl MandateOperationScope {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tool.trim() != self.tool
+            || !text_within(&self.tool, 256)
+            || !MandateAuthority::DELEGABLE_DATA_TOOLS.contains(&self.tool.as_str())
+        {
+            return Err(format!(
+                "operation scope tool must be an exact delegable adapter name: {}",
+                MandateAuthority::DELEGABLE_DATA_TOOLS.join(", ")
+            ));
+        }
+        if self.target_prefixes.is_empty() || self.target_prefixes.len() > 16 {
+            return Err("operation scopes require 1–16 exact target prefixes".to_string());
+        }
+        for (index, prefix) in self.target_prefixes.iter().enumerate() {
+            validate_mandate_target_prefix(prefix)?;
+            if self.target_prefixes[..index]
+                .iter()
+                .any(|seen| seen == prefix)
+            {
+                return Err("operation scope target prefixes must be unique".to_string());
+            }
+        }
+        let url_targets = self
+            .target_prefixes
+            .iter()
+            .filter(|target| target.contains("://"))
+            .count();
+        if url_targets == 0 {
+            return Err("delegated operation scopes require a URL target".to_string());
+        }
+        if self.allowed_query_params.len() > 16 {
+            return Err("operation scope query parameters exceed their bounded size".to_string());
+        }
+        for (index, name) in self.allowed_query_params.iter().enumerate() {
+            if name.trim() != name
+                || name.is_empty()
+                || name.len() > 128
+                || !name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'[' | b']')
+                })
+                || self.allowed_query_params[..index]
+                    .iter()
+                    .any(|seen| seen == name)
+            {
+                return Err(
+                    "operation scope query parameters must be unique canonical parameter names"
+                        .to_string(),
+                );
+            }
+        }
+        if !self.allowed_query_params.is_empty()
+            && self.target_prefixes.iter().any(|target| {
+                reqwest::Url::parse(target)
+                    .ok()
+                    .is_some_and(|url| url.query().is_some())
+            })
+        {
+            return Err(
+                "operation scopes must use either an exact URL query or allowed_query_params, not both"
+                    .to_string(),
+            );
+        }
+        let auth_targets = self
+            .target_prefixes
+            .iter()
+            .filter(|target| target.starts_with("auth_profile:"))
+            .count();
+        let account_targets = self
+            .target_prefixes
+            .iter()
+            .filter(|target| target.starts_with("account:"))
+            .count();
+        if auth_targets > 1 || account_targets > 1 || (auth_targets == 1) != (account_targets == 1)
+        {
+            return Err(
+                "authenticated operation scopes require exactly one auth_profile target paired with exactly one account target"
+                    .to_string(),
+            );
+        }
+        let requires_bound_identity = self.tool == "http_request"
+            && self.target_prefixes.iter().any(|target| {
+                let Ok(url) = reqwest::Url::parse(target) else {
+                    return false;
+                };
+                matches!(url.host_str(), Some("api.x.com" | "api.twitter.com"))
+            });
+        if requires_bound_identity && (auth_targets != 1 || account_targets != 1) {
+            return Err(
+                "X API operation scopes require exact auth_profile: and account: identity targets in every authenticated operation"
+                    .to_string(),
+            );
+        }
+        if self.mutation_effects.len() > MandateAuthority::EFFECT_NAMES.len() {
+            return Err("operation scope mutation effects exceed their bounded size".to_string());
+        }
+        for (index, effect) in self.mutation_effects.iter().enumerate() {
+            if effect.trim() != effect
+                || !MandateAuthority::EFFECT_NAMES.contains(&effect.as_str())
+                || self.mutation_effects[..index]
+                    .iter()
+                    .any(|seen| seen == effect)
+            {
+                return Err(
+                    "operation scope mutation effects must be unique canonical effect names"
+                        .to_string(),
+                );
+            }
+        }
+
+        match (self.tool.as_str(), self.operation, self.kind) {
+            ("web_fetch", ToolCallOperation::Get, MandateOperationKind::Observation) => {
+                if auth_targets != 0 || account_targets != 0 {
+                    return Err(
+                        "web_fetch operation scopes cannot carry authentication identity"
+                            .to_string(),
+                    );
+                }
+                if !self.mutation_effects.is_empty() {
+                    return Err(
+                        "observation operation scopes cannot declare mutation effects".to_string(),
+                    );
+                }
+            }
+            (
+                "http_request",
+                ToolCallOperation::Get | ToolCallOperation::Head | ToolCallOperation::Options,
+                MandateOperationKind::Observation,
+            ) => {
+                if !self.mutation_effects.is_empty() {
+                    return Err(
+                        "observation operation scopes cannot declare mutation effects".to_string(),
+                    );
+                }
+            }
+            (
+                "http_request",
+                ToolCallOperation::Post | ToolCallOperation::Put | ToolCallOperation::Patch,
+                MandateOperationKind::Mutation,
+            ) => {
+                let expected = BTreeSet::from([
+                    "external_delivery".to_string(),
+                    "remote_mutation".to_string(),
+                ]);
+                if self
+                    .mutation_effects
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    != expected
+                {
+                    return Err(
+                        "body-bearing HTTP mutation scopes require exactly remote_mutation and external_delivery effects"
+                            .to_string(),
+                    );
+                }
+            }
+            ("http_request", ToolCallOperation::Delete, MandateOperationKind::Mutation) => {
+                if self.mutation_effects.as_slice() != ["remote_mutation"] {
+                    return Err(
+                        "HTTP DELETE mutation scopes require exactly the remote_mutation effect"
+                            .to_string(),
+                    );
+                }
+            }
+            _ => {
+                return Err(
+                    "operation scope kind/operation is not supported by the selected delegable adapter"
+                        .to_string(),
+                );
+            }
+        }
+        if self.kind != MandateOperationKind::Observation && !self.allowed_query_params.is_empty() {
+            return Err(
+                "dynamic query parameters are supported only for observation operation scopes"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl MandateSuspension {
+    pub fn new(kind: MandateSuspensionKind, reason_code: Option<String>) -> Self {
+        Self {
+            kind,
+            reason_code,
+            decision_cycle_id: None,
+            goal_run_id: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .reason_code
+            .as_deref()
+            .is_some_and(|value| !canonical_text_within(value, 256))
+            || self
+                .decision_cycle_id
+                .as_deref()
+                .is_some_and(|value| !canonical_text_within(value, 256))
+            || self
+                .goal_run_id
+                .as_deref()
+                .is_some_and(|value| !canonical_text_within(value, 256))
+        {
+            return Err("mandate suspension identifiers exceed their canonical bounds".to_string());
+        }
+        chrono::DateTime::parse_from_rfc3339(&self.created_at)
+            .map_err(|_| "mandate suspension created_at must be RFC3339".to_string())?;
+        Ok(())
+    }
+}
+
+/// Deterministic action policy attached to a mandate.
+///
+/// `allowed_tools` applies to both observations and mutations so a mandate
+/// cannot read unrelated private state and then exfiltrate it through an
+/// otherwise-authorized output tool. Patterns are exact names or a scoped
+/// exact v1 data-tool names only; wildcard authority is rejected so a future
+/// adapter cannot silently inherit an old delegation.
+/// V1 rejects MCP tools until their manifests and effect semantics can be
+/// owner-pinned instead of trusted from a live server advertisement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateAuthority {
+    #[serde(default = "default_allow_observations")]
+    pub allow_observations: bool,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub allowed_mutation_effects: Vec<String>,
+    #[serde(default)]
+    pub allowed_target_prefixes: Vec<String>,
+    /// V2 non-combinable operation tuples. When present, the runtime matches a
+    /// call against one complete tuple and never authorizes from the aggregate
+    /// compatibility lists above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operation_scopes: Vec<MandateOperationScope>,
+    #[serde(default)]
+    pub max_mutating_actions_per_cycle: u32,
+    /// Cross-cycle dispatch ceiling. Every claimed mutation attempt, including
+    /// a failed or ambiguous one, consumes one slot for a rolling 24-hour
+    /// window; a reservation abandoned before the final I/O claim does not.
+    #[serde(default)]
+    pub max_mutating_actions_per_rolling_24h: u32,
+    /// Minimum wall-clock separation between two claimed mutation dispatches
+    /// for this mandate. Observation cycles are deliberately unaffected.
+    #[serde(default)]
+    pub min_seconds_between_mutations: u32,
+    /// The owner asked to be told what the mandate finds ("tell me when it
+    /// is down"). It lets a WAIT carry one owner alert
+    /// ([`MandateDecisionCycle::owner_alert`]); it grants no tool, target or
+    /// effect. Absent in policies written before it existed, which keeps
+    /// their confirmed hashes unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_alerts: bool,
+}
+
+fn default_allow_observations() -> bool {
+    true
+}
+
+impl Default for MandateAuthority {
+    fn default() -> Self {
+        Self {
+            allow_observations: true,
+            allowed_tools: Vec::new(),
+            allowed_mutation_effects: Vec::new(),
+            allowed_target_prefixes: Vec::new(),
+            operation_scopes: Vec::new(),
+            max_mutating_actions_per_cycle: 0,
+            max_mutating_actions_per_rolling_24h: 0,
+            min_seconds_between_mutations: 0,
+            owner_alerts: false,
+        }
+    }
+}
+
+impl MandateAuthority {
+    /// V1 delegates only directly governed network data adapters. Protocol
+    /// controls are classified separately and never gain authority merely by
+    /// appearing in this list.
+    pub const DELEGABLE_DATA_TOOLS: &'static [&'static str] = &["http_request", "web_fetch"];
+    /// Adapters that can execute an opaque nested action loop. Their inner
+    /// reads and writes cannot be target-scoped or metered one-by-one by the
+    /// mandate gate, so they are never delegable as a single allowed tool.
+    pub const NON_DELEGABLE_TOOLS: &'static [&'static str] = &[
+        "cli_agent",
+        "terminal",
+        "browser",
+        "computer_use",
+        "health_probe",
+        "manage_automations",
+        "schedule_task",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "search_files",
+        "send_file",
+        "check_environment",
+    ];
+
+    pub const EFFECT_NAMES: &'static [&'static str] = &[
+        "local_source_write",
+        "local_workspace_write",
+        "local_derived_write",
+        "repository_write",
+        "remote_mutation",
+        "remote_deploy",
+        "external_delivery",
+        "process_state",
+        "configuration",
+        "destructive",
+        "unspecified",
+    ];
+
+    pub fn from_operation_scopes(
+        allow_observations: bool,
+        operation_scopes: Vec<MandateOperationScope>,
+        max_mutating_actions_per_cycle: u32,
+        max_mutating_actions_per_rolling_24h: u32,
+        min_seconds_between_mutations: u32,
+    ) -> Self {
+        let allowed_tools = operation_scopes
+            .iter()
+            .map(|scope| scope.tool.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let allowed_mutation_effects = operation_scopes
+            .iter()
+            .flat_map(|scope| scope.mutation_effects.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let allowed_target_prefixes = operation_scopes
+            .iter()
+            .flat_map(|scope| scope.target_prefixes.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Self {
+            allow_observations,
+            allowed_tools,
+            allowed_mutation_effects,
+            allowed_target_prefixes,
+            operation_scopes,
+            max_mutating_actions_per_cycle,
+            max_mutating_actions_per_rolling_24h,
+            min_seconds_between_mutations,
+            owner_alerts: false,
+        }
+    }
+
+    /// The same policy, with or without the owner-alert grant.
+    pub fn with_owner_alerts(mut self, owner_alerts: bool) -> Self {
+        self.owner_alerts = owner_alerts;
+        self
+    }
+
+    pub fn uses_operation_scopes(&self) -> bool {
+        !self.operation_scopes.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.operation_scopes.len() > 64 {
+            return Err("mandate operation scopes exceed their bounded size".to_string());
+        }
+        for (index, scope) in self.operation_scopes.iter().enumerate() {
+            scope.validate()?;
+            if self.operation_scopes[..index]
+                .iter()
+                .any(|seen| seen == scope)
+            {
+                return Err("mandate operation scopes must be unique".to_string());
+            }
+        }
+        if self.uses_operation_scopes() {
+            let derived = Self::from_operation_scopes(
+                self.allow_observations,
+                self.operation_scopes.clone(),
+                self.max_mutating_actions_per_cycle,
+                self.max_mutating_actions_per_rolling_24h,
+                self.min_seconds_between_mutations,
+            );
+            if self.allowed_tools.iter().collect::<BTreeSet<_>>()
+                != derived.allowed_tools.iter().collect::<BTreeSet<_>>()
+                || self
+                    .allowed_mutation_effects
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    != derived
+                        .allowed_mutation_effects
+                        .iter()
+                        .collect::<BTreeSet<_>>()
+                || self.allowed_target_prefixes.iter().collect::<BTreeSet<_>>()
+                    != derived
+                        .allowed_target_prefixes
+                        .iter()
+                        .collect::<BTreeSet<_>>()
+            {
+                return Err(
+                    "mandate aggregate authority lists must exactly match the operation scope projection"
+                        .to_string(),
+                );
+            }
+            if !self.allow_observations
+                && self
+                    .operation_scopes
+                    .iter()
+                    .any(|scope| scope.kind == MandateOperationKind::Observation)
+            {
+                return Err(
+                    "observation operation scopes require allow_observations=true".to_string(),
+                );
+            }
+            let has_mutation = self
+                .operation_scopes
+                .iter()
+                .any(|scope| scope.kind == MandateOperationKind::Mutation);
+            if has_mutation != (self.max_mutating_actions_per_cycle > 0) {
+                return Err(
+                    "operation scopes and per-cycle mutation budget must agree on whether mutations are delegated"
+                        .to_string(),
+                );
+            }
+        }
+        let authority_text = self
+            .allowed_tools
+            .iter()
+            .chain(&self.allowed_mutation_effects)
+            .chain(&self.allowed_target_prefixes);
+        let authority_text_chars = authority_text
+            .clone()
+            .map(|value| value.chars().count())
+            .sum::<usize>();
+        let authority_text_bytes = authority_text.map(String::len).sum::<usize>();
+        if authority_text_chars > MAX_MANDATE_AUTHORITY_JSON
+            || authority_text_bytes > MAX_MANDATE_AUTHORITY_JSON
+        {
+            return Err(
+                "mandate authority exceeds its total 16 KiB text character/byte bound".to_string(),
+            );
+        }
+        let serialized = serde_json::to_string(self)
+            .map_err(|error| format!("mandate authority cannot be serialized: {error}"))?;
+        if !text_within(&serialized, MAX_MANDATE_AUTHORITY_JSON) {
+            return Err(
+                "mandate authority exceeds its total serialized 16 KiB character/byte bound"
+                    .to_string(),
+            );
+        }
+        if self.allowed_tools.len() > 64
+            || self.allowed_target_prefixes.len() > 64
+            || self.allowed_mutation_effects.len() > Self::EFFECT_NAMES.len()
+        {
+            return Err("mandate authority lists exceed their bounded size".to_string());
+        }
+        for (index, pattern) in self.allowed_tools.iter().enumerate() {
+            let trimmed = pattern.trim();
+            let wildcard_count = trimmed.bytes().filter(|byte| *byte == b'*').count();
+            if trimmed.is_empty() || trimmed != pattern || wildcard_count != 0 {
+                return Err(
+                    "allowed_tools must use canonical exact names; wildcards are not allowed"
+                        .to_string(),
+                );
+            }
+            if !text_within(pattern, 256)
+                || self.allowed_tools[..index]
+                    .iter()
+                    .any(|seen| seen == pattern)
+            {
+                return Err(
+                    "allowed_tools must be unique and at most 256 characters and bytes each"
+                        .to_string(),
+                );
+            }
+            if trimmed.starts_with("mcp__") {
+                return Err(
+                    "MCP tools cannot be delegated by a v1 mandate because server-advertised safety hints are not owner-pinned authority facts; use a directly governed adapter such as http_request"
+                        .to_string(),
+                );
+            }
+            if !Self::DELEGABLE_DATA_TOOLS.contains(&trimmed) {
+                return Err(format!(
+                    "{trimmed} is not a directly governed v1 mandate data tool"
+                ));
+            }
+            let covered_non_delegable = Self::NON_DELEGABLE_TOOLS.iter().find(|tool_name| {
+                trimmed == **tool_name
+                    || trimmed
+                        .strip_suffix('*')
+                        .is_some_and(|prefix| tool_name.starts_with(prefix))
+            });
+            if let Some(tool_name) = covered_non_delegable {
+                return Err(format!(
+                    "{tool_name} cannot be delegated by a mandate because its nested actions cannot be target-scoped and metered individually"
+                ));
+            }
+        }
+        if let Some(invalid) = self.allowed_mutation_effects.iter().find(|effect| {
+            effect.trim() != effect.as_str() || !Self::EFFECT_NAMES.contains(&effect.as_str())
+        }) {
+            return Err(format!(
+                "unknown mutation effect `{invalid}`; valid effects: {}",
+                Self::EFFECT_NAMES.join(", ")
+            ));
+        }
+        if self
+            .allowed_mutation_effects
+            .iter()
+            .enumerate()
+            .any(|(index, effect)| {
+                self.allowed_mutation_effects[..index]
+                    .iter()
+                    .any(|seen| seen == effect)
+            })
+        {
+            return Err("allowed_mutation_effects must be unique".to_string());
+        }
+        if self.max_mutating_actions_per_cycle > 0 && self.allowed_tools.is_empty() {
+            return Err(
+                "max_mutating_actions_per_cycle is non-zero but no mutation tools are allowed"
+                    .to_string(),
+            );
+        }
+        if self.max_mutating_actions_per_cycle > 0 && self.allowed_mutation_effects.is_empty() {
+            return Err(
+                "max_mutating_actions_per_cycle is non-zero but no mutation effects are allowed"
+                    .to_string(),
+            );
+        }
+        if self.max_mutating_actions_per_cycle > 0 && self.allowed_target_prefixes.is_empty() {
+            return Err(
+                "mutation-enabled mandates require explicit typed target prefixes".to_string(),
+            );
+        }
+        if !self.allowed_tools.is_empty() && self.allowed_target_prefixes.is_empty() {
+            return Err(
+                "delegated observations require explicit typed target prefixes".to_string(),
+            );
+        }
+        if self.max_mutating_actions_per_cycle == 0 {
+            if self.max_mutating_actions_per_rolling_24h != 0
+                || self.min_seconds_between_mutations != 0
+            {
+                return Err(
+                    "rolling mutation quota and cooldown require a positive per-cycle mutation budget"
+                        .to_string(),
+                );
+            }
+        } else {
+            if self.max_mutating_actions_per_rolling_24h == 0 {
+                return Err(
+                    "mutation-enabled mandates require max_mutating_actions_per_rolling_24h"
+                        .to_string(),
+                );
+            }
+            if self.max_mutating_actions_per_rolling_24h > 24 {
+                return Err(
+                    "max_mutating_actions_per_rolling_24h cannot exceed the hard ceiling of 24"
+                        .to_string(),
+                );
+            }
+            if self.max_mutating_actions_per_rolling_24h < self.max_mutating_actions_per_cycle {
+                return Err(
+                    "max_mutating_actions_per_rolling_24h must be at least the per-cycle mutation budget"
+                        .to_string(),
+                );
+            }
+            if self.min_seconds_between_mutations < 900 {
+                return Err(
+                    "mutation-enabled mandates require at least 900 seconds between mutations"
+                        .to_string(),
+                );
+            }
+        }
+        for (index, prefix) in self.allowed_target_prefixes.iter().enumerate() {
+            if prefix.trim().is_empty()
+                || prefix.trim() != prefix
+                || !text_within(prefix, 2_048)
+                || self.allowed_target_prefixes[..index]
+                    .iter()
+                    .any(|seen| seen == prefix)
+            {
+                return Err(
+                    "allowed_target_prefixes must be unique non-empty canonical prefixes of at most 2048 characters and bytes"
+                        .to_string(),
+                );
+            }
+            validate_mandate_target_prefix(prefix)?;
+        }
+        Ok(())
+    }
+
+    pub fn allows_tool(&self, tool_name: &str) -> bool {
+        self.allowed_tools.iter().any(|raw| raw == tool_name)
+    }
+
+    pub fn allows_effect(&self, effect: &str) -> bool {
+        self.allowed_mutation_effects
+            .iter()
+            .any(|allowed| allowed.trim() == effect)
+    }
+}
+
+fn validate_mandate_target_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.contains("://") {
+        let url = reqwest::Url::parse(prefix)
+            .map_err(|_| "URL target prefixes must be canonical URLs".to_string())?;
+        let well_formed = matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none();
+        // A target covers everything below it, so the site root would grant
+        // the whole site. Refuse it, and say how to name what is meant.
+        if well_formed && matches!(url.path(), "" | "/") {
+            let origin = url.origin().ascii_serialization();
+            return Err(format!(
+                "URL target {prefix} is the site root, which would cover the whole site. Name the exact page or path to check instead, as {origin}/<page> (for the front page, the page the site serves there, such as {origin}/index.html), and confirm that path with the owner."
+            ));
+        }
+        if !well_formed || matches!(url.path(), "" | "/") {
+            return Err(
+                "URL target prefixes require an http(s) origin plus a non-root path and cannot contain userinfo or fragments"
+                    .to_string(),
+            );
+        }
+    } else {
+        let suffix = prefix
+            .strip_prefix("auth_profile:")
+            .or_else(|| prefix.strip_prefix("account:"));
+        if !suffix.is_some_and(canonical_scoped_resource_suffix) {
+            return Err(
+                "v1 resource targets must be exact auth_profile: or account: identifiers with a non-empty canonical suffix"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateDecisionOutcome {
+    Act,
+    Wait,
+    Ask,
+    Stop,
+}
+
+/// Typed signal describing how quickly the mandate should look again.
+///
+/// This affects only the next wake time inside the owner's confirmed review
+/// bounds. It never changes tools, targets, quotas, or any other authority.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateActivityLevel {
+    #[default]
+    Quiet,
+    Active,
+    Urgent,
+}
+
+impl MandateActivityLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quiet => "quiet",
+            Self::Active => "active",
+            Self::Urgent => "urgent",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "quiet" => Some(Self::Quiet),
+            "active" => Some(Self::Active),
+            "urgent" => Some(Self::Urgent),
+            _ => None,
+        }
+    }
+}
+
+/// Who wrote a decision. Only the deliberator's own `record_decision` writes
+/// `Deliberator`; every decision the runtime records on its behalf (it
+/// exited, failed or ran out of budget without one) is `RuntimeFallback`,
+/// which finalization closes as a failed review that is retried with
+/// backoff and surfaced to the owner.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateDecisionOrigin {
+    #[default]
+    Deliberator,
+    RuntimeFallback,
+}
+
+impl MandateDecisionOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deliberator => "deliberator",
+            Self::RuntimeFallback => "runtime_fallback",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "deliberator" => Some(Self::Deliberator),
+            "runtime_fallback" => Some(Self::RuntimeFallback),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the owner hears about a failed review: the first failure of a
+/// streak, then each time the streak doubles (1, 2, 4, 8, …). A streak ends
+/// with the next review that succeeds. The mandate retries either way; a
+/// provider outage no longer sends one critical notice per review.
+pub fn review_failure_is_notified(consecutive_failures: i64) -> bool {
+    consecutive_failures > 0 && (consecutive_failures as u64).is_power_of_two()
+}
+
+/// Rationale of the WAIT the runtime records when a mandate deliberator exits
+/// without committing a decision. Display text only: what makes it a
+/// fallback is its [`MandateDecisionOrigin::RuntimeFallback`].
+pub const SAFE_FALLBACK_WAIT_RATIONALE: &str = "The deliberator returned without committing an explicit decision; the runtime safely defaulted this cycle to WAIT.";
+
+/// Why a STOP decision may close a mandate. Evidence-dependent reasons must
+/// cite one or more current-run structured tool receipts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateTerminationKind {
+    SuccessCriteriaSatisfied,
+    StopConditionMet,
+    SafetyTermination,
+}
+
+impl MandateTerminationKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SuccessCriteriaSatisfied => "success_criteria_satisfied",
+            Self::StopConditionMet => "stop_condition_met",
+            Self::SafetyTermination => "safety_termination",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "success_criteria_satisfied" => Some(Self::SuccessCriteriaSatisfied),
+            "stop_condition_met" => Some(Self::StopConditionMet),
+            "safety_termination" => Some(Self::SafetyTermination),
+            _ => None,
+        }
+    }
+
+    pub const fn requires_receipt_evidence(self) -> bool {
+        matches!(
+            self,
+            Self::SuccessCriteriaSatisfied | Self::StopConditionMet
+        )
+    }
+}
+
+impl MandateDecisionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Act => "act",
+            Self::Wait => "wait",
+            Self::Ask => "ask",
+            Self::Stop => "stop",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "act" => Some(Self::Act),
+            "wait" => Some(Self::Wait),
+            "ask" => Some(Self::Ask),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+}
+
+/// One durable deliberation result for one goal run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateDecisionCycle {
+    pub id: String,
+    pub mandate_id: String,
+    pub goal_run_id: String,
+    /// Owner-policy revision observed when this decision was committed.
+    pub mandate_version: i64,
+    pub outcome: MandateDecisionOutcome,
+    #[serde(default)]
+    pub origin: MandateDecisionOrigin,
+    #[serde(default)]
+    pub activity_level: MandateActivityLevel,
+    pub rationale: String,
+    /// Sourced observations used by the deliberator, serialized as JSON.
+    pub belief_snapshot: Option<String>,
+    /// Exact current-run tool-call receipts that support the belief or STOP
+    /// decision. These identifiers are verified against durable events before
+    /// the decision is committed.
+    #[serde(default)]
+    pub evidence_receipt_ids: Vec<String>,
+    pub question: Option<String>,
+    /// WAIT only, and only when the policy grants `owner_alerts`: one
+    /// finding the owner asked to be told about. Sent to the owner when the
+    /// review closes; the mandate keeps running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_alert: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_kind: Option<MandateTerminationKind>,
+    /// Exact owner-authored success/stop entry matched by a STOP decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_match: Option<String>,
+    pub reconsider_at: Option<String>,
+    /// Number of mutation attempts authorized during this cycle.
+    pub action_attempts: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl MandateDecisionCycle {
+    /// The durable summary a committed non-action decision (WAIT, ASK,
+    /// STOP) closes its review with; `None` for ACT, whose review goes on.
+    pub fn non_action_summary(&self) -> Option<String> {
+        match self.outcome {
+            MandateDecisionOutcome::Act => None,
+            MandateDecisionOutcome::Wait => Some(format!(
+                "WAIT recorded: {} Review again at {}.",
+                self.rationale,
+                self.reconsider_at
+                    .as_deref()
+                    .unwrap_or("the bounded default")
+            )),
+            MandateDecisionOutcome::Ask => Some(format!(
+                "ASK recorded: {}",
+                self.question.as_deref().unwrap_or(&self.rationale)
+            )),
+            MandateDecisionOutcome::Stop => Some(format!("STOP recorded: {}", self.rationale)),
+        }
+    }
+
+    pub fn new(
+        mandate_id: &str,
+        goal_run_id: &str,
+        outcome: MandateDecisionOutcome,
+        rationale: &str,
+        mandate_version: i64,
+    ) -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            mandate_id: mandate_id.to_string(),
+            goal_run_id: goal_run_id.to_string(),
+            mandate_version,
+            outcome,
+            origin: MandateDecisionOrigin::Deliberator,
+            activity_level: MandateActivityLevel::Quiet,
+            rationale: rationale.trim().to_string(),
+            belief_snapshot: None,
+            evidence_receipt_ids: Vec::new(),
+            question: None,
+            owner_alert: None,
+            termination_kind: None,
+            termination_match: None,
+            reconsider_at: None,
+            action_attempts: 0,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    /// The least-privilege decision the runtime records when a deliberator
+    /// exits without committing one. It grants no authority, cites no
+    /// evidence, and is recognized by finalization as a retriable review
+    /// failure rather than a successful WAIT.
+    pub fn runtime_fallback_wait(
+        mandate: &Mandate,
+        goal_run_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let mut decision = Self::new(
+            &mandate.id,
+            goal_run_id,
+            MandateDecisionOutcome::Wait,
+            SAFE_FALLBACK_WAIT_RATIONALE,
+            mandate.version,
+        );
+        decision.origin = MandateDecisionOrigin::RuntimeFallback;
+        decision.reconsider_at = Some(mandate.bounded_next_review_at(None, now));
+        decision
+    }
+
+    /// True when the runtime recorded this decision on the deliberator's
+    /// behalf rather than the deliberator committing it.
+    pub fn is_runtime_fallback(&self) -> bool {
+        self.origin == MandateDecisionOrigin::RuntimeFallback
+    }
+
+    pub fn validate_content_bounds(&self) -> Result<(), String> {
+        if !canonical_text_within(&self.rationale, MAX_DECISION_RATIONALE_TEXT) {
+            return Err(
+                "decision rationale must be canonical non-empty text of at most 2 KiB in both characters and bytes"
+                    .to_string(),
+            );
+        }
+        if let Some(snapshot) = self.belief_snapshot.as_deref() {
+            if !text_within(snapshot, MAX_DECISION_OBSERVATIONS_JSON) {
+                return Err(
+                    "decision observations exceed their serialized 6 KiB character/byte bound"
+                        .to_string(),
+                );
+            }
+            let observations: Vec<String> = serde_json::from_str(snapshot)
+                .map_err(|_| "decision observations must be a JSON string array".to_string())?;
+            if observations.len() > MAX_DECISION_OBSERVATIONS {
+                return Err("decision observations cannot exceed 8 entries".to_string());
+            }
+            if observations
+                .iter()
+                .any(|value| !canonical_text_within(value, MAX_DECISION_OBSERVATION_TEXT))
+            {
+                return Err(
+                    "each decision observation must be canonical non-empty text of at most 750 characters and bytes"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(question) = self.question.as_deref()
+            && !canonical_text_within(question, MAX_DECISION_QUESTION_TEXT)
+        {
+            return Err(
+                    "decision question must be canonical non-empty text of at most 500 characters and bytes"
+                        .to_string(),
+                );
+        }
+        if self.evidence_receipt_ids.len() > MAX_MANDATE_EVIDENCE_REFS
+            || self.evidence_receipt_ids.iter().any(|value| {
+                !canonical_text_within(value, 256)
+                    || !value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':' | b'.')
+                    })
+            })
+        {
+            return Err("decision evidence receipt IDs exceed their canonical bounds".to_string());
+        }
+        if let Some(matched) = self.termination_match.as_deref()
+            && !canonical_text_within(matched, MAX_MANDATE_POLICY_ENTRY_TEXT)
+        {
+            return Err("decision termination match exceeds its canonical bound".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MandateOperatingUpdates {
+    pub learning_note: Option<MandateLearningNote>,
+}
+
+/// Content-free external signal that may accelerate a matching Autopilot
+/// mandate. Matching uses exact typed account identity and URL scope only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateWakeSignal {
+    pub kind: MandateWakeSignalKind,
+    pub source: String,
+    pub target_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    pub dedupe_key: String,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateWakeSignalKind {
+    Mention,
+    Reply,
+    Reaction,
+    MetricChange,
+    DeliveryFailure,
+    ExternalChange,
+}
+
+impl MandateWakeSignal {
+    pub fn validate(&self) -> Result<(), String> {
+        let canonical_token = |value: &str, max: usize| {
+            !value.is_empty()
+                && value.len() <= max
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+                })
+        };
+        if !canonical_token(&self.source, 128)
+            || !canonical_token(&self.dedupe_key, 256)
+            || self
+                .account_id
+                .as_deref()
+                .is_some_and(|value| !value.starts_with("account:") || !canonical_token(value, 256))
+        {
+            return Err("invalid canonical mandate wake signal identifiers".to_string());
+        }
+        let target = reqwest::Url::parse(&self.target_url)
+            .map_err(|_| "mandate wake target_url must be an absolute URL".to_string())?;
+        if !matches!(target.scheme(), "http" | "https")
+            || target.host_str().is_none()
+            || !target.username().is_empty()
+            || target.password().is_some()
+            || target.fragment().is_some()
+        {
+            return Err("mandate wake target_url is not a safe HTTP(S) URL".to_string());
+        }
+        chrono::DateTime::parse_from_rfc3339(&self.occurred_at)
+            .map_err(|_| "mandate wake occurred_at must be RFC3339".to_string())?;
+        Ok(())
+    }
+}
+
+impl MandateWakeSignalKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mention => "mention",
+            Self::Reply => "reply",
+            Self::Reaction => "reaction",
+            Self::MetricChange => "metric_change",
+            Self::DeliveryFailure => "delivery_failure",
+            Self::ExternalChange => "external_change",
+        }
+    }
+}
+
+/// Bounded, mandate-local strategy learning. Notes are advisory continuity,
+/// never authority, and every note must cite durable evidence from this same
+/// mandate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateLearningNote {
+    pub id: String,
+    pub mandate_id: String,
+    pub mandate_version: i64,
+    pub learned_in_decision_cycle_id: String,
+    pub summary: String,
+    pub evidence_receipt_ids: Vec<String>,
+    pub created_at: String,
+}
+
+impl MandateLearningNote {
+    pub fn new(
+        mandate_id: &str,
+        mandate_version: i64,
+        decision_cycle_id: &str,
+        summary: &str,
+        evidence_receipt_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            mandate_id: mandate_id.to_string(),
+            mandate_version,
+            learned_in_decision_cycle_id: decision_cycle_id.to_string(),
+            summary: summary.trim().to_string(),
+            evidence_receipt_ids,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !canonical_text_within(&self.id, 256)
+            || !canonical_text_within(&self.mandate_id, 256)
+            || self.mandate_version <= 0
+            || !canonical_text_within(&self.learned_in_decision_cycle_id, 256)
+            || !canonical_text_within(&self.summary, MAX_MANDATE_LEARNING_NOTE_TEXT)
+            || self.evidence_receipt_ids.is_empty()
+            || self.evidence_receipt_ids.len() > MAX_MANDATE_EVIDENCE_REFS
+            || self
+                .evidence_receipt_ids
+                .iter()
+                .any(|value| !canonical_text_within(value, 256))
+        {
+            return Err("invalid bounded mandate learning note".to_string());
+        }
+        chrono::DateTime::parse_from_rfc3339(&self.created_at)
+            .map_err(|_| "mandate learning note created_at must be RFC3339".to_string())?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateReconciliationResolution {
+    ConfirmedEffectOccurred,
+    ConfirmedNoEffect,
+    AbandonAttempt,
+}
+
+impl MandateReconciliationResolution {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfirmedEffectOccurred => "confirmed_effect_occurred",
+            Self::ConfirmedNoEffect => "confirmed_no_effect",
+            Self::AbandonAttempt => "abandon_attempt",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "confirmed_effect_occurred" => Some(Self::ConfirmedEffectOccurred),
+            "confirmed_no_effect" => Some(Self::ConfirmedNoEffect),
+            "abandon_attempt" => Some(Self::AbandonAttempt),
+            _ => None,
+        }
+    }
+}
+
+/// Agent-selected, revocable commitment made under an owner mandate.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentionStatus {
+    Committed,
+    Satisfied,
+    Failed,
+    Suspended,
+    Abandoned,
+}
+
+impl IntentionStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::Satisfied => "satisfied",
+            Self::Failed => "failed",
+            Self::Suspended => "suspended",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "committed" => Some(Self::Committed),
+            "satisfied" => Some(Self::Satisfied),
+            "failed" => Some(Self::Failed),
+            "suspended" => Some(Self::Suspended),
+            "abandoned" => Some(Self::Abandoned),
+            _ => None,
+        }
+    }
+
+    /// An intention belongs to one decision cycle. Once its commitment ends,
+    /// a later cycle must create a fresh intention rather than resurrecting it.
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (
+                Self::Committed,
+                Self::Satisfied | Self::Failed | Self::Suspended | Self::Abandoned
+            )
+        )
+    }
+}
+
+impl std::fmt::Display for IntentionStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Intention {
+    pub id: String,
+    pub mandate_id: String,
+    pub decision_cycle_id: String,
+    pub goal_run_id: String,
+    pub description: String,
+    pub rationale: String,
+    /// Exact owner-authored success criterion this one-cycle commitment is
+    /// intended to advance. `None` is retained only for pre-value-contract
+    /// records created before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_criterion: Option<String>,
+    pub expected_benefit: Option<String>,
+    pub risk: Option<String>,
+    pub invalidation_criteria: Option<String>,
+    pub status: IntentionStatus,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+impl Intention {
+    pub fn new(
+        mandate_id: &str,
+        decision_cycle_id: &str,
+        goal_run_id: &str,
+        description: &str,
+        rationale: &str,
+    ) -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            mandate_id: mandate_id.to_string(),
+            decision_cycle_id: decision_cycle_id.to_string(),
+            goal_run_id: goal_run_id.to_string(),
+            description: description.trim().to_string(),
+            rationale: rationale.trim().to_string(),
+            value_criterion: None,
+            expected_benefit: None,
+            risk: None,
+            invalidation_criteria: None,
+            status: IntentionStatus::Committed,
+            created_at: now.clone(),
+            updated_at: now,
+            completed_at: None,
+        }
+    }
+
+    pub fn validate_content_bounds(&self) -> Result<(), String> {
+        if !canonical_text_within(&self.description, MAX_INTENTION_DESCRIPTION_TEXT) {
+            return Err(
+                "intention description must be canonical non-empty text of at most 1 KiB in both characters and bytes"
+                    .to_string(),
+            );
+        }
+        if !canonical_text_within(&self.rationale, MAX_DECISION_RATIONALE_TEXT) {
+            return Err(
+                "intention rationale must be canonical non-empty text of at most 2 KiB in both characters and bytes"
+                    .to_string(),
+            );
+        }
+        let mut metadata_chars = 0usize;
+        let mut metadata_bytes = 0usize;
+        for value in [
+            self.value_criterion.as_deref(),
+            self.expected_benefit.as_deref(),
+            self.risk.as_deref(),
+            self.invalidation_criteria.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if value.is_empty() || value.trim() != value {
+                return Err("intention metadata must be canonical non-empty text".to_string());
+            }
+            metadata_chars = metadata_chars.saturating_add(value.chars().count());
+            metadata_bytes = metadata_bytes.saturating_add(value.len());
+        }
+        if metadata_chars > MAX_INTENTION_METADATA_TEXT
+            || metadata_bytes > MAX_INTENTION_METADATA_TEXT
+        {
+            return Err(
+                "intention metadata exceeds its combined 4 KiB character/byte bound".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Validate the typed value judgment required before an ACT may be
+    /// persisted for a value-contract mandate. The criterion is matched by the
+    /// state store against immutable owner policy; this method owns the
+    /// content-presence half of that contract.
+    /// The whole value contract against the owner's policy: when the
+    /// mandate names success criteria, the intention carries a complete
+    /// value contract whose criterion is one of them, word for word.
+    pub fn validate_value_against(&self, mandate: &Mandate) -> Result<(), String> {
+        if mandate.success_criteria.is_empty() {
+            return Ok(());
+        }
+        self.validate_value_contract()?;
+        let value_criterion = self.value_criterion.as_deref().unwrap_or_default();
+        if mandate
+            .success_criteria
+            .iter()
+            .any(|criterion| criterion == value_criterion)
+        {
+            Ok(())
+        } else {
+            Err("ACT value_criterion is not an exact owner-authored success criterion".to_string())
+        }
+    }
+
+    pub fn validate_value_contract(&self) -> Result<(), String> {
+        if !self
+            .value_criterion
+            .as_deref()
+            .is_some_and(|value| canonical_text_within(value, MAX_MANDATE_OBJECTIVE_TEXT))
+        {
+            return Err(
+                "ACT intention requires a canonical non-empty value_criterion within the mandate objective bound"
+                    .to_string(),
+            );
+        }
+        for (name, value) in [
+            ("expected_benefit", self.expected_benefit.as_deref()),
+            ("risk", self.risk.as_deref()),
+            (
+                "invalidation_criteria",
+                self.invalidation_criteria.as_deref(),
+            ),
+        ] {
+            if !value.is_some_and(|value| canonical_text_within(value, MAX_INTENTION_METADATA_TEXT))
+            {
+                return Err(format!(
+                    "ACT intention requires canonical non-empty {name} within the mandate policy entry bound"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Content-safe target identifier persisted for one governed mutation. Raw
+/// arguments, request bodies, query strings, responses, and credentials never
+/// enter the mandate mutation ledger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MandateMutationTarget {
+    /// `url` or `resource_id` in v1.
+    pub kind: String,
+    /// Canonical audit identifier. URL query/fragment/userinfo are removed;
+    /// resource identifiers outside the small account/profile vocabulary are
+    /// represented by a digest.
+    pub identifier: String,
+}
+
+/// Rust-only request to reserve one exact governed mutation. All authority
+/// fields derive from a grant already issued by the deterministic policy gate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateMutationReservation {
+    pub grant: MandateAuthorityGrant,
+    pub goal_run_id: String,
+    pub root_task_id: String,
+    pub root_task_attempt_id: String,
+    pub task_id: String,
+    pub task_attempt_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub mutation_effects: Vec<String>,
+    pub targets: Vec<MandateMutationTarget>,
+    pub account_identifiers: Vec<String>,
+    /// Caller-supplied clock solely for deterministic state tests. Production
+    /// callers always use `Utc::now()` and the store validates RFC3339.
+    pub reserved_at: String,
+}
+
+/// Rust-only exact one-use claim made at the last common dispatcher before
+/// adapter I/O. The store atomically binds this claim to the still-reserved
+/// ledger row and every live task/run/authority fence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateMutationDispatchClaim {
+    pub grant: MandateAuthorityGrant,
+    pub goal_run_id: String,
+    pub root_task_id: String,
+    pub root_task_attempt_id: String,
+    pub task_id: String,
+    pub task_attempt_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub claimed_at: String,
+}
+
+/// Durable state of a mutation attempt. `reserved` is intentionally not a
+/// success: a crash before strict receipt projection remains ambiguous.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateMutationAttemptStatus {
+    Reserved,
+    /// The action slot was reserved, but the final dispatcher never claimed it
+    /// before the run or authority epoch was invalidated. This is terminal and
+    /// explicitly distinct from an externally ambiguous dispatch.
+    NeverDispatched,
+    Succeeded,
+    Failed,
+    Ambiguous,
+}
+
+impl MandateMutationAttemptStatus {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reserved" => Some(Self::Reserved),
+            "never_dispatched" => Some(Self::NeverDispatched),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "ambiguous" => Some(Self::Ambiguous),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateMutationEvidence {
+    ToolReported,
+    StructuredMetadata,
+}
+
+impl MandateMutationEvidence {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "tool_reported" => Some(Self::ToolReported),
+            "structured_metadata" => Some(Self::StructuredMetadata),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateMutationAttempt {
+    pub id: String,
+    pub mandate_id: String,
+    pub mandate_version: i64,
+    pub decision_cycle_id: String,
+    pub goal_run_id: String,
+    pub intention_id: String,
+    pub root_task_id: String,
+    pub root_task_attempt_id: String,
+    pub task_id: String,
+    pub task_attempt_id: String,
+    pub reserved_action_attempt: i64,
+    pub action_digest: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub mutation_effects: Vec<String>,
+    pub targets: Vec<MandateMutationTarget>,
+    pub account_identifiers: Vec<String>,
+    pub status: MandateMutationAttemptStatus,
+    pub outcome_evidence: Option<MandateMutationEvidence>,
+    pub http_status: Option<u16>,
+    pub exit_code: Option<i32>,
+    pub reserved_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateMutationQuotaBlockReason {
+    MutationDisabled,
+    Rolling24hExhausted,
+    Cooldown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateMutationQuotaState {
+    pub mandate_id: String,
+    pub as_of: String,
+    pub max_mutating_actions_per_rolling_24h: u32,
+    pub min_seconds_between_mutations: u32,
+    pub reserved_in_rolling_24h: u32,
+    pub remaining_in_rolling_24h: u32,
+    pub last_reserved_at: Option<String>,
+    pub available_now: bool,
+    pub block_reason: Option<MandateMutationQuotaBlockReason>,
+    /// Earliest instant at which both the rolling quota and cooldown can admit
+    /// another reservation. None means mutation is disabled or available now.
+    pub earliest_next_slot_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateRunFinalizationRequest {
+    pub mandate_id: String,
+    pub expected_mandate_version: i64,
+    pub goal_run_id: String,
+    pub finalized_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateRunProofCounts {
+    pub non_root_tasks: u32,
+    pub completed_tasks: u32,
+    pub incomplete_tasks: u32,
+    pub failed_or_blocked_tasks: u32,
+    pub mutation_reservations: u32,
+    pub succeeded_mutations: u32,
+    pub failed_mutations: u32,
+    pub never_dispatched_mutations: u32,
+    pub ambiguous_or_reserved_mutations: u32,
+}
+
+/// The gate that refused a mandate worker's mutation before dispatch, read
+/// from the typed denial on the worker's receipt.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateDispatchGate {
+    UntrustedContentCheck,
+    MandateAuthority,
+    OwnerDeclined,
+    SecretScan,
+    Other,
+}
+
+impl MandateDispatchGate {
+    /// The gate named by a receipt's `access_denial.reason_code`.
+    pub fn from_reason_code(code: &str) -> Self {
+        match code {
+            "untrusted_egress_denied" => Self::UntrustedContentCheck,
+            "authority_hook_denied" => Self::MandateAuthority,
+            aidaemon_events::OWNER_APPROVAL_DECLINED => Self::OwnerDeclined,
+            "egress_secret_blocked" => Self::SecretScan,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn owner_label(self) -> &'static str {
+        match self {
+            Self::UntrustedContentCheck => "the untrusted-content safety check",
+            Self::MandateAuthority => "the limits of this mandate",
+            Self::OwnerDeclined => "an earlier decline of yours",
+            Self::SecretScan => "the outbound secret scan",
+            Self::Other => "a safety gate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateReconciliationReason {
+    RootTaskNotSuccessful,
+    ActMissingIntention,
+    ActMissingWorkTask,
+    /// A gate refused the worker's mutation before dispatch, and the run
+    /// reserved nothing: no external change exists to reconcile.
+    ActBlockedBeforeDispatch {
+        gate: MandateDispatchGate,
+    },
+    WorkTasksIncomplete,
+    ActMissingVerifiedMutation,
+    ActionLedgerMismatch,
+    MutationOutcomeFailed,
+    MutationOutcomeAmbiguous,
+    NonActionCreatedWork,
+    NonActionReservedMutation,
+}
+
+impl MandateReconciliationReason {
+    /// Why the mandate paused, as a clause the owner reads after "paused for
+    /// safety:". Never an internal code.
+    pub fn owner_sentence(self) -> String {
+        match self {
+            Self::RootTaskNotSuccessful => "its last review did not finish its work".to_string(),
+            Self::ActMissingIntention => {
+                "it decided to act but did not record what it meant to do".to_string()
+            }
+            Self::ActMissingWorkTask => "it decided to act but never started the work".to_string(),
+            Self::ActBlockedBeforeDispatch { gate } => format!(
+                "it decided to act, but {} refused the action before it ran",
+                gate.owner_label()
+            ),
+            Self::WorkTasksIncomplete => "some of its work did not finish".to_string(),
+            Self::ActMissingVerifiedMutation => {
+                "it decided to act but could not confirm the change happened".to_string()
+            }
+            Self::ActionLedgerMismatch => {
+                "its record of changes does not match what it reported".to_string()
+            }
+            Self::MutationOutcomeFailed => "a change it tried failed".to_string(),
+            Self::MutationOutcomeAmbiguous => {
+                "it cannot tell whether a change it tried went through".to_string()
+            }
+            Self::NonActionCreatedWork => {
+                "it started work during a review that was not meant to act".to_string()
+            }
+            Self::NonActionReservedMutation => {
+                "it prepared a change during a review that was not meant to act".to_string()
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RootTaskNotSuccessful => "root_task_not_successful",
+            Self::ActMissingIntention => "act_missing_intention",
+            Self::ActMissingWorkTask => "act_missing_work_task",
+            Self::ActBlockedBeforeDispatch { gate } => match gate {
+                MandateDispatchGate::UntrustedContentCheck => {
+                    "act_blocked_before_dispatch:untrusted_content_check"
+                }
+                MandateDispatchGate::MandateAuthority => {
+                    "act_blocked_before_dispatch:mandate_authority"
+                }
+                MandateDispatchGate::OwnerDeclined => "act_blocked_before_dispatch:owner_declined",
+                MandateDispatchGate::SecretScan => "act_blocked_before_dispatch:secret_scan",
+                MandateDispatchGate::Other => "act_blocked_before_dispatch:other",
+            },
+            Self::WorkTasksIncomplete => "work_tasks_incomplete",
+            Self::ActMissingVerifiedMutation => "act_missing_verified_mutation",
+            Self::ActionLedgerMismatch => "action_ledger_mismatch",
+            Self::MutationOutcomeFailed => "mutation_outcome_failed",
+            Self::MutationOutcomeAmbiguous => "mutation_outcome_ambiguous",
+            Self::NonActionCreatedWork => "non_action_created_work",
+            Self::NonActionReservedMutation => "non_action_reserved_mutation",
+        }
+    }
+
+    /// What went wrong, in the owner's words: no internal stage or
+    /// component names.
+    pub fn owner_text(self) -> &'static str {
+        match self {
+            Self::RootTaskNotSuccessful => "the review did not finish",
+            Self::ActMissingIntention => "it decided to act but did not record what it meant to do",
+            Self::ActMissingWorkTask => "it decided to act but started no work",
+            Self::ActBlockedBeforeDispatch { .. } => "an action was refused before it ran",
+            Self::WorkTasksIncomplete => "some of its work did not finish",
+            Self::ActMissingVerifiedMutation => {
+                "it decided to act but no change could be confirmed"
+            }
+            Self::ActionLedgerMismatch => "its record of what it did does not match what ran",
+            Self::MutationOutcomeFailed => "an action it took failed",
+            Self::MutationOutcomeAmbiguous => {
+                "it can't tell whether an action it took went through"
+            }
+            Self::NonActionCreatedWork => "it decided not to act but started work anyway",
+            Self::NonActionReservedMutation => "it decided not to act but prepared a change anyway",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateFinalizationStaleReason {
+    MandateMissingOrVersionChanged,
+    RunNotCurrent,
+    DecisionVersionChanged,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateFinalizationRejectReason {
+    InvalidRequest,
+    DecisionMissing,
+    InvalidDecisionState,
+    DeliberatorFailed,
+    /// An ACT review whose action ledger proves nothing reached the outside
+    /// world: no mutation succeeded, none has an unknown outcome. Retried
+    /// with backoff; the owner has nothing to reconcile.
+    ActChangedNothing,
+}
+
+impl MandateFinalizationRejectReason {
+    /// What happened to the review, as the owner reads it after "a review".
+    pub fn owner_sentence(self) -> &'static str {
+        match self {
+            Self::InvalidRequest | Self::InvalidDecisionState => {
+                "could not be checked, so nothing was done"
+            }
+            Self::DecisionMissing => "was interrupted before it decided anything. Nothing was done",
+            Self::DeliberatorFailed => "stopped before it finished",
+            Self::ActChangedNothing => {
+                "decided to act, but the action did not go through, so nothing changed"
+            }
+        }
+    }
+
+    /// Whether the mandate retries on its own after this failure.
+    pub fn retries_automatically(self) -> bool {
+        matches!(
+            self,
+            Self::DecisionMissing | Self::DeliberatorFailed | Self::ActChangedNothing
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::DecisionMissing => "decision_missing",
+            Self::InvalidDecisionState => "invalid_decision_state",
+            Self::DeliberatorFailed => "deliberator_failed",
+            Self::ActChangedNothing => "act_changed_nothing",
+        }
+    }
+
+    /// What went wrong, in the owner's words: no internal stage or
+    /// component names.
+    pub fn owner_text(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "the review could not be checked",
+            Self::DecisionMissing => "it was interrupted before it decided anything",
+            Self::InvalidDecisionState => "its decision could not be confirmed",
+            Self::DeliberatorFailed => "it could not finish",
+            Self::ActChangedNothing => "the action it decided on did not go through",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum MandateRunFinalizationResult {
+    ActSatisfied {
+        counts: MandateRunProofCounts,
+    },
+    NonActionSatisfied {
+        outcome: MandateDecisionOutcome,
+        counts: MandateRunProofCounts,
+    },
+    ReconciliationRequired {
+        reason: MandateReconciliationReason,
+        counts: MandateRunProofCounts,
+    },
+    Stale {
+        reason: MandateFinalizationStaleReason,
+    },
+    Rejected {
+        reason: MandateFinalizationRejectReason,
+    },
+}
+
+/// Typed, content-free owner notice committed with a mandate run's terminal
+/// proof state. No model-authored rationale, question, task, tool, response, or
+/// error text can enter this structure or its rendered notification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MandateRunNotificationKind {
+    ActSatisfied,
+    Ask,
+    /// A WAIT that carried the owner alert its policy grants.
+    Alert,
+    Stopped,
+    ReconciliationRequired {
+        reason: MandateReconciliationReason,
+    },
+    ReviewFailed {
+        reason: MandateFinalizationRejectReason,
+    },
+    ExecutionLeaseLost,
+    AuthorityRevokedWithUnresolvedMutation,
+}
+
+impl MandateRunNotificationKind {
+    pub fn notification_type(&self) -> &'static str {
+        match self {
+            Self::ActSatisfied => "mandate_action",
+            Self::Ask => "mandate_ask",
+            Self::Alert => "mandate_alert",
+            Self::Stopped => "mandate_stopped",
+            Self::ReconciliationRequired { .. }
+            | Self::ExecutionLeaseLost
+            | Self::AuthorityRevokedWithUnresolvedMutation => "mandate_reconciliation_required",
+            Self::ReviewFailed { .. } => "mandate_review_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateRunNotification {
+    pub mandate_id: String,
+    pub mandate_version: i64,
+    pub goal_id: String,
+    pub goal_run_id: String,
+    pub owner_session_id: String,
+    pub kind: MandateRunNotificationKind,
+    pub counts: MandateRunProofCounts,
+    pub created_at: String,
+    /// The deliberator's ASK question, shown to the owner so they can
+    /// answer from chat. Rendered through [`owner_question_excerpt`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_question: Option<String>,
+    /// The WAIT's owner alert, rendered through [`owner_question_excerpt`]
+    /// (the same bounding, quoted and attributed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_alert: Option<String>,
+    /// The owner-confirmed objective, so the notice names the automation the
+    /// owner recognizes instead of an opaque id. Rendered through
+    /// [`mandate_owner_label`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    /// The short name the owner gave the mandate, which the notice uses
+    /// before the objective.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// How owner-facing notices name a mandate: its owner-confirmed objective,
+/// flattened and capped at a word boundary so it reads as a title.
+pub fn mandate_owner_label(objective: Option<&str>) -> String {
+    mandate_named_label(None, objective)
+}
+
+/// How owner-facing notices name a mandate: the name the owner gave it, else
+/// its objective, flattened and capped at a word boundary so it reads as a
+/// title.
+pub fn mandate_named_label(name: Option<&str>, objective: Option<&str>) -> String {
+    const MAX_CHARS: usize = 72;
+    let flattened = name
+        .filter(|name| !name.trim().is_empty())
+        .or(objective)
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('"', "'");
+    let flattened = flattened.trim_end_matches(['.', ' ']);
+    if flattened.is_empty() {
+        return "Your automation".to_string();
+    }
+    let title = if flattened.chars().count() <= MAX_CHARS {
+        flattened.to_string()
+    } else {
+        let cut = flattened.chars().take(MAX_CHARS).collect::<String>();
+        let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
+        format!("{}…", cut.trim_end_matches([',', ';', ':']))
+    };
+    format!("Your automation \"{title}\"")
+}
+
+fn plural(count: impl Into<u64>, one: &str, many: &str) -> String {
+    let count = count.into();
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// Bounded, single-line rendering of a model-generated owner question. The
+/// question is derived from untrusted observations, so it is flattened,
+/// stripped of control characters, capped, and always presented quoted and
+/// attributed rather than as the assistant's own words.
+pub fn owner_question_excerpt(question: &str) -> Option<String> {
+    const MAX_CHARS: usize = 500;
+    let flattened = question
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('"', "'");
+    if flattened.is_empty() {
+        return None;
+    }
+    let mut excerpt = flattened.chars().take(MAX_CHARS).collect::<String>();
+    if flattened.chars().count() > MAX_CHARS {
+        excerpt.push('…');
+    }
+    Some(excerpt)
+}
+
+impl MandateRunNotification {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mandate_id: &str,
+        mandate_version: i64,
+        goal_id: &str,
+        goal_run_id: &str,
+        owner_session_id: &str,
+        kind: MandateRunNotificationKind,
+        counts: MandateRunProofCounts,
+        created_at: &str,
+    ) -> Self {
+        Self {
+            mandate_id: mandate_id.to_string(),
+            mandate_version,
+            goal_id: goal_id.to_string(),
+            goal_run_id: goal_run_id.to_string(),
+            owner_session_id: owner_session_id.to_string(),
+            kind,
+            counts,
+            created_at: created_at.to_string(),
+            owner_question: None,
+            owner_alert: None,
+            objective: None,
+            name: None,
+        }
+    }
+
+    pub fn with_objective(mut self, objective: Option<&str>) -> Self {
+        self.objective = objective.map(str::to_string);
+        self
+    }
+
+    pub fn with_name(mut self, name: Option<&str>) -> Self {
+        self.name = name.map(str::to_string);
+        self
+    }
+
+    pub fn with_owner_question(mut self, question: Option<&str>) -> Self {
+        self.owner_question = question.and_then(owner_question_excerpt);
+        self
+    }
+
+    pub fn with_owner_alert(mut self, alert: Option<&str>) -> Self {
+        self.owner_alert = alert.and_then(owner_question_excerpt);
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        for (label, value) in [
+            ("mandate id", self.mandate_id.as_str()),
+            ("goal id", self.goal_id.as_str()),
+            ("goal run id", self.goal_run_id.as_str()),
+            ("owner session id", self.owner_session_id.as_str()),
+        ] {
+            if value.is_empty()
+                || value.trim() != value
+                || value.chars().count() > 256
+                || value.len() > 256
+                || value.chars().any(char::is_control)
+            {
+                return Err(format!("invalid mandate notification {label}"));
+            }
+        }
+        if self.mandate_version <= 0 {
+            return Err("invalid mandate notification version".to_string());
+        }
+        chrono::DateTime::parse_from_rfc3339(&self.created_at)
+            .map_err(|_| "invalid mandate notification timestamp".to_string())?;
+        Ok(())
+    }
+
+    /// Stable primary key: exactly one terminal owner notice can exist for a
+    /// mandate run, even if finalization is retried after a crash.
+    pub fn notification_id(&self) -> String {
+        format!("mandate-run-notice:{}", self.goal_run_id)
+    }
+
+    /// The notice as the owner reads it: the mandate by its name, what
+    /// happened in plain words, and no internal codes or ids (the owner's
+    /// next turn finds the mandate by name, or from the typed notice).
+    pub fn message(&self) -> String {
+        let label = mandate_named_label(self.name.as_deref(), self.objective.as_deref());
+        let unresolved = self.counts.ambiguous_or_reserved_mutations;
+        let check_target = format!(
+            "{} may not have completed cleanly. Please check the account for a missing or duplicate action before resuming it.",
+            plural(unresolved, "external change", "external changes"),
+        );
+        match self.kind {
+            MandateRunNotificationKind::ActSatisfied => {
+                let done = match self.counts.succeeded_mutations {
+                    0 => "finished a review and completed its planned work".to_string(),
+                    count => format!(
+                        "completed {}",
+                        plural(count, "verified action", "verified actions")
+                    ),
+                };
+                format!("{label} {done}. It keeps running on its own.")
+            }
+            MandateRunNotificationKind::Ask => match self.owner_question.as_deref() {
+                Some(question) => format!(
+                    "{label} needs your input. It asked: \"{question}\"\n\nReply here to answer. Your answer guides it, but never gives it new permissions. If you don't reply, it continues on its own within its current limits at its next review."
+                ),
+                None => format!(
+                    "{label} needs your input. Ask me what it wants to know. If you don't reply, it continues on its own within its current limits at its next review."
+                ),
+            },
+            MandateRunNotificationKind::Alert => match self.owner_alert.as_deref() {
+                Some(alert) => format!(
+                    "{label} has something you asked to hear about. It reported: \"{alert}\"\n\nIt keeps running on its own; nothing new was allowed."
+                ),
+                None => format!(
+                    "{label} has something you asked to hear about. Ask me what it found. It keeps running on its own."
+                ),
+            },
+            MandateRunNotificationKind::Stopped => {
+                format!("{label} has stopped. Ask me why if you want the details.")
+            }
+            MandateRunNotificationKind::ReconciliationRequired {
+                reason: reason @ MandateReconciliationReason::ActBlockedBeforeDispatch { .. },
+            } => format!(
+                "{label} is paused: {}, so nothing was published or changed. Ask me for the details, then resume it when you're ready.",
+                reason.owner_sentence(),
+            ),
+            MandateRunNotificationKind::ReconciliationRequired { reason } => {
+                let detail = if unresolved > 0 {
+                    format!(" {check_target}")
+                } else {
+                    " Ask me for the details, then resume it when you're ready.".to_string()
+                };
+                format!(
+                    "{label} is paused for safety: {}.{detail}",
+                    reason.owner_sentence(),
+                )
+            }
+            // The deliberator may fail after committing an ACT and starting an
+            // executor, so its notice claims neither "nothing decided" nor
+            // "nothing done"; an unconfirmed external change takes the
+            // reconciliation path instead.
+            MandateRunNotificationKind::ReviewFailed { reason } => {
+                let mut text = format!("{label}: a review {}.", reason.owner_sentence());
+                if reason == MandateFinalizationRejectReason::DeliberatorFailed {
+                    text.push_str(" Ask me what it got to if you want the details.");
+                }
+                if reason.retries_automatically() {
+                    text.push_str(" It's still active and will retry automatically.");
+                }
+                text
+            }
+            MandateRunNotificationKind::ExecutionLeaseLost => format!(
+                "{label} is paused for safety: a review was cut off before its results could be confirmed. {check_target}"
+            ),
+            MandateRunNotificationKind::AuthorityRevokedWithUnresolvedMutation => format!(
+                "{label}: a review was cancelled after it had already started work outside aidaemon. {check_target}"
+            ),
+        }
+    }
+
+    pub fn to_notification_entry(&self) -> crate::goals::NotificationEntry {
+        let id = self.notification_id();
+        crate::goals::NotificationEntry {
+            id: id.clone(),
+            goal_id: self.goal_id.clone(),
+            session_id: self.owner_session_id.clone(),
+            notification_type: self.kind.notification_type().to_string(),
+            priority: "critical".to_string(),
+            message: self.message(),
+            created_at: self.created_at.clone(),
+            delivered_at: None,
+            attempts: 0,
+            expires_at: None,
+            task_id: None,
+            action_token: Some(id),
+            untrusted: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn a_site_root_target_is_refused_with_a_way_forward() {
+        let refused = super::validate_mandate_target_prefix("https://status.example.test/")
+            .expect_err("a root target would cover the whole site");
+        assert!(refused.contains("whole site"), "{refused}");
+        assert!(
+            refused.contains("https://status.example.test/<page>"),
+            "the refusal names how to scope it: {refused}"
+        );
+        assert!(super::validate_mandate_target_prefix("https://status.example.test").is_err());
+        assert!(
+            super::validate_mandate_target_prefix("https://status.example.test/health").is_ok()
+        );
+        let userinfo = super::validate_mandate_target_prefix("https://a:b@status.example.test/x")
+            .expect_err("userinfo is refused");
+        assert!(!userinfo.contains("whole site"), "{userinfo}");
+    }
+    use super::*;
+
+    #[test]
+    fn deliberator_failure_notice_explains_safe_automatic_retry() {
+        let notice = MandateRunNotification::new(
+            "08012d3d-synthetic",
+            1,
+            "goal-synthetic",
+            "566978b6-synthetic",
+            "owner-synthetic",
+            MandateRunNotificationKind::ReviewFailed {
+                reason: MandateFinalizationRejectReason::DeliberatorFailed,
+            },
+            MandateRunProofCounts::default(),
+            "2026-08-11T12:00:00Z",
+        );
+        let message = notice.message();
+        // A deliberator can fail after committing an ACT and starting an
+        // executor, so its notice claims neither "decided nothing" nor
+        // "nothing was done".
+        assert!(!message.contains("decided anything"), "{message}");
+        assert!(!message.contains("Nothing was done"), "{message}");
+        assert!(message.contains("still active"));
+        assert!(message.contains("will retry automatically"));
+
+        let missing = MandateRunNotification::new(
+            "08012d3d-synthetic",
+            1,
+            "goal-synthetic",
+            "566978b6-synthetic",
+            "owner-synthetic",
+            MandateRunNotificationKind::ReviewFailed {
+                reason: MandateFinalizationRejectReason::DecisionMissing,
+            },
+            MandateRunProofCounts::default(),
+            "2026-08-11T12:00:00Z",
+        )
+        .message();
+        assert!(missing.contains("before it decided anything"), "{missing}");
+        assert!(missing.contains("Nothing was done"), "{missing}");
+    }
+
+    fn review_notice(kind: MandateRunNotificationKind) -> MandateRunNotification {
+        MandateRunNotification::new(
+            "2561769c-0000-4000-8000-synthetic",
+            2,
+            "goal-synthetic",
+            "run-synthetic",
+            "owner-synthetic",
+            kind,
+            MandateRunProofCounts::default(),
+            "2026-08-11T12:00:00Z",
+        )
+        .with_objective(Some("Every hour, check the synthetic status page"))
+    }
+
+    #[test]
+    fn notices_use_the_owner_given_name_and_plain_reasons() {
+        let named = review_notice(MandateRunNotificationKind::ReviewFailed {
+            reason: MandateFinalizationRejectReason::DeliberatorFailed,
+        })
+        .with_name(Some("Status watch"));
+        assert_eq!(
+            named.message(),
+            "Your automation \"Status watch\": a review stopped before it finished. Ask me what \
+             it got to if you want the details. It's still active and will retry automatically."
+        );
+        let unnamed = review_notice(MandateRunNotificationKind::Stopped);
+        assert_eq!(
+            unnamed.message(),
+            "Your automation \"Every hour, check the synthetic status page\" has stopped. Ask me \
+             why if you want the details."
+        );
+        let paused = review_notice(MandateRunNotificationKind::ReconciliationRequired {
+            reason: MandateReconciliationReason::MutationOutcomeFailed,
+        })
+        .with_name(Some("Status watch"));
+        assert_eq!(
+            paused.message(),
+            "Your automation \"Status watch\" is paused for safety: a change it tried failed. \
+             Ask me for the details, then resume it when you're ready."
+        );
+    }
+
+    #[test]
+    fn no_notice_shows_an_internal_code_or_id() {
+        let mut kinds = vec![
+            MandateRunNotificationKind::ActSatisfied,
+            MandateRunNotificationKind::Ask,
+            MandateRunNotificationKind::Alert,
+            MandateRunNotificationKind::Stopped,
+            MandateRunNotificationKind::ExecutionLeaseLost,
+            MandateRunNotificationKind::AuthorityRevokedWithUnresolvedMutation,
+        ];
+        for reason in [
+            MandateFinalizationRejectReason::InvalidRequest,
+            MandateFinalizationRejectReason::DecisionMissing,
+            MandateFinalizationRejectReason::InvalidDecisionState,
+            MandateFinalizationRejectReason::DeliberatorFailed,
+            MandateFinalizationRejectReason::ActChangedNothing,
+        ] {
+            kinds.push(MandateRunNotificationKind::ReviewFailed { reason });
+        }
+        for reason in [
+            MandateReconciliationReason::RootTaskNotSuccessful,
+            MandateReconciliationReason::ActMissingIntention,
+            MandateReconciliationReason::ActMissingWorkTask,
+            MandateReconciliationReason::ActBlockedBeforeDispatch {
+                gate: MandateDispatchGate::MandateAuthority,
+            },
+            MandateReconciliationReason::WorkTasksIncomplete,
+            MandateReconciliationReason::ActMissingVerifiedMutation,
+            MandateReconciliationReason::ActionLedgerMismatch,
+            MandateReconciliationReason::MutationOutcomeFailed,
+            MandateReconciliationReason::MutationOutcomeAmbiguous,
+            MandateReconciliationReason::NonActionCreatedWork,
+            MandateReconciliationReason::NonActionReservedMutation,
+        ] {
+            kinds.push(MandateRunNotificationKind::ReconciliationRequired { reason });
+        }
+        for kind in kinds {
+            let message = review_notice(kind).message();
+            assert!(!message.contains("2561769c"), "{message}");
+            assert!(!message.contains("(ref"), "{message}");
+            assert!(!message.contains('_'), "{message}");
+            assert!(!message.contains("deliberator"), "{message}");
+        }
+    }
+
+    #[test]
+    fn owner_label_names_the_objective_and_caps_at_a_word() {
+        assert_eq!(
+            mandate_owner_label(Some("Grow the newsletter.")),
+            "Your automation \"Grow the newsletter\""
+        );
+        assert_eq!(mandate_owner_label(None), "Your automation");
+        assert_eq!(mandate_owner_label(Some("  \n ")), "Your automation");
+        let long = mandate_owner_label(Some(
+            "Increase authentic audience reach and engagement on the connected X account over the next year.",
+        ));
+        assert!(long.ends_with("…\""), "{long}");
+        assert!(long.chars().count() < 100, "{long}");
+        assert!(!long.contains("  "));
+    }
+
+    #[test]
+    fn mandate_status_legal_transition_matrix_is_explicit() {
+        let statuses = [
+            MandateStatus::Active,
+            MandateStatus::Paused,
+            MandateStatus::AwaitingInput,
+            MandateStatus::Completed,
+            MandateStatus::Cancelled,
+        ];
+        let legal = [
+            (MandateStatus::Active, MandateStatus::Paused),
+            (MandateStatus::Active, MandateStatus::AwaitingInput),
+            (MandateStatus::Active, MandateStatus::Completed),
+            (MandateStatus::Active, MandateStatus::Cancelled),
+            (MandateStatus::Paused, MandateStatus::Active),
+            (MandateStatus::Paused, MandateStatus::Cancelled),
+            (MandateStatus::AwaitingInput, MandateStatus::Active),
+            (MandateStatus::AwaitingInput, MandateStatus::Cancelled),
+        ];
+
+        for from in statuses {
+            for to in statuses {
+                assert_eq!(
+                    from.can_transition_to(to),
+                    legal.contains(&(from, to)),
+                    "unexpected mandate transition {from} -> {to}"
+                );
+            }
+            assert_eq!(
+                from.is_terminal(),
+                matches!(from, MandateStatus::Completed | MandateStatus::Cancelled)
+            );
+        }
+    }
+
+    #[test]
+    fn intention_status_legal_transition_matrix_is_explicit() {
+        let statuses = [
+            IntentionStatus::Committed,
+            IntentionStatus::Satisfied,
+            IntentionStatus::Failed,
+            IntentionStatus::Suspended,
+            IntentionStatus::Abandoned,
+        ];
+        let legal = [
+            (IntentionStatus::Committed, IntentionStatus::Satisfied),
+            (IntentionStatus::Committed, IntentionStatus::Failed),
+            (IntentionStatus::Committed, IntentionStatus::Suspended),
+            (IntentionStatus::Committed, IntentionStatus::Abandoned),
+        ];
+
+        for from in statuses {
+            for to in statuses {
+                assert_eq!(
+                    from.can_transition_to(to),
+                    legal.contains(&(from, to)),
+                    "unexpected intention transition {from} -> {to}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_status_wire_values_remain_stable() {
+        for status in [
+            MandateStatus::Active,
+            MandateStatus::Paused,
+            MandateStatus::AwaitingInput,
+            MandateStatus::Completed,
+            MandateStatus::Cancelled,
+        ] {
+            let encoded = format!("\"{}\"", status.as_str());
+            assert_eq!(serde_json::to_string(&status).unwrap(), encoded);
+            assert_eq!(
+                serde_json::from_str::<MandateStatus>(&encoded).unwrap(),
+                status
+            );
+            assert_eq!(MandateStatus::parse(status.as_str()), Some(status));
+        }
+        for status in [
+            IntentionStatus::Committed,
+            IntentionStatus::Satisfied,
+            IntentionStatus::Failed,
+            IntentionStatus::Suspended,
+            IntentionStatus::Abandoned,
+        ] {
+            let encoded = format!("\"{}\"", status.as_str());
+            assert_eq!(serde_json::to_string(&status).unwrap(), encoded);
+            assert_eq!(
+                serde_json::from_str::<IntentionStatus>(&encoded).unwrap(),
+                status
+            );
+            assert_eq!(IntentionStatus::parse(status.as_str()), Some(status));
+        }
+    }
+
+    #[test]
+    fn authority_rejects_global_wildcard_and_unknown_effects() {
+        let mut authority = MandateAuthority {
+            allowed_tools: vec!["*".to_string()],
+            max_mutating_actions_per_cycle: 1,
+            ..MandateAuthority::default()
+        };
+        assert!(authority.validate().is_err());
+
+        authority.allowed_tools = vec!["mcp__x__*".to_string()];
+        authority.allowed_mutation_effects = vec!["invented_effect".to_string()];
+        assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn only_exact_positive_list_data_tools_can_be_delegated() {
+        let authority = MandateAuthority {
+            allowed_tools: vec!["http_request".to_string(), "web_fetch".to_string()],
+            allowed_target_prefixes: vec!["https://api.x.com/2/".to_string()],
+            ..MandateAuthority::default()
+        };
+        assert!(authority.validate().is_ok());
+        assert!(authority.allows_tool("http_request"));
+        assert!(!authority.allows_tool("http_request_admin"));
+        assert!(!authority.allows_tool("terminal"));
+
+        let mut wildcard = authority.clone();
+        wildcard.allowed_tools = vec!["http_*".to_string()];
+        assert!(wildcard.validate().is_err());
+        let mut private_read = authority;
+        private_read.allowed_tools = vec!["search_history".to_string()];
+        assert!(private_read.validate().is_err());
+    }
+
+    #[test]
+    fn observation_data_tools_require_explicit_typed_target_scopes() {
+        let mut authority = MandateAuthority {
+            allowed_tools: vec!["http_request".to_string()],
+            ..MandateAuthority::default()
+        };
+        assert!(authority.validate().is_err());
+        authority.allowed_target_prefixes = vec!["https://api.x.com/2/users/me".to_string()];
+        assert!(authority.validate().is_ok());
+        authority.allowed_target_prefixes = vec!["/private/history".to_string()];
+        assert!(authority.validate().is_err());
+        for invalid_resource in ["account:", "auth_profile:", "account:123:"] {
+            authority.allowed_target_prefixes = vec![invalid_resource.to_string()];
+            assert!(authority.validate().is_err(), "scope={invalid_resource}");
+        }
+    }
+
+    #[test]
+    fn opaque_nested_action_tools_cannot_be_delegated() {
+        for pattern in [
+            "cli_agent",
+            "cli_*",
+            "terminal",
+            "term*",
+            "browser",
+            "brow*",
+            "computer_use",
+            "computer_*",
+            "health_probe",
+            "health_*",
+            "manage_automations",
+            "schedule_task",
+            "schedule_*",
+            "read_file",
+            "read_*",
+            "write_file",
+            "write_*",
+            "edit_file",
+            "edit_*",
+            "search_files",
+            "search_*",
+            "send_file",
+            "send_*",
+            "check_environment",
+            "check_*",
+            "mcp__x__post",
+            "mcp__x__*",
+        ] {
+            let authority = MandateAuthority {
+                allowed_tools: vec![pattern.to_string()],
+                ..MandateAuthority::default()
+            };
+            assert!(authority.validate().is_err(), "pattern {pattern:?}");
+        }
+    }
+
+    #[test]
+    fn mutation_authority_requires_bounded_daily_quota_cooldown_and_non_root_target() {
+        let mut authority = MandateAuthority {
+            allowed_tools: vec!["http_request".to_string()],
+            allowed_mutation_effects: vec!["external_delivery".to_string()],
+            max_mutating_actions_per_cycle: 1,
+            max_mutating_actions_per_rolling_24h: 1,
+            min_seconds_between_mutations: 900,
+            ..MandateAuthority::default()
+        };
+        assert!(
+            authority.validate().is_err(),
+            "empty targets must fail closed"
+        );
+
+        authority.allowed_target_prefixes = vec!["https://api.x.com/".to_string()];
+        assert!(
+            authority.validate().is_err(),
+            "origin-wide scope is too broad"
+        );
+
+        authority.allowed_target_prefixes = vec![
+            "https://api.x.com/2/tweets".to_string(),
+            "auth_profile:Twitter%20Prod%2Faccount".to_string(),
+        ];
+        assert!(authority.validate().is_ok());
+
+        authority.min_seconds_between_mutations = 899;
+        assert!(authority.validate().is_err());
+        authority.min_seconds_between_mutations = 900;
+        authority.max_mutating_actions_per_rolling_24h = 25;
+        assert!(authority.validate().is_err());
+        authority.max_mutating_actions_per_rolling_24h = 1;
+        authority.max_mutating_actions_per_cycle = 2;
+        assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn operation_scopes_project_exact_authority_and_validate_executable_http_shapes() {
+        let read = MandateOperationScope {
+            tool: "web_fetch".to_string(),
+            operation: ToolCallOperation::Get,
+            kind: MandateOperationKind::Observation,
+            target_prefixes: vec!["https://blog.aidaemon.ai/posts/".to_string()],
+            allowed_query_params: Vec::new(),
+            mutation_effects: Vec::new(),
+        };
+        let post = MandateOperationScope {
+            tool: "http_request".to_string(),
+            operation: ToolCallOperation::Post,
+            kind: MandateOperationKind::Mutation,
+            target_prefixes: vec![
+                "https://api.x.com/2/tweets".to_string(),
+                "auth_profile:twitter".to_string(),
+                "account:12345".to_string(),
+            ],
+            allowed_query_params: Vec::new(),
+            mutation_effects: vec![
+                "remote_mutation".to_string(),
+                "external_delivery".to_string(),
+            ],
+        };
+        let authority =
+            MandateAuthority::from_operation_scopes(true, vec![read, post.clone()], 1, 1, 900);
+        assert!(authority.validate().is_ok());
+        assert_eq!(
+            authority.allowed_tools,
+            vec!["http_request".to_string(), "web_fetch".to_string()]
+        );
+        assert!(
+            authority
+                .allowed_target_prefixes
+                .contains(&"account:12345".to_string())
+        );
+
+        let mut missing_delivery = post.clone();
+        missing_delivery.mutation_effects = vec!["remote_mutation".to_string()];
+        assert!(missing_delivery.validate().is_err());
+
+        let mut missing_account = post;
+        missing_account
+            .target_prefixes
+            .retain(|target| !target.starts_with("account:"));
+        assert!(missing_account.validate().is_err());
+    }
+
+    #[test]
+    fn x_api_operation_scopes_require_bound_profile_and_account_identity() {
+        let unbound = MandateOperationScope {
+            tool: "http_request".to_string(),
+            operation: ToolCallOperation::Get,
+            kind: MandateOperationKind::Observation,
+            target_prefixes: vec!["https://api.x.com/2/users/me".to_string()],
+            allowed_query_params: Vec::new(),
+            mutation_effects: Vec::new(),
+        };
+        let error = unbound.validate().unwrap_err();
+        assert!(error.contains("X API operation scopes require exact auth_profile"));
+
+        let mut bound = unbound;
+        bound
+            .target_prefixes
+            .push("auth_profile:twitter".to_string());
+        bound.target_prefixes.push("account:12345".to_string());
+        assert!(bound.validate().is_ok());
+
+        let public_api = MandateOperationScope {
+            tool: "http_request".to_string(),
+            operation: ToolCallOperation::Get,
+            kind: MandateOperationKind::Observation,
+            target_prefixes: vec!["https://api.example.test/v1/status".to_string()],
+            allowed_query_params: Vec::new(),
+            mutation_effects: Vec::new(),
+        };
+        assert!(public_api.validate().is_ok());
+    }
+
+    #[test]
+    fn dynamic_query_authority_is_bounded_to_observation_parameter_names() {
+        let mut observation = MandateOperationScope {
+            tool: "http_request".to_string(),
+            operation: ToolCallOperation::Get,
+            kind: MandateOperationKind::Observation,
+            target_prefixes: vec!["https://api.example.test/v1/search".to_string()],
+            allowed_query_params: vec!["query".to_string()],
+            mutation_effects: Vec::new(),
+        };
+        assert!(observation.validate().is_ok());
+
+        observation.allowed_query_params = vec!["query=value".to_string()];
+        assert!(observation.validate().is_err());
+
+        observation.allowed_query_params = vec!["query".to_string()];
+        observation.target_prefixes[0] =
+            "https://api.example.test/v1/search?query=exact".to_string();
+        assert!(observation.validate().is_err());
+
+        let mutation = MandateOperationScope {
+            tool: "http_request".to_string(),
+            operation: ToolCallOperation::Post,
+            kind: MandateOperationKind::Mutation,
+            target_prefixes: vec!["https://api.example.test/v1/items".to_string()],
+            allowed_query_params: vec!["destination".to_string()],
+            mutation_effects: vec![
+                "remote_mutation".to_string(),
+                "external_delivery".to_string(),
+            ],
+        };
+        assert!(mutation.validate().is_err());
+    }
+
+    #[test]
+    fn malformed_expiry_fails_closed() {
+        let mut mandate = Mandate::new(
+            "goal-id",
+            None,
+            "Test objective",
+            "owner-session",
+            MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        mandate.expires_at = Some("not-a-timestamp".to_string());
+        assert!(!mandate.is_active());
+    }
+
+    #[test]
+    fn next_review_is_capped_at_exact_expiry() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-03T03:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut mandate = Mandate::new(
+            "goal-id",
+            None,
+            "Test expiry cap",
+            "owner-session",
+            MandateAuthority::default(),
+            60,
+            3_600,
+            600,
+        );
+        let expiry = now + chrono::Duration::seconds(120);
+        mandate.expires_at = Some(expiry.to_rfc3339());
+
+        assert_eq!(
+            mandate.bounded_next_review_at(None, now),
+            expiry.to_rfc3339()
+        );
+    }
+
+    #[test]
+    fn typed_activity_edges_adjust_cadence_only_inside_confirmed_bounds() {
+        let mandate = Mandate::new(
+            "goal-id",
+            None,
+            "Adapt review cadence",
+            "owner-session",
+            MandateAuthority::default(),
+            15 * 60,
+            24 * 60 * 60,
+            3 * 60 * 60,
+        );
+        assert_eq!(
+            mandate.review_secs_for_activity(MandateActivityLevel::Quiet),
+            3 * 60 * 60
+        );
+        assert_eq!(
+            mandate.review_secs_for_activity(MandateActivityLevel::Active),
+            60 * 60
+        );
+        assert_eq!(
+            mandate.review_secs_for_activity(MandateActivityLevel::Urgent),
+            15 * 60
+        );
+    }
+
+    #[test]
+    fn objective_control_reads_legacy_rows_and_enforces_cadence_and_target() {
+        // A row confirmed before the trim still carries experiment and
+        // stagnation settings; they are ignored, not refused.
+        let control: MandateObjectiveControl = serde_json::from_str(
+            r#"{"schema_version":1,"metric_name":"weekly_engagements","unit":"engagements",
+                "baseline_micros":5000000,"target_micros":8000000,"direction":"at_least",
+                "measurement_source":"metric_source:synthetic-analytics",
+                "measurement_cadence_secs":3600,"experiment_cohort":"synthetic-cohort-a",
+                "experiment_window_secs":86400,"minimum_effect_micros":500000,
+                "max_stagnant_measurements":3,"run_failure_budget":3,
+                "baseline_observed_at":"2026-08-15T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(control.validate().is_ok());
+        assert!(!control.target_reached(7_999_999));
+        assert!(control.target_reached(8_000_000));
+        // Next measurement anchors on the latest observation, else the
+        // baseline; either way it is exactly one cadence later.
+        assert_eq!(
+            control.next_measurement_at(None).as_deref(),
+            Some("2026-08-15T01:00:00Z")
+        );
+        assert_eq!(
+            control
+                .next_measurement_at(Some("2026-08-16T12:30:00+02:00"))
+                .as_deref(),
+            Some("2026-08-16T11:30:00Z")
+        );
+        assert_eq!(
+            control.next_measurement_at(Some("not a time")).as_deref(),
+            Some("2026-08-15T01:00:00Z")
+        );
+
+        let mut cadence = control.clone();
+        cadence.measurement_cadence_secs = 59;
+        assert!(
+            cadence
+                .validate()
+                .unwrap_err()
+                .starts_with("measurement_cadence_secs is 59")
+        );
+        let mut when = control.clone();
+        when.baseline_observed_at = "yesterday".to_string();
+        assert!(
+            when.validate()
+                .unwrap_err()
+                .starts_with("baseline_observed_at is \"yesterday\"")
+        );
+    }
+
+    #[test]
+    fn mandate_content_bounds_reject_utf8_byte_overflow_entry_overflow_and_combined_policy() {
+        let mut mandate = Mandate::new(
+            "goal-id",
+            None,
+            "bounded objective",
+            "owner-session",
+            MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        assert!(mandate.validate_content_bounds().is_ok());
+
+        mandate.objective = "é".repeat(1_025);
+        assert!(mandate.validate_content_bounds().is_err());
+        mandate.objective = "bounded objective".to_string();
+
+        mandate.constraints = (0..17).map(|index| format!("constraint {index}")).collect();
+        assert!(mandate.validate_content_bounds().is_err());
+
+        mandate.constraints = vec!["c".repeat(500); 6];
+        mandate.success_criteria = vec!["s".repeat(500); 6];
+        mandate.stop_conditions = vec!["x".repeat(500); 6];
+        assert!(mandate.validate_content_bounds().is_err());
+    }
+
+    #[test]
+    fn authority_rejects_aggregate_serialized_size_and_utf8_byte_overflow() {
+        let mut authority = MandateAuthority {
+            allowed_tools: vec!["é".repeat(129)],
+            ..MandateAuthority::default()
+        };
+        assert!(authority.validate().is_err());
+
+        authority.allowed_tools = vec!["web_fetch".to_string()];
+        authority.allowed_target_prefixes = (0..16)
+            .map(|index| format!("account:{index}-{}", "x".repeat(1_020)))
+            .collect();
+        assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn decision_and_intention_bounds_validate_shape_bytes_and_combined_metadata() {
+        let mut decision = MandateDecisionCycle::new(
+            "mandate-id",
+            "run-id",
+            MandateDecisionOutcome::Wait,
+            "bounded rationale",
+            1,
+        );
+        decision.rationale = "é".repeat(1_025);
+        assert!(decision.validate_content_bounds().is_err());
+        decision.rationale = "bounded rationale".to_string();
+        decision.belief_snapshot = Some(serde_json::json!({"not": "an array"}).to_string());
+        assert!(decision.validate_content_bounds().is_err());
+        decision.belief_snapshot = Some(serde_json::to_string(&vec!["observation"; 9]).unwrap());
+        assert!(decision.validate_content_bounds().is_err());
+        decision.belief_snapshot = Some(serde_json::to_string(&vec!["\"".repeat(750); 8]).unwrap());
+        assert!(decision.validate_content_bounds().is_err());
+        decision.belief_snapshot =
+            Some(serde_json::to_string(&vec!["sourced observation"]).unwrap());
+        decision.question = Some("é".repeat(251));
+        assert!(decision.validate_content_bounds().is_err());
+
+        let mut intention = Intention::new(
+            "mandate-id",
+            &decision.id,
+            "run-id",
+            "bounded intention",
+            "bounded rationale",
+        );
+        assert!(intention.validate_value_contract().is_err());
+        intention.value_criterion = Some("Produce a verified useful outcome".to_string());
+        intention.expected_benefit = Some("Advance the confirmed outcome".to_string());
+        intention.risk = Some("No material downside after bounded checks".to_string());
+        intention.invalidation_criteria =
+            Some("New evidence shows the intervention would not help".to_string());
+        assert!(intention.validate_value_contract().is_ok());
+        intention.description = "é".repeat(513);
+        assert!(intention.validate_content_bounds().is_err());
+        intention.description = "bounded intention".to_string();
+        intention.expected_benefit = Some("b".repeat(2_000));
+        intention.risk = Some("r".repeat(2_000));
+        intention.invalidation_criteria = Some("i".repeat(97));
+        assert!(intention.validate_content_bounds().is_err());
+    }
+
+    #[test]
+    fn failed_reviews_notify_at_the_start_and_each_doubling_of_a_streak() {
+        let notified: Vec<i64> = (0..=20)
+            .filter(|failures| super::review_failure_is_notified(*failures))
+            .collect();
+        assert_eq!(notified, vec![1, 2, 4, 8, 16]);
+    }
+}

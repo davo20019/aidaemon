@@ -190,6 +190,17 @@ pub struct HeartbeatResponse {
     /// An empty list leaves the Device's current list unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gateway_endpoints: Vec<String>,
+    /// Present only when an owner-approved restart is pending for this Node and
+    /// the Node holds an explicit device_restart grant. Older Devices ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_restart: Option<DeviceRestartCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceRestartCommand {
+    pub schema: String,
+    pub command_id: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

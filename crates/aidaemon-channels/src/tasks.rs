@@ -1,0 +1,1304 @@
+//! Each session's chat operations: the running turn (cancel token,
+//! heartbeat), messages queued behind it, steering messages taken mid-turn
+//! and duplicate suppression. Internal to aidaemon, no stability promise.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use chrono::{DateTime, Utc};
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+
+use aidaemon_events::conversation::MessageAttachment;
+use aidaemon_tools::semantics::UserRole;
+
+use crate::context::ChannelContext;
+
+/// Window in seconds during which identical messages to the same session
+/// are treated as duplicates, even after the original was popped from the queue.
+const DEDUP_WINDOW_SECS: i64 = 120;
+
+/// A task still marked `Running` with no sign of life for this many seconds
+/// is treated as leaked: its channel handler never finalized it (an abnormal
+/// turn exit, a dropped future, or a panic), so without this it would block
+/// the session's message queue forever. A task's age says nothing, because a
+/// turn may legitimately run for hours: a live turn's heartbeat ticks every
+/// few seconds, and only a task without one is judged by when it started.
+const MAX_RUNNING_TASK_AGE_SECS: i64 = 3600;
+
+/// A queued message waiting to be processed.
+#[derive(Clone, Debug)]
+pub struct QueuedMessage {
+    pub text: String,
+    /// Authorization is captured when the message arrives. Channel workers
+    /// must never reuse the role of the message that happened to start the
+    /// session worker for later queued messages.
+    pub user_role: UserRole,
+    /// Full per-message channel/sender context, including any scoped grant.
+    pub channel_ctx: ChannelContext,
+    /// Attachments belong to the individual sender/message and must travel
+    /// through the queue with that identity.
+    pub attachments: Vec<MessageAttachment>,
+    #[allow(dead_code)]
+    pub queued_at: DateTime<Utc>,
+    /// Optional transport timing follows the exact message through queue
+    /// coalescing and later agent dispatch.
+    pub ingress_timing: Option<crate::ports::InboundMessageTiming>,
+    /// Whether the running turn may take it in mid-run. A message read as
+    /// unrelated to the running work waits for its own turn.
+    pub steerable: bool,
+}
+
+impl QueuedMessage {
+    pub fn new(
+        text: impl Into<String>,
+        user_role: UserRole,
+        channel_ctx: ChannelContext,
+        attachments: Vec<MessageAttachment>,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            user_role,
+            channel_ctx,
+            attachments,
+            queued_at: Utc::now(),
+            ingress_timing: None,
+            steerable: true,
+        }
+    }
+
+    /// Keep it out of the running turn: it runs as its own turn.
+    pub fn not_steerable(mut self) -> Self {
+        self.steerable = false;
+        self
+    }
+
+    pub fn with_ingress_timing(mut self, mut timing: crate::ports::InboundMessageTiming) -> Self {
+        timing.mark_queued(self.queued_at);
+        self.ingress_timing = Some(timing);
+        self
+    }
+
+    fn can_coalesce_with(&self, other: &Self) -> bool {
+        self.user_role == other.user_role && self.channel_ctx == other.channel_ctx
+    }
+}
+
+/// Outcome of an atomic check-and-queue attempt.
+#[derive(Debug)]
+pub enum QueueOutcome {
+    /// Message queued at this 1-based position.
+    Queued(usize),
+    /// Identical message recently seen — silently dropped.
+    Duplicate,
+    /// No running task for the session: queueing would strand the message
+    /// (nothing will drain it). The caller must process it directly.
+    NoRunningTask,
+}
+
+#[derive(Clone, Debug)]
+pub enum TaskStatus {
+    Running,
+    /// Cancellation was requested, but the owning channel worker has not yet
+    /// durably terminalized the agent task or handed off the session FIFO.
+    Cancelling,
+    Completed,
+    Failed(String),
+    Cancelled,
+}
+
+impl std::fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskStatus::Running => write!(f, "Running"),
+            TaskStatus::Cancelling => write!(f, "Cancelling"),
+            TaskStatus::Completed => write!(f, "Completed"),
+            TaskStatus::Failed(e) => write!(f, "Failed: {}", e),
+            TaskStatus::Cancelled => write!(f, "Cancelled"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskEntry {
+    pub id: u64,
+    pub session_id: String,
+    pub description: String,
+    pub status: TaskStatus,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+struct TaskHandle {
+    entry: TaskEntry,
+    cancel_token: CancellationToken,
+    /// Optional token to cancel the channel's typing indicator for this task.
+    /// Set by the channel after task registration; cancelled alongside the task.
+    typing_cancel: Option<CancellationToken>,
+    /// Unix seconds of the turn's last sign of life, once it has one.
+    heartbeat: Option<Arc<AtomicU64>>,
+}
+
+impl TaskHandle {
+    fn seconds_since_alive(&self, now: DateTime<Utc>) -> i64 {
+        match &self.heartbeat {
+            Some(heartbeat) => now.timestamp() - heartbeat.load(Ordering::Relaxed) as i64,
+            None => (now - self.entry.started_at).num_seconds(),
+        }
+    }
+}
+
+pub struct TaskRegistry {
+    tasks: RwLock<HashMap<u64, TaskHandle>>,
+    next_id: AtomicU64,
+    max_completed: usize,
+    /// Message queues per session - messages wait here when a task is running.
+    queues: RwLock<HashMap<String, VecDeque<QueuedMessage>>>,
+    /// Recently seen message fingerprints per session for deduplication.
+    /// Key: (session_id, text_hash), Value: timestamp when first seen.
+    /// This survives message pops so webhook retries are caught.
+    recently_seen: RwLock<HashMap<(String, u64), DateTime<Utc>>>,
+    /// The short numbers `/tasks` shows for each chat's sub-agents and
+    /// background commands (by their agent key), drawn from the same counter
+    /// as turn numbers so one `/cancel <n>` names either.
+    work_numbers: std::sync::Mutex<HashMap<String, Vec<(String, u64)>>>,
+}
+
+impl TaskRegistry {
+    fn is_active(status: &TaskStatus) -> bool {
+        matches!(status, TaskStatus::Running | TaskStatus::Cancelling)
+    }
+
+    pub fn new(max_completed: usize) -> Self {
+        Self {
+            tasks: RwLock::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            max_completed,
+            queues: RwLock::new(HashMap::new()),
+            recently_seen: RwLock::new(HashMap::new()),
+            work_numbers: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Simple hash for dedup fingerprinting.
+    fn text_hash(text: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Register a new task. Returns the task ID and a cancellation token.
+    pub async fn register(&self, session_id: &str, description: &str) -> (u64, CancellationToken) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let cancel_token = CancellationToken::new();
+        let handle = TaskHandle {
+            entry: TaskEntry {
+                id,
+                session_id: session_id.to_string(),
+                description: description.to_string(),
+                status: TaskStatus::Running,
+                started_at: Utc::now(),
+                finished_at: None,
+            },
+            cancel_token: cancel_token.clone(),
+            typing_cancel: None,
+            heartbeat: None,
+        };
+        let mut tasks = self.tasks.write().await;
+        tasks.insert(id, handle);
+        (id, cancel_token)
+    }
+
+    /// Mark a task as completed.
+    /// Channel loops now use [`Self::finalize_and_drain`]; retained for
+    /// callers that finalize without a session queue (and for tests).
+    #[allow(dead_code)]
+    pub async fn complete(&self, task_id: u64) {
+        let mut tasks = self.tasks.write().await;
+        if let Some(handle) = tasks.get_mut(&task_id) {
+            handle.entry.status = TaskStatus::Completed;
+            handle.entry.finished_at = Some(Utc::now());
+        }
+        Self::cleanup_locked(&mut tasks, self.max_completed);
+    }
+
+    /// Mark a task as failed.
+    #[allow(dead_code)] // Retained for non-queued registry consumers.
+    pub async fn fail(&self, task_id: u64, error: &str) {
+        let mut tasks = self.tasks.write().await;
+        if let Some(handle) = tasks.get_mut(&task_id) {
+            handle.entry.status = TaskStatus::Failed(error.to_string());
+            handle.entry.finished_at = Some(Utc::now());
+        }
+        Self::cleanup_locked(&mut tasks, self.max_completed);
+    }
+
+    /// Give a running task the heartbeat that shows it is alive.
+    pub async fn set_heartbeat(&self, task_id: u64, heartbeat: Arc<AtomicU64>) {
+        let mut tasks = self.tasks.write().await;
+        if let Some(handle) = tasks.get_mut(&task_id) {
+            handle.heartbeat = Some(heartbeat);
+        }
+    }
+
+    /// Associate a typing indicator cancel token with a running task.
+    /// When the task is cancelled, the typing indicator will also be stopped.
+    pub async fn set_typing_cancel(&self, task_id: u64, token: CancellationToken) {
+        let mut tasks = self.tasks.write().await;
+        if let Some(handle) = tasks.get_mut(&task_id) {
+            handle.typing_cancel = Some(token);
+        }
+    }
+
+    /// Cancel a running task. Returns true if the task was found and cancelled.
+    pub async fn cancel(&self, task_id: u64) -> bool {
+        let mut tasks = self.tasks.write().await;
+        if let Some(handle) = tasks.get_mut(&task_id)
+            && matches!(handle.entry.status, TaskStatus::Running)
+        {
+            handle.cancel_token.cancel();
+            if let Some(ref typing) = handle.typing_cancel {
+                typing.cancel();
+            }
+            handle.entry.status = TaskStatus::Cancelling;
+            return true;
+        }
+        false
+    }
+
+    /// Cancel all running tasks for a session. Returns cancelled task (ID, description) pairs.
+    pub async fn cancel_running_for_session(&self, session_id: &str) -> Vec<(u64, String)> {
+        let mut tasks = self.tasks.write().await;
+        let mut cancelled = Vec::new();
+        for (id, handle) in tasks.iter_mut() {
+            if handle.entry.session_id == session_id
+                && matches!(handle.entry.status, TaskStatus::Running)
+            {
+                handle.cancel_token.cancel();
+                if let Some(ref typing) = handle.typing_cancel {
+                    typing.cancel();
+                }
+                handle.entry.status = TaskStatus::Cancelling;
+                cancelled.push((*id, handle.entry.description.clone()));
+            }
+        }
+        cancelled
+    }
+
+    /// The numbers of the chat's running work `keys`, in order: a key keeps
+    /// its number while it runs, a new one gets the next free number, and
+    /// keys no longer running are forgotten.
+    pub fn number_work(&self, session_id: &str, keys: &[&str]) -> Vec<u64> {
+        let mut numbers = self
+            .work_numbers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let known = numbers.remove(session_id).unwrap_or_default();
+        let mut kept: Vec<(String, u64)> = Vec::with_capacity(keys.len());
+        let assigned = keys
+            .iter()
+            .map(|key| {
+                let number = known
+                    .iter()
+                    .find(|(known_key, _)| known_key == key)
+                    .map(|(_, number)| *number)
+                    .unwrap_or_else(|| self.next_id.fetch_add(1, Ordering::Relaxed));
+                kept.push((key.to_string(), number));
+                number
+            })
+            .collect();
+        if !kept.is_empty() {
+            numbers.insert(session_id.to_string(), kept);
+        }
+        assigned
+    }
+
+    /// The work key the chat's number `number` names, if it names one.
+    pub fn work_key(&self, session_id: &str, number: u64) -> Option<String> {
+        self.work_numbers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)?
+            .iter()
+            .find(|(_, known)| *known == number)
+            .map(|(key, _)| key.clone())
+    }
+
+    /// The turn `task_id` as the registry holds it now.
+    pub async fn entry(&self, task_id: u64) -> Option<TaskEntry> {
+        self.tasks
+            .read()
+            .await
+            .get(&task_id)
+            .map(|handle| handle.entry.clone())
+    }
+
+    /// List all tasks for a given session, sorted by ID.
+    pub async fn list_for_session(&self, session_id: &str) -> Vec<TaskEntry> {
+        let tasks = self.tasks.read().await;
+        let mut entries: Vec<TaskEntry> = tasks
+            .values()
+            .filter(|h| h.entry.session_id == session_id)
+            .map(|h| h.entry.clone())
+            .collect();
+        entries.sort_by_key(|e| e.id);
+        entries
+    }
+
+    /// Mark leaked `Running` tasks (older than [`MAX_RUNNING_TASK_AGE_SECS`]) as
+    /// `Failed` so they stop blocking the session queue and surface as resolved
+    /// in `/tasks`. Cancels each reaped task's token to nudge any still-alive
+    /// hung future to exit. Returns the reaped task ids for logging.
+    fn reap_stale_running_locked(tasks: &mut HashMap<u64, TaskHandle>) -> Vec<u64> {
+        let now = Utc::now();
+        let mut reaped = Vec::new();
+        for handle in tasks.values_mut() {
+            let stale = Self::is_active(&handle.entry.status)
+                && handle.seconds_since_alive(now) > MAX_RUNNING_TASK_AGE_SECS;
+            if stale {
+                handle.cancel_token.cancel();
+                if let Some(ref typing) = handle.typing_cancel {
+                    typing.cancel();
+                }
+                handle.entry.status =
+                    TaskStatus::Failed("stale: task was never finalized".to_string());
+                handle.entry.finished_at = Some(now);
+                reaped.push(handle.entry.id);
+            }
+        }
+        reaped
+    }
+
+    /// Remove oldest finished tasks when count exceeds max_completed.
+    fn cleanup_locked(tasks: &mut HashMap<u64, TaskHandle>, max_completed: usize) {
+        let mut finished: Vec<u64> = tasks
+            .iter()
+            .filter(|(_, h)| !Self::is_active(&h.entry.status))
+            .map(|(&id, _)| id)
+            .collect();
+
+        if finished.len() <= max_completed {
+            return;
+        }
+
+        // Sort ascending by ID (oldest first) and remove excess
+        finished.sort();
+        let to_remove = finished.len() - max_completed;
+        for &id in finished.iter().take(to_remove) {
+            tasks.remove(&id);
+        }
+    }
+
+    /// Check if a session has a running task.
+    ///
+    /// Reaps leaked (stale) running tasks first, so a phantom task that was
+    /// never finalized can't make this return `true` forever and block the
+    /// session's queue.
+    pub async fn has_running_task(&self, session_id: &str) -> bool {
+        let mut tasks = self.tasks.write().await;
+        let reaped = Self::reap_stale_running_locked(&mut tasks);
+        if !reaped.is_empty() {
+            tracing::warn!(
+                ?reaped,
+                session_id,
+                "Reaped stale running task(s) that were never finalized"
+            );
+        }
+        tasks
+            .values()
+            .any(|h| h.entry.session_id == session_id && Self::is_active(&h.entry.status))
+    }
+
+    /// Get the description of the currently running task for a session (if any).
+    pub async fn get_running_task_description(&self, session_id: &str) -> Option<String> {
+        let tasks = self.tasks.read().await;
+        tasks
+            .values()
+            .find(|h| h.entry.session_id == session_id && Self::is_active(&h.entry.status))
+            .map(|h| h.entry.description.clone())
+    }
+
+    /// Atomically mark a message as "seen" for dedup purposes.
+    /// Returns `true` if this is the first time (caller should proceed),
+    /// or `false` if a duplicate (caller should drop the message).
+    ///
+    /// Call this at the start of **direct** message processing (when no task
+    /// is already running) to prevent concurrent webhook handlers from all
+    /// bypassing `queue_message()` and starting separate processing flows.
+    ///
+    /// `dedup_key` is the channel's stable per-message identity (e.g. Telegram
+    /// `message_id`, Slack `ts`, Discord message id) — the correct idempotency
+    /// key for webhook/poll redeliveries. When `Some`, dedup is keyed on it so a
+    /// user *re-typing the same text* (which gets a NEW message id) is treated
+    /// as a fresh request rather than a duplicate. Falls back to hashing `text`
+    /// when `None`, preserving the legacy content-based behavior.
+    pub async fn mark_seen(&self, session_id: &str, text: &str, dedup_key: Option<&str>) -> bool {
+        let now = Utc::now();
+        let hash = Self::text_hash(dedup_key.unwrap_or(text));
+        let key = (session_id.to_string(), hash);
+        let mut seen = self.recently_seen.write().await;
+        seen.retain(|_, ts| (now - *ts).num_seconds() < DEDUP_WINDOW_SECS);
+        use std::collections::hash_map::Entry;
+        match seen.entry(key) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(e) => {
+                e.insert(now);
+                true
+            }
+        }
+    }
+
+    /// Queue a message for later processing.
+    /// Returns `Some(position)` if queued, or `None` if deduplicated (identical message
+    /// already exists in the queue or was recently processed).
+    /// Channel loops now use [`Self::queue_message_if_running`]; retained
+    /// for queue-only callers and tests.
+    #[allow(dead_code)]
+    pub async fn queue_message(
+        &self,
+        session_id: &str,
+        message: QueuedMessage,
+        dedup_key: Option<&str>,
+    ) -> Option<usize> {
+        let now = Utc::now();
+        let hash = Self::text_hash(dedup_key.unwrap_or(&message.text));
+        let key = (session_id.to_string(), hash);
+
+        // Check recently_seen first — this survives queue pops and catches
+        // webhook retries even after the original message was processed.
+        {
+            let mut seen = self.recently_seen.write().await;
+            // Prune stale entries while we hold the lock.
+            seen.retain(|_, ts| (now - *ts).num_seconds() < DEDUP_WINDOW_SECS);
+
+            if let Some(first_seen) = seen.get(&key)
+                && (now - *first_seen).num_seconds() < DEDUP_WINDOW_SECS
+            {
+                return None; // Duplicate — silently drop
+            }
+            seen.insert(key, now);
+        }
+
+        let mut queues = self.queues.write().await;
+        let queue = queues.entry(session_id.to_string()).or_default();
+
+        queue.push_back(message);
+        Some(queue.len())
+    }
+
+    /// Pop the next queued message for a session.
+    #[allow(dead_code)] // Retained for compatibility with single-pop queue consumers.
+    pub async fn pop_queued_message(&self, session_id: &str) -> Option<QueuedMessage> {
+        let mut queues = self.queues.write().await;
+        queues.get_mut(session_id).and_then(|q| q.pop_front())
+    }
+
+    /// Pop the next queued message and coalesce only immediately-adjacent
+    /// fragments from the exact same authorization and channel context.
+    /// Messages from different senders/scopes stay queued for a separate turn;
+    /// otherwise a group participant could inherit another participant's role.
+    fn drain_and_coalesce(queue: &mut VecDeque<QueuedMessage>) -> Option<QueuedMessage> {
+        let mut combined = queue.pop_front()?;
+        while queue
+            .front()
+            .is_some_and(|next| combined.can_coalesce_with(next))
+        {
+            let msg = queue.pop_front().expect("front was checked");
+            combined.text.push('\n');
+            combined.text.push_str(&msg.text);
+            combined.attachments.extend(msg.attachments);
+        }
+        Some(combined)
+    }
+
+    /// Pop the next same-principal cohort for a session and coalesce its
+    /// adjacent fragments. Different security contexts remain queued.
+    /// Channel loops now use [`Self::finalize_and_drain`]; retained for
+    /// drain-only callers and tests.
+    #[allow(dead_code)]
+    pub async fn pop_all_queued_messages(&self, session_id: &str) -> Option<QueuedMessage> {
+        let mut queues = self.queues.write().await;
+        let queue = queues.get_mut(session_id)?;
+        Self::drain_and_coalesce(queue)
+    }
+
+    /// Take the queued messages a running turn can absorb mid-run: from the
+    /// front of the queue, while each comes from the same principal and
+    /// channel context as the turn (`user_role`, `channel_ctx`), carries
+    /// no attachments and was not kept for its own turn (`steerable`). The
+    /// first message that differs, and everything after it, stays queued for
+    /// its own turn, so order and authorization hold.
+    pub async fn take_steering_messages(
+        &self,
+        session_id: &str,
+        user_role: UserRole,
+        channel_ctx: &ChannelContext,
+    ) -> Vec<QueuedMessage> {
+        let mut queues = self.queues.write().await;
+        let Some(queue) = queues.get_mut(session_id) else {
+            return Vec::new();
+        };
+        let mut taken = Vec::new();
+        while queue.front().is_some_and(|next| {
+            next.steerable
+                && next.user_role == user_role
+                && &next.channel_ctx == channel_ctx
+                && next.attachments.is_empty()
+        }) {
+            taken.extend(queue.pop_front());
+        }
+        taken
+    }
+
+    /// Put messages a running turn took (`take_steering_messages`) but
+    /// never answered back at the front of the session's queue, in their
+    /// original order, so the channel runs them as their own turn once the
+    /// current one ends. The turn calls this before it returns, so the
+    /// channel's `finalize_and_drain` still finds them.
+    pub async fn return_steering_messages(&self, session_id: &str, messages: Vec<QueuedMessage>) {
+        if messages.is_empty() {
+            return;
+        }
+        let mut queues = self.queues.write().await;
+        let queue = queues.entry(session_id.to_string()).or_default();
+        for message in messages.into_iter().rev() {
+            queue.push_front(message);
+        }
+    }
+
+    /// Atomically check for a running task and queue the message behind it.
+    ///
+    /// Closes the race where a session task finishes between the caller's
+    /// `has_running_task()` check and `queue_message()`: a message queued
+    /// after the drain in `finalize_and_drain` would otherwise sit in the
+    /// queue with nothing left to drain it (observed in the 2026-06-06
+    /// attribution run, where a queued message was silently stranded).
+    ///
+    /// Lock order: `tasks` → `recently_seen` → `queues` (same as
+    /// `finalize_and_drain`), so the two operations serialize and the
+    /// caller can trust the [`QueueOutcome`].
+    pub async fn queue_message_if_running(
+        &self,
+        session_id: &str,
+        message: QueuedMessage,
+        dedup_key: Option<&str>,
+    ) -> QueueOutcome {
+        let mut tasks = self.tasks.write().await;
+        // Reap leaked running tasks first: a phantom that was never finalized
+        // must not strand this message in a queue nobody will drain.
+        let reaped = Self::reap_stale_running_locked(&mut tasks);
+        if !reaped.is_empty() {
+            tracing::warn!(
+                ?reaped,
+                session_id,
+                "Reaped stale running task(s) before queue decision"
+            );
+        }
+        let running = tasks
+            .values()
+            .any(|h| h.entry.session_id == session_id && Self::is_active(&h.entry.status));
+        if !running {
+            return QueueOutcome::NoRunningTask;
+        }
+
+        // Keep holding the task-map write lock while queueing so
+        // finalize_and_drain (which also takes the write lock first) cannot
+        // finalize-and-drain between our check and our push.
+        let now = Utc::now();
+        let hash = Self::text_hash(dedup_key.unwrap_or(&message.text));
+        let key = (session_id.to_string(), hash);
+        {
+            let mut seen = self.recently_seen.write().await;
+            seen.retain(|_, ts| (now - *ts).num_seconds() < DEDUP_WINDOW_SECS);
+            if let Some(first_seen) = seen.get(&key)
+                && (now - *first_seen).num_seconds() < DEDUP_WINDOW_SECS
+            {
+                return QueueOutcome::Duplicate;
+            }
+            seen.insert(key, now);
+        }
+        let mut queues = self.queues.write().await;
+        let queue = queues.entry(session_id.to_string()).or_default();
+        queue.push_back(message);
+        QueueOutcome::Queued(queue.len())
+    }
+
+    /// Atomically finalize a task (complete, or fail with `error`) and drain
+    /// the session's message queue in one critical section.
+    ///
+    /// Holding the task-map write lock across both steps means no concurrent
+    /// `queue_message_if_running` can observe the task as running after the
+    /// drain — so a message is either drained here or rejected with
+    /// `NoRunningTask` (and processed directly by its own handler). Replaces
+    /// the racy `complete()`/`fail()` → gap → `pop_all_queued_messages()`
+    /// sequence in the channel loops.
+    pub async fn finalize_and_drain(
+        &self,
+        task_id: u64,
+        session_id: &str,
+        error: Option<&str>,
+    ) -> Option<QueuedMessage> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(handle) = tasks.get_mut(&task_id) {
+            // `cancel()` records the authoritative terminal cause before the
+            // running future observes its cancellation token. Preserve that
+            // state while still using this transaction to hand off the FIFO.
+            if matches!(handle.entry.status, TaskStatus::Cancelling) {
+                handle.entry.status = TaskStatus::Cancelled;
+            } else if !matches!(handle.entry.status, TaskStatus::Cancelled) {
+                handle.entry.status = match error {
+                    Some(e) => TaskStatus::Failed(e.to_string()),
+                    None => TaskStatus::Completed,
+                };
+            }
+            handle.entry.finished_at = Some(Utc::now());
+        }
+        Self::cleanup_locked(&mut tasks, self.max_completed);
+
+        let mut queues = self.queues.write().await;
+        let queue = queues.get_mut(session_id)?;
+        Self::drain_and_coalesce(queue)
+    }
+
+    /// Get the number of queued messages for a session.
+    pub async fn queue_len(&self, session_id: &str) -> usize {
+        let queues = self.queues.read().await;
+        queues.get(session_id).map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// Clear all queued messages for a session.
+    #[allow(dead_code)] // Explicit queue discard is reserved for reset/wipe flows.
+    pub async fn clear_queue(&self, session_id: &str) {
+        let mut queues = self.queues.write().await;
+        if let Some(queue) = queues.get_mut(session_id) {
+            queue.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_long_turn_with_a_live_heartbeat_is_not_reaped() {
+        let registry = TaskRegistry::new(10);
+        let (live, live_token) = registry.register("live", "long turn").await;
+        let (leaked, leaked_token) = registry.register("leaked", "lost turn").await;
+        let now = Utc::now().timestamp() as u64;
+        registry
+            .set_heartbeat(live, Arc::new(AtomicU64::new(now)))
+            .await;
+        {
+            let mut tasks = registry.tasks.write().await;
+            let long_ago = Utc::now() - chrono::Duration::hours(6);
+            tasks.get_mut(&live).unwrap().entry.started_at = long_ago;
+            tasks.get_mut(&leaked).unwrap().entry.started_at = long_ago;
+        }
+
+        assert!(registry.has_running_task("live").await);
+        assert!(!live_token.is_cancelled());
+        assert!(!registry.has_running_task("leaked").await);
+        assert!(leaked_token.is_cancelled());
+    }
+
+    fn queued(text: &str) -> QueuedMessage {
+        queued_as(text, "test:user", UserRole::Public)
+    }
+
+    fn queued_as(text: &str, sender_id: &str, user_role: UserRole) -> QueuedMessage {
+        let mut channel_ctx = ChannelContext::private("test");
+        channel_ctx.sender_id = Some(sender_id.to_string());
+        QueuedMessage::new(text, user_role, channel_ctx, Vec::new())
+    }
+
+    #[tokio::test]
+    async fn steering_takes_only_the_same_principal_from_the_front() {
+        let registry = TaskRegistry::new(10);
+        let session = "steer-session";
+        let owner = queued_as("also check the tests", "test:user", UserRole::Public);
+        let ctx = owner.channel_ctx.clone();
+        registry.queue_message(session, owner, None).await;
+        registry
+            .queue_message(
+                session,
+                queued_as("and the docs", "test:user", UserRole::Public),
+                None,
+            )
+            .await;
+        // Another sender stops the take; what follows stays queued too.
+        registry
+            .queue_message(
+                session,
+                queued_as("hijack", "test:other", UserRole::Public),
+                None,
+            )
+            .await;
+        registry
+            .queue_message(
+                session,
+                queued_as("later", "test:user", UserRole::Public),
+                None,
+            )
+            .await;
+
+        let taken = registry
+            .take_steering_messages(session, UserRole::Public, &ctx)
+            .await;
+        let texts: Vec<&str> = taken.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["also check the tests", "and the docs"]);
+        assert_eq!(registry.queue_len(session).await, 2);
+
+        // A different role never takes the same sender's messages.
+        assert!(
+            registry
+                .take_steering_messages(session, UserRole::Owner, &ctx)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_leaves_a_message_kept_for_its_own_turn_queued() {
+        let registry = TaskRegistry::new(10);
+        let session = "steer-separate";
+        let separate = queued("what is the capital of Peru?").not_steerable();
+        let ctx = separate.channel_ctx.clone();
+        registry.queue_message(session, separate, None).await;
+        registry
+            .queue_message(session, queued("and the docs"), None)
+            .await;
+        assert!(
+            registry
+                .take_steering_messages(session, UserRole::Public, &ctx)
+                .await
+                .is_empty()
+        );
+        assert_eq!(registry.queue_len(session).await, 2);
+    }
+
+    #[tokio::test]
+    async fn steering_leaves_messages_with_attachments_queued() {
+        let registry = TaskRegistry::new(10);
+        let session = "steer-attachments";
+        let mut with_file = queued("see this file");
+        with_file.attachments.push(MessageAttachment::default());
+        let ctx = with_file.channel_ctx.clone();
+        registry.queue_message(session, with_file, None).await;
+        assert!(
+            registry
+                .take_steering_messages(session, UserRole::Public, &ctx)
+                .await
+                .is_empty()
+        );
+        assert_eq!(registry.queue_len(session).await, 1);
+    }
+
+    #[tokio::test]
+    async fn returned_steering_messages_run_first_in_their_order() {
+        let registry = TaskRegistry::new(10);
+        let session = "steer-returned";
+        let ctx = queued("x").channel_ctx.clone();
+        registry.queue_message(session, queued("first"), None).await;
+        registry
+            .queue_message(session, queued("second"), None)
+            .await;
+        let taken = registry
+            .take_steering_messages(session, UserRole::Public, &ctx)
+            .await;
+        assert_eq!(taken.len(), 2);
+        registry
+            .queue_message(session, queued("arrived later"), None)
+            .await;
+
+        registry.return_steering_messages(session, taken).await;
+
+        let mut order = Vec::new();
+        while let Some(message) = registry.pop_queued_message(session).await {
+            order.push(message.text);
+        }
+        assert_eq!(order, ["first", "second", "arrived later"]);
+    }
+
+    #[tokio::test]
+    async fn test_queue_deduplicates_identical_messages() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        // First message queues normally
+        let result = registry
+            .queue_message(session, queued("hello world"), None)
+            .await;
+        assert_eq!(result, Some(1));
+
+        // Identical message within dedup window is deduplicated
+        let result = registry
+            .queue_message(session, queued("hello world"), None)
+            .await;
+        assert_eq!(result, None);
+
+        // Different message queues normally
+        let result = registry
+            .queue_message(session, queued("different message"), None)
+            .await;
+        assert_eq!(result, Some(2));
+
+        // Only 2 messages in queue (not 3)
+        assert_eq!(registry.queue_len(session).await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_queue_allows_same_message_different_sessions() {
+        let registry = TaskRegistry::new(10);
+
+        let result = registry
+            .queue_message("session-a", queued("hello"), None)
+            .await;
+        assert_eq!(result, Some(1));
+
+        // Same message but different session — should queue
+        let result = registry
+            .queue_message("session-b", queued("hello"), None)
+            .await;
+        assert_eq!(result, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_queue_deduplicates_after_pop() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        let result = registry.queue_message(session, queued("hello"), None).await;
+        assert_eq!(result, Some(1));
+
+        // Pop the message
+        let popped = registry.pop_queued_message(session).await;
+        assert!(popped.is_some());
+        assert_eq!(popped.unwrap().text, "hello");
+
+        // Same message should STILL be deduplicated after pop (within dedup window).
+        // This prevents webhook retry duplicates from re-entering the queue.
+        let result = registry.queue_message(session, queued("hello"), None).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_mark_seen_prevents_duplicates() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        // First call returns true (proceed)
+        assert!(registry.mark_seen(session, "hello world", None).await);
+
+        // Second call with same text returns false (duplicate)
+        assert!(!registry.mark_seen(session, "hello world", None).await);
+
+        // Different text returns true
+        assert!(registry.mark_seen(session, "different text", None).await);
+
+        // Different session with same text returns true
+        assert!(
+            registry
+                .mark_seen("other-session", "hello world", None)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_seen_blocks_subsequent_queue() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        // mark_seen first (simulates direct processing)
+        assert!(registry.mark_seen(session, "hello", None).await);
+
+        // queue_message for the same text should be deduplicated
+        let result = registry.queue_message(session, queued("hello"), None).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_pop_all_coalesces_fragments() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        // Simulate a long message fragmented into 4 parts
+        registry
+            .queue_message(session, queued("Part 1: Hello"), None)
+            .await;
+        registry
+            .queue_message(session, queued("Part 2: World"), None)
+            .await;
+        registry
+            .queue_message(session, queued("Part 3: How are"), None)
+            .await;
+        registry
+            .queue_message(session, queued("Part 4: you?"), None)
+            .await;
+        assert_eq!(registry.queue_len(session).await, 4);
+
+        // pop_all should coalesce into a single message
+        let coalesced = registry.pop_all_queued_messages(session).await;
+        assert!(coalesced.is_some());
+        let msg = coalesced.unwrap();
+        assert_eq!(
+            msg.text,
+            "Part 1: Hello\nPart 2: World\nPart 3: How are\nPart 4: you?"
+        );
+
+        // Queue should now be empty
+        assert_eq!(registry.queue_len(session).await, 0);
+        assert!(registry.pop_all_queued_messages(session).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pop_all_single_message() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        registry
+            .queue_message(session, queued("only one"), None)
+            .await;
+        let result = registry.pop_all_queued_messages(session).await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().text, "only one");
+    }
+
+    #[tokio::test]
+    async fn test_queue_message_if_running_queues_while_task_runs() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (_task_id, _token) = registry.register(session, "long task").await;
+
+        match registry
+            .queue_message_if_running(session, queued("follow-up"), None)
+            .await
+        {
+            QueueOutcome::Queued(pos) => assert_eq!(pos, 1),
+            other => panic!("expected Queued(1), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_queue_message_if_running_rejects_when_no_task() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        // No running task: the caller must process directly instead of
+        // queueing into a queue nobody will ever drain.
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, queued("orphan"), None)
+                .await,
+            QueueOutcome::NoRunningTask
+        ));
+        assert_eq!(registry.queue_len(session).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_queue_message_if_running_detects_finished_task_race() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "task").await;
+        // Task finishes between the caller's has_running_task check and the
+        // queue attempt — the registry must report NoRunningTask instead of
+        // stranding the message.
+        registry.complete(task_id).await;
+
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, queued("late message"), None)
+                .await,
+            QueueOutcome::NoRunningTask
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_queue_message_if_running_deduplicates() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (_task_id, _token) = registry.register(session, "task").await;
+
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, queued("hello"), None)
+                .await,
+            QueueOutcome::Queued(1)
+        ));
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, queued("hello"), None)
+                .await,
+            QueueOutcome::Duplicate
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_finalize_and_drain_completes_and_returns_queued_work() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "task").await;
+        registry
+            .queue_message_if_running(session, queued("queued A"), None)
+            .await;
+        registry
+            .queue_message_if_running(session, queued("queued B"), None)
+            .await;
+
+        let drained = registry.finalize_and_drain(task_id, session, None).await;
+        assert_eq!(drained.unwrap().text, "queued A\nqueued B");
+        assert!(!registry.has_running_task(session).await);
+        assert_eq!(registry.queue_len(session).await, 0);
+    }
+
+    #[tokio::test]
+    async fn queued_group_messages_never_inherit_another_senders_role_or_attachments() {
+        let registry = TaskRegistry::new(10);
+        let session = "shared-group";
+        let (initial_task_id, _token) = registry.register(session, "initial turn").await;
+
+        let mut owner = queued_as("owner request", "slack:owner", UserRole::Owner);
+        owner.attachments.push(MessageAttachment {
+            filename: "owner.txt".to_string(),
+            ..MessageAttachment::default()
+        });
+        let mut guest_a = queued_as("guest part A", "slack:guest", UserRole::Guest);
+        guest_a.attachments.push(MessageAttachment {
+            filename: "guest-a.txt".to_string(),
+            ..MessageAttachment::default()
+        });
+        let mut guest_b = queued_as("guest part B", "slack:guest", UserRole::Guest);
+        guest_b.attachments.push(MessageAttachment {
+            filename: "guest-b.txt".to_string(),
+            ..MessageAttachment::default()
+        });
+
+        registry
+            .queue_message_if_running(session, owner, Some("owner-message"))
+            .await;
+        registry
+            .queue_message_if_running(session, guest_a, Some("guest-message-a"))
+            .await;
+        registry
+            .queue_message_if_running(session, guest_b, Some("guest-message-b"))
+            .await;
+
+        let owner_turn = registry
+            .finalize_and_drain(initial_task_id, session, None)
+            .await
+            .expect("owner turn");
+        assert_eq!(owner_turn.user_role, UserRole::Owner);
+        assert_eq!(
+            owner_turn.channel_ctx.sender_id.as_deref(),
+            Some("slack:owner")
+        );
+        assert_eq!(owner_turn.text, "owner request");
+        assert_eq!(owner_turn.attachments[0].filename, "owner.txt");
+        assert_eq!(registry.queue_len(session).await, 2);
+
+        let (owner_task_id, _token) = registry.register(session, "owner turn").await;
+        let guest_turn = registry
+            .finalize_and_drain(owner_task_id, session, None)
+            .await
+            .expect("guest turn");
+        assert_eq!(guest_turn.user_role, UserRole::Guest);
+        assert_eq!(
+            guest_turn.channel_ctx.sender_id.as_deref(),
+            Some("slack:guest")
+        );
+        assert_eq!(guest_turn.text, "guest part A\nguest part B");
+        assert_eq!(
+            guest_turn
+                .attachments
+                .iter()
+                .map(|attachment| attachment.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["guest-a.txt", "guest-b.txt"]
+        );
+        assert_eq!(registry.queue_len(session).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_finalize_and_drain_with_error_marks_failed() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "task").await;
+
+        let drained = registry
+            .finalize_and_drain(task_id, session, Some("boom"))
+            .await;
+        assert!(drained.is_none());
+        assert!(!registry.has_running_task(session).await);
+        let entries = registry.list_for_session(session).await;
+        assert!(matches!(entries[0].status, TaskStatus::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_terminal_cause_and_hands_off_fifo() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "task").await;
+        registry
+            .queue_message_if_running(session, queued("next"), Some("next-1"))
+            .await;
+
+        assert!(registry.cancel(task_id).await);
+        let drained = registry
+            .finalize_and_drain(task_id, session, Some("Task cancelled"))
+            .await
+            .expect("queued work must be handed off after cancellation");
+
+        assert_eq!(drained.text, "next");
+        assert_eq!(registry.queue_len(session).await, 0);
+        let entries = registry.list_for_session(session).await;
+        assert!(matches!(entries[0].status, TaskStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn cancellation_request_keeps_fifo_owner_active_until_handoff() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "task").await;
+        assert!(registry.cancel(task_id).await);
+        assert!(matches!(
+            registry.list_for_session(session).await[0].status,
+            TaskStatus::Cancelling
+        ));
+
+        let outcome = registry
+            .queue_message_if_running(session, queued("arrived during cancellation"), Some("m-2"))
+            .await;
+        assert!(matches!(outcome, QueueOutcome::Queued(1)));
+        let drained = registry
+            .finalize_and_drain(task_id, session, Some("Task cancelled"))
+            .await
+            .expect("cancelling worker retains FIFO ownership");
+        assert_eq!(drained.text, "arrived during cancellation");
+    }
+
+    // Regression: a user re-typing the SAME text gets a new per-message
+    // identity (Telegram message_id / Slack ts / Discord id). With a distinct
+    // dedup_key, the re-ask must be treated as a fresh request — not silently
+    // swallowed by the 120s text-dedup window. (Screenshot bug: "who is my
+    // wife?" sent twice, second got no reply.)
+    #[tokio::test]
+    async fn test_mark_seen_allows_reask_with_distinct_message_id() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        // First send of "who is my wife?" with message_id 100.
+        assert!(
+            registry
+                .mark_seen(session, "who is my wife?", Some("100"))
+                .await
+        );
+
+        // Deliberate re-ask: identical text, NEW message_id 101 → proceed.
+        assert!(
+            registry
+                .mark_seen(session, "who is my wife?", Some("101"))
+                .await
+        );
+
+        // True redelivery of message_id 100 (poll/webhook retry) → dropped.
+        assert!(
+            !registry
+                .mark_seen(session, "who is my wife?", Some("100"))
+                .await
+        );
+    }
+
+    // Regression: the queued path (task already running) must also key on the
+    // per-message identity so a re-ask queues behind the running task instead
+    // of being dropped as a Duplicate.
+    #[tokio::test]
+    async fn test_queue_if_running_allows_reask_with_distinct_message_id() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (_task_id, _token) = registry.register(session, "task").await;
+
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, queued("status?"), Some("200"))
+                .await,
+            QueueOutcome::Queued(1)
+        ));
+        // Same text, new message_id → fresh request, queues again.
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, queued("status?"), Some("201"))
+                .await,
+            QueueOutcome::Queued(2)
+        ));
+        // Redelivery of message_id 200 → dropped as Duplicate.
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, queued("status?"), Some("200"))
+                .await,
+            QueueOutcome::Duplicate
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_stale_running_task_is_reaped_and_unblocks_queue() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "leaked task").await;
+
+        // Force the task to look leaked: started long before the staleness cap
+        // and never finalized (simulates an abnormal channel-handler exit).
+        {
+            let mut tasks = registry.tasks.write().await;
+            let handle = tasks.get_mut(&task_id).unwrap();
+            handle.entry.started_at =
+                Utc::now() - chrono::Duration::seconds(MAX_RUNNING_TASK_AGE_SECS + 60);
+        }
+
+        // The phantom must not report as running...
+        assert!(!registry.has_running_task(session).await);
+        // ...and a new message must process directly, not queue behind it.
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, queued("new message"), Some("m1"))
+                .await,
+            QueueOutcome::NoRunningTask
+        ));
+        // The reaped task is surfaced as Failed (resolved) in listings.
+        let entries = registry.list_for_session(session).await;
+        assert!(matches!(entries[0].status, TaskStatus::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_recent_running_task_is_not_reaped() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (_task_id, _token) = registry.register(session, "active task").await;
+
+        // A freshly-registered task is genuinely running and must still gate
+        // the queue (no false-positive reaping of legitimate work).
+        assert!(registry.has_running_task(session).await);
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, queued("follow-up"), Some("m1"))
+                .await,
+            QueueOutcome::Queued(1)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_finalize_and_drain_empty_queue_returns_none() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "task").await;
+
+        assert!(
+            registry
+                .finalize_and_drain(task_id, session, None)
+                .await
+                .is_none()
+        );
+        assert!(!registry.has_running_task(session).await);
+    }
+}

@@ -1,0 +1,68 @@
+{
+  "description": "Read (secrets hidden)/update config.toml (backup+validate). key: dotted path, list entry as a[2]. Secrets are never args: owner runs `aidaemon keychain set <key>`; a secret setting takes value `keychain`.",
+  "name": "manage_config",
+  "schema": {
+    "description": "Read (secrets hidden)/update config.toml (backup+validate). key: dotted path, list entry as a[2]. Secrets are never args: owner runs `aidaemon keychain set <key>`; a secret setting takes value `keychain`.",
+    "name": "manage_config",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "read",
+            "get",
+            "set",
+            "unset",
+            "restore",
+            "list_provider_presets",
+            "switch_provider",
+            "list_failover_providers",
+            "add_failover_provider",
+            "remove_failover_provider",
+            "enable_stt",
+            "enable_client_gateway",
+            "enable_exposure"
+          ],
+          "type": "string"
+        },
+        "base_url": {
+          "type": "string"
+        },
+        "failover_index": {
+          "type": "integer"
+        },
+        "fast_model": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "primary_model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "smart_model": {
+          "type": "string"
+        },
+        "stt_cli_path": {
+          "type": "string"
+        },
+        "stt_language": {
+          "type": "string"
+        },
+        "stt_model_path": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

@@ -6,21 +6,23 @@ use crate::config::AppConfig;
 use crate::nodes::channel::NodeChannel;
 use crate::nodes::gateway::{NodeGatewayState, NodeRateLimiter};
 use crate::nodes::service::{AgentNodeConversationIngress, NodeService};
-use crate::nodes::{auth, NodeStore};
-use crate::traits::Channel;
+use crate::nodes::{NodeStore, auth};
+use crate::traits::HubChannel;
 
 pub async fn start(
     config: &AppConfig,
     pool: sqlx::SqlitePool,
     agent: Arc<Agent>,
     hub: Arc<ChannelHub>,
+    endpoints: aidaemon_core::EndpointSource,
 ) -> anyhow::Result<()> {
     if !config.nodes.gateway.enabled {
         return Ok(());
     }
     let instance_key = auth::load_or_create_instance_key()?;
     let store = Arc::new(NodeStore::new(pool, instance_key));
-    let mut service_value = NodeService::new(store.clone(), config.nodes.clone());
+    let mut service_value =
+        NodeService::new(store.clone(), config.nodes.clone()).with_endpoints(endpoints);
     if config.nodes.ota.enabled {
         let release = crate::nodes::ota::FirmwareRelease::load(&config.nodes.ota)?;
         tracing::info!(
@@ -39,7 +41,7 @@ pub async fn start(
     }
     let service = Arc::new(service_value);
     let ingress = Arc::new(AgentNodeConversationIngress::new(agent));
-    hub.register_channel(Arc::new(NodeChannel::new(store)) as Arc<dyn Channel>)
+    hub.register_channel(Arc::new(NodeChannel::new(store)) as Arc<dyn HubChannel>)
         .await;
     let state = NodeGatewayState {
         service,
