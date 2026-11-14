@@ -1,22 +1,100 @@
-//! `scheduled_goal_runs` lives in `aidaemon_work::tools::scheduled_goal_runs`; the tests here run it against the daemon's assembled state store.
+//! Runs of scheduled work (`aidaemon_work::tools::scheduled_goal_runs`, offered through `manage_automations`); the tests here run them against the daemon's assembled state store.
 
-pub use aidaemon_work::tools::scheduled_goal_runs::*;
+#[cfg(test)]
+pub(crate) use aidaemon_work::tools::scheduled_goal_runs::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::testing::CallWithFacts;
     use crate::traits::StateStore;
-    use crate::traits::Tool;
     use crate::traits::ToolCalls as _;
     use crate::traits::ToolResultPresentation;
-    use crate::traits::ToolSemantics;
     use crate::traits::{Goal, GoalSchedule, Task};
     use serde_json::Value;
     use serde_json::json;
     use std::sync::Arc;
+
+    /// `manage_automations` as these tests drive it: the scheduled-run
+    /// actions under their `manage_automations` names, called as the owner
+    /// in a private chat unless a test passes other facts, and the overview
+    /// straight from the engine behind `manage_automations list`.
+    struct Runs {
+        tool: crate::tools::ManageAutomationsTool,
+        engine: ScheduledGoalRuns,
+    }
+
+    impl Runs {
+        fn new(state: Arc<dyn StateStore>) -> Self {
+            Self {
+                tool: crate::tools::ManageAutomationsTool::new(state.clone()),
+                engine: ScheduledGoalRuns::new(state),
+            }
+        }
+
+        fn owner() -> crate::traits::ToolCallContext {
+            crate::traits::ToolCallContext {
+                session_id: "owner-session".into(),
+                user_role: Some(crate::types::UserRole::Owner),
+                channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                ..Default::default()
+            }
+        }
+
+        /// The call under `manage_automations`' names.
+        fn translate(arguments: &str) -> Value {
+            let mut args: Value = serde_json::from_str(arguments).unwrap();
+            if let Some(goal_id) = args.as_object_mut().unwrap().remove("goal_id") {
+                args["id"] = goal_id;
+            }
+            if args["action"] == "run_history" {
+                args["action"] = json!("history");
+            }
+            args
+        }
+
+        async fn resolve_goal_id(&self, handle: &str) -> anyhow::Result<String> {
+            self.engine.resolve_goal_id(handle).await
+        }
+
+        async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+            self.call_with(arguments, Self::owner()).await
+        }
+
+        async fn call_with(
+            &self,
+            arguments: &str,
+            facts: crate::traits::ToolCallContext,
+        ) -> anyhow::Result<String> {
+            Ok(self.outcome(arguments, facts).await?.output)
+        }
+
+        async fn call_with_status_outcome(
+            &self,
+            arguments: &str,
+            _status: Option<()>,
+        ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+            self.outcome(arguments, Self::owner()).await
+        }
+
+        async fn outcome(
+            &self,
+            arguments: &str,
+            facts: crate::traits::ToolCallContext,
+        ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+            let args = Self::translate(arguments);
+            if args["action"] == "overview" {
+                let (output, portfolio) = self.engine.overview_snapshot(50, false).await?;
+                let (observations, collections) = portfolio.receipt_evidence();
+                return Ok(crate::traits::ToolCallOutcome::from_output(output)
+                    .with_observation_evidence(observations, collections));
+            }
+            self.tool
+                .call_with_execution_context(&args.to_string(), None, facts)
+                .await
+        }
+    }
 
     async fn setup_state() -> Arc<dyn StateStore> {
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -32,30 +110,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_supports_id_free_overview_but_targeted_actions_require_goal_id() {
-        let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state);
-        let schema = tool.schema();
-        let required = schema
-            .get("parameters")
-            .and_then(|p| p.get("required"))
-            .and_then(|r| r.as_array())
-            .expect("required array exists");
-        let required_values: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(required_values.contains(&"action"));
-        assert!(!required_values.contains(&"goal_id"));
-        assert!(schema["parameters"]["properties"]["include_diagnostics"].is_object());
-        assert!(tool.validate_arguments(r#"{"action":"overview"}"#).is_ok());
-        assert!(
-            tool.validate_arguments(r#"{"action":"run_history"}"#)
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
     async fn overview_returns_schedule_and_latest_run_without_internal_ids() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
         let goal = Goal::new_continuous(
             "Publish a synthetic weekly report",
             "synthetic-session",
@@ -166,7 +223,7 @@ mod tests {
     #[tokio::test]
     async fn overview_projects_typed_objective_control_with_measurements() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
         let goal = Goal::new_continuous(
             "Publish a synthetic weekly report",
             "synthetic-session",
@@ -256,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn goal_id_accepts_a_distinctive_objective_phrase() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
         let goal = Goal::new_continuous(
             "Each day, independently manage the synthetic blog at https://blog.example.test/",
             "user-session",
@@ -298,7 +355,7 @@ mod tests {
     #[tokio::test]
     async fn run_now_creates_pending_task() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
 
         let mut goal = Goal::new_continuous(
             "Run diagnostics job",
@@ -372,7 +429,7 @@ mod tests {
     #[tokio::test]
     async fn run_now_durably_extends_an_exhausted_daily_budget_once() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
         let mut goal = Goal::new_continuous(
             "Publish a synthetic daily entry",
             "synthetic-session",
@@ -425,7 +482,7 @@ mod tests {
     #[tokio::test]
     async fn run_now_still_stops_at_the_bounded_daily_hard_cap() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
         let mut goal = Goal::new_continuous(
             "Run bounded synthetic work",
             "synthetic-session",
@@ -468,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn run_now_marks_internal_ids_for_natural_owner_presentation() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
         let goal = Goal::new_continuous("Run synthetic diagnostics", "session", None, None);
         state.create_goal(&goal).await.unwrap();
         let now = chrono::Utc::now().to_rfc3339();
@@ -509,55 +566,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_run_diagnostics_select_diagnostic_presentation() {
-        let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
-        let goal = Goal::new_continuous("Run synthetic diagnostics", "session", None, None);
-        state.create_goal(&goal).await.unwrap();
-        let now = chrono::Utc::now().to_rfc3339();
-        state
-            .create_goal_schedule(&GoalSchedule {
-                id: uuid::Uuid::new_v4().to_string(),
-                goal_id: goal.id.clone(),
-                cron_expr: "0 */6 * * *".to_string(),
-                tz: "local".to_string(),
-                original_schedule: Some("every 6h".to_string()),
-                fire_policy: "coalesce".to_string(),
-                is_one_shot: false,
-                is_paused: false,
-                last_run_at: None,
-                next_run_at: crate::cron_utils::compute_next_run("0 */6 * * *")
-                    .unwrap()
-                    .to_rfc3339(),
-                created_at: now.clone(),
-                updated_at: now,
-            })
-            .await
-            .unwrap();
-
-        let outcome = tool
-            .call_with_status_outcome(
-                &json!({
-                    "action": "run_now",
-                    "goal_id": goal.id,
-                    "include_diagnostics": true
-                })
-                .to_string(),
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            outcome.metadata.presentation,
-            Some(ToolResultPresentation::DiagnosticDetail)
-        );
-    }
-
-    #[tokio::test]
     async fn run_now_reactivates_stalled_goal_without_duplicate_run() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
 
         let mut goal = Goal::new_continuous(
             "Publish one diary entry",
@@ -639,7 +650,7 @@ mod tests {
     #[tokio::test]
     async fn update_instructions_persists_without_triggering_and_replaces_prior_update() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
 
         let mut goal = Goal::new_continuous(
             "Publish one daily insight",
@@ -705,7 +716,7 @@ mod tests {
         assert_eq!(
             updated
                 .description
-                .matches(ScheduledGoalRunsTool::RUN_INSTRUCTIONS_MARKER)
+                .matches(ScheduledGoalRuns::RUN_INSTRUCTIONS_MARKER)
                 .count(),
             1
         );
@@ -738,7 +749,7 @@ mod tests {
     #[tokio::test]
     async fn update_instructions_rejects_structurally_conflicting_policy() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
         let goal = Goal::new_continuous("Publish one verified note", "session", None, None);
         state.create_goal(&goal).await.unwrap();
         let now = chrono::Utc::now().to_rfc3339();
@@ -790,16 +801,7 @@ mod tests {
     #[tokio::test]
     async fn run_history_reports_open_tasks_as_schedule_blockers() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
-
-        assert!(
-            tool.validate_arguments(r#"{"action":"run_history"}"#)
-                .is_err()
-        );
-        assert!(
-            tool.validate_arguments(r#"{"action":"run_history","goal_id":"goal-synthetic"}"#)
-                .is_ok()
-        );
+        let tool = Runs::new(state.clone());
 
         let goal = Goal::new_continuous(
             "Post daily optimized tweets",
@@ -871,7 +873,7 @@ mod tests {
     #[tokio::test]
     async fn run_history_projects_terminal_completion_timestamp() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
         let goal = Goal::new_continuous("Inspect a synthetic ledger", "session", None, None);
         state.create_goal(&goal).await.unwrap();
         let run = state
@@ -900,80 +902,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unblock_hints_reports_timeout_guidance() {
-        let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
-
-        let goal = Goal::new_continuous(
-            "Knowledge base maintenance",
-            "system",
-            Some(1000),
-            Some(5000),
-        );
-        let goal_id = goal.id.clone();
-        state.create_goal(&goal).await.unwrap();
-
-        let now = chrono::Utc::now().to_rfc3339();
-        let next_run = crate::cron_utils::compute_next_run("0 */6 * * *")
-            .unwrap()
-            .to_rfc3339();
-        let schedule = GoalSchedule {
-            id: uuid::Uuid::new_v4().to_string(),
-            goal_id: goal.id.clone(),
-            cron_expr: "0 */6 * * *".to_string(),
-            tz: "local".to_string(),
-            original_schedule: Some("every 6h".to_string()),
-            fire_policy: "coalesce".to_string(),
-            is_one_shot: false,
-            is_paused: false,
-            last_run_at: None,
-            next_run_at: next_run,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        };
-        state.create_goal_schedule(&schedule).await.unwrap();
-
-        let task = Task {
-            id: uuid::Uuid::new_v4().to_string(),
-            goal_id: goal.id.clone(),
-            description: "Run scheduled check".to_string(),
-            status: "failed".to_string(),
-            priority: "low".to_string(),
-            task_order: 0,
-            parallel_group: None,
-            depends_on: None,
-            agent_id: None,
-            context: None,
-            result: None,
-            error: Some("Timeout while contacting embeddings service".to_string()),
-            blocker: None,
-            idempotent: true,
-            retry_count: 1,
-            max_retries: 3,
-            created_at: now.clone(),
-            started_at: Some(now.clone()),
-            completed_at: Some(now),
-        };
-        state.create_task(&task).await.unwrap();
-
-        let result = tool
-            .call(
-                &json!({
-                    "action": "unblock_hints",
-                    "goal_id": goal_id
-                })
-                .to_string(),
-            )
-            .await
-            .unwrap();
-        assert!(result.contains("Unblock Hints"));
-        assert!(result.contains("transient service/network"));
-    }
-
-    #[tokio::test]
     async fn set_budget_updates_scheduled_goal() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
 
         let goal = Goal::new_continuous(
             "Run diagnostics job",
@@ -1030,7 +961,7 @@ mod tests {
     #[tokio::test]
     async fn set_budget_rejects_non_owner() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
 
         let goal = Goal::new_continuous(
             "Run diagnostics job",
@@ -1076,13 +1007,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.contains("Only owners"));
+        assert_eq!(result, crate::tools::manage_automations::OWNER_ONLY);
     }
 
     #[tokio::test]
     async fn set_budget_validates_values() {
         let state = setup_state().await;
-        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let tool = Runs::new(state.clone());
 
         let goal = Goal::new_continuous(
             "Run diagnostics job",

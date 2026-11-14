@@ -443,7 +443,7 @@ pub trait TurnHistory: TurnHost {
         // request text. Two sources exist, both runtime state rather than
         // prose:
         //
-        // * this agent's own goal binding (`scheduled_goal_runs bind_workspace`
+        // * this agent's own goal binding (`manage_automations bind_workspace`
         //   → goal.context.project_scope), re-read from the store each turn so
         //   a bind issued mid-run takes effect on the following turn;
         // * the workspace a parent handed to this spawned worker — for an

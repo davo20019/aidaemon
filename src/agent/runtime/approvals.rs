@@ -1229,53 +1229,32 @@ mod tests {
         }
     }
 
-    /// A scheduled goal that runs the agent is confirmed by the owner on a
-    /// goal card before anything is created, in every session; a reminder,
-    /// a guest's call and an internal run need no card (the call answers
-    /// them without creating a goal).
+    /// Scheduled work that runs the agent is confirmed by the owner on a
+    /// goal card before anything is created, in every session; a guest's
+    /// call and an internal run need no card (the call answers them without
+    /// creating anything).
     #[tokio::test]
-    async fn scheduled_goal_asks_before_dispatch_on_a_goal_card() {
-        let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::ManageMemoriesTool::new(
-            {
-                let state = approval_test_store().await;
-                let store = state.memory_stores();
-                (state as Arc<dyn crate::traits::StateStore>, store)
-            }
-            .0,
-            approval_test_store().await.memory_stores(),
+    async fn scheduled_work_asks_before_dispatch_on_a_goal_card() {
+        let state = approval_test_store().await;
+        let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::ScheduleTaskTool::new(
+            state as Arc<dyn crate::traits::StateStore>,
         ));
-        let goal = json!({
-            "action": "create_scheduled_goal",
-            "goal": "Check API health",
-            "schedule": "every 6h"
-        });
+        let work = json!({ "task": "Check API health", "when": "every 6h" });
         for trusted in [false, true] {
             let rules = AppApprovalRules {
                 trusted_session: trusted,
                 ..rules_over_one(tool.clone())
             };
-            let call = sdk::ToolCall::new("c1", "manage_memories", goal.clone());
+            let call = sdk::ToolCall::new("c1", "schedule_task", work.clone());
             let RuleDecision::Ask(request) = rules.judge(&hook_ctx(), &call, &tool_info()).await
             else {
-                panic!("a scheduled goal must ask (trusted={trusted})");
+                panic!("scheduled work must ask (trusted={trusted})");
             };
             assert_eq!(request.summary, "Check API health");
             assert!(matches!(
-                rules.card_kind("manage_memories", &request),
+                rules.card_kind("schedule_task", &request),
                 crate::types::ApprovalKind::GoalConfirmation
             ));
-            let mut reminder = goal.clone();
-            reminder["reminder"] = json!("Check the API.");
-            let call = sdk::ToolCall::new("c2", "manage_memories", reminder);
-            assert_eq!(
-                rules.judge(&hook_ctx(), &call, &tool_info()).await,
-                RuleDecision::Allow
-            );
-            let call = sdk::ToolCall::new("c3", "manage_memories", json!({"action": "list"}));
-            assert_eq!(
-                rules.judge(&hook_ctx(), &call, &tool_info()).await,
-                RuleDecision::Allow
-            );
         }
         for rules in [
             AppApprovalRules {
@@ -1287,7 +1266,7 @@ mod tests {
                 ..rules_over_one(tool.clone())
             },
         ] {
-            let call = sdk::ToolCall::new("c4", "manage_memories", goal.clone());
+            let call = sdk::ToolCall::new("c4", "schedule_task", work.clone());
             assert_eq!(
                 rules.judge(&hook_ctx(), &call, &tool_info()).await,
                 RuleDecision::Allow

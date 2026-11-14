@@ -26,7 +26,7 @@ mod tests {
     #[tokio::test]
     async fn sets_an_active_typed_reminder() {
         let state = state().await;
-        let tool = SetReminderTool::new(state.clone(), state.memory_stores());
+        let tool = SetReminderTool::new(state.clone());
         let outcome = tool
             .call_with_execution_context(
                 &json!({
@@ -69,7 +69,7 @@ mod tests {
     #[tokio::test]
     async fn non_owner_cannot_set_a_reminder() {
         let state = state().await;
-        let tool = SetReminderTool::new(state.clone(), state.memory_stores());
+        let tool = SetReminderTool::new(state.clone());
         let outcome = tool
             .call_with_execution_context(
                 &json!({

@@ -39,8 +39,8 @@ pub struct MemoryContext<'a> {
     pub current_person: Option<&'a Person>,
     /// Facts about the current speaker
     pub current_person_facts: &'a [PersonFact],
-    /// The host offers a `scheduled_goals` tool, so the memory guide points
-    /// at it for scheduled goals and reminders.
+    /// The host offers `manage_automations`, so the memory guide points at
+    /// it for scheduled tasks and reminders.
     pub scheduled_goals_tool: bool,
 }
 
@@ -222,9 +222,8 @@ pub fn render_memory_section(memory: &MemoryContext, max_facts: usize) -> Memory
          - User facts (preferences, personal info, projects): use `manage_memories(action='search', query='...')` or `manage_memories(action='list')`\n",
     );
     if memory.scheduled_goals_tool {
-        prompt.push_str(
-            "- Scheduled goals and reminders: use `scheduled_goals(action='list_scheduled')` or `scheduled_goals(action='list_scheduled_matching', query='...')`\n",
-        );
+        prompt
+            .push_str("- Scheduled tasks and reminders: use `manage_automations(action='list')`\n");
     }
     prompt.push_str(
         "- Contacts and relationships: use `manage_people(action='list')` or `manage_people(action='view', name='...')`\n\
@@ -511,7 +510,7 @@ mod tests {
         let guide = "\n\n## Your Memory\n\
              You have persistent memory across sessions. When you need user context, look it up — do not guess:\n\
              - User facts (preferences, personal info, projects): use `manage_memories(action='search', query='...')` or `manage_memories(action='list')`\n\
-             - Scheduled goals and reminders: use `scheduled_goals(action='list_scheduled')` or `scheduled_goals(action='list_scheduled_matching', query='...')`\n\
+             - Scheduled tasks and reminders: use `manage_automations(action='list')`\n\
              - Contacts and relationships: use `manage_people(action='list')` or `manage_people(action='view', name='...')`\n\
              - To store new facts: use `remember_fact`\n";
         let offered = MemoryContext {
@@ -520,7 +519,7 @@ mod tests {
         };
         assert_eq!(render_memory_section(&offered, 0).prompt, guide);
         let plain = render_memory_section(&MemoryContext::default(), 0).prompt;
-        assert!(!plain.contains("scheduled_goals"), "{plain}");
+        assert!(!plain.contains("manage_automations"), "{plain}");
         assert!(plain.contains("`remember_fact`"), "{plain}");
     }
 }

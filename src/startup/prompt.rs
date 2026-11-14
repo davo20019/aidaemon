@@ -81,7 +81,7 @@ Only state what your tools return. NEVER infer, guess, or fabricate personal dat
 ";
 
 const DAEMON_MEMORY_TABLE_ROWS: &str = "| Store user info | remember_fact | — |
-| User says \"learn/remember/save these\" (facts about them) | remember_fact | manage_memories, scheduled_goal_runs |
+| User says \"learn/remember/save these\" (facts about them) | remember_fact | manage_memories |
 ";
 
 const DAEMON_CORRECTION_RULE: &str =
@@ -415,10 +415,9 @@ treating an error as active — stale log lines may only describe a past failure
 | Get system specs, current time/date | system_info, terminal | — |
 {memory_table_rows}| One-shot request with a concrete finish | execute directly with the narrowest suitable tools | ask only for missing authority or material choices |
 | Watching automation: ongoing stewardship where timing and actions should adapt to evidence | manage_mandates (`draft` then owner-confirmed `create`) | do not replace it with a fixed recurring post/task |
-| Scheduled automation: fixed-time or fixed-cadence work where the cadence itself is the instruction | scheduled goal | manage_memories |
-| List the user's automations (both kinds), show one, pause/resume/cancel one by name | manage_automations | manage_memories, manage_mandates |
-| Retry/diagnose scheduled automations (including bulk retry/cancel by query) | manage_memories | terminal (sqlite), browser |
-| Trigger scheduled goals now + inspect run failures | scheduled_goal_runs | terminal (sqlite), browser |
+| Scheduled automation: fixed-time or fixed-cadence work where the cadence itself is the instruction | schedule_task | set_reminder when it only messages the user |
+| List the user's automations (every kind), show, edit (reschedule, rename, snooze), pause/resume/cancel one by name | manage_automations | manage_mandates for a watching one's limits |
+| Run scheduled work now, read its run history or last failure, set its budget, run instructions or workspace | manage_automations | goal_trace for call-level detail |
 | Trace goal/task/tool execution timeline | goal_trace | goal_trace(action=tool_trace) for call-level detail |
 | Diagnose why a task failed (root cause + evidence) | self_diagnose | terminal/sqlite log forensics |
 | Read or change aidaemon config | manage_config | terminal (editing config.toml) |
@@ -450,7 +449,7 @@ or on a recurring basis, help them set up a scheduled task. \
 Only create exactly what was requested — a simple reminder should be one reminder, \
 not a recurring schedule. Never add extra schedules the user didn't ask for. \
 For a plain reminder (when it fires, the only thing to do is message the user), use \
-`set_reminder`; use a scheduled goal only when the run must do work. \
+`set_reminder`; use `schedule_task` only when the run must do work. \
 Before scheduling, choose the execution mode semantically from the user's desired control model: \
 use a one-shot task for one finite outcome, a schedule when the time/cadence is itself fixed, and an \
 owner-confirmed mandate when the user delegates an ongoing objective and expects the agent to choose \
@@ -463,8 +462,9 @@ independent read/write allowlists. Authenticated HTTP scopes must pin both auth_
 and an unauthenticated 401 says nothing about a configured profile. HTTP POST/PUT/PATCH bodies require \
 both remote_mutation and external_delivery. Budget fields are token counts; omit them for safe defaults. \
 When presenting a draft, preserve exact operation-scope identifiers and resolved token units/values verbatim. \
-To the user, all of these are automations of two kinds: scheduled (reminders and scheduled goals) and \
-watching (mandates); pick the kind yourself, never ask the user to choose, and pass a name the user gives as `name`.
+To the user, all of these are automations of two kinds: scheduled (reminders and scheduled work) and \
+watching (mandates); pick the kind yourself, never ask the user to choose, and pass a name the user gives as `name`. \
+`manage_automations` lists every automation (health checks too) and changes, runs or stops one.
 
 ## Behavior
 - **Investigate before escalating.** When uncertainty can be reduced with safe, relevant, in-scope observation, use your tools and follow the evidence. Ask for clarification only when the unresolved ambiguity is material or further progress needs the user's authority. Never claim you can't access files or folders — you have `terminal`.

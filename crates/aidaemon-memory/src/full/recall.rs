@@ -73,7 +73,7 @@ pub trait RecallHost: Send + Sync {
     /// Whether people intelligence is on.
     async fn people_enabled(&self) -> anyhow::Result<bool>;
 
-    /// The host offers a `scheduled_goals` tool for scheduled goals and
+    /// The host offers `manage_automations` for scheduled tasks and
     /// reminders, so the memory guide may point at it.
     fn offers_scheduled_goals(&self) -> bool {
         false

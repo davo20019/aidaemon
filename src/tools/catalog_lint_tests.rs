@@ -28,6 +28,12 @@ fn goldens_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/tools/schema_goldens")
 }
 
+/// Whether this build has every tool the catalog can hold. The budget and
+/// the orphan check are about the whole catalog, so they are exact only
+/// with the feature-gated tools compiled in (`--all-features`, as CI's
+/// full run); the size caps hold in every build.
+const FULL_CATALOG: bool = cfg!(feature = "browser") && cfg!(feature = "computer_use");
+
 fn updating() -> bool {
     std::env::var_os("UPDATE_TOOL_GOLDENS").is_some()
 }
@@ -248,14 +254,16 @@ async fn catalog_budget() {
         total <= MAX_TOTAL_CHARS,
         "catalog is {total} chars, over {MAX_TOTAL_CHARS}"
     );
-    check_file("_budget.golden", &rendered);
+    if FULL_CATALOG {
+        check_file("_budget.golden", &rendered);
+    }
 }
 
 /// Every golden on disk belongs to a tool in the catalog (or to a tool
 /// pinned by its own test), so a removed tool takes its golden with it.
 #[tokio::test]
 async fn no_orphan_goldens() {
-    if updating() {
+    if updating() || !FULL_CATALOG {
         return;
     }
     let (_catalog, tools) = catalog_tools().await;

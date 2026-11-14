@@ -1,21 +1,19 @@
+//! Runs of scheduled work: run one now, its run history and last failure,
+//! its budget, run instructions and workspace binding, and the canonical
+//! snapshot of every scheduled objective. Not a tool: `manage_automations`
+//! offers these to the model.
+
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::traits::{
-    ScheduledGoalRunsStore, Task, TaskActivity, ToolArgumentContractViolation, ToolCallContext,
-    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
-    ToolResultPresentation, semantics_for_exact_read_actions,
-};
-use aidaemon_tools::OutcomeTool as Tool;
+use crate::traits::{ScheduledGoalRunsStore, Task};
 
-pub struct ScheduledGoalRunsTool {
+pub struct ScheduledGoalRuns {
     state: Arc<dyn ScheduledGoalRunsStore>,
 }
 
-impl ScheduledGoalRunsTool {
+impl ScheduledGoalRuns {
     pub fn new(state: Arc<dyn ScheduledGoalRunsStore>) -> Self {
         Self { state }
     }
@@ -53,7 +51,7 @@ impl ScheduledGoalRunsTool {
     /// task lead honors before any mission-text inference, so a run whose
     /// objective lives in a sibling repository never starts in an empty
     /// synthetic workspace again.
-    async fn bind_workspace(
+    pub async fn bind_workspace(
         &self,
         goal_id_input: &str,
         workspace_path: &str,
@@ -126,7 +124,7 @@ impl ScheduledGoalRunsTool {
         ))
     }
 
-    async fn update_instructions(
+    pub async fn update_instructions(
         &self,
         goal_id_input: &str,
         instructions: &str,
@@ -202,7 +200,7 @@ impl ScheduledGoalRunsTool {
         ))
     }
 
-    async fn set_budget(
+    pub async fn set_budget(
         &self,
         goal_id_input: &str,
         budget_per_check: Option<i64>,
@@ -243,7 +241,7 @@ impl ScheduledGoalRunsTool {
 
         let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
         if schedules.is_empty() {
-            return Ok("Only scheduled goals can be updated with scheduled_goal_runs.".to_string());
+            return Ok("Only scheduled work can have a budget.".to_string());
         }
 
         let old_per_check = goal.budget_per_check;
@@ -341,7 +339,7 @@ impl ScheduledGoalRunsTool {
     /// inspection belong on the same capability surface: requiring callers to
     /// first guess an ID (or route through the memory tool) makes absence and
     /// cross-object audits impossible to establish reliably.
-    async fn overview_snapshot(
+    pub async fn overview_snapshot(
         &self,
         limit: usize,
         include_diagnostics: bool,
@@ -493,77 +491,14 @@ impl ScheduledGoalRunsTool {
         Ok((output, portfolio))
     }
 
-    async fn overview(&self, limit: usize, include_diagnostics: bool) -> anyhow::Result<String> {
+    pub async fn overview(
+        &self,
+        limit: usize,
+        include_diagnostics: bool,
+    ) -> anyhow::Result<String> {
         self.overview_snapshot(limit, include_diagnostics)
             .await
             .map(|(output, _)| output)
-    }
-
-    fn infer_hints(problem_text: &str, has_blocked: bool) -> Vec<&'static str> {
-        let mut hints = Vec::new();
-        let text = problem_text.to_ascii_lowercase();
-
-        if text.contains("timeout")
-            || text.contains("timed out")
-            || text.contains("deadline exceeded")
-            || text.contains("connection reset")
-            || text.contains("temporarily unavailable")
-        {
-            hints.push(
-                "Likely transient service/network failure. Retry now, then reduce schedule frequency if it repeats.",
-            );
-        }
-        if text.contains("429") || text.contains("rate limit") || text.contains("too many requests")
-        {
-            hints.push("Rate limited. Increase interval/backoff and reduce parallel API calls.");
-        }
-        if text.contains("401")
-            || text.contains("403")
-            || text.contains("unauthorized")
-            || text.contains("forbidden")
-            || text.contains("token")
-            || text.contains("oauth")
-            || text.contains("permission denied")
-        {
-            hints.push("Auth/permission issue. Reconnect credentials (manage_oauth/manage_config) and retry.");
-        }
-        if text.contains("404")
-            || text.contains("not found")
-            || text.contains("no such file")
-            || text.contains("does not exist")
-        {
-            hints.push("Target missing/renamed. Re-validate resource IDs, URLs, and file paths.");
-        }
-        if text.contains("json")
-            || text.contains("parse")
-            || text.contains("schema")
-            || text.contains("invalid format")
-        {
-            hints.push(
-                "Data contract mismatch. Validate request payload/response parsing assumptions.",
-            );
-        }
-        if text.contains("cap")
-            || text.contains("budget")
-            || text.contains("tokens_used_today")
-            || text.contains("active evergreen goals reached")
-        {
-            hints.push(
-                "Capacity/budget cap hit. Pause lower-priority recurring goals or raise limits.",
-            );
-        }
-        if has_blocked || text.contains("dependency") || text.contains("blocked") {
-            hints.push(
-                "There are blocked dependencies. Resolve blocker tasks first, then retry the failed task.",
-            );
-        }
-
-        if hints.is_empty() {
-            hints.push(
-                "No obvious failure signature found. Use goal_trace(action='tool_trace') to inspect exact tool-call errors.",
-            );
-        }
-        hints
     }
 
     pub async fn run_now(
@@ -582,7 +517,7 @@ impl ScheduledGoalRunsTool {
 
         let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
         if schedules.is_empty() {
-            return Ok("Only scheduled goals can be run with scheduled_goal_runs.".to_string());
+            return Ok("Only scheduled work can be run now.".to_string());
         }
 
         let mut adaptive_extension = None;
@@ -645,7 +580,7 @@ impl ScheduledGoalRunsTool {
             }
             "paused" => {
                 return Ok(format!(
-                    "Goal {} is paused. Resume it first, then run_now.",
+                    "Goal {} is paused. Resume it first, then run it now.",
                     resolved_goal_id
                 ));
             }
@@ -790,7 +725,7 @@ impl ScheduledGoalRunsTool {
         Ok(out)
     }
 
-    async fn run_history(&self, goal_id_input: &str, limit: usize) -> anyhow::Result<String> {
+    pub async fn run_history(&self, goal_id_input: &str, limit: usize) -> anyhow::Result<String> {
         let resolved_goal_id = match self.resolve_goal_id(goal_id_input).await {
             Ok(id) => id,
             Err(e) => return Ok(e.to_string()),
@@ -932,7 +867,7 @@ impl ScheduledGoalRunsTool {
         Ok(out)
     }
 
-    async fn last_failure(&self, goal_id_input: &str) -> anyhow::Result<String> {
+    pub async fn last_failure(&self, goal_id_input: &str) -> anyhow::Result<String> {
         let resolved_goal_id = match self.resolve_goal_id(goal_id_input).await {
             Ok(id) => id,
             Err(e) => return Ok(e.to_string()),
@@ -996,386 +931,5 @@ impl ScheduledGoalRunsTool {
         }
 
         Ok(out)
-    }
-
-    async fn unblock_hints(&self, goal_id_input: &str) -> anyhow::Result<String> {
-        let resolved_goal_id = match self.resolve_goal_id(goal_id_input).await {
-            Ok(id) => id,
-            Err(e) => return Ok(e.to_string()),
-        };
-        let Some(goal) = self.state.get_goal(&resolved_goal_id).await? else {
-            return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
-        };
-        let tasks = self.state.get_tasks_for_goal(&goal.id).await?;
-        let Some(problem_task) = Self::latest_problem_task(&tasks) else {
-            return Ok(format!(
-                "No failed/blocked runs found for {}. No unblock hints needed.",
-                goal.id
-            ));
-        };
-
-        let activities: Vec<TaskActivity> = self
-            .state
-            .get_task_activities(&problem_task.id)
-            .await
-            .unwrap_or_default();
-        let has_blocked = tasks.iter().any(|t| t.status == "blocked");
-
-        let mut problem_text = String::new();
-        if let Some(err) = &problem_task.error {
-            problem_text.push_str(err);
-            problem_text.push('\n');
-        }
-        if let Some(blocker) = &problem_task.blocker {
-            problem_text.push_str(blocker);
-            problem_text.push('\n');
-        }
-        for a in activities.iter().rev().take(10) {
-            if let Some(result) = &a.result {
-                problem_text.push_str(result);
-                problem_text.push('\n');
-            }
-        }
-
-        let hints = Self::infer_hints(&problem_text, has_blocked);
-        let mut out = format!(
-            "**Unblock Hints**\n\n- Goal: {}\n- Goal ID: {}\n- Problem task: {} ({})\n",
-            goal.description, goal.id, problem_task.id, problem_task.status
-        );
-        if let Some(err) = &problem_task.error {
-            out.push_str(&format!("- Latest error: {}\n", Self::truncate(err, 220)));
-        }
-        if let Some(blocker) = &problem_task.blocker {
-            out.push_str(&format!(
-                "- Latest blocker: {}\n",
-                Self::truncate(blocker, 220)
-            ));
-        }
-
-        out.push_str("\nLikely fixes:\n");
-        for hint in hints {
-            out.push_str(&format!("- {}\n", hint));
-        }
-        out.push_str("\nNext actions:\n");
-        out.push_str(&format!(
-            "- Retry immediately: scheduled_goal_runs(action='run_now', goal_id='{}')\n",
-            goal.id
-        ));
-        out.push_str(&format!(
-            "- Inspect full timeline: goal_trace(action='goal_trace', goal_id='{}')\n",
-            goal.id
-        ));
-        Ok(out)
-    }
-}
-
-#[derive(Deserialize)]
-struct ScheduledGoalRunsArgs {
-    action: String,
-    #[serde(default)]
-    goal_id: Option<String>,
-    #[serde(default)]
-    schedule_id: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    budget_per_check: Option<i64>,
-    #[serde(default)]
-    budget_daily: Option<i64>,
-    #[serde(default)]
-    instructions: Option<String>,
-    #[serde(default)]
-    run_requirement: Option<String>,
-    #[serde(default)]
-    insufficient_evidence: Option<String>,
-    #[serde(default)]
-    include_diagnostics: Option<bool>,
-    #[serde(default)]
-    workspace_path: Option<String>,
-}
-
-fn string_enum(values: &[&str]) -> Value {
-    json!({"type": "string", "enum": values})
-}
-
-/// The tool's one description: the schema the model reads and
-/// `description()` both use it.
-const TOOL_DESCRIPTION: &str = "Manage runs.";
-
-fn scheduled_goal_runs_schema() -> Value {
-    json!({
-        "name": "scheduled_goal_runs",
-        "description": TOOL_DESCRIPTION,
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["overview", "run_now", "run_history", "last_failure", "unblock_hints", "set_budget", "update_instructions", "bind_workspace"]
-                },
-                "goal_id": {
-                    "type": "string",
-                    "description": "id/prefix/objective phrase"
-                },
-                "workspace_path": {
-                    "type": "string"
-                },
-                "schedule_id": {
-                    "type": "string"
-                },
-                "limit": {
-                    "type": "integer"
-                },
-                "budget_per_check": {
-                    "type": "integer"
-                },
-                "budget_daily": {
-                    "type": "integer"
-                },
-                "instructions": {
-                    "type": "string"
-                },
-                "run_requirement": string_enum(&["must_complete", "best_effort"]),
-                "insufficient_evidence": string_enum(&["use_public_sources", "use_best_available", "skip_run"]),
-                "include_diagnostics": {
-                    "type": "boolean"
-                }
-            },
-            "required": ["action"],
-            "additionalProperties": false
-        }
-    })
-}
-
-#[async_trait]
-impl Tool for ScheduledGoalRunsTool {
-    fn name(&self) -> &str {
-        "scheduled_goal_runs"
-    }
-
-    fn description(&self) -> &str {
-        TOOL_DESCRIPTION
-    }
-
-    fn schema(&self) -> Value {
-        scheduled_goal_runs_schema()
-    }
-
-    async fn execute(
-        &self,
-        arguments: &str,
-        facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-        let facts = facts.clone();
-
-        let args: ScheduledGoalRunsArgs = serde_json::from_str(arguments)?;
-        let (output, objective_evidence) = if args.action == "overview" {
-            let (output, portfolio) = self
-                .overview_snapshot(
-                    args.limit.unwrap_or(50),
-                    args.include_diagnostics.unwrap_or(false),
-                )
-                .await?;
-            (output, Some(portfolio.receipt_evidence()))
-        } else {
-            (self.run(arguments, &facts).await?, None)
-        };
-        let mut internal_identifiers = aidaemon_tools::sanitize::extract_uuid_identifiers(&output);
-        for candidate in [args.goal_id.as_deref(), args.schedule_id.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            internal_identifiers.extend(aidaemon_tools::sanitize::extract_uuid_identifiers(
-                candidate,
-            ));
-        }
-        internal_identifiers.sort();
-        internal_identifiers.dedup();
-
-        let presentation = if args.include_diagnostics.unwrap_or(false) {
-            Some(ToolResultPresentation::DiagnosticDetail)
-        } else if matches!(
-            args.action.as_str(),
-            "run_now" | "set_budget" | "update_instructions"
-        ) {
-            Some(ToolResultPresentation::NaturalSummary)
-        } else {
-            None
-        };
-        let mut outcome = ToolCallOutcome {
-            output,
-            metadata: ToolCallMetadata {
-                presentation,
-                internal_identifiers,
-                ..ToolCallMetadata::default()
-            },
-            finish: None,
-        };
-        if let Some((observations, collections)) = objective_evidence {
-            outcome = outcome.with_observation_evidence(observations, collections);
-        }
-        Ok(outcome)
-    }
-}
-
-impl ScheduledGoalRunsTool {
-    /// Run one call with the dispatcher's `facts`.
-    pub(crate) async fn run(
-        &self,
-        arguments: &str,
-        facts: &ToolCallContext,
-    ) -> anyhow::Result<String> {
-        let args: ScheduledGoalRunsArgs = serde_json::from_str(arguments)?;
-
-        match args.action.as_str() {
-            "overview" => {
-                self.overview(
-                    args.limit.unwrap_or(50),
-                    args.include_diagnostics.unwrap_or(false),
-                )
-                .await
-            }
-            "run_now" => {
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for run_now"))?;
-                self.run_now(goal_id, args.schedule_id.as_deref()).await
-            }
-            "run_history" => {
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for run_history"))?;
-                self.run_history(goal_id, args.limit.unwrap_or(10)).await
-            }
-            "last_failure" => {
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for last_failure"))?;
-                self.last_failure(goal_id).await
-            }
-            "unblock_hints" => {
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for unblock_hints"))?;
-                self.unblock_hints(goal_id).await
-            }
-            "set_budget" => {
-                let is_owner = facts.user_role == Some(crate::traits::UserRole::Owner);
-                if !is_owner {
-                    return Ok("Only owners can change scheduled goal budgets.".to_string());
-                }
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for set_budget"))?;
-                self.set_budget(goal_id, args.budget_per_check, args.budget_daily)
-                    .await
-            }
-            "update_instructions" => {
-                let is_owner = facts.user_role == Some(crate::traits::UserRole::Owner);
-                if !is_owner {
-                    return Ok("Only owners can update scheduled goal instructions.".to_string());
-                }
-                let goal_id = args.goal_id.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("'goal_id' is required for update_instructions")
-                })?;
-                let instructions = args.instructions.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("'instructions' is required for update_instructions")
-                })?;
-                self.update_instructions(
-                    goal_id,
-                    instructions,
-                    args.run_requirement.as_deref(),
-                    args.insufficient_evidence.as_deref(),
-                )
-                .await
-            }
-            "bind_workspace" => {
-                let is_guest = facts.user_role == Some(crate::traits::UserRole::Guest);
-                if is_guest {
-                    return Ok("Guests cannot bind scheduled goal workspaces.".to_string());
-                }
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for bind_workspace"))?;
-                let workspace_path = args.workspace_path.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("'workspace_path' is required for bind_workspace")
-                })?;
-                self.bind_workspace(goal_id, workspace_path).await
-            }
-            other => Ok(format!(
-                "Unknown action: '{}'. Use overview, run_now, run_history, last_failure, unblock_hints, set_budget, update_instructions, or bind_workspace.",
-                other
-            )),
-        }
-    }
-}
-
-impl crate::traits::ToolSemantics for ScheduledGoalRunsTool {
-    fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
-        let parsed = serde_json::from_str::<Value>(arguments).ok();
-        let action = parsed
-            .as_ref()
-            .and_then(|value| value.get("action"))
-            .and_then(Value::as_str)
-            .unwrap_or("<missing>");
-        if action == "overview" {
-            return Ok(());
-        }
-        let has_goal_id = parsed
-            .as_ref()
-            .and_then(|value| value.get("goal_id"))
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty());
-        if has_goal_id {
-            return Ok(());
-        }
-        Err(ToolArgumentContractViolation::new(format!(
-            "action `{action}` requires `goal_id` for `scheduled_goal_runs`"
-        ))
-        .with_recovery_hint("Obtain a concrete scheduled goal identifier before retrying."))
-    }
-
-    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
-        vec![crate::tools::objective_status::ObjectiveCollection::ScheduledGoals.stable_subject()]
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        // `bind_workspace` writes the goal's workspace binding, a trusted
-        // root for every later run: a configuration change, so egress after
-        // untrusted content.
-        let binds_workspace = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|args| {
-                args.get("action")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .map(str::to_string)
-            })
-            .is_some_and(|action| action == "bind_workspace");
-        semantics_for_exact_read_actions(
-            arguments,
-            &["overview", "run_history", "last_failure", "unblock_hints"],
-            if binds_workspace {
-                ToolMutationEffects::CONFIGURATION
-            } else {
-                ToolMutationEffects::NONE
-            },
-        )
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
     }
 }

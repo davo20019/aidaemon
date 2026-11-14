@@ -26,19 +26,6 @@ pub const MANAGE_MEMORIES_GOAL_ACTIONS: &[&str] = &[
     "list_goals",
     "complete_goal",
     "abandon_goal",
-    "create_scheduled_goal",
-    "activate_scheduled",
-    "list_scheduled",
-    "list_scheduled_matching",
-    "add_schedule",
-    "cancel_scheduled",
-    "pause_scheduled",
-    "resume_scheduled",
-    "retry_scheduled",
-    "retry_failed_scheduled",
-    "cancel_scheduled_matching",
-    "retry_scheduled_matching",
-    "diagnose_scheduled",
 ];
 
 /// How a daemon tool is offered under the active plugin.
@@ -70,10 +57,8 @@ pub fn goal_actions_view(definition: &serde_json::Value) -> serde_json::Value {
         Some(function) => function,
         None => &mut definition,
     };
-    function["description"] = serde_json::Value::String(
-        "Personal goals and scheduled goals: create, list, pause, resume, retry, cancel, diagnose."
-            .to_string(),
-    );
+    function["description"] =
+        serde_json::Value::String("Personal goals: create, list, complete, abandon.".to_string());
     if let Some(actions) = function
         .pointer_mut("/parameters/properties/action/enum")
         .and_then(serde_json::Value::as_array_mut)

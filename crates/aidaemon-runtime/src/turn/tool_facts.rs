@@ -45,12 +45,7 @@ pub fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemanticScope
         "read_file" | "search_files" | "edit_file" | "write_file" | "terminal"
         | "project_inspect" => Some(ToolSemanticScope::LocalWorkspace),
         "read_channel_history" | "search_history" => Some(ToolSemanticScope::ConversationHistory),
-        "scheduled_goals"
-        | "scheduled_goal_runs"
-        | "manage_goal_tasks"
-        | "goal_trace"
-        | "tool_trace"
-        | "manage_mandates"
+        "manage_goal_tasks" | "schedule_task" | "goal_trace" | "tool_trace" | "manage_mandates"
         | "manage_automations" => Some(ToolSemanticScope::GoalState),
         "system_info" | "check_environment" => Some(ToolSemanticScope::HostLocal),
         _ => None,

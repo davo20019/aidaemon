@@ -6003,7 +6003,7 @@ mod tests {
         let right = with_exact_observations(
             result(
                 "read-a",
-                "scheduled_goal_runs",
+                "manage_automations",
                 ToolOutcomeStatus::Succeeded,
                 0,
                 ToolCallSemantics::observation(),
@@ -6037,7 +6037,7 @@ mod tests {
         let partial = with_exact_observations(
             result(
                 "partial",
-                "scheduled_goal_runs",
+                "manage_automations",
                 ToolOutcomeStatus::Succeeded,
                 0,
                 ToolCallSemantics::observation(),
@@ -6067,7 +6067,7 @@ mod tests {
         let complete = with_exact_observations(
             result(
                 "complete",
-                "scheduled_goal_runs",
+                "manage_automations",
                 ToolOutcomeStatus::Succeeded,
                 0,
                 ToolCallSemantics::observation(),
@@ -6114,7 +6114,7 @@ mod tests {
         let complete_absence = with_exact_observations(
             result(
                 "complete",
-                "scheduled_goal_runs",
+                "manage_automations",
                 ToolOutcomeStatus::Succeeded,
                 0,
                 ToolCallSemantics::observation(),

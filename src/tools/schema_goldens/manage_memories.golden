@@ -19,31 +19,11 @@
             "create_personal_goal",
             "list_goals",
             "complete_goal",
-            "abandon_goal",
-            "create_scheduled_goal",
-            "activate_scheduled",
-            "list_scheduled",
-            "list_scheduled_matching",
-            "add_schedule",
-            "cancel_scheduled",
-            "pause_scheduled",
-            "resume_scheduled",
-            "retry_scheduled",
-            "retry_failed_scheduled",
-            "cancel_scheduled_matching",
-            "retry_scheduled_matching",
-            "diagnose_scheduled"
+            "abandon_goal"
           ],
           "type": "string"
         },
         "category": {
-          "type": "string"
-        },
-        "fire_policy": {
-          "enum": [
-            "coalesce",
-            "always_fire"
-          ],
           "type": "string"
         },
         "goal": {
@@ -52,20 +32,11 @@
         "goal_id": {
           "type": "string"
         },
-        "is_one_shot": {
-          "type": "boolean"
-        },
-        "is_paused": {
-          "type": "boolean"
-        },
         "key": {
           "type": "string"
         },
         "limit": {
           "type": "integer"
-        },
-        "name": {
-          "type": "string"
         },
         "priority": {
           "enum": [
@@ -86,18 +57,6 @@
         },
         "query": {
           "type": "string"
-        },
-        "schedule": {
-          "type": "string"
-        },
-        "schedule_id": {
-          "type": "string"
-        },
-        "schedules": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
         }
       },
       "required": [

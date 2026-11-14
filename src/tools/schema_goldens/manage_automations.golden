@@ -1,8 +1,8 @@
 {
-  "description": "The user's automations, in one list: scheduled ones (a fixed instruction or reminder at set times) and watching ones (work toward an objective within limits the user approved). List them, show one's card, or pause, resume or cancel one by its name.",
+  "description": "The user's automations: scheduled (an instruction or reminder at set times), watching (mandates) and health checks. List, show, edit (when, new_name, snooze_until), pause, resume or cancel one by name; for scheduled work also run_now, history, last_failure, set_budget, update_instructions, bind_workspace. Create with schedule_task or set_reminder.",
   "name": "manage_automations",
   "schema": {
-    "description": "The user's automations, in one list: scheduled ones (a fixed instruction or reminder at set times) and watching ones (work toward an objective within limits the user approved). List them, show one's card, or pause, resume or cancel one by its name.",
+    "description": "The user's automations: scheduled (an instruction or reminder at set times), watching (mandates) and health checks. List, show, edit (when, new_name, snooze_until), pause, resume or cancel one by name; for scheduled work also run_now, history, last_failure, set_budget, update_instructions, bind_workspace. Create with schedule_task or set_reminder.",
     "name": "manage_automations",
     "parameters": {
       "additionalProperties": false,
@@ -11,26 +11,90 @@
           "enum": [
             "list",
             "show",
+            "edit",
             "pause",
             "resume",
-            "cancel"
+            "cancel",
+            "run_now",
+            "history",
+            "last_failure",
+            "set_budget",
+            "update_instructions",
+            "bind_workspace"
           ],
           "type": "string"
         },
+        "budget_daily": {
+          "description": "Tokens per day.",
+          "type": "integer"
+        },
+        "budget_per_check": {
+          "description": "Tokens per run.",
+          "type": "integer"
+        },
         "id": {
-          "description": "The ref from the list, for one with no name.",
+          "description": "Its ref from the list.",
+          "type": "string"
+        },
+        "ids": {
+          "description": "pause/resume/cancel: several refs.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "instructions": {
+          "description": "What later runs do.",
+          "type": "string"
+        },
+        "insufficient_evidence": {
+          "description": "When evidence is short.",
+          "enum": [
+            "use_public_sources",
+            "use_best_available",
+            "skip_run"
+          ],
           "type": "string"
         },
         "kind": {
-          "description": "Narrows the list, or picks between two automations with the same name.",
+          "description": "Narrows the list or picks between equal names.",
           "enum": [
             "scheduled",
-            "watching"
+            "watching",
+            "probe"
           ],
           "type": "string"
         },
+        "limit": {
+          "description": "history: runs to show.",
+          "type": "integer"
+        },
         "name": {
-          "description": "The automation's name, as the user gave it.",
+          "description": "Its name, as the user gave it.",
+          "type": "string"
+        },
+        "new_name": {
+          "description": "edit: new name.",
+          "type": "string"
+        },
+        "run_requirement": {
+          "description": "Must a run finish.",
+          "enum": [
+            "must_complete",
+            "best_effort"
+          ],
+          "type": "string"
+        },
+        "snooze_until": {
+          "description": "edit: move only the next run to this time.",
+          "type": "string"
+        },
+        "when": {
+          "description": "edit: new schedule.",
+          "type": "string"
+        },
+        "workspace_path": {
+          "description": "Absolute project directory for its runs.",
           "type": "string"
         }
       },

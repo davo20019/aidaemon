@@ -173,6 +173,27 @@ async fn unknown_tool_is_reported_to_the_model() {
 }
 
 #[tokio::test]
+async fn a_retired_tool_is_refused_with_where_its_work_went() {
+    let agent = base(ScriptedProvider::new([
+        tool_calls([call("c1", "old_runs", json!({}))]),
+        text("ok"),
+    ]))
+    .tool(echo_tool())
+    .retired_tool("old_runs", "Use echo.")
+    .build()
+    .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert_eq!(out.receipts()[0].status, ReceiptStatus::UnknownTool);
+    let (_, content) = &tool_messages(&out.state)[0];
+    assert!(
+        content.contains("unknown tool `old_runs`: it was retired. Use echo."),
+        "{content}"
+    );
+}
+
+#[tokio::test]
 async fn missing_required_arguments_are_rejected_before_policy() {
     struct PanicsIfAsked;
     #[async_trait]

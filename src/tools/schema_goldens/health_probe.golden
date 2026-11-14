@@ -11,9 +11,6 @@
           "enum": [
             "create",
             "list",
-            "delete",
-            "pause",
-            "resume",
             "run_now",
             "status"
           ],

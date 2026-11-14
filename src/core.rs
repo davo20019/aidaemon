@@ -1255,8 +1255,12 @@ primary = "gpt-4o"
             "| Watching automation: ongoing stewardship where timing and actions should adapt to evidence | manage_mandates"
         ));
         assert!(prompt.contains(
-            "| List the user's automations (both kinds), show one, pause/resume/cancel one by name | manage_automations"
+            "| List the user's automations (every kind), show, edit (reschedule, rename, snooze), pause/resume/cancel one by name | manage_automations"
         ));
+        assert!(prompt.contains(
+            "| Run scheduled work now, read its run history or last failure, set its budget, run instructions or workspace | manage_automations"
+        ));
+        assert!(!prompt.contains("scheduled_goal_runs"));
         assert!(prompt.contains("Do not use keyword filters"));
         assert!(prompt.contains("manage_mandates(action=\"draft\")"));
     }

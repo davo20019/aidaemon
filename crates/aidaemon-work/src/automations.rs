@@ -14,16 +14,20 @@ pub enum AutomationKind {
     Scheduled,
     /// Works toward an objective within approved limits (mandates).
     Watching,
+    /// Checks that a service, port, command or file is healthy (health
+    /// probes).
+    Probe,
 }
 
 impl AutomationKind {
-    pub const ALL: [Self; 2] = [Self::Scheduled, Self::Watching];
+    pub const ALL: [Self; 3] = [Self::Scheduled, Self::Watching, Self::Probe];
 
     /// The typed value in tool arguments.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Scheduled => "scheduled",
             Self::Watching => "watching",
+            Self::Probe => "probe",
         }
     }
 
@@ -38,6 +42,7 @@ impl AutomationKind {
         match self {
             Self::Scheduled => "Scheduled",
             Self::Watching => "Watching",
+            Self::Probe => "Health check",
         }
     }
 }
@@ -220,6 +225,23 @@ pub fn scheduled_card(
         } else {
             "Only when you stop it".to_string()
         },
+        details: Vec::new(),
+    }
+}
+
+/// A health probe as the owner reads it, in the same five lines.
+pub fn probe_card(kind: &str, target: &str, cron: &str, zone: &str) -> MandateConfirmationCard {
+    let schedule = ScheduleSpec {
+        cron: cron.to_string(),
+        one_shot: false,
+        next: None,
+    };
+    MandateConfirmationCard {
+        what: format!("Checks {} ({kind})", target.trim()),
+        how_often: cadence_words(&schedule, zone),
+        can_do: "Only runs the check – makes no changes".to_string(),
+        tells_you_when: "the check keeps failing".to_string(),
+        ends: "Only when you stop it".to_string(),
         details: Vec::new(),
     }
 }

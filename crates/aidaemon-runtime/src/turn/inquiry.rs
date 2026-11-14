@@ -127,7 +127,7 @@ pub fn evidence_capabilities_for_tool_call(
                 _ => Vec::new(),
             }
         }
-        "manage_goal_tasks" | "scheduled_goal_runs" | "scheduled_goals" => vec![capability(
+        "manage_goal_tasks" | "manage_automations" => vec![capability(
             GoalState,
             &[
                 CurrentState,
@@ -340,7 +340,7 @@ pub fn requirement_has_builtin_evidence_route(requirement: &RequestEvidenceRequi
         "goal_trace",
         "manage_mandates",
         "manage_goal_tasks",
-        "scheduled_goal_runs",
+        "manage_automations",
         "search_history",
         "http_request",
         "read_node_health",

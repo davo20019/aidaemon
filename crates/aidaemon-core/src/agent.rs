@@ -65,6 +65,9 @@ pub(crate) struct AgentInner {
     /// Tools whose spec is sent only once loaded (see
     /// [`crate::tool_loading`]).
     pub deferred: std::collections::HashSet<String>,
+    /// Tools that no longer exist, each with the note a call to one gets
+    /// (where its work went).
+    pub retired: HashMap<String, String>,
     pub loaded: crate::tool_loading::LoadedTools,
     pub hooks: Vec<Arc<dyn Hook>>,
     pub limits: Limits,
@@ -282,6 +285,7 @@ pub struct AgentBuilder {
     provider: Option<Arc<dyn Provider>>,
     tools: Vec<Arc<dyn Tool>>,
     deferred_tools: Vec<Arc<dyn Tool>>,
+    retired: HashMap<String, String>,
     loaded: crate::tool_loading::LoadedTools,
     hooks: Vec<Arc<dyn Hook>>,
     attested: Vec<Safeguard>,
@@ -305,6 +309,7 @@ impl AgentBuilder {
             provider: None,
             tools: Vec::new(),
             deferred_tools: Vec::new(),
+            retired: HashMap::new(),
             loaded: crate::tool_loading::LoadedTools::default(),
             hooks: Vec::new(),
             attested: Vec::new(),
@@ -354,6 +359,13 @@ impl AgentBuilder {
     /// directly loads it too. See [`crate::tool_loading`].
     pub fn deferred_tool_arc(mut self, tool: Arc<dyn Tool>) -> Self {
         self.deferred_tools.push(tool);
+        self
+    }
+
+    /// A tool that no longer exists: a call to `name` is refused as an
+    /// unknown tool, with `note` (where its work went) in the refusal.
+    pub fn retired_tool(mut self, name: impl Into<String>, note: impl Into<String>) -> Self {
+        self.retired.insert(name.into(), note.into());
         self
     }
 
@@ -522,6 +534,7 @@ impl AgentBuilder {
                 tools,
                 specs,
                 deferred,
+                retired: self.retired,
                 loaded: self.loaded,
                 hooks: self.hooks,
                 limits: self.limits,
