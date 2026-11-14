@@ -444,6 +444,64 @@ impl TaskPlan {
         changed
     }
 
+    /// The steps a new helper would do that a helper still running already
+    /// does, each with the running jobs on it. `indices` are the steps the
+    /// new launch names (`checklist_items`). A launch that names none is
+    /// judged against every open step: it is covered only when each of them
+    /// is already being done (live 2026-11-14: the turn launched a WordPress
+    /// and a Drupal helper, then a third helper for the WordPress install
+    /// while the first still ran). A step whose helpers all ended is not
+    /// covered, whatever its status still says, so a step an earlier helper
+    /// ended without finishing can be launched again. `running` says whether
+    /// a job is still running (the run records know that, not the plan).
+    pub fn steps_covered_by_running_jobs(
+        &self,
+        indices: &[usize],
+        running: impl Fn(&str) -> bool,
+    ) -> Vec<CoveredStep> {
+        let covered = |step: &PlanStep| -> Option<CoveredStep> {
+            if step.status != StepStatus::Background {
+                return None;
+            }
+            let jobs: Vec<String> = step
+                .background_jobs
+                .iter()
+                .filter(|job| running(job))
+                .cloned()
+                .collect();
+            (!jobs.is_empty()).then(|| CoveredStep {
+                index: step.index,
+                description: step.description.clone(),
+                jobs,
+            })
+        };
+        if !indices.is_empty() {
+            return indices
+                .iter()
+                .filter_map(|index| self.steps.get(*index))
+                .filter_map(covered)
+                .collect();
+        }
+        let open: Vec<&PlanStep> = self
+            .steps
+            .iter()
+            .filter(|step| {
+                !matches!(
+                    step.status,
+                    StepStatus::Completed
+                        | StepStatus::Skipped
+                        | StepStatus::Failed
+                        | StepStatus::Deferred
+                )
+            })
+            .collect();
+        let all: Vec<CoveredStep> = open.iter().filter_map(|step| covered(step)).collect();
+        if open.is_empty() || all.len() < open.len() {
+            return Vec::new();
+        }
+        all
+    }
+
     /// The turn handed its work to background jobs `job_ids` without naming
     /// the steps they do (`checklist_items`): every step still open (marked
     /// handed off with no job yet, or already waiting on an earlier job)
@@ -922,6 +980,16 @@ impl TaskPlan {
     }
 }
 
+/// A checklist step a running helper already does
+/// ([`TaskPlan::steps_covered_by_running_jobs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveredStep {
+    pub index: usize,
+    pub description: String,
+    /// The running jobs (launch ids) on it.
+    pub jobs: Vec<String>,
+}
+
 /// A single step in a task plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanStep {
@@ -1185,6 +1253,101 @@ pub use aidaemon_channels::live_status::is_completed_checklist;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn two_sites() -> TaskPlan {
+        TaskPlan::new(
+            "session_123",
+            "Install two sites",
+            "Two sites",
+            vec![
+                "Install WordPress".to_string(),
+                "Install Drupal".to_string(),
+            ],
+            "low",
+        )
+    }
+
+    /// A step a running helper does is covered: a second launch for it is
+    /// a duplicate. Once that helper ended without finishing it, it is open
+    /// to a retry again.
+    #[test]
+    fn a_step_a_running_helper_does_is_covered_until_it_ends() {
+        let mut plan = two_sites();
+        plan.link_background_job(&[0], "job-wp");
+        plan.link_background_job(&[1], "job-drupal");
+        let running = |job: &str| job == "job-wp" || job == "job-drupal";
+
+        let covered = plan.steps_covered_by_running_jobs(&[0], running);
+        assert_eq!(
+            covered,
+            vec![CoveredStep {
+                index: 0,
+                description: "Install WordPress".to_string(),
+                jobs: vec!["job-wp".to_string()],
+            }]
+        );
+        // Every open step is being done: a launch naming none covers nothing new.
+        assert_eq!(plan.steps_covered_by_running_jobs(&[], running).len(), 2);
+
+        // The WordPress helper stopped short: its step may be launched again.
+        plan.settle_background_job("job-wp", JobEnd::Stopped);
+        let only_drupal = |job: &str| job == "job-drupal";
+        assert!(
+            plan.steps_covered_by_running_jobs(&[0], only_drupal)
+                .is_empty()
+        );
+        // A retry names its step: unnamed, it reads as more of what still runs.
+        let unnamed = plan.steps_covered_by_running_jobs(&[], only_drupal);
+        assert_eq!(
+            unnamed.iter().map(|step| step.index).collect::<Vec<_>>(),
+            [1]
+        );
+    }
+
+    /// A step whose helper is gone (a restart lost its run record) is not
+    /// covered, even while its status still reads as in the background.
+    #[test]
+    fn a_step_whose_helper_is_gone_is_not_covered() {
+        let mut plan = two_sites();
+        plan.link_background_job(&[0, 1], "job-lost");
+        assert!(
+            plan.steps_covered_by_running_jobs(&[0], |_| false)
+                .is_empty()
+        );
+        assert!(
+            plan.steps_covered_by_running_jobs(&[], |_| false)
+                .is_empty()
+        );
+    }
+
+    /// A launch that names no steps is covered only when every open step
+    /// already has a running helper: with one step free, it may be that one.
+    #[test]
+    fn an_unnamed_launch_with_a_free_step_is_not_covered() {
+        let mut plan = two_sites();
+        plan.link_background_job(&[0], "job-wp");
+        assert!(
+            plan.steps_covered_by_running_jobs(&[], |job| job == "job-wp")
+                .is_empty()
+        );
+        // Naming the covered step is still a duplicate.
+        assert_eq!(
+            plan.steps_covered_by_running_jobs(&[0, 1], |job| job == "job-wp")
+                .len(),
+            1
+        );
+    }
+
+    /// A step a launch left waiting on the turn's jobs (no `checklist_items`)
+    /// is covered by them too.
+    #[test]
+    fn steps_waiting_on_unnamed_launches_are_covered() {
+        let mut plan = two_sites();
+        plan.wait_on_background_jobs(&["job-a".to_string(), "job-b".to_string()]);
+        let covered = plan.steps_covered_by_running_jobs(&[], |_| true);
+        assert_eq!(covered.len(), 2);
+        assert_eq!(covered[0].jobs, vec!["job-a", "job-b"]);
+    }
 
     /// A step owns its runs in order and its outcome is its latest run's:
     /// a step an earlier helper failed or stopped short on is taken over by

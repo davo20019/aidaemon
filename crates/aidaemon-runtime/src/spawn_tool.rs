@@ -1595,7 +1595,103 @@ impl Tool for SpawnAgentTool {
     }
 }
 
+/// A launch refused because helpers still running already do the checklist
+/// steps it would do: a step is launched again only once the helper on it
+/// ended without finishing it.
+#[derive(Debug)]
+pub struct StepsAlreadyRunning(String);
+
+impl std::fmt::Display for StepsAlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StepsAlreadyRunning {}
+
+/// The refusal for a launch whose steps running helpers already do. `named`
+/// says whether the launch named its steps; `label` is a running job's
+/// name as the owner reads it.
+fn steps_already_running(
+    covered: &[aidaemon_work::plans::CoveredStep],
+    named: bool,
+    label: impl Fn(&str) -> String,
+) -> StepsAlreadyRunning {
+    let lines = covered
+        .iter()
+        .map(|step| {
+            let helpers = step
+                .jobs
+                .iter()
+                .map(|job| format!("\"{}\"", label(job)))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            format!(
+                "- item {} ({}): being done by {helpers}",
+                step.index, step.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lead = if named {
+        "No helper started: helpers you launched are still running the checklist items this \
+         one would do."
+    } else {
+        "No helper started: every open item on your checklist is already being done by a \
+         helper you launched, and this launch names none of its own."
+    };
+    StepsAlreadyRunning(format!(
+        "{lead}\n{lines}\nEach result comes to you when its helper ends. An item is launched \
+         again only after its helper ended without finishing it. If this is other work, add \
+         it to your checklist with track_requirements and name its item in checklist_items."
+    ))
+}
+
 impl SpawnAgentTool {
+    /// Refuse a launch whose checklist steps helpers of this turn are still
+    /// running ([`aidaemon_work::plans::TaskPlan::steps_covered_by_running_jobs`]):
+    /// the same request unit never gets a second helper while its first
+    /// one runs. The run records say which helpers still run.
+    async fn refuse_steps_a_running_helper_does(
+        &self,
+        args: &SpawnArgs,
+        facts: &aidaemon_tools::semantics::ToolCallContext,
+        agent: &dyn ChildAgentRuntime,
+    ) -> anyhow::Result<()> {
+        let (Some(plans), Some(session)) = (self.plan_store.get(), facts.session()) else {
+            return Ok(());
+        };
+        let plan = match plans.latest(session, facts.task_id.as_deref()).await {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                warn!(%error, "Could not read the checklist a launch names");
+                return Ok(());
+            }
+        };
+        let runs = agent.helper_runs();
+        let running = |job: &str| {
+            runs.get(job)
+                .is_some_and(|run| run.phase == RunPhase::Running)
+        };
+        let covered = plan.steps_covered_by_running_jobs(&args.checklist_items, running);
+        if covered.is_empty() {
+            return Ok(());
+        }
+        let refusal = steps_already_running(&covered, !args.checklist_items.is_empty(), |job| {
+            runs.get(job)
+                .map(|run| run.label)
+                .unwrap_or_else(|| job.to_string())
+        });
+        info!(
+            session,
+            mission = %args.mission,
+            steps = ?covered.iter().map(|step| step.index).collect::<Vec<_>>(),
+            "Refused a helper for checklist steps running helpers already do"
+        );
+        Err(refusal.into())
+    }
+
     /// A `spawn_agent` call that failed started no helper: the checklist
     /// steps it named (`checklist_items`) are marked as not running, the
     /// card shows it, and the failure tells the model which of its steps
@@ -1608,6 +1704,11 @@ impl SpawnAgentTool {
         facts: &aidaemon_tools::semantics::ToolCallContext,
         error: anyhow::Error,
     ) -> anyhow::Error {
+        // A launch refused because a running helper already does its steps
+        // leaves them with that helper.
+        if error.downcast_ref::<StepsAlreadyRunning>().is_some() {
+            return error;
+        }
         let items: Vec<usize> = serde_json::from_str::<Value>(arguments)
             .ok()
             .and_then(|call| call.get("checklist_items").cloned())
@@ -1702,6 +1803,8 @@ impl SpawnAgentTool {
             background = args.background,
             "spawn_agent tool invoked"
         );
+        self.refuse_steps_a_running_helper_does(&args, &facts, agent.as_ref())
+            .await?;
 
         // Preserve the parent call's execution context.
         let channel_ctx = build_child_channel_context(&facts);
@@ -3073,6 +3176,117 @@ mod group_tests {
         fn helper_runs(&self) -> Arc<RunStates> {
             self.runs.clone()
         }
+    }
+
+    /// Live 2026-11-14: one turn launched a WordPress and a Drupal helper,
+    /// then a third helper for the WordPress install while the first still
+    /// ran. A launch for a step a running helper does is refused, naming
+    /// that helper, and leaves the step with it; once the helper ended
+    /// without finishing the step, the step can be launched again.
+    #[tokio::test]
+    async fn a_step_a_running_helper_does_gets_no_second_helper() {
+        let parent = Arc::new(Parent::default());
+        let weak: Weak<dyn ChildAgentRuntime> =
+            Arc::downgrade(&(parent.clone() as Arc<dyn ChildAgentRuntime>));
+        let tool = SpawnAgentTool::new(weak, 8_000, 60);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(aidaemon_work::plans::PlanStore::new(pool).await.unwrap());
+        tool.set_plan_store(plans.clone());
+        let pending = aidaemon_work::plans::StepStatus::Pending;
+        plans
+            .upsert_checklist(
+                "chat-1",
+                Some("task-1"),
+                "Install WordPress and Drupal",
+                &[
+                    ("Install WordPress".to_string(), pending),
+                    ("Install Drupal".to_string(), pending),
+                ],
+            )
+            .await
+            .unwrap();
+        for (job, item) in [("job-wp", 0), ("job-drupal", 1)] {
+            plans
+                .link_background_job("chat-1", Some("task-1"), &[item], job)
+                .await
+                .unwrap();
+        }
+        parent
+            .runs
+            .begin("job-wp", "chat-1", "Install WordPress site", None);
+        parent
+            .runs
+            .begin("job-drupal", "chat-1", "Install Drupal site", None);
+        let facts = ToolCallContext {
+            session_id: "chat-1".to_string(),
+            task_id: Some("task-1".to_string()),
+            ..Default::default()
+        };
+        let again =
+            r#"{"title":"Complete WordPress install","task":"Finish it","checklist_items":[0]}"#;
+        let unnamed = r#"{"title":"Complete WordPress install","task":"Finish it"}"#;
+
+        let refusal = tool
+            .refuse_steps_a_running_helper_does(
+                &SpawnArgs::parse(again).unwrap(),
+                &facts,
+                parent.as_ref(),
+            )
+            .await
+            .expect_err("a second helper for a running step");
+        let text = refusal.to_string();
+        assert!(text.contains("item 0 (Install WordPress)"), "{text}");
+        assert!(text.contains("\"Install WordPress site\""), "{text}");
+        assert!(!text.contains("Drupal"), "{text}");
+        // The step stays with the helper doing it.
+        let error = tool.steps_not_started(again, &facts, refusal).await;
+        assert!(error.downcast_ref::<StepsAlreadyRunning>().is_some());
+        let plan = plans
+            .latest("chat-1", Some("task-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.steps[0].status,
+            aidaemon_work::plans::StepStatus::Background
+        );
+        // A launch that names no item, while every item is being done.
+        assert!(
+            tool.refuse_steps_a_running_helper_does(
+                &SpawnArgs::parse(unnamed).unwrap(),
+                &facts,
+                parent.as_ref(),
+            )
+            .await
+            .is_err()
+        );
+
+        // The WordPress helper ended without finishing: its step is free.
+        parent.runs.finish(
+            "job-wp",
+            RunEnd::Stopped(None),
+            RunMeasure {
+                ended_at: chrono::Utc::now(),
+                work_began: None,
+                waited: Duration::ZERO,
+            },
+            Default::default(),
+            RunReport {
+                text: String::new(),
+                untrusted: false,
+            },
+        );
+        tool.refuse_steps_a_running_helper_does(
+            &SpawnArgs::parse(again).unwrap(),
+            &facts,
+            parent.as_ref(),
+        )
+        .await
+        .expect("a retry once the first helper ended");
     }
 
     fn route(parent: &Arc<Parent>, name: &str) -> ResultRoute {

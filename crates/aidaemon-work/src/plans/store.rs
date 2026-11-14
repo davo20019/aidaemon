@@ -110,6 +110,21 @@ impl PlanStore {
     }
 
     /// The session's latest plan, when it belongs to `task_id` (any task
+    /// when `None`): the checklist a launch's `checklist_items` index into.
+    pub async fn latest(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> anyhow::Result<Option<TaskPlan>> {
+        Ok(self
+            .get_recent_for_session(session_id, 1)
+            .await?
+            .into_iter()
+            .next()
+            .filter(|plan| task_id.is_none() || plan.task_id.as_deref() == task_id))
+    }
+
+    /// The session's latest plan, when it belongs to `task_id` (any task
     /// when `None`), changed by `change` under the plan write lock and
     /// stored when `change` says it changed. Returns the stored plan, or
     /// `None` when there was no such plan or nothing changed.
