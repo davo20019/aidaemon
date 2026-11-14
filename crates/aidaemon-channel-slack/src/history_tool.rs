@@ -2,6 +2,7 @@
 //! Slack Web API, for the model to read and summarize.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,34 +12,89 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use aidaemon_channels::hub::DynamicBotStore;
 use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::semantics::{ToolCallContext, ToolCapabilities};
+
+/// The Slack bot tokens the tool may read with, looked up on every call: the
+/// configured bots, and the bots connected at runtime (kept in a
+/// [`DynamicBotStore`]), so a bot connected after startup is seen.
+pub struct SlackBotTokens {
+    configured: Vec<String>,
+    connected: Option<Arc<dyn DynamicBotStore>>,
+}
+
+impl SlackBotTokens {
+    /// Only these tokens.
+    pub fn fixed(tokens: Vec<String>) -> Self {
+        Self {
+            configured: tokens,
+            connected: None,
+        }
+    }
+
+    /// The `configured` tokens, then each Slack bot `connected` holds when a
+    /// call asks.
+    pub fn with_connected(configured: Vec<String>, connected: Arc<dyn DynamicBotStore>) -> Self {
+        Self {
+            configured,
+            connected: Some(connected),
+        }
+    }
+
+    /// The tokens as of now, configured first, without repeats.
+    pub async fn current(&self) -> Vec<String> {
+        let mut tokens: Vec<String> = Vec::new();
+        let mut push = |token: String| {
+            if !token.is_empty() && !tokens.contains(&token) {
+                tokens.push(token);
+            }
+        };
+        self.configured.iter().cloned().for_each(&mut push);
+        if let Some(store) = &self.connected {
+            match store.get_dynamic_bots().await {
+                Ok(bots) => bots
+                    .into_iter()
+                    .filter(|bot| bot.channel_type == "slack")
+                    .for_each(|bot| push(bot.bot_token)),
+                Err(e) => warn!(error = %e, "read_channel_history: could not list connected bots"),
+            }
+        }
+        tokens
+    }
+}
 
 /// Tool that reads Slack channel conversation history via the Slack API.
 /// Provides rich message data (text, sender, timestamps, threads, reactions, mentions)
 /// for the LLM to analyze and summarize.
 pub struct ReadChannelHistoryTool {
     http: Client,
-    slack_tokens: Vec<String>,
+    tokens: SlackBotTokens,
     base_url: String,
-    /// token index + user ID → display name cache
+    /// token + user ID → display name cache
     user_cache: RwLock<HashMap<String, String>>,
-    /// token index → Slack workspace URL resolved on first use (for permalinks)
-    workspace_url: RwLock<HashMap<usize, String>>,
+    /// token → Slack workspace URL resolved on first use (for permalinks)
+    workspace_url: RwLock<HashMap<String, String>>,
 }
 
 impl ReadChannelHistoryTool {
+    /// A tool reading with exactly these tokens.
     pub fn new(slack_tokens: Vec<String>) -> Self {
-        Self::with_base_url(slack_tokens, "https://slack.com")
+        Self::with_tokens(SlackBotTokens::fixed(slack_tokens))
     }
 
-    fn with_base_url(slack_tokens: Vec<String>, base_url: impl Into<String>) -> Self {
+    /// A tool reading with the tokens `tokens` gives on each call.
+    pub fn with_tokens(tokens: SlackBotTokens) -> Self {
+        Self::with_base_url(tokens, "https://slack.com")
+    }
+
+    fn with_base_url(tokens: SlackBotTokens, base_url: impl Into<String>) -> Self {
         Self {
             http: Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()
                 .expect("failed to build HTTP client"),
-            slack_tokens,
+            tokens,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             user_cache: RwLock::new(HashMap::new()),
             workspace_url: RwLock::new(HashMap::new()),
@@ -46,16 +102,12 @@ impl ReadChannelHistoryTool {
     }
 
     #[cfg(test)]
-    fn new_with_base_url_for_tests(slack_tokens: Vec<String>, base_url: String) -> Self {
-        Self::with_base_url(slack_tokens, base_url)
+    fn new_with_base_url_for_tests(tokens: SlackBotTokens, base_url: String) -> Self {
+        Self::with_base_url(tokens, base_url)
     }
 
     fn api_url(&self, method: &str) -> String {
         format!("{}/api/{}", self.base_url, method)
-    }
-
-    fn token_at(&self, token_index: usize) -> Option<&str> {
-        self.slack_tokens.get(token_index).map(|s| s.as_str())
     }
 
     fn slack_error_hint(err: &str) -> &'static str {
@@ -78,8 +130,8 @@ impl ReadChannelHistoryTool {
     }
 
     /// Resolve a Slack user ID to a display name, with caching.
-    async fn resolve_user(&self, token_index: usize, user_id: &str) -> String {
-        let cache_key = format!("{}:{}", token_index, user_id);
+    async fn resolve_user(&self, token: &str, user_id: &str) -> String {
+        let cache_key = format!("{}:{}", token, user_id);
         // Check cache first
         {
             let cache = self.user_cache.read().await;
@@ -87,11 +139,6 @@ impl ReadChannelHistoryTool {
                 return name.clone();
             }
         }
-
-        let token = match self.token_at(token_index) {
-            Some(t) => t,
-            None => return user_id.to_string(),
-        };
 
         let resp = self
             .http
@@ -131,15 +178,14 @@ impl ReadChannelHistoryTool {
     }
 
     /// Resolve the workspace URL via auth.test (cached).
-    async fn get_workspace_url(&self, token_index: usize) -> Option<String> {
+    async fn get_workspace_url(&self, token: &str) -> Option<String> {
         {
             let cached = self.workspace_url.read().await;
-            if let Some(url) = cached.get(&token_index) {
+            if let Some(url) = cached.get(token) {
                 return Some(url.clone());
             }
         }
 
-        let token = self.token_at(token_index)?;
         let resp = self
             .http
             .post(self.api_url("auth.test"))
@@ -154,7 +200,7 @@ impl ReadChannelHistoryTool {
         {
             let url = url.trim_end_matches('/').to_string();
             let mut cached = self.workspace_url.write().await;
-            cached.insert(token_index, url.clone());
+            cached.insert(token.to_string(), url.clone());
             return Some(url);
         }
         None
@@ -168,7 +214,7 @@ impl ReadChannelHistoryTool {
     }
 
     /// Replace <@U123> mentions in text with resolved names.
-    async fn resolve_mentions(&self, token_index: usize, text: &str) -> String {
+    async fn resolve_mentions(&self, token: &str, text: &str) -> String {
         let re = regex::Regex::new(r"<@(U[A-Z0-9]+)>").unwrap();
         let mut result = text.to_string();
 
@@ -182,15 +228,14 @@ impl ReadChannelHistoryTool {
 
         // Resolve them all
         for uid in user_ids {
-            let name = self.resolve_user(token_index, &uid).await;
+            let name = self.resolve_user(token, &uid).await;
             result = result.replace(&format!("<@{}>", uid), &format!("@{}", name));
         }
         result
     }
 
     /// Resolve channel name from channel ID.
-    async fn resolve_channel_name(&self, token_index: usize, channel_id: &str) -> Option<String> {
-        let token = self.token_at(token_index)?;
+    async fn resolve_channel_name(&self, token: &str, channel_id: &str) -> Option<String> {
         let resp = self
             .http
             .get(self.api_url("conversations.info"))
@@ -208,16 +253,18 @@ impl ReadChannelHistoryTool {
         }
     }
 
-    /// Fetch conversations.history from Slack API.
+    /// Fetch conversations.history from Slack API with the first of `tokens`
+    /// that can read the channel; the token used comes back with the messages.
     async fn fetch_history(
         &self,
+        tokens: &[String],
         channel_id: &str,
         limit: u64,
         oldest: Option<&str>,
         latest: Option<&str>,
-    ) -> anyhow::Result<(usize, Vec<Value>)> {
-        if self.slack_tokens.is_empty() {
-            anyhow::bail!("No Slack bot token configured");
+    ) -> anyhow::Result<(String, Vec<Value>)> {
+        if tokens.is_empty() {
+            anyhow::bail!("No Slack bot is configured or connected");
         }
 
         let mut params: Vec<(&str, String)> = vec![
@@ -232,7 +279,7 @@ impl ReadChannelHistoryTool {
         }
 
         let mut failures = Vec::new();
-        for (token_index, token) in self.slack_tokens.iter().enumerate() {
+        for (token_index, token) in tokens.iter().enumerate() {
             let resp = match self
                 .http
                 .get(self.api_url("conversations.history"))
@@ -258,7 +305,7 @@ impl ReadChannelHistoryTool {
 
             if body["ok"].as_bool() == Some(true) {
                 return Ok((
-                    token_index,
+                    token.clone(),
                     body["messages"].as_array().cloned().unwrap_or_default(),
                 ));
             }
@@ -288,7 +335,7 @@ impl ReadChannelHistoryTool {
     /// Format a single message for output.
     async fn format_message(
         &self,
-        token_index: usize,
+        token: &str,
         msg: &Value,
         channel_id: &str,
         workspace_url: Option<&str>,
@@ -299,8 +346,8 @@ impl ReadChannelHistoryTool {
         let raw_text = msg["text"].as_str().unwrap_or("");
 
         // Resolve user name and mentions
-        let user_name = self.resolve_user(token_index, user_id).await;
-        let text = self.resolve_mentions(token_index, raw_text).await;
+        let user_name = self.resolve_user(token, user_id).await;
+        let text = self.resolve_mentions(token, raw_text).await;
 
         // Format timestamp
         let timestamp = ts
@@ -453,8 +500,8 @@ impl ReadChannelHistoryTool {
             );
         };
 
-        let has_token = !self.slack_tokens.is_empty();
-        info!(channel_id = %channel_id, has_token, "read_channel_history: fetching history");
+        let tokens = self.tokens.current().await;
+        info!(channel_id = %channel_id, tokens = tokens.len(), "read_channel_history: fetching history");
 
         let limit = args["limit"].as_u64().unwrap_or(50).min(200);
 
@@ -462,13 +509,19 @@ impl ReadChannelHistoryTool {
         let latest = args["latest"].as_str().and_then(parse_time_param);
 
         // Fetch messages
-        let (token_index, messages) = match self
-            .fetch_history(&channel_id, limit, oldest.as_deref(), latest.as_deref())
+        let (token, messages) = match self
+            .fetch_history(
+                &tokens,
+                &channel_id,
+                limit,
+                oldest.as_deref(),
+                latest.as_deref(),
+            )
             .await
         {
-            Ok((token_index, msgs)) => {
+            Ok((token, msgs)) => {
                 info!(channel_id = %channel_id, count = msgs.len(), "read_channel_history: fetched messages");
-                (token_index, msgs)
+                (token, msgs)
             }
             Err(e) => {
                 warn!(channel_id = %channel_id, error = %e, "read_channel_history: fetch_history failed");
@@ -488,11 +541,11 @@ impl ReadChannelHistoryTool {
         }
 
         // Get workspace URL for permalinks
-        let workspace_url = self.get_workspace_url(token_index).await;
+        let workspace_url = self.get_workspace_url(&token).await;
 
         // Resolve channel name
         let channel_name = self
-            .resolve_channel_name(token_index, &channel_id)
+            .resolve_channel_name(&token, &channel_id)
             .await
             .map(|n| format!("#{}", n))
             .unwrap_or_else(|| channel_id.clone());
@@ -512,7 +565,7 @@ impl ReadChannelHistoryTool {
 
             let line = self
                 .format_message(
-                    token_index,
+                    &token,
                     msg,
                     &channel_id,
                     workspace_url.as_deref(),
@@ -836,15 +889,80 @@ mod tests {
         });
 
         let tool = ReadChannelHistoryTool::new_with_base_url_for_tests(
-            vec!["xoxb-first".to_string(), "xoxb-second".to_string()],
+            SlackBotTokens::fixed(vec!["xoxb-first".to_string(), "xoxb-second".to_string()]),
             base_url,
         );
-        let (token_index, messages) = tool.fetch_history("C123", 10, None, None).await.unwrap();
+        let tokens = tool.tokens.current().await;
+        let (token, messages) = tool
+            .fetch_history(&tokens, "C123", 10, None, None)
+            .await
+            .unwrap();
 
-        assert_eq!(token_index, 1);
+        assert_eq!(token, "xoxb-second");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["text"].as_str(), Some("from second token"));
         server.await.unwrap();
+    }
+
+    /// Bots connected at runtime, which a test adds after building the tool.
+    #[derive(Default)]
+    struct ConnectedBots(std::sync::Mutex<Vec<aidaemon_channels::hub::DynamicBot>>);
+
+    #[async_trait]
+    impl DynamicBotStore for ConnectedBots {
+        async fn get_dynamic_bots(
+            &self,
+        ) -> anyhow::Result<Vec<aidaemon_channels::hub::DynamicBot>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+
+    fn connected(channel_type: &str, bot_token: &str) -> aidaemon_channels::hub::DynamicBot {
+        aidaemon_channels::hub::DynamicBot {
+            id: 1,
+            channel_type: channel_type.into(),
+            bot_token: bot_token.into(),
+            app_token: None,
+            allowed_user_ids: vec![],
+            extra_config: "{}".into(),
+            created_at: String::new(),
+        }
+    }
+
+    /// A Slack bot connected after the tool was built is read with on the
+    /// next call; other channels' bots and repeats are not.
+    #[tokio::test]
+    async fn a_bot_connected_after_startup_is_used() {
+        let store = Arc::new(ConnectedBots::default());
+        let tool = ReadChannelHistoryTool::with_tokens(SlackBotTokens::with_connected(
+            vec!["xoxb-configured".into()],
+            store.clone(),
+        ));
+        assert_eq!(tool.tokens.current().await, vec!["xoxb-configured"]);
+
+        store.0.lock().unwrap().extend([
+            connected("slack", "xoxb-connected-later"),
+            connected("telegram", "123:synthetic"),
+            connected("slack", "xoxb-configured"),
+            connected("slack", ""),
+        ]);
+        assert_eq!(
+            tool.tokens.current().await,
+            vec!["xoxb-configured", "xoxb-connected-later"]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_bot_says_so() {
+        let tool = ReadChannelHistoryTool::with_tokens(SlackBotTokens::with_connected(
+            vec![],
+            Arc::new(ConnectedBots::default()),
+        ));
+        let out = tool.call(r#"{"channel_id":"C123"}"#).await.unwrap();
+        assert!(
+            out.contains("No Slack bot is configured or connected"),
+            "{out}"
+        );
     }
 
     #[test]

@@ -41,7 +41,7 @@ pub use aidaemon_tool_browser::BrowserTool;
 pub use approval::ApprovalBroker;
 #[cfg(feature = "slack")]
 #[cfg(feature = "slack")]
-pub use channel_history::ReadChannelHistoryTool;
+pub use channel_history::{ReadChannelHistoryTool, SlackBotTokens};
 pub use cli_agent::CliAgentTool;
 #[cfg(feature = "computer_use")]
 pub use computer_use::ComputerUseTool;

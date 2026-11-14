@@ -298,3 +298,98 @@ async fn a_predicted_write_is_the_one_the_call_makes() {
         assert_eq!(std::fs::read(&file).unwrap(), predicted);
     }
 }
+
+/// A batch of edits applies in order, each to the result of the one before,
+/// in one write; `replace_all` works per edit.
+#[tokio::test]
+async fn edit_batch_applies_in_order() {
+    use aidaemon_tools::semantics::ToolSemantics;
+    let (dir, workspace) = workspace();
+    let file = dir.path().join("a.txt");
+    std::fs::write(&file, "alpha\nbeta\ngamma gamma\n").unwrap();
+    let edit = EditFile::new(workspace);
+
+    let args = json!({"path": "a.txt", "edits": [
+        {"old_text": "alpha", "new_text": "ALPHA"},
+        {"old_text": "gamma", "new_text": "delta", "replace_all": true},
+        // Only exists once the first edit has applied.
+        {"old_text": "ALPHA\nbeta", "new_text": "ALPHA\nBETA"},
+    ]});
+    assert!(edit.validate(&args).is_ok());
+    let predicted = edit
+        .file_write_result(&args.to_string(), Some(&std::fs::read(&file).unwrap()))
+        .unwrap()
+        .unwrap();
+    let out = edit.call(args, &ctx()).await.unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content
+            .contains("applied 3 edits, replaced 4 occurrences"),
+        "{}",
+        out.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "ALPHA\nBETA\ndelta delta\n"
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), predicted);
+}
+
+/// When any edit of a batch fails, the file is unchanged and the reply names
+/// the failing edit and why.
+#[tokio::test]
+async fn edit_batch_writes_nothing_when_one_fails() {
+    use aidaemon_tools::semantics::ToolSemantics;
+    let (dir, workspace) = workspace();
+    let file = dir.path().join("a.txt");
+    std::fs::write(&file, "one\ntwo\ntwo\n").unwrap();
+    let edit = EditFile::new(workspace);
+
+    for (args, why) in [
+        (
+            json!({"path": "a.txt", "edits": [
+                {"old_text": "one", "new_text": "ONE"},
+                {"old_text": "absent", "new_text": "x"},
+            ]}),
+            "Text not found",
+        ),
+        (
+            json!({"path": "a.txt", "edits": [
+                {"old_text": "one", "new_text": "ONE"},
+                {"old_text": "two", "new_text": "TWO"},
+            ]}),
+            "2 occurrences",
+        ),
+        // The first edit removes what the second looks for.
+        (
+            json!({"path": "a.txt", "edits": [
+                {"old_text": "one\n", "new_text": "uno\n"},
+                {"old_text": "one", "new_text": "x"},
+            ]}),
+            "Text not found",
+        ),
+    ] {
+        let predicted =
+            edit.file_write_result(&args.to_string(), Some(&std::fs::read(&file).unwrap()));
+        assert!(matches!(predicted, Some(Err(_))), "{args}");
+        let out = edit.call(args.clone(), &ctx()).await.unwrap();
+        assert!(out.is_error, "{args}");
+        assert!(
+            out.content.contains("Edit 2 of 2") && out.content.contains(why),
+            "{}",
+            out.content
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\ntwo\n");
+    }
+
+    for bad in [
+        json!({"path": "a", "edits": []}),
+        json!({"path": "a", "edits": [{"old_text": "", "new_text": "y"}]}),
+        json!({"path": "a", "edits": [{"old_text": "x", "new_text": "x"}]}),
+        json!({"path": "a", "edits": [{"old_text": "x"}]}),
+        json!({"path": "a", "old_text": "x", "new_text": "y",
+               "edits": [{"old_text": "x", "new_text": "y"}]}),
+    ] {
+        assert!(edit.validate(&bad).is_err(), "{bad}");
+    }
+}

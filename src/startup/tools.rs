@@ -886,23 +886,23 @@ pub async fn register_optional_tools(
                 if !config.tools.is_enabled("read_channel_history") {
                     continue;
                 }
-                let mut slack_tokens: Vec<String> = config
+                // Opted in, so registered even before any Slack bot exists:
+                // the tokens are the configured bots plus the bots connected
+                // at runtime, read on every call, so a bot `/connect`ed after
+                // startup is seen.
+                let configured: Vec<String> = config
                     .all_slack_bots()
                     .iter()
                     .map(|bot| bot.bot_token.clone())
                     .collect();
-                if let Ok(dynamic_bots) = state.get_dynamic_bots().await {
-                    for bot in dynamic_bots {
-                        if bot.channel_type == "slack" && !bot.bot_token.is_empty() {
-                            slack_tokens.push(bot.bot_token.clone());
-                        }
-                    }
-                }
-                if slack_tokens.is_empty() {
-                    continue;
-                }
-                info!(count = slack_tokens.len(), "Channel history tool enabled");
-                tools.push(Arc::new(ReadChannelHistoryTool::new(slack_tokens)));
+                let connected: Arc<dyn aidaemon_channels::hub::DynamicBotStore> = state.clone();
+                info!(
+                    configured = configured.len(),
+                    "Channel history tool enabled"
+                );
+                tools.push(Arc::new(ReadChannelHistoryTool::with_tokens(
+                    crate::tools::SlackBotTokens::with_connected(configured, connected),
+                )));
             }
         }
 
