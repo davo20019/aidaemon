@@ -227,7 +227,7 @@ pub fn render_memory_section(memory: &MemoryContext, max_facts: usize) -> Memory
     }
     prompt.push_str(
         "- Contacts and relationships: use `manage_people(action='list')` or `manage_people(action='view', name='...')`\n\
-         - To store new facts: use `remember_fact`\n",
+         - To store new facts: use `remember_fact`; for other people, family and relationships use `manage_people(action='remember')`\n",
     );
 
     let mut report = render_query_ranked_memory(memory, max_facts);
@@ -512,7 +512,7 @@ mod tests {
              - User facts (preferences, personal info, projects): use `manage_memories(action='search', query='...')` or `manage_memories(action='list')`\n\
              - Scheduled tasks and reminders: use `manage_automations(action='list')`\n\
              - Contacts and relationships: use `manage_people(action='list')` or `manage_people(action='view', name='...')`\n\
-             - To store new facts: use `remember_fact`\n";
+             - To store new facts: use `remember_fact`; for other people, family and relationships use `manage_people(action='remember')`\n";
         let offered = MemoryContext {
             scheduled_goals_tool: true,
             ..MemoryContext::default()

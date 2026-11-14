@@ -90,7 +90,7 @@ const DAEMON_CORRECTION_RULE: &str =
 ";
 
 const DAEMON_PEOPLE_TABLE_ROW: &str =
-    "\n| Track contacts, relationships, birthdays | manage_people | — |";
+    "\n| Remember other people, family, relationships | manage_people (remember) | — |\n| Track contacts, birthdays | manage_people | — |";
 
 /// The memory parts of the base prompt: section, tool-table rows, correction
 /// rule, people row.

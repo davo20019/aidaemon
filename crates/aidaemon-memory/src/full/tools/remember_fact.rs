@@ -41,9 +41,14 @@ struct RememberArgs {
     delete: bool,
     #[serde(default)]
     facts: Option<Vec<FactEntry>>,
+    /// People and relationships moved to `manage_people` `remember`; a call
+    /// that still sends them is answered with that and stores nothing.
     #[serde(default)]
     personal_memory: Option<PersonalMemoryWrite>,
 }
+
+/// How a call that still carries people is answered.
+pub const PEOPLE_MOVED: &str = "remember_fact no longer stores people; nothing was stored. Send the same personal_memory to manage_people with action \"remember\", and any owner facts here without it.";
 
 #[derive(Deserialize)]
 struct FactEntry {
@@ -75,7 +80,7 @@ impl Tool for RememberFactTool {
     }
 
     fn description(&self) -> &str {
-        "Store or forget stable user/environment facts, not task research, generated content, goals, or schedules. Use personal_memory for people and relationships."
+        "Store or forget stable facts about the owner and their environment, not task research, generated content, goals, or schedules. Other people, family and relationships: manage_people remember."
     }
 
     fn schema(&self) -> Value {
@@ -121,69 +126,6 @@ impl Tool for RememberFactTool {
                             },
                             "required": ["category", "key"]
                         }
-                    },
-                    "personal_memory": {
-                        "type": "object",
-                        "properties": {
-                            "entities": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "local_id": {"type": "string"},
-                                        "entity_type": {"type": "string", "enum": ["person", "organization", "project", "place", "account"]},
-                                        "canonical_name": {"type": "string"},
-                                        "is_reference": {"type": "boolean", "description": "Resolve existing alias/name; false declares."},
-                                        "canonical_name_confirmed": {"type": "boolean"}
-                                    },
-                                    "required": ["local_id", "entity_type", "canonical_name"]
-                                }
-                            },
-                            "aliases": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "entity_local_id": {"type": "string"},
-                                        "value": {"type": "string"},
-                                        "alias_type": {"type": "string", "enum": ["legal_name_variant", "preferred_name", "nickname", "username", "online_handle", "account_name"]}
-                                    },
-                                    "required": ["entity_local_id", "value", "alias_type"]
-                                }
-                            },
-                            "facts": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "subject_local_id": {"type": "string"},
-                                        "predicate": {"type": "string"},
-                                        "value": {"type": "string"},
-                                        "display_value": {"type": "string"},
-                                        "valid_from": {"type": "string"},
-                                        "valid_to": {"type": "string"}
-                                    },
-                                    "required": ["subject_local_id", "predicate", "value"]
-                                }
-                            },
-                            "relationships": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "source_local_id": {"type": "string"},
-                                        "relationship_type": {"type": "string", "enum": ["PARENT_OF", "CHILD_OF", "LIVES_WITH", "LIVES_IN", "USES_ALIAS", "USES_HANDLE", "HAS_ACCOUNT"]},
-                                        "target_local_id": {"type": "string"},
-                                        "valid_from": {"type": "string"},
-                                        "valid_to": {"type": "string"}
-                                    },
-                                    "required": ["source_local_id", "relationship_type", "target_local_id"]
-                                }
-                            },
-                            "direct_user_statement": {"type": "boolean"},
-                            "correction": {"type": "boolean"}
-                        },
-                        "additionalProperties": false
                     }
                 },
                 "additionalProperties": false
@@ -203,36 +145,13 @@ impl Tool for RememberFactTool {
             let mut results = Vec::new();
 
             // An empty personal_memory block (models often send every schema
-            // section) carries nothing to reconcile. Treating it as present used
-            // to short-circuit the call and silently drop the plain facts beside
-            // it while reporting "No changes (already current)".
-            let personal = args.personal_memory.filter(|personal| {
-                !(personal.entities.is_empty()
-                    && personal.aliases.is_empty()
-                    && personal.facts.is_empty()
-                    && personal.relationships.is_empty())
-            });
-            let has_personal = personal.is_some();
-            if let Some(mut personal) = personal {
-                personal.direct_user_statement = true;
-                let result = self
-                    .state
-                    .reconcile_personal_memory(
-                        &personal,
-                        "agent",
-                        None,
-                        channel_id.as_deref(),
-                        FactPrivacy::Private,
-                    )
-                    .await?;
-                results.push(format!("Personal memory: {}", result.concise_summary()));
+            // section) carries nothing; one with people is answered with
+            // where people went, and nothing in the call is stored.
+            if call_carries_people(arguments) {
+                return Ok(PEOPLE_MOVED.to_string());
             }
-
             let facts = args.facts.filter(|facts| !facts.is_empty());
             let single_key = args.key.filter(|key| !key.trim().is_empty());
-            if has_personal && facts.is_none() && single_key.is_none() {
-                return Ok(results.join("\n"));
-            }
 
             // Build the list of facts to store (batch or single)
             let entries: Vec<FactEntry> = if let Some(facts) = facts {
@@ -409,8 +328,29 @@ impl Tool for RememberFactTool {
             Ok(results.join("\n"))
         }
         .await;
-        output.map(aidaemon_tools::semantics::ToolCallOutcome::from_output)
+        let people_moved = call_carries_people(arguments);
+        output.map(|output| {
+            let mut outcome = aidaemon_tools::semantics::ToolCallOutcome::from_output(output);
+            if people_moved {
+                outcome.metadata.outcome_status =
+                    Some(aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent);
+            }
+            outcome
+        })
     }
+}
+
+/// Whether the call still sends people (a non-empty `personal_memory`).
+fn call_carries_people(arguments: &str) -> bool {
+    serde_json::from_str::<RememberArgs>(arguments)
+        .ok()
+        .and_then(|args| args.personal_memory)
+        .is_some_and(|personal| {
+            !(personal.entities.is_empty()
+                && personal.aliases.is_empty()
+                && personal.facts.is_empty()
+                && personal.relationships.is_empty())
+        })
 }
 
 impl aidaemon_tools::semantics::ToolSemantics for RememberFactTool {
@@ -517,6 +457,55 @@ mod tests {
             "personal_memory": {"entities": [], "aliases": [], "facts": [], "relationships": []}
         });
         assert!(tool.call(&args.to_string()).await.is_err());
+    }
+
+    /// People moved to manage_people: a call that still sends them stores
+    /// nothing (not even the facts beside them) and says where they went.
+    #[tokio::test]
+    async fn a_call_with_people_names_manage_people_and_stores_nothing() {
+        let (tool, state, _db) = setup().await;
+        let args = json!({
+            "facts": [{"category": "preference", "key": "editor", "value": "synthetic-editor"}],
+            "personal_memory": {
+                "entities": [{"local_id": "zoe", "entity_type": "person", "canonical_name": "Zoe"}]
+            }
+        });
+        let outcome = tool
+            .execute(&args.to_string(), &Default::default())
+            .await
+            .unwrap();
+        assert!(
+            outcome.output.contains("manage_people"),
+            "{}",
+            outcome.output
+        );
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent)
+        );
+        assert!(state.get_facts(None).await.unwrap().is_empty());
+        assert!(state.get_canonical_memory_facts().await.unwrap().is_empty());
+    }
+
+    /// The owner's own profile keys still land in structured memory.
+    #[tokio::test]
+    async fn owner_profile_keys_still_reach_structured_memory() {
+        let (tool, state, _db) = setup().await;
+        let out = tool
+            .call(
+                &json!({"category": "user", "key": "birthday", "value": "1990-01-02"}).to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("(canonical)"), "{out}");
+        assert!(
+            state
+                .get_canonical_memory_facts()
+                .await
+                .unwrap()
+                .iter()
+                .any(|fact| fact.category == "user" && fact.value == "1990-01-02")
+        );
     }
 
     /// A value is stored as written: "none" is an answer, and wording such
