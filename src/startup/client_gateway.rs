@@ -123,6 +123,14 @@ impl SystemSources {
         })
         .collect();
         let since = chrono::Utc::now() - chrono::Duration::hours(24);
+        // The timings come from the latest 2000 calls; the count is all of them.
+        let calls_in_window: Option<i64> = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'llm_call' AND created_at >= ?",
+        )
+        .bind(since.to_rfc3339())
+        .fetch_one(&self.pool)
+        .await
+        .ok();
         let model_calls = self
             .events
             .get_llm_stats(since)
@@ -130,7 +138,10 @@ impl SystemSources {
             .ok()
             .filter(|stats| stats.total_calls > 0)
             .map(|stats| ModelCalls {
-                total: stats.total_calls,
+                total: calls_in_window
+                    .and_then(|n| u64::try_from(n).ok())
+                    .unwrap_or(stats.total_calls)
+                    .max(stats.total_calls),
                 failed: stats.failed_calls,
                 fell_back: stats.fell_back_count,
                 p50_ms: stats.p50_latency_ms,
