@@ -23,6 +23,7 @@ manage_skills 820 205
 mandate_review 3694 924
 node_restart 766 192
 policy_metrics 459 115
+read_channel_history 944 236
 read_file 1121 281
 read_node_health 670 168
 read_node_sensors 473 119
@@ -44,5 +45,5 @@ use_skill 483 121
 web_fetch 647 162
 web_search 1326 332
 write_file 1068 267
-TOTAL 74452 18613 (45 tools)
-PER_CALL 31708 7927 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 26 deferred)
+TOTAL 75396 18849 (46 tools)
+PER_CALL 31797 7950 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 27 deferred)
