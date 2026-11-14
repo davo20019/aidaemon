@@ -9,45 +9,52 @@
 //! (default model `moonshotai/kimi-k2.5`) instead.
 //!
 //! Arms:
-//! - `daemon`: what the daemon's model call does today
-//!   (`aidaemon_runtime::engine::turn_engine`): each tool result capped at
-//!   the configured character limit (`compress_tool_result`), the run's
-//!   older rounds replaced by a model-written summary once the request
-//!   passes 80% of the budget, then role-quota fitting
-//!   (`fit_run_values`) as the fallback, over the wire-format JSON.
-//! - `context_window`: the same result cap, then the policies crate's
-//!   `ContextWindow` over the typed messages, with the daemon's own budget
-//!   (the window less the response reserve).
+//! - `daemon`: what the daemon's model call does
+//!   (`aidaemon_runtime::engine::turn_engine::model_call`): each tool result
+//!   capped at the configured character limit (`compress_tool_result`), then
+//!   the one request budget, `engine::provider::fit_request` (the policies
+//!   crate's `ContextWindow` over the prefix, the tool definitions and the
+//!   run) sized by `context_budget::request_window` (the model's window less
+//!   the response reserve, scaled by the per-model token calibration the
+//!   provider's reported usage feeds). A provider's context-overflow error
+//!   records the window it stated and retries, as the daemon does.
+//! - `context_window`: the same result cap, then the policies crate's plain
+//!   `ContextWindow` with the window less the response reserve, no
+//!   calibration, no prefix.
+//!
+//! The daemon's earlier budgeter (role-quota fitting, a model-written
+//! summary at 80% of the budget) was replaced by `fit_request` after the
+//! 2c753f97 run; its numbers are printed beside the `daemon` arm as
+//! [`BASELINE_2C753F97`].
 //!
 //! Both see the model as one with the window a scenario's
 //! `context_cap:<tokens>` tag gives it, the budget the daemon would compute
 //! for such a model. Scenarios default to the two that stress context
 //! (`context_trail`, `context_tally`); `EVAL_ONLY=name,name` picks others.
 //! Each arm writes `<out_dir>/<arm>.json` and prints its report and its
-//! token split (summary calls included, which the report's per-run
-//! billable tokens leave out).
+//! token split; the `daemon` arm also prints itself beside the 2c753f97
+//! baseline. Token calibration is per process, as in the daemon: the
+//! `daemon` arm's runs share it.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aidaemon_core::{
-    Hook, HookContext, ModelRequest, ModelResponse, Provider, ProviderError, StreamEvent, Usage,
+    Hook, HookContext, ModelDecision, ModelErrorDecision, ModelRequest, ModelResponse, Provider,
+    ProviderError, StreamEvent, Usage,
 };
 use aidaemon_eval::examples::{ExampleExpect, ExampleFactory, ExampleSubject};
 use aidaemon_eval::{NoExtension, Report, Suite, compare};
 use aidaemon_policies::ContextWindow;
 use aidaemon_providers::Anthropic;
 use aidaemon_runtime::context_budget::{
-    compress_tool_result, compute_available_budget_precomputed, estimate_multimodal_message_tokens,
-};
-use aidaemon_runtime::engine::compaction::{
-    COMPACT_AT_PERCENT, KEEP_RECENT_PERCENT, RunCompaction, SUMMARY_MAX_OUTPUT_TOKENS,
-    compacted_view, compaction_cut, summary_request,
+    calibrated_tokens, compress_tool_result, record_token_estimate_calibration, request_window,
 };
 use aidaemon_runtime::engine::provider::{
-    fit_run_values, to_daemon_messages_from, to_daemon_tools, values_to_sdk,
+    RunMessage, fit_request, to_daemon_messages_from, values_to_sdk,
 };
+use aidaemon_runtime::engine::turn_engine::model_call::MAX_CONTEXT_OVERFLOW_RETRIES;
 use aidaemon_runtime::settings::ContextWindowConfig;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -56,7 +63,17 @@ use futures::stream::BoxStream;
 const ARMS: &[&str] = &["daemon", "context_window"];
 const DEFAULT_SCENARIOS: &str = "context_trail,context_tally";
 
-/// Every call's usage, summary calls included.
+/// The daemon's earlier budgeter on Haiku (claude-haiku-5-5), N=5, a
+/// 10k-token window, at 2c753f97: (scenario, passes of 5, mean turns, mean
+/// billable tokens per run). context_trail hit the 20-turn limit every run;
+/// context_tally sent ~11.6k tokens against the 10k window and failed on
+/// the provider every run. Spend over the 10 runs: 1.31M input, 20.6k output.
+const BASELINE_2C753F97: &[(&str, usize, f64, f64)] = &[
+    ("context_trail", 0, 20.0, 190_554.0),
+    ("context_tally", 0, 2.0, 921.8),
+];
+
+/// Every call's usage.
 #[derive(Default)]
 struct Spend {
     input: AtomicU64,
@@ -64,7 +81,6 @@ struct Spend {
     created: AtomicU64,
     output: AtomicU64,
     calls: AtomicU64,
-    summary_calls: AtomicU64,
 }
 
 impl Spend {
@@ -79,14 +95,13 @@ impl Spend {
         self.calls.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn take(&self) -> [u64; 6] {
+    fn take(&self) -> [u64; 5] {
         [
             &self.input,
             &self.cached,
             &self.created,
             &self.output,
             &self.calls,
-            &self.summary_calls,
         ]
         .map(|counter| counter.swap(0, Ordering::Relaxed))
     }
@@ -154,70 +169,15 @@ fn cap_results(request: &mut ModelRequest, config: &ContextWindowConfig) {
 }
 
 /// The daemon's budgeting of one model call, as
-/// `turn_engine::model_call` and `turn_engine::compaction` do it.
+/// `turn_engine::model_call` does it: the starting transcript is the wire
+/// prefix, the rest the run.
 struct DaemonBudget {
     config: ContextWindowConfig,
-    summarizer: Arc<dyn Provider>,
-    spend: Arc<Spend>,
     /// The starting transcript's length (the daemon's wire prefix).
     prefix_len: Mutex<Option<usize>>,
-    compaction: Mutex<Option<RunCompaction>>,
-}
-
-impl DaemonBudget {
-    async fn compacted_run(
-        &self,
-        model: &str,
-        prefix_tokens: usize,
-        run: &[serde_json::Value],
-        budget: usize,
-    ) -> Vec<serde_json::Value> {
-        let current = self.compaction.lock().unwrap().clone();
-        let view = compacted_view(run, current.as_ref());
-        let view_tokens = estimate_multimodal_message_tokens(&view);
-        if prefix_tokens + view_tokens <= budget * COMPACT_AT_PERCENT / 100 {
-            return view;
-        }
-        let covered = current.as_ref().map_or(0, |c| c.covered);
-        let keep_tokens = budget.saturating_sub(prefix_tokens) * KEEP_RECENT_PERCENT / 100;
-        let Some(cut) = compaction_cut(&run[covered..], keep_tokens).map(|cut| covered + cut)
-        else {
-            return view;
-        };
-        if cut <= covered {
-            return view;
-        }
-        let request = summary_request(
-            current.as_ref().map(|c| c.summary.as_str()),
-            &run[covered..cut],
-        );
-        let request = ModelRequest {
-            model: model.to_string(),
-            messages: values_to_sdk(&request),
-            tools: Vec::new(),
-            tool_choice: aidaemon_core::ToolChoice::None,
-            max_output_tokens: Some(SUMMARY_MAX_OUTPUT_TOKENS),
-            options: Default::default(),
-        };
-        self.spend.summary_calls.fetch_add(1, Ordering::Relaxed);
-        let summary = match self.summarizer.complete(&request).await {
-            Ok(response) => response.text,
-            Err(error) => {
-                eprintln!("summary call failed, fitting by quota: {error}");
-                return view;
-            }
-        };
-        if summary.trim().is_empty() {
-            return view;
-        }
-        let compaction = RunCompaction {
-            covered: cut,
-            summary: summary.trim().to_string(),
-        };
-        let view = compacted_view(run, Some(&compaction));
-        *self.compaction.lock().unwrap() = Some(compaction);
-        view
-    }
+    /// The last request's model and raw estimate, for calibration.
+    sent: Mutex<Option<(String, usize)>>,
+    overflow_retries: AtomicU32,
 }
 
 #[async_trait]
@@ -233,16 +193,54 @@ impl Hook for DaemonBudget {
             .lock()
             .unwrap()
             .get_or_insert(request.messages.len());
-        let tools = to_daemon_tools(&request.tools);
-        let budget = compute_available_budget_precomputed(&request.model, 0, &tools, &self.config);
         let split = prefix_len.min(request.messages.len());
         let prefix = to_daemon_messages_from(&request.messages[..split]);
-        let run = to_daemon_messages_from(&request.messages[split..]);
-        let prefix_tokens = estimate_multimodal_message_tokens(&prefix);
-        let run = self
-            .compacted_run(&request.model, prefix_tokens, &run, budget)
-            .await;
-        request.messages = values_to_sdk(&fit_run_values(&prefix, run, budget));
+        let run = request.messages[split..]
+            .iter()
+            .cloned()
+            .map(RunMessage::Kernel)
+            .collect();
+        let window = request_window(&request.model, &self.config);
+        let fitted = fit_request(&prefix, run, &request.tools, &window);
+        *self.sent.lock().unwrap() = Some((request.model.clone(), fitted.estimated_tokens));
+        request.messages = values_to_sdk(&fitted.messages);
+    }
+
+    async fn after_model(
+        &self,
+        _ctx: &HookContext<'_>,
+        response: &mut ModelResponse,
+    ) -> ModelDecision {
+        if let Some((model, estimate)) = self.sent.lock().unwrap().take() {
+            record_token_estimate_calibration(
+                &model,
+                estimate,
+                response.usage.input_tokens as usize,
+            );
+        }
+        ModelDecision::Accept
+    }
+
+    async fn on_model_error(
+        &self,
+        _ctx: &HookContext<'_>,
+        error: &ProviderError,
+    ) -> ModelErrorDecision {
+        let sent = self.sent.lock().unwrap().take();
+        if let (ProviderError::ContextOverflow { limit, .. }, Some((model, estimate))) =
+            (error, sent)
+            && self.overflow_retries.fetch_add(1, Ordering::Relaxed) < MAX_CONTEXT_OVERFLOW_RETRIES
+        {
+            aidaemon_runtime::settings::record_context_overflow(
+                &model,
+                limit.map(|l| l as usize),
+                calibrated_tokens(&model, estimate),
+            );
+            return ModelErrorDecision::Retry {
+                after: std::time::Duration::ZERO,
+            };
+        }
+        ModelErrorDecision::Fail
     }
 }
 
@@ -262,6 +260,24 @@ impl Hook for CapThenWindow {
         cap_results(request, &self.config);
         self.window.before_model(ctx, request).await;
     }
+}
+
+/// This run's `daemon` arm beside the earlier budgeter's (2c753f97).
+fn baseline_table(report: &Report) -> String {
+    let mut table = String::from(
+        "| scenario | 2c753f97 passes | now passes | 2c753f97 turns | now turns | \
+         2c753f97 billable/run | now billable/run |\n|---|---|---|---|---|---|---|\n",
+    );
+    for (name, passes, turns, billable) in BASELINE_2C753F97 {
+        let Some(now) = report.scenarios.iter().find(|s| s.name == *name) else {
+            continue;
+        };
+        table.push_str(&format!(
+            "| {name} | {passes}/5 | {}/{} | {turns:.1} | {:.1} | {billable:.0} | {:.0} |\n",
+            now.passes, now.runs, now.mean_turns, now.mean_billable_tokens
+        ));
+    }
+    table
 }
 
 fn window_of(scenario: &aidaemon_eval::Scenario) -> usize {
@@ -337,8 +353,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for arm in arms {
         let hook_arm = arm.clone();
         let hook_model = model.clone();
-        let summarizer = provider.clone();
-        let hook_spend = spend.clone();
         let factory = ExampleFactory::with_live_provider(provider.clone())
             .model(model.clone())
             .with_hooks(move |scenario| {
@@ -347,10 +361,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let hook: Arc<dyn Hook> = match hook_arm.as_str() {
                     "daemon" => Arc::new(DaemonBudget {
                         config,
-                        summarizer: summarizer.clone(),
-                        spend: hook_spend.clone(),
                         prefix_len: Mutex::new(None),
-                        compaction: Mutex::new(None),
+                        sent: Mutex::new(None),
+                        overflow_retries: AtomicU32::new(0),
                     }),
                     _ => Arc::new(CapThenWindow {
                         window: ContextWindow::new(window.saturating_sub(
@@ -362,10 +375,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 vec![hook]
             });
         let report = suite.run_subject(&ExampleSubject::new(&factory), n).await;
-        let [input, cached, created, output, calls, summaries] = spend.take();
+        let [input, cached, created, output, calls] = spend.take();
         println!("## {arm} ({model}, N={n})\n\n{}", report.to_markdown());
         println!(
-            "Spend over {runs} runs: {calls} calls ({summaries} summaries), input {input} \
+            "Spend over {runs} runs: {calls} calls, input {input} \
              (cache read {cached}, cache write {created}), output {output}; \
              billable/run {:.0}\n",
             (input.saturating_sub(cached) + output) as f64 / runs
@@ -375,12 +388,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             out.join(format!("{arm}.spend.json")),
             format!(
                 "{{\"input\":{input},\"cache_read\":{cached},\"cache_write\":{created},\
-                 \"output\":{output},\"calls\":{calls},\"summary_calls\":{summaries},\"runs\":{runs}}}"
+                 \"output\":{output},\"calls\":{calls},\"runs\":{runs}}}"
             ),
         )?;
-        let baseline = out.join("daemon.json");
-        if arm != "daemon" && baseline.exists() {
-            let base = Report::from_json(&std::fs::read_to_string(baseline)?)?;
+        if arm == "daemon" {
+            println!("{}", baseline_table(&report));
+        }
+        let daemon = out.join("daemon.json");
+        if arm != "daemon" && daemon.exists() {
+            let base = Report::from_json(&std::fs::read_to_string(daemon)?)?;
             println!("{}", compare(&base, &report).to_markdown());
         }
     }

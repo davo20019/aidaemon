@@ -3,11 +3,12 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use aidaemon_core::{Hook, HookContext, Message, ModelRequest, Role, ToolCall};
+use aidaemon_core::{Hook, HookContext, Message, ModelRequest, Role, ToolCall, ToolSpec};
 use async_trait::async_trait;
 
 /// Rough token estimate: characters / 4, counting content, tool-call names
-/// and arguments. Good enough to decide *when* to compact.
+/// and arguments, and a fixed allowance per image and audio clip. Good
+/// enough to decide *when* to compact.
 pub fn estimate_tokens(messages: &[Message]) -> usize {
     messages
         .iter()
@@ -16,19 +17,30 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
         .div_ceil(4)
 }
 
+/// What one image costs a request, in estimate characters (about 1.2k
+/// tokens: a screenshot, not its base64 bytes).
+const IMAGE_CHARS: usize = 4_800;
+
+/// What an audio clip costs: about a token per 100 bytes of audio (the
+/// data is base64, 4 characters per 3 bytes), at least 64 tokens.
+fn audio_chars(data: &str) -> usize {
+    ((data.len() * 3 / 4) / 100).max(64) * 4
+}
+
 fn message_chars(m: &Message) -> usize {
     m.content.chars().count()
         + m.tool_calls
             .iter()
             .map(|c| c.name.len() + c.arguments.to_string().len())
             .sum::<usize>()
+        + m.images.len() * IMAGE_CHARS
+        + m.audio.iter().map(|a| audio_chars(&a.data)).sum::<usize>()
 }
 
-/// Characters the request spends outside its messages: the tool
-/// definitions the provider sends with every call.
-fn tool_spec_chars(request: &ModelRequest) -> usize {
-    request
-        .tools
+/// Characters a request spends on its tool definitions, which the
+/// provider sends with every call.
+pub fn tool_spec_chars(tools: &[ToolSpec]) -> usize {
+    tools
         .iter()
         .map(|t| t.name.len() + t.description.chars().count() + t.parameters.to_string().len())
         .sum()
@@ -38,29 +50,45 @@ fn tool_spec_chars(request: &ModelRequest) -> usize {
 const STUB_ARGS_CHARS: usize = 200;
 const STUB_LINE_CHARS: usize = 120;
 
+/// How each message of the transcript goes into one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shown {
+    Full,
+    Stub,
+    Dropped,
+}
+
 /// Keeps each request under a token budget without touching stored state,
 /// and keeps the request's prefix stable so the provider's prompt cache
 /// keeps hitting.
 ///
 /// The budget covers what the provider is sent: every message plus the
-/// tool definitions ([`ContextWindow::compact_request`]). Output tokens are
-/// not included; set the budget below the model's window by at least the
+/// tool definitions ([`ContextWindow::compact_request`]), and anything else
+/// the caller sends around the messages
+/// ([`ContextWindow::compact_with_overhead`]). Output tokens are not
+/// included; set the budget below the model's window by at least the
 /// output limit.
 ///
 /// **Coarse, stable steps.** Old tool results are replaced by a short stub
 /// up to a *cut*, and units before a *drop* point are left out. Both move
-/// only when a request would pass the budget, and then far enough to bring
-/// it down to half the budget, so the following requests grow back on the
-/// same prefix until the budget is reached again. The two points are
-/// replayed from the transcript itself (every earlier model call saw a
-/// prefix of it), so the hook keeps no state and a resumed run computes
-/// the same view.
+/// only when a request would pass the budget. The cut then moves far
+/// enough to bring the request down to half the budget, so the following
+/// requests grow back on the same prefix until the budget is reached again;
+/// stubbed units are dropped (oldest first) only once the stubs themselves
+/// fill a quarter of the budget, since they keep what the model already
+/// learned (its own notes, which calls it made) at little cost. The two
+/// points are replayed from the transcript itself (every earlier model
+/// call saw a prefix of it), so the hook keeps no state and a resumed run
+/// computes the same view.
 ///
 /// **Stubs say what was there.** An elided result becomes
 /// `[earlier tool result elided ...: <tool> <arguments> returned N chars
-/// (first line: "..."; last line: "...")...]`, so the model knows it
-/// already ran the call and where it led, and is told to call again only
-/// if it needs the exact content.
+/// (first line: "..."; last line: "...")...]`. A result an earlier request
+/// showed in full says so, and that the call needs repeating only for its
+/// exact content. A result no request has shown yet (it came in a turn
+/// whose results did not all fit) says the model has not seen it and must
+/// call the tool again, with fewer calls at once: a repeated call is a
+/// new, recent result, which the next request shows in full.
 ///
 /// **Never over budget.** System messages, injected harness messages and
 /// the user's first and latest messages are never elided or dropped, and the most
@@ -88,6 +116,11 @@ impl ContextWindow {
         }
     }
 
+    /// The token budget each request is kept under.
+    pub fn budget_tokens(&self) -> usize {
+        self.budget_tokens
+    }
+
     /// Turns the stable steps keep whole (a turn is an assistant message
     /// plus its tool results, and any user message after it). More turns
     /// mean smaller steps, so the prefix changes more often.
@@ -99,24 +132,57 @@ impl ContextWindow {
     /// Compact `messages` in place, counting messages only. Returns true if
     /// anything changed.
     pub fn compact(&self, messages: &mut Vec<Message>) -> bool {
-        self.compact_with_overhead(messages, 0)
+        let before = messages.clone();
+        self.compact_with_overhead(messages, 0);
+        *messages != before
     }
 
     /// Compact a whole request: its messages, with its tool definitions
     /// counted against the budget too. Returns true if anything changed.
     pub fn compact_request(&self, request: &mut ModelRequest) -> bool {
-        let overhead = tool_spec_chars(request);
-        self.compact_with_overhead(&mut request.messages, overhead)
+        let overhead = tool_spec_chars(&request.tools);
+        let before = request.messages.clone();
+        self.compact_with_overhead(&mut request.messages, overhead);
+        request.messages != before
     }
 
-    fn compact_with_overhead(&self, messages: &mut Vec<Message>, overhead_chars: usize) -> bool {
+    /// Compact `messages` in place, with `overhead_chars` (estimate
+    /// characters, 4 to a token) counted for whatever else the request
+    /// sends: its tool definitions, a fixed prefix sent ahead of these
+    /// messages. Returns, for each message as passed, whether it is still
+    /// there (stubbed or whole); the survivors keep their order.
+    pub fn compact_with_overhead(
+        &self,
+        messages: &mut Vec<Message>,
+        overhead_chars: usize,
+    ) -> Vec<bool> {
+        let view = self.view(messages, overhead_chars);
+        let calls = calls_by_id(messages);
+        let kept: Vec<bool> = view.iter().map(|(s, _)| *s != Shown::Dropped).collect();
+        for (m, (shown, seen)) in messages.iter_mut().zip(&view) {
+            if *shown == Shown::Stub {
+                apply_stub(m, &calls, *seen);
+            }
+        }
+        let mut index = 0;
+        messages.retain(|_| {
+            let k = kept[index];
+            index += 1;
+            k
+        });
+        kept
+    }
+
+    /// How each message goes into this request, and whether an earlier
+    /// request showed it in full.
+    fn view(&self, messages: &[Message], overhead_chars: usize) -> Vec<(Shown, bool)> {
         let budget = self.budget_tokens.saturating_mul(4);
         let low_water = budget / 2;
         let current = overhead_chars + messages.iter().map(message_chars).sum::<usize>();
         // Every earlier request was a prefix of this one, so none of them
         // passed the budget either: nothing was ever cut.
         if current <= budget {
-            return false;
+            return vec![(Shown::Full, true); messages.len()];
         }
 
         let units = units(messages);
@@ -126,6 +192,8 @@ impl ContextWindow {
             .iter()
             .map(|r| messages[r.clone()].iter().map(message_chars).sum())
             .collect();
+        // The stable steps size stubs as shown ones; the exact view below
+        // counts each stub as it is sent.
         let stubbed: Vec<usize> = units
             .iter()
             .enumerate()
@@ -135,10 +203,8 @@ impl ContextWindow {
                 }
                 messages[r.clone()]
                     .iter()
-                    .map(|m| match stub_for(m, &calls) {
-                        Some(stub) => {
-                            stub.chars().count() + message_chars(m) - m.content.chars().count()
-                        }
+                    .map(|m| match stub_for(m, &calls, true) {
+                        Some(stub) => stub.chars().count(),
                         None => message_chars(m),
                     })
                     .sum()
@@ -149,11 +215,14 @@ impl ContextWindow {
             .collect();
 
         // Replay the stable steps at every point a model call was made: the
-        // end of each unit an assistant message follows, and now.
+        // end of each unit an assistant message follows, and now. Each
+        // earlier call's exact view says which results it showed in full.
         let assistant_units: Vec<usize> = (0..units.len())
             .filter(|&u| messages[units[u].start].role == Role::Assistant)
             .collect();
         let (mut cut, mut drop) = (0usize, 0usize);
+        let mut seen = vec![false; messages.len()];
+        let mut view = Vec::new();
         for p in 1..=units.len() {
             if p < units.len() && messages[units[p].start].role != Role::Assistant {
                 continue;
@@ -162,84 +231,107 @@ impl ContextWindow {
                 + dropped[..drop].iter().sum::<usize>()
                 + stubbed[drop..cut].iter().sum::<usize>()
                 + full[cut..p].iter().sum::<usize>();
-            if size <= budget {
-                continue;
+            if size > budget {
+                let boundary = self.protected_start(&assistant_units, p).max(cut);
+                while cut < boundary && size > low_water {
+                    size -= full[cut] - stubbed[cut];
+                    cut += 1;
+                }
+                let stub_floor = budget / 4;
+                let mut stubs: usize = stubbed[drop..cut].iter().sum::<usize>()
+                    - dropped[drop..cut].iter().sum::<usize>();
+                while drop < cut && size > low_water && stubs > stub_floor {
+                    let freed = stubbed[drop] - dropped[drop];
+                    size -= freed;
+                    stubs -= freed;
+                    drop += 1;
+                }
             }
-            let boundary = self.protected_start(&assistant_units, p).max(cut);
-            while cut < boundary && size > low_water {
-                size -= full[cut] - stubbed[cut];
-                cut += 1;
-            }
-            while drop < cut && size > low_water {
-                size -= stubbed[drop] - dropped[drop];
-                drop += 1;
-            }
-        }
-
-        // Apply the stable view.
-        let mut changed = false;
-        let mut keep = vec![true; messages.len()];
-        for (u, range) in units.iter().enumerate().take(cut) {
-            if fixed[u] {
-                continue;
-            }
-            for i in range.clone() {
-                if u < drop {
-                    keep[i] = false;
-                    changed = true;
-                } else {
-                    changed |= apply_stub(&mut messages[i], &calls);
+            view = self.view_at(
+                messages,
+                &units,
+                &fixed,
+                &calls,
+                &seen,
+                (p, cut, drop),
+                overhead_chars,
+            );
+            if p < units.len() {
+                for (i, shown) in view.iter().enumerate() {
+                    if *shown == Shown::Full {
+                        seen[i] = true;
+                    }
                 }
             }
         }
-        let mut size = overhead_chars
-            + messages
-                .iter()
-                .zip(&keep)
-                .filter(|(_, k)| **k)
-                .map(|(m, _)| message_chars(m))
-                .sum::<usize>();
+        view.into_iter().zip(seen).collect()
+    }
 
+    /// The exact view sent at point `p` (the first `p` units) with the
+    /// stable steps at `cut` and `drop`: over the budget, the recent
+    /// results are elided oldest first, then the oldest units dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn view_at(
+        &self,
+        messages: &[Message],
+        units: &[Range<usize>],
+        fixed: &[bool],
+        calls: &HashMap<String, ToolCall>,
+        seen: &[bool],
+        (p, cut, drop): (usize, usize, usize),
+        overhead_chars: usize,
+    ) -> Vec<Shown> {
+        let budget = self.budget_tokens.saturating_mul(4);
+        let end = units[p - 1].end;
+        let mut shown = vec![Shown::Full; end];
+        let sent = |i: usize, how: Shown| match how {
+            Shown::Full => message_chars(&messages[i]),
+            Shown::Stub => stub_for(&messages[i], calls, seen[i])
+                .map_or_else(|| message_chars(&messages[i]), |s| s.chars().count()),
+            Shown::Dropped => 0,
+        };
+        let mut size = overhead_chars;
+        for (u, range) in units[..p].iter().enumerate() {
+            for i in range.clone() {
+                if !fixed[u] && u < drop {
+                    shown[i] = Shown::Dropped;
+                } else if !fixed[u] && u < cut && stub_for(&messages[i], calls, seen[i]).is_some() {
+                    shown[i] = Shown::Stub;
+                }
+                size += sent(i, shown[i]);
+            }
+        }
         // Still over: the recent turns alone pass the budget. For this
         // request only, elide their results oldest first...
         if size > budget {
-            'elide: for range in &units[cut..] {
+            'elide: for range in &units[cut..p] {
                 for i in range.clone() {
                     if size <= budget {
                         break 'elide;
                     }
-                    let before = message_chars(&messages[i]);
-                    if apply_stub(&mut messages[i], &calls) {
-                        size -= before - message_chars(&messages[i]);
-                        changed = true;
+                    if shown[i] == Shown::Full && stub_for(&messages[i], calls, seen[i]).is_some() {
+                        size -= sent(i, Shown::Full) - sent(i, Shown::Stub);
+                        shown[i] = Shown::Stub;
                     }
                 }
             }
         }
         // ...then drop the oldest units, never the newest one.
         if size > budget {
-            for (u, range) in units.iter().enumerate().take(units.len() - 1) {
+            for (u, range) in units[..p].iter().enumerate().take(p - 1) {
                 if size <= budget {
                     break;
                 }
-                if fixed[u] || !keep[range.start] {
+                if fixed[u] || shown[range.start] == Shown::Dropped {
                     continue;
                 }
                 for i in range.clone() {
-                    keep[i] = false;
-                    size -= message_chars(&messages[i]);
+                    size -= sent(i, shown[i]);
+                    shown[i] = Shown::Dropped;
                 }
-                changed = true;
             }
         }
-
-        let mut index = 0;
-        messages.retain(|_| {
-            let k = keep[index];
-            index += 1;
-            k
-        });
-        changed
+        shown
     }
 
     /// First unit of the `keep_recent_turns` most recent turns before `p`.
@@ -303,8 +395,9 @@ fn calls_by_id(messages: &[Message]) -> HashMap<String, ToolCall> {
 }
 
 /// The stub that replaces a tool result, or `None` when `m` is not a tool
-/// result (or already a stub, or the stub would not be shorter).
-fn stub_for(m: &Message, calls: &HashMap<String, ToolCall>) -> Option<String> {
+/// result (or the stub would not be shorter). `seen`: an earlier request
+/// showed the result in full.
+fn stub_for(m: &Message, calls: &HashMap<String, ToolCall>, seen: bool) -> Option<String> {
     if m.role != Role::Tool {
         return None;
     }
@@ -317,7 +410,7 @@ fn stub_for(m: &Message, calls: &HashMap<String, ToolCall>) -> Option<String> {
     };
     let chars = m.content.chars().count();
     let mut lines = m.content.lines().map(str::trim).filter(|l| !l.is_empty());
-    let seen = match (lines.next(), lines.next_back()) {
+    let first_last = match (lines.next(), lines.next_back()) {
         (Some(first), Some(last)) => {
             format!(
                 " (first line: {}; last line: {})",
@@ -328,20 +421,29 @@ fn stub_for(m: &Message, calls: &HashMap<String, ToolCall>) -> Option<String> {
         (Some(only), None) => format!(" (output: {})", quote(only)),
         _ => String::new(),
     };
-    let stub = format!(
-        "[earlier tool result elided to fit the context window: {tool} {args} returned \
-         {chars} chars{seen}. You read it in full when it ran; call the tool again only if \
-         you need its exact content.]"
-    );
-    (stub.chars().count() < chars).then_some(stub)
+    let stub = if seen {
+        format!(
+            "[earlier tool result elided to fit the context window: {tool} {args} returned \
+             {chars} chars{first_last}. You read it in full when it ran; call the tool again only \
+             if you need its exact content.]"
+        )
+    } else {
+        format!(
+            "[tool result not shown, to fit the context window: {tool} {args} returned {chars} \
+             chars{first_last}. You have not seen its content. To read it, call the tool again, \
+             with fewer calls in the same turn.]"
+        )
+    };
+    (stub.chars().count() < message_chars(m)).then_some(stub)
 }
 
 /// Replace a tool result with its stub. Returns true if it changed.
-fn apply_stub(m: &mut Message, calls: &HashMap<String, ToolCall>) -> bool {
-    match stub_for(m, calls) {
+fn apply_stub(m: &mut Message, calls: &HashMap<String, ToolCall>, seen: bool) -> bool {
+    match stub_for(m, calls, seen) {
         Some(stub) => {
             m.content = stub;
             m.images.clear();
+            m.audio.clear();
             true
         }
         None => false,
@@ -517,8 +619,75 @@ mod tests {
         assert!(window.compact(&mut m));
         assert!(estimate_tokens(&m) <= 5_000, "{}", estimate_tokens(&m));
         assert!(well_formed(&m));
-        assert!(m[3].content.starts_with("[earlier tool result elided"));
+        // The model never saw the elided results: the stub says so, and how
+        // to get them.
+        assert!(
+            m[3].content.starts_with("[tool result not shown"),
+            "{}",
+            m[3].content
+        );
+        assert!(m[3].content.contains("You have not seen its content"));
         assert!(m[7].content.len() > 8_000, "the newest result stays");
+    }
+
+    /// A turn whose results did not all fit, then the model calls again for
+    /// the ones it was not shown, alone or in a smaller batch: the repeated
+    /// call comes back whole, and the first turn's stubs stay honest (the
+    /// shown results say they were read, the others that they were not).
+    #[test]
+    fn a_result_never_shown_comes_back_whole_when_called_again() {
+        let read = |id: &str, path: usize| ToolCall::new(id, "read_file", json!({"path": path}));
+        let mut m = vec![Message::system("sys"), Message::user("sum the ten shards")];
+        m.push(Message::assistant(
+            "",
+            (0..10).map(|i| read(&format!("a{i}"), i)).collect(),
+        ));
+        for i in 0..10 {
+            m.push(Message::tool_result(
+                format!("a{i}"),
+                body(7_600, &format!("count {i}")),
+            ));
+        }
+        let window = ContextWindow::new(8_000);
+        let first = view(&window, &m);
+        let unshown: Vec<usize> = (0..10)
+            .filter(|i| first[3 + i].content.starts_with("[tool result not shown"))
+            .collect();
+        assert!(!unshown.is_empty() && unshown.len() < 10, "{unshown:?}");
+        assert_eq!(unshown[0], 0, "oldest first");
+
+        // Each unshown result is asked for again, one call per turn.
+        for (turn, &i) in unshown.iter().enumerate() {
+            let id = format!("r{turn}");
+            m.push(Message::assistant("", vec![read(&id, i)]));
+            m.push(Message::tool_result(id, body(7_600, &format!("count {i}"))));
+            let v = view(&window, &m);
+            assert!(estimate_tokens(&v) <= 8_000);
+            assert!(well_formed(&v));
+            let last = v.last().unwrap();
+            assert!(last.content.len() > 7_600, "re-read {i} came back stubbed");
+            assert!(last.content.contains(&format!("count {i}")));
+            for (j, msg) in v.iter().enumerate() {
+                let Some(id) = msg.tool_call_id.as_deref() else {
+                    continue;
+                };
+                let Some(k) = id.strip_prefix('a').and_then(|k| k.parse::<usize>().ok()) else {
+                    continue;
+                };
+                if msg.content.starts_with('[') {
+                    let honest = if unshown.contains(&k) {
+                        "[tool result not shown"
+                    } else {
+                        "[earlier tool result elided"
+                    };
+                    assert!(
+                        msg.content.starts_with(honest),
+                        "turn {turn}, {j}: {}",
+                        msg.content
+                    );
+                }
+            }
+        }
     }
 
     #[test]

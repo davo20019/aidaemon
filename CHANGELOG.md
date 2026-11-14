@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A long task no longer loses track of what it read when the model's context window fills. Each model request is now fitted by one budgeter: old tool results are replaced by a short note saying which call returned what (first and last line, size), and the model is told plainly when a result it has not seen yet was left out, so it asks for it again instead of guessing. Before, the oldest steps were dropped without a word (the model restarted the task) and a turn with many large results could still go over the window and fail. The budget follows the model's real token count as replies report it, and a provider saying a request was too long lowers the budget even for a model with a configured `model_budgets` entry.
 - The release binary includes the Docker execution backend: `execution-docker` is a default feature (it adds no dependencies), so `[execution] backend = "docker"` works without a custom build. Docker is still needed only when that backend is selected.
 - On Linux, `[terminal] confinement = "sandbox"` no longer fails when the Codex sandbox adapter is not installed: it confines commands with bubblewrap (`bwrap`) instead, with the same task-scoped read, write and network grants, and logs which sandbox it uses. With neither available the command is refused, never run on the host. `host` stays the default on every OS.
 

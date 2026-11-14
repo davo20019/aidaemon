@@ -79,7 +79,7 @@ pub async fn with_idle_timeout<F: std::future::Future>(
 /// `run` with each placed message (a system directive, or a user message
 /// taken mid-turn) inserted before the run message at its position (after
 /// the last one when it is at the end).
-pub fn interleave_directives(run: Vec<Value>, directives: &[(usize, Value)]) -> Vec<Value> {
+pub fn interleave_directives<T: Clone>(run: Vec<T>, directives: &[(usize, T)]) -> Vec<T> {
     if directives.is_empty() {
         return run;
     }
@@ -201,10 +201,8 @@ impl TurnEngine<'_> {
         let iteration = scope.model_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot = self.llm_runtime().snapshot();
         let tools = to_daemon_tools(&request.tools);
-        let budget = crate::context_budget::compute_available_budget_precomputed(
+        let window = crate::context_budget::request_window(
             &request.model,
-            0,
-            &tools,
             &self.turn_runtime().context_window_config,
         );
         // Hook notes (recalled memory) ride in the wire prefix; the rest of
@@ -214,7 +212,6 @@ impl TurnEngine<'_> {
         let prefix = prefix_with_notes(&scope.prefix, &notes);
         // Directives raised since the last call are pinned where the run
         // stands now, so the sent transcript only ever grows at its end.
-        let run = to_daemon_messages_from(run);
         // A parent hears about its children here: pinned at the run's end
         // like any other directive, so the sent prefix never changes.
         if let Some(note) = scope
@@ -252,15 +249,19 @@ impl TurnEngine<'_> {
                 )
             }));
             placed.extend(steering.into_iter().map(|message| (run.len(), message)));
-            interleave_directives(run, &placed)
+            let pinned: Vec<(usize, RunMessage)> = placed
+                .iter()
+                .map(|(at, message)| (*at, RunMessage::Pinned(message.clone())))
+                .collect();
+            interleave_directives(
+                run.iter().cloned().map(RunMessage::Kernel).collect(),
+                &pinned,
+            )
         };
-        // An oversized run is compacted (older rounds summarized) before
-        // quota fitting, which stays as the fallback.
-        let prefix_tokens = crate::context_budget::estimate_multimodal_message_tokens(&prefix);
-        let run = self
-            .sdk_compacted_run(scope, &request.model, prefix_tokens, &run, budget)
-            .await;
-        let messages = fit_run_values(&prefix, run, budget);
+        // The one request budget: the policies' context window over the
+        // prefix, the tool definitions and the run.
+        let fitted = fit_request(&prefix, run, &request.tools, &window);
+        let messages = fitted.messages;
         self.observe_sent(scope.run_id, &messages);
         let mut options = to_chat_options(request);
         options.cache_key = Some(scope.session_id.to_string());
@@ -275,7 +276,11 @@ impl TurnEngine<'_> {
             .lock()
             .map(|learning| learning.tool_calls.is_empty())
             .unwrap_or(true);
-        let est_input_tokens = crate::context_budget::estimate_multimodal_message_tokens(&messages);
+        // The raw estimate calibrates against what the provider counts; the
+        // calibrated one is what the call is expected to cost.
+        let raw_input_tokens = fitted.estimated_tokens;
+        let est_input_tokens =
+            crate::context_budget::calibrated_tokens(&request.model, raw_input_tokens);
         let mut telemetry = crate::llm::turn_calls::LlmCallTelemetry::default();
         // Mandate runs share one durable token balance across the task lead
         // and its executors: reserve before the call, settle after it.
@@ -473,10 +478,11 @@ impl TurnEngine<'_> {
                 )
                 .await;
         } else if usage.is_some() {
-            // Calibrates the chars/4 estimate the summarization threshold uses.
+            // Calibrates the chars/4 estimate the request budget and the
+            // summarization threshold use.
             crate::context_budget::record_token_estimate_calibration(
                 &request.model,
-                est_input_tokens,
+                raw_input_tokens,
                 input_tokens as usize,
             );
         }

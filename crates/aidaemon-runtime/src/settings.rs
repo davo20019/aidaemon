@@ -199,12 +199,13 @@ impl ContextWindowConfig {
     /// else the model family's known window (or `default_budget`), lowered
     /// to what the provider reported if it rejected a request as too long.
     pub fn context_budget_for(&self, model: &str) -> usize {
-        if let Some(budget) = self.model_budgets.get(model) {
-            return *budget;
-        }
-        let assumed = known_context_budget(model).unwrap_or(self.default_budget);
+        let assumed = self
+            .model_budgets
+            .get(model)
+            .copied()
+            .unwrap_or_else(|| known_context_budget(model).unwrap_or(self.default_budget));
         // A window the provider itself reported (it rejected a request as
-        // too long) overrides the assumption when smaller.
+        // too long) overrides the configured or assumed one when smaller.
         learned_context_budget(model).map_or(assumed, |learned| learned.min(assumed))
     }
 

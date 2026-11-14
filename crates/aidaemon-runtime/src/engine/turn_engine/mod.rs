@@ -41,8 +41,8 @@ use crate::engine::calls::{
 };
 use crate::engine::outcome::TurnVerdict;
 use crate::engine::provider::{
-    HostProvider, fit_run_values, from_provider_response, prefix_with_notes, split_injected_notes,
-    to_chat_options, to_daemon_messages_from, to_daemon_tools, values_to_sdk,
+    HostProvider, RunMessage, fit_request, from_provider_response, prefix_with_notes,
+    split_injected_notes, to_chat_options, to_daemon_tools, values_to_sdk,
 };
 use crate::engine::recovery;
 use crate::engine::scope::{AbsorbedSteering, BudgetGoal, TurnScope};
@@ -59,7 +59,6 @@ use crate::turn::notes::TurnNotes;
 use crate::turn::turn_context::TurnHistory;
 use aidaemon_channels::owner_wait::ProgressClock;
 
-pub mod compaction;
 pub mod entry;
 mod events;
 pub mod main_loop;
@@ -1247,7 +1246,6 @@ impl TurnEngine<'_> {
             notices_seen: std::sync::Mutex::new((chrono::Utc::now(), HashSet::new())),
             placed_directives: std::sync::Mutex::new(Vec::new()),
             absorbed_steering: std::sync::Mutex::new(Vec::new()),
-            compaction: std::sync::Mutex::new(None),
             sent_files: std::sync::Mutex::new(HashSet::new()),
             combined_verification_demands: std::sync::atomic::AtomicU32::new(0),
             mandate_commit_retries: std::sync::atomic::AtomicU32::new(0),

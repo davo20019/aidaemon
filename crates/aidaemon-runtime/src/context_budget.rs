@@ -1,11 +1,12 @@
-//! Context budgeting for the daemon's wire-format requests: token estimates
-//! (calibrated per model), message and tool-definition fitting, and tool
-//! result compression.
+//! Context budgeting for the daemon: token estimates (calibrated per model),
+//! the request window each model call is fitted to, the starting
+//! transcript's fitting, and tool result compression.
 //!
-//! These work on OpenAI-format JSON values. They move into the policies
-//! crate's `ContextWindow` once the daemon builds requests from kernel
-//! messages (PLAN 8.3); progressive fact extraction is memory and lives in
-//! `memory::progressive`.
+//! A model call is budgeted by the policies crate's `ContextWindow`
+//! ([`request_window`], `engine::provider::fit_request`); the per-model
+//! window and token calibration here are its inputs. The fitting over
+//! OpenAI-format JSON values below builds the turn's starting transcript;
+//! progressive fact extraction is memory and lives in `memory::progressive`.
 
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -49,6 +50,28 @@ pub fn token_estimate_correction(model: &str) -> f64 {
         .get(model)
         .map(|(factor, _)| *factor)
         .unwrap_or(1.0)
+}
+
+/// `raw` estimated tokens as `model` counts them, by its measured
+/// correction.
+pub fn calibrated_tokens(model: &str, raw: usize) -> usize {
+    ((raw as f64) * token_estimate_correction(model)).ceil() as usize
+}
+
+/// The context window a model call to `model` is fitted to: the model's
+/// window (configured, known or learned from an overflow) less the
+/// response reserve, in the raw chars/4 estimate `ContextWindow` counts,
+/// so the model's measured tokens-per-estimate correction shrinks or grows
+/// it.
+pub fn request_window(
+    model: &str,
+    config: &ContextWindowConfig,
+) -> aidaemon_policies::ContextWindow {
+    let tokens = config
+        .context_budget_for(model)
+        .saturating_sub(CONTEXT_RESPONSE_RESERVE_TOKENS);
+    let raw = ((tokens as f64) / token_estimate_correction(model)).floor() as usize;
+    aidaemon_policies::ContextWindow::new(raw)
 }
 
 const MULTIMODAL_IMAGE_TOKEN_SURROGATE: usize = 1_200;
@@ -576,6 +599,29 @@ pub fn compact_embedded_json(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The request window is the model's window less the response
+    /// reserve, scaled by the model's measured correction, and lowered by a
+    /// provider's overflow even when a budget is configured for the model.
+    #[test]
+    fn the_request_window_follows_the_configured_window_calibration_and_overflow() {
+        let model = "synthetic-request-window-model";
+        let mut config = ContextWindowConfig::default();
+        config.model_budgets.insert(model.to_string(), 10_000);
+        assert_eq!(
+            request_window(model, &config).budget_tokens(),
+            10_000 - CONTEXT_RESPONSE_RESERVE_TOKENS
+        );
+        record_token_estimate_calibration(model, 1_000, 1_250);
+        assert_eq!(
+            request_window(model, &config).budget_tokens(),
+            ((10_000 - CONTEXT_RESPONSE_RESERVE_TOKENS) as f64 / 1.25) as usize
+        );
+        assert_eq!(calibrated_tokens(model, 1_000), 1_250);
+        // The provider said the window is 8k: 85% of it, configured or not.
+        crate::settings::record_context_overflow(model, Some(8_000), 12_000);
+        assert_eq!(config.context_budget_for(model), 6_800);
+    }
 
     #[test]
     fn actual_usage_calibrates_the_portable_token_estimator() {

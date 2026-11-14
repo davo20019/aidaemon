@@ -1857,62 +1857,6 @@ fn wire_result(id: &str, body: &str) -> Value {
 }
 
 #[test]
-fn compaction_cuts_at_a_round_boundary_and_keeps_tool_pairs() {
-    use super::compaction::*;
-    let big = "x".repeat(4_000);
-    let mut run = Vec::new();
-    for round in 0..10 {
-        let id = format!("call-{round}");
-        run.push(wire_call(&id));
-        run.push(wire_result(&id, &big));
-    }
-    // Room for about three rounds of ~1k tokens each.
-    let cut = compaction_cut(&run, 3_200).expect("a cut");
-    assert_eq!(run[cut]["role"], "assistant", "cut must start a round");
-    assert!(run.len() - cut >= 4);
-    assert!(cut >= 10, "the tail stays near the budget, cut={cut}");
-
-    // The view is the summary, then the untouched tail.
-    let compaction = RunCompaction {
-        covered: cut,
-        summary: "read a.rs ten times".to_string(),
-    };
-    let view = compacted_view(&run, Some(&compaction));
-    assert_eq!(view.len(), run.len() - cut + 1);
-    assert_eq!(view[0]["role"], "user");
-    assert!(
-        view[0]["content"]
-            .as_str()
-            .unwrap()
-            .starts_with(COMPACTED_CONTEXT_MARKER)
-    );
-    assert_eq!(&view[1..], &run[cut..]);
-    // No compaction leaves the run as is.
-    assert_eq!(compacted_view(&run, None), run);
-}
-
-#[test]
-fn compaction_refuses_a_cut_that_leaves_too_little() {
-    use super::compaction::*;
-    let big = "x".repeat(40_000);
-    let run = vec![wire("user", "go"), wire_call("a"), wire_result("a", &big)];
-    // Every possible cut would keep fewer than the minimum messages.
-    assert_eq!(compaction_cut(&run, 100), None);
-}
-
-#[test]
-fn the_summary_request_carries_calls_and_the_previous_summary() {
-    use super::compaction::*;
-    let run = vec![wire_call("a"), wire_result("a", "fn main() {}")];
-    let request = summary_request(Some("earlier: cloned repo"), &run);
-    assert_eq!(request[0]["role"], "system");
-    let body = request[1]["content"].as_str().unwrap();
-    assert!(body.contains("earlier: cloned repo"));
-    assert!(body.contains("-> call read_file"));
-    assert!(body.contains("[tool result] fn main() {}"));
-}
-
-#[test]
 fn directives_stay_where_they_were_raised() {
     let run = vec![
         wire_call("a"),

@@ -196,14 +196,12 @@ pub struct TurnScope<'a> {
         chrono::DateTime<chrono::Utc>,
         std::collections::HashSet<String>,
     )>,
-    /// Directives and mid-turn user messages, with the run position they
-    /// arrived at.
+    /// Directives and mid-turn user messages, with the run position (an
+    /// index into the kernel's run messages) they arrived at.
     pub placed_directives: std::sync::Mutex<Vec<(usize, Value)>>,
     /// Mid-turn messages taken into the run, and whether a model call
     /// answered each; unanswered ones are re-queued at run end.
     pub absorbed_steering: std::sync::Mutex<Vec<AbsorbedSteering>>,
-    /// The run's summarized older rounds, once it outgrew the context.
-    pub compaction: std::sync::Mutex<Option<crate::engine::compaction::RunCompaction>>,
     /// Set when a call moved work to the background with completion
     /// notifications on: the daemon will deliver its result later, so the
     /// reply is a background handoff, not the terminal answer.

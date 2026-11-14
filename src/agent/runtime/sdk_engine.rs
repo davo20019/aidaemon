@@ -37,7 +37,7 @@ mod test_support {
         TerminalCanonTurn, sdk_images, terminal_canonicalizer,
     };
     pub(in crate::agent) use aidaemon_runtime::engine::turn_engine::{
-        compaction, model_call, outcome, tool_calls,
+        model_call, outcome, tool_calls,
     };
 
     pub(in crate::agent) use serde_json::Value;

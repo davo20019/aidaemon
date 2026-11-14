@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use super::calls::{HostCall, ModelCall};
-use crate::context_budget::{estimate_multimodal_message_tokens, fit_messages_with_source_quotas};
+use crate::context_budget::estimate_multimodal_message_tokens;
 use aidaemon_events::traits::{ChatOptions, ProviderResponse};
 
 /// The daemon's provider stack as the SDK sees it. It only forwards the
@@ -58,11 +58,6 @@ pub fn to_daemon_messages_from(messages: &[sdk::Message]) -> Vec<Value> {
     crate::chat_bridge::sdk_backed::to_chat_messages(messages)
 }
 
-/// The daemon-format transcript for a model call: the projected `prefix`
-/// unchanged (so the provider's prompt cache keeps hitting), then this run's
-/// own messages. If the run outgrows the budget, only the run part is
-/// trimmed, with the daemon's role-quota fitter, and unpaired tool calls and
-/// results are removed; the newest messages survive.
 /// Split the system notes hooks added to this request (for example the
 /// memory note, marked [`sdk::MessageOrigin::HookNote`]) from the kernel
 /// transcript.
@@ -108,28 +103,84 @@ pub fn prefix_with_notes(prefix: &[Value], notes: &[String]) -> Vec<Value> {
     out
 }
 
-pub fn fit_run(prefix: &[Value], run: &[sdk::Message], budget_tokens: usize) -> Vec<Value> {
-    fit_run_values(prefix, to_daemon_messages_from(run), budget_tokens)
+/// One message of a model call's run: the kernel's own, or one the daemon
+/// pinned at a run position (a directive, a user message taken mid-turn),
+/// sent as it is.
+#[derive(Debug, Clone)]
+pub enum RunMessage {
+    Kernel(sdk::Message),
+    Pinned(Value),
 }
 
-/// [`fit_run`] over a run already in the daemon wire format (after
-/// compaction).
-pub fn fit_run_values(
+/// A model call's wire transcript and its estimated size.
+#[derive(Debug, Clone)]
+pub struct FittedRequest {
+    pub messages: Vec<Value>,
+    /// The request's size in `window`'s raw estimate (characters / 4,
+    /// the prefix, the tool definitions and the run as sent): what the
+    /// provider's reported input tokens calibrate.
+    pub estimated_tokens: usize,
+}
+
+/// The daemon-format transcript for a model call, budgeted by the policies
+/// crate's [`aidaemon_policies::ContextWindow`]: the projected `prefix`
+/// unchanged (so the provider's prompt cache keeps hitting) and the tool
+/// definitions are counted against the budget, then this run's messages
+/// follow, with old tool results stubbed and the oldest rounds dropped in
+/// coarse, stable steps when the request would pass the budget. Pinned
+/// messages are never trimmed; a tool call keeps its results.
+pub fn fit_request(
     prefix: &[Value],
-    run_values: Vec<Value>,
-    budget_tokens: usize,
-) -> Vec<Value> {
-    let prefix_tokens = estimate_multimodal_message_tokens(prefix);
-    let run_tokens = estimate_multimodal_message_tokens(&run_values);
-    let mut out = prefix.to_vec();
-    if prefix_tokens + run_tokens <= budget_tokens || run_values.len() <= 1 {
-        out.extend(run_values);
-        return out;
+    run: Vec<RunMessage>,
+    tools: &[sdk::ToolSpec],
+    window: &aidaemon_policies::ContextWindow,
+) -> FittedRequest {
+    let overhead =
+        estimate_multimodal_message_tokens(prefix) * 4 + aidaemon_policies::tool_spec_chars(tools);
+    let mut view: Vec<sdk::Message> = run
+        .iter()
+        .map(|message| match message {
+            RunMessage::Kernel(message) => message.clone(),
+            RunMessage::Pinned(value) => pinned_stand_in(value),
+        })
+        .collect();
+    let kept = window.compact_with_overhead(&mut view, overhead);
+    let estimated_tokens = aidaemon_policies::estimate_tokens(&view) + overhead.div_ceil(4);
+    let mut messages = prefix.to_vec();
+    // Kernel messages convert together (a tool's images follow its block of
+    // results); pinned ones sit between rounds, never inside one.
+    let mut segment = Vec::new();
+    let mut shown = view.into_iter();
+    for (message, kept) in run.into_iter().zip(kept) {
+        if !kept {
+            continue;
+        }
+        let Some(sent) = shown.next() else { break };
+        match message {
+            RunMessage::Kernel(_) => segment.push(sent),
+            RunMessage::Pinned(value) => {
+                messages.extend(to_daemon_messages_from(&std::mem::take(&mut segment)));
+                messages.push(value);
+            }
+        }
     }
-    let (fitted, _) =
-        fit_messages_with_source_quotas(run_values, budget_tokens.saturating_sub(prefix_tokens));
-    out.extend(repair_tool_pairs(fitted));
-    out
+    messages.extend(to_daemon_messages_from(&segment));
+    FittedRequest {
+        messages,
+        estimated_tokens,
+    }
+}
+
+/// What a pinned message counts for in the budget. A system message or an
+/// injected user message is never elided or dropped.
+fn pinned_stand_in(value: &Value) -> sdk::Message {
+    let (text, images) = split_content(value.get("content"));
+    match value.get("role").and_then(Value::as_str) {
+        Some("user") => {
+            sdk::Message::from_origin(sdk::MessageOrigin::Harness, text).with_images(images)
+        }
+        _ => sdk::Message::system(text),
+    }
 }
 
 /// Daemon-format messages as SDK messages, for the kernel's own view of the
@@ -218,51 +269,6 @@ fn split_content(content: Option<&Value>) -> (String, Vec<sdk::Image>) {
         }
         _ => (String::new(), Vec::new()),
     }
-}
-
-/// Drop tool results whose call is not in the assistant message before
-/// them, and tool calls whose result is not directly after them.
-fn repair_tool_pairs(messages: Vec<Value>) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
-    let mut index = 0;
-    while index < messages.len() {
-        let mut message = messages[index].clone();
-        index += 1;
-        if message["role"] == "tool" {
-            // Only reached for results without a preceding call.
-            continue;
-        }
-        let Some(calls) = message.get("tool_calls").and_then(Value::as_array).cloned() else {
-            out.push(message);
-            continue;
-        };
-        let mut results = Vec::new();
-        while index < messages.len() && messages[index]["role"] == "tool" {
-            results.push(messages[index].clone());
-            index += 1;
-        }
-        let answered: Vec<Value> = calls
-            .into_iter()
-            .filter(|call| results.iter().any(|r| r["tool_call_id"] == call["id"]))
-            .collect();
-        results.retain(|r| answered.iter().any(|call| call["id"] == r["tool_call_id"]));
-        if answered.is_empty() {
-            message
-                .as_object_mut()
-                .map(|object| object.remove("tool_calls"));
-            let empty = message["content"]
-                .as_str()
-                .is_none_or(|text| text.trim().is_empty());
-            if !empty {
-                out.push(message);
-            }
-            continue;
-        }
-        message["tool_calls"] = Value::Array(answered);
-        out.push(message);
-        out.extend(results);
-    }
-    out
 }
 
 /// SDK tool specs as the daemon's OpenAI-style tool definitions.
@@ -556,18 +562,26 @@ mod tests {
         assert_eq!(messages[3].content, "body");
     }
 
-    #[test]
-    fn the_projected_prefix_is_sent_byte_for_byte() {
-        let run = vec![sdk::Message::assistant("done", Vec::new())];
-        let fitted = fit_run(&prefix(), &run, 1_000_000);
-        assert_eq!(fitted[..5], prefix()[..]);
-        assert_eq!(fitted[5]["content"], "done");
+    fn kernel(messages: Vec<sdk::Message>) -> Vec<RunMessage> {
+        messages.into_iter().map(RunMessage::Kernel).collect()
+    }
+
+    fn window(tokens: usize) -> aidaemon_policies::ContextWindow {
+        aidaemon_policies::ContextWindow::new(tokens)
     }
 
     #[test]
-    fn an_oversized_run_is_trimmed_after_the_prefix_with_valid_pairs() {
+    fn the_projected_prefix_is_sent_byte_for_byte() {
+        let run = kernel(vec![sdk::Message::assistant("done", Vec::new())]);
+        let fitted = fit_request(&prefix(), run, &[], &window(1_000_000));
+        assert_eq!(fitted.messages[..5], prefix()[..]);
+        assert_eq!(fitted.messages[5]["content"], "done");
+        assert!(fitted.estimated_tokens > 0);
+    }
+
+    fn rounds(n: usize) -> Vec<sdk::Message> {
         let mut run = Vec::new();
-        for i in 0..20 {
+        for i in 0..n {
             let id = format!("c{i}");
             run.push(sdk::Message::assistant(
                 "",
@@ -575,16 +589,121 @@ mod tests {
             ));
             run.push(sdk::Message::tool_result(id, long(&format!("output {i}"))));
         }
-        let fitted = fit_run(&prefix(), &run, 2_000);
-        assert_eq!(fitted[..5], prefix()[..], "the prefix is never trimmed");
-        assert_tool_pairs_valid(&fitted);
-        assert!(fitted.len() < 5 + run.len());
-        // The newest call survives.
-        assert!(
-            serde_json::to_string(&fitted)
-                .unwrap()
-                .contains("output 19")
+        run
+    }
+
+    /// The prefix, the tool definitions and the run are all counted: the
+    /// request stays under the budget, the prefix untouched, every tool call
+    /// with its result, the newest round whole and older ones stubbed.
+    #[test]
+    fn an_oversized_run_is_fitted_after_the_prefix_with_valid_pairs() {
+        let tools = vec![sdk::ToolSpec {
+            name: "terminal".into(),
+            description: "d".repeat(2_000),
+            parameters: json!({"type": "object"}),
+        }];
+        let fitted = fit_request(&prefix(), kernel(rounds(20)), &tools, &window(3_000));
+        assert_eq!(
+            fitted.messages[..5],
+            prefix()[..],
+            "the prefix is never trimmed"
         );
+        assert_tool_pairs_valid(&fitted.messages);
+        assert!(
+            fitted.estimated_tokens <= 3_000,
+            "{}",
+            fitted.estimated_tokens
+        );
+        let sent = serde_json::to_string(&fitted.messages).unwrap();
+        assert!(sent.contains("output 19"), "the newest result is whole");
+        assert!(
+            sent.contains("[earlier tool result elided"),
+            "older ones stubbed"
+        );
+    }
+
+    /// Directives and mid-turn user messages are sent as they were pinned,
+    /// at their run position, however the rounds around them are fitted.
+    #[test]
+    fn pinned_messages_survive_fitting_in_place() {
+        let mut run = kernel(rounds(10));
+        run.insert(
+            10,
+            RunMessage::Pinned(json!({"role": "system", "content": "[SYSTEM] directive"})),
+        );
+        run.push(RunMessage::Pinned(json!({"role": "user", "content": [
+            {"type": "text", "text": "also check b"},
+            {"type": "input_audio", "input_audio": {"data": "QUJD", "format": "ogg"}}
+        ]})));
+        let fitted = fit_request(&prefix(), run, &[], &window(2_500));
+        let messages = &fitted.messages;
+        assert_tool_pairs_valid(messages);
+        let directive = messages
+            .iter()
+            .position(|m| m["content"] == "[SYSTEM] directive")
+            .expect("directive kept");
+        // Still right after round 4's result.
+        assert_eq!(messages[directive - 1]["tool_call_id"], "c4");
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert_eq!(last["content"][1]["type"], "input_audio", "sent as pinned");
+    }
+
+    /// The 2c753f97 context_tally failure: one turn reads ten ~1.9k-token
+    /// shards at once into a 10k window. The old quota fitter never cut
+    /// below seven messages and sent ~11.6k tokens; the request now stays
+    /// under the window, and each result it leaves out says it was not
+    /// shown and how to get it.
+    #[test]
+    fn a_turn_of_reads_bigger_than_the_window_is_sent_under_it() {
+        let mut config = crate::settings::ContextWindowConfig::default();
+        let model = "synthetic-parallel-reads-model";
+        config.model_budgets.insert(model.into(), 10_000);
+        let window = crate::context_budget::request_window(model, &config);
+        let calls = (0..10)
+            .map(|i| sdk::ToolCall::new(format!("s{i}"), "read_shard", json!({"path": i})))
+            .collect();
+        let mut run = vec![sdk::Message::assistant("", calls)];
+        for i in 0..10 {
+            run.push(sdk::Message::tool_result(
+                format!("s{i}"),
+                format!(
+                    "shard {i}\n{}\nfailed_requests=9\nEnd of shard {i}",
+                    "x".repeat(7_600)
+                ),
+            ));
+        }
+        let prefix = vec![
+            json!({"role": "system", "content": "core prompt"}),
+            json!({"role": "user", "content": "Sum the failures in the ten shards."}),
+        ];
+        let fitted = fit_request(&prefix, kernel(run), &[], &window);
+        assert!(fitted.estimated_tokens <= window.budget_tokens());
+        let sent = values_to_sdk(&fitted.messages);
+        assert!(aidaemon_policies::estimate_tokens(&sent) <= 10_000);
+        assert_tool_pairs_valid(&fitted.messages);
+        let unshown = sent
+            .iter()
+            .filter(|m| m.content.starts_with("[tool result not shown"))
+            .count();
+        assert!(unshown > 0 && unshown < 10, "{unshown}");
+        assert!(
+            sent.iter()
+                .all(|m| !m.content.starts_with("[earlier tool result elided"))
+        );
+    }
+
+    /// A tool's images still follow its block of results.
+    #[test]
+    fn tool_images_follow_their_results_after_fitting() {
+        let run = kernel(vec![
+            sdk::Message::assistant("", vec![sdk::ToolCall::new("a", "read_file", json!({}))]),
+            sdk::Message::tool_result("a", "image file")
+                .with_images([sdk::Image::base64("image/png", "QUJD")]),
+        ]);
+        let fitted = fit_request(&[], run, &[], &window(100_000));
+        let roles: Vec<_> = fitted.messages.iter().map(|m| m["role"].clone()).collect();
+        assert_eq!(roles, ["assistant", "tool", "user"]);
     }
 
     #[test]
