@@ -41,7 +41,6 @@ fn cleanup_inbox(dir: &str, retention: Duration) {
 
 pub(crate) struct HeartbeatSetup {
     pub(crate) coordinator: Option<crate::heartbeat::HeartbeatCoordinator>,
-    pub(crate) telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>>,
 }
 
 pub(crate) struct HeartbeatDependencies {
@@ -114,12 +113,10 @@ pub(crate) async fn init_heartbeat_coordinator(
         terminal_tool,
         execution_backend,
     } = dependencies;
-    let mut heartbeat_telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>> = None;
     let mut heartbeat_opt: Option<crate::heartbeat::HeartbeatCoordinator> = None;
 
     if config.heartbeat.enabled {
         let telemetry = Arc::new(crate::heartbeat::HeartbeatTelemetry::new());
-        heartbeat_telemetry = Some(telemetry.clone());
         let mut heartbeat = crate::heartbeat::HeartbeatCoordinator::new(
             state.clone(),
             config.heartbeat.tick_interval_secs,
@@ -539,7 +536,6 @@ pub(crate) async fn init_heartbeat_coordinator(
 
     HeartbeatSetup {
         coordinator: heartbeat_opt,
-        telemetry: heartbeat_telemetry,
     }
 }
 
@@ -674,11 +670,7 @@ pub(crate) struct DashboardDependencies {
     pub(crate) state: Arc<dyn crate::traits::StateStore>,
     pub(crate) pool: SqlitePool,
     pub(crate) event_store: Arc<crate::events::EventStore>,
-    pub(crate) health_store: Option<Arc<crate::health::HealthProbeStore>>,
-    pub(crate) heartbeat_telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>>,
     pub(crate) oauth_gateway: Option<crate::oauth::OAuthGateway>,
-    pub(crate) write_consistency_thresholds: crate::events::WriteConsistencyThresholds,
-    pub(crate) queue_telemetry: Arc<QueueTelemetry>,
     pub(crate) heartbeat_wake_tx: tokio::sync::mpsc::Sender<()>,
 }
 
@@ -690,11 +682,7 @@ pub(crate) fn spawn_dashboard_or_health_server(
         state,
         pool,
         event_store,
-        health_store,
-        heartbeat_telemetry,
         oauth_gateway,
-        write_consistency_thresholds,
-        queue_telemetry,
         heartbeat_wake_tx,
     } = dependencies;
     let health_port = config.daemon.health_port;
@@ -710,17 +698,9 @@ pub(crate) fn spawn_dashboard_or_health_server(
                     mandate_store: state.clone(),
                     heartbeat_wake_tx,
                     event_store: Some(event_store),
-                    provider_kind: format!("{:?}", config.provider.kind),
-                    models: config.provider.models.clone(),
-                    started_at: std::time::Instant::now(),
                     dashboard_token: dashboard_token_info.token,
                     token_created_at: dashboard_token_info.created_at,
-                    health_store,
-                    heartbeat_telemetry,
                     oauth_gateway,
-                    policy_uncertainty_threshold: config.policy.uncertainty_clarify_threshold,
-                    write_consistency_thresholds,
-                    queue_telemetry,
                     auth_failures: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 };
                 let bind = health_bind.clone();

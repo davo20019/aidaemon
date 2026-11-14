@@ -1251,7 +1251,9 @@ pub struct DaemonConfig {
     /// Set to "0.0.0.0" to listen on all interfaces.
     #[serde(default = "default_health_bind")]
     pub health_bind: String,
-    /// Enable the embedded web dashboard on the health server port (default: true).
+    /// Serve the OAuth callback and the mandate wake webhook (`/api/mandates/signals`,
+    /// token-authenticated) beside `/health` on the health server port (default: true).
+    /// The status page that used to live here is in the AIdaemon app.
     #[serde(default = "default_dashboard_enabled")]
     pub dashboard_enabled: bool,
     /// Watchdog configuration for detecting stuck agent tasks.

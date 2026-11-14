@@ -35,7 +35,6 @@ pub async fn run(
     crate::startup::db_security::enforce_database_encryption(&mut config, &config_path).await?;
     crate::otel_export::start(&config.telemetry);
 
-    let write_consistency_thresholds = config.policy.write_consistency.thresholds();
     let queue_policy = config.daemon.queue_policy.normalized();
 
     let queue_telemetry = Arc::new(QueueTelemetry::new_with_policy(
@@ -337,7 +336,6 @@ pub async fn run(
     let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(16);
     let startup_runtime::HeartbeatSetup {
         coordinator: heartbeat_opt,
-        telemetry: heartbeat_telemetry,
     } = startup_runtime::init_heartbeat_coordinator(
         &config,
         startup_runtime::HeartbeatDependencies {
@@ -480,11 +478,7 @@ pub async fn run(
             state: state.clone(),
             pool: pool.clone(),
             event_store: event_store.clone(),
-            health_store: health_store.clone(),
-            heartbeat_telemetry: heartbeat_telemetry.clone(),
             oauth_gateway: oauth_gateway.clone(),
-            write_consistency_thresholds,
-            queue_telemetry: queue_telemetry.clone(),
             heartbeat_wake_tx: wake_tx.clone(),
         },
     );

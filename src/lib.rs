@@ -213,8 +213,6 @@ pub fn run() -> anyhow::Result<()> {
                 println!("  auth login openai     Connect a ChatGPT subscription (Codex OAuth)");
                 println!("  auth status           Show connected model subscriptions");
                 println!("  auth logout openai    Disconnect the ChatGPT subscription");
-                println!("  dashboard             Open the authenticated local dashboard");
-                println!("  dashboard login-url   Print a local dashboard login URL");
                 println!("  node <command>        Pair, inspect, authorize, or revoke Nodes");
                 println!(
                     "  client-token          Mint the local Client Gateway token (revokes the old)"
@@ -281,7 +279,10 @@ pub fn run() -> anyhow::Result<()> {
                 return handle_keychain_command(&args[2..]);
             }
             "dashboard" => {
-                return handle_dashboard_command(&args[2..], config_path.as_path());
+                anyhow::bail!(
+                    "The dashboard page is gone: its status lives in the AIdaemon app \
+                     (aidaemon app, aidaemon tui, or the web app the gateway serves)."
+                );
             }
             "auth" => {
                 return handle_auth_command(&args[2..]);
@@ -381,61 +382,6 @@ pub fn run() -> anyhow::Result<()> {
         .thread_stack_size(8 * 1024 * 1024)
         .build()?
         .block_on(crate::core::run(config, config_path, daemon_paths))
-}
-
-fn dashboard_login_url(config_path: &Path) -> anyhow::Result<String> {
-    let config = config::AppConfig::load(config_path)?;
-    if !config.daemon.dashboard_enabled {
-        anyhow::bail!("The dashboard is disabled in config.toml");
-    }
-    let token = config::resolve_from_keychain("dashboard_token").map_err(|error| {
-        anyhow::anyhow!(
-            "Dashboard token is unavailable: {error}. Start or restart the daemon first."
-        )
-    })?;
-    let host = match config.daemon.health_bind.trim() {
-        "" | "0.0.0.0" | "::" => "127.0.0.1".to_string(),
-        value if value.contains(':') && !value.starts_with('[') => format!("[{value}]"),
-        value => value.to_string(),
-    };
-    Ok(format!(
-        "http://{}:{}/#token={}",
-        host, config.daemon.health_port, token
-    ))
-}
-
-fn handle_dashboard_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
-    let action = args.first().map(String::as_str).unwrap_or("open");
-    let login_url = dashboard_login_url(config_path)?;
-    match action {
-        "open" => {
-            #[cfg(target_os = "macos")]
-            let status = std::process::Command::new("open")
-                .arg(&login_url)
-                .status()?;
-            #[cfg(target_os = "linux")]
-            let status = std::process::Command::new("xdg-open")
-                .arg(&login_url)
-                .status()?;
-            #[cfg(target_os = "windows")]
-            let status = std::process::Command::new("rundll32")
-                .arg("url.dll,FileProtocolHandler")
-                .arg(&login_url)
-                .status()?;
-            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-            anyhow::bail!("Opening the dashboard is not supported on this platform");
-
-            if !status.success() {
-                anyhow::bail!("Could not open the local dashboard in a browser");
-            }
-            println!("Opened the authenticated local dashboard.");
-        }
-        "login-url" => {
-            println!("{login_url}");
-        }
-        _ => anyhow::bail!("Usage: aidaemon dashboard [open|login-url]"),
-    }
-    Ok(())
 }
 
 #[allow(unreachable_code)]
