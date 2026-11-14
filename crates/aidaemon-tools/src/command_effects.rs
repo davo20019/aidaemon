@@ -37,7 +37,7 @@ const OBSERVATION_PROGRAMS: &[&str] = &[
     "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "find", "stat", "file",
     "pwd", "echo", "printf", "which", "whoami", "id", "uname", "date", "du", "df", "tree", "sort",
     "uniq", "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath", "readlink", "jq", "ps",
-    "hostname", "sw_vers", "true", "git", "test", "[", "sleep",
+    "hostname", "sw_vers", "true", "git", "test", "[", "sleep", "uptime", "sysctl", "top",
 ];
 
 const SYSTEM_BIN_DIRS: &[&str] = &[
@@ -184,6 +184,7 @@ const GIT_OBSERVATION_SUBCOMMANDS: &[&str] = &[
     "rev-parse",
     "ls-files",
     "blame",
+    "rev-list",
 ];
 
 /// Programs that run another command named in their arguments (and shell
@@ -1134,6 +1135,7 @@ fn every_segment(command: &str, ok: &dyn Fn(&str, &[String]) -> bool) -> bool {
     };
     !commands.is_empty()
         && commands.iter().all(|tokens| {
+            let tokens = without_display_env(tokens);
             let Some(program) = tokens.first() else {
                 return false;
             };
@@ -1242,7 +1244,12 @@ impl ShellParser {
                     }
                     if first == "for" {
                         commands.push(self.for_loop(&words)?);
-                    } else if UNMODELLED_KEYWORDS.contains(&first) || first.contains('$') {
+                    } else if UNMODELLED_KEYWORDS.contains(&first)
+                        || without_display_env(&words)
+                            .first()
+                            .map_or(first, String::as_str)
+                            .contains('$')
+                    {
                         // A program named by a variable is whatever the
                         // variable holds, which the other readings of the
                         // command (deletes, network) never see.
@@ -1495,6 +1502,37 @@ fn local_work_args_ok(program: &str, args: &[String]) -> bool {
 
 fn basename(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
+}
+
+/// An assignment that only changes how a program formats or localizes what
+/// it prints: a time zone, a locale, a terminal size or colour. Any other
+/// (`PATH`, `LD_PRELOAD`, `GIT_*`, a pager) can change what runs, so a
+/// command carrying one is judged as before.
+fn is_display_env_assignment(token: &str) -> bool {
+    is_env_assignment(token)
+        && token.split_once('=').is_some_and(|(name, _)| {
+            matches!(
+                name,
+                "TZ" | "LANG"
+                    | "LANGUAGE"
+                    | "LC_ALL"
+                    | "COLUMNS"
+                    | "LINES"
+                    | "NO_COLOR"
+                    | "CLICOLOR"
+                    | "TERM"
+            ) || (name.starts_with("LC_") && name[3..].chars().all(|ch| ch.is_ascii_uppercase()))
+        })
+}
+
+/// The command after its leading display assignments
+/// ([`is_display_env_assignment`]); any other leading assignment stays.
+fn without_display_env(tokens: &[String]) -> &[String] {
+    let start = tokens
+        .iter()
+        .take_while(|token| is_display_env_assignment(token))
+        .count();
+    &tokens[start..]
 }
 
 fn is_env_assignment(token: &str) -> bool {
@@ -1753,6 +1791,7 @@ fn is_observation(command: &str, allow_input_redirects: bool) -> bool {
 
 /// One simple command that only reads or prints.
 fn observing_command(tokens: &[String]) -> bool {
+    let tokens = without_display_env(tokens);
     let Some(first) = tokens.first() else {
         return false;
     };
@@ -1817,6 +1856,71 @@ fn date_args_observe(args: &[String]) -> bool {
         })
 }
 
+/// `find` observes unless it deletes, writes a file or runs a command; an
+/// `-exec`/`-execdir` whose command is itself an observation
+/// (`-exec stat -f %z {} +`) observes too. `-ok`/`-okdir` prompt.
+fn find_args_observe(args: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        match arg.as_str() {
+            "-exec" | "-execdir" => {
+                let rest = &args[index + 1..];
+                let Some(end) = rest
+                    .iter()
+                    .position(|token| matches!(token.as_str(), ";" | "\\;" | "+"))
+                else {
+                    return false;
+                };
+                if end == 0 || !observing_command(&rest[..end]) {
+                    return false;
+                }
+                index += end + 2;
+            }
+            flag if FIND_MUTATING_FLAGS.contains(&flag) => return false,
+            _ => index += 1,
+        }
+    }
+    true
+}
+
+/// `sysctl` reads with display flags and variable names; a `name=value`,
+/// `-w`, or loading a file (`-p`, `-f`, `--system`, `--load`) writes.
+fn sysctl_args_read(args: &[String]) -> bool {
+    args.iter().all(|arg| match arg.strip_prefix('-') {
+        Some(long) if long.starts_with('-') => {
+            matches!(long, "-all" | "-values" | "-names")
+        }
+        Some(cluster) => {
+            !cluster.is_empty() && cluster.chars().all(|ch| "naAehNqxbdoX".contains(ch))
+        }
+        None => {
+            !arg.contains('=')
+                && arg
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        }
+    })
+}
+
+/// `top` that takes a bounded number of samples and exits: `-l N` (macOS)
+/// or batch mode with `-n N` (procps). Anything else waits on a terminal.
+fn top_samples_and_exits(args: &[String]) -> bool {
+    let positive = |value: Option<&String>| {
+        value.is_some_and(|value| value.parse::<u32>().is_ok_and(|n| n >= 1))
+    };
+    let mac = args
+        .iter()
+        .position(|arg| arg == "-l")
+        .is_some_and(|index| positive(args.get(index + 1)));
+    let batch = args.iter().any(|arg| arg == "-b" || arg == "-bn1")
+        && (args.iter().any(|arg| arg == "-bn1")
+            || args
+                .iter()
+                .position(|arg| arg == "-n")
+                .is_some_and(|index| positive(args.get(index + 1))));
+    mac || batch
+}
+
 /// A `sleep` operand: a non-negative number with an optional s/m/h/d unit.
 fn is_sleep_duration(arg: &str) -> bool {
     let number = arg.strip_suffix(['s', 'm', 'h', 'd']).unwrap_or(arg);
@@ -1828,7 +1932,9 @@ fn is_sleep_duration(arg: &str) -> bool {
 fn observation_args_ok(program: &str, args: &[String]) -> bool {
     let any = |pred: &dyn Fn(&str) -> bool| args.iter().any(|arg| pred(arg));
     match program {
-        "find" => !any(&|a| FIND_MUTATING_FLAGS.contains(&a)),
+        "find" => find_args_observe(args),
+        "sysctl" => sysctl_args_read(args),
+        "top" => top_samples_and_exits(args),
         "rg" => !any(&|a| {
             a == "--pre"
                 || a.starts_with("--pre=")
@@ -1851,7 +1957,10 @@ fn observation_args_ok(program: &str, args: &[String]) -> bool {
         }
         "tree" => tree_args_ok(args),
         "date" => date_args_observe(args),
-        "hostname" => args.is_empty(),
+        // A name operand (or `-F file`) sets the host name.
+        "hostname" => args
+            .iter()
+            .all(|arg| matches!(arg.as_str(), "-s" | "-f" | "--short" | "--fqdn")),
         // Waiting does nothing else; a bounded duration (`18`, `0.5`, `2m`).
         // `infinity` never returns and is left to the owner.
         "sleep" => !args.is_empty() && args.iter().all(|arg| is_sleep_duration(arg)),
@@ -1886,9 +1995,12 @@ fn observation_args_ok(program: &str, args: &[String]) -> bool {
                 return true;
             }
             subcommand == "branch"
-                && rest
-                    .iter()
-                    .all(|arg| matches!(arg.as_str(), "--list" | "-a" | "-r" | "-v"))
+                && rest.iter().all(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--list" | "-a" | "-r" | "-v" | "--show-current"
+                    )
+                })
         }
         _ => true,
     }
@@ -4238,6 +4350,20 @@ mod tests {
             "sleep 0.5",
             "sleep 2m",
             "sleep 5 && cat out.log",
+            // Live 2026-11-14: each of these waited about 2 s for the
+            // untrusted-egress verifier in a session that had read a page.
+            "TZ=Asia/Tokyo date '+%I:%M %p'",
+            "date -u '+%Y'; TZ=Europe/London date '+London %H'",
+            "for city in Asia/Tokyo Europe/Paris; do TZ=\"$city\" date '+%Z'; done",
+            "LC_ALL=C sort -u f",
+            "find . -maxdepth 1 -type f -name '*.rs' -exec stat -f '%z %N' {} + | sort -nr",
+            "find . -name '*.rs' -exec wc -l {} \\;",
+            "df -h /System/Volumes/Data; top -l 1 -n 0 | grep PhysMem; sysctl -n hw.memsize",
+            "top -b -n 1",
+            "sysctl -a",
+            "git branch --show-current && git rev-list --count master..HEAD && git log -1 --format=%s",
+            "sw_vers -productVersion; hostname; uptime",
+            "hostname -s",
         ] {
             assert!(
                 command_effects(observing).observation_only,
@@ -4288,6 +4414,24 @@ mod tests {
             "GIT_EXTERNAL_DIFF='rm -rf x' git diff",
             "env GIT_EXTERNAL_DIFF=rm git diff",
             "FOO=1 ls",
+            "PATH=/tmp ls",
+            "TZ=UTC PATH=/tmp date",
+            "LD_PRELOAD=x date",
+            "LC_ALL=C GIT_EXTERNAL_DIFF=x git diff",
+            "find . -exec rm {} +",
+            "find . -exec stat {} \\; -delete",
+            "find . -exec stat {}",
+            "find . -ok stat {} \\;",
+            "find . -exec sh -c 'rm x' \\;",
+            "hostname newname",
+            "hostname -F f",
+            "sysctl -w kern.x=1",
+            "sysctl kern.x=1",
+            "sysctl -p",
+            "sysctl --system",
+            "top",
+            "top -l 0",
+            "git branch --show-current -D x",
             "env ls",
             "git --config-env=core.fsmonitor=F status",
             "git -c core.pager=x status",
