@@ -11,12 +11,23 @@ use crate::traits::{
     Intention, Mandate, MandateActivityLevel, MandateAuthority, MandateAutonomyMode,
     MandateDecisionCycle, MandateDecisionOutcome, MandateLearningNote, MandateObjectiveMeasurement,
     MandateOperatingUpdates, MandateOperationScope, MandateReconciliationResolution, MandateStatus,
-    MandateStrategySnapshot, MandateSuspensionKind, MandateTerminationKind, MandateToolStore,
-    ToolCallContext, ToolCallMetadata, ToolCallOperation, ToolCallOutcome, ToolCallSemantics,
-    ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus, ToolRole,
+    MandateStrategySnapshot, MandateSuspensionKind, MandateToolStore, ToolCallContext,
+    ToolCallMetadata, ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects, ToolOutcomeStatus, ToolRole,
 };
 use aidaemon_core::ChannelVisibility;
 use aidaemon_tools::OutcomeTool as Tool;
+
+use crate::mandates::budget::{
+    ReviewEffort, controller_budget_admission_label, controller_budget_snapshot,
+    expected_default_review_cycles,
+};
+use crate::mandates::validate::{
+    MAX_EVIDENCE_RECEIPTS, MAX_LEARNING_NOTE_TEXT, MAX_POLICY_ENTRY_TEXT, clean_strings,
+    learning_note_fields_complete, normalized_learning_note, normalized_termination_fields,
+    required_bounded_trimmed, required_call_fact, required_trimmed, validate_act_evidence,
+    validate_bounded_strings, validate_bounded_text,
+};
 
 const DEFAULT_MIN_REVIEW_SECS: i64 = 15 * 60;
 const DEFAULT_MAX_REVIEW_SECS: i64 = 24 * 60 * 60;
@@ -34,7 +45,6 @@ const MAX_MANDATE_TOKEN_BUDGET_DAILY: i64 = 50_000_000;
 const MAX_OBJECTIVE_TEXT: usize = 2 * 1024;
 const MAX_NAME_TEXT: usize = 80;
 const MAX_POLICY_ENTRIES: usize = 16;
-const MAX_POLICY_ENTRY_TEXT: usize = 500;
 const MAX_POLICY_TEXT: usize = 8 * 1024;
 const MAX_RATIONALE_TEXT: usize = 2 * 1024;
 const MAX_OBSERVATIONS: usize = 8;
@@ -49,8 +59,6 @@ use crate::mandates::card::{
 const MAX_GUIDANCE_ENTRIES: usize = 10;
 const MAX_GUIDANCE_ENTRY_TEXT: usize = 1024;
 const MAX_GUIDANCE_TEXT: usize = 8 * 1024;
-const MAX_LEARNING_NOTE_TEXT: usize = 1024;
-const MAX_EVIDENCE_RECEIPTS: usize = 16;
 /// Evidence a learning note may cite (`MandateLearningNote::validate`).
 const MAX_LEARNING_EVIDENCE_RECEIPTS: usize = 8;
 const EVIDENCE_RECEIPT_IDS_DESCRIPTION: &str = "Optional. Omit to cite this run's successful observations automatically. To cite specific ones, use the tool_call_id you issued (e.g. call_...) or the result_id in that result's receipt footer (e.g. sha256:...); receipts from other runs, failed calls, or invented IDs are rejected.";
@@ -64,48 +72,6 @@ const SUCCESS_FIELD_DESCRIPTION: &str =
     "Owner-facing, observable success measure. Use one short plain-language result per item.";
 const STOP_FIELD_DESCRIPTION: &str =
     "Owner-facing reason to stop. Use one short plain-language condition per item.";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReviewEffort {
-    Efficient,
-    Balanced,
-    Thorough,
-}
-
-impl ReviewEffort {
-    fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "efficient" => Some(Self::Efficient),
-            "balanced" => Some(Self::Balanced),
-            "thorough" => Some(Self::Thorough),
-            _ => None,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Efficient => "efficient",
-            Self::Balanced => "balanced",
-            Self::Thorough => "thorough",
-        }
-    }
-
-    const fn per_cycle_capacity(self) -> i64 {
-        match self {
-            Self::Efficient => 100_000,
-            Self::Balanced => 250_000,
-            Self::Thorough => 500_000,
-        }
-    }
-
-    const fn daily_capacity_floor(self) -> i64 {
-        match self {
-            Self::Efficient => 1_000_000,
-            Self::Balanced => 2_000_000,
-            Self::Thorough => 4_000_000,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResolvedReviewCapacity {
@@ -413,7 +379,11 @@ impl ManageMandatesTool {
             (MIN_MANDATE_TOKEN_BUDGET..=MAX_MANDATE_TOKEN_BUDGET_PER_CYCLE).contains(&per_cycle),
             "legacy per-review token capacity must be between {MIN_MANDATE_TOKEN_BUDGET} and {MAX_MANDATE_TOKEN_BUDGET_PER_CYCLE}"
         );
-        let review_cycles = expected_default_review_cycles(default_review_secs, timing)?;
+        let review_cycles = expected_default_review_cycles(
+            default_review_secs,
+            timing.duration_secs,
+            timing.expires_at.as_deref(),
+        )?;
         let cadence_floor = per_cycle
             .checked_mul(review_cycles)
             .ok_or_else(|| anyhow::anyhow!("review cadence token budget is too large"))?;
@@ -2849,39 +2819,6 @@ impl crate::traits::ToolSemantics for ManageMandatesTool {
     }
 }
 
-fn required_trimmed<'a>(value: Option<&'a str>, name: &str) -> anyhow::Result<&'a str> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{name} is required"))
-}
-
-/// A dispatcher fact the call needs (from its `ToolCallContext`).
-fn required_call_fact<'a>(value: Option<&'a str>, fact: &str) -> anyhow::Result<&'a str> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("the {fact} fact is missing from the call context"))
-}
-
-fn required_bounded_trimmed<'a>(
-    value: Option<&'a str>,
-    name: &str,
-    max_text: usize,
-) -> anyhow::Result<&'a str> {
-    let value = required_trimmed(value, name)?;
-    validate_bounded_text(value, name, max_text)?;
-    Ok(value)
-}
-
-fn validate_bounded_text(value: &str, name: &str, max_text: usize) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        value.chars().count() <= max_text && value.len() <= max_text,
-        "{name} exceeds its {max_text}-character/byte bound"
-    );
-    Ok(())
-}
-
 /// The owner-given name a draft or create carries, bounded and single-line.
 fn mandate_name(args: &ManageMandatesArgs) -> anyhow::Result<Option<String>> {
     let Some(name) = args.name.as_deref() else {
@@ -2904,50 +2841,6 @@ fn named_suffix(mandate: &Mandate) -> String {
         .unwrap_or_default()
 }
 
-fn bounded_optional_text(
-    value: Option<&str>,
-    name: &str,
-    max_text: usize,
-) -> anyhow::Result<Option<String>> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    validate_bounded_text(value, name, max_text)?;
-    Ok(Some(value.to_string()))
-}
-
-fn normalized_termination_fields(
-    outcome: MandateDecisionOutcome,
-    termination_kind: Option<&str>,
-    termination_match: Option<&str>,
-) -> anyhow::Result<(Option<MandateTerminationKind>, Option<String>)> {
-    // Some structured-tool providers populate every optional schema field with
-    // a default. The explicit typed outcome is authoritative, so STOP-only
-    // metadata on ACT/WAIT/ASK must not turn a safe non-action into a failed
-    // review. It is ignored rather than reinterpreted as a termination.
-    if outcome != MandateDecisionOutcome::Stop {
-        return Ok((None, None));
-    }
-    let kind = termination_kind
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            MandateTerminationKind::parse(value).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "termination_kind must be success_criteria_satisfied, stop_condition_met, or safety_termination"
-                )
-            })
-        })
-        .transpose()?;
-    anyhow::ensure!(kind.is_some(), "STOP requires termination_kind");
-    let matched = bounded_optional_text(
-        termination_match,
-        "termination_match",
-        MAX_POLICY_ENTRY_TEXT,
-    )?;
-    Ok((kind, matched))
-}
-
 /// A scope whose tool can never reach its target fails at the first review,
 /// long after the owner confirmed it. `web_fetch` refuses local and private
 /// hosts by design; reject such a scope while it is still a draft.
@@ -2965,83 +2858,6 @@ fn unreachable_scope_targets(scopes: &[MandateOperationScope]) -> Option<String>
                     )
                 })
         })
-}
-
-fn validate_act_evidence(
-    outcome: MandateDecisionOutcome,
-    observations: &[String],
-    evidence_receipt_ids: &[String],
-) -> anyhow::Result<()> {
-    if outcome == MandateDecisionOutcome::Act {
-        anyhow::ensure!(
-            !observations.is_empty() && !evidence_receipt_ids.is_empty(),
-            "ACT requires at least one current-run sourced observation and its durable evidence receipt; choose WAIT when no evidence shows that intervention is worthwhile"
-        );
-    }
-    Ok(())
-}
-
-fn normalized_learning_note(
-    learning_note: Option<&str>,
-    learning_evidence_receipt_ids: Option<&[String]>,
-) -> anyhow::Result<Option<(String, Vec<String>)>> {
-    let Some(summary) =
-        bounded_optional_text(learning_note, "learning_note", MAX_LEARNING_NOTE_TEXT)?
-    else {
-        // Structured-tool providers may populate this optional companion field
-        // even when learning_note is empty. With no note there is nothing to
-        // persist, so ignore the orphan defaults before the decision commit.
-        return Ok(None);
-    };
-    let evidence = clean_strings(learning_evidence_receipt_ids);
-    validate_bounded_strings(
-        &evidence,
-        "learning_evidence_receipt_ids",
-        MAX_EVIDENCE_RECEIPTS,
-        256,
-        4 * 1024,
-    )?;
-    anyhow::ensure!(
-        !evidence.is_empty(),
-        "learning_note requires learning_evidence_receipt_ids"
-    );
-    Ok(Some((summary, evidence)))
-}
-
-fn learning_note_fields_complete(learning_note: Option<&str>, evidence: Option<&[String]>) -> bool {
-    learning_note.is_some_and(|value| !value.trim().is_empty())
-        && evidence.is_some_and(|values| values.iter().any(|value| !value.trim().is_empty()))
-}
-
-fn clean_strings(values: Option<&[String]>) -> Vec<String> {
-    values
-        .unwrap_or_default()
-        .iter()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn validate_bounded_strings(
-    values: &[String],
-    name: &str,
-    max_entries: usize,
-    max_entry_text: usize,
-    max_serialized_bytes: usize,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        values.len() <= max_entries,
-        "{name} cannot contain more than {max_entries} entries"
-    );
-    for value in values {
-        validate_bounded_text(value, &format!("one {name} entry"), max_entry_text)?;
-    }
-    anyhow::ensure!(
-        serde_json::to_vec(values)?.len() <= max_serialized_bytes,
-        "{name} exceed their serialized {max_serialized_bytes}-byte bound"
-    );
-    Ok(())
 }
 
 fn validate_policy_text(
@@ -3128,86 +2944,6 @@ fn activation_timing(args: &ManageMandatesArgs) -> anyhow::Result<ActivationTimi
         },
         normalized_redundant_expiry,
     })
-}
-
-fn expected_default_review_cycles(
-    default_review_secs: i64,
-    timing: &ActivationTiming,
-) -> anyhow::Result<i64> {
-    anyhow::ensure!(
-        default_review_secs > 0,
-        "default review interval must be positive"
-    );
-    let horizon_secs = if let Some(duration_secs) = timing.duration_secs {
-        duration_secs
-    } else if let Some(expires_at) = timing.expires_at.as_deref() {
-        let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at)
-            .map_err(|_| anyhow::anyhow!("expires_at must be an RFC3339 timestamp"))?
-            .with_timezone(&chrono::Utc);
-        (expires_at - chrono::Utc::now()).num_seconds().max(1)
-    } else {
-        24 * 60 * 60
-    }
-    .clamp(1, 24 * 60 * 60);
-
-    // The first review is immediate, then subsequent reviews occur at the
-    // default interval. Exclude a cycle exactly at expiration.
-    Ok(((horizon_secs - 1) / default_review_secs) + 1)
-}
-
-fn controller_budget_snapshot(goal: &crate::traits::Goal, review_effort: &str) -> Value {
-    let now = chrono::Utc::now();
-    let today = now.date_naive().to_string();
-    let used_today = if goal.tokens_used_day == today {
-        goal.tokens_used_today.max(0)
-    } else {
-        0
-    };
-    let remaining = goal
-        .budget_daily
-        .map(|daily| daily.saturating_sub(used_today).max(0));
-    let can_fund_full_cycle = match (remaining, goal.budget_per_check) {
-        (Some(remaining), Some(per_cycle)) => remaining >= per_cycle.max(0),
-        _ => true,
-    };
-    let blocked_until_utc = (!can_fund_full_cycle).then(|| {
-        let midnight = now
-            .date_naive()
-            .succ_opt()
-            .expect("the next UTC date is representable")
-            .and_hms_opt(0, 0, 0)
-            .expect("UTC midnight is representable");
-        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(midnight, chrono::Utc)
-            .to_rfc3339()
-    });
-    let used_percent = goal
-        .budget_daily
-        .filter(|daily| *daily > 0)
-        .map(|daily| ((used_today as f64 / daily as f64) * 100.0).clamp(0.0, 100.0));
-    let effort = ReviewEffort::parse(review_effort);
-    json!({
-        "review_effort": effort.map_or("legacy_custom", ReviewEffort::as_str),
-        "automatically_managed": effort.is_some(),
-        "runaway_protection": true,
-        "usage_percent_today": used_percent,
-        "usage_utc_day": today,
-        "can_fund_full_cycle": can_fund_full_cycle,
-        "blocked_until_utc": blocked_until_utc,
-    })
-}
-
-fn controller_budget_admission_label(goal: &crate::traits::Goal, review_effort: &str) -> String {
-    let snapshot = controller_budget_snapshot(goal, review_effort);
-    if snapshot["can_fund_full_cycle"] == Value::Bool(true) {
-        "ready".to_string()
-    } else {
-        format!(
-            "budget-blocked-until {}",
-            snapshot["blocked_until_utc"]
-                .as_str()
-                .unwrap_or("next UTC reset")
-        )
-    }
 }
 
 fn append_owner_guidance(existing: Option<&str>, guidance: &str) -> anyhow::Result<String> {
@@ -3635,60 +3371,9 @@ mod tests {
     }
 
     #[test]
-    fn clean_strings_removes_empty_constraints() {
-        let values = vec!["  truthful ".to_string(), " ".to_string()];
-        assert_eq!(clean_strings(Some(&values)), vec!["truthful"]);
-    }
-
-    #[test]
     fn review_minutes_are_checked() {
         assert_eq!(minutes_to_secs(Some(15), 1, "review").unwrap(), 900);
         assert!(minutes_to_secs(Some(0), 1, "review").is_err());
-    }
-
-    #[test]
-    fn non_stop_outcomes_ignore_generator_supplied_stop_metadata() {
-        let (kind, matched) = normalized_termination_fields(
-            MandateDecisionOutcome::Wait,
-            Some("success_criteria_satisfied"),
-            Some("provider-filled default"),
-        )
-        .unwrap();
-        assert!(kind.is_none());
-        assert!(matched.is_none());
-
-        assert!(normalized_termination_fields(MandateDecisionOutcome::Stop, None, None).is_err());
-    }
-
-    #[test]
-    fn act_requires_sourced_evidence_while_non_actions_do_not_manufacture_it() {
-        let observations = vec!["The monitored value crossed its confirmed threshold".to_string()];
-        let receipts = vec!["tool-call-1".to_string()];
-        assert!(validate_act_evidence(MandateDecisionOutcome::Act, &[], &receipts).is_err());
-        assert!(validate_act_evidence(MandateDecisionOutcome::Act, &observations, &[]).is_err());
-        assert!(
-            validate_act_evidence(MandateDecisionOutcome::Act, &observations, &receipts).is_ok()
-        );
-        assert!(validate_act_evidence(MandateDecisionOutcome::Wait, &[], &[]).is_ok());
-    }
-
-    #[test]
-    fn empty_learning_note_ignores_generator_supplied_receipt_defaults_before_commit() {
-        let receipts = vec!["provider-filled-default".to_string()];
-        assert!(
-            normalized_learning_note(Some(""), Some(&receipts))
-                .unwrap()
-                .is_none()
-        );
-        assert!(normalized_learning_note(Some("real learning"), None).is_err());
-    }
-
-    #[test]
-    fn partial_optional_learning_metadata_is_not_decision_blocking() {
-        assert!(!learning_note_fields_complete(
-            Some("possible learning"),
-            None
-        ));
     }
 
     #[test]

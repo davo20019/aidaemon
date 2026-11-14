@@ -1,6 +1,8 @@
+pub mod budget;
 pub mod card;
 pub mod history;
 pub mod policy;
+pub mod validate;
 
 pub use aidaemon_events::mandate_grant::MandateAuthorityGrant;
 
