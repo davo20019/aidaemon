@@ -27,8 +27,7 @@ use crate::tools::{
     ManageMandatesTool, ManageMcpTool, ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool,
     PolicyMetricsTool, ProjectInspectTool, ReadFileTool, RememberFactTool, RunCommandTool,
     SearchFilesTool, SearchHistoryTool, SendFileTool, ServiceStatusTool, ShareMemoryTool,
-    SpawnAgentTool, SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool, WebSearchTool,
-    WriteFileTool,
+    SpawnAgentTool, SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::traits::Tool;
 use crate::traits::store_prelude::*;
@@ -234,9 +233,6 @@ enum BaseToolId {
     ManageMandates,
     ManageAutomations,
     SearchHistory,
-    GoalTrace,
-    ToolTrace,
-    PolicyMetrics,
     ConfigManager,
     WebFetch,
     WebSearch,
@@ -299,18 +295,6 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
         name: "search_history",
     },
     BaseToolSpec {
-        id: BaseToolId::GoalTrace,
-        name: "goal_trace",
-    },
-    BaseToolSpec {
-        id: BaseToolId::ToolTrace,
-        name: "tool_trace",
-    },
-    BaseToolSpec {
-        id: BaseToolId::PolicyMetrics,
-        name: "policy_metrics",
-    },
-    BaseToolSpec {
         id: BaseToolId::ConfigManager,
         name: "manage_config",
     },
@@ -367,6 +351,8 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumCount, strum::EnumIter)]
 enum OptionalToolId {
     Diagnose,
+    GoalTrace,
+    PolicyMetrics,
     NodeHealth,
     NodeSensors,
     NodeAudio,
@@ -443,6 +429,16 @@ const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
     OptionalToolSpec {
         id: OptionalToolId::Diagnose,
         name: "self_diagnose",
+        enabled_if: optional_enabled_diagnostics,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::GoalTrace,
+        name: "goal_trace",
+        enabled_if: optional_enabled_diagnostics,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::PolicyMetrics,
+        name: "policy_metrics",
         enabled_if: optional_enabled_diagnostics,
     },
     OptionalToolSpec {
@@ -753,6 +749,18 @@ pub async fn register_optional_tools(
                     config.diagnostics.max_events,
                     config.diagnostics.include_raw_tool_args,
                 )));
+            }
+            OptionalToolId::GoalTrace => {
+                if !config.tools.is_enabled("goal_trace") {
+                    continue;
+                }
+                tools.push(Arc::new(GoalTraceTool::new(state.clone())));
+            }
+            OptionalToolId::PolicyMetrics => {
+                if !config.tools.is_enabled("policy_metrics") {
+                    continue;
+                }
+                tools.push(Arc::new(PolicyMetricsTool));
             }
             OptionalToolId::NodeSensors => {
                 if !config.tools.is_enabled("read_node_sensors") {
@@ -1268,18 +1276,6 @@ async fn build_base_tool(
                     search
                 })
             },
-            terminal_tool: None,
-        },
-        BaseToolId::GoalTrace => BuiltBaseTool {
-            tool: Arc::new(GoalTraceTool::new(state)),
-            terminal_tool: None,
-        },
-        BaseToolId::ToolTrace => BuiltBaseTool {
-            tool: Arc::new(ToolTraceTool::new(state)),
-            terminal_tool: None,
-        },
-        BaseToolId::PolicyMetrics => BuiltBaseTool {
-            tool: Arc::new(PolicyMetricsTool),
             terminal_tool: None,
         },
         BaseToolId::ConfigManager => BuiltBaseTool {
@@ -1817,7 +1813,7 @@ mod tests {
             [provider]
             api_key = "test-key"
             [tools]
-            disabled = ["policy_metrics", "goal_trace", "check_environment"]
+            disabled = ["web_search", "check_environment"]
             "#,
         )
         .unwrap();
@@ -1858,10 +1854,25 @@ mod tests {
         .unwrap();
 
         let names: Vec<&str> = bundle.tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"policy_metrics"));
-        assert!(!names.contains(&"goal_trace"));
+        assert!(!names.contains(&"web_search"));
         assert!(!names.contains(&"check_environment"));
         assert!(names.contains(&"terminal"));
+    }
+
+    #[tokio::test]
+    async fn forensics_tools_register_only_with_diagnostics() {
+        for diagnostics in [false, true] {
+            let schemas = build_tool_schemas_for_contract_validation(diagnostics, false, false)
+                .await
+                .unwrap();
+            let names: Vec<&str> = schemas
+                .iter()
+                .filter_map(|schema| schema["function"]["name"].as_str())
+                .collect();
+            for tool in ["goal_trace", "policy_metrics", "self_diagnose"] {
+                assert_eq!(names.contains(&tool), diagnostics, "{tool}");
+            }
+        }
     }
 
     #[tokio::test]

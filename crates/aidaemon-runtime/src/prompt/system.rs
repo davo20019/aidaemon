@@ -631,6 +631,7 @@ pub fn build_channel_rules(
             has_read_channel_history: host.has_registered_tool("read_channel_history"),
             own_memory: host.memory_is_daemons_own(),
             memory_owns_manage_memories: host.memory_owns_daemon_tool("manage_memories"),
+            has_goal_trace: host.has_registered_tool("goal_trace"),
         },
         user_role,
         channel_ctx,

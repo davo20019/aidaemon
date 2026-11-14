@@ -56,7 +56,7 @@ pub fn evidence_capabilities_for_tool_call(
     }
 
     match tool_name {
-        "goal_trace" | "tool_trace" => {
+        "goal_trace" => {
             let targeted = string_argument(arguments, "goal_id").is_some()
                 || string_argument(arguments, "task_id").is_some();
             if targeted {
@@ -272,7 +272,7 @@ pub fn evidence_capabilities_from_target_hints(
 /// tools. Exact receipt credit always uses `evidence_capabilities_for_tool_call`.
 fn static_evidence_capabilities(tool_name: &str) -> Vec<ToolEvidenceCapability> {
     let representative_calls: &[&str] = match tool_name {
-        "goal_trace" | "tool_trace" => &[r#"{"action":"tool_trace","task_id":"candidate"}"#],
+        "goal_trace" => &[r#"{"action":"tool_trace","task_id":"candidate"}"#],
         "manage_mandates" => &[
             r#"{"action":"list"}"#,
             r#"{"action":"get","mandate_id":"candidate","section":"history"}"#,

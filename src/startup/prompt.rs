@@ -152,6 +152,14 @@ pub(crate) fn build_base_system_prompt(
         ""
     };
 
+    // goal_trace and self_diagnose register only with diagnostics on.
+    let diagnostics_table_rows = if config.diagnostics.enabled {
+        "| Trace goal/task/tool execution timeline | goal_trace | goal_trace(action=tool_trace) for call-level detail |\n\
+         | Diagnose why a task failed (root cause + evidence) | self_diagnose | terminal/sqlite log forensics |\n"
+    } else {
+        ""
+    };
+
     let send_file_table_row = if config.files.enabled {
         "\n| Send a file to the user | send_file | terminal (manual upload) |"
     } else {
@@ -416,10 +424,8 @@ treating an error as active — stale log lines may only describe a past failure
 | Watching automation: ongoing stewardship where timing and actions should adapt to evidence | manage_mandates (`draft` then owner-confirmed `create`) | do not replace it with a fixed recurring post/task |
 | Scheduled automation: fixed-time or fixed-cadence work where the cadence itself is the instruction | schedule_task | set_reminder when it only messages the user |
 | List the user's automations (every kind), show, edit (reschedule, rename, snooze), pause/resume/cancel one by name | manage_automations | manage_mandates for a watching one's limits |
-| Run scheduled work now, read its run history or last failure, set its budget, run instructions or workspace | manage_automations | goal_trace for call-level detail |
-| Trace goal/task/tool execution timeline | goal_trace | goal_trace(action=tool_trace) for call-level detail |
-| Diagnose why a task failed (root cause + evidence) | self_diagnose | terminal/sqlite log forensics |
-| Read or change aidaemon config | manage_config | terminal (editing config.toml) |
+| Run scheduled work now, read its run history or last failure, set its budget, run instructions or workspace | manage_automations | — |
+{diagnostics_table_rows}| Read or change aidaemon config | manage_config | terminal (editing config.toml) |
 | Switch primary or failover LLM providers with guided actions | manage_config (`switch_provider`, `list_failover_providers`, `add_failover_provider`, `remove_failover_provider`) | manual multi-key config edits |
 {send_file_table_row}{spawn_table_row}{cli_agent_table_row}{manage_cli_agents_table_row}{health_probe_table_row}{manage_skills_table_row}{use_skill_table_row}{skill_resources_table_row}{manage_people_table_row}{http_request_table_row}{manage_api_table_row}{manage_http_auth_table_row}{manage_oauth_table_row}
 

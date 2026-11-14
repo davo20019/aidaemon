@@ -1831,7 +1831,6 @@ fn default_disabled_tools() -> Vec<String> {
         "service_status".to_string(),
         "project_inspect".to_string(),
         "read_channel_history".to_string(),
-        "tool_trace".to_string(),
     ]
 }
 
@@ -1841,9 +1840,10 @@ pub struct ToolsConfig {
     /// Built-in tool machine names to omit at daemon startup (requires `/restart`).
     /// Off by default: `git_info`, `git_commit` (use `run_command`/`terminal`), plus
     /// `policy_metrics`, `service_status`, `project_inspect` (use
-    /// `read_file`/`search_files`/`terminal`), `read_channel_history` (Slack opt-in),
-    /// `tool_trace` (use `goal_trace` with `action: "tool_trace"` instead). Set `disabled = []`
-    /// to register everything. Example extras: `["goal_trace"]` to disable forensics entirely.
+    /// `read_file`/`search_files`/`terminal`), `read_channel_history` (Slack opt-in).
+    /// `goal_trace`, `policy_metrics` and `self_diagnose` also need
+    /// `[diagnostics] enabled = true`. Set `disabled = []` to register everything.
+    /// Example extras: `["goal_trace"]` to disable forensics entirely.
     #[serde(default = "default_disabled_tools")]
     pub disabled: Vec<String>,
 }
@@ -2630,7 +2630,6 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
             "service_status",
             "project_inspect",
             "read_channel_history",
-            "tool_trace",
         ] {
             assert!(
                 !config.is_enabled(tool),
@@ -2640,7 +2639,6 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
         assert!(config.is_enabled("terminal"));
         assert!(config.is_enabled("check_environment"));
         assert!(config.is_enabled("goal_trace"));
-        assert!(!config.is_enabled("tool_trace"));
         assert!(config.is_enabled("search_files"));
     }
 
