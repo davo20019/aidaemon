@@ -1,0 +1,91 @@
+{
+  "description": "Inspect and control native macOS applications via accessibility trees and screenshots. Use this only for a task that requires viewing or interacting with a visible desktop GUI. Never use it to inspect files, directories, paths, processes, command output, or system information, and never use it as a fallback when a filesystem or terminal tool fails; a locked screen affects GUI automation but does not imply that shell commands are unavailable. Only apps that are already running can be controlled — if the target app is not listed by list_apps, call launch_app to start it first; if it is listed but get_app_state reports no accessible window, call launch_app to reopen its window. Call get_app_state before mutating actions; copy the exact snapshot_generation from the most recent result into every mutation (do not increment or guess it). To click or type into a control, prefer targeting it by element_title (and element_role) rather than element_index — titles are stable while indices renumber on every re-render; use occurrence for repeated labels. type_text focuses the element you target before typing, so always pass element_title/element_index when typing into a specific field (e.g. an address bar). After your final mutating action, call get_app_state and confirm the visible state matches the goal before reporting success. When the accessibility tree exposes no addressable elements (common for web pages in a browser and custom-drawn UIs), click by COORDINATE instead: read the target's position off the screenshot and call click with normalized x/y (0-1000 each, no snapshot_generation needed). Never fall back to terminal shell/AppleScript for GUI control.",
+  "name": "computer_use",
+  "schema": {
+    "description": "Inspect and control native macOS applications via accessibility trees and screenshots. Use this only for a task that requires viewing or interacting with a visible desktop GUI. Never use it to inspect files, directories, paths, processes, command output, or system information, and never use it as a fallback when a filesystem or terminal tool fails; a locked screen affects GUI automation but does not imply that shell commands are unavailable. Only apps that are already running can be controlled — if the target app is not listed by list_apps, call launch_app to start it first; if it is listed but get_app_state reports no accessible window, call launch_app to reopen its window. Call get_app_state before mutating actions; copy the exact snapshot_generation from the most recent result into every mutation (do not increment or guess it). To click or type into a control, prefer targeting it by element_title (and element_role) rather than element_index — titles are stable while indices renumber on every re-render; use occurrence for repeated labels. type_text focuses the element you target before typing, so always pass element_title/element_index when typing into a specific field (e.g. an address bar). After your final mutating action, call get_app_state and confirm the visible state matches the goal before reporting success. When the accessibility tree exposes no addressable elements (common for web pages in a browser and custom-drawn UIs), click by COORDINATE instead: read the target's position off the screenshot and call click with normalized x/y (0-1000 each, no snapshot_generation needed). Never fall back to terminal shell/AppleScript for GUI control.",
+    "name": "computer_use",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "The desktop action to perform. computer_use can only control apps that are already running; use launch_app to start an absent app or reopen an app whose process is listed but has no accessible window.",
+          "enum": [
+            "list_apps",
+            "launch_app",
+            "get_app_state",
+            "screenshot",
+            "activate_app",
+            "click",
+            "type_text",
+            "press_key",
+            "scroll",
+            "set_value"
+          ],
+          "type": "string"
+        },
+        "app": {
+          "description": "Application name or bundle id. Required for every action except list_apps. Call launch_app with this name to start an absent app or reopen a listed app that has no accessible window.",
+          "type": "string"
+        },
+        "direction": {
+          "description": "Scroll direction. For scroll, element_index/element_title are OPTIONAL — omit them to scroll the whole page/feed; provide one only to scroll a specific pane.",
+          "enum": [
+            "up",
+            "down",
+            "left",
+            "right"
+          ],
+          "type": "string"
+        },
+        "element_index": {
+          "description": "Indexed element from the accessibility tree. WARNING: indices renumber whenever the screen changes (page load, scroll, new element). Prefer targeting by element_title/element_role, which are stable. Used by click, type_text, scroll, set_value.",
+          "type": "integer"
+        },
+        "element_role": {
+          "description": "Target an element by accessibility role (case-insensitive substring), e.g. 'button', 'textfield'. Use with or instead of element_title to disambiguate.",
+          "type": "string"
+        },
+        "element_title": {
+          "description": "Target an element by its visible title/label (case-insensitive substring), resolved against the latest snapshot. More robust than element_index because it survives re-renders. E.g. 'Address and search bar', 'Like', 'Send'. Combine with occurrence to disambiguate repeats.",
+          "type": "string"
+        },
+        "key": {
+          "description": "Key combo such as Return or Command+s",
+          "type": "string"
+        },
+        "occurrence": {
+          "description": "1-based: which match to use when element_title/element_role match several elements (e.g. occurrence 1 = first 'Like' button in a feed). Default 1.",
+          "type": "integer"
+        },
+        "pages": {
+          "description": "Scroll amount in pages (default 1)",
+          "type": "number"
+        },
+        "snapshot_generation": {
+          "description": "Generation from the latest get_app_state for this app. Required for mutating actions; optional for activate_app (activation may be your first action on an app, and 0 is treated as omitted).",
+          "type": "integer"
+        },
+        "text": {
+          "description": "Text to type. For type_text, also pass element_title (or element_index) to focus that field first; otherwise the text goes to whatever currently has keyboard focus.",
+          "type": "string"
+        },
+        "value": {
+          "description": "Value for set_value",
+          "type": "string"
+        },
+        "x": {
+          "description": "Coordinate-click X in NORMALIZED image space 0-1000 (0=left edge, 1000=right edge of the screenshot you were shown). Use this with y to click by pointing at the screenshot when the element list is empty or the target has no stable title/role (common for web pages in a browser). No snapshot_generation needed for a coordinate click.",
+          "type": "number"
+        },
+        "y": {
+          "description": "Coordinate-click Y in NORMALIZED image space 0-1000 (0=top edge, 1000=bottom edge of the screenshot). Pair with x.",
+          "type": "number"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

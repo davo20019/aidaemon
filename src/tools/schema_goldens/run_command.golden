@@ -1,0 +1,50 @@
+{
+  "description": "Run allowlisted build, test, lint, and read-only inspection commands. Repository-defined scripts, installs, and arbitrary commands require terminal.",
+  "name": "run_command",
+  "schema": {
+    "description": "Run allowlisted build, test, lint, and read-only inspection commands. Repository-defined scripts, installs, and arbitrary commands require terminal.",
+    "name": "run_command",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "access": {
+          "description": "Capability enforced by the process sandbox. Use read_only for inspection and predicates; use workspace_write only when the command must create derived files in working_dir.",
+          "enum": [
+            "read_only",
+            "workspace_write"
+          ],
+          "type": "string"
+        },
+        "command": {
+          "description": "The command to run (must match a safe prefix)",
+          "type": "string"
+        },
+        "parse_format": {
+          "description": "Output parsing format for structured results (default: plain)",
+          "enum": [
+            "cargo",
+            "npm",
+            "pytest",
+            "jest",
+            "go",
+            "plain"
+          ],
+          "type": "string"
+        },
+        "timeout_secs": {
+          "description": "Timeout in seconds (default: 30, max: 300)",
+          "type": "integer"
+        },
+        "working_dir": {
+          "description": "Working directory (default: configured execution workspace root)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "access"
+      ],
+      "type": "object"
+    }
+  }
+}

@@ -419,20 +419,4 @@ mod tests {
         );
         assert!(!ManageCliAgentsTool::effects_for(r#"{"action":"remove","name":"x"}"#).complete);
     }
-
-    #[test]
-    fn schema_fits_payload_budget() {
-        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
-        // admin-tool schemas ride in EVERY provider call; this ceiling is the
-        // per-tool payload budget. If you trip this assert by adding features,
-        // compress the description text — do not raise the ceiling without
-        // updating the Pillar C implementation plan.
-        let bytes = serde_json::to_string(&manage_cli_agents_schema())
-            .unwrap()
-            .len();
-        assert!(
-            bytes <= 1000,
-            "manage_cli_agents schema is {bytes} bytes, budget is 1000"
-        );
-    }
 }

@@ -1,0 +1,109 @@
+{
+  "description": "Onboard API: auth+learn+verify. Never ask user to paste credentials; use keychain command instead.",
+  "name": "manage_api",
+  "schema": {
+    "description": "Onboard API: auth+learn+verify. Never ask user to paste credentials; use keychain command instead.",
+    "name": "manage_api",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "onboard"
+          ],
+          "type": "string"
+        },
+        "allowed_domains": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "auth_mode": {
+          "description": "Auth strategy; other fields depend on this",
+          "enum": [
+            "existing",
+            "oauth2_pkce",
+            "oauth2_authorization_code",
+            "oauth2_client_credentials",
+            "bearer",
+            "header",
+            "basic",
+            "oauth1a"
+          ],
+          "type": "string"
+        },
+        "authorize_url": {
+          "type": "string"
+        },
+        "client_id": {
+          "type": "string"
+        },
+        "connect": {
+          "description": "Run auth flow now",
+          "type": "boolean"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "docs_url": {
+          "type": "string"
+        },
+        "header_name": {
+          "type": "string"
+        },
+        "learn_kind": {
+          "description": "auto=detect; openapi=parse spec; docs=scrape",
+          "enum": [
+            "auto",
+            "openapi",
+            "docs"
+          ],
+          "type": "string"
+        },
+        "learn_url": {
+          "type": "string"
+        },
+        "openapi_url": {
+          "type": "string"
+        },
+        "scopes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "service": {
+          "type": "string"
+        },
+        "timeout_secs": {
+          "type": "integer"
+        },
+        "token_url": {
+          "type": "string"
+        },
+        "user_id": {
+          "type": "string"
+        },
+        "username": {
+          "type": "string"
+        },
+        "verify_method": {
+          "enum": [
+            "GET",
+            "HEAD"
+          ],
+          "type": "string"
+        },
+        "verify_url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "service"
+      ],
+      "type": "object"
+    }
+  }
+}

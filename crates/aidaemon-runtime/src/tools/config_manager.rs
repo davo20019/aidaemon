@@ -2424,25 +2424,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_fits_payload_budget() {
-        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
-        // admin-tool schemas ride in EVERY provider call; this ceiling is the
-        // per-tool payload budget. If you trip this assert by adding features,
-        // compress the description text — do not raise the ceiling without
-        // updating the Pillar C implementation plan.
-        // NOTE: plan ceiling was 900. manage_config has a 10-value action enum
-        // (including enable_stt + 4 failover-provider actions) plus 15 parameters.
-        // Descriptions trimmed to stay within payload budget.
-        let bytes = serde_json::to_string(&manage_config_schema())
-            .unwrap()
-            .len();
-        assert!(
-            bytes <= 950,
-            "manage_config schema is {bytes} bytes, budget is 950"
-        );
-    }
-
-    #[test]
     fn normalize_provider_key_strips_non_alnum() {
         assert_eq!(
             ConfigManagerTool::normalize_provider_key("Cloudflare AI Gateway"),

@@ -1970,22 +1970,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schema_fits_payload_budget() {
-        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
-        // admin-tool schemas ride in EVERY provider call; this ceiling is the
-        // per-tool payload budget. If you trip this assert by adding features,
-        // compress the description text — do not raise the ceiling without
-        // updating the Pillar C implementation plan.
-        let bytes = serde_json::to_string(&manage_memories_schema())
-            .unwrap()
-            .len();
-        assert!(
-            bytes <= 1250,
-            "manage_memories schema is {bytes} bytes, budget is 1250"
-        );
-    }
-
-    #[test]
     fn a_goal_action_reports_what_it_did_without_counting_as_outbound() {
         use crate::tools::traits::ToolMutationEffects as Effects;
         let effects = memory_action_effects(r#"{"action":"create_scheduled_goal"}"#);

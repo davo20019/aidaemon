@@ -1,0 +1,35 @@
+{
+  "description": "Find and replace text in a file",
+  "name": "edit_file",
+  "schema": {
+    "description": "Find and replace text in a file. Use this instead of terminal sed/awk. Shows context around the change. Fails safely if the text isn't found or is ambiguous. On not-found/ambiguous text, read_file the same path and retry once before asking the user.",
+    "name": "edit_file",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "new_text": {
+          "description": "Text to replace with",
+          "type": "string"
+        },
+        "old_text": {
+          "description": "Exact text to find and replace",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path to the file (supports ~ expansion)",
+          "type": "string"
+        },
+        "replace_all": {
+          "description": "Replace all occurrences (default: false, errors if multiple found)",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "old_text",
+        "new_text"
+      ],
+      "type": "object"
+    }
+  }
+}

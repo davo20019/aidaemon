@@ -1342,22 +1342,33 @@ async fn build_base_tool(
     Ok(built)
 }
 
+/// The tool catalog as the model can see it, assembled for the schema lint
+/// and the per-tool goldens: every startup-registered tool with its feature
+/// switched on, plus the tools added outside startup (skills, the
+/// checklist, sub-agents and the role-scoped tools a task, mandate run or
+/// coordinated child gets).
 #[cfg(test)]
-mod tests {
+pub(crate) mod lint_catalog {
     use super::*;
     use crate::events::EventStoreForTests as _;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use proptest::prelude::*;
-    use serde_json::json;
-    use std::collections::HashSet;
     use tempfile::{NamedTempFile, TempDir};
 
-    async fn build_tool_schemas_for_contract_validation(
-        diagnostics_enabled: bool,
-        files_enabled: bool,
-        subagents_enabled: bool,
-    ) -> anyhow::Result<Vec<serde_json::Value>> {
+    pub(crate) struct Catalog {
+        pub tools: Vec<Arc<dyn Tool>>,
+        _guards: (TempDir, NamedTempFile, NamedTempFile),
+        pub state: Arc<SqliteStateStore>,
+        /// Node tools read their instance key from the secret store: never
+        /// the developer's real keychain.
+        _keychain: Option<crate::testing::KeychainIsolation>,
+    }
+
+    /// The tools startup registers (base, optional, runtime), with the
+    /// config `configure` leaves.
+    pub(crate) async fn build_registered(
+        configure: impl FnOnce(&mut AppConfig),
+    ) -> anyhow::Result<Catalog> {
         let mut config: AppConfig = toml::from_str(
             r#"
             [provider]
@@ -1365,9 +1376,6 @@ mod tests {
             "#,
         )?;
         config.provider.models.apply_defaults(&config.provider.kind);
-        config.diagnostics.enabled = diagnostics_enabled;
-        config.files.enabled = files_enabled;
-        config.subagents.enabled = subagents_enabled;
         config.cli_agents.enabled = false;
         config.oauth.enabled = false;
         // Validate the full manifest⇄construction contract: every base tool must
@@ -1376,6 +1384,7 @@ mod tests {
         // BASE_TOOL_REGISTRY. The disable behavior itself is covered by
         // `disabled_tools_are_omitted_from_base_registry`.
         config.tools.disabled.clear();
+        configure(&mut config);
 
         let io_temp = TempDir::new()?;
         config.files.inbox_dir = io_temp.path().join("inbox").display().to_string();
@@ -1441,7 +1450,86 @@ mod tests {
         )
         .await?;
 
-        Ok(bundle
+        Ok(Catalog {
+            tools: bundle.tools,
+            _guards: (io_temp, db_file, config_file),
+            state,
+            _keychain: None,
+        })
+    }
+
+    /// Every tool the model can be offered, each feature on.
+    pub(crate) async fn build_full() -> anyhow::Result<Catalog> {
+        let keychain = crate::testing::KeychainIsolation::acquire();
+        let mut catalog = build_registered(|config| {
+            config.diagnostics.enabled = true;
+            config.files.enabled = true;
+            config.subagents.enabled = true;
+            config.nodes.gateway.enabled = true;
+            config.nodes.announcements.enabled = true;
+            config.nodes.speech.enabled = true;
+            config.nodes.monitoring.enabled = true;
+            config.browser.enabled = cfg!(feature = "browser");
+            config.computer_use.enabled = cfg!(feature = "computer_use");
+        })
+        .await?;
+        let state = catalog.state.clone();
+        let skills_dir = catalog._guards.0.path().join("skills");
+        std::fs::create_dir_all(&skills_dir)?;
+        let resolver = Arc::new(crate::skills::FileSystemResolver::new());
+        let plan_store = Arc::new(crate::plans::PlanStore::new(state.pool()).await?);
+        let extra: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(crate::tools::UseSkillTool::new(skills_dir.clone())),
+            Arc::new(crate::tools::SkillResourcesTool::new(
+                skills_dir.clone(),
+                resolver as Arc<dyn crate::skills::ResourceResolver>,
+            )),
+            Arc::new(crate::tools::ManageSkillsTool::new(
+                skills_dir,
+                state.clone(),
+            )),
+            Arc::new(crate::tools::track_requirements::TrackRequirementsTool::new(plan_store)),
+            Arc::new(crate::tools::EscalateToParentTool),
+            Arc::new(
+                aidaemon_work::tools::manage_goal_tasks::ManageGoalTasksTool::new(
+                    "synthetic-goal".to_string(),
+                    state.clone(),
+                ),
+            ),
+            Arc::new(crate::tools::report_blocker::ReportBlockerTool::new(
+                "synthetic-task".to_string(),
+                state.clone(),
+            )),
+        ];
+        catalog.tools.extend(extra);
+        catalog._keychain = Some(keychain);
+        Ok(catalog)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::EventStoreForTests as _;
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+    use proptest::prelude::*;
+    use serde_json::json;
+    use std::collections::HashSet;
+    use tempfile::NamedTempFile;
+
+    async fn build_tool_schemas_for_contract_validation(
+        diagnostics_enabled: bool,
+        files_enabled: bool,
+        subagents_enabled: bool,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let catalog = super::lint_catalog::build_registered(|config| {
+            config.diagnostics.enabled = diagnostics_enabled;
+            config.files.enabled = files_enabled;
+            config.subagents.enabled = subagents_enabled;
+        })
+        .await?;
+        Ok(catalog
             .tools
             .iter()
             .map(|tool| json!({"type":"function","function": tool.schema()}))

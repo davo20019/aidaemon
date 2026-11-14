@@ -1,0 +1,29 @@
+{
+  "description": "Restart a connected AIdaemon Node after the owner approves it, or check the last restart's status.",
+  "name": "node_restart",
+  "schema": {
+    "description": "Ask a connected AIdaemon Node to restart, or read the status of its latest restart. Each request needs the owner's approval, a device_restart grant and firmware that reports the runtime.restart capability. A request only queues the restart for the Node's next heartbeat; it is done only when status reports confirmed. This cannot reach an offline Device.",
+    "name": "node_restart",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "request queues a restart; status reports the latest one.",
+          "enum": [
+            "request",
+            "status"
+          ],
+          "type": "string"
+        },
+        "node": {
+          "description": "Optional Node display name. Omit when exactly one active Node is enrolled.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

@@ -1,12 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAX_SCHEMA_SEGMENT_CHARS: usize = 6_500;
-// Reference-image editing and the owner-facing bounded-mandate contract add
-// explicit inputs, including non-combinable operation scopes. Retain a hard
-// aggregate ceiling while accounting for those user-visible capabilities.
-const MAX_TOTAL_SCHEMA_SEGMENT_CHARS: usize = 107_000;
-
 fn tools_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools")
 }
@@ -179,49 +173,6 @@ fn schema_region_is_not_extended_by_following_adapter_hooks() {
 }
 
 #[test]
-fn all_tool_schemas_disable_additional_properties() {
-    for file in tool_source_files() {
-        let source = fs::read_to_string(&file).expect("read tool source");
-        let segment = schema_source_region(&source)
-            .unwrap_or_else(|| panic!("Could not locate schema segment in {}", file.display()));
-        assert!(
-            segment.contains("\"additionalProperties\": false"),
-            "Schema must include parameters.additionalProperties=false: {}",
-            file.display()
-        );
-    }
-}
-
-/// A tool has one description. The model reads the schema's, so a second
-/// literal in `description()` drifts unseen (a spawn_agent fix once landed
-/// in the copy the model never reads); the schema must reference it.
-#[test]
-fn tool_schemas_use_the_single_tool_description() {
-    let mut duplicated = Vec::new();
-    for file in tool_source_files() {
-        let source = fs::read_to_string(&file).expect("read tool source");
-        let Some(segment) = schema_source_region(&source) else {
-            continue;
-        };
-        let Some(name_at) = segment.find("\"name\":") else {
-            continue;
-        };
-        let after_name = &segment[name_at..];
-        let Some(description_at) = after_name.find("\"description\":") else {
-            continue;
-        };
-        let value = after_name[description_at + "\"description\":".len()..].trim_start();
-        if value.starts_with('"') {
-            duplicated.push(file.display().to_string());
-        }
-    }
-    assert!(
-        duplicated.is_empty(),
-        "schema() must use \"description\": self.description(), not a second copy: {duplicated:?}"
-    );
-}
-
-#[test]
 fn all_tools_define_explicit_capabilities() {
     for file in tool_source_files() {
         let source = fs::read_to_string(&file).expect("read tool source");
@@ -243,30 +194,6 @@ fn tools_do_not_silently_fallback_to_empty_arguments() {
             file.display()
         );
     }
-}
-
-#[test]
-fn schema_payload_budget_stays_bounded() {
-    let mut total = 0usize;
-    for file in tool_source_files() {
-        let source = fs::read_to_string(&file).expect("read tool source");
-        let segment = schema_source_region(&source)
-            .unwrap_or_else(|| panic!("Could not locate schema segment in {}", file.display()));
-        total += segment.len();
-        assert!(
-            segment.len() <= MAX_SCHEMA_SEGMENT_CHARS,
-            "Schema segment too large ({} chars) in {}",
-            segment.len(),
-            file.display()
-        );
-    }
-
-    assert!(
-        total <= MAX_TOTAL_SCHEMA_SEGMENT_CHARS,
-        "Total schema segment payload too large: {} chars (max {})",
-        total,
-        MAX_TOTAL_SCHEMA_SEGMENT_CHARS
-    );
 }
 
 #[test]
