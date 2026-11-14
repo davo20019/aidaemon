@@ -324,7 +324,7 @@ pub async fn run(
 
     // Background sub-agents do not survive a restart: tell their chats. Done
     // before channels start, so nothing running now can be mistaken for lost.
-    crate::tools::spawn::report_interrupted_background_children(
+    aidaemon_runtime::helper_run::delivery::report_interrupted_background_children(
         &(state.clone() as Arc<dyn crate::traits::NotificationStore>),
     )
     .await;

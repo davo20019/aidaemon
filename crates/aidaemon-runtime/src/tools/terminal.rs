@@ -3163,7 +3163,9 @@ async fn run_background_continuation_with_timeout(
     // measured"), when it adds to the runs' own times.
     let total = clock
         .filter(|_| !envelope.text.trim().is_empty())
-        .and_then(|clock| crate::spawn_tool::answer_sent_line(clock, false, chrono::Utc::now()));
+        .and_then(|clock| {
+            crate::run_state::timing::answer_sent_line(clock, false, chrono::Utc::now())
+        });
     if let Some(total) = total {
         envelope.text = format!(
             "{}\n\n{}{}",

@@ -19,7 +19,10 @@ mod test_scope {
     };
     pub(super) use crate::traits::{AgentRole, StateStore, Tool, ToolCallContext};
     pub(super) use crate::types::{ChannelVisibility, StatusUpdate, UserRole};
+    pub(super) use aidaemon_runtime::helper_run::card::*;
+    pub(super) use aidaemon_runtime::helper_run::delivery::*;
     pub(super) use aidaemon_runtime::run_state::RunPhase;
+    pub(super) use aidaemon_runtime::run_state::timing::*;
 }
 #[cfg(test)]
 use test_scope::*;
@@ -1728,7 +1731,7 @@ mod child_runtime_tests {
             note.contains(&format!("Count lines took 21s (21s), {from} to {to} ")),
             "{note}"
         );
-        let card = aidaemon_runtime::spawn_tool::took_line(run.span(), run.waited);
+        let card = aidaemon_runtime::run_state::timing::took_line(run.span(), run.waited);
         assert!(
             card.starts_with(&format!("Took 21s ({from} to {to} ")),
             "{card}"
