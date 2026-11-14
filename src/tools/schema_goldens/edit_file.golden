@@ -7,6 +7,32 @@
     "parameters": {
       "additionalProperties": false,
       "properties": {
+        "edits": {
+          "description": "Several edits, in place of old_text/new_text; each applies to the result of the one before",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "new_text": {
+                "description": "Text to replace with",
+                "type": "string"
+              },
+              "old_text": {
+                "description": "Exact text to find",
+                "type": "string"
+              },
+              "replace_all": {
+                "description": "Replace all occurrences (default: false)",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "old_text",
+              "new_text"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
         "new_text": {
           "description": "Text to replace with",
           "type": "string"
@@ -25,9 +51,7 @@
         }
       },
       "required": [
-        "path",
-        "old_text",
-        "new_text"
+        "path"
       ],
       "type": "object"
     }

@@ -1,5 +1,6 @@
 //! `edit_file`: exact find and replace that changes nothing when the text is
-//! missing or ambiguous.
+//! missing or ambiguous. A batch of `edits` applies in order, all or none, in
+//! one write of the file.
 
 use std::sync::Arc;
 
@@ -37,7 +38,7 @@ impl EditFile {
             policy,
             text: ToolText {
                 short: "Find and replace text in a file".into(),
-                schema: "Find and replace text in a file. Fails without changing anything when the text is not found or is ambiguous; read the file again and retry.".into(),
+                schema: "Find and replace text in a file. Fails without changing anything when the text is not found or is ambiguous; read the file again and retry. For several changes to one file, pass `edits`: applied in order, all or nothing.".into(),
             },
         }
     }
@@ -49,7 +50,92 @@ impl EditFile {
     }
 }
 
-/// One edit applied to a file's bytes.
+/// The argument names a model may use for the text to find and its
+/// replacement.
+const OLD_KEYS: [&str; 4] = ["old_text", "old_string", "search", "find"];
+const NEW_KEYS: [&str; 4] = ["new_text", "new_string", "replace", "replacement"];
+
+fn text_arg<'a>(value: &'a Value, keys: [&str; 4]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+}
+
+/// One find-and-replace a call asks for.
+struct EditArg {
+    old_text: String,
+    new_text: String,
+    replace_all: bool,
+}
+
+/// The edits one call asks for: its `edits` list (`batch`), or the single
+/// `old_text`/`new_text` pair.
+struct EditRequest {
+    edits: Vec<EditArg>,
+    batch: bool,
+}
+
+impl EditRequest {
+    /// Read the edits from a call's arguments, or say what is malformed.
+    fn parse(args: &Value) -> Result<Self, String> {
+        let replace_all = |value: &Value| {
+            value
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        let Some(list) = args.get("edits").filter(|value| !value.is_null()) else {
+            let old_text = text_arg(args, OLD_KEYS)
+                .ok_or("Missing required parameter: old_text (or `edits`)")?;
+            let new_text =
+                text_arg(args, NEW_KEYS).ok_or("Missing required parameter: new_text")?;
+            return Ok(Self {
+                edits: vec![EditArg {
+                    old_text: old_text.to_string(),
+                    new_text: new_text.to_string(),
+                    replace_all: replace_all(args),
+                }],
+                batch: false,
+            });
+        };
+        if text_arg(args, OLD_KEYS).is_some() || text_arg(args, NEW_KEYS).is_some() {
+            return Err("Give either `edits` or `old_text`/`new_text`, not both".into());
+        }
+        let list = list
+            .as_array()
+            .ok_or("`edits` must be a list of {old_text, new_text, replace_all?}")?;
+        if list.is_empty() {
+            return Err("`edits` is empty; nothing to change".into());
+        }
+        let edits = list
+            .iter()
+            .enumerate()
+            .map(|(index, edit)| {
+                let n = index + 1;
+                let old_text = text_arg(edit, OLD_KEYS)
+                    .ok_or_else(|| format!("Edit {n} is missing `old_text`"))?;
+                let new_text = text_arg(edit, NEW_KEYS)
+                    .ok_or_else(|| format!("Edit {n} is missing `new_text`"))?;
+                Ok(EditArg {
+                    old_text: old_text.to_string(),
+                    new_text: new_text.to_string(),
+                    replace_all: replace_all(edit),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self { edits, batch: true })
+    }
+
+    /// Name edit `index` in a refusal: a batch numbers its edits.
+    fn prefix(&self, index: usize) -> String {
+        if self.batch {
+            format!("Edit {} of {}: ", index + 1, self.edits.len())
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// One edit applied to a file's text.
 struct AppliedEdit {
     new_content: String,
     /// Occurrences of the text that were found.
@@ -58,21 +144,65 @@ struct AppliedEdit {
     used_newline_recovery: bool,
 }
 
-/// Apply one edit to `bytes`, or say why it cannot be applied. The tool and
-/// its `file_write_result` share this, so a predicted result is the one the
-/// call writes.
-fn apply_edit(
+/// Every edit of a call applied, in order, to a file's bytes.
+struct AppliedEdits {
+    new_content: String,
+    /// Occurrences replaced, over all the edits.
+    replaced: usize,
+    /// Each edit's replacement as written, for showing where it landed.
+    new_texts: Vec<String>,
+    used_newline_recovery: bool,
+}
+
+/// Apply every edit of `request` to `bytes`, each to the result of the one
+/// before, or say which edit cannot be applied and why. The tool and its
+/// `file_write_result` share this, so a predicted result is the one the call
+/// writes.
+fn apply_edits(
     bytes: &[u8],
     path_str: &str,
-    old_text: &str,
-    new_text: &str,
-    replace_all: bool,
-) -> anyhow::Result<AppliedEdit> {
+    request: &EditRequest,
+) -> anyhow::Result<AppliedEdits> {
     if bytes.iter().take(8192).any(|byte| *byte == 0) {
         anyhow::bail!("Cannot edit binary file: {}", path_str);
     }
-    let content = std::str::from_utf8(bytes)
-        .map_err(|_| anyhow::anyhow!("Cannot edit non-UTF-8 file: {}", path_str))?;
+    let mut content = std::str::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("Cannot edit non-UTF-8 file: {}", path_str))?
+        .to_string();
+    let mut applied_all = AppliedEdits {
+        new_content: String::new(),
+        replaced: 0,
+        new_texts: Vec::with_capacity(request.edits.len()),
+        used_newline_recovery: false,
+    };
+    for (index, edit) in request.edits.iter().enumerate() {
+        let applied = apply_edit(&content, path_str, edit).map_err(|why| {
+            if request.batch {
+                anyhow::anyhow!(
+                    "{}failed, so no edit was written. {}",
+                    request.prefix(index),
+                    why
+                )
+            } else {
+                why
+            }
+        })?;
+        applied_all.replaced += if edit.replace_all { applied.count } else { 1 };
+        applied_all.used_newline_recovery |= applied.used_newline_recovery;
+        applied_all.new_texts.push(applied.effective_new_text);
+        content = applied.new_content;
+    }
+    applied_all.new_content = content;
+    Ok(applied_all)
+}
+
+/// Apply one edit to `content`, or say why it cannot be applied.
+fn apply_edit(content: &str, path_str: &str, edit: &EditArg) -> anyhow::Result<AppliedEdit> {
+    let (old_text, new_text, replace_all) = (
+        edit.old_text.as_str(),
+        edit.new_text.as_str(),
+        edit.replace_all,
+    );
 
     // Count occurrences using exact match first.
     let mut effective_old_text = old_text.to_string();
@@ -151,9 +281,32 @@ impl OutcomeTool for EditFile {
                     "replace_all": {
                         "type": "boolean",
                         "description": "Replace all occurrences (default: false, errors if multiple found)"
+                    },
+                    "edits": {
+                        "type": "array",
+                        "description": "Several edits, in place of old_text/new_text; each applies to the result of the one before",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {
+                                    "type": "string",
+                                    "description": "Exact text to find"
+                                },
+                                "new_text": {
+                                    "type": "string",
+                                    "description": "Text to replace with"
+                                },
+                                "replace_all": {
+                                    "type": "boolean",
+                                    "description": "Replace all occurrences (default: false)"
+                                }
+                            },
+                            "required": ["old_text", "new_text"],
+                            "additionalProperties": false
+                        }
                     }
                 },
-                "required": ["path", "old_text", "new_text"],
+                "required": ["path"],
                 "additionalProperties": false
             }
         })
@@ -173,19 +326,7 @@ impl OutcomeTool for EditFile {
             .or_else(|| args["file"].as_str())
             .or_else(|| args["filename"].as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: path"))?;
-        let old_text = args["old_text"]
-            .as_str()
-            .or_else(|| args["old_string"].as_str())
-            .or_else(|| args["search"].as_str())
-            .or_else(|| args["find"].as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: old_text"))?;
-        let new_text = args["new_text"]
-            .as_str()
-            .or_else(|| args["new_string"].as_str())
-            .or_else(|| args["replace"].as_str())
-            .or_else(|| args["replacement"].as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: new_text"))?;
-        let replace_all = args["replace_all"].as_bool().unwrap_or(false);
+        let request = EditRequest::parse(&args).map_err(|why| anyhow::anyhow!(why))?;
 
         let backend = self.backend.clone();
         let path = backend.resolve_path(path_str).await?;
@@ -206,12 +347,12 @@ impl OutcomeTool for EditFile {
         };
 
         let bytes = backend.read(&path).await?;
-        let AppliedEdit {
+        let AppliedEdits {
             new_content,
-            count,
-            effective_new_text,
+            replaced,
+            new_texts,
             used_newline_recovery,
-        } = apply_edit(&bytes, path_str, old_text, new_text, replace_all)?;
+        } = apply_edits(&bytes, path_str, &request)?;
 
         // Backup + atomic write
         self.policy.backup_before_overwrite(&backend, &path).await;
@@ -222,19 +363,36 @@ impl OutcomeTool for EditFile {
             write_guard.committed().await;
         }
 
-        // Show context around the change
-        let replaced_count = if replace_all { count } else { 1 };
-        let context = get_change_context(&new_content, &effective_new_text);
+        // Show context around each change (the first few of a batch).
+        const SHOWN_EDITS: usize = 5;
+        let mut context = new_texts
+            .iter()
+            .take(SHOWN_EDITS)
+            .map(|new_text| get_change_context(&new_content, new_text))
+            .collect::<Vec<_>>()
+            .join("\n     ...\n");
+        if new_texts.len() > SHOWN_EDITS {
+            context.push_str(&format!(
+                "\n(and {} more edits)",
+                new_texts.len() - SHOWN_EDITS
+            ));
+        }
+        let edits = if request.batch {
+            format!("applied {} edits, ", request.edits.len())
+        } else {
+            String::new()
+        };
         let diagnostics = self
             .policy
             .post_write_diagnostics(&*backend, std::path::Path::new(path.as_str()))
             .await;
 
         Ok(ToolCallOutcome::from_output(format!(
-            "Edited {}: replaced {} occurrence{}{}\n\n{}{}",
+            "Edited {}: {}replaced {} occurrence{}{}\n\n{}{}",
             path_str,
-            replaced_count,
-            if replaced_count > 1 { "s" } else { "" },
+            edits,
+            replaced,
+            if replaced > 1 { "s" } else { "" },
             if used_newline_recovery {
                 " (newline-normalized match)"
             } else {
@@ -246,17 +404,19 @@ impl OutcomeTool for EditFile {
     }
 
     fn validate_call(&self, arguments: &Value) -> Result<(), String> {
-        let text = |keys: [&str; 4]| {
-            keys.iter()
-                .find_map(|key| arguments.get(*key).and_then(Value::as_str))
-        };
-        let old = text(["old_text", "old_string", "search", "find"]);
-        let new = text(["new_text", "new_string", "replace", "replacement"]);
-        if old == Some("") {
-            return Err("`old_text` must not be empty; use write_file to create a file".into());
-        }
-        if old.is_some() && old == new {
-            return Err("`old_text` and `new_text` are identical; nothing to change".into());
+        let request = EditRequest::parse(arguments)?;
+        for (index, edit) in request.edits.iter().enumerate() {
+            let prefix = request.prefix(index);
+            if edit.old_text.is_empty() {
+                return Err(format!(
+                    "{prefix}`old_text` must not be empty; use write_file to create a file"
+                ));
+            }
+            if edit.old_text == edit.new_text {
+                return Err(format!(
+                    "{prefix}`old_text` and `new_text` are identical; nothing to change"
+                ));
+            }
         }
         Ok(())
     }
@@ -323,15 +483,28 @@ impl crate::semantics::ToolSemantics for EditFile {
 
     fn call_file_write(&self, arguments: &str) -> Option<crate::semantics::FileWrite> {
         let args: Value = serde_json::from_str(arguments).ok()?;
-        let old_text = ["old_text", "old_string", "search", "find"]
-            .iter()
-            .find_map(|key| args.get(*key).and_then(Value::as_str))?;
+        let request = EditRequest::parse(&args).ok()?;
+        let kind = if request.batch {
+            crate::semantics::FileWriteKind::Edits(
+                request
+                    .edits
+                    .into_iter()
+                    .map(|edit| crate::semantics::TextEdit {
+                        old_text: edit.old_text,
+                        replace_all: edit.replace_all,
+                    })
+                    .collect(),
+            )
+        } else {
+            let edit = request.edits.into_iter().next()?;
+            crate::semantics::FileWriteKind::Edit {
+                old_text: edit.old_text,
+                replace_all: edit.replace_all,
+            }
+        };
         Some(crate::semantics::FileWrite {
             path: path_arg(&args)?.to_string(),
-            kind: crate::semantics::FileWriteKind::Edit {
-                old_text: old_text.to_string(),
-                replace_all: args["replace_all"].as_bool().unwrap_or(false),
-            },
+            kind,
         })
     }
 
@@ -342,18 +515,12 @@ impl crate::semantics::ToolSemantics for EditFile {
     ) -> Option<Result<Vec<u8>, String>> {
         let args: Value = serde_json::from_str(arguments).ok()?;
         let path = path_arg(&args)?;
-        let old_text = ["old_text", "old_string", "search", "find"]
-            .iter()
-            .find_map(|key| args.get(*key).and_then(Value::as_str))?;
-        let new_text = ["new_text", "new_string", "replace", "replacement"]
-            .iter()
-            .find_map(|key| args.get(*key).and_then(Value::as_str))?;
-        let replace_all = args["replace_all"].as_bool().unwrap_or(false);
+        let request = EditRequest::parse(&args).ok()?;
         let Some(current) = current else {
             return Some(Err(format!("File not found: {path}")));
         };
         Some(
-            apply_edit(current, path, old_text, new_text, replace_all)
+            apply_edits(current, path, &request)
                 .map(|applied| applied.new_content.into_bytes())
                 .map_err(|why| why.to_string()),
         )

@@ -2240,10 +2240,20 @@ pub enum AgentRole {
 pub enum FileWriteKind {
     /// Replaces this exact text.
     Edit { old_text: String, replace_all: bool },
+    /// Replaces each exact text in order, each in the result of the one
+    /// before: all of them, or nothing.
+    Edits(Vec<TextEdit>),
     /// Replaces the whole file.
     Replace,
     /// Adds to the end of the file.
     Append,
+}
+
+/// One find-and-replace of a [`FileWriteKind::Edits`] batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextEdit {
+    pub old_text: String,
+    pub replace_all: bool,
 }
 
 /// The file one call writes, as the tool's arguments name it.
