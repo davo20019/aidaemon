@@ -241,6 +241,15 @@ pub fn start(store: Store) {
                     }
                     Some(Some(Heard::Message(text))) => {
                         if let Some(frame) = machine.received(&text, now()) {
+                            // Welcomed with the key it has: a pairing link
+                            // still in the address has nothing left to do.
+                            if matches!(
+                                frame,
+                                aidaemon_client_protocol::ServerFrame::Welcome { .. }
+                            ) && offered_pairing().is_some()
+                            {
+                                forget_pairing_link();
+                            }
                             store.update(Update::Frame(frame));
                         }
                     }

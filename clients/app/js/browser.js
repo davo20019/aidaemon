@@ -78,6 +78,13 @@ export function pairingLink() {
   return [hash.get("offer") ?? "", hash.get("code") ?? "", hash.get("fp") ?? ""];
 }
 
+// A pairing link opened in a tab that already shows the app changes only
+// the fragment, which loads nothing: start the page afresh so the link and
+// its pairing run from the offer, as a first visit would.
+window.addEventListener("hashchange", () => {
+  if (new URLSearchParams(location.hash.slice(1)).get("offer")) location.reload();
+});
+
 export function forgetPairingLink() {
   history.replaceState(null, "", location.pathname + location.search);
 }
