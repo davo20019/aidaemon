@@ -41,6 +41,8 @@ __pycache__/
 !tests/fixtures/**/*.json
 # The Client Protocol's generated JSON Schema, which clients generate from.
 !schemas/**/*.json
+# Stand-alone protocol reference docs, not generated from code.
+schemas/node-protocol-v1.schema.json
 *.png
 *.txt
 *.pdf
