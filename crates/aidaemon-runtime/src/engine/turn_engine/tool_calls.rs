@@ -1241,13 +1241,24 @@ impl TurnEngine<'_> {
         {
             warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool result");
         }
-        // The executor's own checklist becomes ledger expectations.
+        // The executor's own checklist becomes ledger expectations, read
+        // from the arguments the tool itself ran on: its canonical form drops
+        // the targets no adapter can report (a bare `README.md`, `user`).
+        // Read from the model's raw arguments, the ledger kept a target the
+        // stored checklist had dropped, so a step's own receipt (a file sent,
+        // a fact remembered) could never credit it (live 2026-11-14).
+        let checklist_arguments = if facts.requirement_checklist {
+            self.turn_tool(scope, &request.name)
+                .and_then(|tool| tool.canonicalize_arguments(arguments).ok())
+        } else {
+            None
+        };
         if facts.requirement_checklist
             && !failed
             && let Some(declared) =
                 aidaemon_work::plans::checklist_args::executor_expectations_from_checklist_arguments(
                     scope.task_id,
-                    arguments,
+                    checklist_arguments.as_deref().unwrap_or(arguments),
                 )
         {
             let open = declared
