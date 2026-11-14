@@ -428,7 +428,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev clang pkg-config
+          # GStreamer (gstreamer, -base, -app, -audio) and Wayland are linked by the app's media backend.
+          sudo apt-get install -y libgtk-4-dev clang pkg-config \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev
       - name: Check
         run: cargo check --all-targets
       - name: Clippy
