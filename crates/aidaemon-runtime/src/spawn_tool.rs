@@ -517,6 +517,41 @@ async fn job_plan(
         })
 }
 
+/// A waited-on helper's status channel: its own steps go on its run record,
+/// and its line on the card is drawn from that record ([`RunState::view`]),
+/// as a background helper's is. Every other update passes through.
+///
+/// [`RunState::view`]: crate::run_state::RunState::view
+pub fn record_waited_steps(
+    parent: Option<mpsc::Sender<StatusUpdate>>,
+    runs: Arc<crate::run_state::RunStates>,
+    id: String,
+    label: String,
+) -> Option<mpsc::Sender<StatusUpdate>> {
+    let parent = parent?;
+    let (tx, mut rx) = mpsc::channel::<StatusUpdate>(64);
+    tokio::spawn(async move {
+        while let Some(update) = rx.recv().await {
+            let update = match update {
+                StatusUpdate::Helper(view) if view.label == label && !view.phase.is_terminal() => {
+                    if let Some(step) = view.step.clone() {
+                        runs.step(&id, step);
+                    }
+                    match runs.get(&id) {
+                        Some(run) if !run.phase.is_terminal() => StatusUpdate::Helper(run.view()),
+                        _ => continue,
+                    }
+                }
+                other => other,
+            };
+            if parent.send(update).await.is_err() {
+                break;
+            }
+        }
+    });
+    Some(tx)
+}
+
 /// A background helper's status channel: every update goes on to its
 /// parent's, and its own steps are also noted for its line on the card and
 /// shown there once its turn has ended (live 2026-11-13: the turn's live
@@ -2120,6 +2155,7 @@ impl SpawnAgentTool {
             .clone()
             .filter(|_| plan_session.as_deref() == Some(session_id.as_str()));
         if let Some(task) = parent_task_id.as_deref() {
+            runs.for_request(&background_id, task);
             runs.join_group(
                 &background_id,
                 &crate::run_state::turn_group(&session_id, task),
@@ -2927,25 +2963,43 @@ impl SpawnAgentTool {
             .unwrap_or_default()
             .nested();
         let card_tx = status_tx.clone();
+        // Its one typed record, as a background run has: every surface (the
+        // card, `/tasks`, the status reply) reads this helper from it, by
+        // its id, never by its label.
+        let runs = agent.helper_runs();
+        let run_id = format!("helper:{}", uuid::Uuid::new_v4());
+        runs.begin_waited(
+            &run_id,
+            approval_session_id.unwrap_or_default(),
+            &helper_name,
+            started,
+            task_id,
+        );
+        runs.link_steps(&run_id, &card_steps);
+        let status_tx =
+            record_waited_steps(status_tx, runs.clone(), run_id.clone(), helper_name.clone());
         let result = aidaemon_channels::owner_wait::OwnerWaitClock::within(
             Some(waits.clone()),
-            agent.run_child(ChildAgentRequest {
-                mission: mission.to_string(),
-                task: task.to_string(),
-                status_tx,
-                channel_ctx,
-                user_role,
-                child_role,
-                goal_id: goal_id.map(str::to_string),
-                task_id: task_id.map(str::to_string),
-                project_scope: project_scope.map(str::to_string),
-                specialist: arg_specialist.map(str::to_string),
-                approval_session_id: approval_session_id.map(str::to_string),
-                parent_authority,
-                time_limit: self.time_limit(),
-                model_tier,
-                bound_task_attempt: None,
-            }),
+            crate::run_state::within_run(
+                &run_id,
+                agent.run_child(ChildAgentRequest {
+                    mission: mission.to_string(),
+                    task: task.to_string(),
+                    status_tx,
+                    channel_ctx,
+                    user_role,
+                    child_role,
+                    goal_id: goal_id.map(str::to_string),
+                    task_id: task_id.map(str::to_string),
+                    project_scope: project_scope.map(str::to_string),
+                    specialist: arg_specialist.map(str::to_string),
+                    approval_session_id: approval_session_id.map(str::to_string),
+                    parent_authority,
+                    time_limit: self.time_limit(),
+                    model_tier,
+                    bound_task_attempt: None,
+                }),
+            ),
         )
         .await;
         let measured = MeasuredRun::ended_now(started, &waits);
@@ -2955,11 +3009,6 @@ impl SpawnAgentTool {
             Err(error) => crate::spawn::end_of_child_error(error),
         };
         let failed = run_end.phase() == RunPhase::Failed;
-        // How long after the owner's request it ended: what the owner means
-        // by "how long did it take", on the card and for the parent to
-        // quote. Several helpers of one request each carry theirs, and the
-        // card says when the last one ended.
-        let since = requested_at.map(|requested| since_request_view(requested, measured.finished));
         // Its one time set ([`crate::run_state::RunTimes`]): the card's line
         // and the parent's, labelled the same.
         let times = crate::run_state::RunTimes::new(
@@ -2984,24 +3033,28 @@ impl SpawnAgentTool {
         // Its header on the turn's card ends with how it ended and the time
         // the runtime measured: the owner reads the time there, never as
         // the parent's arithmetic.
-        if let Some(tx) = card_tx {
-            let _ = tx.try_send(StatusUpdate::Helper(aidaemon_core::card::HelperView {
-                label: helper_name.clone(),
-                phase: run_end.phase(),
-                background: false,
-                step: None,
-                steps: card_steps,
-                // Stopped by the owner: its header says so, with no reason
-                // line.
-                reason: match &result {
-                    _ if run_end.stopped_by_owner() => None,
-                    Ok(run) => run_end.reason(&run.evidence),
-                    Err(_) => run_end.reason(&Default::default()),
-                },
-                stopped_by_owner: run_end.stopped_by_owner(),
-                took: Some(times.line()),
-                since_request: since,
-            }));
+        // How it ended goes on its record; its header on the turn's card is
+        // drawn from that record, with the time the runtime measured: the
+        // owner reads the time there, never as the parent's arithmetic.
+        let ended = runs.finish(
+            &run_id,
+            run_end.clone(),
+            crate::run_state::RunMeasure {
+                ended_at: measured.finished,
+                work_began: measured.steps.map(|(first, _)| first),
+                waited: measured.waited,
+            },
+            result
+                .as_ref()
+                .map(|run| run.evidence.clone())
+                .unwrap_or_default(),
+            crate::run_state::RunReport {
+                text: String::new(),
+                untrusted: false,
+            },
+        );
+        if let (Some(tx), Some(ended)) = (card_tx, ended) {
+            let _ = tx.try_send(StatusUpdate::Helper(ended.view()));
         }
 
         match result {
@@ -3445,6 +3498,8 @@ mod group_tests {
             evidence: Default::default(),
             failure: None,
             card: Default::default(),
+            background: true,
+            request: None,
         };
         let end = |state: RunState, report: &str| GroupEnd {
             state,
@@ -3546,6 +3601,8 @@ mod group_tests {
                 },
                 failure: None,
                 card: Default::default(),
+                background: true,
+                request: None,
             },
             report: RunReport {
                 text: "I sent a rendered homepage screenshot.".to_string(),

@@ -592,7 +592,8 @@ impl TurnRunner {
                 (entry.description, elapsed)
             },
         );
-        self.live.snapshot(session_id, &request, elapsed)
+        let runs = self.deps.agent.chat_runs(session_id).await;
+        self.live.snapshot(session_id, &request, elapsed, runs)
     }
 
     /// Whether the agent reads `turn` sent mid-run: the owner's own text,
@@ -1388,6 +1389,30 @@ mod tests {
                 items: self.work.lock().unwrap().clone(),
             }
         }
+        /// Each sub-agent with a run record, running a command.
+        async fn chat_runs(&self, _session_id: &str) -> crate::ports::ChatRuns {
+            let runs = self
+                .work
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|item| {
+                    Some(crate::ports::ChatRun {
+                        id: item.run.clone()?,
+                        view: aidaemon_core::card::HelperView::running(
+                            item.title.trim_start_matches("Sub-agent: "),
+                            true,
+                            Some(aidaemon_core::card::Step::Doing(
+                                aidaemon_core::card::ActivityKind::Run,
+                            )),
+                        ),
+                        running_for: Duration::from_secs(60),
+                        this_request: false,
+                    })
+                })
+                .collect();
+            crate::ports::ChatRuns { runs, plan: None }
+        }
         async fn stop_chat_work(&self, _session_id: &str, key: &str) -> bool {
             let mut work = self.work.lock().unwrap();
             work.retain(|item| item.key != key);
@@ -1957,30 +1982,8 @@ mod tests {
             watch: TurnWatch::default(),
         });
         let session = "test:mid-run";
-        // The turn that started the helper has ended; the helper reports on.
-        runner.live.begin(session, 7);
-        runner.live.record(
-            session,
-            7,
-            &StatusUpdate::Helper(aidaemon_core::card::HelperView::running(
-                "Counting agent A",
-                true,
-                None,
-            )),
-        );
-        runner.live.end(session, 7);
-        runner.live.record(
-            session,
-            7,
-            &StatusUpdate::Helper(aidaemon_core::card::HelperView::running(
-                "Counting agent A",
-                true,
-                Some(aidaemon_core::card::Step::Doing(
-                    aidaemon_core::card::ActivityKind::Run,
-                )),
-            )),
-        );
-
+        // The turn that started the helper has ended; the helper runs on,
+        // its record says how.
         let surface = Arc::new(Said::default());
         runner
             .submit(surface.clone(), owner_turn("how's it going?", "b1"))
@@ -2111,6 +2114,7 @@ mod tests {
                 started_at: now - chrono::Duration::seconds(60),
                 request: Some("req-1".into()),
                 step: None,
+                run: Some("helper:a".into()),
             },
             crate::ports::ChatWork {
                 key: "job:0:4242".into(),
@@ -2119,6 +2123,7 @@ mod tests {
                 started_at: now - chrono::Duration::seconds(50),
                 request: Some("req-1".into()),
                 step: None,
+                run: None,
             },
         ]
     }

@@ -58,11 +58,13 @@ fn work_facts(work: &RunningWork) -> Value {
             "seconds_ago": since.as_secs(),
         })),
         "plan": work.plan.as_deref().map(|plan| clip(plan, PLAN_CHARS)),
-        "helpers": work.helpers.iter().take(MAX_HELPERS).map(|helper| json!({
-            "job": clip(&helper.label, LINE_CHARS),
-            "progress": clip(&helper.progress, LINE_CHARS),
-            "seconds_ago": helper.since.as_secs(),
-            "running_for_seconds": helper.running_for.as_secs(),
+        "helpers": work.runs.iter().take(MAX_HELPERS).map(|run| json!({
+            "job": clip(&run.view.label, LINE_CHARS),
+            "progress": clip(
+                &aidaemon_channels::live_status::helper_status_words(&run.view),
+                LINE_CHARS,
+            ),
+            "running_for_seconds": run.running_for.as_secs(),
         })).collect::<Vec<_>>(),
         "running": work.running.iter().take(MAX_RUNNING).map(|item| json!({
             "number": item.number,
@@ -200,7 +202,7 @@ pub async fn read_mid_run_message(
 mod tests {
     use std::time::Duration;
 
-    use aidaemon_channels::ports::{ChatWorkKind, HelperProgress, RunningItem};
+    use aidaemon_channels::ports::{ChatRun, ChatWorkKind, RunningItem};
 
     use super::*;
     use crate::llm::gateway::test_support::{
@@ -213,18 +215,24 @@ mod tests {
             elapsed: Duration::from_secs(240),
             last_step: Some(("installing the blog".into(), Duration::from_secs(12))),
             plan: Some("☑ create folders\n☐ install sites\n☐ screenshots".into()),
-            helpers: vec![HelperProgress {
-                label: "Install the blog site".into(),
-                progress: "step 2 of 4".into(),
-                since: Duration::from_secs(3),
+            runs: vec![ChatRun {
+                id: "helper:blog".into(),
+                view: aidaemon_core::card::HelperView::running(
+                    "Install the blog site",
+                    false,
+                    Some(aidaemon_core::card::Step::Doing(
+                        aidaemon_core::card::ActivityKind::Run,
+                    )),
+                ),
                 running_for: Duration::from_secs(90),
-                this_turn: true,
+                this_request: true,
             }],
             running: vec![RunningItem {
                 number: 4,
                 title: "Sub-agent: Counting agent A".into(),
                 elapsed: Duration::from_secs(30),
                 work: Some(ChatWorkKind::SubAgent),
+                run: None,
             }],
         }
     }
@@ -343,7 +351,10 @@ mod tests {
             user["live_state"]["latest_step"]["what"],
             "installing the blog"
         );
-        assert_eq!(user["live_state"]["helpers"][0]["progress"], "step 2 of 4");
+        assert_eq!(
+            user["live_state"]["helpers"][0]["progress"],
+            "Running a command"
+        );
         assert_eq!(user["live_state"]["helpers"][0]["running_for_seconds"], 90);
     }
 }

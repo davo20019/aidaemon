@@ -1,8 +1,11 @@
 //! Messages that arrive while a run is going.
 //!
-//! The [`crate::turns::TurnRunner`] keeps each session's running work as
-//! typed live state ([`LiveWork`], fed by the run's status updates). When
-//! the owner writes mid-run, the agent reads the message
+//! The [`crate::turns::TurnRunner`] keeps each session's running turn's own
+//! latest step ([`LiveWork`], fed by the turn's status updates). Its
+//! helpers and plan card are read from the runtime's records
+//! ([`crate::ports::ChannelAgentRuntime::chat_runs`]), the same views the
+//! card draws, keyed by run id. When the owner writes mid-run, the agent
+//! reads the message
 //! ([`crate::ports::ChannelAgentRuntime::read_mid_run_message`]): a question
 //! about the work is answered at once from that state, without touching the
 //! run; a change to the work joins it; anything else waits for its own turn.
@@ -11,43 +14,28 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aidaemon_core::card::RunPhase;
 use aidaemon_tools::duration_format::{ZeroUnitStyle, compact_seconds};
 use aidaemon_tools::status::StatusUpdate;
 
-use crate::ports::{ChatWorkKind, HelperProgress, RunningWork};
+use crate::ports::{ChatRun, ChatWorkKind, RunningWork};
 
 /// How many helpers a reply lists.
 const MAX_HELPERS: usize = 6;
-
-/// How many helpers a session keeps the last step of.
-const MAX_TRACKED_HELPERS: usize = 32;
 
 #[derive(Debug, Default)]
 struct Progress {
     task_id: u64,
     last_step: Option<(String, Instant)>,
-    plan: Option<String>,
 }
 
-#[derive(Debug)]
-struct Helper {
-    /// The turn that started it.
-    task_id: u64,
-    label: String,
-    progress: String,
-    at: Instant,
-    started: Instant,
-}
-
-/// Each session's running work as its status updates showed it: the
-/// running turn's own steps and plan, and every helper's latest step. A
-/// helper outlives the turn that started it (it runs in the background), so
-/// its steps are kept for the session, not the turn: a question asked while
-/// only helpers run is answered with where each one stands.
+/// Each session's running turn's own latest step, as its status updates
+/// showed it. Helpers and the plan card are not kept here: they are read
+/// from the runtime's records, so a reply never keeps a second account of
+/// them.
 #[derive(Clone, Default)]
 pub struct LiveWork {
     sessions: Arc<Mutex<HashMap<String, Progress>>>,
-    helpers: Arc<Mutex<HashMap<String, Vec<Helper>>>>,
 }
 
 impl LiveWork {
@@ -64,7 +52,7 @@ impl LiveWork {
         }
     }
 
-    /// Stop tracking `task_id` (its turn ended). Its helpers' steps stay.
+    /// Stop tracking `task_id` (its turn ended).
     pub fn end(&self, session_id: &str, task_id: u64) {
         if let Ok(mut sessions) = self.sessions.lock()
             && sessions
@@ -75,38 +63,9 @@ impl LiveWork {
         }
     }
 
-    /// Note what `update` says about `task_id`'s work. A helper's start
-    /// and steps are noted whichever turn started it.
+    /// Note what `update` says about `task_id`'s own work.
     pub fn record(&self, session_id: &str, task_id: u64, update: &StatusUpdate) {
         let now = Instant::now();
-        if let StatusUpdate::Helper(view) = update {
-            let line = crate::live_status::helper_status_words(view);
-            let Ok(mut helpers) = self.helpers.lock() else {
-                return;
-            };
-            let helpers = helpers.entry(session_id.to_string()).or_default();
-            match helpers.iter_mut().find(|h| h.label == view.label) {
-                Some(helper) => {
-                    if helper.progress != line {
-                        helper.progress = line;
-                        helper.at = now;
-                    }
-                }
-                None => {
-                    helpers.push(Helper {
-                        task_id,
-                        label: view.label.clone(),
-                        progress: line,
-                        at: now,
-                        started: now,
-                    });
-                    if helpers.len() > MAX_TRACKED_HELPERS {
-                        helpers.remove(0);
-                    }
-                }
-            }
-            return;
-        }
         let Ok(mut sessions) = self.sessions.lock() else {
             return;
         };
@@ -130,10 +89,6 @@ impl LiveWork {
                 "step {} of {total_steps}: {description}",
                 step_index + 1
             )),
-            StatusUpdate::Checklist(plan) => {
-                progress.plan = Some(plan.text.clone());
-                None
-            }
             _ => None,
         };
         if let Some(step) = step.filter(|step| !step.trim().is_empty()) {
@@ -142,38 +97,29 @@ impl LiveWork {
     }
 
     /// The session's running work: `request` started `elapsed` ago (empty
-    /// when no turn runs), plus what its status updates showed. Helpers
-    /// started by an earlier turn are included; only the running turn's
-    /// own are marked as its.
-    pub fn snapshot(&self, session_id: &str, request: &str, elapsed: Duration) -> RunningWork {
+    /// when no turn runs), its own latest step, and the chat's helper runs
+    /// and plan card as the runtime's records show them (`runs`).
+    pub fn snapshot(
+        &self,
+        session_id: &str,
+        request: &str,
+        elapsed: Duration,
+        runs: crate::ports::ChatRuns,
+    ) -> RunningWork {
         let mut work = RunningWork {
             request: request.to_string(),
             elapsed,
+            plan: runs.plan,
+            runs: runs.runs,
             ..RunningWork::default()
         };
-        let turn = self.sessions.lock().ok().and_then(|sessions| {
-            sessions.get(session_id).map(|progress| {
-                work.last_step = progress
-                    .last_step
-                    .as_ref()
-                    .map(|(step, at)| (step.clone(), at.elapsed()));
-                work.plan = progress.plan.clone();
-                progress.task_id
-            })
-        });
-        if let Ok(helpers) = self.helpers.lock() {
-            work.helpers = helpers
-                .get(session_id)
-                .into_iter()
-                .flatten()
-                .map(|helper| HelperProgress {
-                    label: helper.label.clone(),
-                    progress: helper.progress.clone(),
-                    since: helper.at.elapsed(),
-                    running_for: helper.started.elapsed(),
-                    this_turn: turn == Some(helper.task_id),
-                })
-                .collect();
+        if let Ok(sessions) = self.sessions.lock()
+            && let Some(progress) = sessions.get(session_id)
+        {
+            work.last_step = progress
+                .last_step
+                .as_ref()
+                .map(|(step, at)| (step.clone(), at.elapsed()));
         }
         work
     }
@@ -186,24 +132,26 @@ fn ago(duration: Duration) -> String {
     )
 }
 
-/// Whether `helper` (its card label, cut with "…" when long) is the
-/// running item titled `title` (which names the helper in full).
-fn helper_is(helper: &HelperProgress, title: &str) -> bool {
-    let label = helper.label.trim();
-    if label.is_empty() {
-        return false;
-    }
-    match label.strip_suffix('…') {
-        Some(stem) => title.contains(stem.trim_end()),
-        None => title.ends_with(label),
+/// A helper run's words, as its line on the card says them: its latest
+/// step while it runs, how it ended once it ended, with the reason its
+/// record gives.
+fn run_words(run: &ChatRun) -> String {
+    let words = crate::live_status::helper_status_words(&run.view);
+    match run.view.reason.as_deref().map(str::trim) {
+        Some(reason) if run.view.phase.is_terminal() && !reason.is_empty() => {
+            format!("{words}. {reason}")
+        }
+        _ => words,
     }
 }
 
 /// Where the running work stands, from its typed state: the request and how
-/// long it has run, its latest step, then one line per helper and
-/// background command with its current step and its time from the running
-/// list, the same clock and numbers `/tasks` shows. A helper that is no
-/// longer on that list keeps its last step, without a time.
+/// long it has run, its latest step, then one line per helper run (from its
+/// record, as the card draws it) and background command, with the time
+/// from the running list, the same clock and numbers `/tasks` shows. A
+/// helper is matched to its running item by its run id. A helper of the
+/// running turn that ended says how it ended, as its card does; one an
+/// earlier turn started that ended is left out.
 pub fn running_work_status(work: &RunningWork) -> String {
     let mut lines = vec![if work.request.trim().is_empty() {
         // No turn runs: only helpers and background commands do.
@@ -222,24 +170,22 @@ pub fn running_work_status(work: &RunningWork) -> String {
             ago(*since)
         ));
     }
-    let mut listed = vec![false; work.helpers.len()];
     let mut items = Vec::new();
+    let mut listed_runs: Vec<&str> = Vec::new();
     for item in work.running.iter().filter(|item| item.work.is_some()) {
-        let helper = (item.work == Some(ChatWorkKind::SubAgent))
+        let run = (item.work == Some(ChatWorkKind::SubAgent))
             .then(|| {
-                work.helpers
-                    .iter()
-                    .enumerate()
-                    .find(|(i, helper)| !listed[*i] && helper_is(helper, &item.title))
+                let id = item.run.as_deref()?;
+                work.runs.iter().find(|run| run.id == id)
             })
             .flatten();
-        items.push(match helper {
-            Some((i, helper)) => {
-                listed[i] = true;
+        items.push(match run {
+            Some(run) => {
+                listed_runs.push(&run.id);
                 format!(
                     "• {}: {} ({} so far)",
-                    crate::presentation::word_preview(&helper.label, 60),
-                    crate::presentation::word_preview(&helper.progress, 80),
+                    crate::presentation::word_preview(&run.view.label, 60),
+                    crate::presentation::word_preview(&run_words(run), 80),
                     ago(item.elapsed)
                 )
             }
@@ -250,18 +196,16 @@ pub fn running_work_status(work: &RunningWork) -> String {
             ),
         });
     }
-    // A helper of this turn that is no longer listed keeps its last step;
-    // one an earlier turn started and that is gone has finished.
-    for (helper, _) in work
-        .helpers
+    for run in work
+        .runs
         .iter()
-        .zip(&listed)
-        .filter(|(helper, listed)| !**listed && helper.this_turn)
+        .filter(|run| !listed_runs.contains(&run.id.as_str()))
+        .filter(|run| run.this_request || run.view.phase == RunPhase::Running)
     {
         items.push(format!(
             "• {}: {}",
-            crate::presentation::word_preview(&helper.label, 60),
-            crate::presentation::word_preview(&helper.progress, 80),
+            crate::presentation::word_preview(&run.view.label, 60),
+            crate::presentation::word_preview(&run_words(run), 80),
         ));
     }
     lines.extend(items.into_iter().take(MAX_HELPERS));
@@ -295,6 +239,23 @@ pub fn unread_message_notice(work: &RunningWork) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aidaemon_core::card::{ActivityKind, HelperView, Step};
+
+    fn run(id: &str, view: HelperView, this_request: bool) -> ChatRun {
+        ChatRun {
+            id: id.into(),
+            view,
+            running_for: Duration::from_secs(10),
+            this_request,
+        }
+    }
+
+    fn ended(label: &str, phase: RunPhase) -> HelperView {
+        HelperView {
+            phase,
+            ..HelperView::running(label, false, None)
+        }
+    }
 
     #[test]
     fn the_state_follows_its_own_turn_only() {
@@ -306,39 +267,8 @@ mod tests {
             &StatusUpdate::ToolStart {
                 name: "terminal".into(),
                 summary: "installing the site".into(),
-                kind: aidaemon_core::card::ActivityKind::Run,
+                kind: ActivityKind::Run,
             },
-        );
-        live.record(
-            "s",
-            7,
-            &StatusUpdate::Helper(aidaemon_core::card::HelperView::running(
-                "Set up the blog",
-                true,
-                None,
-            )),
-        );
-        live.record(
-            "s",
-            7,
-            &StatusUpdate::Helper(aidaemon_core::card::HelperView::running(
-                "Set up the blog",
-                true,
-                Some(aidaemon_core::card::Step::Doing(
-                    aidaemon_core::card::ActivityKind::Write,
-                )),
-            )),
-        );
-        live.record(
-            "s",
-            7,
-            &StatusUpdate::Checklist(aidaemon_core::card::PlanCard {
-                text: "☑ one\n☐ two".into(),
-                steps: 2,
-                done: 1,
-                finished_steps: Vec::new(),
-                settled: false,
-            }),
         );
         // A late update from an earlier turn changes nothing.
         live.record(
@@ -347,19 +277,44 @@ mod tests {
             &StatusUpdate::ToolStart {
                 name: "terminal".into(),
                 summary: "old step".into(),
-                kind: aidaemon_core::card::ActivityKind::Web,
+                kind: ActivityKind::Web,
             },
         );
-        let work = live.snapshot("s", "Set up two demo sites", Duration::from_secs(300));
+        let records = crate::ports::ChatRuns {
+            runs: vec![run(
+                "helper:1",
+                HelperView::running(
+                    "Set up the blog",
+                    true,
+                    Some(Step::Doing(ActivityKind::Write)),
+                ),
+                true,
+            )],
+            plan: Some("☑ one\n☐ two".into()),
+        };
+        let work = live.snapshot(
+            "s",
+            "Set up two demo sites",
+            Duration::from_secs(300),
+            records,
+        );
         assert_eq!(work.last_step.as_ref().unwrap().0, "Running a command");
         assert_eq!(work.plan.as_deref(), Some("☑ one\n☐ two"));
-        assert_eq!(work.helpers.len(), 1);
-        assert_eq!(work.helpers[0].progress, "Changing files");
+        assert_eq!(work.runs.len(), 1);
 
+        let none = crate::ports::ChatRuns::default();
         live.end("s", 6);
-        assert!(live.snapshot("s", "x", Duration::ZERO).last_step.is_some());
+        assert!(
+            live.snapshot("s", "x", Duration::ZERO, none.clone())
+                .last_step
+                .is_some()
+        );
         live.end("s", 7);
-        assert!(live.snapshot("s", "x", Duration::ZERO).last_step.is_none());
+        assert!(
+            live.snapshot("s", "x", Duration::ZERO, none)
+                .last_step
+                .is_none()
+        );
     }
 
     /// Live 2026-11-13: "how's it going?" got one paragraph ("about 38
@@ -388,16 +343,14 @@ mod tests {
             elapsed: Duration::from_secs(55),
             last_step: None,
             plan: None,
-            helpers: ["Slow count A", "Slow count B"]
+            runs: [("run:1", "Slow count A"), ("run:2", "Slow count B")]
                 .into_iter()
-                .map(|label| HelperProgress {
-                    label: label.into(),
-                    progress: "running a command".into(),
-                    since: Duration::from_secs(4),
-                    // Its own first-progress clock, which the reply no
-                    // longer reads for a listed helper.
-                    running_for: Duration::from_secs(10),
-                    this_turn: true,
+                .map(|(id, label)| {
+                    run(
+                        id,
+                        HelperView::running(label, false, Some(Step::Doing(ActivityKind::Run))),
+                        true,
+                    )
                 })
                 .collect(),
             running: list.items(now),
@@ -407,24 +360,84 @@ mod tests {
         assert_eq!(tasks[0], "#1 Sub-agent: Slow count A (26s so far)");
         assert!(reply.starts_with("Still working on \"Count to 100 twice, slowly\" (55s so far)."));
         assert!(
-            reply.contains("\n• Slow count A: running a command (26s so far)\n"),
+            reply.contains("\n• Slow count A: Running a command (26s so far)\n"),
             "{reply}"
         );
         assert!(
-            reply.contains("\n• Slow count B: running a command (26s so far)"),
+            reply.contains("\n• Slow count B: Running a command (26s so far)"),
             "{reply}"
         );
         assert!(!reply.contains("10s"), "{reply}");
         assert!(reply.ends_with("I'll send the results when it's done."));
+    }
 
-        // A helper no longer listed keeps its last step, without a time.
-        let ended = RunningWork {
-            running: Vec::new(),
-            ..work
+    /// Live 2026-11-14: "how is it going?" said the Drupal helper stopped
+    /// while the card said it finished. Two attempts with the same label
+    /// were one entry in a second, label-keyed account of the helpers. The
+    /// reply now reads the runs' records by id, as the card does: two
+    /// attempts stay two lines, each saying what its card line says.
+    #[test]
+    fn two_attempts_with_one_label_stay_two_and_agree_with_the_card() {
+        let label = "Install Drupal";
+        let mut first = ended(label, RunPhase::Stopped);
+        first.reason = Some("It ran out of time.".into());
+        let second = ended(label, RunPhase::Succeeded);
+        let work = RunningWork {
+            request: "Set up the Drupal site".into(),
+            elapsed: Duration::from_secs(120),
+            runs: vec![
+                run("helper:a", first.clone(), true),
+                run("helper:b", second.clone(), true),
+            ],
+            ..RunningWork::default()
         };
-        let reply = running_work_reply(&ended);
+        let reply = running_work_status(&work);
+        let lines: Vec<&str> = reply.lines().filter(|line| line.starts_with('•')).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "• Install Drupal: Didn't finish. It ran out of time.",
+                "• Install Drupal: Finished",
+            ],
+            "{reply}"
+        );
+
+        // The card, drawn from the same records, says the same of each.
+        let mut card = crate::live_status::LiveStatus::new();
+        card.note(&StatusUpdate::Helper(first.clone()));
+        card.note(&StatusUpdate::Helper(HelperView::running(
+            label, false, None,
+        )));
+        card.note(&StatusUpdate::Helper(second.clone()));
+        let drawn = card.preview().unwrap();
+        assert!(drawn.contains(first.headline()), "{drawn}");
+        assert!(drawn.contains(second.headline()), "{drawn}");
+        assert!(drawn.contains("It ran out of time."), "{drawn}");
+        for view in [&first, &second] {
+            assert!(reply.contains(&crate::live_status::helper_status_words(view)));
+        }
+    }
+
+    /// A helper an earlier turn started that has ended is history: the
+    /// reply leaves it out; one still running is listed.
+    #[test]
+    fn an_earlier_turns_ended_helper_is_left_out() {
+        let work = RunningWork {
+            request: "Next thing".into(),
+            runs: vec![
+                run("helper:old", ended("Old job", RunPhase::Succeeded), false),
+                run(
+                    "helper:bg",
+                    HelperView::running("Background job", true, None),
+                    false,
+                ),
+            ],
+            ..RunningWork::default()
+        };
+        let reply = running_work_status(&work);
+        assert!(!reply.contains("Old job"), "{reply}");
         assert!(
-            reply.contains("• Slow count A: running a command\n"),
+            reply.contains("• Background job: Getting started"),
             "{reply}"
         );
     }

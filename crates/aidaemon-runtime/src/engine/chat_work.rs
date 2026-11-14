@@ -2,7 +2,7 @@
 //! ([`ChatWorkControl`], on any [`TurnHost`]): its sub-agents and background
 //! commands, its finite goals and background spawns.
 
-use aidaemon_channels::ports::{ChatWork, ChatWorkKind, ChatWorkView};
+use aidaemon_channels::ports::{ChatRun, ChatRuns, ChatWork, ChatWorkKind, ChatWorkView};
 use aidaemon_work::traits::Goal;
 
 use crate::host::TurnHost;
@@ -63,6 +63,7 @@ pub trait ChatWorkControl: TurnHost {
                 started_at: child.child.started_at,
                 request: child.request,
                 step: child.step,
+                run: child.run,
             })
             .collect();
         for (index, tool) in self.tools().iter().enumerate() {
@@ -74,6 +75,7 @@ pub trait ChatWorkControl: TurnHost {
                     started_at: job.started_at,
                     request: job.task_id,
                     step: None,
+                    run: None,
                 });
             }
         }
@@ -82,6 +84,38 @@ pub trait ChatWorkControl: TurnHost {
             current_request: self.running_children().current_request(session_id),
             items,
         }
+    }
+
+    /// The chat's helper runs from their records, as every card draws them
+    /// ([`crate::run_state::RunState::view`]), and the running turn's plan
+    /// card from the plan store.
+    async fn chat_runs(&self, session_id: &str) -> ChatRuns {
+        let request = self.running_children().current_request(session_id);
+        let now = chrono::Utc::now();
+        let runs = self
+            .running_children()
+            .runs()
+            .for_chat(session_id)
+            .into_iter()
+            .map(|run| ChatRun {
+                id: run.id.clone(),
+                view: run.view(),
+                running_for: (run.ended_at.unwrap_or(now) - run.started_at)
+                    .to_std()
+                    .unwrap_or_default(),
+                this_request: request.is_some() && run.request == request,
+            })
+            .collect();
+        let plan = match (self.plan_store().await, request.as_deref()) {
+            (Some(plans), Some(request)) => plans
+                .latest(session_id, Some(request))
+                .await
+                .ok()
+                .flatten()
+                .map(|plan| plan.card().text),
+            _ => None,
+        };
+        ChatRuns { runs, plan }
     }
 
     /// Stop the chat's work `key` and read it back: a sub-agent is stopped

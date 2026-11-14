@@ -132,22 +132,28 @@ pub enum MidRunIntent {
     StopsWork,
 }
 
-/// One helper (sub-agent) of the running work, as its progress last said.
+/// One helper run of a chat, as the runtime's record of it shows it: the
+/// same view every card draws, keyed by the run's id (two attempts with the
+/// same label are two runs).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HelperProgress {
-    /// The helper's job, in the words it was given.
-    pub label: String,
-    /// Its own progress line ("step 2 of 4: ...").
-    pub progress: String,
-    /// How long ago that progress came.
-    pub since: std::time::Duration,
-    /// How long it has been running (since its first progress). The reply
-    /// says the running list's time instead when the helper is on it, the
-    /// clock `/tasks` reads.
+pub struct ChatRun {
+    /// The run's id: the key every surface finds it by.
+    pub id: String,
+    pub view: aidaemon_core::card::HelperView,
+    /// How long it has run (to now, or to its end once it ended).
     pub running_for: std::time::Duration,
-    /// The running turn started it (an earlier turn's helper runs on in the
-    /// background).
-    pub this_turn: bool,
+    /// The chat's running turn started it (an earlier turn's helper runs on
+    /// in the background).
+    pub this_request: bool,
+}
+
+/// A chat's helper runs and its plan card, from the runtime's records.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatRuns {
+    /// Oldest first.
+    pub runs: Vec<ChatRun>,
+    /// The running turn's plan card, as the chat shows it.
+    pub plan: Option<String>,
 }
 
 /// The running work as its typed live state shows it, for answering a
@@ -162,8 +168,8 @@ pub struct RunningWork {
     pub last_step: Option<(String, std::time::Duration)>,
     /// Its plan card (checklist), as shown in chat.
     pub plan: Option<String>,
-    /// Its helpers still reporting progress.
-    pub helpers: Vec<HelperProgress>,
+    /// The chat's helper runs, from their records.
+    pub runs: Vec<ChatRun>,
     /// Everything running for the chat, numbered as `/tasks` shows it.
     pub running: Vec<RunningItem>,
 }
@@ -176,6 +182,8 @@ pub struct RunningItem {
     pub elapsed: std::time::Duration,
     /// What it is: `None` for a chat turn.
     pub work: Option<ChatWorkKind>,
+    /// The helper run it is, when it is one ([`ChatRun::id`]).
+    pub run: Option<String>,
 }
 
 /// How a message sent mid-run is handled.
@@ -217,6 +225,8 @@ pub struct ChatWork {
     pub request: Option<String>,
     /// Its latest step, from its record (a sub-agent's).
     pub step: Option<aidaemon_core::card::Step>,
+    /// The helper run it is, when it is one ([`ChatRun::id`]).
+    pub run: Option<String>,
 }
 
 /// Everything running for a chat besides its turns.
@@ -246,6 +256,13 @@ pub trait ChannelAgentRuntime: AgentIngress {
     /// in the background), oldest first.
     async fn running_children(&self, _session_id: &str) -> Vec<RunningChild> {
         Vec::new()
+    }
+
+    /// The chat's helper runs and its running turn's plan card, from the
+    /// runtime's run records and plan store: what every card draws, so a
+    /// status reply agrees with the card.
+    async fn chat_runs(&self, _session_id: &str) -> ChatRuns {
+        ChatRuns::default()
     }
 
     /// Everything running for `session_id` besides its turns: sub-agents

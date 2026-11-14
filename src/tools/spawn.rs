@@ -119,6 +119,8 @@ mod tests {
             failure: (phase == RunPhase::Failed)
                 .then_some(aidaemon_runtime::run_state::RunFailure::NoCause),
             card: Default::default(),
+            background: true,
+            request: None,
         }
     }
 
