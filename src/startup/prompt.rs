@@ -89,8 +89,7 @@ const DAEMON_CORRECTION_RULE: &str =
 (category \"preference\") so you remember next time.
 ";
 
-const DAEMON_PEOPLE_TABLE_ROW: &str =
-    "\n| Remember other people, family, relationships | manage_people (remember) | — |\n| Track contacts, birthdays | manage_people | — |";
+const DAEMON_PEOPLE_TABLE_ROW: &str = "\n| Remember other people, family, relationships | manage_people (remember) | — |\n| Track contacts, birthdays | manage_people | — |";
 
 /// The memory parts of the base prompt: section, tool-table rows, correction
 /// rule, people row.
