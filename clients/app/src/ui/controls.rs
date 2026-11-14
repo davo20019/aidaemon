@@ -300,8 +300,10 @@ pub fn status(label: impl IntoReactive<SharedString>, tone: Tone) -> View {
         )
         .child(
             text(label)
+                .flex_1()
+                .min_w(px(0.0))
                 .text_size(px(type_scale::SM))
-                .number_of_lines(1)
+                .number_of_lines(2)
                 .text_color(colors::MUTED),
         )
 }

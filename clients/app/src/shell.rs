@@ -15,13 +15,14 @@ pub fn shell(store: Store) -> View {
     let wide = computed(move || window().width.0 >= 1180.0);
     let roomy = computed(move || window().width.0 >= 760.0);
     store.set_inspector(!terminal);
+    effect(move || store.set_compact(!roomy.get()));
     crate::features::notify::approvals(store);
     let palette = signal(false);
 
     on_key("mod+k", move |_| palette.update(|open| *open = !*open));
     on_key("mod+n", move |_| store.select(None));
-    on_key("mod+b", move |_| store.toggle_sidebar());
-    on_key("mod+i", move |_| store.toggle_inspector());
+    on_key("mod+b", move |_| store.open_sidebar());
+    on_key("mod+i", move |_| store.open_inspector());
     on_key("mod+g", move |_| store.take_suggestion());
     on_key("escape", move |_| {
         if let Some(id) = store.selected()
@@ -42,7 +43,30 @@ pub fn shell(store: Store) -> View {
                 )
                 .child(sidebar(store)),
         )
+        // A narrow window shows one thing at a time: a pane, full-screen,
+        // or the conversation.
+        .child(
+            view()
+                .flex_1()
+                .style_when(
+                    move || !(store.is_compact() && store.sidebar_open()),
+                    |s| s.hidden(),
+                )
+                .child(sidebar(store)),
+        )
+        .child(
+            view()
+                .flex_1()
+                .style_when(
+                    move || !(store.is_compact() && store.inspector_open()),
+                    |s| s.hidden(),
+                )
+                .child(inspector(store)),
+        )
         .child(dynamic(move || {
+            if store.is_compact() && (store.sidebar_open() || store.inspector_open()) {
+                return None;
+            }
             if store.connection() == Connection::NeedsPairing {
                 return Some(untracked(|| {
                     crate::features::pairing::pairing(store).key("pairing")
@@ -58,7 +82,7 @@ pub fn shell(store: Store) -> View {
         .child(
             view()
                 .style_when(
-                    move || !(store.inspector_open() && wide.get()),
+                    move || !(store.inspector_open() && wide.get() && !store.is_compact()),
                     |s| s.hidden(),
                 )
                 .child(inspector(store)),
@@ -109,8 +133,8 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                             open.set(false);
                             match id.as_ref() {
                                 "new" => store.select(None),
-                                "sidebar" => store.toggle_sidebar(),
-                                "inspector" => store.toggle_inspector(),
+                                "sidebar" => store.open_sidebar(),
+                                "inspector" => store.open_inspector(),
                                 other => {
                                     if let Some(session) = other.strip_prefix("go:") {
                                         store.select(Some(session.to_owned()));

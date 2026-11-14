@@ -23,6 +23,12 @@ aidaemon-client-protocol = { path = "../../crates/client-protocol" }
 aidaemon-client-core = { path = "../../crates/aidaemon-client-core" }
 tokio = { version = "1", features = ["sync"] }
 dirs = "6"
+# The terminal build (`--tui`): NSH's terminal surface and its input glue.
+nsh-platform-tui = { version = "=0.5.0", default-features = false, features = ["run-app"] }
+nsh-tui-host = "=0.5.0"
+ratatui-core = { version = "0.1.2", features = ["std", "layout-cache", "underline-color"] }
+ratatui-crossterm = "0.1.2"
+crossterm = "0.29"
 
 # The browser: the page's socket, Web Crypto and storage.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

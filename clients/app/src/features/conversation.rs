@@ -119,20 +119,31 @@ fn header(store: Store, session: Option<String>) -> View {
     let title = session.clone();
     let running = session.clone();
     let stop = session.clone();
+    let waiting = computed(move || store.approvals().len());
     view()
         .h(px(44.0))
         .flex_row()
         .items_center()
         .gap_2()
-        .px_4()
+        .px_2()
         .border_b_1()
         .border_color(colors::LINE)
+        // Narrow windows reach the panes from here; wide ones when folded.
+        .child(when(
+            move || store.is_compact() || !store.sidebar_open(),
+            move || {
+                ui::icon_btn(Glyph::Sidebar, "Conversations", Size::Md, move || {
+                    store.open_sidebar()
+                })
+            },
+        ))
         .child(
             text(move || match &title {
                 Some(id) => store.title(id),
                 None => "New conversation".into(),
             })
             .flex_1()
+            .px_2()
             .number_of_lines(1)
             .text_size(px(type_scale::BASE))
             .font_weight(FontWeight::SEMIBOLD),
@@ -146,6 +157,30 @@ fn header(store: Store, session: Option<String>) -> View {
                         store.stop(id);
                     }
                 })
+            },
+        ))
+        .child(when(
+            move || store.is_compact(),
+            move || {
+                ui::icon_btn(Glyph::Plus, "New conversation", Size::Md, move || {
+                    store.select(None)
+                })
+            },
+        ))
+        .child(when(
+            move || store.is_compact() || !store.inspector_open(),
+            move || {
+                ui::btn_icon(
+                    Glyph::Approval,
+                    move || match waiting.get() {
+                        0 => "Activity".to_owned(),
+                        n => format!("{n} waiting"),
+                    },
+                    Variant::Ghost,
+                    Size::Sm,
+                    move || store.open_inspector(),
+                )
+                .accessibility_label("Activity")
             },
         ))
 }
@@ -296,6 +331,10 @@ fn composer(store: Store, session: Option<String>) -> View {
         computed(move || session.as_deref().is_some_and(|id| store.is_running(id)))
     };
     let field = element_ref();
+    let touch = matches!(
+        idiom(),
+        nsh_core::platform::Idiom::Phone | nsh_core::platform::Idiom::Pad
+    );
     view().items_center().px_4().pb_4().pt_2().child(
         ui::surface()
             .w_full()
@@ -309,7 +348,12 @@ fn composer(store: Store, session: Option<String>) -> View {
                     .value(move || store.draft())
                     .on_change(move |text: &str| store.set_draft(text.to_owned()))
                     .multiline(true)
-                    .submit_behavior(SubmitBehavior::Submit)
+                    // Phones keep Return for new lines; Send sends.
+                    .submit_behavior(if touch {
+                        SubmitBehavior::Newline
+                    } else {
+                        SubmitBehavior::Submit
+                    })
                     .on_submit(move |_: &str| store.submit())
                     .auto_focus(true)
                     .placeholder(move || match store.connection() {
@@ -341,10 +385,11 @@ fn composer(store: Store, session: Option<String>) -> View {
                     .items_center()
                     .gap_1()
                     .child(
-                        text(move || {
-                            if running.get() {
-                                "Working · Esc stops".to_owned()
-                            } else {
+                        text(move || match (running.get(), touch) {
+                            (true, true) => "Working · Stop is at the top".to_owned(),
+                            (true, false) => "Working · Esc stops".to_owned(),
+                            (false, true) => String::new(),
+                            (false, false) => {
                                 "Enter to send · Shift+Enter for a new line".to_owned()
                             }
                         })

@@ -27,6 +27,7 @@ extern "C" {
     #[wasm_bindgen(js_name = keepKey)]
     fn keep_key(id: &str) -> js_sys::Promise;
     fn sign(message: &str) -> js_sys::Promise;
+    fn forget() -> js_sys::Promise;
     #[wasm_bindgen(js_name = pairingLink)]
     fn pairing_link() -> Vec<String>;
     #[wasm_bindgen(js_name = forgetPairingLink)]
@@ -133,19 +134,29 @@ enum Heard {
     Close(String),
 }
 
+/// The paired device's id, once there is one: the pairing screen saves it.
+async fn paired_device(store: Store) -> String {
+    loop {
+        let device = text_of(device_id()).await.unwrap_or_default();
+        if !device.is_empty() {
+            return device;
+        }
+        if store.connection_untracked() != crate::store::Connection::NeedsPairing {
+            store.needs_pairing();
+        }
+        timer(Duration::from_secs(1)).await;
+    }
+}
+
+/// Forget this browser's key: the daemon refused it, and the owner pairs
+/// again.
+pub async fn unpair() {
+    let _ = text_of(forget()).await;
+}
+
 pub fn start(store: Store) {
     spawn(async move {
-        // Wait for a key: the pairing screen saves one.
-        let device = loop {
-            let device = text_of(device_id()).await.unwrap_or_default();
-            if !device.is_empty() {
-                break device;
-            }
-            if store.connection_untracked() != crate::store::Connection::NeedsPairing {
-                store.needs_pairing();
-            }
-            timer(Duration::from_secs(1)).await;
-        };
+        let mut device = paired_device(store).await;
         let mut machine = LinkMachine::new(
             ClientIdentity {
                 kind: ClientKind::Web,
@@ -166,6 +177,13 @@ pub fn start(store: Store) {
             store.update(Update::Connecting);
             let token = match grant_token(&mut grant, &base, &device).await {
                 Ok(token) => token,
+                Err((DropKind::Unauthorized, _)) if offered_pairing().is_some() => {
+                    // Refused, with a new pairing offer in hand: pair again.
+                    unpair().await;
+                    grant.drop_grant();
+                    device = paired_device(store).await;
+                    continue;
+                }
                 Err((kind, why)) => {
                     let d = machine.failed(kind, why);
                     let wait = d.retry_in;
@@ -244,6 +262,11 @@ pub fn start(store: Store) {
             drop(on_event);
             if disconnect.kind == DropKind::Unauthorized {
                 grant.drop_grant();
+                if offered_pairing().is_some() {
+                    unpair().await;
+                    device = paired_device(store).await;
+                    continue;
+                }
             }
             let wait = disconnect.retry_in;
             store.update(Update::Disconnected(disconnect));

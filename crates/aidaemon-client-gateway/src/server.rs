@@ -350,7 +350,12 @@ const WEB_MODULES: &[(&str, &str)] = &[
 async fn web_page(State(gateway): State<Arc<ClientGateway>>) -> Response {
     // With the nsh app served, the old page's links (pairing links,
     // bookmarks) open it instead; the browser keeps the `#offer=…`.
-    if gateway.config.app_dir.as_deref().is_some_and(|d| !d.trim().is_empty()) {
+    if gateway
+        .config
+        .app_dir
+        .as_deref()
+        .is_some_and(|d| !d.trim().is_empty())
+    {
         return axum::response::Redirect::temporary("/client/v1/next/").into_response();
     }
     (
@@ -452,6 +457,13 @@ async fn serve_app_file(gateway: &ClientGateway, path: &str, request: &HeaderMap
     if let Some(encoding) = encoding {
         headers.push((axum::http::header::CONTENT_ENCODING, encoding));
         headers.push((axum::http::header::VARY, "accept-encoding"));
+    }
+    // The page names its files by content hash: they never change, and the
+    // page itself is always checked, so a new build shows on the next load.
+    if relative.ends_with(".html") || relative.ends_with(".webmanifest") {
+        headers.push((axum::http::header::CACHE_CONTROL, "no-cache"));
+    } else if relative.split('/').next_back().is_some_and(|name| name.split('.').count() >= 3) {
+        headers.push((axum::http::header::CACHE_CONTROL, "public, max-age=31536000, immutable"));
     }
     if relative.ends_with(".html") {
         headers.push((

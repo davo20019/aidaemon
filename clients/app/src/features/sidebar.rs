@@ -12,6 +12,7 @@ pub fn sidebar(store: Store) -> View {
     view()
         .w(px(size::SIDEBAR))
         .flex_1()
+        .style_when(move || store.is_compact(), |s| s.w_full())
         .bg(colors::SIDEBAR)
         .border_r_1()
         .border_color(colors::LINE)
@@ -28,7 +29,17 @@ pub fn sidebar(store: Store) -> View {
                         .text_size(px(type_scale::BASE))
                         .font_weight(FontWeight::SEMIBOLD),
                 )
-                .child(ui::kbd(key_label("mod+k"))),
+                .child(
+                    when(
+                        move || store.is_compact(),
+                        move || {
+                            ui::icon_btn(ui::Glyph::Close, "Close", ui::Size::Md, move || {
+                                store.close_panes()
+                            })
+                        },
+                    )
+                    .otherwise(|| ui::kbd(key_label("mod+k"))),
+                ),
         )
         .child(
             view().px_2().child(

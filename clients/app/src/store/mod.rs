@@ -72,6 +72,9 @@ pub struct Store {
     /// The side panes, which the owner and the agent's view moves open.
     sidebar: Signal<bool>,
     inspector: Signal<bool>,
+    /// A narrow window (a phone): the side panes open full-screen, one at a
+    /// time, and picking a conversation closes them.
+    compact: Signal<bool>,
     /// A view move the agent asked for while the owner was typing: offered,
     /// not taken.
     suggestion: Signal<Option<ViewRequest>>,
@@ -103,6 +106,7 @@ impl Store {
             inspected: signal(None),
             sidebar: signal(true),
             inspector: signal(true),
+            compact: signal(false),
             suggestion: signal(None),
             spotlight: signal(None),
             toast: signal(None),
@@ -362,6 +366,52 @@ impl Store {
         self.inspector.set(open);
     }
 
+    pub fn is_compact(&self) -> bool {
+        self.compact.get()
+    }
+
+    /// The window became narrow (or wide again). Narrow starts on the
+    /// conversation, with both panes closed.
+    pub fn set_compact(&self, compact: bool) {
+        if self.compact.get_untracked() != compact {
+            self.compact.set(compact);
+            if compact {
+                self.sidebar.set(false);
+                self.inspector.set(false);
+            } else {
+                self.sidebar.set(true);
+            }
+        }
+    }
+
+    /// Open one pane on a narrow window (the other closes); toggle it on a
+    /// wide one.
+    pub fn open_sidebar(&self) {
+        if self.compact.get_untracked() {
+            self.inspector.set(false);
+            self.sidebar.set(true);
+        } else {
+            self.toggle_sidebar();
+        }
+    }
+
+    pub fn open_inspector(&self) {
+        if self.compact.get_untracked() {
+            self.sidebar.set(false);
+            self.inspector.set(true);
+        } else {
+            self.toggle_inspector();
+        }
+    }
+
+    /// Back to the conversation (a narrow window's panes).
+    pub fn close_panes(&self) {
+        if self.compact.get_untracked() {
+            self.sidebar.set(false);
+            self.inspector.set(false);
+        }
+    }
+
     fn note_activity(&self, event: &Event) {
         let now = now_ms();
         let push = |turn_id: &str, kind: ActivityKind, title: String, detail: String| {
@@ -609,6 +659,7 @@ impl Store {
     // ----- What the owner does --------------------------------------------
 
     pub fn select(&self, id: Option<String>) {
+        self.close_panes();
         if let Some(id) = &id {
             self.load_history(id);
             self.inspected.set(self.latest_turn(id));

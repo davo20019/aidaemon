@@ -16,6 +16,7 @@ pub fn inspector(store: Store) -> View {
     view()
         .w(px(size::INSPECTOR))
         .flex_1()
+        .style_when(move || store.is_compact(), |s| s.w_full())
         .bg(colors::SIDEBAR)
         .border_l_1()
         .border_color(colors::LINE)
@@ -38,6 +39,14 @@ pub fn inspector(store: Store) -> View {
                             move || format!("{} waiting", approvals.with(Vec::len)),
                             Tone::Warning,
                         )
+                    },
+                ))
+                .child(when(
+                    move || store.is_compact(),
+                    move || {
+                        ui::icon_btn(ui::Glyph::Close, "Close", ui::Size::Md, move || {
+                            store.close_panes()
+                        })
                     },
                 )),
         )

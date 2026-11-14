@@ -2,6 +2,9 @@
 //! terminal it is `aidaemon-client-core`'s own link (the one the old TUI
 //! uses), run on NSH's background threads; its updates come back to the engine thread and into the [`Store`].
 
+#[cfg(target_arch = "wasm32")]
+use nsh_core::prelude::*;
+
 use crate::store::Store;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -44,3 +47,18 @@ pub async fn pair(
         Err("On the daemon's own machine this app signs in with `aidaemon client-token`.".into())
     }
 }
+
+/// Forget this device's pairing and show the pairing screen (the daemon
+/// refused it). Only the browser pairs from the app.
+pub fn pair_again(store: Store) {
+    #[cfg(target_arch = "wasm32")]
+    spawn(async move {
+        web::unpair().await;
+        store.needs_pairing();
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = store;
+}
+
+/// Whether this platform pairs from the app (the browser does).
+pub const PAIRS_IN_APP: bool = cfg!(target_arch = "wasm32");

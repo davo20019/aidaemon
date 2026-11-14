@@ -36,9 +36,10 @@ pub fn pairing(store: Store) -> View {
                 fingerprint,
             )
             .await;
-            busy.set(false);
+            // On success the screen is already gone: its signals with it.
+            let _ = busy.try_set(false);
             if let Err(why) = result {
-                state.set(Some((why, Tone::Danger)));
+                let _ = state.try_set(Some((why, Tone::Danger)));
             }
         });
     };
@@ -73,7 +74,7 @@ pub fn pairing(store: Store) -> View {
                     )
                     .child(dynamic(move || {
                         let (message, tone) = state.get()?;
-                        Some(untracked(move || status(message, tone)))
+                        Some(untracked(move || status(message, tone).flex_1().min_w(px(0.0))))
                     })),
             ),
     )
