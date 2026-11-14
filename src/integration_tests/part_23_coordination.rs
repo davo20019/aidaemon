@@ -927,15 +927,27 @@ mod coordination_tests {
             .unwrap();
         turn(&mut harness, &family, CHILD_A).await;
         turn(&mut harness, &family, CHILD_B).await;
+        // Change the file while the parent's answer (the seventh model call,
+        // delayed 600 ms) is in flight: after A re-read and asked, before
+        // `apply` lands. A fixed sleep raced A's re-read on slow builds.
         let writer = {
             let file = file.clone();
+            let provider = harness.provider.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                while provider.call_count().await < 7 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 std::fs::write(&file, "changed during the wait\n").unwrap();
+                provider.call_count().await
             })
         };
         turn(&mut harness, &family, CHILD_A).await;
-        writer.await.unwrap();
+        assert_eq!(
+            writer.await.unwrap(),
+            7,
+            "the file must change while the parent's answer is in flight"
+        );
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "changed during the wait\n"

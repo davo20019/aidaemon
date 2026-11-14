@@ -423,7 +423,7 @@ impl DiscordChannel {
         let url = connect_url(&base, self.zlib_enabled());
         tracing::debug!(%url, resume, shard, "discord: connecting to gateway");
 
-        let tls = match aidaemon_tools::tls::client_config() {
+        let tls = match crate::tls::client_config() {
             Ok(tls) => tls,
             Err(e) => {
                 tracing::warn!(error = %e, "discord: gateway tls setup failed");
