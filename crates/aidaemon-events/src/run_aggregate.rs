@@ -1018,19 +1018,52 @@ impl RunAggregate {
                     }
                     None
                 };
+                let index: Option<usize> = id
+                    .rsplit_once("/obligation:checklist:")
+                    .and_then(|(_, index)| index.parse().ok());
+                // Or the change, then a later observation of the item's own
+                // target confirming it: the change is the item's when it
+                // carries the effect, or when it changed something (of
+                // whatever type it could state: a shell command's start of
+                // a service, a helper's whole run) and either names the
+                // item (its typed `checklist_items`) or touched its target.
+                // The observation names the same target by resolved
+                // identity (`hint_matches_target`), and only one that
+                // succeeded confirms anything. Live 2026-11-13: two helpers
+                // installed sites, the parent then saw each answer and
+                // reported both verified, while the card said it couldn't
+                // verify either.
                 let proof = covering(true).or_else(|| {
                     let target = target?;
-                    let mut proof = covering(false)?;
-                    let done_at = proof.iter().map(|receipt| receipt.sequence).max()?;
-                    let observed = receipts.iter().find(|receipt| {
-                        receipt.sequence > done_at
-                            && receipt.completed_observation
-                            && receipt.dispatched
-                            && receipt.observes
-                            && hints_touch_target(&self.paths, target, &receipt.targets)
-                    })?;
-                    proof.push(observed);
-                    Some(proof)
+                    let observed_after = |done_at: u64| {
+                        receipts.iter().find(|receipt| {
+                            receipt.sequence > done_at
+                                && receipt.succeeded
+                                && receipt.dispatched
+                                && receipt.observes
+                                && hints_touch_target(&self.paths, target, &receipt.targets)
+                        })
+                    };
+                    covering(false)
+                        .and_then(|mut proof| {
+                            let done_at = proof.iter().map(|receipt| receipt.sequence).max()?;
+                            proof.push(observed_after(done_at)?);
+                            Some(proof)
+                        })
+                        .or_else(|| {
+                            let change = receipts.iter().find(|receipt| {
+                                receipt.dispatched
+                                    && !receipt.proven_effects.is_empty()
+                                    && (index.is_some_and(|index| {
+                                        receipt.checklist_items.contains(&index)
+                                    }) || hints_touch_target(
+                                        &self.paths,
+                                        target,
+                                        &receipt.targets,
+                                    ))
+                            })?;
+                            Some(vec![change, observed_after(change.sequence)?])
+                        })
                 });
                 // A call that said it carries this item out (its typed
                 // `checklist_items`), finished, and changed something is the
@@ -1039,9 +1072,6 @@ impl RunAggregate {
                 // service). Live 2026-11-13: `ddev start` ran for "Start the
                 // WordPress project only if it is stopped" and the card
                 // still listed the step undone.
-                let index: Option<usize> = id
-                    .rsplit_once("/obligation:checklist:")
-                    .and_then(|(_, index)| index.parse().ok());
                 let proof = proof.or_else(|| {
                     let index = index?;
                     receipts
@@ -2778,7 +2808,9 @@ fn hint_matches_target(
     hint: &ToolTargetHint,
 ) -> bool {
     match (target.kind, hint.kind) {
-        (RequestVerificationTargetKind::Url, ToolTargetHintKind::Url) => target.value == hint.value,
+        (RequestVerificationTargetKind::Url, ToolTargetHintKind::Url) => {
+            url_identity(&target.value) == url_identity(&hint.value)
+        }
         (RequestVerificationTargetKind::Path, ToolTargetHintKind::Path) => {
             // The target itself, or a path under it: only a directory has
             // paths under it, so a folder-scoped item is met by work on its
@@ -2808,6 +2840,42 @@ fn hint_matches_target(
         }
         _ => false,
     }
+}
+
+/// The resource an absolute URL names, as its parts resolve: scheme and
+/// host compared without case, a scheme's default port left out, an empty
+/// path the root and the fragment (never sent) dropped. Two spellings of
+/// one address (`https://Site.test` and `https://site.test:443/`) are one
+/// target; any other difference (path, query, port, scheme) is another.
+/// Text that does not parse as an absolute URL is compared as written.
+fn url_identity(value: &str) -> String {
+    let value = value.trim();
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return value.to_string();
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
+    let split = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(split);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
+        .to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" | "ws" => Some(":80"),
+        "https" | "wss" => Some(":443"),
+        _ => None,
+    };
+    let authority = default_port
+        .and_then(|port| authority.strip_suffix(port))
+        .unwrap_or(&authority)
+        .trim_end_matches('.');
+    let tail = if tail.starts_with('/') {
+        tail.to_string()
+    } else {
+        format!("/{tail}")
+    };
+    format!("{scheme}://{authority}{tail}")
 }
 
 /// Whether a receipt subject of `hint` kind could have been a target of
@@ -6754,6 +6822,168 @@ mod tests {
         ]
         .concat();
         assert_eq!(state(observed_after), RunObligationState::Satisfied);
+    }
+
+    /// Live 2026-11-13: two helpers installed a site each; the parent then
+    /// saw each site answer and reported both verified, while the card said
+    /// it couldn't verify either. An install's change, typed only as some
+    /// change (a helper's run, a shell command), is the step's when it names
+    /// the step or touched its target, and a later succeeded observation of
+    /// that same target, named by resolved identity (the site's URL with
+    /// the folder that serves it), confirms it.
+    #[test]
+    fn an_unspecified_change_is_confirmed_by_a_later_observation_of_its_target() {
+        const FOLDER: &str = "/tmp/proj/claude-company-drupal";
+        const SITE: &str = "https://claude-company-drupal.ddev.site";
+        let install =
+            ToolMutationEffects::PROCESS_STATE.union(ToolMutationEffects::LOCAL_WORKSPACE_WRITE);
+        let item = |target: &str| {
+            executor_expectations(vec![checklist_item(
+                0,
+                install,
+                false,
+                &[target],
+                "completed",
+            )])
+        };
+        let change = |names_item: bool, hint: Option<&str>| {
+            let semantics = ToolCallSemantics {
+                effect: ToolCallEffect::Mutation,
+                mutation_effects: ToolMutationEffects::UNSPECIFIED,
+                ..ToolCallSemantics::default()
+            };
+            let semantics = match hint {
+                Some(path) => {
+                    semantics.with_target_hint(crate::traits::ToolTargetHintKind::Path, path)
+                }
+                None => semantics,
+            };
+            let mut done = result(
+                "install",
+                "spawn_agent",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                semantics,
+            );
+            if names_item {
+                done.data["receipt"]["checklist_items"] = json!([0]);
+            }
+            vec![call("install", "spawn_agent"), done]
+        };
+        // The observation of the site, with the folder serving it resolved.
+        let check = |status: ToolOutcomeStatus, url: &str| {
+            vec![
+                call("check", "terminal"),
+                result(
+                    "check",
+                    "terminal",
+                    status,
+                    0,
+                    url_observation_semantics(url)
+                        .with_target_hint(crate::traits::ToolTargetHintKind::Path, FOLDER),
+                ),
+            ]
+        };
+        let state = |mut events: Vec<Event>| {
+            renumber(&mut events);
+            RunAggregate::replay("task-1", &events).obligations
+                ["task:task-1/obligation:checklist:0"]
+                .state
+        };
+        let succeeded = ToolOutcomeStatus::Succeeded;
+
+        // The step's target is the folder; the change names the step.
+        let named = [
+            vec![item(FOLDER)],
+            change(true, None),
+            check(succeeded, &format!("{SITE}/")),
+        ]
+        .concat();
+        assert_eq!(state(named), RunObligationState::Satisfied);
+        // ... or it touched the folder.
+        let touched = [
+            vec![item(FOLDER)],
+            change(false, Some(FOLDER)),
+            check(succeeded, SITE),
+        ]
+        .concat();
+        assert_eq!(state(touched), RunObligationState::Satisfied);
+        // The step's target is the site, spelled with a trailing slash and
+        // another case: one address. (A change that names the step proves
+        // it on its own; this one only ran for the site.)
+        let by_url = [
+            vec![item("https://Claude-Company-Drupal.ddev.site:443/")],
+            vec![
+                call("start", "terminal"),
+                result(
+                    "start",
+                    "terminal",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    ToolCallSemantics {
+                        effect: ToolCallEffect::Mutation,
+                        mutation_effects: ToolMutationEffects::UNSPECIFIED,
+                        ..ToolCallSemantics::default()
+                    }
+                    .with_target_hint(crate::traits::ToolTargetHintKind::Url, SITE),
+                ),
+            ],
+            check(succeeded, SITE),
+        ]
+        .concat();
+        assert_eq!(state(by_url), RunObligationState::Satisfied);
+
+        // A change that is not the step's proves nothing about it.
+        let unrelated = [
+            vec![item(FOLDER)],
+            change(false, Some("/tmp/proj/elsewhere")),
+            check(succeeded, SITE),
+        ]
+        .concat();
+        assert_eq!(state(unrelated), RunObligationState::Pending);
+        // An observation that did not succeed confirms nothing.
+        let failed_check = [
+            vec![item(FOLDER)],
+            change(false, Some(FOLDER)),
+            check(ToolOutcomeStatus::CompletedWithNegativeResult, SITE),
+        ]
+        .concat();
+        assert_eq!(state(failed_check), RunObligationState::Pending);
+        // Another site is another target.
+        let other_site = [
+            vec![item("https://claude-company-wordpress.ddev.site/")],
+            change(false, Some(FOLDER)),
+            check(succeeded, SITE),
+        ]
+        .concat();
+        assert_eq!(state(other_site), RunObligationState::Pending);
+        // An observation before the change confirms nothing.
+        let early = [
+            vec![item(FOLDER)],
+            check(succeeded, SITE),
+            change(false, Some(FOLDER)),
+        ]
+        .concat();
+        assert_eq!(state(early), RunObligationState::Pending);
+    }
+
+    #[test]
+    fn a_url_is_one_target_however_it_is_spelled() {
+        for (a, b) in [
+            ("https://site.test", "https://site.test/"),
+            ("https://SITE.test:443/", "https://site.test/"),
+            ("http://site.test:80/x?y=1#top", "http://site.test/x?y=1"),
+        ] {
+            assert_eq!(url_identity(a), url_identity(b), "{a} {b}");
+        }
+        for (a, b) in [
+            ("https://site.test/a", "https://site.test/b"),
+            ("http://site.test/", "https://site.test/"),
+            ("https://site.test:8443/", "https://site.test/"),
+            ("https://site.test/?a", "https://site.test/"),
+        ] {
+            assert_ne!(url_identity(a), url_identity(b), "{a} {b}");
+        }
     }
 
     /// Two receipts that each carry part of an item's effects prove it

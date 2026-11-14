@@ -237,6 +237,39 @@ pub fn folders_serving(host: &str, folders: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Name, on an observation, the project folder (among `folders`) that
+/// serves each site it observed, by that project's own configuration
+/// ([`project_hosts`]): a check of the site is a check of what the folder
+/// serves, so a step aimed at the folder and a step aimed at its site are
+/// matched by what they resolve to, never by their text. A call that
+/// observes nothing, or names no URL, is left as it is.
+pub fn name_serving_folders(
+    semantics: &mut crate::semantics::ToolCallSemantics,
+    folders: &[String],
+) {
+    if !semantics.observes_state() || folders.is_empty() {
+        return;
+    }
+    let hosts: Vec<String> = semantics
+        .target_hints
+        .iter()
+        .filter(|hint| hint.kind == crate::semantics::ToolTargetHintKind::Url)
+        .filter_map(|hint| reqwest::Url::parse(&hint.value).ok())
+        .filter_map(|url| url.host_str().map(str::to_string))
+        .collect();
+    for host in hosts {
+        for folder in folders_serving(&host, folders) {
+            let named = semantics.target_hints.iter().any(|hint| {
+                hint.kind == crate::semantics::ToolTargetHintKind::Path && hint.value == folder
+            });
+            if !named {
+                *semantics = std::mem::take(semantics)
+                    .with_target_hint(crate::semantics::ToolTargetHintKind::Path, folder);
+            }
+        }
+    }
+}
+
 /// The host names a local project folder serves, read from the project's
 /// own configuration: a `ddev` project's `.ddev/config.yaml` (and its
 /// `config.*.yaml` overrides, applied in name order as `ddev` does) gives
@@ -583,6 +616,41 @@ mod tests {
             "test:local-sites-elsewhere",
             "own-site.ddev.site"
         ));
+    }
+
+    /// A check of a site names the project folder that serves it, so a
+    /// step aimed at that folder is matched by what the check observed.
+    #[test]
+    fn an_observation_of_a_site_names_the_folder_that_serves_it() {
+        use crate::semantics::{ToolCallSemantics, ToolTargetHintKind};
+        let root = tempfile::tempdir().unwrap();
+        let site = ddev_project(root.path(), "site-a", "name: site-a\n");
+        let other = ddev_project(root.path(), "site-b", "name: site-b\n");
+        let folders = vec![site.clone(), other];
+        let paths = |semantics: &ToolCallSemantics| -> Vec<String> {
+            semantics
+                .target_hints
+                .iter()
+                .filter(|hint| hint.kind == ToolTargetHintKind::Path)
+                .map(|hint| hint.value.clone())
+                .collect()
+        };
+        let mut check = ToolCallSemantics::observation()
+            .with_target_hint(ToolTargetHintKind::Url, "https://site-a.ddev.site/");
+        name_serving_folders(&mut check, &folders);
+        assert_eq!(paths(&check), vec![site.clone()]);
+        name_serving_folders(&mut check, &folders);
+        assert_eq!(paths(&check), vec![site], "named once");
+        // A change names no folder by it: only an observation checks.
+        let mut change = ToolCallSemantics::mutation()
+            .with_target_hint(ToolTargetHintKind::Url, "https://site-a.ddev.site/");
+        name_serving_folders(&mut change, &folders);
+        assert!(paths(&change).is_empty());
+        // A site no folder serves names none.
+        let mut elsewhere = ToolCallSemantics::observation()
+            .with_target_hint(ToolTargetHintKind::Url, "https://site-c.ddev.site/");
+        name_serving_folders(&mut elsewhere, &folders);
+        assert!(paths(&elsewhere).is_empty());
     }
 
     #[tokio::test]

@@ -483,6 +483,30 @@ impl TurnEngine<'_> {
                     &call_semantics,
                     &mut outcome.metadata,
                 );
+                // A check of a local site names the folder that serves it
+                // (the request's own folders, its write scope, where it
+                // ran), so the receipt matches a step aimed at that folder
+                // by resolved identity.
+                let mut folders = scope.spawn_family.owned_folders().list();
+                folders.extend(
+                    scope
+                        .authority
+                        .task_access
+                        .iter()
+                        .flat_map(|access| access.write_targets.iter())
+                        .map(|target| target.value.clone()),
+                );
+                folders.extend(
+                    outcome
+                        .metadata
+                        .access_manifest
+                        .as_ref()
+                        .and_then(|access| access.execution_cwd.clone()),
+                );
+                aidaemon_tools::local_sites::name_serving_folders(
+                    &mut outcome.metadata.semantics,
+                    &folders,
+                );
                 let status = crate::turn::loop_utils::classify_tool_outcome_status(
                     &request.name,
                     &outcome.output,

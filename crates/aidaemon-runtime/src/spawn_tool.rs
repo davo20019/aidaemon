@@ -1028,6 +1028,11 @@ pub fn combine_batch(
     let mut failures = 0;
     let mut all_succeeded = true;
     let mut trust = SourceTrust::Trusted;
+    // The declared items each child took on: the batch's one receipt is
+    // the typed link from the call to all of them (live 2026-11-13: two
+    // helpers installed a site each in one call, and the card said it
+    // couldn't verify either: the batch result had dropped their items).
+    let mut checklist_items: Vec<usize> = Vec::new();
     let mut truncation: Option<aidaemon_tools::semantics::TruncationInfo> = None;
     for (mission, run) in runs {
         // Its own name, in words the parent can repeat to the owner. A
@@ -1040,6 +1045,11 @@ pub fn combine_batch(
         };
         match run {
             Ok(outcome) => {
+                for item in &outcome.metadata.checklist_items {
+                    if !checklist_items.contains(item) {
+                        checklist_items.push(*item);
+                    }
+                }
                 if outcome.metadata.output_trust != Some(SourceTrust::Trusted) {
                     trust = SourceTrust::Untrusted;
                 }
@@ -1078,6 +1088,8 @@ pub fn combine_batch(
     }
     let mut outcome = reported(output, trust);
     outcome.metadata.truncation = truncation;
+    checklist_items.sort_unstable();
+    outcome.metadata.checklist_items = checklist_items;
     if background {
         return Ok(outcome.handed_to_background());
     }
@@ -3413,5 +3425,38 @@ mod folder_tests {
         ));
         release_request_folders(&made, &facts);
         assert!(family.owned_folders().list().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    /// Live 2026-11-13: two helpers installed a site each from one batch
+    /// call, and the card said it couldn't verify either: the batch's one
+    /// receipt had lost the declared items its children took on, so
+    /// nothing linked the helpers' finished work to those steps.
+    #[test]
+    fn a_batch_result_carries_every_childs_declared_items() {
+        let child = |items: &[usize]| {
+            let mut outcome = reported("done".to_string(), SourceTrust::Trusted);
+            outcome.metadata.outcome_status =
+                Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded);
+            outcome.metadata.checklist_items = items.to_vec();
+            outcome
+        };
+        let combined = combine_batch(
+            vec![
+                ("Install WordPress".to_string(), Ok(child(&[1]))),
+                ("Install Drupal".to_string(), Ok(child(&[0, 1]))),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(combined.metadata.checklist_items, vec![0, 1]);
+        assert_eq!(
+            combined.metadata.outcome_status,
+            Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded)
+        );
     }
 }
