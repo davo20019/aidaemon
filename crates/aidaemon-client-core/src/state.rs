@@ -51,7 +51,7 @@ pub struct SessionView {
 }
 
 /// The client's view. Its JSON form (`serde_json::to_value`) is what the
-/// shared reducer fixtures compare, in Rust and in the web client.
+/// shared reducer fixtures (`tests/fixtures/reducer/`) compare.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct State {
     /// The last durable `seq` applied.

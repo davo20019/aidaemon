@@ -1,5 +1,5 @@
-//! Device-key sign-in, the Rust twin of the web client's: pair once (redeem
-//! an offer with a fresh P-256 public key, wait for the owner to confirm),
+//! Device-key sign-in: pair once (redeem an offer with a fresh P-256
+//! public key, wait for the owner to confirm),
 //! then on each connection ask for a challenge, sign
 //! [`challenge_message`] and trade the signature for a 15-minute
 //! [`AccessGrant`], renewed before it runs out.

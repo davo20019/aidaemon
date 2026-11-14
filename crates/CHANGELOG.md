@@ -12,6 +12,9 @@ stability promise.
 
 ## [Unreleased]
 
+### Removed
+- `aidaemon-client-gateway`: the built-in TypeScript web client (`clients/web` and the gateway's `web/` assets, `/client/v1/app/{module}`). The app's web build (`clients/app`) replaces it at `/client/v1/next/`; `/client/v1/app` redirects there when `app_dir` is set and otherwise serves a self-contained page saying the web app is not installed and how to get it.
+
 ### Added
 - `aidaemon-client-protocol` 1.2: command `get_system` and result `system` (`SystemStatus`: version, uptime, models, token use per day and model, model call timings, scheduled goals, background jobs, queues and health checks). `aidaemon-client-gateway`: `ClientHost::system` (default `None`, answered `not_found`).
 - `aidaemon-client-protocol` 1.1: capability `view_actions` and the ephemeral `view_action` event (`ViewAction`: open a session, show an approval or a task, focus a `Pane`, new session, show devices; unknown kinds read as `Unknown`). `aidaemon-client-gateway`: `views::ViewTargets` sends a view action to the one socket that declared the capability and sent the session's message, never logged or broadcast. `aidaemon-client-core`: `State::view_request`. `aidaemon-tools`: `ToolSemantics::offered_in_session`; `aidaemon-runtime`: `TurnHost::retain_offered_in_session`, applied when a turn's tools are chosen.

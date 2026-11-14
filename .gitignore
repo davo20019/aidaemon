@@ -41,10 +41,6 @@ __pycache__/
 !tests/fixtures/**/*.json
 # The Client Protocol's generated JSON Schema, which clients generate from.
 !schemas/**/*.json
-# The web client's manifest and compiler settings (its build output is
-# copied into crates/aidaemon-client-gateway/web).
-!clients/web/*.json
-clients/web/dist/
 *.png
 *.txt
 *.pdf

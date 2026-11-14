@@ -1,7 +1,5 @@
 //! The shared reducer fixtures: each file in `tests/fixtures/reducer/` is a
-//! list of server frames and the state they must leave, as JSON. The web
-//! client runs the same files against its TypeScript reducer
-//! (`clients/web`, `npm run test:fixtures`), so both apply frames alike.
+//! list of server frames and the state they must leave, as JSON.
 //!
 //! `UPDATE_GOLDEN=1 cargo test -p aidaemon-client-core --test reducer`
 //! rewrites each file's `state` from the Rust reducer, which is the

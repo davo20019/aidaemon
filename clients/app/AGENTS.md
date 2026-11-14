@@ -43,8 +43,8 @@ its pairing link approves itself (use `/client/v1/next/#offer=…`).
   WebSocket (`src/link/web.rs`, `js/browser.js`). Do not add protocol logic
   to the app.
 - The browser's device key is WebCrypto, non-extractable, in IndexedDB
-  `aidaemon-client` (shared with `clients/web`). Never store a key a script
-  can read.
+  `aidaemon-client` (the name the retired TypeScript client used; keep it).
+  Never store a key a script can read.
 - Model output renders as Markdown with HTML off (`html: false`).
 - The store (`src/store/`) is the only writer of app state; screens call
   its methods.

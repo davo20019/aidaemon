@@ -1147,9 +1147,10 @@ async fn a_pairing_made_in_a_chat_is_confirmed_there() {
     assert_eq!(state, EnrollmentState::Approved);
 }
 
-/// The gateway serves the web client: its page and its script.
+/// Without an installed web build, `/client/v1/app` says so and how to get
+/// it; the old built-in client's modules are gone.
 #[tokio::test]
-async fn the_web_client_is_served() {
+async fn the_app_path_explains_a_missing_web_build() {
     let f = fixture(RiskLevel::Medium).await;
     let page = f
         .http()
@@ -1162,45 +1163,19 @@ async fn the_web_client_is_served() {
         page.headers()["content-security-policy"]
             .to_str()
             .unwrap()
-            .contains("default-src 'self'")
+            .contains("default-src 'none'")
     );
-    assert!(page.text().await.unwrap().contains("/client/v1/app/app.js"));
-    let script = f
+    let text = page.text().await.unwrap();
+    assert!(text.contains("not installed"));
+    assert!(text.contains("nsh package --target web"));
+    assert!(!text.contains("<script"));
+    let gone = f
         .http()
         .get(format!("http://{}/client/v1/app/app.js", f.url))
         .send()
         .await
         .unwrap();
-    assert!(
-        script.headers()["content-type"]
-            .to_str()
-            .unwrap()
-            .starts_with("text/javascript")
-    );
-    assert!(script.text().await.unwrap().contains("./ui.js"));
-    // Each module the page imports is served; nothing else is.
-    for (module, holds) in [
-        ("link.js", "/sessions/challenge"),
-        ("state.js", "approval_resolved"),
-        ("platform.js", "__TAURI__"),
-        ("ui.js", "resolve_approval"),
-    ] {
-        let response = f
-            .http()
-            .get(format!("http://{}/client/v1/app/{module}", f.url))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200, "{module}");
-        assert!(response.text().await.unwrap().contains(holds), "{module}");
-    }
-    let missing = f
-        .http()
-        .get(format!("http://{}/client/v1/app/protocol.js", f.url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(missing.status(), 404);
+    assert_eq!(gone.status(), 404);
 }
 
 /// The shared client core pairs a device with its own key, signs in with a
