@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 3;
+pub const PROTOCOL_MINOR: u16 = 4;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -280,6 +280,15 @@ pub enum Command {
     ListMemories,
     /// Forget one remembered fact, by its `id` from `list_memories`.
     ForgetMemory { memory_id: String },
+    /// The daemon's settings: every value its config file holds (secrets
+    /// only as set or not), the settings it knows that are unset, its bots
+    /// and MCP servers, and what waits for a reload or restart
+    /// (protocol 1.4).
+    GetSettings,
+    /// Change the daemon's settings (protocol 1.4). A security-sensitive
+    /// change asks for approval first, and the reply says so; its result
+    /// then arrives as a `settings_updated` event.
+    ChangeSettings { change: SettingsChange },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -377,6 +386,14 @@ pub enum CommandResult {
     Forgotten {
         memory_id: String,
     },
+    /// `get_settings`.
+    Settings {
+        settings: Settings,
+    },
+    /// `change_settings`: done, or waiting for an approval.
+    SettingsChanged {
+        outcome: SettingsOutcome,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -413,6 +430,272 @@ pub struct MemoryItem {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
     pub updated_ms: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Settings (protocol 1.4)
+// ---------------------------------------------------------------------------
+
+/// A secret's text: sent once, to be stored, and never shown or logged.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(transparent)]
+pub struct SecretText(pub String);
+
+impl std::fmt::Debug for SecretText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretText(***)")
+    }
+}
+
+/// The daemon's settings, as the Settings page shows them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct Settings {
+    /// The config file the settings live in.
+    pub config_path: String,
+    /// The settings, by config table.
+    pub groups: Vec<SettingGroup>,
+    /// Bots connected at runtime (stored in the database, not the file).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bots: Vec<BotInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServerInfo>,
+    /// Saved changes that take effect on a reload.
+    #[serde(default)]
+    pub reload_pending: bool,
+    /// Saved changes that take effect on a restart.
+    #[serde(default)]
+    pub restart_pending: bool,
+    /// What is scheduled or last happened to the database or the gateway's
+    /// address, in plain words.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
+    /// The database file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub database_path: String,
+    /// Whether the database is encrypted (its key can be rotated).
+    #[serde(default)]
+    pub database_encrypted: bool,
+}
+
+/// The settings of one config table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct SettingGroup {
+    /// The table's name in the file (`provider`, `memory`, ...).
+    pub name: String,
+    pub settings: Vec<Setting>,
+}
+
+/// One setting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct Setting {
+    /// Its dotted path, a list entry as `a[2]` (`provider.models.default`).
+    pub key: String,
+    /// Its value as TOML (`"gpt-x"`, `true`, `[1, 2]`); `None` when it is
+    /// not set (the default applies) or is a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    pub kind: SettingKind,
+    /// For a secret: whether it is set.
+    #[serde(default)]
+    pub secret_set: bool,
+    /// What it does, from the example config.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// The example config's value, as TOML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub example: Option<String>,
+    pub applies: Applies,
+    /// Changing it asks for approval.
+    #[serde(default)]
+    pub guarded: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingKind {
+    Text,
+    Number,
+    Bool,
+    List,
+    /// A table or a list of tables, edited as TOML.
+    Table,
+    /// Stored in the keychain; set with `SettingsChange::Secret`.
+    Secret,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// When a saved change takes effect.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Applies {
+    /// Already in effect.
+    Now,
+    /// On `apply` with `reload`.
+    Reload,
+    /// On `apply` with `restart`.
+    Restart,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// A bot connected at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct BotInfo {
+    pub id: i64,
+    /// `telegram`, `discord` or `slack`.
+    pub platform: String,
+    /// Who may talk to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_user_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub created_at: String,
+}
+
+/// An MCP server the daemon runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct McpServerInfo {
+    pub name: String,
+    /// The command line it runs.
+    pub command: String,
+    pub enabled: bool,
+    /// The tools it offers while running.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// From the config file (changed as settings) rather than added at
+    /// runtime.
+    #[serde(default)]
+    pub from_config: bool,
+}
+
+/// One change to the daemon's settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SettingsChange {
+    /// Set `key` to `value` (TOML), or remove it (`None`) so its default
+    /// applies.
+    Set {
+        key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+    },
+    /// Store a secret in the keychain and point `key` at it.
+    Secret {
+        key: String,
+        value: SecretText,
+    },
+    /// Make a provider preset the primary provider.
+    SwitchProvider {
+        provider: ProviderChoice,
+    },
+    /// Add a failover provider after the others.
+    AddFailover {
+        provider: ProviderChoice,
+    },
+    /// Remove failover provider `index` (from 0).
+    RemoveFailover {
+        index: u32,
+    },
+    /// Put back the config file as it was before the last change.
+    RestoreBackup,
+    /// Remove a bot connected at runtime.
+    RemoveBot {
+        bot_id: i64,
+    },
+    Mcp {
+        name: String,
+        action: McpAction,
+    },
+    /// Put saved changes into effect.
+    Apply {
+        how: ApplyHow,
+    },
+    /// Database upkeep, done at the next restart.
+    Database {
+        action: DatabaseAction,
+    },
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// A provider, by preset (`openai`, `anthropic`, `openrouter`, ...).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ProviderChoice {
+    pub preset: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub primary_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fast_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub smart_model: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAction {
+    Enable,
+    Disable,
+    Restart,
+    Remove,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyHow {
+    /// Reload the config in place (providers and models).
+    Reload,
+    /// Restart the daemon. Clients reconnect.
+    Restart,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DatabaseAction {
+    /// Move the database file to `path` (absolute, or relative to the
+    /// config file).
+    MoveTo { path: String },
+    /// Re-encrypt the database under a new key.
+    RotateKey,
+    /// Drop what is scheduled.
+    Cancel,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// What a `change_settings` did.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SettingsOutcome {
+    /// Done: `message` says what changed.
+    Done {
+        message: String,
+        /// When a saved change takes effect.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        applies: Option<Applies>,
+    },
+    /// Waiting for an approval (shown like any other); the result arrives
+    /// as a `settings_updated` event.
+    AwaitingApproval {
+        approval_id: String,
+        /// Only another device (or the owner at the computer) may approve.
+        #[serde(default)]
+        other_device: bool,
+    },
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +790,12 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         reason: String,
     },
+    /// Ephemeral: the settings changed (or a change waiting for approval
+    /// ended): read them again (protocol 1.4).
+    SettingsUpdated {
+        ok: bool,
+        message: String,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -517,7 +806,10 @@ impl Event {
     pub fn is_durable(&self) -> bool {
         !matches!(
             self,
-            Event::TurnDelta { .. } | Event::TurnStatus { .. } | Event::ViewAction { .. }
+            Event::TurnDelta { .. }
+                | Event::TurnStatus { .. }
+                | Event::ViewAction { .. }
+                | Event::SettingsUpdated { .. }
         )
     }
 
@@ -538,6 +830,7 @@ impl Event {
             Event::TaskUpdated { .. } => "task_updated",
             Event::GoalUpdated { .. } => "goal_updated",
             Event::ViewAction { .. } => "view_action",
+            Event::SettingsUpdated { .. } => "settings_updated",
             Event::Unknown => "unknown",
         }
     }

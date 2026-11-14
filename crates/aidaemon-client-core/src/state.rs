@@ -358,7 +358,8 @@ impl State {
             Event::ViewAction { action, reason } => {
                 self.view_request = Some(ViewRequest { action, reason });
             }
-            Event::GoalUpdated { .. } | Event::Unknown => {}
+            // The app reads the settings again (its store, not this state).
+            Event::GoalUpdated { .. } | Event::SettingsUpdated { .. } | Event::Unknown => {}
         }
     }
 

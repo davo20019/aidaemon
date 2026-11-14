@@ -1803,6 +1803,29 @@ struct ConfigArgs {
     kernel_approved: bool,
 }
 
+impl ConfigArgs {
+    fn change(action: &str, key: &str, value: &str) -> Self {
+        Self {
+            action: action.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            provider: String::new(),
+            api_key: None,
+            base_url: String::new(),
+            gateway_token: None,
+            primary_model: String::new(),
+            fast_model: String::new(),
+            smart_model: String::new(),
+            failover_index: None,
+            stt_cli_path: None,
+            stt_model_path: None,
+            stt_language: None,
+            stt_ffmpeg_path: None,
+            kernel_approved: false,
+        }
+    }
+}
+
 fn apply_instruction_for_key(key: &str) -> &'static str {
     if key == "agent" || key.starts_with("agent.") {
         "Restart aidaemon to apply agent identity or persona changes."
@@ -1910,7 +1933,44 @@ impl ConfigManagerTool {
     ) -> anyhow::Result<ConfigReply> {
         let mut args: ConfigArgs = serde_json::from_str(arguments)?;
         args.kernel_approved = facts.kernel_approved.is_some();
+        self.run_args(args).await
+    }
 
+    /// Run one call for the owner from outside the agent loop (the owner's
+    /// own client), through the same checks, backups and refusals as the
+    /// tool. `approved`: the owner approved this exact call (what
+    /// [`Self::owner_approval`] asked), as the kernel's approval would mean.
+    /// `Ok` says what changed; `Err` why nothing was.
+    pub async fn run_owner_call(
+        &self,
+        arguments: &Value,
+        approved: bool,
+    ) -> Result<String, String> {
+        let mut args: ConfigArgs =
+            serde_json::from_value(arguments.clone()).map_err(|e| e.to_string())?;
+        args.kernel_approved = approved;
+        match self.run_args(args).await {
+            Ok(ConfigReply {
+                status: Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded) | None,
+                text,
+            }) => Ok(text),
+            Ok(ConfigReply { text, .. }) => Err(text),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Whether a `set` or `unset` of `key` names a security-sensitive
+    /// setting (a secret, or one that redirects traffic or widens access).
+    pub fn is_guarded_key(key: &str) -> bool {
+        Self::change_needs_approval(&ConfigArgs::change("unset", key, ""))
+    }
+
+    /// Whether `key` holds a secret, kept in the secret store.
+    pub fn is_secret_key(key: &str) -> bool {
+        is_sensitive_key(key)
+    }
+
+    async fn run_args(&self, args: ConfigArgs) -> anyhow::Result<ConfigReply> {
         match args.action.as_str() {
             "list_provider_presets" => Ok(ConfigReply::done(Self::list_provider_presets_message())),
             "switch_provider" => self.switch_provider(&args).await.map(Into::into),

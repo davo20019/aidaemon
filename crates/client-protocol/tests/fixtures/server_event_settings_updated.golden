@@ -1,0 +1,10 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "message": "Updated provider.models.default",
+    "ok": true,
+    "type": "settings_updated"
+  },
+  "session_id": "app:6c1f",
+  "type": "event"
+}

@@ -1,0 +1,12 @@
+{
+  "command": {
+    "change": {
+      "key": "provider.models.default",
+      "kind": "set",
+      "value": "\"synthetic-model-1\""
+    },
+    "type": "change_settings"
+  },
+  "request_id": "5d0c2b1e-0012",
+  "type": "command"
+}

@@ -42,9 +42,10 @@ use aidaemon_channels::hub::{ChannelHub, HubChannel};
 use aidaemon_channels::stop::{self, StopRequest};
 use aidaemon_channels::turns::{MidRunPlacement, Turn, TurnDeps, TurnRunner};
 use aidaemon_client_protocol::{
-    ApprovalDecision, ClientKind, Command, CommandResult, ErrorCode, Event, Glance, HistoryMessage,
-    LastReply, MemoryItem, MidRun, OwnerInfo, ProtocolError, Risk, Scope, SearchHit, ServerFrame,
-    SessionSummary, SlashCommand, Snapshot, TaskState, TaskSummary,
+    Applies, ApprovalDecision, ClientKind, Command, CommandResult, ErrorCode, Event, Glance,
+    HistoryMessage, LastReply, MemoryItem, MidRun, OwnerInfo, ProtocolError, Risk, Scope,
+    SearchHit, ServerFrame, SessionSummary, Settings, SettingsChange, SettingsOutcome,
+    SlashCommand, Snapshot, TaskState, TaskSummary,
 };
 use aidaemon_store_sqlite::SqliteClientEventLog;
 use aidaemon_tools::semantics::UserRole;
@@ -105,7 +106,59 @@ pub trait ClientHost: Send + Sync {
     async fn forget(&self, _id: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
+
+    /// The daemon's settings; `None` when this host does not show them.
+    async fn settings(&self) -> anyhow::Result<Option<Settings>> {
+        Ok(None)
+    }
+
+    /// What `change` needs before it runs: nothing, or the owner's
+    /// approval. `Err`: it cannot be made (why, in plain words).
+    async fn settings_gate(&self, _change: &SettingsChange) -> Result<SettingsGate, String> {
+        Err("This daemon does not change its settings from apps".to_string())
+    }
+
+    /// Make `change`; `approved`: the owner approved it (what
+    /// [`Self::settings_gate`] asked for). `Err`: nothing was changed, and why.
+    async fn change_settings(
+        &self,
+        _change: SettingsChange,
+        _approved: bool,
+    ) -> Result<SettingsDone, String> {
+        Err("This daemon does not change its settings from apps".to_string())
+    }
+
+    /// A signed-in client sent a command: it reaches the gateway.
+    fn client_seen(&self) {}
 }
+
+/// What a settings change needs before it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsGate {
+    Free,
+    /// The owner's approval, with what the card says.
+    Ask {
+        summary: String,
+        warnings: Vec<String>,
+        risk: Risk,
+        /// Only another device (or the owner at the computer) may approve:
+        /// it widens what the daemon may do.
+        other_device: bool,
+    },
+}
+
+/// A settings change made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsDone {
+    pub message: String,
+    pub applies: Option<Applies>,
+}
+
+/// The session a settings change's approval card belongs to.
+pub const SETTINGS_SESSION: &str = "app:settings";
+
+/// How long a settings change waits for its approval.
+const SETTINGS_APPROVAL_WAIT: Duration = Duration::from_secs(10 * 60);
 
 /// Hands events to the bus in the order they were raised, from code that
 /// cannot wait (the turn observer, the approval tap).
@@ -454,8 +507,9 @@ impl ClientGateway {
             | Command::GetSystem
             | Command::SearchMessages { .. }
             | Command::ListCommands
-            | Command::ListMemories => Some(Scope::Observe),
-            Command::ForgetMemory { .. } => Some(Scope::Chat),
+            | Command::ListMemories
+            | Command::GetSettings => Some(Scope::Observe),
+            Command::ForgetMemory { .. } | Command::ChangeSettings { .. } => Some(Scope::Chat),
             Command::Unknown => None,
         };
         if let Some(scope) = needs
@@ -466,6 +520,7 @@ impl ClientGateway {
                 format!("This device may not {scope:?}"),
             ));
         }
+        self.host.client_seen();
         match command {
             Command::SendMessage {
                 session_id,
@@ -528,7 +583,13 @@ impl ClientGateway {
                     .device
                     .clone()
                     .or_else(|| caller.principal.device_name.clone());
-                self.resolve_approval(&approval_id, decision, device, ceiling)
+                self.resolve_approval(
+                    &approval_id,
+                    decision,
+                    device,
+                    caller.principal.device_id.as_deref(),
+                    ceiling,
+                )
             }
             Command::ListSessions { cursor, limit } => self.list_sessions(cursor, limit).await,
             Command::GetHistory {
@@ -592,6 +653,21 @@ impl ClientGateway {
                     ))
                 }
             },
+            Command::GetSettings => match self.host.settings().await {
+                Ok(Some(settings)) => Ok(CommandResult::Settings { settings }),
+                Ok(None) => Err(ProtocolError::new(
+                    ErrorCode::NotFound,
+                    "This daemon does not show its settings",
+                )),
+                Err(e) => {
+                    warn!(error = %e, "Reading settings failed");
+                    Err(ProtocolError::new(
+                        ErrorCode::Internal,
+                        "Could not read the settings",
+                    ))
+                }
+            },
+            Command::ChangeSettings { change } => self.change_settings(change, caller).await,
             Command::Unknown => Err(ProtocolError::new(
                 ErrorCode::Invalid,
                 "Unknown command for this gateway version",
@@ -599,16 +675,112 @@ impl ClientGateway {
         }
     }
 
+    /// A settings change from a client: made now, or after the owner
+    /// approves it. Every client is told to read the settings again.
+    async fn change_settings(
+        &self,
+        change: SettingsChange,
+        caller: &Caller,
+    ) -> Result<CommandResult, ProtocolError> {
+        let invalid = |message: String| ProtocolError::new(ErrorCode::Invalid, message);
+        match self.host.settings_gate(&change).await.map_err(invalid)? {
+            SettingsGate::Free => {
+                let done = self
+                    .host
+                    .change_settings(change, false)
+                    .await
+                    .map_err(invalid)?;
+                self.settings_updated(true, done.message.clone());
+                Ok(CommandResult::SettingsChanged {
+                    outcome: SettingsOutcome::Done {
+                        message: done.message,
+                        applies: done.applies,
+                    },
+                })
+            }
+            SettingsGate::Ask {
+                summary,
+                warnings,
+                risk,
+                other_device,
+            } => {
+                let not_from = other_device
+                    .then(|| caller.principal.device_id.clone())
+                    .flatten();
+                let other_device = not_from.is_some();
+                self.runner
+                    .register_session(SETTINGS_SESSION, APP_CHANNEL)
+                    .await;
+                let (approval_id, answer) = self.approvals.ask(approvals::OwnAsk {
+                    session_id: SETTINGS_SESSION.to_string(),
+                    summary,
+                    warnings,
+                    risk,
+                    expires_at_ms: bus::now_ms()
+                        .saturating_add(SETTINGS_APPROVAL_WAIT.as_millis() as u64),
+                    not_from,
+                });
+                let host = self.host.clone();
+                let approvals = self.approvals.clone();
+                let publisher = self.publisher.clone();
+                let id = approval_id.clone();
+                tokio::spawn(async move {
+                    let answer = tokio::time::timeout(SETTINGS_APPROVAL_WAIT, answer)
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                    let approved = matches!(
+                        answer,
+                        Some((
+                            aidaemon_tools::semantics::ApprovalResponse::AllowOnce
+                                | aidaemon_tools::semantics::ApprovalResponse::AllowSession
+                                | aidaemon_tools::semantics::ApprovalResponse::AllowAlways,
+                            _
+                        ))
+                    );
+                    let answered = answer.is_some();
+                    approvals.settle(&id, answer);
+                    let (ok, message) = if approved {
+                        match host.change_settings(change, true).await {
+                            Ok(done) => (true, done.message),
+                            Err(reason) => (false, reason),
+                        }
+                    } else if answered {
+                        (false, "Declined: nothing was changed.".to_string())
+                    } else {
+                        (
+                            false,
+                            "Nobody approved it in time: nothing was changed.".to_string(),
+                        )
+                    };
+                    publisher.publish(None, Event::SettingsUpdated { ok, message });
+                });
+                Ok(CommandResult::SettingsChanged {
+                    outcome: SettingsOutcome::AwaitingApproval {
+                        approval_id,
+                        other_device,
+                    },
+                })
+            }
+        }
+    }
+
+    fn settings_updated(&self, ok: bool, message: String) {
+        self.publisher
+            .publish(None, Event::SettingsUpdated { ok, message });
+    }
+
     fn resolve_approval(
         &self,
         approval_id: &str,
         decision: ApprovalDecision,
         device: Option<String>,
+        device_id: Option<&str>,
         ceiling: Option<Risk>,
     ) -> Result<CommandResult, ProtocolError> {
         let outcome = self
             .approvals
-            .resolve(approval_id, decision, device, ceiling)?;
+            .resolve(approval_id, decision, device, device_id, ceiling)?;
         Ok(CommandResult::ApprovalResolved {
             approval_id: approval_id.to_string(),
             outcome,

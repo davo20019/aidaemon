@@ -40,6 +40,40 @@
       ],
       "type": "object"
     },
+    "Applies": {
+      "description": "When a saved change takes effect.",
+      "oneOf": [
+        {
+          "const": "now",
+          "description": "Already in effect.",
+          "type": "string"
+        },
+        {
+          "const": "reload",
+          "description": "On `apply` with `reload`.",
+          "type": "string"
+        },
+        {
+          "const": "restart",
+          "description": "On `apply` with `restart`.",
+          "type": "string"
+        }
+      ]
+    },
+    "ApplyHow": {
+      "oneOf": [
+        {
+          "const": "reload",
+          "description": "Reload the config in place (providers and models).",
+          "type": "string"
+        },
+        {
+          "const": "restart",
+          "description": "Restart the daemon. Clients reconnect.",
+          "type": "string"
+        }
+      ]
+    },
     "Approval": {
       "description": "A question the owner must answer before work goes on. Pending until\nexactly one of: answered, expired (nobody answered in time: the call is\nnot run, and it is not a refusal) or withdrawn (its turn stopped, or the\ndaemon restarted).",
       "properties": {
@@ -290,6 +324,34 @@
       "required": [
         "id",
         "name"
+      ],
+      "type": "object"
+    },
+    "BotInfo": {
+      "description": "A bot connected at runtime.",
+      "properties": {
+        "allowed_user_ids": {
+          "description": "Who may talk to it.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "platform": {
+          "description": "`telegram`, `discord` or `slack`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "platform"
       ],
       "type": "object"
     },
@@ -890,6 +952,36 @@
             "memory_id"
           ],
           "type": "object"
+        },
+        {
+          "description": "The daemon's settings: every value its config file holds (secrets\nonly as set or not), the settings it knows that are unset, its bots\nand MCP servers, and what waits for a reload or restart\n(protocol 1.4).",
+          "properties": {
+            "type": {
+              "const": "get_settings",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Change the daemon's settings (protocol 1.4). A security-sensitive\nchange asks for approval first, and the reply says so; its result\nthen arrives as a `settings_updated` event.",
+          "properties": {
+            "change": {
+              "$ref": "#/$defs/SettingsChange"
+            },
+            "type": {
+              "const": "change_settings",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "change"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1154,6 +1246,87 @@
           "required": [
             "type",
             "memory_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`get_settings`.",
+          "properties": {
+            "settings": {
+              "$ref": "#/$defs/Settings"
+            },
+            "type": {
+              "const": "settings",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "settings"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`change_settings`: done, or waiting for an approval.",
+          "properties": {
+            "outcome": {
+              "$ref": "#/$defs/SettingsOutcome"
+            },
+            "type": {
+              "const": "settings_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "outcome"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DatabaseAction": {
+      "oneOf": [
+        {
+          "description": "Move the database file to `path` (absolute, or relative to the\nconfig file).",
+          "properties": {
+            "kind": {
+              "const": "move_to",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Re-encrypt the database under a new key.",
+          "properties": {
+            "kind": {
+              "const": "rotate_key",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Drop what is scheduled.",
+          "properties": {
+            "kind": {
+              "const": "cancel",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
           ],
           "type": "object"
         }
@@ -1623,6 +1796,27 @@
             "action"
           ],
           "type": "object"
+        },
+        {
+          "description": "Ephemeral: the settings changed (or a change waiting for approval\nended): read them again (protocol 1.4).",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "ok": {
+              "type": "boolean"
+            },
+            "type": {
+              "const": "settings_updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "ok",
+            "message"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1962,6 +2156,48 @@
       ],
       "type": "object"
     },
+    "McpAction": {
+      "enum": [
+        "enable",
+        "disable",
+        "restart",
+        "remove"
+      ],
+      "type": "string"
+    },
+    "McpServerInfo": {
+      "description": "An MCP server the daemon runs.",
+      "properties": {
+        "command": {
+          "description": "The command line it runs.",
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "from_config": {
+          "default": false,
+          "description": "From the config file (changed as settings) rather than added at\nruntime.",
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "tools": {
+          "description": "The tools it offers while running.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "command",
+        "enabled"
+      ],
+      "type": "object"
+    },
     "MemoryItem": {
       "description": "One remembered fact.",
       "properties": {
@@ -2184,6 +2420,30 @@
       ],
       "type": "object"
     },
+    "ProviderChoice": {
+      "description": "A provider, by preset (`openai`, `anthropic`, `openrouter`, ...).",
+      "properties": {
+        "base_url": {
+          "type": "string"
+        },
+        "fast_model": {
+          "type": "string"
+        },
+        "preset": {
+          "type": "string"
+        },
+        "primary_model": {
+          "type": "string"
+        },
+        "smart_model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "preset"
+      ],
+      "type": "object"
+    },
     "QueueInfo": {
       "properties": {
         "capacity": {
@@ -2391,6 +2651,10 @@
       ],
       "type": "object"
     },
+    "SecretText": {
+      "description": "A secret's text: sent once, to be stored, and never shown or logged.",
+      "type": "string"
+    },
     "ServerFrame": {
       "description": "A frame from the daemon to a client.",
       "oneOf": [
@@ -2596,6 +2860,400 @@
         "channel"
       ],
       "type": "object"
+    },
+    "Setting": {
+      "description": "One setting.",
+      "properties": {
+        "applies": {
+          "$ref": "#/$defs/Applies"
+        },
+        "description": {
+          "description": "What it does, from the example config.",
+          "type": "string"
+        },
+        "example": {
+          "description": "The example config's value, as TOML.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "guarded": {
+          "default": false,
+          "description": "Changing it asks for approval.",
+          "type": "boolean"
+        },
+        "key": {
+          "description": "Its dotted path, a list entry as `a[2]` (`provider.models.default`).",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/SettingKind"
+        },
+        "secret_set": {
+          "default": false,
+          "description": "For a secret: whether it is set.",
+          "type": "boolean"
+        },
+        "value": {
+          "description": "Its value as TOML (`\"gpt-x\"`, `true`, `[1, 2]`); `None` when it is\nnot set (the default applies) or is a secret.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "key",
+        "kind",
+        "applies"
+      ],
+      "type": "object"
+    },
+    "SettingGroup": {
+      "description": "The settings of one config table.",
+      "properties": {
+        "name": {
+          "description": "The table's name in the file (`provider`, `memory`, ...).",
+          "type": "string"
+        },
+        "settings": {
+          "items": {
+            "$ref": "#/$defs/Setting"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "settings"
+      ],
+      "type": "object"
+    },
+    "SettingKind": {
+      "oneOf": [
+        {
+          "enum": [
+            "text",
+            "number",
+            "bool",
+            "list"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "table",
+          "description": "A table or a list of tables, edited as TOML.",
+          "type": "string"
+        },
+        {
+          "const": "secret",
+          "description": "Stored in the keychain; set with `SettingsChange::Secret`.",
+          "type": "string"
+        }
+      ]
+    },
+    "Settings": {
+      "description": "The daemon's settings, as the Settings page shows them.",
+      "properties": {
+        "bots": {
+          "description": "Bots connected at runtime (stored in the database, not the file).",
+          "items": {
+            "$ref": "#/$defs/BotInfo"
+          },
+          "type": "array"
+        },
+        "config_path": {
+          "description": "The config file the settings live in.",
+          "type": "string"
+        },
+        "database_encrypted": {
+          "default": false,
+          "description": "Whether the database is encrypted (its key can be rotated).",
+          "type": "boolean"
+        },
+        "database_path": {
+          "description": "The database file.",
+          "type": "string"
+        },
+        "groups": {
+          "description": "The settings, by config table.",
+          "items": {
+            "$ref": "#/$defs/SettingGroup"
+          },
+          "type": "array"
+        },
+        "mcp_servers": {
+          "items": {
+            "$ref": "#/$defs/McpServerInfo"
+          },
+          "type": "array"
+        },
+        "notices": {
+          "description": "What is scheduled or last happened to the database or the gateway's\naddress, in plain words.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reload_pending": {
+          "default": false,
+          "description": "Saved changes that take effect on a reload.",
+          "type": "boolean"
+        },
+        "restart_pending": {
+          "default": false,
+          "description": "Saved changes that take effect on a restart.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "config_path",
+        "groups"
+      ],
+      "type": "object"
+    },
+    "SettingsChange": {
+      "description": "One change to the daemon's settings.",
+      "oneOf": [
+        {
+          "description": "Set `key` to `value` (TOML), or remove it (`None`) so its default\napplies.",
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "set",
+              "type": "string"
+            },
+            "value": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "key"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Store a secret in the keychain and point `key` at it.",
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "secret",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/SecretText"
+            }
+          },
+          "required": [
+            "kind",
+            "key",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Make a provider preset the primary provider.",
+          "properties": {
+            "kind": {
+              "const": "switch_provider",
+              "type": "string"
+            },
+            "provider": {
+              "$ref": "#/$defs/ProviderChoice"
+            }
+          },
+          "required": [
+            "kind",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Add a failover provider after the others.",
+          "properties": {
+            "kind": {
+              "const": "add_failover",
+              "type": "string"
+            },
+            "provider": {
+              "$ref": "#/$defs/ProviderChoice"
+            }
+          },
+          "required": [
+            "kind",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Remove failover provider `index` (from 0).",
+          "properties": {
+            "index": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "remove_failover",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "index"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Put back the config file as it was before the last change.",
+          "properties": {
+            "kind": {
+              "const": "restore_backup",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Remove a bot connected at runtime.",
+          "properties": {
+            "bot_id": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "kind": {
+              "const": "remove_bot",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "bot_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/McpAction"
+            },
+            "kind": {
+              "const": "mcp",
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name",
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Put saved changes into effect.",
+          "properties": {
+            "how": {
+              "$ref": "#/$defs/ApplyHow"
+            },
+            "kind": {
+              "const": "apply",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "how"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Database upkeep, done at the next restart.",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/DatabaseAction"
+            },
+            "kind": {
+              "const": "database",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "action"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SettingsOutcome": {
+      "description": "What a `change_settings` did.",
+      "oneOf": [
+        {
+          "description": "Done: `message` says what changed.",
+          "properties": {
+            "applies": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Applies"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "When a saved change takes effect."
+            },
+            "kind": {
+              "const": "done",
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Waiting for an approval (shown like any other); the result arrives\nas a `settings_updated` event.",
+          "properties": {
+            "approval_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "awaiting_approval",
+              "type": "string"
+            },
+            "other_device": {
+              "default": false,
+              "description": "Only another device (or the owner at the computer) may approve.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "approval_id"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "SlashCommand": {
       "description": "A slash command, as a completion list shows it.",

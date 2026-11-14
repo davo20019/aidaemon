@@ -22,6 +22,16 @@ use tokio::sync::oneshot;
 use crate::bus::now_ms;
 use crate::{APP_CHANNEL, Publisher};
 
+/// An approval the gateway asks for itself.
+pub(crate) struct OwnAsk {
+    pub session_id: String,
+    pub summary: String,
+    pub warnings: Vec<String>,
+    pub risk: Risk,
+    pub expires_at_ms: u64,
+    pub not_from: Option<String>,
+}
+
 /// How many settled approvals are remembered for `conflict` replies.
 const SETTLED_KEPT: usize = 512;
 
@@ -31,6 +41,9 @@ struct Open {
     answer: Option<oneshot::Sender<(ApprovalResponse, String)>>,
     /// The client answer that won, and the device that gave it.
     answered: Option<(ApprovalOutcome, Option<String>)>,
+    /// The paired device that asked, when only another one (or the owner
+    /// at the computer) may approve.
+    not_from: Option<String>,
 }
 
 #[derive(Default)]
@@ -83,13 +96,16 @@ impl Approvals {
         pending
     }
 
-    /// Answer approval `id` from a client. The first answer wins; a `watch`
-    /// may only deny above `ceiling`.
+    /// Answer approval `id` from a client (`device_id`: the paired device,
+    /// `None` for the owner's local token). The first answer wins; a `watch`
+    /// may only deny above `ceiling`, and an approval only another device may
+    /// give is denied, not approved, from the device that asked.
     pub fn resolve(
         &self,
         id: &str,
         decision: ApprovalDecision,
         device: Option<String>,
+        device_id: Option<&str>,
         ceiling: Option<Risk>,
     ) -> Result<ApprovalOutcome, ProtocolError> {
         let mut book = self.book();
@@ -109,6 +125,16 @@ impl Approvals {
             return Err(ProtocolError::new(
                 ErrorCode::Invalid,
                 format!("{decision:?} is not offered for this approval"),
+            ));
+        }
+        if decision != ApprovalDecision::Deny
+            && open.not_from.is_some()
+            && open.not_from.as_deref() == device_id
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "Approve this from another device, or on the computer the daemon runs on \
+                     (denying it from here is fine)",
             ));
         }
         if let Some(ceiling) = ceiling
@@ -140,6 +166,59 @@ impl Approvals {
         }
         open.answered = Some((outcome, device));
         Ok(outcome)
+    }
+
+    /// Ask the owner from the gateway itself (a settings change from a
+    /// client): shown and answered like any card. `not_from`: the paired
+    /// device that asked, which may then only deny. The answer arrives on
+    /// the receiver; the caller settles the card with [`Self::settle`].
+    pub(crate) fn ask(
+        &self,
+        ask: OwnAsk,
+    ) -> (String, oneshot::Receiver<(ApprovalResponse, String)>) {
+        let id = format!(
+            "{}-a{}",
+            self.boot,
+            self.next.fetch_add(1, Ordering::Relaxed)
+        );
+        let approval = Approval {
+            id: id.clone(),
+            session_id: ask.session_id,
+            kind: wire::ApprovalKind::Command,
+            risk: ask.risk,
+            summary: ask.summary,
+            detail: None,
+            card: None,
+            warnings: ask.warnings,
+            options: vec![ApprovalDecision::ApproveOnce, ApprovalDecision::Deny],
+            requested_at_ms: now_ms(),
+            expires_at_ms: Some(ask.expires_at_ms),
+            channel: None,
+        };
+        let (answer, answered) = oneshot::channel();
+        self.book().open.insert(
+            id.clone(),
+            Open {
+                approval: approval.clone(),
+                answer: Some(answer),
+                answered: None,
+                not_from: ask.not_from,
+            },
+        );
+        self.publisher.publish(
+            Some(approval.session_id.clone()),
+            Event::ApprovalRequested { approval },
+        );
+        (id, answered)
+    }
+
+    /// Settle a card [`Self::ask`] opened: answered, or out of time.
+    pub(crate) fn settle(&self, id: &str, answer: Option<(ApprovalResponse, String)>) {
+        let how = match answer {
+            Some((response, by)) => TapClosed::Answered { response, by },
+            None => TapClosed::Unanswered,
+        };
+        self.closed(id, how);
     }
 
     /// Settle approvals a previous daemon process left open in the log:
@@ -309,6 +388,7 @@ impl ApprovalTap for Approvals {
                 approval: approval.clone(),
                 answer: Some(answer),
                 answered: None,
+                not_from: None,
             },
         );
         self.publisher.publish(
@@ -368,5 +448,57 @@ impl ApprovalTap for Approvals {
                 resolved_by,
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approvals() -> Approvals {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        Approvals::new(Publisher(tx), "t".into())
+    }
+
+    fn own(not_from: Option<&str>) -> OwnAsk {
+        OwnAsk {
+            session_id: "app:settings".into(),
+            summary: "Raise the owner's default authority".into(),
+            warnings: Vec::new(),
+            risk: Risk::High,
+            expires_at_ms: now_ms() + 60_000,
+            not_from: not_from.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_device_that_asked_may_only_deny_when_another_must_approve() {
+        let book = approvals();
+        let (id, mut answer) = book.ask(own(Some("dv-1")));
+        let refused = book
+            .resolve(&id, ApprovalDecision::ApproveOnce, None, Some("dv-1"), None)
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Forbidden);
+        assert!(answer.try_recv().is_err(), "nothing was answered");
+        book.resolve(&id, ApprovalDecision::ApproveOnce, None, Some("dv-2"), None)
+            .unwrap();
+        assert!(matches!(
+            answer.try_recv(),
+            Ok((ApprovalResponse::AllowOnce, _))
+        ));
+        book.settle(&id, Some((ApprovalResponse::AllowOnce, "app".into())));
+        assert!(book.pending().is_empty());
+    }
+
+    #[test]
+    fn the_owners_local_token_approves_and_the_asker_may_deny() {
+        let book = approvals();
+        let (id, _answer) = book.ask(own(Some("dv-1")));
+        book.resolve(&id, ApprovalDecision::ApproveOnce, None, None, None)
+            .unwrap();
+        let (id, mut answer) = book.ask(own(Some("dv-1")));
+        book.resolve(&id, ApprovalDecision::Deny, None, Some("dv-1"), None)
+            .unwrap();
+        assert!(matches!(answer.try_recv(), Ok((ApprovalResponse::Deny, _))));
     }
 }

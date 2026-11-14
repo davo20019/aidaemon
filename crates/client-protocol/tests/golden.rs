@@ -102,6 +102,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::ListCommands => "list_commands",
         Command::ListMemories => "list_memories",
         Command::ForgetMemory { .. } => "forget_memory",
+        Command::GetSettings => "get_settings",
+        Command::ChangeSettings { .. } => "change_settings",
         Command::Unknown => "unknown",
     }
 }
@@ -132,6 +134,8 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Commands { .. } => "commands",
         CommandResult::Memories { .. } => "memories",
         CommandResult::Forgotten { .. } => "forgotten",
+        CommandResult::Settings { .. } => "settings",
+        CommandResult::SettingsChanged { .. } => "settings_changed",
         CommandResult::Unknown => "unknown",
     }
 }
@@ -235,6 +239,16 @@ fn client_samples() -> Vec<ClientFrame> {
             "5d0c2b1e-0010",
             Command::ForgetMemory {
                 memory_id: "41".into(),
+            },
+        ),
+        command("5d0c2b1e-0011", Command::GetSettings),
+        command(
+            "5d0c2b1e-0012",
+            Command::ChangeSettings {
+                change: SettingsChange::Set {
+                    key: "provider.models.default".into(),
+                    value: Some("\"synthetic-model-1\"".into()),
+                },
             },
         ),
         command("5d0c2b1e-000b", Command::Unknown),
@@ -369,6 +383,13 @@ fn server_samples() -> Vec<ServerFrame> {
                     approval_id: "a-7f3e-1".into(),
                 },
                 reason: "You asked what is waiting".into(),
+            },
+        ),
+        event(
+            None,
+            Event::SettingsUpdated {
+                ok: true,
+                message: "Updated provider.models.default".into(),
             },
         ),
         ack(CommandResult::MessageAccepted {
@@ -520,6 +541,62 @@ fn server_samples() -> Vec<ServerFrame> {
         }),
         ack(CommandResult::Forgotten {
             memory_id: "41".into(),
+        }),
+        ack(CommandResult::Settings {
+            settings: Settings {
+                config_path: "/home/synthetic/.aidaemon/config.toml".into(),
+                groups: vec![SettingGroup {
+                    name: "provider".into(),
+                    settings: vec![
+                        Setting {
+                            key: "provider.models.default".into(),
+                            value: Some("\"synthetic-model-1\"".into()),
+                            kind: SettingKind::Text,
+                            secret_set: false,
+                            description: "The model most turns use.".into(),
+                            example: Some("\"openai/gpt-4o\"".into()),
+                            applies: Applies::Reload,
+                            guarded: false,
+                        },
+                        Setting {
+                            key: "provider.api_key".into(),
+                            value: None,
+                            kind: SettingKind::Secret,
+                            secret_set: true,
+                            description: String::new(),
+                            example: None,
+                            applies: Applies::Reload,
+                            guarded: true,
+                        },
+                    ],
+                }],
+                bots: vec![BotInfo {
+                    id: 3,
+                    platform: "telegram".into(),
+                    allowed_user_ids: vec!["telegram:synthetic-user-1".into()],
+                    created_at: "2026-01-01 00:00:00".into(),
+                }],
+                mcp_servers: vec![McpServerInfo {
+                    name: "files".into(),
+                    command: "synthetic-mcp --root /tmp".into(),
+                    enabled: true,
+                    tools: vec!["read_file".into()],
+                    from_config: false,
+                }],
+                reload_pending: true,
+                restart_pending: false,
+                notices: vec![
+                    "The database moves to /data/aidaemon.db at the next restart.".into(),
+                ],
+                database_path: "/home/synthetic/.aidaemon/aidaemon.db".into(),
+                database_encrypted: true,
+            },
+        }),
+        ack(CommandResult::SettingsChanged {
+            outcome: SettingsOutcome::AwaitingApproval {
+                approval_id: "a-7f3e-2".into(),
+                other_device: true,
+            },
         }),
         ack(CommandResult::Unknown),
         ServerFrame::Error {

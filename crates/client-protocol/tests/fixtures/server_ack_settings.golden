@@ -1,0 +1,62 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "settings": {
+      "bots": [
+        {
+          "allowed_user_ids": [
+            "telegram:synthetic-user-1"
+          ],
+          "created_at": "2026-01-01 00:00:00",
+          "id": 3,
+          "platform": "telegram"
+        }
+      ],
+      "config_path": "/home/synthetic/.aidaemon/config.toml",
+      "database_encrypted": true,
+      "database_path": "/home/synthetic/.aidaemon/aidaemon.db",
+      "groups": [
+        {
+          "name": "provider",
+          "settings": [
+            {
+              "applies": "reload",
+              "description": "The model most turns use.",
+              "example": "\"openai/gpt-4o\"",
+              "guarded": false,
+              "key": "provider.models.default",
+              "kind": "text",
+              "secret_set": false,
+              "value": "\"synthetic-model-1\""
+            },
+            {
+              "applies": "reload",
+              "guarded": true,
+              "key": "provider.api_key",
+              "kind": "secret",
+              "secret_set": true
+            }
+          ]
+        }
+      ],
+      "mcp_servers": [
+        {
+          "command": "synthetic-mcp --root /tmp",
+          "enabled": true,
+          "from_config": false,
+          "name": "files",
+          "tools": [
+            "read_file"
+          ]
+        }
+      ],
+      "notices": [
+        "The database moves to /data/aidaemon.db at the next restart."
+      ],
+      "reload_pending": true,
+      "restart_pending": false
+    },
+    "type": "settings"
+  },
+  "type": "ack"
+}
