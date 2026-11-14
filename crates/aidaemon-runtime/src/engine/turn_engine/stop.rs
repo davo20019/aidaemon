@@ -191,7 +191,7 @@ impl TurnEngine<'_> {
     /// killed (live 2026-11-12: a counting sub-agent answered "at 15 of
     /// 300, still running", its end killed the count, and the chat was told
     /// it finished). Waits, as progress, until those jobs end, at most
-    /// [`UNREPORTED_JOB_MAX_WAIT`] in one run: `None` when nothing was
+    /// `UNREPORTED_JOB_MAX_WAIT` in one run: `None` when nothing was
     /// running, else whether they ended, so the run reads their result (or
     /// stops them and says so) before it answers. Read from the tools' typed
     /// process state, never from the reply.

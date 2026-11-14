@@ -42,7 +42,7 @@ impl DecisionLayer {
         Self::from_config_with_key(config, None)
     }
 
-    /// Like [`from_config`](Self::from_config); `provider_key` is used for
+    /// Like `from_config`; `provider_key` is used for
     /// the Gemini backend when `[decisions]` sets no key of its own.
     pub fn from_config_with_key(
         config: &DecisionsConfig,

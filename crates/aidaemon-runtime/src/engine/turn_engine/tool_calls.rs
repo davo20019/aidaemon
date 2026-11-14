@@ -1413,7 +1413,7 @@ impl TurnEngine<'_> {
         }
     }
 
-    /// Serve [`hooks::DispatchGate`]: gate the call once and tell the
+    /// Serve `hooks::DispatchGate`: gate the call once and tell the
     /// kernel what was decided.
     pub async fn serve_sdk_gate(&self, scope: &TurnScope<'_>, request: GateRequest) {
         let call = &request.call;

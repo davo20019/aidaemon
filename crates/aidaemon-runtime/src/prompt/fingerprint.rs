@@ -8,7 +8,7 @@
 //! pre-boundary history region, the tool definitions, or the session summary)
 //! without ever emitting raw message content.
 //!
-//! The single source of truth is [`canonical_prefix`]: it is used both by the
+//! The single source of truth is `canonical_prefix`: it is used both by the
 //! provider-call fingerprint in `mandate_run` and by the hash unit tests, so the
 //! tests exercise exactly the code path that runs in production.
 //!

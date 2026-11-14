@@ -7,7 +7,7 @@
 //! web page, a phone, a watch) drive and watch the daemon:
 //!
 //! - an app's message runs as a turn on the same
-//!   [`TurnRunner`](aidaemon_channels::turns::TurnRunner) the chat bots use,
+//!   [`aidaemon_channels::turns::TurnRunner`] the chat bots use,
 //!   with the same queueing, stop and approval behaviour ([`AppSurface`]);
 //! - every chat's turns are reported as client events
 //!   ([`TurnObserver`](aidaemon_channels::turns::TurnObserver)), so a turn

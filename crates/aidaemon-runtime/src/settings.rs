@@ -292,7 +292,7 @@ pub fn record_context_overflow(
     *entry
 }
 
-/// The budget for a model family listed in [`KNOWN_CONTEXT_WINDOWS`].
+/// The budget for a model family listed in `KNOWN_CONTEXT_WINDOWS`.
 pub fn known_context_budget(model: &str) -> Option<usize> {
     let name = model
         .rsplit('/')
@@ -861,8 +861,10 @@ impl ComputerUseConfig {
 pub struct PathAliasConfig {
     /// Optional alias roots for "projects/..." paths.
     /// Example:
+    /// ```toml
     /// [path_aliases]
     /// projects = ["~/projects"]
+    /// ```
     #[serde(default)]
     pub projects: Vec<String>,
 }

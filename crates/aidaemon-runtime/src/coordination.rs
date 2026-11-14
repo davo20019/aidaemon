@@ -2091,7 +2091,7 @@ impl Escalator {
     }
 
     /// Put `escalation` to the top-level agent. Waiting here does not spend
-    /// the child's working time, and never exceeds [`ESCALATION_WAIT`].
+    /// the child's working time, and never exceeds `ESCALATION_WAIT`.
     pub async fn ask(
         &self,
         coordination: &Coordination,

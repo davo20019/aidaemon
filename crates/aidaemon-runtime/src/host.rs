@@ -171,7 +171,7 @@ pub trait ComputerUseState: Send + Sync {
 }
 
 /// The host a turn runs on: its stores, workspace and decision record, the
-/// agent's [`TurnRuntime`] and where the agent stands in its tree.
+/// agent's `TurnRuntime` and where the agent stands in its tree.
 #[async_trait::async_trait]
 pub trait TurnHost:
     TurnStores + TurnWorkspace + DecisionRecorder + EngineContext + TurnServices + EngineHostOps

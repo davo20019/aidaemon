@@ -2,7 +2,7 @@
 //! terminal command or a CLI agent moved to the background.
 //!
 //! It is a run in [`RunStates`] exactly like a background helper: the
-//! turn's card shows it as a typed [`HelperView`] (the same "Running in the
+//! turn's card shows it as a typed `HelperView` (the same "Running in the
 //! background" and "Finished in the background" headers, drawn by
 //! `render_card` and kept by `CardEnd::of`), its progress is its latest
 //! typed [`Step`], its end is recorded once with the times the runtime

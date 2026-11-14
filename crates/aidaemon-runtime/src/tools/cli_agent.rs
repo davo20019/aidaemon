@@ -302,7 +302,7 @@ enum CliWorkspaceMode {
 }
 
 /// What a delegated CLI agent's sandbox lets it do, as the adapters below
-/// enforce it ([`apply_read_only_cli_adapter`], [`apply_scoped_cli_adapter`]:
+/// enforce it (`apply_read_only_cli_adapter`, `apply_scoped_cli_adapter`:
 /// the network off, only `:minimal` plus the run's own paths reachable).
 pub const CLI_SANDBOX: crate::helper_run::CliSandbox = crate::helper_run::DELEGATED_CLI_SANDBOX;
 

@@ -74,7 +74,7 @@ pub struct CommandDef {
     /// Short description shown in Telegram's command menu and `/help` text.
     /// Must be 3-256 characters for Telegram's `BotCommand`.
     pub description: &'static str,
-    /// Optional usage string shown only in `/help` (e.g. "/model [name]").
+    /// Optional usage string shown only in `/help` (e.g. `/model [name]`).
     pub usage: Option<&'static str>,
     /// Which platform group this command belongs to.
     pub category: CommandCategory,

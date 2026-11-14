@@ -92,7 +92,7 @@ fn labelled_credential() -> &'static Regex {
 }
 
 /// The values printed under a credential's label in `text`
-/// ([`labelled_credential`]), each once, in order.
+/// (`labelled_credential`), each once, in order.
 pub fn labelled_credentials(text: &str) -> Vec<&str> {
     let mut values: Vec<&str> = Vec::new();
     for found in labelled_credential().captures_iter(text) {

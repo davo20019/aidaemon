@@ -721,7 +721,7 @@ fn normalize_for_name_match(text: &str) -> String {
 }
 
 /// The skills the user asked for in this message, by `$skill`, `skill:name`,
-/// `use skill <name>`, or "the <name> skill". Nothing else activates a skill
+/// `use skill <name>`, or "the `<name>` skill". Nothing else activates a skill
 /// up front: the model sees the Available Skills list and loads what a task
 /// needs with `use_skill`.
 pub fn match_skills<'a>(skills: &'a [Skill], user_message: &str) -> Vec<&'a Skill> {

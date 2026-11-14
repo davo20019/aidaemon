@@ -21,7 +21,7 @@ pub struct DynamicSkill {
     pub enabled: bool,
     pub version: Option<String>,
     pub created_at: String,
-    /// JSON-serialized Vec<ResourceEntry> for directory-based skills
+    /// JSON-serialized `Vec<ResourceEntry>` for directory-based skills
     #[serde(default = "default_empty_json")]
     pub resources_json: String,
 }

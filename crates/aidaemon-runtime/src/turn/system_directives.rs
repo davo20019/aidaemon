@@ -103,7 +103,7 @@ pub enum SystemDirective {
     /// repeating their shape is explicitly forbidden).
     ExternalMutationRecoveryRequired(String),
     /// The model's final answer was mostly harness scaffolding (tool-result
-    /// envelopes, [SYSTEM] notices) and was gutted by sanitization. Ask it to
+    /// envelopes, `[SYSTEM]` notices) and was gutted by sanitization. Ask it to
     /// restate the answer in plain language once before any deterministic
     /// fallback ships.
     FinalAnswerRejectedInternalMarkers,

@@ -328,7 +328,7 @@ pub struct LiveStatus {
 const ELAPSED_SHOWN_AFTER: Duration = Duration::from_secs(30);
 
 /// `line` with how long its step has run, in whole minutes once it passes
-/// [`ELAPSED_SHOWN_AFTER`] ("Running a command · 3 min so far"), so a long
+/// `ELAPSED_SHOWN_AFTER` ("Running a command · 3 min so far"), so a long
 /// step reads as alive and the card changes at most once a minute.
 pub fn line_with_elapsed(line: &str, elapsed: Duration) -> String {
     if elapsed < ELAPSED_SHOWN_AFTER {

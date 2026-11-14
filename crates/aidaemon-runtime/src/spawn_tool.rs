@@ -106,7 +106,7 @@ impl SpawnAgentTool {
     }
 
     /// Create a SpawnAgentTool with a deferred agent reference.
-    /// Call [`set_agent`] after constructing the root runtime.
+    /// Call `set_agent` after constructing the root runtime.
     pub fn new_deferred(max_response_chars: usize, timeout_secs: u64) -> Self {
         Self {
             agent: OnceLock::new(),
@@ -470,7 +470,7 @@ pub struct SpawnArgs {
     #[serde(default)]
     pub precedence: Option<crate::coordination::Precedence>,
     /// Folders this child creates fresh (a new install or project): each
-    /// must not exist yet; the spawn creates them ([`claim_new_folders`]).
+    /// must not exist yet; the spawn creates them (`claim_new_folders`).
     #[serde(default)]
     pub new_folders: Vec<String>,
 }

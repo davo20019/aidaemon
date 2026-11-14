@@ -1,5 +1,5 @@
 //! The Telegram bot: who may talk to it, which session a chat is, files,
-//! commands, the live status card and replies. [`crate::TelegramBot`]
+//! commands, the live status card and replies. `crate::TelegramBot`
 //! carries the traffic; turns run on the shared
 //! [`aidaemon_channels::turns::TurnRunner`]. What is the application's own
 //! (its config file, extra commands, terminal sessions) goes through a
