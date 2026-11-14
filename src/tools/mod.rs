@@ -109,6 +109,8 @@ pub use aidaemon_tools::service_status::ServiceStatusTool;
 pub use run_command::RunCommandTool;
 
 #[cfg(test)]
+mod catalog_lint_tests;
+#[cfg(test)]
 mod execution_backend_injection_tests;
 #[cfg(test)]
 mod schema_golden_tests;

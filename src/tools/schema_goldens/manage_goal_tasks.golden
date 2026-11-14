@@ -1,0 +1,119 @@
+{
+  "description": "Manage tasks within your assigned goal. Use create_task to break work into steps, claim_task before spawning an executor, list_tasks to check progress, update_task to record results.",
+  "name": "manage_goal_tasks",
+  "schema": {
+    "description": "Manage tasks within your assigned goal. Use create_task to break work into steps, claim_task before spawning an executor, list_tasks to check progress, update_task to record results.",
+    "name": "manage_goal_tasks",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "create_task",
+            "list_tasks",
+            "update_task",
+            "claim_task",
+            "retry_task",
+            "resolve_blocker",
+            "complete_goal",
+            "fail_goal"
+          ],
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "artifacts": {
+          "description": "Produced paths, URLs, commits, or messages.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "depends_on": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "description": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "idempotent": {
+          "type": "boolean"
+        },
+        "next_step": {
+          "description": "Next action.",
+          "type": "string"
+        },
+        "parallel_group": {
+          "type": "string"
+        },
+        "priority": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "remaining_risk": {
+          "description": "Residual risk.",
+          "type": "string"
+        },
+        "result": {
+          "type": "string"
+        },
+        "status": {
+          "description": "New status (for update_task). Use superseded only when another named task replaced this task's required work.",
+          "enum": [
+            "pending",
+            "running",
+            "completed",
+            "failed",
+            "blocked",
+            "skipped",
+            "superseded"
+          ],
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "task_order": {
+          "type": "integer"
+        },
+        "verification": {
+          "description": "Checks and outcomes.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "worker_profile": {
+          "description": "Worker profile ID.",
+          "type": "string"
+        },
+        "workspace_policy": {
+          "description": "shared, isolated, or Git worktree.",
+          "enum": [
+            "shared",
+            "isolated",
+            "worktree"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

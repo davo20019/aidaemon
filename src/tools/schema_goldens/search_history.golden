@@ -1,0 +1,71 @@
+{
+  "description": "Search exact retained conversation messages. Search returns anchored context and task objective/resolution bookends. Open an event or page older/newer exact messages with signed cursors. Opening a turn_id also returns the tool calls that turn ran and their output, which search does not cover.",
+  "name": "search_history",
+  "schema": {
+    "description": "Search exact retained conversation messages. Search returns anchored context and task objective/resolution bookends. Open an event or page older/newer exact messages with signed cursors. Opening a turn_id also returns the tool calls that turn ran and their output, which search does not cover.",
+    "name": "search_history",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "search",
+            "open",
+            "page",
+            "health",
+            "repair"
+          ],
+          "type": "string"
+        },
+        "context": {
+          "maximum": 4,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cursor": {
+          "description": "Opaque signed cursor returned by a prior call",
+          "type": "string"
+        },
+        "event_id": {
+          "description": "Authorized anchor event for open",
+          "type": "integer"
+        },
+        "include_subagents": {
+          "description": "Include specialist child sessions; false by default",
+          "type": "boolean"
+        },
+        "limit": {
+          "maximum": 20,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message_id": {
+          "description": "Stable canonical message ID for open",
+          "maxLength": 256,
+          "type": "string"
+        },
+        "query": {
+          "description": "Words to find; FTS syntax is treated as literal terms",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Optional session narrowing filter",
+          "type": "string"
+        },
+        "task_id": {
+          "description": "Optional task narrowing filter",
+          "type": "string"
+        },
+        "turn_id": {
+          "description": "Stable canonical turn ID; open returns the whole authorized turn, including its tool calls and their output",
+          "maxLength": 256,
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

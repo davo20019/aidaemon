@@ -1,0 +1,26 @@
+{
+  "description": "Make a memory global: visible in every channel and chat, permanently. Use only when the owner approves sharing it.",
+  "name": "share_memory",
+  "schema": {
+    "description": "Make a memory global: visible in every channel and chat, permanently. Use only when the owner approves sharing it.",
+    "name": "share_memory",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "description": "The category of the fact to share",
+          "type": "string"
+        },
+        "key": {
+          "description": "The key of the fact to share",
+          "type": "string"
+        }
+      },
+      "required": [
+        "category",
+        "key"
+      ],
+      "type": "object"
+    }
+  }
+}

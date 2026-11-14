@@ -1611,25 +1611,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn schema_fits_payload_budget() {
-        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
-        // admin-tool schemas ride in EVERY provider call; this ceiling is the
-        // per-tool payload budget. If you trip this assert by adding features,
-        // compress the description text — do not raise the ceiling without
-        // updating the Pillar C implementation plan.
-        // NOTE: plan ceiling was 1000 but manage_oauth carries 4 mandatory
-        // behavioral invariants (never-credentials-in-chat, inspect-before-reconnect,
-        // connect-not-remove, manage_http_auth routing) plus a 9-value action enum
-        // and a 3-value auth_type enum. Structural floor with all params is ~749 bytes;
-        // ceiling set to 1100 to accommodate invariants with short readable text.
-        let bytes = serde_json::to_string(&manage_oauth_schema()).unwrap().len();
-        assert!(
-            bytes <= 1100,
-            "manage_oauth schema is {bytes} bytes, budget is 1100"
-        );
-    }
-
     async fn test_tool(
         config_path: PathBuf,
     ) -> anyhow::Result<(ManageOAuthTool, OAuthGateway, Option<NamedTempFile>)> {

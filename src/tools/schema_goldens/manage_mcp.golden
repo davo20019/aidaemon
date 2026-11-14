@@ -1,0 +1,48 @@
+{
+  "description": "Manage MCP servers at runtime. set_env binds an env var to `mcp_<server>_<KEY>`, which the owner stores with `aidaemon keychain set`; values are never args.",
+  "name": "manage_mcp",
+  "schema": {
+    "description": "Manage MCP servers at runtime. set_env binds an env var to `mcp_<server>_<KEY>`, which the owner stores with `aidaemon keychain set`; values are never args.",
+    "name": "manage_mcp",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "add",
+            "list",
+            "remove",
+            "set_env",
+            "restart",
+            "enable",
+            "disable"
+          ],
+          "type": "string"
+        },
+        "args": {
+          "description": "Command args (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "description": "Spawn command (add). Allowed: npx, uvx, node, python, python3",
+          "type": "string"
+        },
+        "key": {
+          "description": "Env var name (set_env)",
+          "type": "string"
+        },
+        "name": {
+          "description": "Server name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

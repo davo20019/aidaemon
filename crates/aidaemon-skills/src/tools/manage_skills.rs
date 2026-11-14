@@ -4136,21 +4136,6 @@ mutation CreateWidget {
     }
 
     #[tokio::test]
-    async fn schema_fits_payload_budget() {
-        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
-        // admin-tool schemas ride in EVERY provider call; this ceiling is the
-        // per-tool payload budget. If you trip this assert by adding features,
-        // compress the description text — do not raise the ceiling without
-        // updating the Pillar C implementation plan.
-        let (tool, _state, _skills_dir) = setup_tool().await;
-        let bytes = serde_json::to_string(&tool.schema()).unwrap().len();
-        assert!(
-            bytes <= 1000,
-            "manage_skills schema is {bytes} bytes, budget is 1000"
-        );
-    }
-
-    #[tokio::test]
     async fn schema_description_keeps_action_discoverability() {
         let (tool, _state, _skills_dir) = setup_tool().await;
         let schema = tool.schema();

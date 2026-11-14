@@ -59,8 +59,13 @@ pub(crate) struct AgentInner {
     pub provider: Arc<dyn Provider>,
     pub tools: HashMap<String, Arc<dyn Tool>>,
     /// Specs in registration order, computed once so the tool block of the
-    /// prompt is byte-stable across turns (cache friendly).
+    /// prompt is byte-stable across turns (cache friendly). Deferred tools'
+    /// specs come last, name-sorted, after `load_tools`.
     pub specs: Vec<ToolSpec>,
+    /// Tools whose spec is sent only once loaded (see
+    /// [`crate::tool_loading`]).
+    pub deferred: std::collections::HashSet<String>,
+    pub loaded: crate::tool_loading::LoadedTools,
     pub hooks: Vec<Arc<dyn Hook>>,
     pub limits: Limits,
     pub stuck: StuckConfig,
@@ -276,6 +281,8 @@ pub struct AgentBuilder {
     instructions: String,
     provider: Option<Arc<dyn Provider>>,
     tools: Vec<Arc<dyn Tool>>,
+    deferred_tools: Vec<Arc<dyn Tool>>,
+    loaded: crate::tool_loading::LoadedTools,
     hooks: Vec<Arc<dyn Hook>>,
     attested: Vec<Safeguard>,
     unguarded: bool,
@@ -297,6 +304,8 @@ impl AgentBuilder {
             instructions: String::new(),
             provider: None,
             tools: Vec::new(),
+            deferred_tools: Vec::new(),
+            loaded: crate::tool_loading::LoadedTools::default(),
             hooks: Vec::new(),
             attested: Vec::new(),
             unguarded: false,
@@ -337,6 +346,21 @@ impl AgentBuilder {
 
     pub fn tool_arc(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
+        self
+    }
+
+    /// Register a tool whose schema is sent only once loaded: until then
+    /// the built-in `load_tools` lists it by name and one line. Calling it
+    /// directly loads it too. See [`crate::tool_loading`].
+    pub fn deferred_tool_arc(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.deferred_tools.push(tool);
+        self
+    }
+
+    /// The set of loaded deferred tools. Share one across a session's runs
+    /// so a tool loaded once stays loaded (and the tool block stable).
+    pub fn loaded_tools(mut self, loaded: crate::tool_loading::LoadedTools) -> Self {
+        self.loaded = loaded;
         self
     }
 
@@ -436,8 +460,35 @@ impl AgentBuilder {
         };
 
         let mut tools = HashMap::new();
-        let mut specs = Vec::with_capacity(self.tools.len());
-        for tool in self.tools {
+        let mut specs = Vec::with_capacity(self.tools.len() + self.deferred_tools.len() + 1);
+        let mut deferred = std::collections::HashSet::new();
+        let mut deferred_specs = Vec::new();
+        for tool in self.deferred_tools {
+            let spec = tool.spec();
+            if !valid_tool_name(&spec.name) {
+                return Err(BuildError::InvalidToolName(spec.name));
+            }
+            if tools.insert(spec.name.clone(), tool).is_some() {
+                return Err(BuildError::DuplicateTool(spec.name));
+            }
+            deferred.insert(spec.name.clone());
+            deferred_specs.push(spec);
+        }
+        let mut core_tools = self.tools;
+        if !deferred_specs.is_empty() {
+            let entries = deferred_specs
+                .iter()
+                .map(|spec| crate::tool_loading::DeferredEntry {
+                    name: spec.name.clone(),
+                    summary: crate::tool_loading::one_line(&spec.description),
+                })
+                .collect();
+            core_tools.push(Arc::new(crate::tool_loading::LoadToolsTool::new(
+                entries,
+                self.loaded.clone(),
+            )));
+        }
+        for tool in core_tools {
             let spec = tool.spec();
             if !valid_tool_name(&spec.name) {
                 return Err(BuildError::InvalidToolName(spec.name));
@@ -447,6 +498,8 @@ impl AgentBuilder {
             }
             specs.push(spec);
         }
+        deferred_specs.sort_by(|a, b| a.name.cmp(&b.name));
+        specs.extend(deferred_specs);
         if !specs.is_empty() && !self.unguarded {
             for required in Safeguard::REQUIRED {
                 let covered = self.attested.contains(&required)
@@ -468,6 +521,8 @@ impl AgentBuilder {
                 provider,
                 tools,
                 specs,
+                deferred,
+                loaded: self.loaded,
                 hooks: self.hooks,
                 limits: self.limits,
                 stuck: self.stuck,

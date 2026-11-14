@@ -1125,24 +1125,6 @@ mod tests {
     use aidaemon_tools::testing::ToolCalls as _;
 
     #[test]
-    fn schema_fits_payload_budget() {
-        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
-        // admin-tool schemas ride in EVERY provider call; this ceiling is the
-        // per-tool payload budget. If you trip this assert by adding features,
-        // compress the description text — do not raise the ceiling without
-        // updating the Pillar C implementation plan.
-        // NOTE: plan ceiling was 950 but manage_api has 21 parameters including
-        // an 8-value auth_mode enum; the structural minimum with all params is
-        // ~1100 bytes. Ceiling adjusted to 1300 to allow short descriptions on
-        // the non-obvious params (auth_mode, connect, learn_kind).
-        let bytes = serde_json::to_string(&manage_api_schema()).unwrap().len();
-        assert!(
-            bytes <= 1300,
-            "manage_api schema is {bytes} bytes, budget is 1300"
-        );
-    }
-
-    #[test]
     fn discovery_candidate_urls_expand_common_docs_and_spec_paths() {
         let candidates = ManageApiTool::discovery_candidate_urls("https://api.example.com")
             .expect("candidate discovery");

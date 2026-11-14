@@ -1,0 +1,88 @@
+{
+  "description": "Owner's contacts: people, relationships, facts. Use add_fact to store new info.",
+  "name": "manage_people",
+  "schema": {
+    "description": "Owner's contacts: people, relationships, facts. Use add_fact to store new info.",
+    "name": "manage_people",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "enable",
+            "disable",
+            "status",
+            "add",
+            "list",
+            "view",
+            "brief",
+            "upcoming",
+            "reconnect",
+            "update",
+            "remove",
+            "add_fact",
+            "remove_fact",
+            "link",
+            "export",
+            "purge",
+            "audit",
+            "confirm"
+          ],
+          "type": "string"
+        },
+        "category": {
+          "description": "Fact category; avoid health/finance",
+          "type": "string"
+        },
+        "communication_style": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "fact_id": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "integer"
+        },
+        "inactive_days": {
+          "type": "integer"
+        },
+        "key": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "string"
+        },
+        "person_name": {
+          "description": "Person for add_fact/remove_fact/link",
+          "type": "string"
+        },
+        "platform_id": {
+          "type": "string"
+        },
+        "relationship": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        },
+        "within_days": {
+          "description": "days ahead",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

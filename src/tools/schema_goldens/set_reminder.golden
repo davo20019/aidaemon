@@ -1,0 +1,30 @@
+{
+  "description": "Set up a scheduled automation that only sends the user a reminder message at a time or on a cadence. Nothing else runs when it fires. For scheduled work, use manage_memories create_scheduled_goal.",
+  "name": "set_reminder",
+  "schema": {
+    "description": "Set up a scheduled automation that only sends the user a reminder message at a time or on a cadence. Nothing else runs when it fires. For scheduled work, use manage_memories create_scheduled_goal.",
+    "name": "set_reminder",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "message": {
+          "description": "Exact text to send, e.g. 'Check the oven.'",
+          "type": "string"
+        },
+        "name": {
+          "description": "The short name the user gave it, exactly as given; omit when none.",
+          "type": "string"
+        },
+        "when": {
+          "description": "e.g. 'in 2 minutes', 'tomorrow at 9am', 'every weekday at 8am'",
+          "type": "string"
+        }
+      },
+      "required": [
+        "message",
+        "when"
+      ],
+      "type": "object"
+    }
+  }
+}

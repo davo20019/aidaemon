@@ -893,22 +893,6 @@ mod tests {
     use crate::full::tools::test_support::{Settings, ToolCalls as _, memory};
     use aidaemon_tools::semantics::ToolSemantics;
 
-    #[test]
-    fn schema_fits_payload_budget() {
-        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
-        // admin-tool schemas ride in EVERY provider call; this ceiling is the
-        // per-tool payload budget. If you trip this assert by adding features,
-        // compress the description text — do not raise the ceiling without
-        // updating the Pillar C implementation plan.
-        let bytes = serde_json::to_string(&manage_people_schema())
-            .unwrap()
-            .len();
-        assert!(
-            bytes <= 1000,
-            "manage_people schema is {bytes} bytes, budget is 1000"
-        );
-    }
-
     /// The people store is the agent's own; the enable/disable setting and
     /// `link` (which widens who sees a person's facts) stay undeclared.
     #[tokio::test]
