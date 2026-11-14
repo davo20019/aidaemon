@@ -40,8 +40,11 @@ pub struct TreeBudget {
     started: std::sync::atomic::AtomicBool,
     /// Distinct successful operations across the tree: its progress.
     successes: std::sync::atomic::AtomicUsize,
-    /// The member whose operation was the tree's latest new one.
-    last_new_by: std::sync::Mutex<Option<String>>,
+    /// The same, per member (the turn and each helper, by session): what a
+    /// member that is repeating itself compares with the rest of the tree.
+    by_member: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// Each member's count at the last extension.
+    by_member_at_last: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     warned: std::sync::atomic::AtomicBool,
     /// Extensions so far, and the progress at the last one. Held while one
     /// member decides, so a second member that hit the same limit waits for
@@ -87,24 +90,35 @@ impl TreeBudget {
     pub fn note_success(&self, member: &str) {
         self.successes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut last) = self.last_new_by.lock() {
-            *last = Some(member.to_string());
+        if let Ok(mut by_member) = self.by_member.lock() {
+            *by_member.entry(member.to_string()).or_default() += 1;
         }
     }
 
     /// Whether the tree is making progress for `member`, whose latest call
-    /// repeated an earlier one when `repeating`: something new succeeded
-    /// since the last extension, and either `member` is not going round in
-    /// circles or another member did the newest work (a helper checking on
-    /// its running command while its sibling works is waiting, not stuck).
+    /// repeated an earlier one when `repeating`. The budget is the tree's,
+    /// so its progress is the tree's: something new succeeded anywhere in it
+    /// since the last extension. Only a member going round in circles needs
+    /// the rest of the tree to have done new work since then: a helper
+    /// checking on its running command while its sibling works is waiting,
+    /// not stuck, whichever of them did the very latest new thing (live
+    /// 2026-11-14: asked at 500,044 of 500,000 tokens, "Nothing new has
+    /// succeeded", while two helpers were installing a site each).
     pub fn progressed(&self, extensions: &Extensions, member: &str, repeating: bool) -> bool {
-        let newest_by_other = self
-            .last_new_by
-            .lock()
-            .ok()
-            .and_then(|last| last.clone())
-            .is_some_and(|last| last != member);
-        self.successes() > extensions.successes_at_last && (!repeating || newest_by_other)
+        let new_in_tree = self
+            .successes()
+            .saturating_sub(extensions.successes_at_last);
+        if !repeating {
+            return new_in_tree > 0;
+        }
+        let count = |map: &std::sync::Mutex<std::collections::HashMap<String, usize>>| {
+            map.lock()
+                .ok()
+                .and_then(|map| map.get(member).copied())
+                .unwrap_or(0)
+        };
+        let own_new = count(&self.by_member).saturating_sub(count(&self.by_member_at_last));
+        new_in_tree > own_new
     }
 
     pub fn successes(&self) -> usize {
@@ -131,6 +145,9 @@ impl TreeBudget {
         self.limit.store(to, std::sync::atomic::Ordering::SeqCst);
         extensions.count += 1;
         extensions.successes_at_last = self.successes();
+        if let (Ok(now), Ok(mut at_last)) = (self.by_member.lock(), self.by_member_at_last.lock()) {
+            *at_last = now.clone();
+        }
     }
 }
 
@@ -708,6 +725,33 @@ mod tests {
         let fresh = Extensions::default();
         assert!(tree.progressed(&fresh, "solo", false));
         assert!(!tree.progressed(&fresh, "solo", true));
+    }
+
+    /// The tree's budget judges the tree's progress: a helper repeating its
+    /// check on a running command hits the limit while its sibling has done
+    /// new work since the last extension, even when the repeating helper
+    /// did the very latest new thing (live 2026-11-14: "Nothing new has
+    /// succeeded since the budget last grew" at 500,044 of 500,000 tokens
+    /// while two helpers were installing a site each).
+    #[tokio::test]
+    async fn a_siblings_new_work_is_the_trees_progress() {
+        let tree = TreeBudget::default();
+        tree.start(500_000);
+        tree.note_success("wordpress");
+        tree.note_success("drupal");
+        let extensions = tree.deciding().await;
+        assert!(tree.progressed(&extensions, "drupal", true));
+        assert!(tree.progressed(&extensions, "wordpress", true));
+        drop(extensions);
+
+        let mut extensions = tree.deciding().await;
+        tree.extend(1_000_000, &mut extensions);
+        // Since then only Drupal did anything new: repeating, it has no
+        // one else's progress to lean on; not repeating, its work counts.
+        tree.note_success("drupal");
+        assert!(!tree.progressed(&extensions, "drupal", true));
+        assert!(tree.progressed(&extensions, "drupal", false));
+        assert!(tree.progressed(&extensions, "wordpress", true));
     }
 
     /// The owner is asked only past the configured policy: its extensions
