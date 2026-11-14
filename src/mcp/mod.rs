@@ -132,4 +132,106 @@ mod annotation_tests {
             );
         }
     }
+
+    fn hook_ctx_declined(
+        untrusted_seen: bool,
+        declined: &'static [aidaemon_core::EffectKey],
+    ) -> aidaemon_core::HookContext<'static> {
+        aidaemon_core::HookContext {
+            declined,
+            ..hook_ctx(untrusted_seen)
+        }
+    }
+
+    fn tool_info(tool: &McpTool) -> aidaemon_core::ToolInfo {
+        use crate::traits::ToolSemantics;
+        let roots = crate::traits::TrustRoots::new(&[]);
+        aidaemon_core::ToolInfo {
+            annotations: tool.call_annotations_in("{}", &roots),
+            access: aidaemon_core::AccessManifest::default(),
+            effects: tool.call_effects("{}"),
+            outbound: tool.call_outbound("{}"),
+        }
+    }
+
+    /// A tool the owner's config lists read-only is a read of its server:
+    /// read-only authority runs it and a decline elsewhere in the run asks
+    /// nothing more. Its output is still untrusted, what it sends still goes
+    /// to the untrusted verifier after an untrusted read, and it declares the
+    /// server it reaches, so a declined server binds it.
+    #[tokio::test]
+    async fn owner_listed_read_only_tool_is_a_read_with_untrusted_output() {
+        use crate::traits::ToolSemantics;
+        use aidaemon_core::Hook;
+        let roots = crate::traits::TrustRoots::new(&[]);
+        let listed = mcp_tool(serde_json::json!({})).with_owner_read_only(true);
+        assert!(listed.owner_read_only());
+        assert_eq!(
+            listed.call_annotations_in("{}", &roots),
+            aidaemon_core::ToolAnnotations::READ_ONLY
+        );
+        let caps = listed.capabilities();
+        assert!(caps.read_only && !caps.needs_approval && !caps.high_impact_write);
+        assert_eq!(
+            listed.output_trust("{}", &roots),
+            aidaemon_core::SourceTrust::Untrusted
+        );
+        let server =
+            aidaemon_core::EffectKey::named(aidaemon_core::EffectClass::Process, "mcp-server:acme");
+        let effects = listed.call_effects("{}");
+        assert!(effects.complete, "{effects:?}");
+        assert_eq!(effects.keys, vec![server.clone()]);
+
+        let call =
+            aidaemon_core::ToolCall::new("c1", "acme__synthetic_tool", serde_json::json!({}));
+        let info = tool_info(&listed);
+        let read_only = aidaemon_core::AuthorityHook::new(aidaemon_core::Authority::read_only());
+        assert_eq!(
+            read_only.before_tool(&hook_ctx(false), &call, &info).await,
+            aidaemon_core::ToolDecision::Allow
+        );
+        let untrusted = aidaemon_core::UntrustedHook::new(
+            aidaemon_core::UntrustedMode::Enforce,
+            |_, content| content.to_string(),
+        );
+        assert!(
+            matches!(
+                untrusted.before_tool(&hook_ctx(true), &call, &info).await,
+                aidaemon_core::ToolDecision::Interrupt { .. }
+            ),
+            "its arguments reach the server: checked after untrusted content"
+        );
+
+        // After an unrelated decline the listed read runs; an unlisted tool
+        // of the same server, even one whose server claims it is read-only,
+        // is asked again.
+        static DECLINED_POST: std::sync::LazyLock<Vec<aidaemon_core::EffectKey>> =
+            std::sync::LazyLock::new(|| {
+                vec![aidaemon_core::EffectKey::named(
+                    aidaemon_core::EffectClass::Egress,
+                    "h.example.invalid:443",
+                )]
+            });
+        let policy = aidaemon_policies::ApprovalPolicy::new(aidaemon_policies::ApprovalMode::Never);
+        let ctx = hook_ctx_declined(false, DECLINED_POST.as_slice());
+        assert_eq!(
+            policy.before_tool(&ctx, &call, &info).await,
+            aidaemon_core::ToolDecision::Allow
+        );
+        for unlisted in [
+            mcp_tool(serde_json::json!({})),
+            mcp_tool(serde_json::json!({"readOnlyHint": true, "openWorldHint": false})),
+        ] {
+            assert!(!unlisted.owner_read_only());
+            assert!(matches!(
+                policy.before_tool(&ctx, &call, &tool_info(&unlisted)).await,
+                aidaemon_core::ToolDecision::Interrupt {
+                    kind: aidaemon_core::InterruptKind::OwnerApproval(_),
+                    ..
+                }
+            ));
+        }
+        // A declined start of the server overlaps the listed read.
+        assert!(effects.keys.iter().any(|key| key.overlaps(&server)));
+    }
 }

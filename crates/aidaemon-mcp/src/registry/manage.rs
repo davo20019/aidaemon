@@ -16,7 +16,7 @@ use super::running::ServerEnvBinding;
 use super::{McpRegistry, McpServerConfig};
 
 /// The process effect key naming an MCP server, whatever its command.
-fn server_process_key(name: &str) -> String {
+pub(super) fn server_process_key(name: &str) -> String {
     format!("mcp-server:{name}")
 }
 
@@ -138,6 +138,7 @@ impl ManageMcpTool {
             command: command.to_string(),
             args,
             env: std::collections::HashMap::new(),
+            read_only_tools: Vec::new(),
         };
 
         match self.registry.add_server(name, config, true).await {

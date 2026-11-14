@@ -95,7 +95,6 @@ dependencies = [
  "aidaemon-terminal-bridge",
  "aidaemon-tool-browser",
  "aidaemon-tools",
- "aidaemon-tui",
  "aidaemon-work",
  "anyhow",
  "assert_cmd",

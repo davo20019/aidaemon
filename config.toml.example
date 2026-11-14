@@ -414,6 +414,11 @@ health_port = 8080
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 # Prefer built-in read_file/write_file/search_files instead of MCP filesystem.
+# read_only_tools = ["read_text_file", "list_directory"]
+# Tools you declare read-only (by the server's own tool names) are judged as
+# reads: no approval card, and they run under read-only authority. Their
+# results are still untrusted content. A server's own readOnlyHint never
+# counts; only this list does. Servers added with manage_mcp have no list.
 
 # [health]
 # Scheduled uptime probes (http/port/command/file) with channel alerts. Off by default.

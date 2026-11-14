@@ -103,6 +103,22 @@ fn notices(store: Store) -> View {
                 ))
             },
         ))
+        // What the daemon refused or reported (a message it could not take).
+        .child(when(
+            move || store.notice().is_some(),
+            move || {
+                ui::banner(
+                    move || store.notice().unwrap_or_default(),
+                    ui::Tone::Neutral,
+                )
+                .child(ui::btn(
+                    "Dismiss",
+                    Variant::Ghost,
+                    ui::Size::Sm,
+                    move || store.dismiss_notice(),
+                ))
+            },
+        ))
         .child(when(
             move || store.toast().is_some() && store.suggestion().is_none(),
             move || {

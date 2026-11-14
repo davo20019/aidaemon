@@ -711,6 +711,15 @@ pub fn fake_mcp_server_path() -> PathBuf {
 /// An MCP registry with the synthetic `fake` server (`fake_mcp_server`)
 /// running: its tools are named `fake__<tool>` and offered on `mcp:fake`.
 pub async fn fake_mcp_registry(state: Arc<SqliteStateStore>) -> crate::mcp::McpRegistry {
+    fake_mcp_registry_with_read_only(state, &[]).await
+}
+
+/// [`fake_mcp_registry`] with `read_only_tools` in the server's config, as
+/// the owner would list them.
+pub async fn fake_mcp_registry_with_read_only(
+    state: Arc<SqliteStateStore>,
+    read_only_tools: &[&str],
+) -> crate::mcp::McpRegistry {
     let registry = crate::mcp::McpRegistry::new(state, crate::config::secret_store().clone());
     registry
         .add_server(
@@ -719,6 +728,7 @@ pub async fn fake_mcp_registry(state: Arc<SqliteStateStore>) -> crate::mcp::McpR
                 command: fake_mcp_server_path().to_string_lossy().into_owned(),
                 args: Vec::new(),
                 env: HashMap::new(),
+                read_only_tools: read_only_tools.iter().map(|t| t.to_string()).collect(),
             },
             false,
         )

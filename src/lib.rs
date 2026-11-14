@@ -220,6 +220,8 @@ pub fn run() -> anyhow::Result<()> {
                     "  client-token          Mint the local Client Gateway token (revokes the old)"
                 );
                 println!("  pair                  Pair a phone or browser with the Client Gateway");
+                println!("  app                   Open the AIdaemon app in a window");
+                println!("  tui                   Run the AIdaemon app in this terminal");
                 println!("  keychain set <key>    Store a secret in the OS keychain");
                 println!("  keychain get <key>    Retrieve a secret from the OS keychain");
                 println!("  keychain delete <key> Remove a secret from the OS keychain");
@@ -298,6 +300,9 @@ pub fn run() -> anyhow::Result<()> {
             }
             "tui" => {
                 return handle_tui_command(&args[2..], config_path.as_path());
+            }
+            "app" => {
+                return handle_app_command(&args[2..], config_path.as_path());
             }
             other => {
                 if let Some(agent) = normalize_terminal_agent_name(other) {
@@ -752,38 +757,82 @@ fn client_gateway_ready(
 /// daemon's Client Gateway, with the gateway's own address and the local
 /// token (minted on first use).
 fn handle_tui_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
-    let mut device = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--device" => {
-                let Some(value) = args.get(i + 1) else {
-                    anyhow::bail!("Missing value for --device");
-                };
-                device = Some(value.clone());
-                i += 2;
-            }
-            "-h" | "--help" => {
-                println!("Usage: aidaemon tui [--device NAME]");
-                println!();
-                println!("Chat with the daemon, watch every chat's turns and answer approvals");
-                println!("in this terminal. Needs [client_gateway] enabled.");
-                return Ok(());
-            }
-            other => anyhow::bail!("Unknown tui option: {other}"),
-        }
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("Usage: aidaemon tui");
+        println!();
+        println!("The AIdaemon app in this terminal: chat, every chat's turns and approvals.");
+        println!("Needs [client_gateway] enabled and the aidaemon-app binary (it ships with");
+        println!("releases and install.sh).");
+        return Ok(());
     }
+    if let Some(other) = args.first() {
+        anyhow::bail!("Unknown tui option: {other}");
+    }
+    launch_app(config_path, true)
+}
+
+/// `aidaemon app`: the AIdaemon app in a window on this machine.
+fn handle_app_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("Usage: aidaemon app");
+        println!();
+        println!("The AIdaemon app in a window: chat, approvals and running work.");
+        println!("Needs [client_gateway] enabled and the aidaemon-app binary.");
+        return Ok(());
+    }
+    if let Some(other) = args.first() {
+        anyhow::bail!("Unknown app option: {other}");
+    }
+    launch_app(config_path, false)
+}
+
+/// The `aidaemon-app` binary: beside this one, else on `PATH`.
+fn app_binary() -> Option<std::path::PathBuf> {
+    let name = if cfg!(windows) {
+        "aidaemon-app.exe"
+    } else {
+        "aidaemon-app"
+    };
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
+        .filter(|path| path.is_file());
+    beside.or_else(|| {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(name))
+                .find(|path| path.is_file())
+        })
+    })
+}
+
+/// Start the app against this machine's gateway, signed in with the owner's
+/// local token; the terminal build takes over this terminal until it quits.
+fn launch_app(config_path: &Path, terminal: bool) -> anyhow::Result<()> {
     let settings = client_gateway_ready(config_path)?;
+    let Some(binary) = app_binary() else {
+        anyhow::bail!(
+            "The aidaemon-app binary is not installed. It ships with each release (install.sh \
+             installs it beside aidaemon); from a checkout: cargo build --release \
+             --manifest-path clients/app/Cargo.toml"
+        );
+    };
     let token = crate::startup::client_gateway::local_token_or_mint(&settings)?;
-    let url = format!("ws://{}/client/v1/ws", settings.bind_addr()?);
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(aidaemon_tui::run(aidaemon_tui::link_config(
-            url,
-            aidaemon_tui::link::Auth::LocalToken(token),
-            device,
-        )))
+    let mut command = std::process::Command::new(binary);
+    command
+        .env(
+            "AIDAEMON_GATEWAY_URL",
+            format!("ws://{}/client/v1/ws", settings.bind_addr()?),
+        )
+        .env("AIDAEMON_CLIENT_TOKEN", token);
+    if terminal {
+        let status = command.arg("--tui").status()?;
+        anyhow::ensure!(status.success(), "the app exited with {status}");
+    } else {
+        command.spawn()?;
+        println!("Opened the AIdaemon app.");
+    }
+    Ok(())
 }
 
 /// Open `url` in the default browser.
