@@ -26,9 +26,9 @@ use crate::tools::{
     ListCheckpointsTool, ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool,
     ManageMandatesTool, ManageMcpTool, ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool,
     PolicyMetricsTool, ProjectInspectTool, ReadFileTool, RememberFactTool, RunCommandTool,
-    SearchFilesTool, SearchHistoryTool, SendFileTool, ServiceStatusTool,
-    ShareMemoryTool, SpawnAgentTool, SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    SearchFilesTool, SearchHistoryTool, SendFileTool, ServiceStatusTool, ShareMemoryTool,
+    SpawnAgentTool, SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool, WebSearchTool,
+    WriteFileTool,
 };
 use crate::traits::Tool;
 use crate::traits::store_prelude::*;

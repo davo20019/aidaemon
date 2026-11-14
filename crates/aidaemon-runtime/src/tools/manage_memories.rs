@@ -433,9 +433,8 @@ impl ManageMemoriesTool {
         let moved = action_of(arguments).is_some_and(|action| moved_action(&action).is_some());
         let output = self.run(arguments, facts).await?;
         let trimmed = output.trim_start();
-        let outcome_status = if moved {
-            ToolOutcomeStatus::FailedPermanent
-        } else if trimmed.starts_with("Internal error:")
+        let outcome_status = if moved
+            || trimmed.starts_with("Internal error:")
             || trimmed.starts_with("Invalid priority")
             || trimmed.starts_with("Unknown action:")
             || trimmed.starts_with("Personal goal not found:")

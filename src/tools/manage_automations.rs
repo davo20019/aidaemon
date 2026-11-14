@@ -6,11 +6,11 @@ pub use aidaemon_runtime::tools::manage_automations::*;
 mod tests {
     use super::*;
     use crate::testing::CallWithFacts;
-    use crate::traits::ToolCalls as _;
     use crate::testing::{MockProvider, setup_test_agent};
     use crate::tools::ManageMandatesTool;
     use crate::traits::StateStore;
     use crate::traits::ToolCallContext;
+    use crate::traits::ToolCalls as _;
     use crate::types::ChannelVisibility;
     use crate::types::UserRole;
     use aidaemon_work::automations;
@@ -383,12 +383,23 @@ mod tests {
             edited.starts_with("Edited \"Inbox digest\": renamed it \"Morning digest\"; its schedule is now Every weekday at 7:00 AM"),
             "{edited}"
         );
-        let id = f.scheduled.lock().unwrap().get("Inbox digest").cloned().unwrap();
+        let id = f
+            .scheduled
+            .lock()
+            .unwrap()
+            .get("Inbox digest")
+            .cloned()
+            .unwrap();
         let schedules = f.state.get_schedules_for_goal(&id).await.unwrap();
         assert_eq!(schedules.len(), 1);
         assert_eq!(schedules[0].cron_expr, "0 7 * * 1-5");
-        let shown = f.call(json!({"action": "show", "name": "morning digest"})).await;
-        assert!(shown.contains("How often: Every weekday at 7:00 AM"), "{shown}");
+        let shown = f
+            .call(json!({"action": "show", "name": "morning digest"}))
+            .await;
+        assert!(
+            shown.contains("How often: Every weekday at 7:00 AM"),
+            "{shown}"
+        );
 
         let snoozed = f
             .call(json!({"action": "edit", "name": "Morning digest", "snooze_until": "in 3 days"}))
@@ -398,13 +409,22 @@ mod tests {
         // The cadence stays; only the next run moved.
         assert_eq!(schedule.cron_expr, "0 7 * * 1-5");
         let next = chrono::DateTime::parse_from_rfc3339(&schedule.next_run_at).unwrap();
-        assert!(next > chrono::Utc::now() + chrono::Duration::days(2), "{next}");
+        assert!(
+            next > chrono::Utc::now() + chrono::Duration::days(2),
+            "{next}"
+        );
 
         // A recurring snooze, a one-time reschedule of recurring work and a
         // name already taken are refused, and change nothing.
         for (args, refusal) in [
-            (json!({"action": "edit", "name": "Morning digest", "snooze_until": "every day at 8am"}), "`snooze_until` is one time"),
-            (json!({"action": "edit", "name": "Morning digest", "when": "tomorrow at 9am"}), "recurs; to make it a one-time one"),
+            (
+                json!({"action": "edit", "name": "Morning digest", "snooze_until": "every day at 8am"}),
+                "`snooze_until` is one time",
+            ),
+            (
+                json!({"action": "edit", "name": "Morning digest", "when": "tomorrow at 9am"}),
+                "recurs; to make it a one-time one",
+            ),
         ] {
             let answer = f.call(args).await;
             assert!(answer.contains(refusal), "{answer}");
@@ -413,7 +433,10 @@ mod tests {
         let taken = f
             .call(json!({"action": "edit", "name": "Morning digest", "new_name": "Status watch"}))
             .await;
-        assert!(taken.starts_with("An automation is already named"), "{taken}");
+        assert!(
+            taken.starts_with("An automation is already named"),
+            "{taken}"
+        );
         assert_eq!(
             f.state.get_schedules_for_goal(&id).await.unwrap()[0].cron_expr,
             "0 7 * * 1-5"
@@ -471,10 +494,17 @@ mod tests {
             "{}",
             outcome.output
         );
-        let id = f.scheduled.lock().unwrap().get("Inbox digest").cloned().unwrap();
+        let id = f
+            .scheduled
+            .lock()
+            .unwrap()
+            .get("Inbox digest")
+            .cloned()
+            .unwrap();
         assert_eq!(f.state.get_tasks_for_goal(&id).await.unwrap().len(), 1);
         // A paused one does not run, and that is no success.
-        f.call(json!({"action": "pause", "name": "Inbox digest"})).await;
+        f.call(json!({"action": "pause", "name": "Inbox digest"}))
+            .await;
         let refused = f
             .tool
             .call_with_execution_context(
@@ -500,7 +530,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let tool = ManageAutomationsTool::new(f.state.clone()).with_health_probes(Some(store.clone()));
+        let tool =
+            ManageAutomationsTool::new(f.state.clone()).with_health_probes(Some(store.clone()));
         let mut probe = crate::health::HealthProbe::new(
             "Synthetic site".to_string(),
             crate::health::ProbeType::Http,
@@ -520,10 +551,16 @@ mod tests {
             "{list}"
         );
         let paused = call(json!({"action": "pause", "name": "synthetic site"})).await;
-        assert!(paused.starts_with("Paused \"Synthetic site\" (probe)"), "{paused}");
+        assert!(
+            paused.starts_with("Paused \"Synthetic site\" (probe)"),
+            "{paused}"
+        );
         assert!(store.get_probe(&probe.id).await.unwrap().unwrap().is_paused);
         let cancelled = call(json!({"action": "cancel", "name": "Synthetic site"})).await;
-        assert!(cancelled.starts_with("Cancelled \"Synthetic site\" (probe)"), "{cancelled}");
+        assert!(
+            cancelled.starts_with("Cancelled \"Synthetic site\" (probe)"),
+            "{cancelled}"
+        );
         assert!(store.get_probe(&probe.id).await.unwrap().is_none());
     }
 
@@ -532,7 +569,10 @@ mod tests {
         let f = fixture().await;
         f.reminder("Oven", "every weekday at 8am").await;
         let id = f.scheduled.lock().unwrap().get("Oven").cloned().unwrap();
-        let memories = crate::tools::ManageMemoriesTool::new(f.state.clone(), f._harness.state.memory_stores());
+        let memories = crate::tools::ManageMemoriesTool::new(
+            f.state.clone(),
+            f._harness.state.memory_stores(),
+        );
         let outcome = memories
             .call_with_execution_context(
                 &json!({"action": "cancel_scheduled", "goal_id": id}).to_string(),

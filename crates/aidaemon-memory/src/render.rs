@@ -222,9 +222,8 @@ pub fn render_memory_section(memory: &MemoryContext, max_facts: usize) -> Memory
          - User facts (preferences, personal info, projects): use `manage_memories(action='search', query='...')` or `manage_memories(action='list')`\n",
     );
     if memory.scheduled_goals_tool {
-        prompt.push_str(
-            "- Scheduled tasks and reminders: use `manage_automations(action='list')`\n",
-        );
+        prompt
+            .push_str("- Scheduled tasks and reminders: use `manage_automations(action='list')`\n");
     }
     prompt.push_str(
         "- Contacts and relationships: use `manage_people(action='list')` or `manage_people(action='view', name='...')`\n\

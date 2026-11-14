@@ -552,7 +552,11 @@ impl ManageAutomationsTool {
         Ok(None)
     }
 
-    async fn change_probe(&self, automation: &Automation, action: &str) -> anyhow::Result<ChangeNote> {
+    async fn change_probe(
+        &self,
+        automation: &Automation,
+        action: &str,
+    ) -> anyhow::Result<ChangeNote> {
         let Some(store) = &self.probes else {
             return Ok(None);
         };
@@ -766,7 +770,9 @@ impl ManageAutomationsTool {
                 let cron = match aidaemon_work::schedule::parse_schedule(when) {
                     Ok(cron) => cron,
                     Err(error) => {
-                        return Ok(negative(format!("Couldn't read the time '{when}': {error}")));
+                        return Ok(negative(format!(
+                            "Couldn't read the time '{when}': {error}"
+                        )));
                     }
                 };
                 let next = match aidaemon_work::schedule::compute_next_run_local(&cron) {
@@ -778,8 +784,7 @@ impl ManageAutomationsTool {
                     }
                 };
                 let one_shot = aidaemon_work::schedule::is_one_shot_schedule(&cron);
-                let was_one_shot =
-                    !schedules.is_empty() && schedules.iter().all(|s| s.is_one_shot);
+                let was_one_shot = !schedules.is_empty() && schedules.iter().all(|s| s.is_one_shot);
                 if !schedules.is_empty() && one_shot != was_one_shot {
                     let (from, to) = if was_one_shot {
                         ("runs once", "a recurring one")
@@ -910,7 +915,11 @@ impl ManageAutomationsTool {
         session_id: &str,
     ) -> anyhow::Result<Result<String, String>> {
         if let Some(id) = given(&args.id) {
-            return Ok(self.runs.resolve_goal_id(id).await.map_err(|e| e.to_string()));
+            return Ok(self
+                .runs
+                .resolve_goal_id(id)
+                .await
+                .map_err(|e| e.to_string()));
         }
         Ok(self
             .select(
@@ -964,7 +973,11 @@ impl ManageAutomationsTool {
         let run_before = self.run_state(&goal_id).await?;
         let output = match action {
             "run_now" => self.runs.run_now(&goal_id, None).await?,
-            "history" => self.runs.run_history(&goal_id, args.limit.unwrap_or(10)).await?,
+            "history" => {
+                self.runs
+                    .run_history(&goal_id, args.limit.unwrap_or(10))
+                    .await?
+            }
             "last_failure" => self.runs.last_failure(&goal_id).await?,
             "set_budget" => {
                 self.runs
@@ -1003,8 +1016,8 @@ impl ManageAutomationsTool {
             "run_now" => {
                 let (tasks, status) = self.run_state(&goal_id).await?;
                 let started = tasks.iter().any(|task| !run_before.0.contains(task));
-                let reactivated =
-                    status.as_deref() == Some("active") && run_before.1.as_deref() != Some("active");
+                let reactivated = status.as_deref() == Some("active")
+                    && run_before.1.as_deref() != Some("active");
                 if started || reactivated {
                     ToolOutcomeStatus::Succeeded
                 } else {
@@ -1056,7 +1069,8 @@ impl ManageAutomationsTool {
         match action {
             "list" => {
                 let all = self.all(session_id, kind).await?;
-                let mut listed = outcome(Self::render_list(&all, kind), ToolOutcomeStatus::Succeeded);
+                let mut listed =
+                    outcome(Self::render_list(&all, kind), ToolOutcomeStatus::Succeeded);
                 // The scheduled collection was read in full: record it as
                 // every owner surface does.
                 if kind.is_none_or(|kind| kind == AutomationKind::Scheduled) {
@@ -1184,7 +1198,9 @@ impl crate::tools::traits::ToolSemantics for ManageAutomationsTool {
             Some("bind_workspace") => {
                 ToolCallSemantics::mutation_with(ToolMutationEffects::CONFIGURATION)
             }
-            Some("run_now") => ToolCallSemantics::mutation_with(ToolMutationEffects::SCHEDULED_WORK),
+            Some("run_now") => {
+                ToolCallSemantics::mutation_with(ToolMutationEffects::SCHEDULED_WORK)
+            }
             _ => ToolCallSemantics::mutation_with(
                 ToolMutationEffects::SCHEDULED_WORK.union(ToolMutationEffects::CONFIGURATION),
             ),

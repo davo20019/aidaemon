@@ -1086,12 +1086,7 @@ mod tests {
         // Rendered as the channel would: clean, no contradictory verb.
         assert_eq!(format!("Using {label}..."), "Using checking memory...");
 
-        for read in [
-            "search",
-            "search_episodes",
-            "list",
-            "list_goals",
-        ] {
+        for read in ["search", "search_episodes", "list", "list_goals"] {
             let (label, _) =
                 user_facing_tool_activity("manage_memories", read, ChannelVisibility::Private);
             assert_eq!(label, "checking memory", "action {read} should read");

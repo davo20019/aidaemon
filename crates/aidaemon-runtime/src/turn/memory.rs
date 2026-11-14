@@ -57,10 +57,8 @@ pub fn goal_actions_view(definition: &serde_json::Value) -> serde_json::Value {
         Some(function) => function,
         None => &mut definition,
     };
-    function["description"] = serde_json::Value::String(
-        "Personal goals: create, list, complete, abandon."
-            .to_string(),
-    );
+    function["description"] =
+        serde_json::Value::String("Personal goals: create, list, complete, abandon.".to_string());
     if let Some(actions) = function
         .pointer_mut("/parameters/properties/action/enum")
         .and_then(serde_json::Value::as_array_mut)

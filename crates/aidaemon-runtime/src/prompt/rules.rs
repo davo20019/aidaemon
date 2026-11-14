@@ -452,9 +452,7 @@ pub fn channel_rules(
             "- `manage_memories` (search/list) — for stored facts, preferences, personal goals\n",
         );
     } else {
-        rules.push_str(
-            "- `manage_memories` (goal actions) — for personal goals\n",
-        );
+        rules.push_str("- `manage_memories` (goal actions) — for personal goals\n");
     }
     rules.push_str(
         "- `manage_automations` — scheduled tasks, reminders, mandates and health checks: list, show, edit, pause, resume, cancel, run now, run history, last failure\n\

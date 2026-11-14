@@ -55,7 +55,11 @@ mod tests {
             .unwrap()
     }
 
-    async fn judged(tool: &ScheduleTaskTool, args: Value, facts: ToolCallContext) -> OwnerApprovalNeed {
+    async fn judged(
+        tool: &ScheduleTaskTool,
+        args: Value,
+        facts: ToolCallContext,
+    ) -> OwnerApprovalNeed {
         tool.owner_approval_request(&ApprovalCall::as_sent(&args), &facts)
             .await
     }
@@ -116,7 +120,11 @@ mod tests {
         );
         let goal = state.get_scheduled_goals().await.unwrap().remove(0);
         assert_eq!(goal.goal_type, "finite");
-        assert!(!goal.description.contains("tomorrow"), "{}", goal.description);
+        assert!(
+            !goal.description.contains("tomorrow"),
+            "{}",
+            goal.description
+        );
         let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
         assert!(schedules[0].is_one_shot);
     }
@@ -194,7 +202,11 @@ mod tests {
             again.metadata.outcome_status,
             Some(ToolOutcomeStatus::FailedPermanent)
         );
-        assert!(again.output.starts_with("The same scheduled work already exists"));
+        assert!(
+            again
+                .output
+                .starts_with("The same scheduled work already exists")
+        );
         assert_eq!(state.get_scheduled_goals().await.unwrap().len(), 1);
     }
 

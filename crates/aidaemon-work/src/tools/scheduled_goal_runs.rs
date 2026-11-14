@@ -491,7 +491,11 @@ impl ScheduledGoalRuns {
         Ok((output, portfolio))
     }
 
-    pub async fn overview(&self, limit: usize, include_diagnostics: bool) -> anyhow::Result<String> {
+    pub async fn overview(
+        &self,
+        limit: usize,
+        include_diagnostics: bool,
+    ) -> anyhow::Result<String> {
         self.overview_snapshot(limit, include_diagnostics)
             .await
             .map(|(output, _)| output)

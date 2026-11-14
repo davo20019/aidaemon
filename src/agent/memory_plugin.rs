@@ -554,10 +554,7 @@ mod tests {
         }
         // manage_memories keeps only its goal actions.
         let actions = offered_actions(log.last().unwrap(), "manage_memories");
-        assert!(
-            actions.contains(&"list_goals".to_string()),
-            "{actions:?}"
-        );
+        assert!(actions.contains(&"list_goals".to_string()), "{actions:?}");
         assert!(!actions.contains(&"search".to_string()), "{actions:?}");
         assert!(!actions.contains(&"forget".to_string()), "{actions:?}");
         let system = system_text(log.last().unwrap());
