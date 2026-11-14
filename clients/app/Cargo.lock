@@ -69,7 +69,6 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "futures",
- "getrandom 0.4.3",
  "p256",
  "rand 0.10.3",
  "reqwest",
@@ -3127,6 +3126,9 @@ dependencies = [
  "aidaemon-client-protocol",
  "dirs",
  "env_logger",
+ "futures",
+ "getrandom 0.4.3",
+ "js-sys",
  "log",
  "nsh-base",
  "nsh-core",
@@ -3138,6 +3140,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -6148,7 +6152,17 @@ checksum = "bed99139f7dac9b5cfe5f17be4d66dc7079a34dee1d74bcc77217119240e267c"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "uuid-rng-internal",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "uuid-rng-internal"
+version = "1.29.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4af36ce0aa6ec3337634e98de25504b6ce3cf9478468c21748a6a6cea37d7276"
+dependencies = [
+ "getrandom 0.4.3",
 ]
 
 [[package]]

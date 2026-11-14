@@ -7,7 +7,7 @@ use nsh_core::platform::Idiom;
 use nsh_core::prelude::*;
 
 use crate::features::{conversation, inspector::inspector, sidebar::sidebar};
-use crate::store::Store;
+use crate::store::{Connection, Store};
 use crate::ui::{colors, radius, size, type_scale};
 
 pub fn shell(store: Store) -> View {
@@ -39,6 +39,11 @@ pub fn shell(store: Store) -> View {
                 .child(sidebar(store)),
         )
         .child(dynamic(move || {
+            if store.connection() == Connection::NeedsPairing {
+                return Some(untracked(|| {
+                    crate::features::pairing::pairing(store).key("pairing")
+                }));
+            }
             // A new page per conversation: its list and draft are its own.
             let selected = store.selected();
             Some(untracked(move || {

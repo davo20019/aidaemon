@@ -140,6 +140,12 @@ impl LinkMachine {
     /// The socket opened at `now_ms`: send these frames, in order (`hello`,
     /// then every unanswered command again).
     pub fn opened(&mut self, now_ms: u64) -> Vec<ClientFrame> {
+        self.opened_with_token(now_ms, None)
+    }
+
+    /// [`LinkMachine::opened`] for a socket that could not carry the token
+    /// in a header (a browser's): `hello` carries it.
+    pub fn opened_with_token(&mut self, now_ms: u64, token: Option<String>) -> Vec<ClientFrame> {
         self.open = true;
         self.refused = None;
         self.last_heard_ms = now_ms;
@@ -154,7 +160,7 @@ impl LinkMachine {
             },
             capabilities: self.capabilities.clone(),
             resume_from: self.cursor,
-            token: None,
+            token,
         }];
         frames.extend(
             self.pending

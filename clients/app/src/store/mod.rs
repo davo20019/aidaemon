@@ -18,6 +18,8 @@ pub enum Connection {
     #[default]
     Connecting,
     Online,
+    /// This device has no key the daemon knows: pair it first.
+    NeedsPairing,
     Offline {
         kind: DropKind,
         reason: String,
@@ -166,12 +168,9 @@ impl Store {
                 .with(|s| s.as_deref() == Some(request_id.as_str()))
         {
             self.starting.replace(None);
-            let draft = self.drafts.with_untracked(|d| d.get(NEW).cloned());
+            // The draft was sent: the new conversation starts empty.
             self.drafts.update(|d| {
                 d.remove(NEW);
-                if let Some(draft) = draft.filter(|d| !d.is_empty()) {
-                    d.insert(session_id.clone(), draft);
-                }
             });
             self.fetched.with(|f| f.insert(session_id.clone()));
             self.selected.set(Some(session_id.clone()));
@@ -282,6 +281,11 @@ impl Store {
         self.connection.get()
     }
 
+    /// The connection, read without subscribing (for the link's own loop).
+    pub fn connection_untracked(&self) -> Connection {
+        self.connection.get_untracked()
+    }
+
     pub fn is_online(&self) -> bool {
         self.connection.with(|c| *c == Connection::Online)
     }
@@ -296,12 +300,17 @@ impl Store {
     pub fn title(&self, id: &str) -> String {
         self.state.with(|s| {
             let view = s.sessions.get(id);
-            if let Some(title) = view.and_then(|v| v.summary.as_ref()).and_then(|m| m.title.clone()) {
+            if let Some(title) = view
+                .and_then(|v| v.summary.as_ref())
+                .and_then(|m| m.title.clone())
+            {
                 return title;
             }
             let first = view.and_then(|v| {
                 v.lines.iter().find_map(|line| match line {
-                    Line::User { text, .. } => Some(text.lines().next().unwrap_or_default().trim().to_owned()),
+                    Line::User { text, .. } => {
+                        Some(text.lines().next().unwrap_or_default().trim().to_owned())
+                    }
                     _ => None,
                 })
             });
@@ -500,6 +509,11 @@ impl Store {
         });
     }
 
+    /// The link found no paired key on this device.
+    pub fn needs_pairing(&self) {
+        self.connection.set(Connection::NeedsPairing);
+    }
+
     pub fn dismiss_notice(&self) {
         self.state.update(|s| s.notice = None);
     }
@@ -514,7 +528,11 @@ impl Default for Store {
 /// The platform a session id names (`aidaemon:slack:…`, `app:…`).
 pub fn platform_name(id: &str) -> &'static str {
     let lower = id.to_ascii_lowercase();
-    let has = |word: &str| lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|part| part == word);
+    let has = |word: &str| {
+        lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|part| part == word)
+    };
     if lower.starts_with("app:") {
         "App"
     } else if has("slack") {

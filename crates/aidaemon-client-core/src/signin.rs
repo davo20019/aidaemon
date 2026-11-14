@@ -12,7 +12,7 @@ use aidaemon_client_protocol::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use p256::ecdsa::signature::Signer;
+use p256::ecdsa::signature::Signer as _;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::elliptic_curve::Generate;
 
@@ -142,31 +142,63 @@ pub fn read<T: serde::de::DeserializeOwned>(reply: HttpReply) -> Result<T, SignI
     }
 }
 
+/// What signs a sign-in challenge: a [`DeviceKey`] held in memory, or a key
+/// the platform keeps and never hands out (a browser's non-extractable
+/// WebCrypto key).
+pub trait Signer {
+    /// The signature (`r || s`, base64url) of `message`.
+    fn sign(&self, message: &str)
+    -> impl std::future::Future<Output = Result<String, SignInError>>;
+}
+
+impl Signer for DeviceKey {
+    async fn sign(&self, message: &str) -> Result<String, SignInError> {
+        let signature: Signature = self.0.sign(message.as_bytes());
+        Ok(URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+    }
+}
+
+/// Sign device `device_id` in at `gateway` over `http`, with `signer`.
+pub async fn sign_in_as(
+    http: &impl Http,
+    gateway: &str,
+    device_id: &str,
+    signer: &impl Signer,
+) -> Result<AccessGrant, SignInError> {
+    let challenge: Challenge = post(
+        http,
+        gateway,
+        "/client/v1/sessions/challenge",
+        &ChallengeRequest {
+            device_id: device_id.to_owned(),
+        },
+    )
+    .await?;
+    let signature = signer
+        .sign(&challenge_message(
+            &challenge.challenge_id,
+            &challenge.nonce,
+        ))
+        .await?;
+    post(
+        http,
+        gateway,
+        "/client/v1/sessions",
+        &SessionRequest {
+            signature,
+            challenge_id: challenge.challenge_id,
+        },
+    )
+    .await
+}
+
 /// Sign `device` in over `http`: a challenge, its signature, a grant.
 pub async fn sign_in_with(
     http: &impl Http,
     device: &StoredDevice,
 ) -> Result<AccessGrant, SignInError> {
     let key = DeviceKey::from_stored(device).map_err(|e| SignInError::Refused(e.to_string()))?;
-    let challenge: Challenge = post(
-        http,
-        &device.gateway,
-        "/client/v1/sessions/challenge",
-        &ChallengeRequest {
-            device_id: device.device_id.clone(),
-        },
-    )
-    .await?;
-    post(
-        http,
-        &device.gateway,
-        "/client/v1/sessions",
-        &SessionRequest {
-            signature: key.sign_challenge(&challenge),
-            challenge_id: challenge.challenge_id,
-        },
-    )
-    .await
+    sign_in_as(http, &device.gateway, &device.device_id, &key).await
 }
 
 /// What a pairing needs: the offer from the owner's `/pair_device` or
@@ -184,14 +216,15 @@ pub struct PairRequest {
     pub fingerprint: Option<String>,
 }
 
-/// Pair over `http`: redeem the offer with a new key, then wait (polling
-/// every `poll`) until the owner approves. Returns the identity to keep.
-pub async fn pair_with(
+/// Redeem the offer with `public_key` (SEC1 uncompressed, base64url), then
+/// wait (polling every `poll`) until the owner approves. Returns the device
+/// id the gateway gave.
+pub async fn redeem_and_wait(
     http: &impl Http,
     request: &PairRequest,
+    public_key: String,
     poll: Duration,
-) -> anyhow::Result<StoredDevice> {
-    let key = DeviceKey::generate();
+) -> anyhow::Result<String> {
     let mut enrollment: Enrollment = post(
         http,
         &request.gateway,
@@ -201,7 +234,7 @@ pub async fn pair_with(
             code: request.code.clone(),
             device_name: request.device_name.clone(),
             device_kind: request.device_kind,
-            public_key: key.public_key_b64(),
+            public_key,
             scopes: Vec::new(),
         },
     )
@@ -224,13 +257,24 @@ pub async fn pair_with(
         enrollment = read(http.get(&url).await?)?;
     }
     match (enrollment.state, enrollment.device_id) {
-        (EnrollmentState::Approved, Some(device_id)) => Ok(StoredDevice {
-            gateway: request.gateway.trim_end_matches('/').to_string(),
-            device_id,
-            secret_key: key.secret_b64(),
-        }),
+        (EnrollmentState::Approved, Some(device_id)) => Ok(device_id),
         (state, _) => anyhow::bail!("the pairing ended {state:?}"),
     }
+}
+
+/// Pair over `http` with a new in-memory key. Returns the identity to keep.
+pub async fn pair_with(
+    http: &impl Http,
+    request: &PairRequest,
+    poll: Duration,
+) -> anyhow::Result<StoredDevice> {
+    let key = DeviceKey::generate();
+    let device_id = redeem_and_wait(http, request, key.public_key_b64(), poll).await?;
+    Ok(StoredDevice {
+        gateway: request.gateway.trim_end_matches('/').to_string(),
+        device_id,
+        secret_key: key.secret_b64(),
+    })
 }
 
 /// A grant kept between connections and renewed when it nears its end.
@@ -255,6 +299,27 @@ impl GrantCache {
             return Ok(grant.access_token.clone());
         }
         let grant = sign_in_with(http, device).await?;
+        let token = grant.access_token.clone();
+        self.grant = Some(grant);
+        Ok(token)
+    }
+
+    /// [`GrantCache::token_with`] for a key the platform keeps: `device`'s
+    /// gateway and id, signed by `signer`.
+    pub async fn token_signed(
+        &mut self,
+        http: &impl Http,
+        device: &StoredDevice,
+        signer: &impl Signer,
+        now_ms: u64,
+    ) -> Result<String, SignInError> {
+        let margin = u64::try_from(RENEW_BEFORE.as_millis()).unwrap_or(60_000);
+        if let Some(grant) = &self.grant
+            && grant.expires_at_ms > now_ms.saturating_add(margin)
+        {
+            return Ok(grant.access_token.clone());
+        }
+        let grant = sign_in_as(http, &device.gateway, &device.device_id, signer).await?;
         let token = grant.access_token.clone();
         self.grant = Some(grant);
         Ok(token)

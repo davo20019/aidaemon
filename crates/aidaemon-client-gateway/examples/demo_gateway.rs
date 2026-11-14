@@ -241,6 +241,9 @@ async fn main() -> anyhow::Result<()> {
         log,
         config: ClientGatewayConfig {
             enabled: true,
+            // The nsh app's web build (`nsh package --target web` in
+            // clients/app), served at /client/v2/app/.
+            app_dir: std::env::var("AIDAEMON_APP_DIR").ok(),
             ..ClientGatewayConfig::default()
         },
         token_file,

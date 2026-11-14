@@ -8,9 +8,7 @@ use nsh_core::prelude::*;
 
 use super::approvals;
 use crate::store::{Connection, Store};
-use crate::ui::{
-    self, Glyph, Size, Variant, btn_icon, colors, icon_btn, radius, size, type_scale, working,
-};
+use crate::ui::{self, Glyph, Size, Variant, btn_icon, colors, radius, size, type_scale, working};
 
 /// A row of the transcript.
 #[derive(Debug, Clone, PartialEq)]
@@ -268,7 +266,9 @@ fn composer(store: Store, session: Option<String>) -> View {
                     .auto_focus(true)
                     .placeholder(move || match store.connection() {
                         Connection::Online => "Message AIdaemon… (/ for commands)".to_owned(),
-                        Connection::Connecting => "Connecting to the daemon…".to_owned(),
+                        Connection::Connecting | Connection::NeedsPairing => {
+                            "Connecting to the daemon…".to_owned()
+                        }
                         Connection::Offline { .. } => {
                             "Offline. Messages send once the daemon is back.".to_owned()
                         }
@@ -305,17 +305,6 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .text_size(px(type_scale::XS))
                         .text_color(colors::FAINT),
                     )
-                    .child(when(running, {
-                        let session = session.clone();
-                        move || {
-                            let session = session.clone();
-                            icon_btn(Glyph::Stop, "Stop", ui::Size::Sm, move || {
-                                if let Some(id) = &session {
-                                    store.stop(id);
-                                }
-                            })
-                        }
-                    }))
                     .child(
                         ui::btn_icon(
                             Glyph::Send,
