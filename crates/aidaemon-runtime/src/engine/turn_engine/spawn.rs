@@ -216,7 +216,6 @@ impl TurnEngine<'_> {
             "search_files",
             "web_search",
             "web_fetch",
-            "project_inspect",
         ];
         for tool in full_tools {
             if tool.tool_role() == ToolRole::Action

@@ -576,6 +576,16 @@ impl TurnEngine<'_> {
                 "Use manage_automations: run_now, history, last_failure, set_budget, \
                  update_instructions or bind_workspace, by the automation's name or ref.",
             )
+            .retired_tool("git_info", "Use terminal: git status, git log, git diff.")
+            .retired_tool("git_commit", "Use terminal: git add and git commit.")
+            .retired_tool(
+                "project_inspect",
+                "Use search_files and read_file, or terminal (ls).",
+            )
+            .retired_tool(
+                "service_status",
+                "Use terminal (for example lsof -i, docker ps, launchctl list).",
+            )
             .retired_tool(
                 "tool_trace",
                 "Use goal_trace with action \"tool_trace\" (needs [diagnostics] enabled).",

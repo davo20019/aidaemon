@@ -4,8 +4,6 @@ description: Inspects existing work and reports findings.
 tools:
   - read_file
   - search_files
-  - project_inspect
-  - git_info
   - web_search
   - web_fetch
   - track_requirements

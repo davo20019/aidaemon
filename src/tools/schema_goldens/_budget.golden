@@ -5,8 +5,6 @@ computer_use 4894 1224
 edit_file 773 194
 escalate_to_parent 614 154
 generate_image 921 231
-git_commit 599 150
-git_info 609 153
 goal_trace 812 203
 health_probe 1233 309
 http_request 2463 616
@@ -26,7 +24,6 @@ manage_skills 948 237
 mandate_review 3694 924
 node_restart 766 192
 policy_metrics 459 115
-project_inspect 587 147
 read_file 1121 281
 read_node_health 670 168
 read_node_sensors 473 119
@@ -39,7 +36,6 @@ search_history 1440 360
 self_diagnose 1123 281
 send_file 722 181
 send_node_audio 584 146
-service_status 586 147
 set_reminder 647 162
 share_memory 438 110
 skill_resources 631 158
@@ -51,5 +47,5 @@ use_skill 483 121
 web_fetch 647 162
 web_search 1326 332
 write_file 1068 267
-TOTAL 77923 19481 (52 tools)
-PER_CALL 31906 7977 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 33 deferred)
+TOTAL 75542 18886 (48 tools)
+PER_CALL 31471 7868 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 29 deferred)

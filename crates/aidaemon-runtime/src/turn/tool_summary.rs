@@ -114,20 +114,6 @@ pub fn summarize_tool_args(name: &str, arguments: &str) -> String {
             }
         }
 
-        // --- Git ---
-        "git_info" => {
-            let include = val.get("include").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            });
-            include.unwrap_or_default()
-        }
-        "git_commit" => get_str("message")
-            .map(|m| truncate_summary(m, 40))
-            .unwrap_or_default(),
-
         // --- Memory ---
         "remember_fact" => {
             let fact = get_str("fact").or_else(|| get_str("value")).unwrap_or("");
@@ -197,30 +183,6 @@ pub fn summarize_tool_args(name: &str, arguments: &str) -> String {
                 action.to_string()
             } else {
                 format!("{} {}", action, name_val)
-            }
-        }
-        "project_inspect" => {
-            if let Some(path) = get_str("path") {
-                short_path(path).to_string()
-            } else if let Some(paths) = val.get("paths").and_then(|v| v.as_array()) {
-                let mut summarized: Vec<String> = paths
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .map(short_path)
-                    .map(str::to_string)
-                    .take(3)
-                    .collect();
-                if summarized.is_empty() {
-                    String::new()
-                } else {
-                    let total = paths.iter().filter_map(|v| v.as_str()).count();
-                    if total > summarized.len() {
-                        summarized.push(format!("+{} more", total - summarized.len()));
-                    }
-                    summarized.join(", ")
-                }
-            } else {
-                String::new()
             }
         }
 

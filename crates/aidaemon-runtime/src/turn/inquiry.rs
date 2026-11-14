@@ -175,23 +175,11 @@ pub fn evidence_capabilities_for_tool_call(
             // before filesystem I/O and is therefore a host-local outcome.
             capability(HostLocal, &[Outcome], Direct, Current),
         ],
-        "search_files" | "project_inspect" => vec![capability(
+        "search_files" => vec![capability(
             LocalWorkspace,
             &[CurrentState, Content, CausalExplanation],
             Direct,
             Current,
-        )],
-        "git_info" => vec![capability(
-            LocalWorkspace,
-            &[
-                CurrentState,
-                HistoricalRecord,
-                Outcome,
-                Attribution,
-                Content,
-            ],
-            Canonical,
-            Both,
         )],
         "terminal" | "run_command" => vec![
             capability(
@@ -207,7 +195,7 @@ pub fn evidence_capabilities_for_tool_call(
                 Current,
             ),
         ],
-        "system_info" | "service_status" | "check_environment" => vec![capability(
+        "system_info" | "check_environment" => vec![capability(
             HostLocal,
             &[CurrentState, Content, Outcome, CausalExplanation],
             Direct,
@@ -348,7 +336,6 @@ pub fn requirement_has_builtin_evidence_route(requirement: &RequestEvidenceRequi
         "web_search",
         "read_file",
         "search_files",
-        "git_info",
         "terminal",
         "system_info",
         "self_diagnose",

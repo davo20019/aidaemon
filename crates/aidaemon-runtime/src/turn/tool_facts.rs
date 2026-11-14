@@ -42,8 +42,9 @@ pub fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemanticScope
         "web_search" | "web_fetch" | "http_request" | "browser" => {
             Some(ToolSemanticScope::ExternalRemote)
         }
-        "read_file" | "search_files" | "edit_file" | "write_file" | "terminal"
-        | "project_inspect" => Some(ToolSemanticScope::LocalWorkspace),
+        "read_file" | "search_files" | "edit_file" | "write_file" | "terminal" => {
+            Some(ToolSemanticScope::LocalWorkspace)
+        }
         "read_channel_history" | "search_history" => Some(ToolSemanticScope::ConversationHistory),
         "manage_goal_tasks" | "schedule_task" | "goal_trace" | "manage_mandates"
         | "mandate_review" | "manage_automations" => Some(ToolSemanticScope::GoalState),

@@ -149,7 +149,6 @@ pub fn is_untrusted_external_reference_blocked_tool(tool_name: &str) -> bool {
         tool_name,
         "read_file"
             | "search_files"
-            | "project_inspect"
             | "check_environment"
             | "web_fetch"
             | "web_search"

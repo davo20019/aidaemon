@@ -470,7 +470,6 @@ fn categorize_tool_calls_inner(tool_calls: &[String], redact_commands: bool) -> 
             "send_file" | "send_media" => files_sent.push(args),
             "web_search" | "search_files" => searches.push(args),
             "web_fetch" | "http_request" => external_reads.push(args),
-            "project_inspect" => files_read.push(args),
             _ => {
                 if !args.is_empty() {
                     other.push(args);
@@ -561,7 +560,7 @@ mod tests {
             "terminal(`python3 generate_pdf.py`)".to_string(),
             "send_file(Guide.pdf)".to_string(),
             "web_search(top things Chantilly VA)".to_string(),
-            "project_inspect(chantilly-va-site)".to_string(),
+            "read_file(chantilly-va-site)".to_string(),
         ];
         let result = categorize_tool_calls(&calls);
         assert!(result.contains("Files read:"));

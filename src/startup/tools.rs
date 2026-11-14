@@ -22,12 +22,12 @@ use crate::tools::ReadChannelHistoryTool;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::{
     CheckEnvironmentTool, CliAgentTool, ConfigManagerTool, DiagnoseTool, EditFileTool,
-    GenerateImageTool, GitCommitTool, GitInfoTool, GoalTraceTool, HealthProbeTool, HttpRequestTool,
-    ListCheckpointsTool, ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool,
-    ManageMandatesTool, ManageMcpTool, ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool,
-    PolicyMetricsTool, ProjectInspectTool, ReadFileTool, RememberFactTool, RunCommandTool,
-    SearchFilesTool, SearchHistoryTool, SendFileTool, ServiceStatusTool, ShareMemoryTool,
-    SpawnAgentTool, SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool, WriteFileTool,
+    GenerateImageTool, GoalTraceTool, HealthProbeTool, HttpRequestTool, ListCheckpointsTool,
+    ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool, ManageMandatesTool, ManageMcpTool,
+    ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool, PolicyMetricsTool, ReadFileTool,
+    RememberFactTool, RunCommandTool, SearchFilesTool, SearchHistoryTool, SendFileTool,
+    ShareMemoryTool, SpawnAgentTool, SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool,
+    WriteFileTool,
 };
 use crate::traits::Tool;
 use crate::traits::store_prelude::*;
@@ -240,12 +240,8 @@ enum BaseToolId {
     WriteFile,
     EditFile,
     SearchFiles,
-    ProjectInspect,
     RunCommand,
-    GitInfo,
-    GitCommit,
     CheckEnvironment,
-    ServiceStatus,
 }
 
 struct BaseToolSpec {
@@ -323,28 +319,12 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
         name: "search_files",
     },
     BaseToolSpec {
-        id: BaseToolId::ProjectInspect,
-        name: "project_inspect",
-    },
-    BaseToolSpec {
         id: BaseToolId::RunCommand,
         name: "run_command",
     },
     BaseToolSpec {
-        id: BaseToolId::GitInfo,
-        name: "git_info",
-    },
-    BaseToolSpec {
-        id: BaseToolId::GitCommit,
-        name: "git_commit",
-    },
-    BaseToolSpec {
         id: BaseToolId::CheckEnvironment,
         name: "check_environment",
-    },
-    BaseToolSpec {
-        id: BaseToolId::ServiceStatus,
-        name: "service_status",
     },
 ];
 
@@ -1309,28 +1289,12 @@ async fn build_base_tool(
             tool: Arc::new(SearchFilesTool::on_backend(execution_backend, daemon_paths)),
             terminal_tool: None,
         },
-        BaseToolId::ProjectInspect => BuiltBaseTool {
-            tool: Arc::new(ProjectInspectTool::new(execution_backend)),
-            terminal_tool: None,
-        },
         BaseToolId::RunCommand => BuiltBaseTool {
             tool: Arc::new(RunCommandTool::new(execution_backend)),
             terminal_tool: None,
         },
-        BaseToolId::GitInfo => BuiltBaseTool {
-            tool: Arc::new(GitInfoTool::new(execution_backend)),
-            terminal_tool: None,
-        },
-        BaseToolId::GitCommit => BuiltBaseTool {
-            tool: Arc::new(GitCommitTool::new(execution_backend)),
-            terminal_tool: None,
-        },
         BaseToolId::CheckEnvironment => BuiltBaseTool {
             tool: Arc::new(CheckEnvironmentTool::new(execution_backend)),
-            terminal_tool: None,
-        },
-        BaseToolId::ServiceStatus => BuiltBaseTool {
-            tool: Arc::new(ServiceStatusTool::new(execution_backend)),
             terminal_tool: None,
         },
     };

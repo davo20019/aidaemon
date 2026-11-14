@@ -196,16 +196,6 @@ pub fn extract_project_dirs_from_tool_args(
         }
         return dirs;
     }
-    if tool_name == "project_inspect" {
-        if let Some(path) = parsed.get("path") {
-            collect_project_dirs_from_value(backend, path, Some("path"), &mut dirs);
-        }
-        if let Some(paths) = parsed.get("paths") {
-            collect_project_dirs_from_value(backend, paths, Some("paths"), &mut dirs);
-        }
-        return dirs;
-    }
-
     collect_project_dirs_from_value(backend, &parsed, None, &mut dirs);
     dirs
 }
@@ -222,14 +212,7 @@ pub fn project_instruction_targets_for_tool_call(
 ) -> Vec<String> {
     if !matches!(
         tool_name,
-        "read_file"
-            | "write_file"
-            | "edit_file"
-            | "project_inspect"
-            | "git_info"
-            | "git_commit"
-            | "terminal"
-            | "run_command"
+        "read_file" | "write_file" | "edit_file" | "terminal" | "run_command"
     ) {
         return Vec::new();
     }
@@ -255,9 +238,7 @@ pub fn project_instruction_targets_for_tool_call(
 
 fn project_dir_arg_key_for_tool(tool_name: &str) -> Option<&'static str> {
     match tool_name {
-        "search_files" | "project_inspect" | "git_info" | "git_commit" | "check_environment" => {
-            Some("path")
-        }
+        "search_files" | "check_environment" => Some("path"),
         "run_command" | "cli_agent" => Some("working_dir"),
         _ => None,
     }
@@ -319,18 +300,6 @@ pub fn maybe_inject_project_dir_into_tool_args(
     }
 
     let key = project_dir_arg_key_for_tool(tool_name)?;
-    if tool_name == "project_inspect"
-        && obj
-            .get("paths")
-            .and_then(|v| v.as_array())
-            .is_some_and(|arr| {
-                arr.iter()
-                    .filter_map(|entry| entry.as_str())
-                    .any(|entry| !entry.trim().is_empty())
-            })
-    {
-        return None;
-    }
     if obj
         .get(key)
         .and_then(|v| v.as_str())
@@ -450,23 +419,6 @@ mod tests {
         let args = r#"{"glob":"*.html","path":"/tmp/explicit"}"#;
         let updated =
             maybe_inject_project_dir_into_tool_args("search_files", args, Some("/tmp/inferred"));
-        assert!(updated.is_none());
-    }
-
-    #[test]
-    fn parses_project_inspect_paths_array() {
-        let args = r#"{"paths":["/tmp/dogs","/tmp/cats"]}"#;
-        assert_eq!(
-            project_dir_from_tool_args("project_inspect", args).as_deref(),
-            Some("/tmp/dogs")
-        );
-    }
-
-    #[test]
-    fn does_not_inject_project_dir_when_project_inspect_paths_exist() {
-        let args = r#"{"paths":["/tmp/explicit"]}"#;
-        let updated =
-            maybe_inject_project_dir_into_tool_args("project_inspect", args, Some("/tmp/inferred"));
         assert!(updated.is_none());
     }
 
@@ -720,7 +672,7 @@ mod tests {
                 "path": path.clone()
             })
             .to_string();
-            let dirs = extract_project_dirs_from_tool_args("project_inspect", &args);
+            let dirs = extract_project_dirs_from_tool_args("search_files", &args);
             let unique: std::collections::HashSet<String> = dirs.iter().cloned().collect();
             prop_assert_eq!(dirs.len(), unique.len());
         }

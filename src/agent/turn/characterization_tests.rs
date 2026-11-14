@@ -15,7 +15,6 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Mutex;
 
 struct RejectingArgumentTool {
     io_calls: Arc<AtomicUsize>,
@@ -495,146 +494,21 @@ async fn completed_negative_observation_is_reportable_when_semantic_assessment_i
     );
 }
 
-struct RecordingSearchFilesTool {
-    calls: Arc<Mutex<Vec<String>>>,
-}
+struct MockInspectFolderTool;
 
 #[async_trait]
-impl Tool for RecordingSearchFilesTool {
+impl Tool for MockInspectFolderTool {
     fn name(&self) -> &str {
-        "search_files"
+        "inspect_folder"
     }
 
     fn description(&self) -> &str {
-        "Mock search_files tool for regression testing"
+        "Mock folder-inspection tool for regression testing"
     }
 
     fn schema(&self) -> Value {
         json!({
-            "name": "search_files",
-            "description": "Mock search",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "glob": {"type": "string"},
-                    "path": {"type": "string"}
-                },
-                "additionalProperties": true
-            }
-        })
-    }
-
-    async fn execute(
-        &self,
-        arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-        let output: anyhow::Result<String> = async move {
-            self.calls.lock().await.push(arguments.to_string());
-            let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
-            let path = args["path"].as_str().unwrap_or(".");
-            Ok(format!("No matches found (0 files scanned in {})", path))
-        }
-        .await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
-    }
-}
-
-impl crate::traits::ToolSemantics for RecordingSearchFilesTool {
-    fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-}
-
-struct RecordingProjectInspectTool {
-    calls: Arc<Mutex<Vec<String>>>,
-}
-
-#[async_trait]
-impl Tool for RecordingProjectInspectTool {
-    fn name(&self) -> &str {
-        "project_inspect"
-    }
-
-    fn description(&self) -> &str {
-        "Recording project_inspect tool for regression testing"
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "name": "project_inspect",
-            "description": "Record project_inspect args",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "paths": {"type": "array", "items": {"type": "string"}}
-                },
-                "additionalProperties": true
-            }
-        })
-    }
-
-    async fn execute(
-        &self,
-        arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-        let output: anyhow::Result<String> = async move {
-            self.calls.lock().await.push(arguments.to_string());
-            let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
-            let primary = args["path"]
-                .as_str()
-                .or_else(|| {
-                    args["paths"]
-                        .as_array()
-                        .and_then(|arr| arr.first())
-                        .and_then(|v| v.as_str())
-                })
-                .unwrap_or(".");
-            Ok(format!(
-                "# Project: {}\n\n## Structure\n```\nindex.html\nstyles.css\n```\n",
-                primary
-            ))
-        }
-        .await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
-    }
-}
-
-impl crate::traits::ToolSemantics for RecordingProjectInspectTool {
-    fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-}
-
-struct MockProjectInspectTool;
-
-#[async_trait]
-impl Tool for MockProjectInspectTool {
-    fn name(&self) -> &str {
-        "project_inspect"
-    }
-
-    fn description(&self) -> &str {
-        "Mock project_inspect tool for regression testing"
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "name": "project_inspect",
+            "name": "inspect_folder",
             "description": "Mock inspect",
             "parameters": {
                 "type": "object",
@@ -665,7 +539,7 @@ impl Tool for MockProjectInspectTool {
     }
 }
 
-impl crate::traits::ToolSemantics for MockProjectInspectTool {
+impl crate::traits::ToolSemantics for MockInspectFolderTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: true,
@@ -1387,7 +1261,7 @@ async fn budget_blocked_same_tool_calls_do_not_trigger_false_consecutive_loop_st
     let burst_calls: Vec<ToolCall> = (0..20)
         .map(|idx| ToolCall {
             id: format!("call_{}", idx),
-            name: "project_inspect".to_string(),
+            name: "inspect_folder".to_string(),
             arguments: json!({"path": format!("/tmp/project_{}", idx)}).to_string(),
             extra_content: None,
         })
@@ -1413,7 +1287,7 @@ async fn budget_blocked_same_tool_calls_do_not_trigger_false_consecutive_loop_st
 
     let harness = setup_full_stack_test_agent_with_extra_tools(
         provider,
-        vec![Arc::new(MockProjectInspectTool) as Arc<dyn Tool>],
+        vec![Arc::new(MockInspectFolderTool) as Arc<dyn Tool>],
     )
     .await
     .unwrap();
@@ -1432,84 +1306,6 @@ async fn budget_blocked_same_tool_calls_do_not_trigger_false_consecutive_loop_st
         .unwrap();
 
     assert_eq!(reply, "Summarized project status.");
-}
-
-#[tokio::test]
-#[ignore = "project directory scope constraints not yet fully wired"]
-async fn mixed_project_inspect_path_and_paths_preserves_primary_path_for_follow_up_tools() {
-    let primary_dir = tempfile::tempdir().unwrap();
-    let secondary_dir = tempfile::tempdir().unwrap();
-    let primary_dir_str = primary_dir.path().to_string_lossy().to_string();
-    let secondary_dir_str = secondary_dir.path().to_string_lossy().to_string();
-
-    let search_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let inspect_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response(
-            "project_inspect",
-            &json!({
-                "path": primary_dir_str,
-                "paths": [primary_dir_str, secondary_dir_str]
-            })
-            .to_string(),
-        ),
-        MockProvider::tool_call_response("search_files", &json!({"glob":"*.html"}).to_string()),
-        MockProvider::tool_call_response(
-            "search_files",
-            &json!({"glob":"*.html", "path": primary_dir.path().to_string_lossy()}).to_string(),
-        ),
-        MockProvider::text_response("Inspection complete."),
-    ]);
-
-    let harness = setup_full_stack_test_agent_with_extra_tools(
-        provider,
-        vec![
-            Arc::new(RecordingSearchFilesTool {
-                calls: search_calls.clone(),
-            }) as Arc<dyn Tool>,
-            Arc::new(RecordingProjectInspectTool {
-                calls: inspect_calls.clone(),
-            }) as Arc<dyn Tool>,
-        ],
-    )
-    .await
-    .unwrap();
-
-    let reply = harness
-        .agent
-        .handle_message(
-            "mixed_project_inspect_path_paths",
-            "Inspect both project folders and find HTML files",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(reply, "Inspection complete.");
-
-    let inspect_args = inspect_calls.lock().await.clone();
-    assert_eq!(inspect_args.len(), 1, "expected one project_inspect call");
-    assert!(
-        inspect_args[0].contains("\"path\"") && inspect_args[0].contains("\"paths\""),
-        "expected mixed path+paths args in project_inspect call, got: {}",
-        inspect_args[0]
-    );
-
-    let search_args = search_calls.lock().await.clone();
-    assert_eq!(
-        search_args.len(),
-        2,
-        "expected one follow-up search_files call plus required explicit re-check"
-    );
-    assert!(
-        search_args[0].contains(&format!("\"path\":\"{}\"", primary_dir.path().display())),
-        "expected first search_files call to inherit primary path from project_inspect(path), got: {}",
-        search_args[0]
-    );
 }
 
 #[tokio::test]

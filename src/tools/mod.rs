@@ -101,10 +101,6 @@ pub use crate::startup::tool_config::SearchFilesTool;
 pub(crate) use aidaemon_runtime::tools::run_command;
 pub use aidaemon_tools::check_environment::CheckEnvironmentTool;
 pub use aidaemon_tools::checkpoints::ListCheckpointsTool;
-pub use aidaemon_tools::git_commit::GitCommitTool;
-pub use aidaemon_tools::git_info::GitInfoTool;
-pub use aidaemon_tools::project_inspect::ProjectInspectTool;
-pub use aidaemon_tools::service_status::ServiceStatusTool;
 pub use run_command::RunCommandTool;
 
 #[cfg(test)]
