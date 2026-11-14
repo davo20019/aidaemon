@@ -8,8 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use aidaemon_client_core::machine::{DropKind, Update, request_id};
 use aidaemon_client_core::state::{Line, LiveTurn, SessionView, State};
 use aidaemon_client_protocol::{
-    Approval, ApprovalDecision, CommandResult, Command, Event, ServerFrame, TaskSummary,
-    TurnStatus,
+    Approval, ApprovalDecision, Command, CommandResult, Event, ServerFrame, TaskSummary, TurnStatus,
 };
 use nsh_core::prelude::*;
 
@@ -115,7 +114,8 @@ impl Store {
             None => false,
         });
         if !sent {
-            self.queued.with(|queued| queued.push((id.clone(), command)));
+            self.queued
+                .with(|queued| queued.push((id.clone(), command)));
         }
         id
     }
@@ -125,7 +125,10 @@ impl Store {
     pub fn update(&self, update: Update) {
         match update {
             Update::Connecting => {
-                if self.connection.with_untracked(|c| !matches!(c, Connection::Offline { .. })) {
+                if self
+                    .connection
+                    .with_untracked(|c| !matches!(c, Connection::Offline { .. }))
+                {
                     self.connection.set(Connection::Connecting);
                 }
             }
@@ -158,7 +161,9 @@ impl Store {
             request_id,
             result: CommandResult::MessageAccepted { session_id, .. },
         } = &frame
-            && self.starting.with(|s| s.as_deref() == Some(request_id.as_str()))
+            && self
+                .starting
+                .with(|s| s.as_deref() == Some(request_id.as_str()))
         {
             self.starting.replace(None);
             let draft = self.drafts.with_untracked(|d| d.get(NEW).cloned());
@@ -225,18 +230,24 @@ impl Store {
                 }
             }
             Event::TurnStatus { turn_id, status } => match status {
-                TurnStatus::Thinking => {
-                    push(turn_id, ActivityKind::Thinking, "Thinking".into(), String::new())
-                }
+                TurnStatus::Thinking => push(
+                    turn_id,
+                    ActivityKind::Thinking,
+                    "Thinking".into(),
+                    String::new(),
+                ),
                 TurnStatus::ToolStarted { name, summary } => {
                     push(turn_id, ActivityKind::Tool, name.clone(), summary.clone())
                 }
                 TurnStatus::ToolProgress { name, chunk } => {
                     push(turn_id, ActivityKind::Output, name.clone(), chunk.clone())
                 }
-                TurnStatus::ToolCompleted { name, summary } => {
-                    push(turn_id, ActivityKind::ToolDone, name.clone(), summary.clone())
-                }
+                TurnStatus::ToolCompleted { name, summary } => push(
+                    turn_id,
+                    ActivityKind::ToolDone,
+                    name.clone(),
+                    summary.clone(),
+                ),
                 TurnStatus::PlanStep {
                     step,
                     total,
@@ -298,8 +309,12 @@ impl Store {
     }
 
     pub fn lines(&self, id: &str) -> Vec<Line> {
-        self.state
-            .with(|s| s.sessions.get(id).map(|v| v.lines.clone()).unwrap_or_default())
+        self.state.with(|s| {
+            s.sessions
+                .get(id)
+                .map(|v| v.lines.clone())
+                .unwrap_or_default()
+        })
     }
 
     pub fn live(&self, id: &str) -> Option<LiveTurn> {
@@ -344,7 +359,8 @@ impl Store {
 
     pub fn draft(&self) -> String {
         let key = self.selected.get().unwrap_or_default();
-        self.drafts.with(|d| d.get(&key).cloned().unwrap_or_default())
+        self.drafts
+            .with(|d| d.get(&key).cloned().unwrap_or_default())
     }
 
     /// The activity of the turn the inspector shows.

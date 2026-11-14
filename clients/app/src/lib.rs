@@ -17,7 +17,8 @@ fn native(registry: &mut Registry) {
 }
 
 /// Frames waiting for an [`Offline`] root, from any thread.
-static FEED: std::sync::Mutex<Vec<aidaemon_client_core::Update>> = std::sync::Mutex::new(Vec::new());
+static FEED: std::sync::Mutex<Vec<aidaemon_client_core::Update>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Hand `updates` to the [`Offline`] root, as the link would.
 pub fn feed(updates: impl IntoIterator<Item = aidaemon_client_core::Update>) {
@@ -33,7 +34,10 @@ pub fn Offline() -> impl IntoElement {
     let store = store::Store::new();
     provide_context(store);
     set_interval(std::time::Duration::from_millis(20), move || {
-        let updates = FEED.lock().map(|mut f| std::mem::take(&mut *f)).unwrap_or_default();
+        let updates = FEED
+            .lock()
+            .map(|mut f| std::mem::take(&mut *f))
+            .unwrap_or_default();
         for update in updates {
             store.update(update);
         }

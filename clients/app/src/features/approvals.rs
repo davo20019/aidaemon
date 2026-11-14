@@ -2,15 +2,11 @@
 //! touch, and every answer the daemon offers. The first answer anywhere
 //! wins; a card answered elsewhere leaves by itself.
 
-use aidaemon_client_protocol::{
-    Approval, ApprovalDecision, AskReason, CardAction, Impact, Risk,
-};
+use aidaemon_client_protocol::{Approval, ApprovalDecision, AskReason, CardAction, Impact, Risk};
 use nsh_core::prelude::*;
 
 use crate::store::{Store, now_ms};
-use crate::ui::{
-    self, Glyph, Size, Tone, Variant, badge, btn, code, colors, radius, type_scale,
-};
+use crate::ui::{self, Glyph, Size, Tone, Variant, badge, btn, code, colors, radius, type_scale};
 
 fn risk(risk: Risk) -> (&'static str, Tone) {
     match risk {
@@ -77,7 +73,11 @@ pub fn card(store: Store, approval: Approval) -> View {
         facts.push((Glyph::Warning, warning.clone(), Tone::Danger));
     }
     let (heading, body): (String, Option<View>) = match approval.card.as_ref().map(|c| &c.action) {
-        Some(CardAction::Command { line, title, looks_inside }) => (
+        Some(CardAction::Command {
+            line,
+            title,
+            looks_inside,
+        }) => (
             title.clone().unwrap_or_else(|| "Run a command".into()),
             Some(command_block(line, looks_inside)),
         ),
@@ -85,10 +85,9 @@ pub fn card(store: Store, approval: Approval) -> View {
             format!("Open {site}"),
             Some(detail_text(format!("For {once_minutes} minutes."))),
         ),
-        Some(CardAction::Use { what, detail }) => (
-            format!("Use {what}"),
-            detail.clone().map(detail_text),
-        ),
+        Some(CardAction::Use { what, detail }) => {
+            (format!("Use {what}"), detail.clone().map(detail_text))
+        }
         _ => (
             approval.summary.clone(),
             approval.detail.clone().map(detail_text),
@@ -148,11 +147,14 @@ pub fn card(store: Store, approval: Approval) -> View {
                 .child(view().flex_1())
                 .child(
                     text(
-                        [asked_by.map(|who| format!("asked by {who}")), expires(approval.expires_at_ms)]
-                            .into_iter()
-                            .flatten()
-                            .collect::<Vec<_>>()
-                            .join(" · "),
+                        [
+                            asked_by.map(|who| format!("asked by {who}")),
+                            expires(approval.expires_at_ms),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" · "),
                     )
                     .text_size(px(type_scale::XS))
                     .text_color(colors::FAINT),

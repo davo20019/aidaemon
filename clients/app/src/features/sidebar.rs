@@ -4,9 +4,7 @@
 use nsh_core::prelude::*;
 
 use crate::store::{Connection, Store, now_ms};
-use crate::ui::{
-    self, Glyph, Tone, colors, icon, row, section_label, size, status, type_scale,
-};
+use crate::ui::{self, Glyph, Tone, colors, icon, row, section_label, size, status, type_scale};
 use aidaemon_client_core::machine::DropKind;
 
 pub fn sidebar(store: Store) -> View {
@@ -34,22 +32,29 @@ pub fn sidebar(store: Store) -> View {
         )
         .child(
             view().px_2().child(
-                row(move || store.selected().is_none(), move || store.select(None))
-                    .accessibility_label("New conversation")
-                    .child(icon(Glyph::Plus).text_color(colors::MUTED))
-                    .child(text("New conversation").flex_1().text_size(px(type_scale::BASE)))
-                    .child(ui::kbd(key_label("mod+n"))),
+                row(
+                    move || store.selected().is_none(),
+                    move || store.select(None),
+                )
+                .accessibility_label("New conversation")
+                .child(icon(Glyph::Plus).text_color(colors::MUTED))
+                .child(
+                    text("New conversation")
+                        .flex_1()
+                        .text_size(px(type_scale::BASE)),
+                )
+                .child(ui::kbd(key_label("mod+n"))),
             ),
         )
         .child(section_label("Conversations").px_4())
         .child(
-            scroll().flex_1().child(
-                view().px_2().pb_2().gap(px(1.0)).child(each(
+            scroll()
+                .flex_1()
+                .child(view().px_2().pb_2().gap(px(1.0)).child(each(
                     ids,
                     |id: &String| id.clone(),
                     move |id, _| session_row(store, id.get_untracked()),
-                )),
-            ),
+                ))),
         )
         .child(ui::separator())
         .child(connection(store))
@@ -66,7 +71,13 @@ fn session_row(store: Store, id: String) -> nsh_base::ButtonElement {
             .w(px(size::ICON))
             .text_center()
             .text_size(px(8.0))
-            .text_color(move || if store.is_running(&e) { colors::ACCENT } else { colors::FAINT }),
+            .text_color(move || {
+                if store.is_running(&e) {
+                    colors::ACCENT
+                } else {
+                    colors::FAINT
+                }
+            }),
     )
     .child(
         view()
@@ -92,7 +103,11 @@ fn connection(store: Store) -> View {
         Some(untracked(move || match state {
             Connection::Online => status("Connected to the daemon", Tone::Success),
             Connection::Connecting => status("Connecting…", Tone::Accent),
-            Connection::Offline { kind, reason, retry_at_ms } => {
+            Connection::Offline {
+                kind,
+                reason,
+                retry_at_ms,
+            } => {
                 let headline = match kind {
                     DropKind::DaemonNotRunning => "The daemon is not running",
                     DropKind::Unauthorized => "The daemon refused this app",
@@ -100,18 +115,15 @@ fn connection(store: Store) -> View {
                     DropKind::Dropped => "Connection lost",
                 };
                 let retry = retry_at_ms.saturating_sub(now_ms()) / 1000;
-                view()
-                    .gap_1()
-                    .child(status(headline, Tone::Danger))
-                    .child(
-                        text(if kind == DropKind::Unauthorized {
-                            reason
-                        } else {
-                            format!("Retrying in {}s", retry.max(1))
-                        })
-                        .text_size(px(type_scale::XS))
-                        .text_color(colors::FAINT),
-                    )
+                view().gap_1().child(status(headline, Tone::Danger)).child(
+                    text(if kind == DropKind::Unauthorized {
+                        reason
+                    } else {
+                        format!("Retrying in {}s", retry.max(1))
+                    })
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+                )
             }
         }))
     }))

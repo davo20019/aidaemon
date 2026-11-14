@@ -87,12 +87,18 @@ fn frame(variant: Variant, size: Size, scale: f32) -> nsh_base::ButtonElement {
         .transition_all()
         .duration(motion::FAST)
         .ease_out()
-        .focus_visible(|s| s.outline(px(2.0)).outline_offset(px(2.0)).outline_color(colors::ACCENT))
+        .focus_visible(|s| {
+            s.outline(px(2.0))
+                .outline_offset(px(2.0))
+                .outline_color(colors::ACCENT)
+        })
         .active(move |s| s.scale(scale))
         .disabled_style(|s| s.opacity(0.45));
     let base = match fill(variant) {
         Some(color) => base.bg(color).hover(|s| s.opacity(0.88)),
-        None => base.hover(|s| s.bg(colors::HOVER)).active(|s| s.bg(colors::SELECTED)),
+        None => base
+            .hover(|s| s.bg(colors::HOVER))
+            .active(|s| s.bg(colors::SELECTED)),
     };
     if variant == Variant::Outline {
         base.border_1().border_color(colors::BORDER)
@@ -172,7 +178,11 @@ pub fn hint(label: impl IntoReactive<SharedString>) -> nsh_base::TooltipElement 
         .bg(colors::PRIMARY)
         .px_2()
         .py_1()
-        .child(text(label).text_size(px(type_scale::XS)).text_color(colors::ON_PRIMARY))
+        .child(
+            text(label)
+                .text_size(px(type_scale::XS))
+                .text_color(colors::ON_PRIMARY),
+        )
 }
 
 /// The app's glyphs: one family of plain symbols, so they read the same in
@@ -283,7 +293,11 @@ pub fn status(label: impl IntoReactive<SharedString>, tone: Tone) -> View {
         .flex_row()
         .items_center()
         .gap_1p5()
-        .child(text(Glyph::Dot.symbol()).text_size(px(8.0)).text_color(tone.color()))
+        .child(
+            text(Glyph::Dot.symbol())
+                .text_size(px(8.0))
+                .text_color(tone.color()),
+        )
         .child(
             text(label)
                 .text_size(px(type_scale::SM))
@@ -333,7 +347,10 @@ pub fn section_label(label: impl IntoReactive<SharedString>) -> Text {
 
 /// A selectable row in a list (the sidebar's sessions, a menu-like list).
 /// The wash fills its whole hit area; selection is stronger than hover.
-pub fn row(selected: impl Fn() -> bool + 'static, on_press: impl Fn() + 'static) -> nsh_base::ButtonElement {
+pub fn row(
+    selected: impl Fn() -> bool + 'static,
+    on_press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
     button()
         .min_h(px(size::ROW))
         .flex_row()

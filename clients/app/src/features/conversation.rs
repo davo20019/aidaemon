@@ -46,7 +46,12 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
     if store.live(session).is_some() {
         rows.push(Row::Live);
     }
-    rows.extend(store.approvals_for(session).into_iter().map(|a| Row::Approval(a.id)));
+    rows.extend(
+        store
+            .approvals_for(session)
+            .into_iter()
+            .map(|a| Row::Approval(a.id)),
+    );
     rows
 }
 
@@ -155,7 +160,14 @@ fn transcript(store: Store, session: String) -> VirtualList {
             }))
         },
     )
-    .keys(move || all.with(|r| r.iter().enumerate().map(|(i, row)| row.key(i)).collect::<Vec<_>>()))
+    .keys(move || {
+        all.with(|r| {
+            r.iter()
+                .enumerate()
+                .map(|(i, row)| row.key(i))
+                .collect::<Vec<_>>()
+        })
+    })
     .estimated_item_size(px(96.0))
     .initial_scroll_index(count.saturating_sub(1))
     .follow_end(px(48.0))
@@ -172,7 +184,7 @@ fn user_bubble(content: impl Fn() -> String + 'static) -> View {
         .px_3()
         .py_2()
         .child(
-            text(move || content())
+            text(content)
                 .selectable(true)
                 .text_size(px(type_scale::READ))
                 .line_height(px(type_scale::LH_READ)),
@@ -181,7 +193,7 @@ fn user_bubble(content: impl Fn() -> String + 'static) -> View {
 
 fn note(content: impl Fn() -> String + 'static) -> View {
     view().flex_row().gap_2().child(
-        text(move || content())
+        text(content)
             .text_size(px(type_scale::SM))
             .text_color(colors::MUTED),
     )
@@ -257,7 +269,9 @@ fn composer(store: Store, session: Option<String>) -> View {
                     .placeholder(move || match store.connection() {
                         Connection::Online => "Message AIdaemon… (/ for commands)".to_owned(),
                         Connection::Connecting => "Connecting to the daemon…".to_owned(),
-                        Connection::Offline { .. } => "Offline. Messages send once the daemon is back.".to_owned(),
+                        Connection::Offline { .. } => {
+                            "Offline. Messages send once the daemon is back.".to_owned()
+                        }
                     })
                     .placeholder_color(|| color(colors::FAINT))
                     .caret_color(|| color(colors::ACCENT))
@@ -303,9 +317,13 @@ fn composer(store: Store, session: Option<String>) -> View {
                         }
                     }))
                     .child(
-                        ui::btn_icon(Glyph::Send, "Send", Variant::Primary, ui::Size::Sm, move || {
-                            store.submit()
-                        })
+                        ui::btn_icon(
+                            Glyph::Send,
+                            "Send",
+                            Variant::Primary,
+                            ui::Size::Sm,
+                            move || store.submit(),
+                        )
                         .disabled(move || !can_send())
                         .accessibility_label("Send"),
                     ),

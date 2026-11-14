@@ -48,10 +48,15 @@ pub fn shell(store: Store) -> View {
         }))
         .child(
             view()
-                .style_when(move || !(show_inspector.get() && wide.get()), |s| s.hidden())
+                .style_when(
+                    move || !(show_inspector.get() && wide.get()),
+                    |s| s.hidden(),
+                )
                 .child(inspector(store)),
         )
-        .child(when(palette, move || palette_dialog(store, palette, show_sidebar, show_inspector)))
+        .child(when(palette, move || {
+            palette_dialog(store, palette, show_sidebar, show_inspector)
+        }))
 }
 
 fn palette_dialog(
@@ -61,8 +66,12 @@ fn palette_dialog(
     show_inspector: Signal<bool>,
 ) -> impl IntoElement {
     let mut items = vec![
-        CommandItem::new("new", "New conversation").group("Conversation").shortcut("mod+n"),
-        CommandItem::new("sidebar", "Show or hide the sidebar").group("View").shortcut("mod+b"),
+        CommandItem::new("new", "New conversation")
+            .group("Conversation")
+            .shortcut("mod+n"),
+        CommandItem::new("sidebar", "Show or hide the sidebar")
+            .group("View")
+            .shortcut("mod+b"),
         CommandItem::new("inspector", "Show or hide the activity panel")
             .group("View")
             .shortcut("mod+i"),
