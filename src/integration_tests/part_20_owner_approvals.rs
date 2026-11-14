@@ -1222,12 +1222,14 @@ async fn terminal_outside_kernel_requires_kernel_approval() {
         pool,
     )
     .await;
-    // Trust markers in the arguments stand in for nothing.
+    // Trust markers in the arguments stand in for nothing. (An allowlisted
+    // observation such as `printf` runs confined without a card, so the
+    // command here is one the ladder asks about.)
     let error = terminal
         .call(
             &json!({
                 "action": "run",
-                "command": "printf synthetic-outside",
+                "command": "rm -f synthetic-outside",
                 "_trusted_session": true,
                 "_user_role": "Owner",
             })
