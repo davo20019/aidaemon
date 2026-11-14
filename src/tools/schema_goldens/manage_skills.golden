@@ -1,8 +1,8 @@
 {
-  "description": "Manage skills: add, add_inline, learn_api, list, remove, remove_all, enable, disable, browse, install, update, review. Bundled files via skill_resources.",
+  "description": "Manage skills: add, add_inline, list, remove, remove_all, enable, disable, browse, install, update, review. Bundled files via skill_resources. API guides: manage_api.",
   "name": "manage_skills",
   "schema": {
-    "description": "Manage skills: add, add_inline, learn_api, list, remove, remove_all, enable, disable, browse, install, update, review. Bundled files via skill_resources.",
+    "description": "Manage skills: add, add_inline, list, remove, remove_all, enable, disable, browse, install, update, review. Bundled files via skill_resources. API guides: manage_api.",
     "name": "manage_skills",
     "parameters": {
       "additionalProperties": false,
@@ -12,7 +12,6 @@
           "enum": [
             "add",
             "add_inline",
-            "learn_api",
             "list",
             "remove",
             "remove_all",
@@ -38,14 +37,6 @@
         "dry_run": {
           "type": "boolean"
         },
-        "kind": {
-          "enum": [
-            "auto",
-            "openapi",
-            "docs"
-          ],
-          "type": "string"
-        },
         "name": {
           "type": "string"
         },
@@ -55,10 +46,6 @@
             "type": "string"
           },
           "type": "array"
-        },
-        "profile": {
-          "description": "Auth profile for learn_api",
-          "type": "string"
         },
         "query": {
           "type": "string"

@@ -109,7 +109,6 @@ manage_people.value
 manage_skills.approve
 manage_skills.draft_id
 manage_skills.dry_run
-manage_skills.kind
 manage_skills.name
 manage_skills.query
 manage_skills.url

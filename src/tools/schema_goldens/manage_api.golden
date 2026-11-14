@@ -1,8 +1,8 @@
 {
-  "description": "Onboard API: auth+learn+verify. Never ask user to paste credentials; use keychain command instead.",
+  "description": "Connect an API: auth, learn its guide from docs/OpenAPI (learn_url), verify. Never ask the user to paste credentials; they use the keychain command.",
   "name": "manage_api",
   "schema": {
-    "description": "Onboard API: auth+learn+verify. Never ask user to paste credentials; use keychain command instead.",
+    "description": "Connect an API: auth, learn its guide from docs/OpenAPI (learn_url), verify. Never ask the user to paste credentials; they use the keychain command.",
     "name": "manage_api",
     "parameters": {
       "additionalProperties": false,

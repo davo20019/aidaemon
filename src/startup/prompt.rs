@@ -264,8 +264,8 @@ pub(crate) fn build_base_system_prompt(
         "\n\n## API Runtime Context\n\
         Available manual HTTP auth profiles: {}.\n\
         Profiles missing API guides: {}.\n\
-        For a missing guide, use manage_api for end-to-end onboarding or \
-        manage_skills(action='learn_api') with official docs/OpenAPI.\n\
+        For a missing guide, use manage_api (onboard; auth_mode existing plus learn_url \
+        for an already connected API) with official docs/OpenAPI.\n\
         Never ask the user to paste credentials into chat.",
         if profile_names.is_empty() {
             "none".to_string()

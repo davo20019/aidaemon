@@ -1210,7 +1210,6 @@ mod tests {
             };
             for args in [
                 json!({"action":"add","url":"https://example.com/skill.md"}),
-                json!({"action":"learn_api","url":"https://example.com/openapi.json"}),
                 json!({"action":"install","name":"synthetic"}),
                 json!({"action":"update","name":"synthetic"}),
             ] {
