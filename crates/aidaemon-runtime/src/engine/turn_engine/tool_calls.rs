@@ -1267,15 +1267,20 @@ impl TurnEngine<'_> {
             {
                 warn!(task_id = scope.task_id, %error, "SDK engine: could not record a checklist");
             }
-            // A step the model ticked shows as done only once receipts
-            // prove it: the card is redrawn with what they proved.
-            if let Some(plan) = self
+        }
+        // A step's proof is an event: any receipt recorded can prove a step
+        // the model ticked earlier (a change, then a later check of its
+        // target, live 2026-11-14: the parent saw the site answer after its
+        // helper's run, and the row kept "I couldn't verify this one"). So
+        // each result that lands re-reads the proof, and a step it proves
+        // redraws the card through the one renderer.
+        if !failed
+            && let Some(plan) = self
                 .confirm_checklist_from_receipts(scope.session_id, scope.task_id)
                 .await
-                && let Some(status_tx) = &scope.status_tx
-            {
-                let _ = status_tx.try_send(StatusUpdate::Checklist(plan));
-            }
+            && let Some(status_tx) = &scope.status_tx
+        {
+            let _ = status_tx.try_send(StatusUpdate::Checklist(plan));
         }
         info!(
             session_id = scope.session_id,

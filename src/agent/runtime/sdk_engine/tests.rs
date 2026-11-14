@@ -5288,3 +5288,96 @@ async fn a_ticked_step_is_confirmed_only_by_the_runs_receipts() {
     assert!(card.contains("✅ read the second file"), "{card}");
     assert!(!card.contains("verify"), "{card}");
 }
+
+/// A step's proof is an event: a step the model ticked before anything
+/// proved it is redrawn on the card once a later receipt proves it, so its
+/// row loses "I couldn't verify this one" (live 2026-11-14: the parent saw
+/// the site answer after the step was ticked, and the row kept the note).
+#[tokio::test]
+async fn a_later_receipt_that_proves_a_ticked_step_redraws_the_card() {
+    use crate::testing::MockProvider;
+    let workspace = tempfile::tempdir().expect("workspace");
+    let cwd = workspace.path().to_string_lossy().to_string();
+    let first = workspace.path().join("first.txt");
+    let second = workspace.path().join("second.txt");
+    let (first, second) = (
+        first.to_string_lossy().to_string(),
+        second.to_string_lossy().to_string(),
+    );
+    let checklist = |status: &str| {
+        serde_json::json!({
+            "items": [
+                {"text": "write the first file", "status": status,
+                 "mutation_effects": ["local_workspace_write"], "targets": [first]},
+                {"text": "write the second file", "status": status,
+                 "mutation_effects": ["local_workspace_write"], "targets": [second]}
+            ]
+        })
+        .to_string()
+    };
+    let write = |path: &str| {
+        serde_json::json!({
+            "command": format!("printf SYNTHETIC > '{path}'"),
+            "working_dir": cwd,
+            "write_paths": [path]
+        })
+        .to_string()
+    };
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", &checklist("pending")),
+        // Ticked on the model's word, before anything proves either step.
+        MockProvider::tool_call_response("track_requirements", &checklist("completed")),
+        MockProvider::tool_call_response("terminal", &write(&first)),
+        MockProvider::tool_call_response("terminal", &write(&second)),
+        MockProvider::text_response("Both written."),
+        MockProvider::text_response("Both written."),
+        MockProvider::text_response("Both written."),
+    ]);
+    let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let plans = Arc::new(crate::plans::PlanStore::new(plan_pool).await.unwrap());
+    let track =
+        Arc::new(crate::tools::track_requirements::TrackRequirementsTool::new(plans.clone()));
+    let mut harness = crate::testing::setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![track as Arc<dyn crate::traits::Tool>],
+    )
+    .await
+    .unwrap();
+    harness.agent.set_sdk_engine(SdkEngineSettings::default());
+    harness.agent.set_plan_store(plans.clone()).await;
+
+    let (status_tx, mut status_rx) = mpsc::channel(256);
+    harness
+        .agent
+        .handle_message(
+            "later_receipt_redraws_the_card",
+            "Write both files.",
+            Some(status_tx),
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut cards = Vec::new();
+    while let Ok(update) = status_rx.try_recv() {
+        if let aidaemon_tools::status::StatusUpdate::Checklist(plan) = update {
+            cards.push(plan.text);
+        }
+    }
+    assert!(
+        std::fs::read_to_string(&second).is_ok(),
+        "the writes ran: {cards:?}"
+    );
+    let last = cards.last().expect("a card was drawn");
+    assert!(
+        last.contains("✅ write the first file") && last.contains("✅ write the second file"),
+        "the card drawn last shows both proven: {cards:?}"
+    );
+    assert!(!last.contains("verify"), "{cards:?}");
+}

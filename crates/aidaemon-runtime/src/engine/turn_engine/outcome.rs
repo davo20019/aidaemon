@@ -69,6 +69,18 @@ impl TurnEngine<'_> {
         task_id: &str,
     ) -> Option<aidaemon_core::card::PlanCard> {
         let plan_store = self.plan_store().await?;
+        // Only a step still on the model's word can be proven: a checklist
+        // with none skips reading the run's evidence.
+        plan_store
+            .for_task(session_id, task_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|plan| {
+                plan.steps
+                    .iter()
+                    .any(|step| step.evidence == aidaemon_work::plans::StepEvidence::ModelSaid)
+            })?;
         let proven = self
             .events()
             .task_run_aggregate(session_id, task_id)
