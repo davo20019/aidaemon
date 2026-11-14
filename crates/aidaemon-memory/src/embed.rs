@@ -166,7 +166,7 @@ mod fast {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+    use fastembed::{AutoDevicePolicy, EmbeddingModel, TextEmbedding, TextInitOptions};
     use tokio::sync::OnceCell;
 
     use super::Embedder;
@@ -213,6 +213,9 @@ mod fast {
                     tokio::task::spawn_blocking(move || {
                         let mut options = TextInitOptions::new(EmbeddingModel::AllMiniLML6V2)
                             .with_show_download_progress(progress);
+                        // Plain CPU: ort's default registers CoreML on macOS,
+                        // which costs ~5x the memory for this model and is slower.
+                        options.auto_device = Some(AutoDevicePolicy::PreferCPU);
                         if let Some(dir) = cache_dir {
                             options = options.with_cache_dir(dir);
                         }

@@ -1,4 +1,4 @@
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use fastembed::{AutoDevicePolicy, EmbeddingModel, TextEmbedding, TextInitOptions};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 use tokio::task;
@@ -71,6 +71,11 @@ impl EmbeddingService {
                 task::spawn_blocking(|| {
                     let mut options = TextInitOptions::default();
                     options.model_name = EmbeddingModel::AllMiniLML6V2;
+                    // Plain CPU execution. ort's default policy registers
+                    // CoreML on macOS, which for this small model peaked near
+                    // 1 GB of memory (vs ~200 MB) and ran 2-4x slower, with
+                    // the same vectors.
+                    options.auto_device = Some(AutoDevicePolicy::PreferCPU);
                     options.show_download_progress = true;
                     let model = TextEmbedding::try_new(options)?;
                     info!("Embedding model loaded (AllMiniLML6V2)");
