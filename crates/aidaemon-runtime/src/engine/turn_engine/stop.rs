@@ -191,7 +191,7 @@ impl TurnEngine<'_> {
     /// killed (live 2026-11-12: a counting sub-agent answered "at 15 of
     /// 300, still running", its end killed the count, and the chat was told
     /// it finished). Waits, as progress, until those jobs end, at most
-    /// [`UNREPORTED_JOB_MAX_WAIT`] in one run: `None` when nothing was
+    /// `UNREPORTED_JOB_MAX_WAIT` in one run: `None` when nothing was
     /// running, else whether they ended, so the run reads their result (or
     /// stops them and says so) before it answers. Read from the tools' typed
     /// process state, never from the reply.
@@ -549,7 +549,7 @@ impl TurnEngine<'_> {
     pub async fn sdk_judge_unattempted_work(
         &self,
         scope: &TurnScope<'_>,
-        launch: Option<(&str, &[usize])>,
+        launch: Option<(&str, &[usize], usize)>,
     ) -> Option<sdk::StopDecision> {
         let aggregate = self
             .events()
@@ -557,7 +557,7 @@ impl TurnEngine<'_> {
             .await
             .ok()?;
         let aggregate = match launch {
-            Some((call_id, items)) => aggregate.with_pending_launch(call_id, items),
+            Some((call_id, items, runs)) => aggregate.with_pending_launch(call_id, items, runs),
             None => aggregate,
         };
         let changes_permitted =

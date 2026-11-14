@@ -28,9 +28,10 @@ pub enum TerminalConfinement {
     /// authenticated CLIs just work.
     #[default]
     Host,
-    /// Run every command inside the OS sandbox (macOS seatbelt / Codex
-    /// sandbox) with deny-by-default filesystem and network policy scoped
-    /// to the task. Opt-in for advanced users who want blast-radius
+    /// Run every command inside the OS sandbox (seatbelt on macOS; on
+    /// Linux the Codex sandbox adapter when installed, else bubblewrap)
+    /// with deny-by-default filesystem and network policy scoped to the
+    /// task. Opt-in for advanced users who want blast-radius
     /// containment; expect tools that rely on `$HOME` credentials or the
     /// network to need explicit grants.
     Sandbox,
@@ -463,6 +464,107 @@ impl Sandbox for BubblewrapSandbox {
     }
 }
 
+/// What a task-scoped bubblewrap sandbox may touch: deny by default, unlike
+/// [`BubblewrapSandbox::args`] (which mounts the whole host read-only). The
+/// command sees the base system directories (the dynamic loader, `/usr`,
+/// `/bin`, `/lib`), a private `/dev`, `/proc` and `/tmp`, and exactly the
+/// listed paths: `read_paths` read-only, `write_paths` read-write. With
+/// `allow_network` it also sees the resolver and CA configuration it needs
+/// to use the network. Listed paths that do not exist are skipped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BubblewrapScope {
+    /// Working directory inside the sandbox (absolute).
+    pub cwd: String,
+    pub read_paths: Vec<String>,
+    pub write_paths: Vec<String>,
+    pub allow_network: bool,
+}
+
+/// Base system paths every scoped command can read.
+const SCOPED_SYSTEM_READS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/alternatives",
+];
+
+/// Extra configuration a networked scoped command reads (name resolution,
+/// TLS roots).
+const SCOPED_NETWORK_READS: &[&str] = &[
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+    "/etc/gai.conf",
+    "/etc/ssl",
+    "/etc/ca-certificates",
+    "/etc/pki",
+];
+
+impl BubblewrapSandbox {
+    /// The `bwrap` argument list for a task-scoped command (see
+    /// [`BubblewrapScope`]), ending with `-- <command...>`. Listed paths are
+    /// mounted shallowest first, so a narrower grant inside a wider one
+    /// keeps its own access; a path listed both ways is writable.
+    pub fn scoped_args(scope: &BubblewrapScope, command: &[String]) -> Vec<String> {
+        let mut args: Vec<String> = Vec::new();
+        let system = SCOPED_SYSTEM_READS.iter().chain(if scope.allow_network {
+            SCOPED_NETWORK_READS.iter()
+        } else {
+            [].iter()
+        });
+        for path in system {
+            args.extend(["--ro-bind-try".into(), path.to_string(), path.to_string()]);
+        }
+        args.extend(
+            ["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        let mut mounts: Vec<(&str, bool)> = Vec::new();
+        for path in &scope.write_paths {
+            if !mounts.iter().any(|(p, _)| *p == path.as_str()) {
+                mounts.push((path.as_str(), true));
+            }
+        }
+        for path in &scope.read_paths {
+            if !mounts.iter().any(|(p, _)| *p == path.as_str()) {
+                mounts.push((path.as_str(), false));
+            }
+        }
+        // Stable: equal depths keep writes before reads, and paths keep
+        // their listed order.
+        mounts.sort_by_key(|(path, _)| Path::new(path).components().count());
+        for (path, writable) in mounts {
+            let flag = if writable {
+                "--bind-try"
+            } else {
+                "--ro-bind-try"
+            };
+            args.extend([flag.into(), path.to_string(), path.to_string()]);
+        }
+        args.push("--unshare-pid".into());
+        if !scope.allow_network {
+            args.push("--unshare-net".into());
+        }
+        args.extend([
+            "--die-with-parent".into(),
+            "--new-session".into(),
+            "--chdir".into(),
+            scope.cwd.clone(),
+            "--".into(),
+        ]);
+        args.extend(command.iter().cloned());
+        args
+    }
+}
+
 // ----------------------------------------------------------------- seatbelt
 
 /// macOS sandbox using `sandbox-exec` with a generated profile: everything
@@ -882,6 +984,53 @@ mod tests {
                 .args(&open)
                 .contains(&"--unshare-net".to_string())
         );
+    }
+
+    #[test]
+    fn bubblewrap_scoped_args_mount_only_the_listed_paths() {
+        let scope = BubblewrapScope {
+            cwd: "/work/repo".into(),
+            read_paths: vec!["/work/repo".into(), "/work/repo/src".into()],
+            write_paths: vec!["/work/repo/target".into(), "/work/repo".into()],
+            allow_network: false,
+        };
+        let command = vec!["/bin/sh".to_string(), "-c".into(), "make".into()];
+        let args = BubblewrapSandbox::scoped_args(&scope, &command);
+        let joined = args.join(" ");
+        // Deny by default: never the whole host, and no network config.
+        assert!(!joined.contains("--ro-bind / /"), "{joined}");
+        assert!(!joined.contains("/etc/resolv.conf"), "{joined}");
+        assert!(joined.contains("--ro-bind-try /usr /usr"));
+        assert!(joined.contains("--dev /dev --proc /proc --tmpfs /tmp"));
+        // Shallowest first; the repo is listed both ways and stays writable;
+        // the narrower read-only `src` comes after it.
+        let repo = joined.find("--bind-try /work/repo /work/repo").unwrap();
+        let src = joined
+            .find("--ro-bind-try /work/repo/src /work/repo/src")
+            .unwrap();
+        let target = joined
+            .find("--bind-try /work/repo/target /work/repo/target")
+            .unwrap();
+        assert!(repo < src && repo < target, "{joined}");
+        assert!(!joined.contains("--ro-bind-try /work/repo /work/repo"));
+        // The private /tmp is mounted before any listed path under it.
+        assert!(joined.find("--tmpfs /tmp").unwrap() < repo);
+        assert!(args.contains(&"--unshare-net".to_string()));
+        assert!(joined.ends_with("--chdir /work/repo -- /bin/sh -c make"));
+    }
+
+    #[test]
+    fn bubblewrap_scoped_args_with_network_read_the_resolver() {
+        let scope = BubblewrapScope {
+            cwd: "/".into(),
+            allow_network: true,
+            ..BubblewrapScope::default()
+        };
+        let args = BubblewrapSandbox::scoped_args(&scope, &["true".to_string()]);
+        let joined = args.join(" ");
+        assert!(!args.contains(&"--unshare-net".to_string()));
+        assert!(joined.contains("--ro-bind-try /etc/resolv.conf /etc/resolv.conf"));
+        assert!(joined.contains("--ro-bind-try /etc/ssl /etc/ssl"));
     }
 
     #[test]

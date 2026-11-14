@@ -1,7 +1,7 @@
 //! The agent-driven view: which client connection may be moved, and the one
 //! way to move it.
 //!
-//! A socket that declares [`Capability::ViewActions`] in `hello` is given a
+//! A socket that declares `Capability::ViewActions` in `hello` is given a
 //! private outbox. When it sends a message into an app session, that session
 //! names it as its view target; a message from anywhere else (an HTTP call,
 //! a socket without the capability) clears the target, and so does the

@@ -5,7 +5,7 @@
 //! engine reads the host's typed surface as its own, and it passes itself
 //! wherever a `&dyn TurnHost` is wanted (`turn::task_end`, the side-call
 //! gateway). It owns no state; a turn's state lives in its
-//! [`TurnScope`](crate::engine::scope::TurnScope).
+//! [`crate::engine::scope::TurnScope`].
 //!
 //! Layout: `model_call` serves the kernel's provider requests,
 //! `compaction` compacts a run that outgrows its window, `outcome` turns a
@@ -1328,6 +1328,7 @@ impl TurnEngine<'_> {
                 // The request's project folder.
                 working_area: scope.project_scope.as_deref(),
                 owned_folders: scope.spawn_family.owned_folders(),
+                produced_files: scope.spawn_family.produced_files(),
             },
             owner: crate::approvals::OwnerApprovalResolver {
                 decisions: self.host,

@@ -289,6 +289,22 @@ pub async fn deliver_when_run_ends(
         turn.wait().await;
     }
     let state = ended.state;
+    // One of a group its turn started: the request's answer, a continuation
+    // of that turn, does the turn's own steps and settles the card once it
+    // is written ([`answer_group`]). The plan is known by this run's job
+    // until its end settles its steps.
+    let answer_follows = route.runs.answered_together(&state.id);
+    let plan_id = if answer_follows {
+        super::card::job_plan(
+            route.plans.as_ref(),
+            route.plan_session.as_deref(),
+            &state.id,
+        )
+        .await
+        .map(|plan| plan.id)
+    } else {
+        None
+    };
     // The card settles to its final header first; the result follows,
     // without saying again how it ended.
     let on_card = settle_background_steps(
@@ -299,6 +315,7 @@ pub async fn deliver_when_run_ends(
         &state.chat,
         &state.id,
         job_end(state.phase, state.failure.as_ref()),
+        answer_follows,
     )
     .await;
     let message = render_run_result(
@@ -325,7 +342,9 @@ pub async fn deliver_when_run_ends(
                 "A helper's result waits for the rest of its group"
             );
         }
-        crate::run_state::GroupTurn::Complete(ends) => answer_group(&route, ends).await,
+        crate::run_state::GroupTurn::Complete(ends) => {
+            answer_group(&route, ends, plan_id.as_deref()).await
+        }
     }
 }
 
@@ -369,10 +388,15 @@ async fn deliver_run_message(route: &ResultRoute, end: &crate::run_state::GroupE
 /// answer, written by the parent from every run's typed result
 /// ([`group_followup`]). When no answer can be written, each run's own
 /// result goes to the chat instead, so nothing is lost.
-async fn answer_group(route: &ResultRoute, ends: Vec<crate::run_state::GroupEnd>) {
+async fn answer_group(
+    route: &ResultRoute,
+    ends: Vec<crate::run_state::GroupEnd>,
+    plan_id: Option<&str>,
+) {
     let Some(chat) = ends.first().map(|end| end.state.chat.clone()) else {
         return;
     };
+    let jobs: Vec<String> = ends.iter().map(|end| end.state.id.clone()).collect();
     let answered = route
         .agent
         .answer_after_runs(crate::spawn::RunsAnswer {
@@ -383,6 +407,18 @@ async fn answer_group(route: &ResultRoute, ends: Vec<crate::run_state::GroupEnd>
             clock: crate::run_state::RequestClock::of_group(&ends),
         })
         .await;
+    // The request's turn is over, answered or not: the card settles from
+    // the plan as the answer left it (its own steps done by the answer's
+    // turn), above the answer or the results that replace it.
+    super::card::settle_answered_request(
+        &route.runs,
+        route.plans.as_ref(),
+        route.hub.as_ref(),
+        &chat,
+        plan_id,
+        &jobs,
+    )
+    .await;
     match answered {
         Ok(true) => {
             info!(session_id = %chat, runs = ends.len(), "Answered a request once its helpers all ended");

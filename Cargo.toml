@@ -109,7 +109,8 @@ regex = "1"
 # background-process reaper to detect genuine progress (CPU/IO/output advancing)
 # vs. a truly-stalled process. Default features disabled — we only need the
 # `system` component (processes), not disks/networks/components.
-sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+# 0.38: sysinfo 0.39 and later need rustc 1.95, past the SDK crates' MSRV (1.94).
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 self_update = { version = "1.3", features = ["reqwest", "rustls", "github", "archive-tar", "compression-tar-gz"], default-features = false }
 semver = "1"
 hmac = "0.13"
@@ -165,10 +166,12 @@ xcap = { version = "0.9", optional = true }
 tikv-jemallocator = "0.7"
 
 [features]
-default = ["discord", "slack", "encryption", "browser", "terminal-bridge", "otel"]
+default = ["discord", "slack", "encryption", "browser", "terminal-bridge", "otel", "execution-docker"]
 browser = ["aidaemon-tool-browser/chromium"]
 discord = ["dep:aidaemon-channel-discord"]
 slack = ["dep:aidaemon-channel-slack"]
+# The Docker execution backend: code only (it drives the `docker` CLI, no
+# extra crates), so it is on by default and needs Docker only when used.
 execution-docker = ["aidaemon-tools/docker"]
 terminal-bridge = ["dep:aidaemon-terminal-bridge"]
 encryption = ["libsqlite3-sys/bundled-sqlcipher", "aidaemon-runtime/encryption"]

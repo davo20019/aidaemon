@@ -49,6 +49,15 @@
           },
           "type": "array"
         },
+        "owner_units": {
+          "description": "The owner's units of work (numbered in \"What the owner asked for\") this sub-agent carries out. It takes on your checklist's own items for those units, so name them even when you also give checklist_items.",
+          "items": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
         "precedence": {
           "description": "Give this whenever scope overlaps a running child's: whose change stands if both change the same lines there. this_child: this child's. running_siblings: the children already running. shared: neither, and each such change is put to you to decide. Omitted, it is shared. No child ever overwrites another's lines without one of these deciding it.",
           "enum": [
@@ -80,7 +89,7 @@
           "type": "string"
         },
         "task": {
-          "description": "The specific task or question the sub-agent should accomplish. Keep it self-contained but concise: state the goal, success criteria, and any non-obvious constraints. Do NOT paste file contents, prior tool output, or conversation excerpts — give file paths and let the sub-agent read them itself. Ask only for the work and what it found: the daemon measures every helper's time (start, finish, and since the owner's request) on its own record, so a helper never times itself or reports a duration.",
+          "description": "The specific task or question the sub-agent should accomplish. Keep it self-contained but concise: state the goal, success criteria, and any non-obvious constraints. Do NOT paste file contents, prior tool output, or conversation excerpts — give file paths and let the sub-agent read them itself. Ask only for the work and what it found: the daemon measures every helper's time (start, finish, and since the owner's request) on its own record, so a helper never times itself or reports a duration. What the owner asked to receive from a piece of work (its screenshot, its file) is that work's own deliverable: ask for it in the task of the helper doing the work, which delivers it when its run ends, never in a separate helper that collects and sends what other helpers made.",
           "type": "string"
         },
         "task_id": {

@@ -252,6 +252,7 @@ mod tests {
 
     fn ended(label: &str, phase: RunPhase) -> HelperView {
         HelperView {
+            run: None,
             phase,
             ..HelperView::running(label, false, None)
         }

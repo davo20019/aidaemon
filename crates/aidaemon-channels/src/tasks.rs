@@ -572,12 +572,12 @@ impl TaskRegistry {
     ///
     /// Closes the race where a session task finishes between the caller's
     /// `has_running_task()` check and `queue_message()`: a message queued
-    /// after the drain in [`finalize_and_drain`] would otherwise sit in the
+    /// after the drain in `finalize_and_drain` would otherwise sit in the
     /// queue with nothing left to drain it (observed in the 2026-06-06
     /// attribution run, where a queued message was silently stranded).
     ///
     /// Lock order: `tasks` → `recently_seen` → `queues` (same as
-    /// [`finalize_and_drain`]), so the two operations serialize and the
+    /// `finalize_and_drain`), so the two operations serialize and the
     /// caller can trust the [`QueueOutcome`].
     pub async fn queue_message_if_running(
         &self,
@@ -629,7 +629,7 @@ impl TaskRegistry {
     /// the session's message queue in one critical section.
     ///
     /// Holding the task-map write lock across both steps means no concurrent
-    /// [`queue_message_if_running`] can observe the task as running after the
+    /// `queue_message_if_running` can observe the task as running after the
     /// drain — so a message is either drained here or rejected with
     /// `NoRunningTask` (and processed directly by its own handler). Replaces
     /// the racy `complete()`/`fail()` → gap → `pop_all_queued_messages()`

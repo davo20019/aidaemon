@@ -3521,6 +3521,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
     for (tool, turn_authority) in [("spawn_agent", None), ("note_probe", Some(&turn))] {
         let ctx = crate::agent::tool_exec::ToolExecCtx {
             file_fence: None,
+            produced_files: None,
             mcp_tool: None,
             owner_approval_by_kernel: false,
             session_id: "telegram:synthetic-user-1",
@@ -5366,4 +5367,235 @@ async fn a_later_receipt_that_proves_a_ticked_step_redraws_the_card() {
         "the card drawn last shows both proven: {cards:?}"
     );
     assert!(!last.contains("verify"), "{cards:?}");
+}
+
+/// Live 2026-11-14 (tool-audit test on `de7ba692`): remember_fact answered
+/// "Remembered: ..." and the step that declared the save still closed "(I
+/// couldn't verify this one)". A memory-write receipt credits the step that
+/// declared a memory write.
+#[tokio::test]
+async fn a_memory_write_receipt_credits_the_step_that_declared_it() {
+    use crate::testing::MockProvider;
+    let checklist = |status: &str, effects: &[&str], targets: &serde_json::Value| {
+        serde_json::json!({
+            "items": [
+                {"text": "remember the color", "status": status,
+                 "mutation_effects": effects, "targets": targets},
+                {"text": "say it back", "status": status}
+            ]
+        })
+        .to_string()
+    };
+    let none = serde_json::json!([]);
+    let mut failures = Vec::new();
+    for (effects, targets) in [
+        (&["memory_write"][..], none.clone()),
+        (&["configuration"][..], none.clone()),
+        (&["memory_write", "configuration"][..], none.clone()),
+        (&["memory_write"][..], serde_json::json!(["color"])),
+        (
+            &["memory_write"][..],
+            serde_json::json!(["preference:color"]),
+        ),
+        (&["memory_write"][..], serde_json::json!(["memory"])),
+        (&["memory_write"][..], serde_json::json!(["user"])),
+    ] {
+        let provider = MockProvider::with_responses(vec![
+            MockProvider::tool_call_response(
+                "track_requirements",
+                &checklist("pending", effects, &targets),
+            ),
+            remember("teal"),
+            MockProvider::tool_call_response(
+                "track_requirements",
+                &checklist("completed", effects, &targets),
+            ),
+            MockProvider::text_response("Remembered teal."),
+            MockProvider::text_response("Remembered teal."),
+            MockProvider::text_response("Remembered teal."),
+        ]);
+        let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(plan_pool).await.unwrap());
+        // Resource-ID targets bind against what the adapters advertise, as
+        // in the daemon (`core.rs`): here the session-resource namespace.
+        let vocabulary =
+            crate::tools::track_requirements::StableSubjectVocabulary::from_subjects(vec![
+                crate::traits::StableObservationSubject::namespace("res_", "session resources"),
+            ]);
+        let track = Arc::new(
+            crate::tools::track_requirements::TrackRequirementsTool::new(plans.clone())
+                .with_stable_subjects(vocabulary),
+        );
+        let mut harness = crate::testing::setup_full_stack_test_agent_with_extra_tools(
+            provider,
+            vec![track as Arc<dyn crate::traits::Tool>],
+        )
+        .await
+        .unwrap();
+        harness.agent.set_sdk_engine(SdkEngineSettings::default());
+        harness.agent.set_plan_store(plans.clone()).await;
+        let (status_tx, mut status_rx) = mpsc::channel(256);
+        harness
+            .agent
+            .handle_message(
+                "memory_receipt_credits_the_step",
+                "Remember that my color is teal.",
+                Some(status_tx),
+                UserRole::Owner,
+                ChannelContext::private("telegram"),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut cards = Vec::new();
+        while let Ok(update) = status_rx.try_recv() {
+            if let aidaemon_tools::status::StatusUpdate::Checklist(plan) = update {
+                cards.push(plan.text);
+            }
+        }
+        let last = cards.last().expect("a card was drawn");
+        if !(last.contains("✅ remember the color") && !last.contains("verify")) {
+            failures.push(format!("{effects:?} {targets}: {last}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the save proves the step: {failures:#?}"
+    );
+}
+
+/// Live 2026-11-14 (tool-audit test on `de7ba692`): send_file answered
+/// "File sent: README.md (24 KB)" and the step that declared the delivery
+/// still closed "(I couldn't verify this one)". A delivery receipt credits
+/// the step that declared the delivery.
+#[tokio::test]
+async fn a_delivery_receipt_credits_the_step_that_declared_it() {
+    use crate::testing::MockProvider;
+    let workspace = tempfile::tempdir().expect("workspace");
+    let readme = workspace.path().join("README.md");
+    std::fs::write(&readme, "SYNTHETIC README\n").unwrap();
+    let readme = readme.to_string_lossy().to_string();
+    let dir = workspace.path().to_string_lossy().to_string();
+    let variants: Vec<(&str, serde_json::Value, bool)> = vec![
+        ("no target", serde_json::json!([]), false),
+        ("exact path", serde_json::json!([readme.clone()]), false),
+        ("file name", serde_json::json!(["README.md"]), false),
+        ("its folder", serde_json::json!([dir.clone()]), false),
+        ("no target, ticked after", serde_json::json!([]), true),
+        (
+            "exact path, ticked after",
+            serde_json::json!([readme.clone()]),
+            true,
+        ),
+        (
+            "file name, ticked after",
+            serde_json::json!(["README.md"]),
+            true,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, targets, after) in variants {
+        let checklist = |status: &str| {
+            serde_json::json!({
+                "items": [
+                    {"text": "send the readme", "status": status,
+                     "mutation_effects": ["external_delivery"], "targets": targets},
+                    {"text": "say it was sent", "status": status}
+                ]
+            })
+            .to_string()
+        };
+        let send = serde_json::json!({"file_path": readme}).to_string();
+        let mut script = Vec::new();
+        if !after {
+            script.push(MockProvider::tool_call_response(
+                "track_requirements",
+                &checklist("pending"),
+            ));
+        }
+        script.extend([
+            MockProvider::tool_call_response("send_file", &send),
+            MockProvider::tool_call_response("track_requirements", &checklist("completed")),
+            MockProvider::text_response("Sent."),
+            MockProvider::text_response("Sent."),
+            MockProvider::text_response("Sent."),
+        ]);
+        let provider = MockProvider::with_responses(script);
+        let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(plan_pool).await.unwrap());
+        let (media_tx, mut media_rx) = mpsc::channel::<aidaemon_channels::hub::MediaMessage>(8);
+        tokio::spawn(async move {
+            while let Some(message) = media_rx.recv().await {
+                if let Some(ack) = message.result_tx {
+                    let _ = ack.send(Ok(()));
+                }
+            }
+        });
+        let send_file = Arc::new(crate::tools::SendFileTool::new(
+            crate::execution::active_execution_backend(),
+            media_tx,
+            std::slice::from_ref(&dir),
+            &workspace.path().join("inbox").to_string_lossy(),
+        ));
+        // Resource-ID targets bind against what the adapters advertise, as
+        // in the daemon (`core.rs`).
+        let vocabulary =
+            crate::tools::track_requirements::StableSubjectVocabulary::from_tools(&[send_file
+                .clone()
+                as Arc<dyn crate::traits::Tool>]);
+        let track = Arc::new(
+            crate::tools::track_requirements::TrackRequirementsTool::new(plans.clone())
+                .with_stable_subjects(vocabulary),
+        );
+        let mut harness = crate::testing::setup_full_stack_test_agent_with_extra_tools(
+            provider,
+            vec![
+                track as Arc<dyn crate::traits::Tool>,
+                send_file as Arc<dyn crate::traits::Tool>,
+            ],
+        )
+        .await
+        .unwrap();
+        harness.agent.set_sdk_engine(SdkEngineSettings::default());
+        harness.agent.set_plan_store(plans.clone()).await;
+        let (status_tx, mut status_rx) = mpsc::channel(256);
+        harness
+            .agent
+            .handle_message(
+                "delivery_receipt_credits_the_step",
+                "Send me the README.",
+                Some(status_tx),
+                UserRole::Owner,
+                ChannelContext::private("telegram"),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut cards = Vec::new();
+        let mut tool_lines = Vec::new();
+        while let Ok(update) = status_rx.try_recv() {
+            match update {
+                aidaemon_tools::status::StatusUpdate::Checklist(plan) => cards.push(plan.text),
+                other => {
+                    tool_lines.push(format!("{other:?}").chars().take(200).collect::<String>())
+                }
+            }
+        }
+        let last = cards.last().expect("a card was drawn");
+        if !(last.contains("✅ send the readme") && !last.contains("verify")) {
+            failures.push(format!("{label}: {last}\n{tool_lines:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the delivery proves the step: {failures:#?}"
+    );
 }

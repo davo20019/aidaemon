@@ -18,6 +18,7 @@ pub mod provider;
 pub mod run_aggregate;
 pub mod schema;
 pub mod session;
+pub mod step_identity;
 pub mod store;
 pub mod stores;
 pub mod terminal_state;

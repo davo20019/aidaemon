@@ -62,8 +62,8 @@ pub(crate) struct AgentInner {
     /// prompt is byte-stable across turns (cache friendly). Deferred tools'
     /// specs come last, name-sorted, after `load_tools`.
     pub specs: Vec<ToolSpec>,
-    /// Tools whose spec is sent only once loaded (see
-    /// [`crate::tool_loading`]).
+    /// Tools whose spec is sent only once loaded (see [`crate::LOAD_TOOLS`]
+    /// and [`crate::LoadedTools`]).
     pub deferred: std::collections::HashSet<String>,
     /// Tools that no longer exist, each with the note a call to one gets
     /// (where its work went).
@@ -366,7 +366,8 @@ impl AgentBuilder {
 
     /// Register a tool whose schema is sent only once loaded: until then
     /// the built-in `load_tools` lists it by name and one line. Calling it
-    /// directly loads it too. See [`crate::tool_loading`].
+    /// directly loads it too. See [`crate::LOAD_TOOLS`] and
+    /// [`crate::LoadedTools`].
     pub fn deferred_tool_arc(mut self, tool: Arc<dyn Tool>) -> Self {
         self.deferred_tools.push(tool);
         self

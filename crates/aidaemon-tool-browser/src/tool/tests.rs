@@ -5363,7 +5363,6 @@ async fn one_request_sends_a_pages_screenshot_once() {
 #[derive(Default)]
 struct RunEndFence {
     kept: std::sync::Mutex<Vec<aidaemon_tools::semantics::Deliverable>>,
-    captures: std::sync::Mutex<Vec<(String, aidaemon_tools::semantics::DeliverableKind)>>,
 }
 
 #[async_trait::async_trait]
@@ -5387,13 +5386,6 @@ impl aidaemon_tools::semantics::FileFence for RunEndFence {
         kept.push(deliverable);
         aidaemon_tools::semantics::DeliveryPlan::AtRunEnd { replaced }
     }
-
-    async fn note_capture(&self, path: &str, kind: &aidaemon_tools::semantics::DeliverableKind) {
-        self.captures
-            .lock()
-            .unwrap()
-            .push((path.to_string(), kind.clone()));
-    }
 }
 
 /// Live 2026-11-13: a helper declared the WordPress homepage before its
@@ -5406,12 +5398,14 @@ async fn a_helpers_declared_screenshot_is_sent_when_its_run_ends() {
     let (tool, _backend, rx) = mock_tool();
     let media = spawn_media_responder(rx, Ok(()));
     let fence = Arc::new(RunEndFence::default());
+    let produced = aidaemon_tools::semantics::ProducedFiles::default();
     let facts = || {
         let mut facts = aidaemon_tools::testing::call_facts("sess-helper");
         let shared: Arc<dyn aidaemon_tools::semantics::FileFence> = fence.clone();
         facts
             .extensions
             .insert(aidaemon_tools::semantics::CallFileFence(shared));
+        facts.extensions.insert(produced.clone());
         facts
     };
     let args = json!({ "action": "screenshot", "deliver": true}).to_string();
@@ -5428,7 +5422,20 @@ async fn a_helpers_declared_screenshot_is_sent_when_its_run_ends() {
         media.messages.lock().await.is_empty(),
         "nothing is sent mid-run"
     );
-    assert_eq!(fence.captures.lock().unwrap().len(), 3);
+    // Each capture is the request's own, found by its path and its resource
+    // id alike.
+    let captures: Vec<_> = produced
+        .entries()
+        .into_iter()
+        .filter(|(key, _)| std::path::Path::new(key).is_absolute())
+        .collect();
+    assert_eq!(captures.len(), 3, "{captures:?}");
+    assert!(
+        captures
+            .iter()
+            .all(|(_, file)| matches!(file, aidaemon_tools::semantics::ProducedFile::Capture(_)))
+    );
+    assert_eq!(produced.entries().len(), 6, "each also by its resource id");
 
     // The run ends: its one deliverable is sent, once.
     let kept: Vec<_> = std::mem::take(&mut *fence.kept.lock().unwrap());

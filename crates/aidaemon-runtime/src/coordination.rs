@@ -544,8 +544,6 @@ struct Shared {
     /// Each helper's declared deliverables, by member, in the order first
     /// declared: the last of each kind, sent when its run ends.
     pending: std::sync::Mutex<HashMap<String, Vec<PendingDeliverable>>>,
-    /// What each saved capture shows, by its path.
-    captures: std::sync::Mutex<HashMap<String, aidaemon_tools::semantics::DeliverableKind>>,
     path_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Escalations are answered one at a time, so the second sees the first.
     answering: tokio::sync::Mutex<()>,
@@ -789,25 +787,6 @@ impl Coordination {
             });
         }
         delivered
-    }
-
-    /// A capture saved at `path` shows `kind`.
-    pub fn note_capture(&self, path: &str, kind: &aidaemon_tools::semantics::DeliverableKind) {
-        self.0
-            .captures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(capture_key(path), kind.clone());
-    }
-
-    /// What the capture saved at `path` shows, when one was noted.
-    pub fn capture_kind(&self, path: &str) -> Option<aidaemon_tools::semantics::DeliverableKind> {
-        self.0
-            .captures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&capture_key(path))
-            .cloned()
     }
 
     /// Give back `member`'s claim on `subject`: its delivery did not happen.
@@ -1536,13 +1515,6 @@ impl Drop for RosterEntry {
     }
 }
 
-/// A saved capture's path as one key, whichever spelling names it.
-fn capture_key(path: &str) -> String {
-    std::fs::canonicalize(path)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| path.to_string())
-}
-
 /// One path contains the other, compared by whole components.
 fn paths_overlap(a: &str, b: &str) -> bool {
     let (a, b) = (std::path::Path::new(a), std::path::Path::new(b));
@@ -1916,14 +1888,6 @@ impl FileFence for CallFence {
         self.coordination
             .declare_deliverable(&self.member, deliverable)
     }
-
-    async fn note_capture(&self, path: &str, kind: &aidaemon_tools::semantics::DeliverableKind) {
-        self.coordination.note_capture(path, kind);
-    }
-
-    async fn capture_kind(&self, path: &str) -> Option<aidaemon_tools::semantics::DeliverableKind> {
-        self.coordination.capture_kind(path)
-    }
 }
 
 /// What a coordinator can decide. Each escalation offers only the ones that
@@ -2127,7 +2091,7 @@ impl Escalator {
     }
 
     /// Put `escalation` to the top-level agent. Waiting here does not spend
-    /// the child's working time, and never exceeds [`ESCALATION_WAIT`].
+    /// the child's working time, and never exceeds `ESCALATION_WAIT`.
     pub async fn ask(
         &self,
         coordination: &Coordination,
@@ -2623,8 +2587,9 @@ mod tests {
         assert!(sent.lock().unwrap().is_empty());
         // The styled capture, sent with send_file of the noted path, is the
         // same kind and replaces it.
-        tree.note_capture("/tmp/ed7237a2_screenshot.png", &page);
-        let kind = tree
+        let produced = aidaemon_tools::semantics::ProducedFiles::default();
+        produced.note_capture("/tmp/ed7237a2_screenshot.png", None, &page);
+        let kind = produced
             .capture_kind("/tmp/ed7237a2_screenshot.png")
             .expect("the capture was noted");
         assert_eq!(kind, page);

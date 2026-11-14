@@ -35,9 +35,16 @@ thiserror = "2"
 aidaemon-eval = { path = ".", features = ["examples"] }
 aidaemon-policies = { path = "../aidaemon-policies" }
 aidaemon-providers = { path = "../aidaemon-providers" }
+# The daemon's context budgeting, for `live_budgeters`.
+aidaemon-runtime = { path = "../aidaemon-runtime" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 # The shipped scenarios against a live model, one policy on at a time.
 [[example]]
 name = "live_policies"
+required-features = ["examples"]
+
+# The daemon's turn on each context budgeter, against a live model.
+[[example]]
+name = "live_budgeters"
 required-features = ["examples"]

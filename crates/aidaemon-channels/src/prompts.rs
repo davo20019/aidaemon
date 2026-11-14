@@ -1,7 +1,7 @@
 //! Approval and goal-confirmation prompts on any SDK channel.
 //!
 //! A prompt is sent with [`Channel::ask`] (buttons) and waits for an
-//! [`ApprovalAnswer`]; the answer replaces the prompt with its outcome.
+//! `ApprovalAnswer`; the answer replaces the prompt with its outcome.
 //! Who may answer is the caller's decision, made before [`Prompts::answer`].
 
 use std::collections::HashMap;

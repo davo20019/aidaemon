@@ -1,5 +1,5 @@
 //! The Telegram bot: who may talk to it, which session a chat is, files,
-//! commands, the live status card and replies. [`crate::TelegramBot`]
+//! commands, the live status card and replies. `crate::TelegramBot`
 //! carries the traffic; turns run on the shared
 //! [`aidaemon_channels::turns::TurnRunner`]. What is the application's own
 //! (its config file, extra commands, terminal sessions) goes through a
@@ -816,7 +816,36 @@ impl TelegramBot {
         }
     }
 
+    /// Run one inbound slash command and log that it arrived and how long
+    /// until its reply was sent: the session, the command's name and the
+    /// Telegram message id, never its arguments (they can carry secrets).
+    /// So a command that seems unanswered shows in the log whether it
+    /// arrived and how long it took.
     async fn handle_command(self: &Arc<Self>, text: &str, msg: &Message, bot: &Bot) {
+        let started = std::time::Instant::now();
+        self.handle_command_inner(text, msg, bot).await;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let session_id = self.session_id(msg.chat.id.0).await;
+        let command: String = text
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .split('@')
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(32)
+            .collect();
+        info!(
+            session_id = %session_id,
+            command = %command,
+            message_id = msg.id.0,
+            latency_ms,
+            "Slash command answered"
+        );
+    }
+
+    async fn handle_command_inner(self: &Arc<Self>, text: &str, msg: &Message, bot: &Bot) {
         let parts: Vec<&str> = text.splitn(2, ' ').collect();
         let cmd_raw = parts[0];
         let cmd = cmd_raw.split('@').next().unwrap_or(cmd_raw);

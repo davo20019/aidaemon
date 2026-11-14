@@ -371,13 +371,11 @@ impl SendFileTool {
         // owner got both). Anyone else's is sent now, once per request.
         let delivered_path = ready.canonical_path.to_string_lossy().to_string();
         let fence = aidaemon_tools::semantics::file_fence(facts);
-        let kind = match fence {
-            Some(fence) => fence.capture_kind(&delivered_path).await,
-            None => None,
-        }
-        .unwrap_or_else(|| aidaemon_tools::semantics::DeliverableKind::File {
-            name: ready.filename.clone(),
-        });
+        let kind = aidaemon_tools::semantics::produced_files(facts)
+            .and_then(|produced| produced.capture_kind(&delivered_path))
+            .unwrap_or_else(|| aidaemon_tools::semantics::DeliverableKind::File {
+                name: ready.filename.clone(),
+            });
         if let Some(fence) = fence {
             let deliverable = aidaemon_tools::semantics::Deliverable {
                 kind: kind.clone(),

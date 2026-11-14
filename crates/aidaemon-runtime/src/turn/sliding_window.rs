@@ -53,11 +53,11 @@ pub fn with_measured_timing(summary: String, text: &str) -> String {
 /// * `result` — the raw result string returned by the tool
 ///
 /// # Examples
-/// ```ignore
-/// // "terminal: cargo test -> exit 0"
-/// // "http_request: GET api.example.com/data -> 200 OK"
-/// // "read_file: src/main.rs -> 245 lines"
-/// // "write_file: src/utils.rs -> ok"
+/// ```text
+/// terminal: cargo test -> exit 0
+/// http_request: GET api.example.com/data -> 200 OK
+/// read_file: src/main.rs -> 245 lines
+/// write_file: src/utils.rs -> ok
 /// ```
 pub fn summarize_tool_result(tool_name: &str, args_json: &str, result: &str) -> String {
     let args_summary = extract_args_summary(tool_name, args_json);

@@ -6,7 +6,7 @@
 //! turn.
 //!
 //! Relative path references are anchored to the turn's typed workspace when
-//! one exists (see [`TurnContext::bound_workspace`]); only workspace-less turns
+//! one exists (see `TurnContext::bound_workspace`); only workspace-less turns
 //! fall back to the daemon process cwd.
 
 use std::path::Path;

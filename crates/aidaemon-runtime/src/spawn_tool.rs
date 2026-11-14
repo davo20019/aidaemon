@@ -106,7 +106,7 @@ impl SpawnAgentTool {
     }
 
     /// Create a SpawnAgentTool with a deferred agent reference.
-    /// Call [`set_agent`] after constructing the root runtime.
+    /// Call `set_agent` after constructing the root runtime.
     pub fn new_deferred(max_response_chars: usize, timeout_secs: u64) -> Self {
         Self {
             agent: OnceLock::new(),
@@ -336,6 +336,11 @@ pub fn combine_batch(
     // helpers installed a site each in one call, and the card said it
     // couldn't verify either: the batch result had dropped their items).
     let mut checklist_items: Vec<usize> = Vec::new();
+    // Each child it left running, by its own name: the launch line names
+    // them all (live 2026-11-14: it named only the batch's first child).
+    let mut run_labels: Vec<String> = Vec::new();
+    // Each child started is its own run: a batch of two launches two.
+    let mut launched_runs = 0;
     let mut truncation: Option<aidaemon_tools::semantics::TruncationInfo> = None;
     for (mission, run) in runs {
         // Its own name, in words the parent can repeat to the owner. A
@@ -348,6 +353,8 @@ pub fn combine_batch(
         };
         match run {
             Ok(outcome) => {
+                launched_runs += outcome.metadata.launched_runs.max(1);
+                run_labels.extend(outcome.metadata.background_run_labels.iter().cloned());
                 for item in &outcome.metadata.checklist_items {
                     if !checklist_items.contains(item) {
                         checklist_items.push(*item);
@@ -393,8 +400,11 @@ pub fn combine_batch(
     outcome.metadata.truncation = truncation;
     checklist_items.sort_unstable();
     outcome.metadata.checklist_items = checklist_items;
+    outcome.metadata.launched_runs = launched_runs;
     if background {
-        return Ok(outcome.handed_to_background());
+        let mut outcome = outcome.handed_to_background();
+        outcome.metadata.background_run_labels = run_labels;
+        return Ok(outcome);
     }
     outcome.metadata.outcome_status = Some(if all_succeeded {
         aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded
@@ -429,6 +439,12 @@ pub struct SpawnArgs {
     /// supersedes an earlier one that didn't finish.
     #[serde(default)]
     pub checklist_items: Vec<usize>,
+    /// The owner's units of work (numbered in "What the owner asked for")
+    /// this child carries out: it takes on the plan's own steps for them
+    /// ([`aidaemon_work::plans::TaskPlan::launch_steps`]), whichever item
+    /// it names.
+    #[serde(default)]
+    pub owner_units: Vec<usize>,
     /// Task ID — when provided by a task lead, the executor tracks activity against this task.
     #[serde(default)]
     pub task_id: Option<String>,
@@ -454,7 +470,7 @@ pub struct SpawnArgs {
     #[serde(default)]
     pub precedence: Option<crate::coordination::Precedence>,
     /// Folders this child creates fresh (a new install or project): each
-    /// must not exist yet; the spawn creates them ([`claim_new_folders`]).
+    /// must not exist yet; the spawn creates them (`claim_new_folders`).
     #[serde(default)]
     pub new_folders: Vec<String>,
 }
@@ -650,7 +666,12 @@ impl Tool for SpawnAgentTool {
                             conversation excerpts — give file paths and let the sub-agent read them itself. \
                             Ask only for the work and what it found: the daemon measures every \
                             helper's time (start, finish, and since the owner's request) on its own \
-                            record, so a helper never times itself or reports a duration."
+                            record, so a helper never times itself or reports a duration. \
+                            What the owner asked to receive from a piece of work (its \
+                            screenshot, its file) is that work's own deliverable: ask for it \
+                            in the task of the helper doing the work, which delivers it when \
+                            its run ends, never in a separate helper that collects and sends \
+                            what other helpers made."
                     },
                     "background": {
                         "type": "boolean",
@@ -664,6 +685,12 @@ impl Tool for SpawnAgentTool {
                         "items": { "type": "integer", "minimum": 0 },
                         "uniqueItems": true,
                         "description": "The zero-based indices of your track_requirements items this sub-agent does. With background=true they show as running in the background until it ends, then as done or failed by its result. To retry a step an earlier sub-agent didn't finish, name the same items: the new run takes the step over, and the earlier try shows as history, not as a failure."
+                    },
+                    "owner_units": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 0 },
+                        "uniqueItems": true,
+                        "description": "The owner's units of work (numbered in \"What the owner asked for\") this sub-agent carries out. It takes on your checklist's own items for those units, so name them even when you also give checklist_items."
                     },
                     "task_id": {
                         "type": "string",
@@ -839,6 +866,28 @@ impl SpawnAgentTool {
         Err(refusal.into())
     }
 
+    /// The plan steps this launch takes on, resolved against the request's
+    /// one plan ([`aidaemon_work::plans::TaskPlan::launch_steps`]): its
+    /// named items that the plan lists, and the plan's own steps for the
+    /// owner units it carries out. Without a plan, what it named.
+    async fn launch_steps(
+        &self,
+        args: &SpawnArgs,
+        facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> Vec<usize> {
+        let (Some(plans), Some(session)) = (self.plan_store.get(), facts.session()) else {
+            return args.checklist_items.clone();
+        };
+        match plans.latest(session, facts.task_id.as_deref()).await {
+            Ok(Some(plan)) => plan.launch_steps(&args.checklist_items, &args.owner_units),
+            Ok(None) => args.checklist_items.clone(),
+            Err(error) => {
+                warn!(%error, "Could not read the checklist a launch takes on");
+                args.checklist_items.clone()
+            }
+        }
+    }
+
     /// A `spawn_agent` call that failed started no helper: the checklist
     /// steps it named (`checklist_items`) are marked as not running, the
     /// card shows it, and the failure tells the model which of its steps
@@ -916,7 +965,7 @@ impl SpawnAgentTool {
     /// Start one child for parsed `args`, whose `new_folders` were made.
     async fn start_child(
         &self,
-        args: SpawnArgs,
+        mut args: SpawnArgs,
         new_folders: Vec<String>,
         facts: &aidaemon_tools::semantics::ToolCallContext,
     ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
@@ -955,6 +1004,7 @@ impl SpawnAgentTool {
             background = args.background,
             "spawn_agent tool invoked"
         );
+        args.checklist_items = self.launch_steps(&args, &facts).await;
         self.refuse_steps_a_running_helper_does(&args, &facts, agent.as_ref())
             .await?;
 
@@ -1487,6 +1537,7 @@ impl SpawnAgentTool {
         // The launch's typed link to the declared items it took on: the
         // run's ledger judges each declared item by it.
         outcome.metadata.checklist_items = args.checklist_items.clone();
+        outcome.metadata.launched_runs = 1;
         outcome.output.push_str(&scope_overlap_note);
         Ok(outcome)
     }
@@ -1508,7 +1559,7 @@ pub fn background_spawn_outcome(name: &str) -> ToolCallOutcome {
         SourceTrust::Trusted,
     )
     .handed_to_background();
-    outcome.metadata.background_run_label = Some(name.trim().to_string());
+    outcome.metadata.background_run_labels = vec![name.trim().to_string()];
     outcome
 }
 
@@ -1919,11 +1970,16 @@ mod group_tests {
         }
     }
 
+    /// The work a group answer's continuation does, run when the parent is
+    /// asked to write it.
+    type Continuation = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
+
     /// A parent that records the group answers it is asked to write.
     #[derive(Default)]
     struct Parent {
         answers: std::sync::Mutex<Vec<RunsAnswer>>,
         runs: Arc<RunStates>,
+        continuation: std::sync::Mutex<Option<Continuation>>,
     }
 
     #[async_trait::async_trait]
@@ -1960,6 +2016,10 @@ mod group_tests {
         async fn mark_executor_task_timeout(&self, _task_id: &str, _timeout_secs: u64) {}
         async fn answer_after_runs(&self, answer: RunsAnswer) -> anyhow::Result<bool> {
             self.answers.lock().unwrap().push(answer);
+            let continuation = self.continuation.lock().unwrap().take();
+            if let Some(continuation) = continuation {
+                continuation().await;
+            }
             Ok(true)
         }
         async fn deliver_background_child_result(
@@ -1974,6 +2034,76 @@ mod group_tests {
         fn helper_runs(&self) -> Arc<RunStates> {
             self.runs.clone()
         }
+    }
+
+    /// Live 2026-11-14: the owner asked for parallel Drupal and WordPress
+    /// helpers. The Drupal launch named only its own step; the checklist,
+    /// posted again, left the WordPress step waiting on the Drupal job, and
+    /// the WordPress launch was refused as a duplicate. Waiting on a run is
+    /// not being done by it: the second launch is accepted.
+    #[tokio::test]
+    async fn a_parallel_launch_for_a_step_that_only_waits_is_accepted() {
+        let parent = Arc::new(Parent::default());
+        let weak: Weak<dyn ChildAgentRuntime> =
+            Arc::downgrade(&(parent.clone() as Arc<dyn ChildAgentRuntime>));
+        let tool = SpawnAgentTool::new(weak, 8_000, 60);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(aidaemon_work::plans::PlanStore::new(pool).await.unwrap());
+        tool.set_plan_store(plans.clone());
+        let background = aidaemon_work::plans::StepStatus::Background;
+        plans
+            .upsert_checklist(
+                "chat-1",
+                Some("task-1"),
+                "Install Drupal and WordPress",
+                &[
+                    ("Install Drupal".to_string(), background),
+                    ("Install WordPress".to_string(), background),
+                ],
+            )
+            .await
+            .unwrap();
+        plans
+            .link_background_job("chat-1", Some("task-1"), &[0], "job-drupal")
+            .await
+            .unwrap();
+        plans
+            .wait_on_background_jobs("chat-1", Some("task-1"), &["job-drupal".to_string()])
+            .await
+            .unwrap();
+        parent
+            .runs
+            .begin("job-drupal", "chat-1", "Install Drupal site", None);
+        let facts = ToolCallContext {
+            session_id: "chat-1".to_string(),
+            task_id: Some("task-1".to_string()),
+            ..Default::default()
+        };
+        let wordpress =
+            r#"{"title":"Install WordPress","task":"Install it","checklist_items":[1]}"#;
+        tool.refuse_steps_a_running_helper_does(
+            &SpawnArgs::parse(wordpress).unwrap(),
+            &facts,
+            parent.as_ref(),
+        )
+        .await
+        .expect("the WordPress step only waits on the Drupal job");
+        let drupal_again =
+            r#"{"title":"Install Drupal","task":"Install it","checklist_items":[0]}"#;
+        assert!(
+            tool.refuse_steps_a_running_helper_does(
+                &SpawnArgs::parse(drupal_again).unwrap(),
+                &facts,
+                parent.as_ref(),
+            )
+            .await
+            .is_err(),
+            "Drupal's own step is still guarded"
+        );
     }
 
     /// Live 2026-11-14: one turn launched a WordPress and a Drupal helper,
@@ -2179,6 +2309,201 @@ mod group_tests {
         assert!(followup.contains("don't list them again"), "{followup}");
     }
 
+    /// Live 2026-11-14 (Drupal and WordPress in parallel, a folder check and
+    /// a report of the times): the last helper's end settled the parent's
+    /// own steps as "nothing was left working on it" before the group
+    /// answer did them, and both install rows named both folders. The
+    /// steps no run took on are the answer's turn's: they stay open through
+    /// the runs' ends, its receipt and its own update tick them, and the
+    /// card settles from the plan as the answer left it. Each install row
+    /// names only its own run's folder.
+    #[tokio::test]
+    async fn the_group_answer_settles_the_parents_own_steps() {
+        use aidaemon_work::plans::{ChecklistItem, StepStatus};
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(aidaemon_work::plans::PlanStore::new(pool).await.unwrap());
+        let item = |description: &str, units: Vec<usize>, observes: bool| ChecklistItem {
+            description: description.to_string(),
+            status: StepStatus::Pending,
+            depends_on: Vec::new(),
+            required_mutation_effects: Default::default(),
+            requires_observation: observes,
+            expected_targets: Vec::new(),
+            owner_units: units,
+        };
+        let plan = plans
+            .upsert_checklist_graph(
+                "chat",
+                Some("task-1"),
+                "track_requirements",
+                &[
+                    item("Install Drupal with DDEV", vec![0], false),
+                    item("Install WordPress with DDEV", vec![0], false),
+                    item("Check the current projects folder state", vec![], true),
+                    item(
+                        "Report each agent's measured completion time",
+                        vec![1],
+                        false,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        // One owner unit ("install both") on two rows: each child of the
+        // batch takes its own row, not both.
+        assert_eq!(plan.launch_steps(&[0], &[0]), vec![0]);
+        assert_eq!(plan.launch_steps(&[1], &[0]), vec![1]);
+        let parent = Arc::new(Parent::default());
+        let runs = parent.runs.clone();
+        let mut ended = Vec::new();
+        for (job, label, step, folder) in [
+            (
+                "job-drupal",
+                "Install Drupal",
+                0,
+                "/p/claude-company-drupal-2",
+            ),
+            (
+                "job-wordpress",
+                "Install WordPress",
+                1,
+                "/p/claude-company-wordpress-2",
+            ),
+        ] {
+            plans
+                .link_background_job("chat", Some("task-1"), &[step], job)
+                .await
+                .unwrap()
+                .unwrap();
+            let (tx, rx) = mpsc::unbounded_channel();
+            runs.begin(job, "chat", label, Some(tx));
+            runs.link_steps(job, &[step]);
+            runs.for_request(job, "task-1");
+            runs.join_group(job, "chat#task-1");
+            runs.note_folders(job, &[folder.to_string()]);
+            ended.push((job, label, rx));
+        }
+        let routed = |name: &str| ResultRoute {
+            plans: Some(plans.clone()),
+            plan_session: Some("chat".to_string()),
+            ..route(&parent, name)
+        };
+
+        // The group's answer: a continuation of the same request checks the
+        // folder (its observation receipt) and reports the times (its own
+        // checklist update). The runs' ends left both steps to it.
+        let continuation_plans = plans.clone();
+        let plan_id = plan.id.clone();
+        *parent.continuation.lock().unwrap() = Some(Box::new(move || {
+            Box::pin(async move {
+                let plans = continuation_plans;
+                let open = plans.get(&plan_id).await.unwrap().unwrap();
+                for index in [2, 3] {
+                    assert!(
+                        matches!(
+                            open.steps[index].status,
+                            StepStatus::Pending | StepStatus::InProgress
+                        ),
+                        "{open:?}"
+                    );
+                    assert_eq!(open.steps[index].not_done, None, "{open:?}");
+                }
+                plans
+                    .carry_into_turn("chat", "task-2")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                plans
+                    .reconcile_checklist_after_tool_success(
+                        "chat",
+                        &aidaemon_work::traits::ToolCallSemantics::observation(),
+                        "receipt-ls",
+                        "claude-company-drupal-2 claude-company-wordpress-2",
+                    )
+                    .await
+                    .unwrap()
+                    .expect("the folder check ticks from its receipt");
+                plans
+                    .modify(&plan_id, |plan| {
+                        plan.steps[3].status = StepStatus::Completed;
+                        plan.steps[3].completed_at = Some(chrono::Utc::now());
+                        true
+                    })
+                    .await
+                    .unwrap();
+            })
+        }));
+
+        for (job, label, rx) in ended {
+            finish(&runs, job, &format!("{label} is up."));
+            deliver_when_run_ends(rx, routed(label)).await;
+        }
+        assert_eq!(parent.answers.lock().unwrap().len(), 1);
+        let plan = plans.get(&plan.id).await.unwrap().unwrap();
+        for step in &plan.steps {
+            assert_eq!(step.status, StepStatus::Completed, "{plan:?}");
+            assert_eq!(step.not_done, None, "{plan:?}");
+        }
+        assert_eq!(
+            plan.steps[0].made_folders,
+            vec!["/p/claude-company-drupal-2"]
+        );
+        assert_eq!(
+            plan.steps[1].made_folders,
+            vec!["/p/claude-company-wordpress-2"]
+        );
+        let card = plan.card();
+        assert!(card.text.contains("Done · 4 of 4"), "{}", card.text);
+        assert!(!card.text.contains("Not done"), "{}", card.text);
+        assert!(
+            !card
+                .text
+                .contains("claude-company-wordpress-2, claude-company-drupal-2"),
+            "{}",
+            card.text
+        );
+        assert!(runs.get("job-drupal").is_none(), "the records are let go");
+    }
+
+    /// A batch call's launch line names every child it left running, not
+    /// only the first (live 2026-11-14: "Started in the background" named
+    /// Drupal and never WordPress).
+    #[test]
+    fn a_batch_launch_names_every_child() {
+        let combined = combine_batch(
+            vec![
+                (
+                    "Install Drupal".to_string(),
+                    Ok(background_spawn_outcome("Install Drupal")),
+                ),
+                (
+                    "Install WordPress".to_string(),
+                    Ok(background_spawn_outcome("Install WordPress")),
+                ),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            combined.metadata.background_run_labels,
+            vec![
+                "Install Drupal".to_string(),
+                "Install WordPress".to_string()
+            ]
+        );
+        assert_eq!(
+            crate::background_run::started_group_in_background(
+                &combined.metadata.background_run_labels
+            ),
+            "Started 2 in the background: Install Drupal and Install WordPress. I'll answer \
+             when both finish."
+        );
+    }
+
     /// Live 2026-11-13 (Drupal and WordPress, 8:16:45 AM request): the
     /// group answer said WordPress's "agent took 3m 55s" and Drupal
     /// "stopped after 2m" under a card that said "Done 5m 54s after your
@@ -2211,6 +2536,7 @@ mod group_tests {
             card: Default::default(),
             background: true,
             request: None,
+            made_folders: Vec::new(),
         };
         let end = |state: RunState, report: &str| GroupEnd {
             state,
@@ -2314,6 +2640,7 @@ mod group_tests {
                 card: Default::default(),
                 background: true,
                 request: None,
+                made_folders: Vec::new(),
             },
             report: RunReport {
                 text: "I sent a rendered homepage screenshot.".to_string(),

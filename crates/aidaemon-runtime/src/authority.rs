@@ -254,6 +254,9 @@ struct SpawnFamilyState {
     /// spawn's claimed `new_folders`): the work's own, for every run of
     /// the tree.
     owned_folders: aidaemon_tools::semantics::OwnedFolders,
+    /// The files this request's own work produced (its captures and the
+    /// files its calls created), for every run of the tree.
+    produced_files: aidaemon_tools::semantics::ProducedFiles,
 }
 
 /// One request's tree of plain sub-agents: its running count, how many it
@@ -333,6 +336,7 @@ impl SpawnFamily {
                 limits.max_escalations_per_request,
             ),
             owned_folders: Default::default(),
+            produced_files: Default::default(),
         }))
     }
 
@@ -341,6 +345,13 @@ impl SpawnFamily {
     /// records them here as it makes them).
     pub fn owned_folders(&self) -> &aidaemon_tools::semantics::OwnedFolders {
         &self.0.owned_folders
+    }
+
+    /// The files this request's own work produced, shared by every run of
+    /// the tree: a capture any run's tool saved, a file any run's call
+    /// created. Kept whether or not the tree has a child.
+    pub fn produced_files(&self) -> &aidaemon_tools::semantics::ProducedFiles {
+        &self.0.produced_files
     }
 
     /// Whether this tree coordinates its members at all.

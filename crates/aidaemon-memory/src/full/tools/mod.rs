@@ -1,7 +1,7 @@
 //! The full memory system's tools: `remember_fact`, `manage_memories`,
 //! and `manage_people`, over the memory stores.
 //!
-//! Each is an [`OutcomeTool`](aidaemon_tools::OutcomeTool), so a host with its
+//! Each is an [`aidaemon_tools::OutcomeTool`], so a host with its
 //! own dispatcher (receipts, approvals, result fitting) runs it directly and
 //! keeps the typed outcome; [`kernel_tools`] gives the same tools to a plain
 //! `aidaemon_core` agent. [`tool_facts`] says how a host's turn should treat

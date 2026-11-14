@@ -117,6 +117,7 @@ mod tests {
         .unwrap();
         let ctx = crate::agent::tool_exec::ToolExecCtx {
             file_fence: None,
+            produced_files: None,
             mcp_tool: None,
             owner_approval_by_kernel: false,
             session_id: "guest-session",

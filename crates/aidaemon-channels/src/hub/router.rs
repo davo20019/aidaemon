@@ -919,7 +919,7 @@ impl ChannelHub {
     }
 
     /// Send media to the channel that owns a session, requiring REAL media
-    /// support. Unlike [`send_media`], this never silently falls back to a text
+    /// support. Unlike `send_media`, this never silently falls back to a text
     /// caption: if the owning channel cannot deliver documents/photos it returns
     /// an error so callers (e.g. the terminal deliverable notifier) can report an
     /// honest delivery failure instead of mistaking a text fallback for success.

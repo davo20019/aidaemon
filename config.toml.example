@@ -26,9 +26,8 @@ backend = "local" # local | docker | ssh
 # workspace_root = "/absolute/path/to/workspace"
 # allow_outside_workspace = true # path tools: defaults true locally, false remotely
 
-# Docker is optional and requires a binary built with:
-#   cargo install aidaemon --features execution-docker
-# The backend creates/reuses one persistent container and bind-mounts a host
+# Docker is built in (the default `execution-docker` feature) and needed only
+# when this backend is selected. The backend creates/reuses one persistent container and bind-mounts a host
 # workspace. Network access is disabled unless explicitly enabled.
 # [execution.docker]
 # container = "aidaemon-execution"

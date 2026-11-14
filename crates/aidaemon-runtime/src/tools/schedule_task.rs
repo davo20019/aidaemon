@@ -1,9 +1,9 @@
 //! `schedule_task`: scheduled work in three typed fields, and the one path
 //! that creates scheduled work.
 //!
-//! [`ScheduledWork::create`] is shared with `set_reminder` (a reminder is
+//! `ScheduledWork::create` is shared with `set_reminder` (a reminder is
 //! scheduled work that only messages the owner). It answers with a typed
-//! [`ScheduleOutcome`], so a refusal (duplicate, owner-only, a time it cannot
+//! `ScheduleOutcome`, so a refusal (duplicate, owner-only, a time it cannot
 //! read, a name in use) is never read as a success from its wording.
 //! Changing or stopping scheduled work is `manage_automations`.
 

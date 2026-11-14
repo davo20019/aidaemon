@@ -558,6 +558,18 @@ impl TurnEngine<'_> {
         let duration_ms = started.elapsed().as_millis() as u64;
         let failed = executed.failed();
         if !failed && !absent_before.is_empty() {
+            // A file it created there is the request's own artifact.
+            let files = scope
+                .spawn_family
+                .produced_files()
+                .claim_created(&absent_before);
+            if !files.is_empty() {
+                info!(
+                    tool = %request.name,
+                    files = ?files,
+                    "A file this request's work created is its own"
+                );
+            }
             let claimed = scope
                 .spawn_family
                 .owned_folders()
@@ -569,6 +581,11 @@ impl TurnEngine<'_> {
                     "A folder this request's work created is its own"
                 );
                 aidaemon_tools::local_sites::note_folders(&site_grant, &claimed);
+                // The helper run this turn is records the real folders its
+                // work made, so its plan steps name them when it ends.
+                if let Some(run) = self.running_children().run_of_session(scope.session_id) {
+                    self.running_children().runs().note_folders(&run, &claimed);
+                }
             }
         }
         let trust =
@@ -843,24 +860,23 @@ impl TurnEngine<'_> {
                 // the run on the tool's finish.
                 let mut handed_off = false;
                 // The runs this turn leaves running: a call that left one
-                // there names it, and the turn's launch line names them all.
-                let launched = outcome
-                    .metadata
-                    .background_run_label
-                    .as_deref()
-                    .filter(|_| {
-                        !outcome.metadata.detached
+                // there names it (a batch, each of its children), and the
+                // turn's launch line names them all.
+                let launched = Some(&outcome.metadata.background_run_labels)
+                    .filter(|labels| {
+                        !labels.is_empty()
+                            && !outcome.metadata.detached
                             && outcome.metadata.outcome_status
                                 != Some(
                                     aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent,
                                 )
                     })
-                    .map(|label| {
+                    .map(|labels| {
                         let mut runs = scope
                             .background_runs
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        runs.push(label.to_string());
+                        runs.extend(labels.iter().cloned());
                         crate::background_run::started_group_in_background(&runs)
                     });
                 // Track the jobs this run left running whose result the
@@ -927,7 +943,11 @@ impl TurnEngine<'_> {
                         let judged = self
                             .sdk_judge_unattempted_work(
                                 scope,
-                                Some((&request.call_id, &outcome.metadata.checklist_items)),
+                                Some((
+                                    &request.call_id,
+                                    &outcome.metadata.checklist_items,
+                                    outcome.metadata.launched_runs,
+                                )),
                             )
                             .await;
                         if let Some(sdk::StopDecision::Continue { message }) = judged {
@@ -1241,13 +1261,24 @@ impl TurnEngine<'_> {
         {
             warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool result");
         }
-        // The executor's own checklist becomes ledger expectations.
+        // The executor's own checklist becomes ledger expectations, read
+        // from the arguments the tool itself ran on: its canonical form drops
+        // the targets no adapter can report (a bare `README.md`, `user`).
+        // Read from the model's raw arguments, the ledger kept a target the
+        // stored checklist had dropped, so a step's own receipt (a file sent,
+        // a fact remembered) could never credit it (live 2026-11-14).
+        let checklist_arguments = if facts.requirement_checklist {
+            self.turn_tool(scope, &request.name)
+                .and_then(|tool| tool.canonicalize_arguments(arguments).ok())
+        } else {
+            None
+        };
         if facts.requirement_checklist
             && !failed
             && let Some(declared) =
                 aidaemon_work::plans::checklist_args::executor_expectations_from_checklist_arguments(
                     scope.task_id,
-                    arguments,
+                    checklist_arguments.as_deref().unwrap_or(arguments),
                 )
         {
             let open = declared
@@ -1332,6 +1363,7 @@ impl TurnEngine<'_> {
                         untrusted_seen: scope.untrusted_seen.load(Ordering::SeqCst),
                     })
                 }),
+            produced_files: Some(scope.spawn_family.produced_files().clone()),
             // The MCP tool bridged and judged at turn start, if this is one.
             mcp_tool: scope
                 .mcp_tools
@@ -1381,7 +1413,7 @@ impl TurnEngine<'_> {
         }
     }
 
-    /// Serve [`hooks::DispatchGate`]: gate the call once and tell the
+    /// Serve `hooks::DispatchGate`: gate the call once and tell the
     /// kernel what was decided.
     pub async fn serve_sdk_gate(&self, scope: &TurnScope<'_>, request: GateRequest) {
         let call = &request.call;

@@ -422,6 +422,13 @@ pub struct ToolReceiptV1 {
     /// `checklist_items`), copied from its metadata.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checklist_items: Vec<usize>,
+    /// How many runs the call left working, from its metadata.
+    #[serde(default, skip_serializing_if = "is_zero_runs")]
+    pub launched_runs: usize,
+}
+
+fn is_zero_runs(value: &usize) -> bool {
+    *value == 0
 }
 
 impl ToolReceiptV1 {
@@ -474,6 +481,7 @@ impl ToolReceiptV1 {
             },
             mandate_authority: None,
             checklist_items: metadata.checklist_items.clone(),
+            launched_runs: metadata.launched_runs,
         }
     }
 
@@ -506,6 +514,7 @@ impl ToolReceiptV1 {
             observations: self.observations.clone(),
             collection_observations: self.collection_observations.clone(),
             checklist_items: self.checklist_items.clone(),
+            launched_runs: self.launched_runs,
             ..ToolCallMetadata::default()
         }
     }

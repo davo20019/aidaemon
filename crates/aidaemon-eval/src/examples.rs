@@ -357,6 +357,43 @@ fn trail_part(part: usize) -> String {
     text
 }
 
+/// The shards in the `context_tally` scenario.
+pub const SHARD_COUNT: usize = 10;
+/// Failed requests per shard (shard 1 first).
+const SHARD_FAILURES: [usize; SHARD_COUNT] = [11, 7, 23, 9, 14, 6, 17, 8, 5, 13];
+/// The sum of the shards' failure counts.
+pub const SHARD_TOTAL: usize = 113;
+
+/// One shard log: about 7.6k characters of heartbeat lines with the shard's
+/// failure count halfway down, so neither the first nor the last lines of a
+/// result carry it.
+fn shard_part(shard: usize) -> String {
+    let mut text = String::new();
+    for i in 0..80 {
+        if i == 40 {
+            text.push_str(&format!(
+                "2026-11-13T04:{shard:02}:40Z WARN shard-{shard} summary: failed_requests={} in this window\n",
+                SHARD_FAILURES[shard - 1]
+            ));
+        }
+        text.push_str(&format!(
+            "2026-11-13T04:{shard:02}:{i:02}Z INFO shard-{shard} worker-{} heartbeat ok seq={} queue_depth={} latency_ms={}\n",
+            i % 5,
+            shard * 1000 + i,
+            (i * 29) % 83,
+            (i * 41) % 230
+        ));
+    }
+    text.push_str(&format!("End of shard-{shard}.log\n"));
+    text
+}
+
+fn shard_number(path: &str) -> Option<usize> {
+    let rest = &path[path.find("shard-")? + "shard-".len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 fn trail_number(path: &str) -> Option<usize> {
     let rest = &path[path.find("trail-")? + "trail-".len()..];
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
@@ -445,6 +482,9 @@ fn orbstack_shell(running: Arc<std::sync::atomic::AtomicBool>) -> Arc<dyn Tool> 
 /// - `cleanup`: `list_dir` (read-only, `path`), a nearly full disk.
 /// - `logs`: `read_log` (read-only, `path`): a trail of [`TRAIL_PARTS`]
 ///   files, each naming the next, the last holding [`TRAIL_CODE`].
+/// - `shards`: `read_shard` (read-only, `path`): [`SHARD_COUNT`] shard logs
+///   of heartbeat lines, each with one failure count in the middle; the
+///   counts add up to [`SHARD_TOTAL`].
 /// - `service`: `build_site` (write, `project`) fails with a Docker
 ///   connection error until `start_service` (write, `service`) has run;
 ///   `check_service` (read-only, `service`) reports the container engine
@@ -627,6 +667,21 @@ pub fn kit_tools(kit: &str) -> Result<Vec<Arc<dyn Tool>>, FactoryError> {
                 Ok(match trail_number(&path) {
                     Some(part) if (1..=TRAIL_PARTS).contains(&part) => {
                         ToolOutput::text(trail_part(part))
+                    }
+                    _ => ToolOutput::error(format!("no such file: {path}")),
+                })
+            },
+        )],
+        "shards" => vec![fn_tool(
+            "read_shard",
+            "Read one shard log",
+            &["path"],
+            ToolAnnotations::READ_ONLY,
+            |args| async move {
+                let path = arg(&args, "path");
+                Ok(match shard_number(&path) {
+                    Some(shard) if (1..=SHARD_COUNT).contains(&shard) => {
+                        ToolOutput::text(shard_part(shard))
                     }
                     _ => ToolOutput::error(format!("no such file: {path}")),
                 })

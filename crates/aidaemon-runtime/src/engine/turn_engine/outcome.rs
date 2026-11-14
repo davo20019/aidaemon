@@ -15,7 +15,7 @@ pub fn reconcile_plan_projection(plan: &mut aidaemon_work::plans::TaskPlan) -> b
     for step in &mut plan.steps {
         // Marked as handed to the background, but no launch took it: nothing
         // is working on it, so it was not done.
-        if step.status == StepStatus::Background && step.background_jobs.is_empty() {
+        if step.status == StepStatus::Background && !step.has_background_jobs() {
             step.status = StepStatus::Deferred;
             step.completed_at = Some(chrono::Utc::now());
             changed = true;

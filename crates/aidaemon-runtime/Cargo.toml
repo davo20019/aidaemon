@@ -63,7 +63,8 @@ sha2 = "0.11"
 hex = "0.4"
 libc = "0.2"
 shell-words = "1.1"
-sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+# 0.38: sysinfo 0.39 and later need rustc 1.95, past the SDK crates' MSRV (1.94).
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 shellexpand = "3"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = { version = "3", optional = true }

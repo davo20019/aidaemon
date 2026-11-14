@@ -169,8 +169,19 @@ pub fn run_phase(
         return (RunEnd::Failed(failure), secondary());
     }
     // Nothing else explains it: the owner declined a step it asked to
-    // take, so it ended short. Its deliveries stay delivered.
-    if let Some(steps) = declined {
+    // take, so it ended short of that step. Its deliveries stay delivered.
+    // A decline costs only the steps the declined calls served and that
+    // were then left undone: a declined extra on a step that got done
+    // anyway, or a call that served none of its steps, leaves its steps as
+    // they ended (live 2026-11-14: the owner declined the Drupal helper's
+    // copy of its screenshot into the site folder; the install and the
+    // screenshot were done, yet the run, and so the "Install Drupal" step,
+    // read "you declined a step").
+    let short_of_declined = declined
+        .is_some()
+        .then(|| declined_undone_steps(aggregate, &checklist))
+        .flatten();
+    if let Some(steps) = short_of_declined {
         return (
             RunEnd::Stopped(Some(RunFailure::Declined { steps })),
             RunEvidence::default(),
@@ -181,7 +192,6 @@ pub fn run_phase(
         && aggregate.executor_claimed_outcome
             == Some(aidaemon_events::ExecutorClaimedOutcome::Done)
         && !aggregate.has_background_in_flight()
-        && !aggregate.owner_declined()
         && checklist.iter().all(|obligation| {
             matches!(
                 obligation.state,
@@ -195,7 +205,7 @@ pub fn run_phase(
         );
     }
     let unconfirmed = if checklist.len() > 1 {
-        let mut pending: Vec<(&String, String)> = checklist
+        let mut pending: Vec<(&String, crate::run_state::UnconfirmedStep)> = checklist
             .iter()
             .filter(|obligation| {
                 // A step that changes nothing needs no receipt: the
@@ -204,22 +214,28 @@ pub fn run_phase(
                     && !obligation.required_effect.is_empty()
             })
             .map(|obligation| {
-                let id = &obligation.id;
-                // The step in its own words: never the internal demand text
+                // What it declared, typed: never the internal demand text
                 // (live 2026-11-13: "checklist item 2 … needs a succeeded
-                // receipt carrying local_workspace_write|process_state").
+                // receipt carrying local_workspace_write|process_state"),
+                // nor its planning words (live 2026-11-14).
                 (
-                    id,
-                    obligation
-                        .step
-                        .as_deref()
-                        .map(plain_step)
-                        .unwrap_or_else(|| "a step it listed".to_string()),
+                    &obligation.id,
+                    crate::run_state::UnconfirmedStep {
+                        effect: obligation.required_effect,
+                        target: obligation.required_target.as_ref().and_then(|target| {
+                            matches!(
+                                target.kind,
+                                aidaemon_events::dialogue::RequestVerificationTargetKind::Path
+                                    | aidaemon_events::dialogue::RequestVerificationTargetKind::Url
+                            )
+                            .then(|| target.value.clone())
+                        }),
+                    },
                 )
             })
             .collect();
         pending.sort_by(|a, b| a.0.cmp(b.0));
-        pending.into_iter().map(|(_, summary)| summary).collect()
+        pending.into_iter().map(|(_, step)| step).collect()
     } else {
         Vec::new()
     };
@@ -230,6 +246,36 @@ pub fn run_phase(
             ..Default::default()
         },
     )
+}
+
+/// The steps a decline left the run short of, in its words, each once:
+/// the checklist steps the declined calls served that ended undone (a
+/// delivered step counts as done). A run with no checklist is its own one
+/// step, so any decline is short of it (`Some(vec![])`). `None` when the
+/// decline cost no step: every step it served got done, or it served none
+/// of the run's steps.
+fn declined_undone_steps(
+    aggregate: &aidaemon_events::RunAggregate,
+    checklist: &[&aidaemon_events::RunObligation],
+) -> Option<Vec<String>> {
+    if checklist.is_empty() {
+        return Some(declined_steps(aggregate));
+    }
+    let mut steps: Vec<String> = Vec::new();
+    for obligation in checklist {
+        let served = aggregate.operations.values().any(|operation| {
+            operation.owner_declined && operation.obligation_ids.contains(&obligation.id)
+        });
+        if !served || obligation.state == aidaemon_events::RunObligationState::Satisfied {
+            continue;
+        }
+        if let Some(step) = obligation.step.as_deref().map(plain_step)
+            && !steps.contains(&step)
+        {
+            steps.push(step);
+        }
+    }
+    (!steps.is_empty()).then_some(steps)
 }
 
 /// The run's own checklist steps that the calls the owner declined served,
@@ -581,6 +627,18 @@ impl RunningChildren {
         }
     }
 
+    /// The helper run (its record's id) whose child works in
+    /// `child_session`, while it is listed.
+    pub fn run_of_session(&self, child_session: &str) -> Option<String> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|child| child.child_session == child_session)
+            .and_then(|child| child.run.clone())
+    }
+
     /// Record `task_id` as the chat's running turn until the guard drops.
     pub fn begin_request(self: &Arc<Self>, session_id: &str, task_id: &str) -> RunningRequest {
         self.requests
@@ -769,6 +827,7 @@ pub fn child_status_sender(
     steps: &[usize],
     background: bool,
     step: Option<ChildStep>,
+    run: Option<String>,
 ) -> Option<mpsc::Sender<StatusUpdate>> {
     use aidaemon_core::card::{HelperView, Step};
     let parent = parent?;
@@ -804,7 +863,9 @@ pub fn child_status_sender(
                             Some(own_step.clone());
                     }
                     StatusUpdate::Helper(
-                        HelperView::running(&label, background, Some(own_step)).for_steps(&steps),
+                        HelperView::running(&label, background, Some(own_step))
+                            .for_steps(&steps)
+                            .of_run(run.as_deref()),
                     )
                 }
                 None => update,
@@ -1692,6 +1753,62 @@ mod tests {
         );
     }
 
+    /// Live 2026-11-14: the owner declined the Drupal helper's copy of its
+    /// own screenshot into the site folder; the install and the screenshot
+    /// were done, yet its run ended "declined" and the card's "Install
+    /// Drupal" row read "(not done: you declined a step its helper asked to
+    /// take)". A decline costs only a step it served that was left undone:
+    /// one on a step that got done, or one that served none of its steps,
+    /// leaves the run's steps as they ended. One that served a step left
+    /// undone still ends it short of that step alone.
+    #[test]
+    fn a_decline_marks_only_the_step_it_left_undone() {
+        let end: aidaemon_events::TaskEndData = serde_json::from_value(serde_json::json!({
+            "task_id": "t",
+            "status": "completed",
+            "duration_secs": 1,
+            "iterations": 1,
+            "tool_calls_count": 3,
+        }))
+        .unwrap();
+        let with_decline = |served: &[&str]| {
+            let mut run = aggregate(&[("satisfied", 2), ("satisfied", 2)], &[("succeeded", 2)]);
+            run.executor_claimed_outcome = Some(aidaemon_events::ExecutorClaimedOutcome::Done);
+            let op = serde_json::from_value(serde_json::json!({
+                "operation_id": "op-declined",
+                "tool_name": "terminal",
+                "dispatched": false,
+                "owner_declined": true,
+                "mutating": true,
+                "obligation_ids": served,
+            }))
+            .unwrap();
+            run.operations.insert("op-declined".to_string(), op);
+            run
+        };
+        for served in [&["task:t/obligation:checklist:1"][..], &[][..]] {
+            let run = with_decline(served);
+            let (phase, _) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run), None);
+            assert_eq!(phase, crate::run_state::RunEnd::Succeeded, "{served:?}");
+            assert_eq!(
+                crate::helper_run::delivery::job_end(phase.phase(), phase.failure()),
+                aidaemon_work::plans::JobEnd::Succeeded
+            );
+        }
+        let mut run = with_decline(&["task:t/obligation:checklist:1"]);
+        run.obligations
+            .get_mut("task:t/obligation:checklist:1")
+            .unwrap()
+            .state = aidaemon_events::RunObligationState::Pending;
+        let (phase, _) = run_phase(TaskOutcome::Partial, Some(&end), Some(&run), None);
+        assert_eq!(
+            phase,
+            crate::run_state::RunEnd::Stopped(Some(RunFailure::Declined {
+                steps: vec!["step 1".to_string()]
+            }))
+        );
+    }
+
     /// One precedence for a run's reasons: the primary cause of its end
     /// (an error that ended it, nothing done) wins, and a step the owner
     /// declined is said second; the decline is the cause only when nothing
@@ -1770,7 +1887,7 @@ mod tests {
 
         // Nothing else explains it: the decline is the cause, said once.
         let run = declined(aggregate(
-            &[("satisfied", 2), ("pending", 2)],
+            &[("pending", 2), ("satisfied", 2)],
             &[("succeeded", 2)],
         ));
         let (phase, evidence) = run_phase(TaskOutcome::Partial, Some(&end(None)), Some(&run), None);
@@ -1782,11 +1899,12 @@ mod tests {
         assert_eq!(phase.line(&evidence).unwrap().lines().count(), 1);
     }
 
-    /// A run whose steps no receipt confirmed names them in their own
-    /// words: the owner never reads the internal demand ("needs a succeeded
-    /// receipt carrying local_workspace_write|process_state").
+    /// A run whose steps no receipt confirmed says what they changed, in
+    /// plain words from their typed effects: the owner never reads the
+    /// internal demand ("needs a succeeded receipt carrying
+    /// local_workspace_write|process_state") nor the helper's planning text.
     #[test]
-    fn unconfirmed_steps_are_named_in_their_own_words() {
+    fn unconfirmed_steps_are_said_from_what_they_changed() {
         let run = aggregate(&[("pending", 2), ("pending", 64)], &[("succeeded", 2)]);
         let mut run = run;
         run.executor_claimed_outcome = Some(aidaemon_events::ExecutorClaimedOutcome::Done);
@@ -1803,9 +1921,10 @@ mod tests {
         let line = evidence.line().expect("an evidence line");
         assert_eq!(
             line,
-            "Its report is the only record of 2 steps: step 0; step 1."
+            "Its report is the only record of the files it wrote and what it sent."
         );
         for internal in [
+            "step 0",
             "receipt",
             "local_workspace_write",
             "process_state",
@@ -1877,7 +1996,13 @@ mod tests {
             Some(&sent),
         );
         assert_eq!(phase, crate::run_state::RunEnd::Succeeded);
-        assert_eq!(evidence.unconfirmed, vec!["step 0".to_string()]);
+        assert_eq!(
+            evidence.unconfirmed,
+            vec![crate::run_state::UnconfirmedStep {
+                effect: aidaemon_tools::semantics::ToolMutationEffects::PROCESS_STATE,
+                target: None,
+            }]
+        );
     }
 
     /// Live 2026-11-13: DDEV stopped on low Docker disk space and the
@@ -2011,6 +2136,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         let drupal = child_status_sender(
@@ -2018,6 +2144,7 @@ mod tests {
             "Build the Drupal demo site for Acme Corp",
             &[],
             false,
+            None,
             None,
         )
         .unwrap();

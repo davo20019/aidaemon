@@ -348,7 +348,7 @@ async fn fallback_models(host: &dyn TurnHost, model: &str, router: Option<&Route
 /// chain: `model` on `provider` first (within `first_attempt_deadline`),
 /// then the other models of its router, then each configured failover
 /// provider's models (each within its own deadline). The chain is the
-/// app's policy; [`DaemonRecovery`] decides retries per error:
+/// app's policy; `DaemonRecovery` decides retries per error:
 ///
 /// - RateLimit, Timeout/Network/Server, malformed parse: backoff retries,
 ///   then the next model (a server error on media first retries without

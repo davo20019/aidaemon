@@ -147,7 +147,7 @@ impl HelperCard {
 }
 
 /// The recent plan of `plan_session` that background job `job` works on.
-async fn job_plan(
+pub(crate) async fn job_plan(
     plans: Option<&Arc<aidaemon_work::plans::PlanStore>>,
     plan_session: Option<&str>,
     job: &str,
@@ -158,9 +158,12 @@ async fn job_plan(
         .ok()?
         .into_iter()
         .find(|plan| {
-            plan.steps
-                .iter()
-                .any(|step| step.background_jobs.iter().any(|known| known == job))
+            plan.steps.iter().any(|step| {
+                step.background_jobs
+                    .iter()
+                    .chain(&step.waited_jobs)
+                    .any(|known| known == job)
+            })
         })
 }
 
@@ -180,7 +183,13 @@ pub fn record_waited_steps(
     tokio::spawn(async move {
         while let Some(update) = rx.recv().await {
             let update = match update {
-                StatusUpdate::Helper(view) if view.label == label && !view.phase.is_terminal() => {
+                StatusUpdate::Helper(view)
+                    if view
+                        .run
+                        .as_deref()
+                        .map_or(view.label == label, |run| run == id)
+                        && !view.phase.is_terminal() =>
+                {
                     if let Some(step) = view.step.clone() {
                         runs.step(&id, step);
                     }
@@ -267,6 +276,16 @@ pub fn show_helper_steps_on_card(
 /// the chat's plan card (or sends it fresh) when it had a plan. `true` when
 /// a card now shows how the run ended; the result message follows on its
 /// own and never says it again.
+///
+/// `answer_follows`: the run is one of a group its turn started, whose
+/// request a continuation of that turn answers once the last of them ended.
+/// The steps no run took on are that turn's own (a check it makes, the
+/// report it writes): the continuation does them, so the runs' ends never
+/// settle them, and the records stay for the card the request's answer
+/// settles ([`settle_answered_request`]). Live 2026-11-14: the last helper's
+/// end marked "Report each agent's measured completion time" as "nothing
+/// was left working on it" just before the answer reported those times.
+#[allow(clippy::too_many_arguments)]
 pub async fn settle_background_steps(
     runs: &crate::run_state::RunStates,
     plan_store: Option<&Arc<aidaemon_work::plans::PlanStore>>,
@@ -275,6 +294,7 @@ pub async fn settle_background_steps(
     chat_session: &str,
     job_id: &str,
     end: aidaemon_work::plans::JobEnd,
+    answer_follows: bool,
 ) -> bool {
     // Its run record already says it ended, so a step redraw that starts
     // now draws nothing; this waits for any still in flight.
@@ -285,6 +305,15 @@ pub async fn settle_background_steps(
         .map(|plan| plan.id);
     let settled = match (plan_store, plan_session) {
         (Some(plans), Some(plan_session)) => {
+            // The folders its work made, on the steps it took on, first:
+            // the card then names the real ones.
+            let made = runs
+                .get(job_id)
+                .map(|run| run.made_folders)
+                .unwrap_or_default();
+            if let Err(error) = plans.note_job_folders(plan_session, job_id, &made).await {
+                warn!(%error, job_id, "Could not record the folders a background job made");
+            }
             match plans.settle_background_job(plan_session, job_id, end).await {
                 Ok(plan) => plan,
                 Err(error) => {
@@ -336,7 +365,7 @@ pub async fn settle_background_steps(
     let all_ended = on_card.iter().all(|run| run.phase.is_terminal());
     let mut plan = settled;
     if let (Some(plans), Some(plan_id)) = (plan_store, plan_id.as_deref()) {
-        let latest = if all_ended {
+        let latest = if all_ended && !answer_follows {
             plans.settle_open_steps(plan_id).await
         } else {
             plans.get(plan_id).await
@@ -357,10 +386,78 @@ pub async fn settle_background_steps(
         },
         None => false,
     };
-    if all_ended {
+    if all_ended && !answer_follows {
         for run in &on_card {
             runs.forget(&run.id);
         }
+    }
+    shown
+}
+
+/// The request a group of runs worked for has its answer (or none could be
+/// written): its turn is over, so whatever step of its plan is still open
+/// now has nothing left to do it and settles as not done
+/// ([`aidaemon_work::plans::TaskPlan::settle_open_steps`]), and the card the
+/// runs are drawn on settles once, from the plan and the runs as they stand
+/// at the request's end: its header, rows and total from one final state.
+/// The runs' records are then let go. `plan_id` is the plan the runs
+/// worked on; `jobs` the runs of the group.
+pub async fn settle_answered_request(
+    runs: &crate::run_state::RunStates,
+    plan_store: Option<&Arc<aidaemon_work::plans::PlanStore>>,
+    hub: Option<&Weak<dyn OutboundRouter>>,
+    chat: &str,
+    plan_id: Option<&str>,
+    jobs: &[String],
+) -> bool {
+    let writer = card_writer(chat);
+    let _turn = writer.lock().await;
+    let plan = match (plan_store, plan_id) {
+        (Some(plans), Some(plan_id)) => match plans.settle_open_steps(plan_id).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                warn!(%error, plan_id, "Could not settle an answered request's checklist");
+                None
+            }
+        },
+        _ => None,
+    };
+    let forget = |on_card: &[crate::run_state::RunState]| {
+        for run in on_card {
+            runs.forget(&run.id);
+        }
+        for job in jobs {
+            runs.forget(job);
+        }
+    };
+    let Some(hub) = hub.and_then(Weak::upgrade) else {
+        forget(&[]);
+        return false;
+    };
+    let mut surface = None;
+    for job in jobs {
+        surface = run_card(hub.as_ref(), runs, job, chat).await;
+        if surface.is_some() {
+            break;
+        }
+    }
+    let Some(surface) = surface else {
+        forget(&[]);
+        return false;
+    };
+    let on_card = runs_on_card(hub.as_ref(), runs, chat, &surface).await;
+    let shown = match kept_card(plan.as_ref(), &on_card) {
+        Some(card) => match hub.edit_text(chat, &surface, &card).await {
+            Ok(edited) => edited,
+            Err(error) => {
+                warn!(session_id = %chat, %error, "Could not settle an answered request's card");
+                false
+            }
+        },
+        None => false,
+    };
+    if on_card.iter().all(|run| run.phase.is_terminal()) {
+        forget(&on_card);
     }
     shown
 }

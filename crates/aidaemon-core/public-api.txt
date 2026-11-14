@@ -54,6 +54,7 @@ pub aidaemon_core::card::HelperView::background: bool
 pub aidaemon_core::card::HelperView::label: alloc::string::String
 pub aidaemon_core::card::HelperView::phase: aidaemon_core::card::RunPhase
 pub aidaemon_core::card::HelperView::reason: core::option::Option<alloc::string::String>
+pub aidaemon_core::card::HelperView::run: core::option::Option<alloc::string::String>
 pub aidaemon_core::card::HelperView::since_request: core::option::Option<aidaemon_core::card::SinceRequest>
 pub aidaemon_core::card::HelperView::step: core::option::Option<aidaemon_core::card::Step>
 pub aidaemon_core::card::HelperView::steps: alloc::vec::Vec<usize>
@@ -62,7 +63,9 @@ pub aidaemon_core::card::HelperView::took: core::option::Option<alloc::string::S
 impl aidaemon_core::card::HelperView
 pub fn aidaemon_core::card::HelperView::for_steps(self, &[usize]) -> Self
 pub fn aidaemon_core::card::HelperView::headline(&self) -> &'static str
+pub fn aidaemon_core::card::HelperView::of_run(self, core::option::Option<&str>) -> Self
 pub fn aidaemon_core::card::HelperView::running(&str, bool, core::option::Option<aidaemon_core::card::Step>) -> Self
+pub fn aidaemon_core::card::HelperView::same_helper(&self, &aidaemon_core::card::HelperView) -> bool
 pub struct aidaemon_core::card::PlanCard
 pub aidaemon_core::card::PlanCard::done: usize
 pub aidaemon_core::card::PlanCard::finished_steps: alloc::vec::Vec<usize>

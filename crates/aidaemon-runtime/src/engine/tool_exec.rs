@@ -15,6 +15,9 @@ use tokio::sync::mpsc;
 pub struct ToolExecCtx<'a> {
     /// The tree's file fence for this call, when agents share the workspace.
     pub file_fence: Option<Arc<crate::coordination::CallFence>>,
+    /// The files the request's own work produced, kept for every run of its
+    /// tree (handed to the tools that note or deliver them).
+    pub produced_files: Option<aidaemon_tools::semantics::ProducedFiles>,
     pub session_id: &'a str,
     pub task_id: Option<&'a str>,
     pub status_tx: Option<mpsc::Sender<StatusUpdate>>,

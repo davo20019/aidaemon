@@ -630,6 +630,9 @@ pub trait ToolDispatch: TurnHost {
             workspace_collaboration_root: workspace_grant.map(|grant| grant.project_root.clone()),
             ..Default::default()
         };
+        if let Some(produced) = ctx.produced_files.clone() {
+            facts.extensions.insert(produced);
+        }
         if let Some(fence) = ctx.file_fence.clone() {
             facts
                 .extensions

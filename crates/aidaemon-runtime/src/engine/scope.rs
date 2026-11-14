@@ -31,7 +31,7 @@ pub struct TurnScope<'a> {
     pub daemon_paths: &'a aidaemon_tools::path_class::DaemonPaths,
     pub execution_backend: &'a dyn aidaemon_tools::ExecutionBackend,
     /// The MCP-registry tools bridged for this turn (daemon tools are
-    /// `Agent::tools`); see [`Agent::turn_tool`].
+    /// `Agent::tools`); see `Agent::turn_tool`.
     pub mcp_tools: Vec<Arc<dyn aidaemon_tools::OutcomeTool>>,
     /// Redacts secrets (the SDK's shapes and the configured literals) from
     /// the arguments of calls the kernel refused before they are written to
@@ -220,7 +220,7 @@ pub struct TurnScope<'a> {
     /// while the job runs.
     pub background_ack: std::sync::Mutex<Option<String>>,
     /// The names of the runs this turn left running in the background, in
-    /// launch order (each call's typed `background_run_label`): the turn's
+    /// launch order (each call's typed `background_run_labels`): the turn's
     /// launch line names them all
     /// ([`crate::background_run::started_group_in_background`]).
     pub background_runs: std::sync::Mutex<Vec<String>>,

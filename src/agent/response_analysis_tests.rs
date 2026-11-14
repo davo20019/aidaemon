@@ -94,8 +94,12 @@ fn test_user_text_references_filesystem_path_ignores_fractions_and_shorthand() {
 
 #[test]
 fn test_user_text_references_filesystem_path_detects_common_paths_and_files() {
+    // An absolute path counts only when it reaches this machine's filesystem,
+    // so the path sits under a directory every host has (`/Users` exists on
+    // macOS only).
+    let absolute = std::env::temp_dir().join("alice/project/file.txt");
     assert!(user_text_references_filesystem_path(
-        "/Users/alice/project/file.txt"
+        &absolute.display().to_string()
     ));
     assert!(user_text_references_filesystem_path("~/project/file.txt"));
     assert!(user_text_references_filesystem_path(

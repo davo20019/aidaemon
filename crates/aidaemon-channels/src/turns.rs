@@ -1782,6 +1782,7 @@ mod tests {
 
     fn helper(label: &str, phase: aidaemon_core::card::RunPhase) -> StatusUpdate {
         StatusUpdate::Helper(aidaemon_core::card::HelperView {
+            run: None,
             phase,
             ..aidaemon_core::card::HelperView::running(label, false, None)
         })
