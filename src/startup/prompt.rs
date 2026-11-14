@@ -141,7 +141,7 @@ pub(crate) fn build_base_system_prompt(
     };
 
     let cli_agent_table_row = if config.cli_agents.enabled {
-        "\n| Complex multi-step tasks (research, coding, analysis, admin) | cli_agent (REQUIRED when available at runtime) | terminal/run_command for simple or fallback work |"
+        "\n| Complex multi-step tasks (research, coding, analysis, admin) | cli_agent (REQUIRED when available at runtime) | terminal for simple or fallback work |"
     } else {
         ""
     };
@@ -200,10 +200,7 @@ pub(crate) fn build_base_system_prompt(
 
     let manage_api_table_row = "\n| Deterministically connect, learn, and verify an API end-to-end | manage_api | manual multi-tool orchestration |";
 
-    let manage_http_auth_table_row = "\n| Create and verify generic API auth profiles | manage_http_auth | manual config edits + keychain commands |";
-
-    let manage_oauth_table_row =
-        "\n| Connect external services via OAuth (built-in or custom OAuth2) | manage_oauth | — |";
+    let manage_auth_table_row = "\n| Create and verify generic API auth profiles; connect services via OAuth (built-in or custom OAuth2) | manage_auth (kind profile or oauth) | manual config edits + keychain commands |";
 
     let browser_table_row = if cfg!(feature = "browser") && config.browser.enabled {
         "| Interact with login/JavaScript website | browser | web_fetch for readable public pages |\n"
@@ -264,8 +261,8 @@ pub(crate) fn build_base_system_prompt(
         "\n\n## API Runtime Context\n\
         Available manual HTTP auth profiles: {}.\n\
         Profiles missing API guides: {}.\n\
-        For a missing guide, use manage_api for end-to-end onboarding or \
-        manage_skills(action='learn_api') with official docs/OpenAPI.\n\
+        For a missing guide, use manage_api (onboard; auth_mode existing plus learn_url \
+        for an already connected API) with official docs/OpenAPI.\n\
         Never ask the user to paste credentials into chat.",
         if profile_names.is_empty() {
             "none".to_string()
@@ -413,8 +410,8 @@ treating an error as active — stale log lines may only describe a past failure
 | Edit text in files | edit_file | — |
 | Search code/files | search_files | terminal (grep) |
 | Understand a project | read_file + search_files + terminal (ls) | — |
-| Run build/test/lint | run_command | terminal for arbitrary commands or commands requiring approval |
-| Git repository state | run_command (git status/log/diff) or terminal | — |
+| Run build/test/lint | terminal (allowlisted build, lint and read-only git commands run confined without asking) | — |
+| Git repository state | terminal (git status/log/diff) | — |
 | Stage and commit | terminal (git) | — |
 | Check runtimes/tools | check_environment | terminal |
 | Check ports/containers | terminal | — |
@@ -427,7 +424,7 @@ treating an error as active — stale log lines may only describe a past failure
 | Run scheduled work now, read its run history or last failure, set its budget, run instructions or workspace | manage_automations | — |
 {diagnostics_table_rows}| Read or change aidaemon config | manage_config | terminal (editing config.toml) |
 | Switch primary or failover LLM providers with guided actions | manage_config (`switch_provider`, `list_failover_providers`, `add_failover_provider`, `remove_failover_provider`) | manual multi-key config edits |
-{send_file_table_row}{spawn_table_row}{cli_agent_table_row}{manage_cli_agents_table_row}{health_probe_table_row}{manage_skills_table_row}{use_skill_table_row}{skill_resources_table_row}{manage_people_table_row}{http_request_table_row}{manage_api_table_row}{manage_http_auth_table_row}{manage_oauth_table_row}
+{send_file_table_row}{spawn_table_row}{cli_agent_table_row}{manage_cli_agents_table_row}{health_probe_table_row}{manage_skills_table_row}{use_skill_table_row}{skill_resources_table_row}{manage_people_table_row}{http_request_table_row}{manage_api_table_row}{manage_auth_table_row}
 
 ## Tools
 Your tool schemas are the authoritative reference for what each tool does and
@@ -438,7 +435,7 @@ tool for a task; consult the schema for parameters and semantics.{cli_agent_guid
 Telegram, Discord, and Slack are built into your binary. To add a channel, use the built-in \
 commands: `/connect telegram <token>`, `/connect discord <token>`, `/connect slack <bot_token> <app_token>`. \
 To edit config: use `manage_config`. For provider switches, prefer `manage_config(action='switch_provider')`. \
-For manual API key/token/basic/header integrations, prefer `manage_http_auth` over raw config edits. \
+For manual API key/token/basic/header integrations, prefer `manage_auth` (kind profile) over raw config edits. \
 For cross-provider failover setup, use `manage_config(action='list_failover_providers' | 'add_failover_provider' | 'remove_failover_provider')`. \
 After changes: tell user to run `/restart` (`!restart` in Slack). \
 In Slack, use `!` prefix for commands (e.g., `!restart`, `!reload`) since `/` is reserved by Slack.

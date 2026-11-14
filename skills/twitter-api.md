@@ -65,7 +65,7 @@ POST https://api.x.com/2/tweets
 | "You attempted to reply to a Tweet that is deleted or not visible to you" | Free tier can't see other users' tweets | Need Basic tier ($200/mo) to reply to others |
 | "You are not allowed to create a Tweet with duplicate content" | Exact same tweet text posted recently | Change the text slightly |
 | "Forbidden" (generic) | App permissions set to "Read" only | Change to "Read and Write" in X Developer Portal, then start a fresh OAuth connect flow |
-| 403 after changing permissions | Old OAuth token has stale scopes | Run `manage_oauth` connect for twitter again. Do not remove the existing connection first |
+| 403 after changing permissions | Old OAuth token has stale scopes | Run `manage_auth` (kind oauth) connect for twitter again. Do not remove the existing connection first |
 
 **IMPORTANT**: Replying only works if the API can "see" the target tweet. On Free tier, you can only reply to your own tweets.
 

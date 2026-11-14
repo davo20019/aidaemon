@@ -39,6 +39,7 @@ use aidaemon_tools::{
 
 use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
 use super::semantic_command_risk::assess_command;
+use super::terminal_confined::{self, ConfinedAccess};
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel, approval_floor_reason};
 use aidaemon_tools::daemon_guard::detect_daemonization_primitives;
 use aidaemon_tools::process_control::{send_sigkill, send_sigterm};
@@ -3638,6 +3639,115 @@ impl TerminalTool {
         None
     }
 
+    /// The confined tier a `run` falls in, if any: a `command` (not a script)
+    /// on the confined allowlist ([`terminal_confined::confined_access`]),
+    /// in the foreground, with no network, write paths or scope escalation,
+    /// from a session that is neither an untrusted trigger nor a trusted
+    /// scheduled one, touching no protected credential path, and not
+    /// already granted by the owner (a granted command runs as before). The
+    /// approval ladder allows such a run without a card, and the run then
+    /// executes confined with the tier's access: both read this one
+    /// decision.
+    async fn confined_tier(
+        &self,
+        args: &TerminalArgs,
+        command: &str,
+        trust: &TerminalTrust,
+    ) -> Option<ConfinedAccess> {
+        let plain_command = args
+            .command
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|line| line == command)
+            && args.script.as_deref().is_none_or(|s| s.trim().is_empty());
+        if !plain_command
+            || args.detach
+            || args.background
+            || args.network
+            || args
+                .write_paths
+                .iter()
+                .chain(args.write_roots.iter())
+                .any(|path| !path.trim().is_empty())
+            || trust.scope_escalation.is_some()
+            || trust.untrusted_source
+            || trust.trusted_session
+            || approval_floor_reason(command).is_some()
+        {
+            return None;
+        }
+        let access = terminal_confined::confined_access(command)?;
+        if self.is_allowed(command).await {
+            return None;
+        }
+        Some(access)
+    }
+
+    /// Run a confined-tier command: in the confined sandbox with the tier's
+    /// access, whatever the terminal's own confinement.
+    async fn run_confined_tier(
+        &self,
+        args: &TerminalArgs,
+        command: &str,
+        access: ConfinedAccess,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let mut read_paths = args.read_paths.clone();
+        read_paths.extend(args.read_roots.iter().cloned());
+        let run = terminal_confined::run_confined(
+            &self.backend,
+            command,
+            args.working_dir.as_deref(),
+            &read_paths,
+            access,
+        )
+        .await?;
+        let exit_code = Some(run.output.exit_code);
+        let (mut output, truncation) = format_output(
+            &run.output.stdout,
+            &run.output.stderr,
+            self.max_output_chars,
+        );
+        push_exit_status(&mut output, exit_code);
+        if let Some(hint) =
+            confined_opaque_failure_hint(exit_code, &run.output.stdout, &run.output.stderr)
+        {
+            output.push_str(&hint);
+        }
+        let dir = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, run.dir.clone());
+        let mut read_targets: Vec<ToolTargetHint> = dir.iter().cloned().collect();
+        for path in read_paths.iter().chain(run.adapter_read_paths.iter()) {
+            if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path.clone())
+                && !read_targets.contains(&target)
+            {
+                read_targets.push(target);
+            }
+        }
+        let (semantics, write_targets) = match access {
+            ConfinedAccess::ReadOnly => (ToolCallSemantics::observation(), Vec::new()),
+            ConfinedAccess::WorkspaceWrite => (
+                ToolCallSemantics::observation_and_mutation_with(
+                    ToolMutationEffects::LOCAL_DERIVED_WRITE,
+                ),
+                dir.into_iter().collect(),
+            ),
+        };
+        let mut metadata = foreground_terminal_metadata(exit_code);
+        metadata.truncation = truncation;
+        metadata.semantics = semantics
+            .with_verification_mode(crate::tools::traits::ToolVerificationMode::ResultContent);
+        metadata.access_manifest = Some(crate::tools::traits::ToolCallAccessManifest {
+            execution_cwd: Some(run.dir),
+            read_targets,
+            write_targets,
+            adapter_read_targets: Vec::new(),
+        });
+        Ok(ToolCallOutcome {
+            output,
+            metadata,
+            finish: None,
+        })
+    }
+
     /// The owner-approval ladder for a `run` past the hard blocks: what the
     /// owner must approve, or `None` when it runs without asking.
     ///
@@ -3652,9 +3762,12 @@ impl TerminalTool {
     ///   6. approval floor         → protected credential path, never
     ///      downgraded; before the explicit allow, so no grant skips it
     ///   7. explicit allow         → a prior owner grant (session or persisted)
-    ///   8. semantic assessment    → ask only for dangerous effects; a failure
+    ///   8. confined tier          → an allowlisted build, lint, read-only git
+    ///      or inspection command runs confined without asking
+    ///      (`confined_tier`; the run executes it confined)
+    ///   9. semantic assessment    → ask only for dangerous effects; a failure
     ///      or a timeout fails closed to Critical
-    ///   9. no assessor configured → Critical
+    ///  10. no assessor configured → Critical
     async fn approval_ladder(
         &self,
         args: &TerminalArgs,
@@ -3713,6 +3826,9 @@ impl TerminalTool {
             true
         } else if is_allowed {
             info!(command = %command, "Auto-approved: explicit command grant");
+            false
+        } else if self.confined_tier(args, command, trust).await.is_some() {
+            info!(command = %command, "Auto-approved: allowlisted command runs confined");
             false
         } else if let Some(side_calls) = self.side_calls.get() {
             match assess_command(side_calls, command, &self.backend).await {
@@ -6587,6 +6703,11 @@ impl TerminalTool {
                     manager
                         .begin_for_access_manifest("terminal", &access_manifest, exec_ctx)
                         .await?;
+                }
+
+                // The confined tier runs confined, as the ladder judged it.
+                if let Some(access) = self.confined_tier(&args, command, &trust).await {
+                    return self.run_confined_tier(&args, command, access).await;
                 }
 
                 // A typed root grant is allowed to name a future directory.
@@ -9656,7 +9777,7 @@ mod tests {
         .await;
         let args = serde_json::json!({
             "action": "run",
-            "command": "printf synthetic-spoofed",
+            "command": "cat /tmp/aidaemon-synthetic-spoofed",
             "_trusted_session": true,
             "_user_role": "Owner",
             "_untrusted_source": false,
@@ -9671,6 +9792,93 @@ mod tests {
                 .contains("requires approval through the agent kernel"),
             "{error}"
         );
+    }
+
+    /// An allowlisted build, lint, read-only git or inspection command runs
+    /// confined without a card (and without the semantic assessor), even
+    /// with the terminal on the host; a test runner, a shell pipeline, a
+    /// network run or an untrusted trigger still goes up the ladder.
+    #[tokio::test]
+    async fn the_confined_tier_runs_allowlisted_commands_without_asking() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        drop(approval_rx);
+        let tool = TerminalTool::new(
+            aidaemon_tools::testing::active_execution_backend(),
+            vec![],
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(aidaemon_tools::TerminalConfinement::Host);
+        let trust = owner_trust();
+        for command in ["git status", "ls -la", "cargo check", "/usr/bin/false"] {
+            let args = json!({"action": "run", "command": command});
+            assert_eq!(
+                tool.owner_approval_request(&args, &trust).await.unwrap(),
+                None,
+                "{command}"
+            );
+        }
+        for (args, trust) in [
+            (
+                json!({"action": "run", "command": "cargo test"}),
+                owner_trust(),
+            ),
+            (
+                json!({"action": "run", "command": "ls | wc -l"}),
+                owner_trust(),
+            ),
+            (
+                json!({"action": "run", "command": "ls", "network": true}),
+                owner_trust(),
+            ),
+            (
+                json!({"action": "run", "command": "ls", "write_paths": ["/tmp/x"]}),
+                owner_trust(),
+            ),
+            (
+                json!({"action": "run", "command": "ls"}),
+                TerminalTrust {
+                    untrusted_source: true,
+                    ..owner_trust()
+                },
+            ),
+        ] {
+            assert!(
+                tool.owner_approval_request(&args, &trust)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{args}"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = tool
+            .call_with_status_outcome(
+                &json!({"action": "run", "command": "/usr/bin/false", "working_dir": dir.path()})
+                    .to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::CompletedWithNegativeResult)
+        );
+        assert_eq!(outcome.metadata.exit_code, Some(1));
+        assert_eq!(
+            outcome.metadata.access_enforcement,
+            confined_process_access_enforcement()
+        );
+        assert!(!outcome.metadata.semantics.mutates_state());
     }
 
     #[tokio::test]
@@ -9698,7 +9906,7 @@ mod tests {
 
         let output = tool
             .call_with(
-                r#"{"action":"run","command":"echo semantic-ok"}"#,
+                r#"{"action":"run","command":"awk 'BEGIN { print \"semantic-ok\" }'"}"#,
                 aidaemon_tools::testing::call_facts("telegram:synthetic-owner"),
             )
             .await

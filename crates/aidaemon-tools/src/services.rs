@@ -9,6 +9,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "oauth")]
+pub mod manage_auth;
+#[cfg(feature = "oauth")]
 pub mod manage_http_auth;
 #[cfg(feature = "oauth")]
 pub mod manage_oauth;

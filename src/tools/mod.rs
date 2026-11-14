@@ -97,10 +97,8 @@ mod edit_file;
 pub use crate::startup::tool_config::EditFileTool;
 mod search_files;
 pub use crate::startup::tool_config::SearchFilesTool;
-pub(crate) use aidaemon_runtime::tools::run_command;
 pub use aidaemon_tools::check_environment::CheckEnvironmentTool;
 pub use aidaemon_tools::checkpoints::ListCheckpointsTool;
-pub use run_command::RunCommandTool;
 
 #[cfg(test)]
 mod catalog_lint_tests;

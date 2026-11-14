@@ -222,7 +222,7 @@ impl ManageOAuthTool {
         if let Some(tx) = status_tx {
             let _ = tx
                 .send(StatusUpdate::ToolProgress {
-                    name: "manage_oauth".to_string(),
+                    name: "manage_auth".to_string(),
                     chunk,
                 })
                 .await;
@@ -249,7 +249,7 @@ impl ManageOAuthTool {
                 Ok("oauth2_client_credentials".to_string())
             }
             "oauth1a" => anyhow::bail!(
-                "Interactive OAuth 1.0a provider onboarding is not supported yet. Use `manage_http_auth` for manual OAuth 1.0a tokens."
+                "Interactive OAuth 1.0a provider onboarding is not supported yet. Use `manage_auth` with kind \"profile\" for manual OAuth 1.0a tokens."
             ),
             other => anyhow::bail!(
                 "Unknown auth_type '{}'. Supported values: oauth2_pkce, oauth2_authorization_code, oauth2_client_credentials.",
@@ -944,7 +944,7 @@ impl ManageOAuthTool {
             match provider.auth_type {
                 OAuthType::OAuth1a => {
                     return Ok(format!(
-                        "Provider '{}' is configured as OAuth 1.0a, which is not supported by the interactive OAuth connector yet. Use manage_http_auth for manual OAuth 1.0a tokens.",
+                        "Provider '{}' is configured as OAuth 1.0a, which is not supported by the interactive OAuth connector yet. Use manage_auth with kind \"profile\" for manual OAuth 1.0a tokens.",
                         service
                     ));
                 }

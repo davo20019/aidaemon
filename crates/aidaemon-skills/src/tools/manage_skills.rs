@@ -2233,19 +2233,6 @@ impl ManageSkillsTool {
         self.persist_to_filesystem(skill).await
     }
 
-    async fn handle_learn_api(
-        &self,
-        name: Option<&str>,
-        profile: Option<&str>,
-        url: &str,
-        kind: Option<&str>,
-    ) -> anyhow::Result<String> {
-        Ok(self
-            .learn_api_and_persist(name, profile, url, kind)
-            .await?
-            .output)
-    }
-
     async fn handle_list(&self) -> anyhow::Result<String> {
         let mut all_skills = skills::load_skills_with_status(&self.skills_dir);
         if all_skills.is_empty() {
@@ -2999,14 +2986,15 @@ impl ManageSkillsTool {
     }
 }
 
+/// The answer to the retired `learn_api` action, which ran nothing.
+const LEARN_API_MOVED: &str = "learn_api moved: use manage_api with action \"onboard\", auth_mode \"existing\" and learn_url (the docs or OpenAPI URL). Nothing ran.";
+
 #[derive(Deserialize)]
 struct ManageSkillsArgs {
     action: String,
     url: Option<String>,
     content: Option<String>,
     name: Option<String>,
-    profile: Option<String>,
-    kind: Option<String>,
     names: Option<Vec<String>>,
     query: Option<String>,
     draft_id: Option<i64>,
@@ -3030,7 +3018,7 @@ impl Tool for ManageSkillsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage skills: add, add_inline, learn_api, list, remove, remove_all, enable, disable, browse, install, update, review. Bundled files via skill_resources."
+        "Manage skills: add, add_inline, list, remove, remove_all, enable, disable, browse, install, update, review. Bundled files via skill_resources. API guides: manage_api."
     }
 
     fn schema(&self) -> Value {
@@ -3042,7 +3030,7 @@ impl Tool for ManageSkillsTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["add", "add_inline", "learn_api", "list", "remove", "remove_all", "enable", "disable", "browse", "install", "update", "review"],
+                        "enum": ["add", "add_inline", "list", "remove", "remove_all", "enable", "disable", "browse", "install", "update", "review"],
                         "description": "Action"
                     },
                     "url": {
@@ -3054,14 +3042,6 @@ impl Tool for ManageSkillsTool {
                     },
                     "name": {
                         "type": "string"
-                    },
-                    "profile": {
-                        "type": "string",
-                        "description": "Auth profile for learn_api"
-                    },
-                    "kind": {
-                        "type": "string",
-                        "enum": ["auto", "openapi", "docs"]
                     },
                     "names": {
                         "type": "array",
@@ -3131,18 +3111,8 @@ impl ManageSkillsTool {
                 })?;
                 self.handle_add_inline(content).await
             }
-            "learn_api" => {
-                let url = args.url.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("'url' parameter required for 'learn_api' action")
-                })?;
-                self.handle_learn_api(
-                    args.name.as_deref(),
-                    args.profile.as_deref(),
-                    url,
-                    args.kind.as_deref(),
-                )
-                .await
-            }
+            // Learning an API guide moved to manage_api.
+            "learn_api" => Ok(LEARN_API_MOVED.to_string()),
             "list" => self.handle_list().await,
             "remove" => {
                 let name = args.name.as_deref().ok_or_else(|| {
@@ -3184,7 +3154,7 @@ impl ManageSkillsTool {
             }
             "review" => self.handle_review(args.draft_id, args.approve).await,
             other => Ok(format!(
-                "Unknown action '{}'. Valid actions: add, add_inline, learn_api, list, remove, remove_all, enable, disable, browse, install, update, review",
+                "Unknown action '{}'. Valid actions: add, add_inline, list, remove, remove_all, enable, disable, browse, install, update, review",
                 other
             )),
         }
@@ -3208,20 +3178,6 @@ impl ManageSkillsTool {
                     format!("Add skill from URL '{url}'"),
                     "This will fetch external instructions that can influence AI behavior.",
                     json!({"action": "add", "url": url}),
-                )
-            }
-            "learn_api" => {
-                let url = args.url.as_deref()?;
-                (
-                    format!("Learn API from URL '{url}'"),
-                    "This will fetch external documentation or an OpenAPI spec and save a new reusable API guide skill.",
-                    json!({
-                        "action": "learn_api",
-                        "url": url,
-                        "name": args.name,
-                        "profile": args.profile,
-                        "kind": args.kind,
-                    }),
                 )
             }
             "install" if has_registries => {
@@ -3273,7 +3229,7 @@ impl ManageSkillsTool {
 
     /// The typed effects of one call. Listing and reviewing drafts without a
     /// decision read only the skills store. A fetch from a URL (add,
-    /// learn_api) or from a configured registry (install) names its host, so
+    /// update) or from a configured registry (install) names its host, so
     /// a declined fetch binds that host; the fetched content then becomes a
     /// skill, so no fetching call claims its effects are exhaustive. Every
     /// other change stays undeclared (`unknown`).
@@ -3287,7 +3243,7 @@ impl ManageSkillsTool {
         match args.action.as_str() {
             "list" => return CallEffects::none(),
             "review" if args.approve.is_none() => return CallEffects::none(),
-            "add" | "learn_api" => {
+            "add" => {
                 effects
                     .keys
                     .extend(args.url.as_deref().and_then(url_effect));
@@ -3772,12 +3728,14 @@ mutation CreateWidget {
         .unwrap();
         assert_ne!(add.subject, other.subject);
 
-        let learn = ask(
-            json!({"action":"learn_api","url":"https://example.com/openapi.json","profile":"demo"}),
-            false,
-        )
-        .expect("learn_api asks");
-        assert!(learn.summary.contains("Learn API from URL"));
+        assert!(
+            ask(
+                json!({"action":"learn_api","url":"https://example.com/openapi.json"}),
+                false
+            )
+            .is_none(),
+            "learn_api moved to manage_api and fetches nothing here"
+        );
         assert!(
             ask(json!({"action":"update","name":"updatable"}), false)
                 .expect("update asks")
@@ -3806,7 +3764,6 @@ mutation CreateWidget {
         let (tool, _state, _skills_dir) = setup_tool().await;
         for args in [
             r#"{"action":"add","url":"https://example.com/skill.md"}"#,
-            r#"{"action":"learn_api","url":"https://example.com/openapi.json"}"#,
             r#"{"action":"update","name":"updatable"}"#,
         ] {
             let error = tool
@@ -3828,6 +3785,14 @@ mutation CreateWidget {
             .await
             .unwrap();
         assert!(!listed.contains("agent kernel"));
+        let moved = tool
+            .call_with(
+                r#"{"action":"learn_api","url":"https://example.com/openapi.json"}"#,
+                aidaemon_tools::testing::call_facts("test:owner"),
+            )
+            .await
+            .unwrap();
+        assert!(moved.contains("manage_api"), "{moved}");
     }
 
     #[test]
@@ -4140,7 +4105,7 @@ mutation CreateWidget {
         let (tool, _state, _skills_dir) = setup_tool().await;
         let schema = tool.schema();
         let description = schema["description"].as_str().unwrap();
-        for action in ["learn_api", "remove_all", "review"] {
+        for action in ["remove_all", "review", "manage_api"] {
             assert!(description.contains(action), "missing action {action}");
         }
     }
