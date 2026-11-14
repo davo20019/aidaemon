@@ -1028,9 +1028,11 @@ fn no_assessor(allowed: &[&str]) -> TerminalSetup {
     }
 }
 
+// The commands below are ones the ladder asks about: allowlisted
+// observations (`printf`, `echo`, `ls`) run confined without a card.
 #[tokio::test]
 async fn terminal_unknown_command_interrupts_for_owner() {
-    let command = "printf synthetic-unknown-ok";
+    let command = "awk 'BEGIN{print \"synthetic-unknown-ok\"}'";
     let (harness, approver, _pool) = terminal_harness(
         vec![terminal_run(command), MockProvider::text_response("Done.")],
         vec![Some(crate::types::ApprovalResponse::AllowOnce)],
@@ -1089,8 +1091,8 @@ async fn terminal_allowlisted_command_runs_without_card() {
 async fn terminal_allow_always_persists_prefix() {
     let (harness, approver, pool) = terminal_harness(
         vec![
-            terminal_run("printf synthetic-first"),
-            terminal_run("printf synthetic-second"),
+            terminal_run("basename /tmp/synthetic-first"),
+            terminal_run("basename /tmp/synthetic-second"),
             MockProvider::text_response("Done."),
         ],
         vec![Some(crate::types::ApprovalResponse::AllowAlways)],
@@ -1111,7 +1113,7 @@ async fn terminal_allow_always_persists_prefix() {
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(persisted, ["printf"]);
+    assert_eq!(persisted, ["basename"]);
 }
 
 #[tokio::test]
@@ -1169,7 +1171,7 @@ async fn terminal_semantic_failure_fails_closed_to_card() {
     let assessment = MockProvider::text_response("looks fine to me");
     let (harness, approver, _pool) = terminal_harness(
         vec![
-            terminal_run("printf synthetic-unjudged"),
+            terminal_run("awk 'BEGIN{print \"synthetic-unjudged\"}'"),
             MockProvider::text_response("The owner declined."),
         ],
         vec![Some(crate::types::ApprovalResponse::Deny)],
@@ -1317,7 +1319,7 @@ async fn terminal_cards_offer_the_old_buttons() {
         // No assessor configured (Critical).
         (
             crate::types::PermissionMode::Default,
-            "printf synthetic-critical",
+            "awk 'BEGIN{print \"synthetic-critical\"}'",
             RiskLevel::Critical,
             true,
         ),
