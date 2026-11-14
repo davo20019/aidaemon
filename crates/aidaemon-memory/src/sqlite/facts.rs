@@ -758,6 +758,17 @@ impl SqliteMemory {
 
 #[async_trait]
 impl FactStore for SqliteMemory {
+    async fn warm_query(&self, query: &str) {
+        let started = std::time::Instant::now();
+        let outcome = self.embedding_service.embed(query.to_string()).await;
+        tracing::debug!(
+            target: "memory_recall",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            ok = outcome.is_ok(),
+            "query embedding warmed"
+        );
+    }
+
     async fn search_facts(
         &self,
         query: &str,

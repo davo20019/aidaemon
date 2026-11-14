@@ -135,6 +135,12 @@ pub struct MemoryParts {
 pub trait MemoryPlugin: Send + Sync {
     async fn turn(&self, turn: &MemoryTurn) -> MemoryParts;
 
+    /// Starts preparing recall for `user_text` (for example its query
+    /// embedding) when the message arrives, before the turn's memory policy
+    /// is settled. It must read and write no memory and return at once; the
+    /// turn's recall uses whatever is ready.
+    fn warm(&self, _user_text: &str) {}
+
     /// The daemon memory tools ([`DAEMON_MEMORY_TOOLS`]) this plugin owns.
     fn owned_daemon_tools(&self) -> &'static [&'static str] {
         &[]

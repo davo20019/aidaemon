@@ -341,6 +341,18 @@ impl MemoryPlugin for DaemonMemory {
         self.served.turn(turn).await
     }
 
+    fn warm(&self, user_text: &str) {
+        if user_text.trim().is_empty() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let store = self.inner.store.clone();
+        let text = user_text.to_string();
+        runtime.spawn(async move { store.warm_query(&text).await });
+    }
+
     fn owned_daemon_tools(&self) -> &'static [&'static str] {
         DAEMON_MEMORY_TOOLS
     }

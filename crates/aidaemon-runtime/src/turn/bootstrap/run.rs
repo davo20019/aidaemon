@@ -568,6 +568,15 @@ async fn annotate_identity(
     }
 }
 
+/// How long bootstrap waits for the turn digest before starting the
+/// relationship router beside it: about the digest's p90 (0.8 s on
+/// 2026-11-14, against a 1.5 s deadline and a router p50 of 2 s).
+const ROUTER_HEDGE_AFTER: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// When the digest gave no answer, how long after the planner starts the
+/// request compiler may still finish (its p50 was 1.8 s on 2026-11-14).
+const COMPILER_WAIT_WITHOUT_DIGEST: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub async fn run_bootstrap(
     agent: &dyn TurnHost,
     ctx: &BootstrapCtx<'_>,
@@ -598,6 +607,12 @@ pub async fn run_bootstrap(
         .await
     };
     let user_text = user_text_enriched.as_str();
+    // Recall searches for this text at the first model call; preparing it
+    // now (the query embedding) overlaps the rest of bootstrap. It reads
+    // and writes no memory, so it needs no memory policy yet.
+    if !is_mandate_execution {
+        agent.memory_plugin().warm(user_text);
+    }
     // Resume checkpoints can contain prior tool arguments/results and broader
     // owner authority. A collaborator starts a fresh scoped turn instead of
     // inheriting an interrupted owner task from the shared session.
@@ -1137,14 +1152,32 @@ pub async fn run_bootstrap(
     let relationship_and_digest = async {
         match digest {
             Some(digest) if digest_awaited => {
-                let outcome = agent
-                    .side_calls()
-                    .decide(
-                        crate::llm::decisions::Decision::TurnDigest,
-                        digest.request,
-                        crate::llm::decide::DecisionContext::turn(session_id, &task_id),
-                    )
-                    .await;
+                let decide = agent.side_calls().decide(
+                    crate::llm::decisions::Decision::TurnDigest,
+                    digest.request,
+                    crate::llm::decide::DecisionContext::turn(session_id, &task_id),
+                );
+                let mut decide = std::pin::pin!(decide);
+                let mut router = std::pin::pin!(router);
+                // A digest slower than it almost always is (its p90) is
+                // likely to time out, and the router it stands in for takes
+                // seconds: from then the router runs beside it, so a timeout
+                // costs the turn the hedge delay instead of the whole
+                // deadline. A digest that still decides drops the router.
+                let mut routed = None;
+                let outcome = match tokio::time::timeout(ROUTER_HEDGE_AFTER, &mut decide).await {
+                    Ok(outcome) => outcome,
+                    Err(_) if relationship_needed => {
+                        tokio::select! {
+                            outcome = &mut decide => outcome,
+                            shaped = &mut router => {
+                                routed = Some(shaped);
+                                decide.await
+                            }
+                        }
+                    }
+                    Err(_) => decide.await,
+                };
                 let decided =
                     crate::turn::task_planning::digest_relationship(&outcome, &digest.antecedents);
                 let relationship = match decided {
@@ -1157,7 +1190,10 @@ pub async fn run_bootstrap(
                         Some(shape)
                     }
                     // Below threshold, failed or timed out: today's router.
-                    None => router.await,
+                    None => match routed {
+                        Some(shaped) => shaped,
+                        None => router.await,
+                    },
                 };
                 (relationship, Some(outcome))
             }
@@ -1213,6 +1249,24 @@ pub async fn run_bootstrap(
                     .is_some_and(crate::turn::task_planning::digest_asks_no_change) =>
             {
                 (None, "skipped_no_change")
+            }
+            // The digest gave no answer (timed out or failed), so nothing
+            // says the units are only looks, and the backend that missed
+            // it is often slow for the compiler too. Units are a planning
+            // hint (receipts decide completion), so a compiler past its
+            // usual time is not waited for.
+            None if digest_outcome.as_ref().is_some_and(|outcome| {
+                matches!(
+                    outcome,
+                    crate::llm::decisions::DecisionOutcome::UseDefault(_)
+                )
+            }) =>
+            {
+                let budget = COMPILER_WAIT_WITHOUT_DIGEST.saturating_sub(planner_started.elapsed());
+                match tokio::time::timeout(budget, &mut compile_units).await {
+                    Ok(units) => (units, "compiled"),
+                    Err(_) => (None, "abandoned_slow"),
+                }
             }
             None => (compile_units.await, "compiled"),
         };

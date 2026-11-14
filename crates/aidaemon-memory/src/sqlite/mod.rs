@@ -118,6 +118,47 @@ pub const DEFAULT_RERANK_DEADLINE: std::time::Duration = std::time::Duration::fr
 pub(crate) struct StoreModels {
     embedder: Arc<dyn Embedder>,
     reranker: Option<Arc<dyn Reranker>>,
+    /// Recent single-text embeddings, shared by every clone.
+    queries: Arc<QueryMemo>,
+}
+
+/// How many recent query texts keep their vectors.
+const QUERY_MEMO_CAPACITY: usize = 8;
+
+/// The last few single-text embeddings. One turn's recall searches facts,
+/// episodes, procedures and error solutions for the same message at once;
+/// with this they share one model run instead of queueing four behind the
+/// model's lock, and a warm-up started when the message arrives (see
+/// `FactStore::warm_query`) leaves the vector ready for all of them. A text
+/// always has the same vector, so an entry never goes stale; one being
+/// computed is awaited, not recomputed, and a failed run leaves its entry
+/// empty for the next caller to retry.
+#[derive(Default)]
+struct QueryMemo {
+    entries: std::sync::Mutex<std::collections::VecDeque<(String, VectorCell)>>,
+}
+
+/// One text's vector, filled by whichever caller runs the model first.
+type VectorCell = Arc<tokio::sync::OnceCell<Vec<f32>>>;
+
+impl QueryMemo {
+    fn cell(&self, text: &str) -> VectorCell {
+        let Ok(mut entries) = self.entries.lock() else {
+            return Arc::new(tokio::sync::OnceCell::new());
+        };
+        if let Some(position) = entries.iter().position(|(key, _)| key == text) {
+            let entry = entries.remove(position).expect("position is in range");
+            let cell = entry.1.clone();
+            entries.push_back(entry);
+            return cell;
+        }
+        let cell = Arc::new(tokio::sync::OnceCell::new());
+        entries.push_back((text.to_string(), cell.clone()));
+        while entries.len() > QUERY_MEMO_CAPACITY {
+            entries.pop_front();
+        }
+        cell
+    }
 }
 
 impl StoreModels {
@@ -126,12 +167,17 @@ impl StoreModels {
     }
 
     async fn embed(&self, text: String) -> anyhow::Result<Vec<f32>> {
-        self.embedder
-            .embed(&[text])
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))
+        let cell = self.queries.cell(&text);
+        cell.get_or_try_init(|| async {
+            self.embedder
+                .embed(&[text])
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))
+        })
+        .await
+        .cloned()
     }
 
     /// One embedder call for many texts: one model hop instead of one per
@@ -208,6 +254,7 @@ impl SqliteMemory {
             embedding_service: StoreModels {
                 embedder,
                 reranker: None,
+                queries: Arc::default(),
             },
             fact_upsert_lock: Arc::new(Mutex::new(())),
             channels: Arc::new(ExactChannelIds),
@@ -322,4 +369,83 @@ fn days_until_date(value: &str, today: chrono::NaiveDate) -> Option<i64> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod query_memo_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+
+    use super::{QUERY_MEMO_CAPACITY, StoreModels};
+    use crate::Embedder;
+
+    struct Counting {
+        runs: AtomicUsize,
+        fail_first: bool,
+    }
+
+    #[async_trait]
+    impl Embedder for Counting {
+        fn model_id(&self) -> &str {
+            "counting"
+        }
+        fn dimensions(&self) -> usize {
+            1
+        }
+        async fn embed(&self, texts: &[String]) -> crate::Result<Vec<Vec<f32>>> {
+            let run = self.runs.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if self.fail_first && run == 0 {
+                return Err(crate::MemoryError::Embedding("model not loaded yet".into()));
+            }
+            Ok(texts.iter().map(|text| vec![text.len() as f32]).collect())
+        }
+    }
+
+    fn models(fail_first: bool) -> (StoreModels, Arc<Counting>) {
+        let embedder = Arc::new(Counting {
+            runs: AtomicUsize::new(0),
+            fail_first,
+        });
+        let models = StoreModels {
+            embedder: embedder.clone(),
+            reranker: None,
+            queries: Arc::default(),
+        };
+        (models, embedder)
+    }
+
+    #[tokio::test]
+    async fn concurrent_searches_for_one_text_share_one_model_run() {
+        let (models, embedder) = models(false);
+        let text = "what is on my calendar".to_string();
+        let (a, b, c, d) = tokio::join!(
+            models.embed(text.clone()),
+            models.embed(text.clone()),
+            models.embed(text.clone()),
+            models.embed(text.clone()),
+        );
+        let results = [a.unwrap(), b.unwrap(), c.unwrap(), d.unwrap()];
+        assert!(results.iter().all(|vector| vector == &results[0]));
+        assert_eq!(embedder.runs.load(Ordering::SeqCst), 1);
+        // A different text runs the model again.
+        models.embed("another question".to_string()).await.unwrap();
+        assert_eq!(embedder.runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_is_retried_and_old_texts_are_evicted() {
+        let (models, embedder) = models(true);
+        assert!(models.embed("first".to_string()).await.is_err());
+        assert!(models.embed("first".to_string()).await.is_ok());
+        assert_eq!(embedder.runs.load(Ordering::SeqCst), 2);
+        for n in 0..QUERY_MEMO_CAPACITY {
+            models.embed(format!("text {n}")).await.unwrap();
+        }
+        let before = embedder.runs.load(Ordering::SeqCst);
+        models.embed("first".to_string()).await.unwrap();
+        assert_eq!(embedder.runs.load(Ordering::SeqCst), before + 1);
+    }
 }
