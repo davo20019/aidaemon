@@ -22,6 +22,8 @@ pub mod link;
 pub mod machine;
 pub mod signin;
 pub mod state;
+#[cfg(feature = "native")]
+mod tls;
 
 pub use keystore::{FileKeyStore, KeyStore, StoredDevice};
 #[cfg(feature = "native")]

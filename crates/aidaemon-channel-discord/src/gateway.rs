@@ -423,9 +423,23 @@ impl DiscordChannel {
         let url = connect_url(&base, self.zlib_enabled());
         tracing::debug!(%url, resume, shard, "discord: connecting to gateway");
 
+        let tls = match aidaemon_tools::tls::client_config() {
+            Ok(tls) => tls,
+            Err(e) => {
+                tracing::warn!(error = %e, "discord: gateway tls setup failed");
+                return Outcome::Reconnect {
+                    delay: Delay::Backoff,
+                };
+            }
+        };
         let connect = tokio::select! {
             _ = shutdown.cancelled() => return Outcome::Shutdown,
-            r = tokio_tungstenite::connect_async(url.as_str()) => r,
+            r = tokio_tungstenite::connect_async_tls_with_config(
+                url.as_str(),
+                None,
+                false,
+                Some(tokio_tungstenite::Connector::Rustls(tls)),
+            ) => r,
         };
         let ws = match connect {
             Ok((ws, _)) => ws,

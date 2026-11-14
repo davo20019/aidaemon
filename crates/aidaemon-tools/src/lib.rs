@@ -83,6 +83,7 @@ pub mod system;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod text;
+pub mod tls;
 mod util;
 pub mod web;
 pub mod web_search;

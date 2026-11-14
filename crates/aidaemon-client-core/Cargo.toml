@@ -22,10 +22,12 @@ futures = { version = "0.3", optional = true }
 p256 = { version = "0.14", features = ["ecdsa"] }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"], optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"], optional = true }
-tokio-tungstenite = { version = "0.30", features = ["native-tls"], optional = true }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"], optional = true }
 uuid = { version = "1", features = ["v4"] }
 
 # A browser has no OS randomness. Request ids take getrandom's, whose
@@ -39,7 +41,7 @@ uuid = { version = "1", features = ["v4", "rng-getrandom"] }
 default = ["native"]
 # The tokio link and reqwest sign-in. Without it the
 # crate has no I/O and builds for wasm32-unknown-unknown.
-native = ["dep:futures", "dep:reqwest", "dep:tokio", "dep:tokio-tungstenite"]
+native = ["dep:futures", "dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:tokio", "dep:tokio-tungstenite"]
 # wasm32 only: randomness from the page's Web Crypto, for a runtime that
 # registers no getrandom backend of its own.
 browser-random = ["dep:getrandom", "getrandom/wasm_js"]

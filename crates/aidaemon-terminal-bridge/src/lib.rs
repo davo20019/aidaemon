@@ -37,11 +37,11 @@ use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 use tracing::{debug, error, info, warn};
 
 use aidaemon_secrets::SecretStore;
@@ -3921,7 +3921,9 @@ impl TerminalBridge {
             "Prepared daemon websocket request headers"
         );
         info!("Connecting terminal bridge to broker");
-        let (ws_stream, _) = connect_async(req).await?;
+        let tls = aidaemon_tools::tls::client_config()?;
+        let (ws_stream, _) =
+            connect_async_tls_with_config(req, None, false, Some(Connector::Rustls(tls))).await?;
         info!("Terminal bridge connected");
 
         let (mut ws_write, mut ws_read) = ws_stream.split();

@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::imap_proto::Envelope;
-use async_native_tls::TlsConnector;
 use futures::TryStreamExt;
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::pki_types::ServerName;
 use tracing::{error, info, warn};
 
 use super::{EventSender, TriggerEvent, TriggerSettings};
@@ -58,8 +59,10 @@ async fn imap_idle_loop(
     sender: &EventSender,
 ) -> anyhow::Result<()> {
     let tcp = TcpStream::connect((host, port)).await?;
-    let tls = TlsConnector::new();
-    let tls_stream = tls.connect(host, tcp).await?;
+    let tls = TlsConnector::from(aidaemon_tools::tls::client_config()?);
+    let tls_stream = tls
+        .connect(ServerName::try_from(host.to_owned())?, tcp)
+        .await?;
 
     let client = async_imap::Client::new(tls_stream);
     let mut session = client.login(username, password).await.map_err(|e| e.0)?;

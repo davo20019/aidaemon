@@ -426,9 +426,16 @@ impl SlackChannel {
             .and_then(Value::as_str)
             .ok_or_else(|| ChannelError::Other("apps.connections.open: no url".into()))?;
         // The URL carries a short-lived ticket; never log it.
-        let (ws, _) = tokio_tungstenite::connect_async(url)
-            .await
-            .map_err(|e| ChannelError::Transport(format!("websocket connect: {e}")))?;
+        let tls = aidaemon_tools::tls::client_config()
+            .map_err(|e| ChannelError::Transport(format!("websocket tls: {e}")))?;
+        let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+            url,
+            None,
+            false,
+            Some(tokio_tungstenite::Connector::Rustls(tls)),
+        )
+        .await
+        .map_err(|e| ChannelError::Transport(format!("websocket connect: {e}")))?;
         Ok(ws)
     }
 

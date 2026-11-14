@@ -22,7 +22,7 @@ publish = false
 # reach across a crate boundary.
 testing = ["aidaemon-events/testing"]
 # The IMAP email trigger.
-email-trigger = ["dep:async-imap", "dep:async-native-tls", "dep:futures"]
+email-trigger = ["dep:async-imap", "dep:tokio-rustls", "dep:futures"]
 
 [dependencies]
 aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels" }
@@ -31,7 +31,7 @@ aidaemon-events = { version = "0.20.0", path = "../aidaemon-events" }
 aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools" }
 anyhow = "1"
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"], optional = true }
-async-native-tls = { version = "0.6", default-features = false, features = ["runtime-tokio"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, optional = true }
 async-trait = "0.1"
 croner = "4"
 dirs = "7"

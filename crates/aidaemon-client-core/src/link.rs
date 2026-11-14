@@ -185,9 +185,15 @@ impl Link {
             "authorization",
             format!("Bearer {token}").parse().map_err(failed)?,
         );
-        let (mut socket, _) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(connect_failure)?;
+        let tls = crate::tls::client_config().map_err(failed)?;
+        let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            None,
+            false,
+            Some(tokio_tungstenite::Connector::Rustls(tls)),
+        )
+        .await
+        .map_err(connect_failure)?;
         let send = |frame: &ClientFrame| {
             serde_json::to_string(frame)
                 .map(Message::text)
