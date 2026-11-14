@@ -5,7 +5,9 @@
 use std::sync::Arc;
 
 use aidaemon_client_gateway::{ClientGateway, ClientGatewayConfig, ClientHost, GatewayDeps};
-use aidaemon_client_protocol::{HistoryMessage, SessionSummary};
+use aidaemon_client_protocol::{
+    HistoryMessage, MemoryItem, SearchHit, SessionSummary, SlashCommand,
+};
 use async_trait::async_trait;
 
 use crate::channels::{ChannelHub, ChannelRuntimeDeps};
@@ -89,6 +91,8 @@ pub(crate) struct SystemSources {
     pub health: Option<Arc<crate::health::HealthProbeStore>>,
     pub jobs: Option<Arc<crate::heartbeat::HeartbeatTelemetry>>,
     pub queues: Arc<crate::queue_telemetry::QueueTelemetry>,
+    /// What the daemon remembers, for the app's Memory page.
+    pub memory: Arc<dyn aidaemon_memory::stores::MemoryStores>,
 }
 
 /// A stored time (RFC 3339 or SQLite's `YYYY-MM-DD HH:MM:SS`, UTC) in ms.
@@ -245,6 +249,37 @@ impl SystemSources {
                 });
             }
         }
+        type RunRow = (
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+        );
+        let runs = sqlx::query_as::<_, RunRow>(
+            "SELECT r.goal_id, g.description, r.status, r.outcome_summary, r.started_at, \
+             r.completed_at, g.session_id FROM goal_runs r JOIN goals g ON g.id = r.goal_id \
+             WHERE r.started_at >= datetime('now', '-1 day') \
+             ORDER BY r.started_at DESC LIMIT 50",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(
+            |(goal_id, description, status, outcome, started, finished, session_id)| GoalRunInfo {
+                goal_id,
+                description,
+                status,
+                outcome: outcome.filter(|o| !o.trim().is_empty()),
+                started_ms: stored_ms(&started).unwrap_or(0),
+                finished_ms: finished.as_deref().and_then(stored_ms),
+                session_id: Some(session_id).filter(|s| !s.is_empty()),
+            },
+        )
+        .collect();
         let model = Some(self.models.default_model.clone()).filter(|m| !m.is_empty());
         SystemStatus {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -257,8 +292,53 @@ impl SystemSources {
             jobs,
             queues,
             checks,
+            runs,
         }
     }
+}
+
+/// The tool names in a stored `tool_calls_json`, in order.
+fn tool_names(json: &str) -> Vec<String> {
+    let Ok(serde_json::Value::Array(calls)) = serde_json::from_str::<serde_json::Value>(json)
+    else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .filter_map(|call| {
+            call.get("name")
+                .or_else(|| call.get("function").and_then(|f| f.get("name")))
+                .and_then(|n| n.as_str())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// The text around the first of `words` in `text`, on one line.
+fn snippet(text: &str, words: &[String]) -> String {
+    const SPAN: usize = 140;
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = flat.to_lowercase();
+    let at = words
+        .iter()
+        .filter_map(|w| lower.find(w.as_str()))
+        .min()
+        .unwrap_or(0);
+    // Back up to a char boundary about a third of the span before the match.
+    let mut start = at.saturating_sub(SPAN / 3);
+    while start > 0 && !flat.is_char_boundary(start) {
+        start -= 1;
+    }
+    let body: String = flat[start..].chars().take(SPAN).collect();
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.push_str(&body);
+    if flat[start..].chars().count() > SPAN {
+        out.push('…');
+    }
+    out
 }
 
 #[async_trait]
@@ -298,31 +378,137 @@ impl ClientHost for DaemonClientHost {
 
     async fn history(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<HistoryMessage>> {
         let messages = self.state.get_history(session_id, limit).await?;
-        Ok(messages
-            .into_iter()
-            .filter(|m| matches!(m.role.as_str(), "user" | "assistant"))
-            .filter(|m| m.tool_calls_json.is_none())
-            // Runtime continuations and system notices ride as user-role
-            // turns for the model; they are not what the owner said.
-            .filter(|m| {
-                !m.annotations.iter().any(|a| {
+        // Runtime continuations and system notices ride as user-role turns
+        // for the model; they are not what the owner said. A reply carries
+        // the tools its turn used before it.
+        let messages = messages.into_iter().filter(|m| {
+            matches!(m.role.as_str(), "user" | "assistant")
+                && !m.annotations.iter().any(|a| {
                     matches!(
                         a,
                         crate::traits::MessageAnnotation::InternalContinuation
                             | crate::traits::MessageAnnotation::EntireSystemNotice
                     )
                 })
-            })
-            .filter_map(|m| {
-                let text = m.content.filter(|text| !text.trim().is_empty())?;
-                Some(HistoryMessage {
-                    id: m.id,
-                    role: m.role,
-                    text,
-                    at_ms: u64::try_from(m.created_at.timestamp_millis()).unwrap_or(0),
-                })
+        });
+        let mut pending: Vec<String> = Vec::new();
+        let mut out = Vec::new();
+        for m in messages {
+            if m.role == "user" {
+                pending.clear();
+            }
+            if let Some(json) = &m.tool_calls_json {
+                pending.extend(tool_names(json));
+                continue;
+            }
+            let Some(text) = m.content.filter(|text| !text.trim().is_empty()) else {
+                continue;
+            };
+            let tools = if m.role == "assistant" {
+                std::mem::take(&mut pending)
+            } else {
+                Vec::new()
+            };
+            out.push(HistoryMessage {
+                id: m.id,
+                role: m.role,
+                text,
+                at_ms: u64::try_from(m.created_at.timestamp_millis()).unwrap_or(0),
+                tools,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchHit>> {
+        let words: Vec<String> = query
+            .to_lowercase()
+            .split_whitespace()
+            .take(8)
+            .map(str::to_owned)
+            .collect();
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sql = String::from(
+            "SELECT id, session_id, event_type, json_extract(data, '$.content'), created_at \
+             FROM events WHERE event_type IN ('user_message', 'assistant_response') \
+             AND json_extract(data, '$.content') IS NOT NULL",
+        );
+        for _ in &words {
+            sql.push_str(" AND lower(json_extract(data, '$.content')) LIKE ? ESCAPE '\\'");
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        // Only fixed text and `?` placeholders are joined; every word is bound.
+        let mut q =
+            sqlx::query_as::<_, (i64, String, String, String, String)>(sqlx::AssertSqlSafe(sql));
+        for word in &words {
+            let escaped = word
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            q = q.bind(format!("%{escaped}%"));
+        }
+        q = q.bind(i64::try_from(limit).unwrap_or(50));
+        Ok(q.fetch_all(&self.system.pool)
+            .await?
+            .into_iter()
+            .map(|(id, session_id, kind, content, at)| SearchHit {
+                session_id,
+                message_id: id.to_string(),
+                role: if kind == "user_message" {
+                    "user"
+                } else {
+                    "assistant"
+                }
+                .into(),
+                snippet: snippet(&content, &words),
+                at_ms: stored_ms(&at).unwrap_or(0),
             })
             .collect())
+    }
+
+    fn commands(&self) -> Vec<SlashCommand> {
+        let mut defs = aidaemon_channels::slash::shared_commands();
+        defs.extend(self.commands.extension_commands());
+        let mut seen = std::collections::HashSet::new();
+        defs.into_iter()
+            .filter(|d| seen.insert(d.name))
+            .map(|d| SlashCommand {
+                name: d.name.to_string(),
+                description: d.description.to_string(),
+            })
+            .collect()
+    }
+
+    async fn memories(&self) -> anyhow::Result<Vec<MemoryItem>> {
+        let mut facts = self.system.memory.get_facts(None).await?;
+        facts.retain(|f| f.superseded_at.is_none());
+        facts.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        facts.truncate(500);
+        Ok(facts
+            .into_iter()
+            .map(|f| MemoryItem {
+                id: f.id.to_string(),
+                category: f.category,
+                key: f.key,
+                value: f.value,
+                source: f.source,
+                updated_ms: u64::try_from(f.updated_at.timestamp_millis()).unwrap_or(0),
+            })
+            .collect())
+    }
+
+    async fn forget(&self, id: &str) -> anyhow::Result<bool> {
+        let Ok(id) = id.parse::<i64>() else {
+            return Ok(false);
+        };
+        let memory = &self.system.memory;
+        if !memory.get_facts(None).await?.iter().any(|f| f.id == id) {
+            return Ok(false);
+        }
+        memory.delete_fact(id).await?;
+        Ok(true)
     }
 
     async fn slash(&self, session_id: &str, command: &str, args: &str) -> Option<String> {
@@ -544,4 +730,33 @@ fn devices_text(devices: &[aidaemon_client_protocol::DeviceInfo]) -> String {
     }
     text.push_str("\n\nRevoke one with /revoke_device <id>.");
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{snippet, tool_names};
+
+    #[test]
+    fn tool_names_read_both_stored_shapes() {
+        let flat =
+            r#"[{"id":"1","name":"read_file","arguments":{}},{"id":"2","name":"web_search"}]"#;
+        assert_eq!(tool_names(flat), ["read_file", "web_search"]);
+        let nested = r#"[{"id":"1","function":{"name":"terminal","arguments":"{}"}}]"#;
+        assert_eq!(tool_names(nested), ["terminal"]);
+        assert!(tool_names("not json").is_empty());
+    }
+
+    #[test]
+    fn snippet_centres_on_the_first_match_and_marks_cuts() {
+        let text = format!(
+            "{} the synthetic weekly summary {}",
+            "lead ".repeat(40),
+            "tail ".repeat(40)
+        );
+        let words = vec!["weekly".to_string()];
+        let s = snippet(&text, &words);
+        assert!(s.starts_with('…') && s.ends_with('…'), "{s}");
+        assert!(s.contains("synthetic weekly summary"), "{s}");
+        assert_eq!(snippet("Short ünïcode note", &words), "Short ünïcode note");
+    }
 }

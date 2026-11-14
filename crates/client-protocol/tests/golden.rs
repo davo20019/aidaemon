@@ -98,6 +98,10 @@ fn command_name(command: &Command) -> &'static str {
         Command::GetGlance => "get_glance",
         Command::GetSnapshot => "get_snapshot",
         Command::GetSystem => "get_system",
+        Command::SearchMessages { .. } => "search_messages",
+        Command::ListCommands => "list_commands",
+        Command::ListMemories => "list_memories",
+        Command::ForgetMemory { .. } => "forget_memory",
         Command::Unknown => "unknown",
     }
 }
@@ -124,6 +128,10 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Glance { .. } => "glance",
         CommandResult::Snapshot { .. } => "snapshot",
         CommandResult::System { .. } => "system",
+        CommandResult::SearchResults { .. } => "search_results",
+        CommandResult::Commands { .. } => "commands",
+        CommandResult::Memories { .. } => "memories",
+        CommandResult::Forgotten { .. } => "forgotten",
         CommandResult::Unknown => "unknown",
     }
 }
@@ -160,6 +168,7 @@ fn client_samples() -> Vec<ClientFrame> {
                     mime: Some("application/pdf".into()),
                     size_bytes: Some(2048),
                 }],
+                mid_run: Some(MidRun::Queue),
             },
         ),
         command(
@@ -213,6 +222,21 @@ fn client_samples() -> Vec<ClientFrame> {
         command("5d0c2b1e-0009", Command::GetGlance),
         command("5d0c2b1e-000a", Command::GetSnapshot),
         command("5d0c2b1e-000c", Command::GetSystem),
+        command(
+            "5d0c2b1e-000d",
+            Command::SearchMessages {
+                query: "weekly summary".into(),
+                limit: 20,
+            },
+        ),
+        command("5d0c2b1e-000e", Command::ListCommands),
+        command("5d0c2b1e-000f", Command::ListMemories),
+        command(
+            "5d0c2b1e-0010",
+            Command::ForgetMemory {
+                memory_id: "41".into(),
+            },
+        ),
         command("5d0c2b1e-000b", Command::Unknown),
         ClientFrame::Ping,
     ]
@@ -364,12 +388,22 @@ fn server_samples() -> Vec<ServerFrame> {
         }),
         ack(CommandResult::History {
             session_id: "app:6c1f".into(),
-            messages: vec![HistoryMessage {
-                id: "m-119".into(),
-                role: "user".into(),
-                text: "Post the synthetic report for Alice Rivera".into(),
-                at_ms: 1_767_225_600_000,
-            }],
+            messages: vec![
+                HistoryMessage {
+                    id: "m-119".into(),
+                    role: "user".into(),
+                    text: "Post the synthetic report for Alice Rivera".into(),
+                    at_ms: 1_767_225_600_000,
+                    tools: Vec::new(),
+                },
+                HistoryMessage {
+                    id: "m-120".into(),
+                    role: "assistant".into(),
+                    text: "Posted it.".into(),
+                    at_ms: 1_767_225_660_000,
+                    tools: vec!["http_request".into()],
+                },
+            ],
             more: true,
         }),
         ack(CommandResult::Reply {
@@ -448,7 +482,44 @@ fn server_samples() -> Vec<ServerFrame> {
                     checked_ms: Some(1_767_225_500_000),
                     error: None,
                 }],
+                runs: vec![GoalRunInfo {
+                    goal_id: "g-1".into(),
+                    description: "Send the synthetic weekly summary".into(),
+                    status: "completed".into(),
+                    outcome: Some("Sent the summary to Jordan Lee".into()),
+                    started_ms: 1_767_225_000_000,
+                    finished_ms: Some(1_767_225_120_000),
+                    session_id: Some("telegram:synthetic-user-1".into()),
+                }],
             },
+        }),
+        ack(CommandResult::SearchResults {
+            hits: vec![SearchHit {
+                session_id: "app:6c1f".into(),
+                message_id: "m-119".into(),
+                role: "user".into(),
+                snippet: "Post the synthetic report for Alice Rivera".into(),
+                at_ms: 1_767_225_600_000,
+            }],
+        }),
+        ack(CommandResult::Commands {
+            commands: vec![SlashCommand {
+                name: "tasks".into(),
+                description: "What is running now".into(),
+            }],
+        }),
+        ack(CommandResult::Memories {
+            memories: vec![MemoryItem {
+                id: "41".into(),
+                category: "preference".into(),
+                key: "coffee".into(),
+                value: "Alice Rivera takes her coffee black".into(),
+                source: "conversation".into(),
+                updated_ms: 1_767_225_000_000,
+            }],
+        }),
+        ack(CommandResult::Forgotten {
+            memory_id: "41".into(),
         }),
         ack(CommandResult::Unknown),
         ServerFrame::Error {

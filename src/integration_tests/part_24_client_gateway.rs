@@ -252,6 +252,7 @@ mod client_gateway {
                 session_id: None,
                 text: "Post the synthetic report for Alice Rivera".into(),
                 attachments: Vec::new(),
+                mid_run: None,
             },
         )
         .await;

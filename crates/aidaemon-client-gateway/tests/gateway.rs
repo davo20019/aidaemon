@@ -146,6 +146,7 @@ impl ClientHost for Host {
                 role: "user".into(),
                 text: format!("message {n}"),
                 at_ms: n,
+                tools: Vec::new(),
             })
             .collect())
     }
@@ -331,6 +332,7 @@ fn send(text: &str) -> Command {
         session_id: None,
         text: text.into(),
         attachments: Vec::new(),
+        mid_run: None,
     }
 }
 
@@ -463,6 +465,7 @@ async fn http_mode_runs_a_turn_and_long_polls_its_events() {
                     session_id: Some("telegram:synthetic-user-1".into()),
                     text: "hi".into(),
                     attachments: Vec::new(),
+                    mid_run: None,
                 },
             ),
         )
@@ -1402,6 +1405,7 @@ async fn a_view_action_reaches_only_the_capable_sender() {
                     session_id: Some(session_id.clone()),
                     text: "Carry on".into(),
                     attachments: Vec::new(),
+                    mid_run: None,
                 },
             ),
         )

@@ -18,7 +18,9 @@ use aidaemon_channels::ports::{
 };
 use aidaemon_channels::turns::{TurnDeps, TurnWatch};
 use aidaemon_client_gateway::{ClientGateway, ClientGatewayConfig, ClientHost, GatewayDeps};
-use aidaemon_client_protocol::{HistoryMessage, SessionSummary, ViewAction};
+use aidaemon_client_protocol::{
+    HistoryMessage, MemoryItem, SearchHit, SessionSummary, SlashCommand, ViewAction,
+};
 use aidaemon_store_sqlite::SqliteClientEventLog;
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
 use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse};
@@ -191,6 +193,11 @@ impl ClientHost for Host {
                 text: text.to_string(),
                 // A minute apart, ending an hour ago.
                 at_ms: now_ms() - 3_600_000 - (count - n as u64) * 60_000,
+                tools: if *role == "assistant" {
+                    vec!["read_file".into(), "web_search".into(), "read_file".into()]
+                } else {
+                    Vec::new()
+                },
             })
             .collect())
     }
@@ -275,9 +282,101 @@ impl ClientHost for Host {
                 checked_ms: Some(now - 120_000),
                 error: None,
             }],
+            runs: vec![
+                GoalRunInfo {
+                    goal_id: "g-digest".into(),
+                    description: "Morning digest for Acme Corp".into(),
+                    status: "completed".into(),
+                    outcome: Some("Sent the digest: 3 new issues, 1 release".into()),
+                    started_ms: now - 5 * 3_600_000,
+                    finished_ms: Some(now - 5 * 3_600_000 + 90_000),
+                    session_id: Some("app:plan".into()),
+                },
+                GoalRunInfo {
+                    goal_id: "g-watch".into(),
+                    description: "Watch the synthetic report folder".into(),
+                    status: "completed".into(),
+                    outcome: None,
+                    started_ms: now - 9 * 3_600_000,
+                    finished_ms: Some(now - 9 * 3_600_000 + 20_000),
+                    session_id: None,
+                },
+            ],
         })
     }
+    async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchHit>> {
+        let words: Vec<String> = query
+            .to_lowercase()
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        let mut hits = Vec::new();
+        for session in ["app:plan", "telegram:synthetic-user-1"] {
+            for message in self.history(session, 50).await? {
+                let lower = message.text.to_lowercase();
+                if words.iter().all(|w| lower.contains(w.as_str())) {
+                    hits.push(SearchHit {
+                        session_id: session.into(),
+                        message_id: message.id,
+                        role: message.role,
+                        snippet: message.text,
+                        at_ms: message.at_ms,
+                    });
+                }
+            }
+        }
+        hits.truncate(limit);
+        Ok(hits)
+    }
+    fn commands(&self) -> Vec<SlashCommand> {
+        [
+            ("tasks", "What is running now"),
+            ("cancel", "Stop running work"),
+            ("clear", "Start this conversation afresh"),
+            ("goals", "Your scheduled goals"),
+        ]
+        .into_iter()
+        .map(|(name, description)| SlashCommand {
+            name: name.into(),
+            description: description.into(),
+        })
+        .collect()
+    }
+    async fn memories(&self) -> anyhow::Result<Vec<MemoryItem>> {
+        let forgotten = FORGOTTEN.lock().unwrap().clone();
+        Ok([
+            (
+                "1",
+                "preference",
+                "coffee",
+                "Alice Rivera takes her coffee black",
+            ),
+            ("2", "work", "employer", "Works at Acme Corp"),
+            ("3", "family", "daughters", "Daughters Mia and Zoe"),
+        ]
+        .into_iter()
+        .filter(|(id, ..)| !forgotten.contains(&id.to_string()))
+        .map(|(id, category, key, value)| MemoryItem {
+            id: id.into(),
+            category: category.into(),
+            key: key.into(),
+            value: value.into(),
+            source: "conversation".into(),
+            updated_ms: now_ms() - 86_400_000,
+        })
+        .collect())
+    }
+    async fn forget(&self, id: &str) -> anyhow::Result<bool> {
+        let mut forgotten = FORGOTTEN.lock().unwrap();
+        if forgotten.iter().any(|f| f == id) || !["1", "2", "3"].contains(&id) {
+            return Ok(false);
+        }
+        forgotten.push(id.to_string());
+        Ok(true)
+    }
 }
+
+static FORGOTTEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

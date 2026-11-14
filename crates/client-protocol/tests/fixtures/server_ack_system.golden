@@ -44,6 +44,17 @@
           "overloaded": false
         }
       ],
+      "runs": [
+        {
+          "description": "Send the synthetic weekly summary",
+          "finished_ms": 1767225120000,
+          "goal_id": "g-1",
+          "outcome": "Sent the summary to Jordan Lee",
+          "session_id": "telegram:synthetic-user-1",
+          "started_ms": 1767225000000,
+          "status": "completed"
+        }
+      ],
       "schedules": [
         {
           "description": "Send the synthetic weekly summary",

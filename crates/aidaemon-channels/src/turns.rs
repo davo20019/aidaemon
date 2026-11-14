@@ -55,6 +55,15 @@ pub struct Turn {
     pub ingress_timing: Option<InboundMessageTiming>,
 }
 
+/// Where the owner put a message sent while its session works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MidRunPlacement {
+    /// Into the running work.
+    Steer,
+    /// After it, as a turn of its own.
+    Queue,
+}
+
 /// What delivering a reply achieved.
 pub struct Delivered {
     pub state: ResponseDeliveryState,
@@ -406,6 +415,19 @@ impl TurnRunner {
     /// Handle an authorized message: a cancel word, a message queued behind
     /// a running turn, or a new turn (and then every turn queued behind it).
     pub async fn submit(&self, surface: Arc<dyn TurnSurface>, turn: Turn) {
+        self.submit_placed(surface, turn, None).await;
+    }
+
+    /// [`Self::submit`], with the owner's own choice of where a message
+    /// sent while the session works goes. With a choice the agent does not
+    /// read the message first: it joins the running work (`Steer`) or waits
+    /// for its own turn (`Queue`).
+    pub async fn submit_placed(
+        &self,
+        surface: Arc<dyn TurnSurface>,
+        turn: Turn,
+        placement: Option<MidRunPlacement>,
+    ) {
         if is_cancel_word(&turn.text) {
             let reply = self
                 .cancel(&turn.session_id, turn.user_role, StopRequest::Bare)
@@ -450,7 +472,21 @@ impl TurnRunner {
             // The agent was asked to read it but gave no reading (its model
             // call failed): the owner still sees where the work stands.
             let mut unread = false;
-            match self.read_mid_run(&turn).await {
+            let reading = match placement {
+                Some(MidRunPlacement::Steer) => None,
+                Some(MidRunPlacement::Queue) => {
+                    steerable = false;
+                    None
+                }
+                None => {
+                    let reading = self.read_mid_run(&turn).await;
+                    if reading.is_none() {
+                        unread = Self::mid_run_readable(&turn);
+                    }
+                    reading
+                }
+            };
+            match reading {
                 Some(
                     reading @ MidRunReading {
                         intent: MidRunIntent::StopsWork,
@@ -488,8 +524,8 @@ impl TurnRunner {
                 Some(MidRunReading {
                     intent: MidRunIntent::ChangesWork,
                     ..
-                }) => {}
-                None => unread = Self::mid_run_readable(&turn),
+                })
+                | None => {}
             }
             let mut queued = QueuedMessage::new(
                 &turn.text,
@@ -1620,6 +1656,47 @@ mod tests {
                 .await;
             assert_eq!(taken.len(), 1);
         }
+
+        // The owner's own placement wins over any reading: even a message
+        // read as a question goes where the owner put it.
+        set(Some(MidRunReading {
+            intent: MidRunIntent::AboutRunningWork,
+            stop: Vec::new(),
+        }));
+        runner
+            .submit_placed(
+                surface.clone(),
+                owner_turn("How is it going so far?", "m7"),
+                Some(MidRunPlacement::Queue),
+            )
+            .await;
+        assert_eq!(
+            last(&surface),
+            crate::presentation::queued_message_notice(true)
+        );
+        assert!(
+            registry
+                .take_steering_messages(session, UserRole::Owner, &ctx)
+                .await
+                .is_empty()
+        );
+        assert_eq!(registry.queue_len(session).await, 1);
+        registry.clear_queue(session).await;
+        runner
+            .submit_placed(
+                surface.clone(),
+                owner_turn("Use the staging server instead", "m8"),
+                Some(MidRunPlacement::Steer),
+            )
+            .await;
+        assert_eq!(
+            last(&surface),
+            crate::presentation::queued_message_notice(false)
+        );
+        let taken = registry
+            .take_steering_messages(session, UserRole::Owner, &ctx)
+            .await;
+        assert_eq!(taken.len(), 1);
 
         agent.release.notify_one();
     }

@@ -1,0 +1,13 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "commands": [
+      {
+        "description": "What is running now",
+        "name": "tasks"
+      }
+    ],
+    "type": "commands"
+  },
+  "type": "ack"
+}

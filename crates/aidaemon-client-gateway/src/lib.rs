@@ -40,11 +40,11 @@ use std::time::Duration;
 
 use aidaemon_channels::hub::{ChannelHub, HubChannel};
 use aidaemon_channels::stop::{self, StopRequest};
-use aidaemon_channels::turns::{Turn, TurnDeps, TurnRunner};
+use aidaemon_channels::turns::{MidRunPlacement, Turn, TurnDeps, TurnRunner};
 use aidaemon_client_protocol::{
     ApprovalDecision, ClientKind, Command, CommandResult, ErrorCode, Event, Glance, HistoryMessage,
-    LastReply, OwnerInfo, ProtocolError, Risk, Scope, ServerFrame, SessionSummary, Snapshot,
-    TaskState, TaskSummary,
+    LastReply, MemoryItem, MidRun, OwnerInfo, ProtocolError, Risk, Scope, SearchHit, ServerFrame,
+    SessionSummary, SlashCommand, Snapshot, TaskState, TaskSummary,
 };
 use aidaemon_store_sqlite::SqliteClientEventLog;
 use aidaemon_tools::semantics::UserRole;
@@ -87,6 +87,23 @@ pub trait ClientHost: Send + Sync {
     /// How the daemon itself is doing; `None` when this host does not say.
     async fn system(&self) -> Option<aidaemon_client_protocol::SystemStatus> {
         None
+    }
+    /// Up to `limit` messages of any session holding every word of
+    /// `query`, newest first.
+    async fn search(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<SearchHit>> {
+        Ok(Vec::new())
+    }
+    /// The slash commands the owner can run.
+    fn commands(&self) -> Vec<SlashCommand> {
+        Vec::new()
+    }
+    /// What the daemon remembers about the owner.
+    async fn memories(&self) -> anyhow::Result<Vec<MemoryItem>> {
+        Ok(Vec::new())
+    }
+    /// Forget memory `id`; `false` when there is no such memory.
+    async fn forget(&self, _id: &str) -> anyhow::Result<bool> {
+        Ok(false)
     }
 }
 
@@ -434,7 +451,11 @@ impl ClientGateway {
             | Command::GetHistory { .. }
             | Command::GetGlance
             | Command::GetSnapshot
-            | Command::GetSystem => Some(Scope::Observe),
+            | Command::GetSystem
+            | Command::SearchMessages { .. }
+            | Command::ListCommands
+            | Command::ListMemories => Some(Scope::Observe),
+            Command::ForgetMemory { .. } => Some(Scope::Chat),
             Command::Unknown => None,
         };
         if let Some(scope) = needs
@@ -450,13 +471,20 @@ impl ClientGateway {
                 session_id,
                 text,
                 attachments,
+                mid_run,
             } => {
+                let placement = match mid_run {
+                    Some(MidRun::Steer) => Some(MidRunPlacement::Steer),
+                    Some(MidRun::Queue) => Some(MidRunPlacement::Queue),
+                    Some(MidRun::Unknown) | None => None,
+                };
                 self.send_message(
                     request_id,
                     session_id,
                     text,
                     attachments.is_empty(),
                     caller.view_connection,
+                    placement,
                 )
                 .await
             }
@@ -531,6 +559,39 @@ impl ClientGateway {
                     "This daemon does not report its status",
                 )),
             },
+            Command::SearchMessages { query, limit } => {
+                let query = query.trim();
+                if query.is_empty() {
+                    return Ok(CommandResult::SearchResults { hits: Vec::new() });
+                }
+                let limit = (limit as usize).clamp(1, 100);
+                let hits = self.host.search(query, limit).await.map_err(|e| {
+                    warn!(error = %e, "Message search failed");
+                    ProtocolError::new(ErrorCode::Internal, "Search failed")
+                })?;
+                Ok(CommandResult::SearchResults { hits })
+            }
+            Command::ListCommands => Ok(CommandResult::Commands {
+                commands: self.host.commands(),
+            }),
+            Command::ListMemories => {
+                let memories = self.host.memories().await.map_err(|e| {
+                    warn!(error = %e, "Listing memories failed");
+                    ProtocolError::new(ErrorCode::Internal, "Could not read memories")
+                })?;
+                Ok(CommandResult::Memories { memories })
+            }
+            Command::ForgetMemory { memory_id } => match self.host.forget(&memory_id).await {
+                Ok(true) => Ok(CommandResult::Forgotten { memory_id }),
+                Ok(false) => Err(ProtocolError::new(ErrorCode::NotFound, "No such memory")),
+                Err(e) => {
+                    warn!(error = %e, "Forgetting a memory failed");
+                    Err(ProtocolError::new(
+                        ErrorCode::Internal,
+                        "Could not forget it",
+                    ))
+                }
+            },
             Command::Unknown => Err(ProtocolError::new(
                 ErrorCode::Invalid,
                 "Unknown command for this gateway version",
@@ -565,6 +626,7 @@ impl ClientGateway {
         request_id: &str,
         session_id: String,
         text: String,
+        placement: Option<MidRunPlacement>,
     ) -> Result<CommandResult, ProtocolError> {
         let known = self
             .contexts
@@ -616,7 +678,7 @@ impl ClientGateway {
             session_id: session_id.clone(),
         });
         let runner = self.runner.clone();
-        tokio::spawn(async move { runner.submit(surface, turn).await });
+        tokio::spawn(async move { runner.submit_placed(surface, turn, placement).await });
         Ok(CommandResult::MessageAccepted {
             session_id,
             new_session: false,
@@ -630,6 +692,7 @@ impl ClientGateway {
         text: String,
         no_attachments: bool,
         view_connection: Option<u64>,
+        placement: Option<MidRunPlacement>,
     ) -> Result<CommandResult, ProtocolError> {
         if !no_attachments {
             return Err(ProtocolError::new(
@@ -650,7 +713,9 @@ impl ClientGateway {
             ),
             Some(session_id) if session_id.starts_with(APP_SESSION_PREFIX) => (session_id, false),
             Some(session_id) => {
-                return self.reply_in_chat(request_id, session_id, text).await;
+                return self
+                    .reply_in_chat(request_id, session_id, text, placement)
+                    .await;
             }
         };
         self.runner.register_session(&session_id, APP_CHANNEL).await;
@@ -689,7 +754,7 @@ impl ClientGateway {
         // Submitting may first read the message against running work, which
         // can take seconds: the ack does not wait for it.
         let runner = self.runner.clone();
-        tokio::spawn(async move { runner.submit(surface, turn).await });
+        tokio::spawn(async move { runner.submit_placed(surface, turn, placement).await });
         Ok(CommandResult::MessageAccepted {
             session_id,
             new_session,

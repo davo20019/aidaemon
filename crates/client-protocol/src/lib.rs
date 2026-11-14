@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 3;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -222,6 +222,10 @@ pub enum Command {
         /// Files uploaded beforehand; needs the `attachments` capability.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<AttachmentRef>,
+        /// What to do with it when the session is already working
+        /// (protocol 1.3). `None`: the agent reads it and decides.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mid_run: Option<MidRun>,
     },
     /// Stop everything the session has running (`/cancel all`).
     StopTurn { session_id: String },
@@ -262,6 +266,33 @@ pub enum Command {
     /// How the daemon itself is doing: version, models, usage, schedules,
     /// background jobs, queues and health checks (protocol 1.2).
     GetSystem,
+    /// Messages of every session whose text holds all of `query`'s words,
+    /// newest first (protocol 1.3).
+    SearchMessages {
+        query: String,
+        #[serde(default = "default_limit")]
+        limit: u32,
+    },
+    /// The slash commands the owner can run, for a client's completion
+    /// list (protocol 1.3).
+    ListCommands,
+    /// What the daemon remembers about the owner (protocol 1.3).
+    ListMemories,
+    /// Forget one remembered fact, by its `id` from `list_memories`.
+    ForgetMemory { memory_id: String },
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// Where a message sent while its session works goes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MidRun {
+    /// Into the work running now: the agent takes it into account.
+    Steer,
+    /// After the work running now, as a turn of its own.
+    Queue,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -330,9 +361,58 @@ pub enum CommandResult {
     System {
         system: SystemStatus,
     },
+    /// `search_messages`.
+    SearchResults {
+        hits: Vec<SearchHit>,
+    },
+    /// `list_commands`.
+    Commands {
+        commands: Vec<SlashCommand>,
+    },
+    /// `list_memories`.
+    Memories {
+        memories: Vec<MemoryItem>,
+    },
+    /// `forget_memory`: the fact is no longer recalled.
+    Forgotten {
+        memory_id: String,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
+}
+
+/// A message that matched a search.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct SearchHit {
+    pub session_id: String,
+    pub message_id: String,
+    /// `user` or `assistant`.
+    pub role: String,
+    /// The text around the first match, plain.
+    pub snippet: String,
+    pub at_ms: u64,
+}
+
+/// A slash command, as a completion list shows it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct SlashCommand {
+    /// Without the slash ("tasks").
+    pub name: String,
+    pub description: String,
+}
+
+/// One remembered fact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct MemoryItem {
+    pub id: String,
+    pub category: String,
+    pub key: String,
+    pub value: String,
+    /// Where it came from, in a word or two.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    pub updated_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +871,9 @@ pub struct HistoryMessage {
     pub role: String,
     pub text: String,
     pub at_ms: u64,
+    /// For a reply: the tools its turn used, in order (protocol 1.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
 }
 
 /// One entry of a session's running-work list: a turn, a helper (sub-agent)
@@ -868,6 +951,28 @@ pub struct SystemStatus {
     /// The owner's health checks of their own services.
     #[serde(default)]
     pub checks: Vec<HealthCheckInfo>,
+    /// Background goal runs of the last 24 hours, newest first (protocol
+    /// 1.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<GoalRunInfo>,
+}
+
+/// One run of a background goal, judged by what it left behind.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct GoalRunInfo {
+    pub goal_id: String,
+    pub description: String,
+    /// `running`, `completed`, `failed`, `cancelled`...
+    pub status: String,
+    /// What the run reported; `None` when it reported nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    pub started_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_ms: Option<u64>,
+    /// The session the goal reports into, to open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]

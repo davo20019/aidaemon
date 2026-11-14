@@ -432,6 +432,7 @@ pub async fn run(
             health: health_store.clone(),
             jobs: heartbeat_telemetry,
             queues: queue_telemetry.clone(),
+            memory: memory_store.clone(),
         },
     )
     .await?;

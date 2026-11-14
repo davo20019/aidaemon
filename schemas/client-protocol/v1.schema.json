@@ -606,6 +606,17 @@
               },
               "type": "array"
             },
+            "mid_run": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MidRun"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "What to do with it when the session is already working\n(protocol 1.3). `None`: the agent reads it and decides."
+            },
             "session_id": {
               "type": [
                 "string",
@@ -813,6 +824,72 @@
             "type"
           ],
           "type": "object"
+        },
+        {
+          "description": "Messages of every session whose text holds all of `query`'s words,\nnewest first (protocol 1.3).",
+          "properties": {
+            "limit": {
+              "default": 50,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "query": {
+              "type": "string"
+            },
+            "type": {
+              "const": "search_messages",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "query"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The slash commands the owner can run, for a client's completion\nlist (protocol 1.3).",
+          "properties": {
+            "type": {
+              "const": "list_commands",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "What the daemon remembers about the owner (protocol 1.3).",
+          "properties": {
+            "type": {
+              "const": "list_memories",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Forget one remembered fact, by its `id` from `list_memories`.",
+          "properties": {
+            "memory_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "forget_memory",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "memory_id"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1000,6 +1077,83 @@
           "required": [
             "type",
             "system"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`search_messages`.",
+          "properties": {
+            "hits": {
+              "items": {
+                "$ref": "#/$defs/SearchHit"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "search_results",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "hits"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`list_commands`.",
+          "properties": {
+            "commands": {
+              "items": {
+                "$ref": "#/$defs/SlashCommand"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "commands",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "commands"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`list_memories`.",
+          "properties": {
+            "memories": {
+              "items": {
+                "$ref": "#/$defs/MemoryItem"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "memories",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "memories"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`forget_memory`: the fact is no longer recalled.",
+          "properties": {
+            "memory_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "forgotten",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "memory_id"
           ],
           "type": "object"
         }
@@ -1525,6 +1679,55 @@
       ],
       "type": "object"
     },
+    "GoalRunInfo": {
+      "description": "One run of a background goal, judged by what it left behind.",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "finished_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "outcome": {
+          "description": "What the run reported; `None` when it reported nothing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "description": "The session the goal reports into, to open.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "description": "`running`, `completed`, `failed`, `cancelled`...",
+          "type": "string"
+        }
+      },
+      "required": [
+        "goal_id",
+        "description",
+        "status",
+        "started_ms"
+      ],
+      "type": "object"
+    },
     "GoalSummary": {
       "properties": {
         "description": {
@@ -1618,6 +1821,13 @@
         },
         "text": {
           "type": "string"
+        },
+        "tools": {
+          "description": "For a reply: the tools its turn used, in order (protocol 1.3).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -1751,6 +1961,55 @@
         "at_ms"
       ],
       "type": "object"
+    },
+    "MemoryItem": {
+      "description": "One remembered fact.",
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "source": {
+          "description": "Where it came from, in a word or two.",
+          "type": "string"
+        },
+        "updated_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "category",
+        "key",
+        "value",
+        "updated_ms"
+      ],
+      "type": "object"
+    },
+    "MidRun": {
+      "description": "Where a message sent while its session works goes.",
+      "oneOf": [
+        {
+          "const": "steer",
+          "description": "Into the work running now: the agent takes it into account.",
+          "type": "string"
+        },
+        {
+          "const": "queue",
+          "description": "After the work running now, as a turn of its own.",
+          "type": "string"
+        }
+      ]
     },
     "ModelCalls": {
       "properties": {
@@ -2100,6 +2359,38 @@
         }
       ]
     },
+    "SearchHit": {
+      "description": "A message that matched a search.",
+      "properties": {
+        "at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "role": {
+          "description": "`user` or `assistant`.",
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "snippet": {
+          "description": "The text around the first match, plain.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "message_id",
+        "role",
+        "snippet",
+        "at_ms"
+      ],
+      "type": "object"
+    },
     "ServerFrame": {
       "description": "A frame from the daemon to a client.",
       "oneOf": [
@@ -2306,6 +2597,23 @@
       ],
       "type": "object"
     },
+    "SlashCommand": {
+      "description": "A slash command, as a completion list shows it.",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "name": {
+          "description": "Without the slash (\"tasks\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description"
+      ],
+      "type": "object"
+    },
     "Snapshot": {
       "description": "What a client needs when it cannot resume.",
       "properties": {
@@ -2390,6 +2698,13 @@
           "default": [],
           "items": {
             "$ref": "#/$defs/QueueInfo"
+          },
+          "type": "array"
+        },
+        "runs": {
+          "description": "Background goal runs of the last 24 hours, newest first (protocol\n1.3).",
+          "items": {
+            "$ref": "#/$defs/GoalRunInfo"
           },
           "type": "array"
         },
