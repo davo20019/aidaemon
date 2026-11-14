@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use aidaemon_client_core::link::{self, Auth, LinkConfig};
-use aidaemon_client_core::machine::{ClientIdentity, Disconnect, DropKind, Update};
+use aidaemon_client_core::machine::{ClientIdentity, Update};
 use aidaemon_client_protocol::{Capability, ClientKind};
 use nsh_core::platform::Idiom;
 use nsh_core::prelude::*;
@@ -47,13 +47,29 @@ fn local_token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+/// Where this app keeps its key once paired with a daemon elsewhere.
+fn device_file() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".aidaemon").join("app-device.json"))
+}
+
+fn device_store() -> Option<std::sync::Arc<aidaemon_client_core::FileKeyStore>> {
+    device_file().map(|path| std::sync::Arc::new(aidaemon_client_core::FileKeyStore::new(path)))
+}
+
 pub fn start(store: Store) {
-    let Some(token) = local_token() else {
-        store.update(Update::Disconnected(Disconnect {
-            kind: DropKind::Unauthorized,
-            reason: "No local token. Run `aidaemon client-token` on this machine.".into(),
-            retry_in: std::time::Duration::from_secs(3600),
-        }));
+    use aidaemon_client_core::KeyStore;
+    let (url, auth) = if let Some(token) = local_token() {
+        (gateway_url(), Auth::LocalToken(token))
+    } else if let Some(keys) = device_store()
+        && let Ok(Some(device)) = keys.load()
+    {
+        (
+            aidaemon_client_core::machine::socket_url(&device.gateway),
+            Auth::Device(keys),
+        )
+    } else {
+        // Nothing to sign in to yet: where should the agent run?
+        store.needs_daemon();
         return;
     };
     let kind = if idiom() == Idiom::Terminal {
@@ -62,8 +78,8 @@ pub fn start(store: Store) {
         ClientKind::Desktop
     };
     let config = LinkConfig {
-        url: gateway_url(),
-        auth: Auth::LocalToken(token),
+        url,
+        auth,
         client: ClientIdentity {
             kind,
             name: "aidaemon-app".into(),
@@ -86,4 +102,177 @@ pub fn start(store: Store) {
             store.update(update);
         }
     });
+}
+
+/// The `aidaemon` binary: beside this app (the bundled download), else on
+/// `PATH`.
+fn daemon_binary() -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        "aidaemon.exe"
+    } else {
+        "aidaemon"
+    };
+    let beside = std::env::current_exe().ok().and_then(|exe| {
+        let dir = exe.parent()?.to_path_buf();
+        // In a macOS bundle the daemon sits in Resources or beside the app.
+        [dir.join(name), dir.join("../Resources").join(name)]
+            .into_iter()
+            .find(|p| p.is_file())
+    });
+    beside.or_else(|| {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(name))
+                .find(|path| path.is_file())
+        })
+    })
+}
+
+/// Run the daemon on this computer: install it to start at login (no
+/// administrator rights), wait for its token, then connect.
+pub fn install_here(store: Store) {
+    store.set_starting_daemon(Some(("Starting AIdaemon on this computer…".into(), false)));
+    spawn(async move {
+        let result =
+            background(async move {
+                let binary = daemon_binary().ok_or_else(|| {
+                    "The aidaemon program is not beside this app. Reinstall the app, or install \
+                 AIdaemon with the install script."
+                        .to_string()
+                })?;
+                let output = std::process::Command::new(binary)
+                    .args(["service", "install"])
+                    .output()
+                    .map_err(|e| format!("Could not start AIdaemon: {e}"))?;
+                if !output.status.success() {
+                    return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+                }
+                // The daemon mints the app's token as it starts.
+                for _ in 0..120 {
+                    if local_token().is_some() {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err("AIdaemon did not start within a minute. Its log is in ~/Library/Logs/aidaemon \
+                 (macOS) or `journalctl --user -u aidaemon` (Linux)."
+                .to_string())
+            })
+            .await
+            .unwrap_or_else(|_| Err("Could not start AIdaemon".to_string()));
+        match result {
+            Ok(()) => {
+                store.set_starting_daemon(None);
+                store.update(Update::Connecting);
+                start(store);
+            }
+            Err(why) => store.set_starting_daemon(Some((why, true))),
+        }
+    });
+}
+
+/// The parts of a pairing link: the gateway's HTTP base, the offer, the
+/// code and the daemon's fingerprint. Takes the web link
+/// (`http://host/client/v1/next/#offer=…&code=…&fp=…`) or an
+/// `aidaemon-pair:?gateway=…` link.
+pub fn parse_pairing_link(link: &str) -> Option<(String, String, String, Option<String>)> {
+    let link = link.trim();
+    let (base, query) = if let Some(rest) = link.strip_prefix("aidaemon-pair:?") {
+        (None, rest)
+    } else {
+        let (url, fragment) = link.split_once('#')?;
+        (
+            Some(aidaemon_client_core::machine::http_base(url)),
+            fragment,
+        )
+    };
+    let mut gateway = base;
+    let (mut offer, mut code, mut fp) = (None, None, None);
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        let value = percent_decode(value);
+        match key {
+            "gateway" => gateway = Some(value.trim_end_matches('/').to_owned()),
+            "offer" => offer = Some(value),
+            "code" => code = Some(value),
+            "fp" => fp = Some(value),
+            _ => {}
+        }
+    }
+    Some((gateway?, offer?, code?, fp))
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&text[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Pair with a daemon elsewhere from its pairing link, keep the key, then
+/// connect.
+pub async fn pair_remote(store: Store, link: String, name: String) -> Result<(), String> {
+    use aidaemon_client_core::KeyStore;
+    let (gateway, offer_id, code, fingerprint) = parse_pairing_link(&link).ok_or_else(|| {
+        "That is not a pairing link. Paste the whole link the daemon printed.".to_string()
+    })?;
+    let request = aidaemon_client_core::signin::PairRequest {
+        gateway,
+        offer_id,
+        code,
+        device_name: if name.trim().is_empty() {
+            "Desktop".into()
+        } else {
+            name.trim().into()
+        },
+        device_kind: ClientKind::Desktop,
+        fingerprint,
+    };
+    let device = background(async move {
+        aidaemon_client_core::signin::pair(
+            &reqwest::Client::new(),
+            &request,
+            std::time::Duration::from_millis(500),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "Could not pair".to_string())??;
+    let keys = device_store().ok_or("No home directory to keep the key in")?;
+    keys.save(&device).map_err(|e| e.to_string())?;
+    store.update(Update::Connecting);
+    start(store);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn both_pairing_link_forms_read_back() {
+        let web = super::parse_pairing_link(
+            "http://127.0.0.1:8788/client/v1/next/#offer=of-1&code=K7Q2-9FZD&fp=abc",
+        )
+        .unwrap();
+        assert_eq!(web.0, "http://127.0.0.1:8788");
+        assert_eq!((web.1.as_str(), web.2.as_str()), ("of-1", "K7Q2-9FZD"));
+        let app = super::parse_pairing_link(
+            "aidaemon-pair:?gateway=https%3A%2F%2Fd.example.invalid&offer=of-2&code=AB&fp=f",
+        )
+        .unwrap();
+        assert_eq!(app.0, "https://d.example.invalid");
+        assert!(super::parse_pairing_link("hello").is_none());
+    }
 }

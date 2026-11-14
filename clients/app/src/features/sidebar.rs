@@ -358,6 +358,7 @@ fn connection(store: Store) -> View {
             Connection::Online => status("Connected to the daemon", Tone::Success),
             Connection::Connecting => status("Connecting…", Tone::Accent),
             Connection::NeedsPairing => status("Not paired yet", Tone::Warning),
+            Connection::NoDaemon => status("No daemon yet", Tone::Warning),
             Connection::Offline {
                 kind,
                 reason,

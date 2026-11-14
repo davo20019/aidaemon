@@ -27,7 +27,8 @@ chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 # Desktop and terminal: the shared tokio link, on NSH's background threads.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 aidaemon-client-core = { path = "../../crates/aidaemon-client-core" }
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "time"] }
+reqwest = { version = "0.13", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
 dirs = "6"
 # The terminal build (`--tui`): NSH's terminal surface and its input glue.

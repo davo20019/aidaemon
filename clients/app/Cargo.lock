@@ -3374,6 +3374,7 @@ dependencies = [
  "nsh-tui-host",
  "ratatui-core",
  "ratatui-crossterm",
+ "reqwest",
  "serde_json",
  "tokio",
  "wasm-bindgen",

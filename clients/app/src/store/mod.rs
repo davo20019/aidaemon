@@ -8,9 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use aidaemon_client_core::machine::{DropKind, Update, request_id};
 use aidaemon_client_core::state::{Line, LiveTurn, SessionView, State, ViewRequest};
 use aidaemon_client_protocol::{
-    Approval, ApprovalDecision, Command, CommandResult, Event, MemoryItem, MidRun, SearchHit,
-    ServerFrame, Settings, SettingsChange, SettingsOutcome, SlashCommand, SystemStatus,
-    TaskSummary, TurnStatus,
+    Approval, ApprovalDecision, Command, CommandResult, ErrorCode, Event, Feature, MemoryItem,
+    MidRun, SearchHit, ServerFrame, Settings, SettingsChange, SettingsOutcome, SetupAction,
+    SetupState, SetupStep, SlashCommand, SystemStatus, TaskSummary, TurnStatus,
 };
 use aidaemon_client_protocol::{Pane, ViewAction};
 use nsh_core::prelude::*;
@@ -23,6 +23,9 @@ pub enum Connection {
     Online,
     /// This device has no key the daemon knows: pair it first.
     NeedsPairing,
+    /// No daemon to sign in to yet (no local token, no paired one): run one
+    /// here, or connect to one elsewhere.
+    NoDaemon,
     Offline {
         kind: DropKind,
         reason: String,
@@ -234,7 +237,19 @@ pub struct Store {
     /// Changes waiting for an approval, and whether another device must
     /// give it.
     settings_waiting: Signal<BTreeMap<String, bool>>,
+    /// The setup step sent and not yet answered.
+    setup_request: Signal<Option<String>>,
+    /// Why the last setup step failed.
+    setup_error: Signal<Option<String>>,
+    /// Starting the daemon on this computer or pairing with one elsewhere,
+    /// before any link: what is happening, or why it stopped.
+    starting_daemon: Signal<Option<(String, bool)>>,
+    /// Open the next conversation the daemon starts (the greeting).
+    open_greeting: Stored<bool>,
 }
+
+/// The first approval card says how approvals work, once per device.
+const APPROVALS_TAUGHT_KEY: &str = "aidaemon.approvals-taught";
 
 /// The draft key of a conversation not started yet.
 const NEW: &str = "";
@@ -278,7 +293,116 @@ impl Store {
             settings_request: stored(None),
             settings_changes: stored(BTreeSet::new()),
             settings_waiting: signal(BTreeMap::new()),
+            setup_request: signal(None),
+            setup_error: signal(None),
+            starting_daemon: signal(None),
+            open_greeting: stored(false),
         }
+    }
+
+    // ----- First-run setup -------------------------------------------------
+
+    /// Setup still to finish, as the daemon last said.
+    pub fn setup(&self) -> Option<SetupState> {
+        self.state.with(|s| s.setup.clone())
+    }
+
+    /// The daemon is in setup mode: only the model step is open.
+    fn in_setup_mode(&self) -> bool {
+        self.state.with_untracked(|s| {
+            s.setup
+                .as_ref()
+                .is_some_and(|s| matches!(s.step, SetupStep::Model | SetupStep::Starting))
+        })
+    }
+
+    /// Take a setup step.
+    pub fn setup_step(&self, action: SetupAction) {
+        if matches!(action, SetupAction::SkipChannel | SetupAction::Finish) {
+            self.open_greeting.replace(true);
+        }
+        self.setup_error.set(None);
+        let id = self.send(Command::Setup { action });
+        self.setup_request.set(Some(id));
+    }
+
+    /// A setup step is waiting for its answer.
+    pub fn setup_busy(&self) -> bool {
+        self.setup_request.with(Option::is_some)
+    }
+
+    pub fn setup_error(&self) -> Option<String> {
+        self.setup_error.get()
+    }
+
+    /// No daemon to sign in to: show where the agent should run.
+    pub fn needs_daemon(&self) {
+        self.connection.set(Connection::NoDaemon);
+    }
+
+    /// Starting a daemon here or pairing with one: `(what, failed)`.
+    pub fn starting_daemon(&self) -> Option<(String, bool)> {
+        self.starting_daemon.get()
+    }
+
+    pub fn set_starting_daemon(&self, status: Option<(String, bool)>) {
+        self.starting_daemon.set(status);
+    }
+
+    /// Prompts the daemon offered under the last reply of `session`.
+    pub fn suggestions(&self, session: &str) -> Vec<String> {
+        self.state.with(|s| {
+            s.sessions
+                .get(session)
+                .map(|v| v.suggestions.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    /// Features the agent asked for in `session`.
+    pub fn feature_requests(&self, session: &str) -> Vec<(Feature, String)> {
+        self.state.with(|s| {
+            s.feature_requests
+                .iter()
+                .filter(|r| r.session_id == session)
+                .map(|r| (r.feature, r.reason.clone()))
+                .collect()
+        })
+    }
+
+    /// Turn `feature` on (saved, then a restart puts it in effect).
+    pub fn enable_feature(&self, feature: Feature) {
+        let key = match feature {
+            Feature::Browser => "browser.enabled",
+            Feature::ComputerUse => "computer_use.enabled",
+            // Voice needs a local model set up: the agent does that.
+            Feature::Voice | Feature::Unknown => {
+                self.dismiss_feature(feature);
+                return;
+            }
+        };
+        self.change_settings(SettingsChange::Set {
+            key: key.into(),
+            value: Some("true".into()),
+        });
+        self.change_settings(SettingsChange::Apply {
+            how: aidaemon_client_protocol::ApplyHow::Restart,
+        });
+        self.dismiss_feature(feature);
+    }
+
+    pub fn dismiss_feature(&self, feature: Feature) {
+        self.state.update(|s| s.settle_feature(feature));
+    }
+
+    /// Whether this device has yet to be told how approvals work; telling
+    /// it once is remembered.
+    pub fn teach_approvals(&self) -> bool {
+        nsh_core::storage::Storage::get_item(APPROVALS_TAUGHT_KEY).is_none()
+    }
+
+    pub fn approvals_taught(&self) {
+        let _ = nsh_core::storage::Storage::set_item(APPROVALS_TAUGHT_KEY, "1");
     }
 
     /// Put back what this device had: drafts, pins and the open conversation.
@@ -452,6 +576,54 @@ impl Store {
             self.selected.set(Some(session_id.clone()));
         }
         match &frame {
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Setup { .. },
+            } if self
+                .setup_request
+                .with_untracked(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.setup_request.set(None);
+                self.setup_error.set(None);
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self
+                .setup_request
+                .with_untracked(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.setup_request.set(None);
+                self.setup_error.set(Some(error.message.clone()));
+                return;
+            }
+            // In setup mode the usual reads on connecting are refused.
+            ServerFrame::Error { error, .. }
+                if error.code == ErrorCode::Forbidden && self.in_setup_mode() =>
+            {
+                return;
+            }
+            ServerFrame::Event {
+                event: Event::SessionCreated { session },
+                ..
+            } if self.open_greeting.with(|o| *o) => {
+                self.open_greeting.replace(false);
+                self.selected.set(Some(session.id.clone()));
+                self.page.set(Page::Conversation);
+            }
+            // The chat step heard from the owner: read where it stands.
+            ServerFrame::Event {
+                event: Event::UserMessage { origin, .. },
+                ..
+            } if origin != "app"
+                && self.state.with_untracked(|s| {
+                    s.setup
+                        .as_ref()
+                        .is_some_and(|s| s.step == SetupStep::Channel)
+                }) =>
+            {
+                self.send(Command::GetSetup);
+            }
             ServerFrame::Ack {
                 request_id,
                 result: CommandResult::System { system },
@@ -890,6 +1062,16 @@ impl Store {
                 mid_run: None,
             });
         }
+    }
+
+    /// Say `text` in `session`, as if typed (a suggested prompt pressed).
+    pub fn ask(&self, session: &str, text: String) {
+        self.send(Command::SendMessage {
+            session_id: Some(session.to_owned()),
+            text,
+            attachments: Vec::new(),
+            mid_run: None,
+        });
     }
 
     /// Conversations with an approval waiting.

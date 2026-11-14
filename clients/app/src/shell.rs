@@ -23,6 +23,12 @@ pub fn shell(store: Store) -> View {
         store.advance_tick()
     });
     let palette = signal(false);
+    // Only entering and leaving setup remakes the page, not each step's news.
+    let in_setup = computed(move || {
+        store
+            .setup()
+            .is_some_and(|s| !matches!(s.step, aidaemon_client_protocol::SetupStep::Done))
+    });
 
     on_key("mod+k", move |_| palette.update(|open| *open = !*open));
     on_key("mod+n", move |_| store.select(None));
@@ -111,6 +117,16 @@ pub fn shell(store: Store) -> View {
         .child(dynamic(move || {
             if store.is_compact() && (store.sidebar_open() || store.inspector_open()) {
                 return None;
+            }
+            if store.connection() == Connection::NoDaemon {
+                return Some(untracked(|| {
+                    crate::features::setup::where_page(store).key("where")
+                }));
+            }
+            if in_setup.get() {
+                return Some(untracked(|| {
+                    crate::features::setup::page(store).key("setup")
+                }));
             }
             if store.connection() == Connection::NeedsPairing {
                 return Some(untracked(|| {

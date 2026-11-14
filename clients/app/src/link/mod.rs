@@ -62,3 +62,26 @@ pub fn pair_again(store: Store) {
 
 /// Whether this platform pairs from the app (the browser does).
 pub const PAIRS_IN_APP: bool = cfg!(target_arch = "wasm32");
+
+/// Run the daemon on this computer, then connect (desktops only).
+pub fn install_here(store: Store) {
+    #[cfg(not(target_arch = "wasm32"))]
+    native::install_here(store);
+    #[cfg(target_arch = "wasm32")]
+    let _ = store;
+}
+
+/// Pair with a daemon on another machine from its pairing link, then
+/// connect (desktops; the browser pairs with [`pair`]).
+pub async fn pair_remote(store: Store, link: String, name: String) -> Result<(), String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return native::pair_remote(store, link, name).await;
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (store, link, name);
+        Err("Open the pairing link in this browser instead.".into())
+    }
+}
+
+/// Whether this build can run the daemon on its own computer.
+pub const RUNS_DAEMON: bool = cfg!(not(target_arch = "wasm32"));

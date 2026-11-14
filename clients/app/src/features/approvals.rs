@@ -94,6 +94,10 @@ pub fn card(store: Store, approval: Approval) -> View {
         ),
     };
     let asked_by = approval.card.as_ref().and_then(|c| c.asked_by.clone());
+    let teach = store.teach_approvals();
+    if teach {
+        store.approvals_taught();
+    }
     let id = approval.id.clone();
     ui::surface()
         .border_color(risk_tone.color())
@@ -134,6 +138,14 @@ pub fn card(store: Store, approval: Approval) -> View {
             move || detail_text(summary.clone())
         }))
         .child(body)
+        // The first card this device shows says how approvals work.
+        .child(when(teach, || {
+            detail_text(
+                "Your agent asks before anything that sends, posts, deletes or spends. Allow \
+                 it once, for this conversation, or always; Deny stops just this step."
+                    .to_string(),
+            )
+        }))
         .children(facts.into_iter().map(|(glyph, text_, tone)| {
             view()
                 .flex_row()

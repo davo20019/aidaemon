@@ -67,8 +67,17 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | Terminal | Quit | The open conversation prints to the normal scrollback as Markdown |
 | Settings | A change is sent | The daemon's answer stays as a note at the top until dismissed; guarded changes say they wait for approval (or for another device) and a banner counts them |
 | Settings | Saved changes not yet in effect | Info banner with Reload, warning banner with Restart |
+| First run | No daemon to sign in to | "Where should your agent run?": Run it here (status while it starts) or a pairing link for one elsewhere |
+| First run | Connect a model | Found models first with Use it; every provider says how it bills; a key form opens under its row; "Testing" while the test call runs; the daemon's refusal as a danger banner |
+| First run | Model connected | "Connected" with a working line until the daemon restarts with it |
+| First run | Chat step | Platform choices, then the token form; after connecting, "Waiting for your first message" until the bot has answered; Skip for now always |
+| Conversation | The daemon offers prompts under a reply | Outline buttons above the composer until the owner says something |
+| Conversation | The agent asks for a feature that is off | Info banner with Turn it on (or Set it up for voice) and Not now |
+| Approval card | The first one on this device | One line saying what is asked about and what each answer does |
 
 ## Areas
+
+- **First run:** where the agent runs, then the daemon's own setup steps (a model, then an optional chat), then the greeting's conversation opens.
 
 - **Conversation:** day breaks ("Today", "Yesterday", weekday, date), times under messages, Copy on every reply, Copy conversation as Markdown and Pin in the header.
 - **Inbox** (the right pane): waiting approvals of other conversations, new replies, running work, and the current turn's steps.

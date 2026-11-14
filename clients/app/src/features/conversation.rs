@@ -90,8 +90,110 @@ pub fn page(store: Store, session: Option<String>) -> View {
         .min_w(px(0.0))
         .child(header(store, session.clone()))
         .child(view().flex_1().child(body))
+        .child(offers(store, session.clone()))
         .child(notices(store))
         .child(composer(store, session))
+}
+
+/// What the daemon offers in this conversation: features the agent asked
+/// for (a card that turns one on), and prompts to press under its reply.
+fn offers(store: Store, session: Option<String>) -> View {
+    let Some(session) = session else {
+        return view();
+    };
+    let for_features = session.clone();
+    let for_prompts = session.clone();
+    view()
+        .items_center()
+        .px_4()
+        .child(dynamic(move || {
+            let requests = store.feature_requests(&for_features);
+            let for_features = for_features.clone();
+            (!requests.is_empty()).then(|| {
+                untracked(move || {
+                    let mut list = view().w_full().items_center();
+                    for (feature, reason) in requests {
+                        let (what, how) = feature_words(feature);
+                        let enable = if feature == aidaemon_client_protocol::Feature::Voice {
+                            "Set it up"
+                        } else {
+                            "Turn it on"
+                        };
+                        list = list.child(
+                            ui::banner(
+                                format!("Your agent needs {what} {reason}. {how}"),
+                                ui::Tone::Info,
+                            )
+                            .child(ui::btn(enable, Variant::Primary, ui::Size::Sm, {
+                                let session = for_features.clone();
+                                move || {
+                                    if feature == aidaemon_client_protocol::Feature::Voice {
+                                        store.ask(
+                                            &session,
+                                            "Set up voice-note transcription for me".into(),
+                                        );
+                                        store.dismiss_feature(feature);
+                                    } else {
+                                        store.enable_feature(feature);
+                                    }
+                                }
+                            }))
+                            .child(ui::btn(
+                                "Not now",
+                                Variant::Ghost,
+                                ui::Size::Sm,
+                                move || store.dismiss_feature(feature),
+                            )),
+                        );
+                    }
+                    list
+                })
+            })
+        }))
+        .child(dynamic(move || {
+            if store.is_running(&for_prompts) {
+                return None;
+            }
+            let prompts = store.suggestions(&for_prompts);
+            (!prompts.is_empty()).then(|| {
+                let session = for_prompts.clone();
+                untracked(move || {
+                    let mut row = view()
+                        .w_full()
+                        .max_w(px(size::COLUMN))
+                        .flex_row()
+                        .flex_wrap()
+                        .gap_2()
+                        .py_2();
+                    for prompt in prompts {
+                        let session = session.clone();
+                        let text = prompt.clone();
+                        row =
+                            row.child(ui::btn(prompt, Variant::Outline, ui::Size::Sm, move || {
+                                store.ask(&session, text.clone())
+                            }));
+                    }
+                    row
+                })
+            })
+        }))
+}
+
+/// A feature as the card names it, and what turning it on does.
+fn feature_words(feature: aidaemon_client_protocol::Feature) -> (&'static str, &'static str) {
+    use aidaemon_client_protocol::Feature;
+    match feature {
+        Feature::Browser => ("to browse websites", "Turning it on restarts the daemon."),
+        Feature::ComputerUse => (
+            "to see and use this computer's screen",
+            "Turning it on restarts the daemon; your computer then asks to allow it.",
+        ),
+        Feature::Voice => (
+            "to understand voice notes",
+            "It needs a speech model on this computer; your agent can set it up.",
+        ),
+        Feature::Unknown => ("a feature", ""),
+    }
 }
 
 /// What the agent's view moves say: a move offered while the owner types,
@@ -719,9 +821,9 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .auto_focus(true)
                         .placeholder(move || match store.connection() {
                             Connection::Online => "Message AIdaemon… (/ for commands)".to_owned(),
-                            Connection::Connecting | Connection::NeedsPairing => {
-                                "Connecting to the daemon…".to_owned()
-                            }
+                            Connection::Connecting
+                            | Connection::NeedsPairing
+                            | Connection::NoDaemon => "Connecting to the daemon…".to_owned(),
                             Connection::Offline { .. } => {
                                 "Offline. Messages send once the daemon is back.".to_owned()
                             }

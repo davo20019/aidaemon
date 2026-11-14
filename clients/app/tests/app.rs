@@ -110,3 +110,51 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
     app.wait_for("Updated memory.retention_days = 30")?;
     Ok(())
 }
+
+#[test]
+fn first_run_connects_a_model_then_offers_a_chat_and_greets() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"welcome","version":{"major":1,"minor":5},"owner":{},"latest_seq":0,"setup":{"step":"model","found":[{"preset":"openai_chatgpt","name":"OpenAI (ChatGPT subscription) · gpt-synthetic","source":"ChatGPT sign-in on this computer","billing":"plan","works":true}],"providers":[{"preset":"openrouter","name":"OpenRouter","billing":"per_token","needs_key":true,"model":"synthetic/model-1"}]}}"#,
+        ),
+    ]);
+    app.wait_for("Connect a model")?;
+    app.wait_for("ChatGPT sign-in on this computer · uses your plan · has limits")?;
+    app.wait_for("pay per token")?;
+    // A key provider opens its form.
+    app.press("Use a key")?;
+    app.wait_for("Test and connect")?;
+    // The daemon starts with the model, then asks about a chat.
+    feed([frame(
+        r#"{"type":"event","at_ms":1,"event":{"type":"setup_updated","setup":{"step":"starting","model":"OpenRouter · synthetic/model-1"}}}"#,
+    )]);
+    app.wait_for("OpenRouter · synthetic/model-1 answered its test. AIdaemon is starting with it…")?;
+    feed([frame(
+        r#"{"type":"event","at_ms":2,"event":{"type":"setup_updated","setup":{"step":"channel","model":"OpenRouter · synthetic/model-1","channels":[{"platform":"telegram","name":"Telegram","help_url":"https://t.me/BotFather"}],"channel":{"platform":"telegram","bot":"@synthetic_bot"}}}}"#,
+    )]);
+    app.wait_for("Reach it from your phone")?;
+    app.wait_for("Waiting for your first message")?;
+    feed([frame(
+        r#"{"type":"event","at_ms":3,"event":{"type":"setup_updated","setup":{"step":"channel","channel":{"platform":"telegram","bot":"@synthetic_bot","connected":true}}}}"#,
+    )]);
+    app.wait_for("Connected: your agent answered you as @synthetic_bot.")?;
+    app.press("Continue")?;
+    // Done: the greeting's conversation opens, with prompts to press.
+    feed([
+        frame(
+            r#"{"type":"event","at_ms":4,"event":{"type":"setup_updated","setup":{"step":"done"}}}"#,
+        ),
+        frame(
+            r#"{"type":"event","seq":1,"at_ms":5,"session_id":"app:welcome","event":{"type":"session_created","session":{"id":"app:welcome","channel":"app","title":"Welcome","writable":true}}}"#,
+        ),
+        frame(
+            r#"{"type":"event","seq":2,"at_ms":6,"session_id":"app:welcome","event":{"type":"assistant_message","session_id":"app:welcome","text":"Hi, I'm AIdaemon.","suggestions":["What can you do on this computer?"]}}"#,
+        ),
+    ]);
+    app.wait_for("Hi, I'm AIdaemon.")?;
+    app.wait_for("What can you do on this computer?")?;
+    Ok(())
+}
