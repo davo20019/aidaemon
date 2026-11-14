@@ -797,6 +797,29 @@ impl TurnEngine<'_> {
         Ok(())
     }
 
+    /// A heartbeat that could not renew a running child's attempt: whether
+    /// the child closed the attempt itself (its task is terminal and has no
+    /// live attempt, the same record [`Self::finalize_executor_task_outcome`]
+    /// keeps as authoritative) rather than losing its lease to expiry or to
+    /// another worker. A store error reads as not settled.
+    async fn child_settled_its_attempt(&self, task_id: Option<&str>) -> bool {
+        let Some(task_id) = task_id else {
+            return false;
+        };
+        let terminal = matches!(
+            self.work().get_task(task_id).await,
+            Ok(Some(task)) if matches!(
+                task.status.as_str(),
+                "blocked" | "completed" | "failed" | "cancelled"
+            )
+        );
+        terminal
+            && matches!(
+                self.work().get_current_task_attempt(task_id).await,
+                Ok(None)
+            )
+    }
+
     pub async fn mark_executor_task_timeout(&self, task_id: &str, timeout_secs: u64) {
         let session_id = format!("executor-timeout-{task_id}");
         let error = format!("Executor timed out after {timeout_secs} seconds");
@@ -2011,6 +2034,10 @@ impl TurnEngine<'_> {
         tokio::pin!(deadline_reached);
         let mut heartbeat = tokio::time::interval(Duration::from_secs(45));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The child closed its own attempt (`report_blocker` settles it with
+        // the run's lease): from then on there is no lease to renew, and the
+        // child is finishing, not stale.
+        let mut attempt_settled = false;
         let result = loop {
             tokio::select! {
                 joined = &mut join => {
@@ -2048,7 +2075,7 @@ impl TurnEngine<'_> {
                             }
                     return Err(crate::spawn::ChildStoppedByOwner.into());
                 }
-                _ = heartbeat.tick(), if task_attempt.is_some() => {
+                _ = heartbeat.tick(), if task_attempt.is_some() && !attempt_settled => {
                     let Some(attempt) = task_attempt.as_ref() else {
                         continue;
                     };
@@ -2073,6 +2100,10 @@ impl TurnEngine<'_> {
                         }
                     };
                     if !renewed {
+                        if self.child_settled_its_attempt(saved_task_id.as_deref()).await {
+                            attempt_settled = true;
+                            continue;
+                        }
                         join.abort();
                         break Err(anyhow::anyhow!(
                             "Task execution lease was lost; stale worker stopped"
