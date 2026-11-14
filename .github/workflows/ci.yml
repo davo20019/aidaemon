@@ -219,7 +219,7 @@ jobs:
   # Semver check of the public-contract tier against the last published
   # version on crates.io. Before the first publish there is no baseline, so a
   # crate that is not on crates.io yet is skipped with a notice instead of
-  # failing; once 0.2.0 is out the check is live with no workflow change.
+  # failing; once 0.20.0 is out the check is live with no workflow change.
   semver:
     name: Semver (public contract)
     runs-on: ubuntu-latest

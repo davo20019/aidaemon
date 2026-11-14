@@ -9,4 +9,4 @@ let provider = aidaemon_providers::Anthropic::builder().api_key("<key>").build()
 let agent = aidaemon_core::Agent::builder("a").model("claude-sonnet-5-5").provider(provider)/* ... */;
 ```
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-providers
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.20.0). MIT licensed. Docs: https://docs.rs/aidaemon-providers

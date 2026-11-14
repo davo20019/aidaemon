@@ -32,8 +32,8 @@ chatgpt-login = [
 ]
 
 [dependencies]
-aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
-aidaemon-secrets = { version = "0.2.0", path = "../aidaemon-secrets", default-features = false, optional = true }
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
+aidaemon-secrets = { version = "0.20.0", path = "../aidaemon-secrets", default-features = false, optional = true }
 anyhow = { version = "1", optional = true }
 base64 = { version = "0.23", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }

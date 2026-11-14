@@ -8,4 +8,4 @@ The `browser` tool: Chrome over the DevTools protocol (`chromiumoxide`), launche
 let tool = aidaemon_tool_browser::BrowserTool::new(settings, media_tx, inbox_dir, backend)?;
 ```
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-tool-browser
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.20.0). MIT licensed. Docs: https://docs.rs/aidaemon-tool-browser

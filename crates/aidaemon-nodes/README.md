@@ -20,4 +20,4 @@ aidaemon_nodes::gateway::serve(state).await?;
 
 Settings are `config::NodesConfig` (the `[nodes]` TOML section). The host supplies the conversation behind a Node turn (`NodeConversationIngress`) and the `SecretStore` holding the Gateway instance key.
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-nodes
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.20.0). MIT licensed. Docs: https://docs.rs/aidaemon-nodes

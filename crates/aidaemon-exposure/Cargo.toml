@@ -19,7 +19,7 @@ publish = false
 testing = []
 
 [dependencies]
-aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
 async-trait = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }

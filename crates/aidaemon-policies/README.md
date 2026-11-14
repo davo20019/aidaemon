@@ -9,4 +9,4 @@ use aidaemon_policies::{ApprovalMode, ApprovalPolicy};
 let agent = builder.hook(ApprovalPolicy::new(ApprovalMode::DestructiveOnly)).build()?;
 ```
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-policies
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.20.0). MIT licensed. Docs: https://docs.rs/aidaemon-policies

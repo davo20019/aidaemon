@@ -12,4 +12,4 @@ cargo run -p aidaemon-client-protocol --bin export-client-schema
 
 A test fails when the checked-in file is stale, and golden fixtures (`tests/fixtures/*.golden`) cover every frame, command, result and event.
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed.
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.20.0). MIT licensed.

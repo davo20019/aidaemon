@@ -18,8 +18,8 @@ exclude = ["tests/", "benches/"]
 publish = false
 
 [dependencies]
-aidaemon-secrets = { version = "0.2.0", path = "../aidaemon-secrets", default-features = false }
-aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools" }
+aidaemon-secrets = { version = "0.20.0", path = "../aidaemon-secrets", default-features = false }
+aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools" }
 aes-gcm = "0.11"
 anyhow = "1"
 async-trait = "0.1"

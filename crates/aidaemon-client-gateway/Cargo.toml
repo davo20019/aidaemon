@@ -17,12 +17,12 @@ exclude = ["tests/", "benches/"]
 publish = false
 
 [dependencies]
-aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels" }
-aidaemon-client-protocol = { version = "0.2.0", path = "../client-protocol" }
-aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
-aidaemon-events = { version = "0.2.0", path = "../aidaemon-events" }
-aidaemon-store-sqlite = { version = "0.2.0", path = "../aidaemon-store-sqlite", features = ["client-events"] }
-aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools" }
+aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels" }
+aidaemon-client-protocol = { version = "0.20.0", path = "../client-protocol" }
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
+aidaemon-events = { version = "0.20.0", path = "../aidaemon-events" }
+aidaemon-store-sqlite = { version = "0.20.0", path = "../aidaemon-store-sqlite", features = ["client-events"] }
+aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools" }
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.23"

@@ -26,9 +26,9 @@ test-server = []
 registry = ["dep:aidaemon-tools", "dep:aidaemon-secrets", "dep:tracing"]
 
 [dependencies]
-aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
-aidaemon-secrets = { version = "0.2.0", path = "../aidaemon-secrets", default-features = false, optional = true }
-aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools", optional = true }
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
+aidaemon-secrets = { version = "0.20.0", path = "../aidaemon-secrets", default-features = false, optional = true }
+aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools", optional = true }
 anyhow = "1"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }

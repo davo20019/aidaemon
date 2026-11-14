@@ -9,4 +9,4 @@ let store = std::sync::Arc::new(aidaemon_store_sqlite::SqliteStore::open("runs.d
 for state in store.in_flight_runs().await? { /* agent.run_from(state, token) */ }
 ```
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-store-sqlite
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.20.0). MIT licensed. Docs: https://docs.rs/aidaemon-store-sqlite

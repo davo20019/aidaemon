@@ -40,10 +40,10 @@ chromium = [
 ]
 
 [dependencies]
-aidaemon-core = { version = "0.2.0", path = "../aidaemon-core", optional = true }
-aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels", optional = true }
-aidaemon-events = { version = "0.2.0", path = "../aidaemon-events", optional = true }
-aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools", optional = true }
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core", optional = true }
+aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels", optional = true }
+aidaemon-events = { version = "0.20.0", path = "../aidaemon-events", optional = true }
+aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools", optional = true }
 anyhow = { version = "1", optional = true }
 async-trait = { version = "0.1", optional = true }
 chromiumoxide = { version = "0.9", default-features = false, optional = true }
