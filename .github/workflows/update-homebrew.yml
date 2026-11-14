@@ -71,6 +71,8 @@ jobs:
 
             def install
               bin.install "aidaemon"
+              # The app (`aidaemon app` / `aidaemon tui`); older archives lack it.
+              bin.install "aidaemon-app" if File.exist?("aidaemon-app")
             end
 
             test do
