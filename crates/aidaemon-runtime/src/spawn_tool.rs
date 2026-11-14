@@ -1976,6 +1976,76 @@ mod group_tests {
         }
     }
 
+    /// Live 2026-11-14: the owner asked for parallel Drupal and WordPress
+    /// helpers. The Drupal launch named only its own step; the checklist,
+    /// posted again, left the WordPress step waiting on the Drupal job, and
+    /// the WordPress launch was refused as a duplicate. Waiting on a run is
+    /// not being done by it: the second launch is accepted.
+    #[tokio::test]
+    async fn a_parallel_launch_for_a_step_that_only_waits_is_accepted() {
+        let parent = Arc::new(Parent::default());
+        let weak: Weak<dyn ChildAgentRuntime> =
+            Arc::downgrade(&(parent.clone() as Arc<dyn ChildAgentRuntime>));
+        let tool = SpawnAgentTool::new(weak, 8_000, 60);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(aidaemon_work::plans::PlanStore::new(pool).await.unwrap());
+        tool.set_plan_store(plans.clone());
+        let background = aidaemon_work::plans::StepStatus::Background;
+        plans
+            .upsert_checklist(
+                "chat-1",
+                Some("task-1"),
+                "Install Drupal and WordPress",
+                &[
+                    ("Install Drupal".to_string(), background),
+                    ("Install WordPress".to_string(), background),
+                ],
+            )
+            .await
+            .unwrap();
+        plans
+            .link_background_job("chat-1", Some("task-1"), &[0], "job-drupal")
+            .await
+            .unwrap();
+        plans
+            .wait_on_background_jobs("chat-1", Some("task-1"), &["job-drupal".to_string()])
+            .await
+            .unwrap();
+        parent
+            .runs
+            .begin("job-drupal", "chat-1", "Install Drupal site", None);
+        let facts = ToolCallContext {
+            session_id: "chat-1".to_string(),
+            task_id: Some("task-1".to_string()),
+            ..Default::default()
+        };
+        let wordpress =
+            r#"{"title":"Install WordPress","task":"Install it","checklist_items":[1]}"#;
+        tool.refuse_steps_a_running_helper_does(
+            &SpawnArgs::parse(wordpress).unwrap(),
+            &facts,
+            parent.as_ref(),
+        )
+        .await
+        .expect("the WordPress step only waits on the Drupal job");
+        let drupal_again =
+            r#"{"title":"Install Drupal","task":"Install it","checklist_items":[0]}"#;
+        assert!(
+            tool.refuse_steps_a_running_helper_does(
+                &SpawnArgs::parse(drupal_again).unwrap(),
+                &facts,
+                parent.as_ref(),
+            )
+            .await
+            .is_err(),
+            "Drupal's own step is still guarded"
+        );
+    }
+
     /// Live 2026-11-14: one turn launched a WordPress and a Drupal helper,
     /// then a third helper for the WordPress install while the first still
     /// ran. A launch for a step a running helper does is refused, naming

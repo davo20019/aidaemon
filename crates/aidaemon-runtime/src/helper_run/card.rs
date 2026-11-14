@@ -158,9 +158,12 @@ async fn job_plan(
         .ok()?
         .into_iter()
         .find(|plan| {
-            plan.steps
-                .iter()
-                .any(|step| step.background_jobs.iter().any(|known| known == job))
+            plan.steps.iter().any(|step| {
+                step.background_jobs
+                    .iter()
+                    .chain(&step.waited_jobs)
+                    .any(|known| known == job)
+            })
         })
 }
 

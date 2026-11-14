@@ -87,7 +87,7 @@ impl TaskPlan {
                 expected_targets: Vec::new(),
                 evidence_receipt_ids: Vec::new(),
                 background_jobs: Vec::new(),
-                waits_on_jobs: false,
+                waited_jobs: Vec::new(),
                 not_done: None,
                 evidence: StepEvidence::Settled,
                 status: if index == 0 {
@@ -215,6 +215,7 @@ impl TaskPlan {
             }
             step.status = StepStatus::Failed;
             step.evidence = StepEvidence::HelperNotStarted;
+            step.waited_jobs.clear();
             step.error = Some(reason.to_string());
             step.completed_at = Some(now);
             changed = true;
@@ -425,6 +426,8 @@ impl TaskPlan {
             step.evidence = StepEvidence::Settled;
             step.error = None;
             step.not_done = None;
+            // Its own run now: the jobs it waited on no longer settle it.
+            step.waited_jobs.clear();
             step.status = StepStatus::Background;
             step.started_at.get_or_insert_with(Utc::now);
             step.completed_at = None;
@@ -507,7 +510,7 @@ impl TaskPlan {
     /// handed off with no job yet, or already waiting on an earlier job)
     /// waits on them, so the card reads "continuing in the background", never
     /// "stopped short", while they run. Their typed ends settle such a step
-    /// ([`PlanStep::waits_on_jobs`]). Returns whether anything changed.
+    /// ([`PlanStep::waited_jobs`]). Returns whether anything changed.
     pub fn wait_on_background_jobs(&mut self, job_ids: &[String]) -> bool {
         if job_ids.is_empty() {
             return false;
@@ -526,17 +529,15 @@ impl TaskPlan {
             // both helpers went on to succeed).
             let open = matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
                 || (step.status == StepStatus::Deferred && step.not_done.is_none())
-                || (step.status == StepStatus::Background
-                    && (step.waits_on_jobs || step.background_jobs.is_empty()));
+                || (step.status == StepStatus::Background && step.background_jobs.is_empty());
             if !open {
                 continue;
             }
             step.status = StepStatus::Background;
-            step.waits_on_jobs = true;
             step.completed_at = None;
             for job in job_ids {
-                if !step.background_jobs.contains(job) {
-                    step.background_jobs.push(job.clone());
+                if !step.waited_jobs.contains(job) {
+                    step.waited_jobs.push(job.clone());
                 }
             }
             changed = true;
@@ -579,33 +580,40 @@ impl TaskPlan {
             _ => 1,
         };
         for step in &mut self.steps {
-            if step.status != StepStatus::Background
-                || !step.background_jobs.iter().any(|job| job == job_id)
-            {
+            let took_on = step.background_jobs.iter().any(|job| job == job_id);
+            let waited = step.waited_jobs.iter().any(|job| job == job_id);
+            if step.status != StepStatus::Background || !(took_on || waited) {
                 continue;
             }
             changed = true;
             step.background_jobs.retain(|job| job != job_id);
+            step.waited_jobs.retain(|job| job != job_id);
+            // A step a job of its own took on settles from its own runs
+            // only: an end it merely waited on is not its outcome (live
+            // 2026-11-14: Drupal's success marked the WordPress step done).
+            if !took_on && !step.background_jobs.is_empty() {
+                continue;
+            }
             if let Some(short) = short {
                 step.not_done = Some(match step.not_done {
                     Some(earlier) if rank(earlier) >= rank(short) => earlier,
                     _ => short,
                 });
             }
-            if !step.background_jobs.is_empty() {
+            if !step.background_jobs.is_empty() || (!took_on && !step.waited_jobs.is_empty()) {
                 continue;
             }
             // Live 2026-11-13: a step that only waited on a background job
             // read "(not done)" after the job succeeded. Its runs' typed
             // ends are what settle it.
-            let waited = std::mem::take(&mut step.waits_on_jobs);
+            step.waited_jobs.clear();
             step.completed_at = Some(now);
             match step.not_done {
                 None => {
                     step.status = StepStatus::Completed;
                     step.evidence = StepEvidence::Settled;
                 }
-                Some(NotDoneReason::WaitedOnFailed) if !waited => {
+                Some(NotDoneReason::WaitedOnFailed) if took_on => {
                     step.status = StepStatus::Failed;
                     step.not_done = None;
                 }
@@ -645,7 +653,7 @@ impl TaskPlan {
         if self
             .steps
             .iter()
-            .any(|step| step.status == StepStatus::Background && !step.background_jobs.is_empty())
+            .any(|step| step.status == StepStatus::Background && step.has_background_jobs())
         {
             return false;
         }
@@ -657,7 +665,7 @@ impl TaskPlan {
                 StepStatus::Pending | StepStatus::InProgress | StepStatus::Background
             ) {
                 step.status = StepStatus::Deferred;
-                step.waits_on_jobs = false;
+                step.waited_jobs.clear();
                 step.background_jobs.clear();
                 step.not_done = Some(NotDoneReason::LeftOpen);
                 step.completed_at = Some(now);
@@ -684,12 +692,12 @@ impl TaskPlan {
                 continue;
             };
             if matches!(step.status, StepStatus::Completed | StepStatus::Skipped)
-                || (step.status == StepStatus::Background && !step.waits_on_jobs)
+                || (step.status == StepStatus::Background && !step.background_jobs.is_empty())
             {
                 continue;
             }
             step.status = StepStatus::Deferred;
-            step.waits_on_jobs = false;
+            step.waited_jobs.clear();
             step.background_jobs.clear();
             step.not_done = Some(NotDoneReason::NotAttempted);
             step.completed_at = Some(now);
@@ -1019,18 +1027,21 @@ pub struct PlanStep {
     #[serde(default)]
     pub evidence_receipt_ids: Vec<String>,
 
-    /// Background jobs (their launch ids) still working on this step. Set at
-    /// launch from the launch's typed `checklist_items`; each job's end
-    /// settles the step ([`TaskPlan::settle_background_job`]).
+    /// Background jobs (their launch ids) that took this step on and still
+    /// work on it: a launch named it in its typed `checklist_items`. Each
+    /// job's end settles the step ([`TaskPlan::settle_background_job`]), and
+    /// only these make a new helper for the step a duplicate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_jobs: Vec<String>,
 
-    /// The step was left open while the turn's background jobs ran, not
-    /// handed to them by a launch's `checklist_items`: it reads as running
-    /// while they do and settles from their typed ends: done once every one
-    /// succeeded, not done (with the reason) once one failed or stopped.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub waits_on_jobs: bool,
+    /// Background jobs this step only waits on: it was left open while the
+    /// turn's jobs ran, and no launch named it. It reads as running while
+    /// they do and, while no job of its own took it on, settles from their
+    /// typed ends: done once every one succeeded, not done (with the reason)
+    /// once one failed or stopped. Waiting on a job is not being done by it:
+    /// it never makes a launch for the step a duplicate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waited_jobs: Vec<String>,
 
     /// Why a step that was not done was left undone, when the daemon knows it
     /// from typed state (never from the step's text). Such a step was held
@@ -1087,6 +1098,12 @@ impl PlanStep {
         self.status == StepStatus::Completed
             && self.evidence == StepEvidence::ModelSaid
             && !self.required_mutation_effects.is_empty()
+    }
+
+    /// Any background job is still listed on it: one that took it on, or
+    /// one it waits on.
+    pub fn has_background_jobs(&self) -> bool {
+        !self.background_jobs.is_empty() || !self.waited_jobs.is_empty()
     }
 
     /// It was handed to a helper that never started.
@@ -1347,14 +1364,18 @@ mod tests {
     }
 
     /// A step a launch left waiting on the turn's jobs (no `checklist_items`)
-    /// is covered by them too.
+    /// is not being done by them: it waits, and a launch for it is not a
+    /// duplicate (live 2026-11-14: the WordPress helper was refused because
+    /// its step waited on the Drupal job).
     #[test]
-    fn steps_waiting_on_unnamed_launches_are_covered() {
+    fn steps_waiting_on_unnamed_launches_are_not_covered() {
         let mut plan = two_sites();
         plan.wait_on_background_jobs(&["job-a".to_string(), "job-b".to_string()]);
-        let covered = plan.steps_covered_by_running_jobs(&[], |_| true);
-        assert_eq!(covered.len(), 2);
-        assert_eq!(covered[0].jobs, vec!["job-a", "job-b"]);
+        assert!(plan.steps_covered_by_running_jobs(&[], |_| true).is_empty());
+        assert!(
+            plan.steps_covered_by_running_jobs(&[0], |_| true)
+                .is_empty()
+        );
     }
 
     /// A step owns its runs in order and its outcome is its latest run's:
@@ -1487,14 +1508,14 @@ mod tests {
         }
         assert!(plan.wait_on_background_jobs(&["job-1".to_string()]));
         assert!(plan.wait_on_background_jobs(&["job-2".to_string()]));
-        assert_eq!(plan.steps[0].background_jobs, vec!["job-1", "job-2"]);
+        assert_eq!(plan.steps[0].waited_jobs, vec!["job-1", "job-2"]);
         plan.settle_background_job("job-1", JobEnd::Succeeded);
         assert_eq!(plan.steps[0].status, StepStatus::Background);
         plan.steps.push(PlanStep {
             status: StepStatus::InProgress,
             description: "Report each time".into(),
             background_jobs: Vec::new(),
-            waits_on_jobs: false,
+            waited_jobs: Vec::new(),
             ..plan.steps[0].clone()
         });
         plan.settle_background_job("job-2", JobEnd::Succeeded);
@@ -1915,5 +1936,90 @@ mod tests {
         assert!(!PlanStatus::PartiallyCompleted.is_incomplete());
         assert!(!PlanStatus::Failed.is_incomplete());
         assert!(!PlanStatus::Abandoned.is_incomplete());
+    }
+
+    fn parallel_installs() -> TaskPlan {
+        let mut plan = TaskPlan::new(
+            "synthetic-session",
+            "synthetic-task",
+            "description",
+            vec![
+                "install the drupal site".into(),
+                "install the wordpress site".into(),
+                "report both".into(),
+            ],
+            "track_requirements",
+        );
+        // The model marked both installs handed off before either launch.
+        plan.steps[0].status = StepStatus::Background;
+        plan.steps[1].status = StepStatus::Background;
+        plan
+    }
+
+    /// Live 2026-11-14: two parallel helpers, Drupal and WordPress. The
+    /// Drupal launch named only its own step, yet the WordPress step, left
+    /// waiting on the turn's launches, counted as already being done by the
+    /// Drupal job and the WordPress launch was refused. Waiting on a run is
+    /// not being done by it.
+    #[test]
+    fn a_second_parallel_launch_is_accepted_when_the_first_named_only_its_own_step() {
+        let mut plan = parallel_installs();
+        assert!(plan.link_background_job(&[0], "job-drupal"));
+        // The checklist is posted again while Drupal runs: the open steps
+        // wait on the turn's launch.
+        plan.wait_on_background_jobs(&["job-drupal".to_string()]);
+        let running = |_: &str| true;
+        assert!(
+            plan.steps_covered_by_running_jobs(&[1], running).is_empty(),
+            "the WordPress step only waits on Drupal: {:?}",
+            plan.steps[1]
+        );
+        assert_eq!(
+            plan.steps_covered_by_running_jobs(&[0], running)
+                .iter()
+                .map(|covered| covered.index)
+                .collect::<Vec<_>>(),
+            vec![0],
+            "Drupal's own step is still guarded"
+        );
+        assert!(plan.link_background_job(&[1], "job-wordpress"));
+        // Drupal's end settles only its own step; WordPress's is its run's.
+        assert!(plan.settle_background_job("job-drupal", JobEnd::Succeeded));
+        assert_eq!(plan.steps[0].status, StepStatus::Completed);
+        assert_eq!(plan.steps[1].status, StepStatus::Background);
+        assert!(plan.settle_background_job("job-wordpress", JobEnd::Failed));
+        assert_eq!(plan.steps[1].status, StepStatus::Failed);
+    }
+
+    /// A step that only waits on a running job never blocks a launch, named
+    /// or not.
+    #[test]
+    fn a_step_that_only_waits_never_blocks_a_launch() {
+        let mut plan = parallel_installs();
+        plan.steps[0].status = StepStatus::Pending;
+        plan.steps[1].status = StepStatus::Pending;
+        plan.wait_on_background_jobs(&["job-first".to_string()]);
+        let running = |_: &str| true;
+        assert!(plan.steps_covered_by_running_jobs(&[], running).is_empty());
+        assert!(plan.steps_covered_by_running_jobs(&[1], running).is_empty());
+    }
+
+    /// The WordPress step's own helper never started while it waited on
+    /// Drupal's: Drupal's success does not make it done, and the header
+    /// counts it as not done (live 2026-11-14: "Done · 4 of 4 steps").
+    #[test]
+    fn a_waiting_step_whose_own_helper_never_started_is_not_done() {
+        let mut plan = parallel_installs();
+        assert!(plan.link_background_job(&[0], "job-drupal"));
+        plan.wait_on_background_jobs(&["job-drupal".to_string()]);
+        assert!(plan.helper_did_not_start(&[1], "the launch was refused"));
+        assert!(plan.settle_background_job("job-drupal", JobEnd::Succeeded));
+        assert_eq!(plan.steps[0].status, StepStatus::Completed);
+        assert_ne!(plan.steps[1].status, StepStatus::Completed);
+        let card = plan.render_compact_checklist();
+        assert!(!card.contains("Done ·"), "{card}");
+        assert!(!card.contains("3 of 3"), "{card}");
+        assert!(card.contains("didn't run"), "{card}");
+        assert!(!card.contains("running in the background"), "{card}");
     }
 }

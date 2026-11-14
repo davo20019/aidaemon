@@ -215,7 +215,7 @@ impl PlanStore {
                 expected_targets: item.expected_targets.clone(),
                 evidence_receipt_ids: Vec::new(),
                 background_jobs: Vec::new(),
-                waits_on_jobs: false,
+                waited_jobs: Vec::new(),
                 not_done: None,
                 // The model's own tick: done on its word until evidence
                 // confirms it.
@@ -312,12 +312,12 @@ impl PlanStore {
                     }
                 }
                 if previous.status == StepStatus::Background
-                    && !previous.background_jobs.is_empty()
+                    && previous.has_background_jobs()
                     && previous.description == step.description
                 {
                     step.status = StepStatus::Background;
                     step.background_jobs = previous.background_jobs.clone();
-                    step.waits_on_jobs = previous.waits_on_jobs;
+                    step.waited_jobs = previous.waited_jobs.clone();
                     step.started_at = previous.started_at;
                     step.completed_at = None;
                 }
@@ -884,6 +884,14 @@ fn steps_from_json(json: &str) -> anyhow::Result<Vec<crate::plans::PlanStep>> {
         };
         let said_done = flag(fields, "said_done");
         let not_started = flag(fields, "helper_not_started");
+        // Rows written before a step kept the jobs it waits on apart listed
+        // them as its own jobs under a `waits_on_jobs` flag.
+        if flag(fields, "waits_on_jobs") && !fields.contains_key("waited_jobs") {
+            let jobs = fields
+                .remove("background_jobs")
+                .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+            fields.insert("waited_jobs".to_string(), jobs);
+        }
         if fields.contains_key("evidence") {
             continue;
         }
@@ -1040,6 +1048,23 @@ mod tests {
         assert_eq!(read[0].evidence, StepEvidence::ModelSaid);
         assert_eq!(read[1].evidence, StepEvidence::HelperNotStarted);
         assert_eq!(read[2].evidence, StepEvidence::Settled);
+    }
+
+    /// Rows stored before a step kept the jobs it only waits on apart read
+    /// those jobs as waited on, never as its own.
+    #[test]
+    fn legacy_waiting_flag_reads_as_waited_jobs() {
+        let plan = TaskPlan::new("s", "t", "d", vec!["a".into(), "b".into()], "r");
+        let mut raw = serde_json::to_value(&plan.steps).unwrap();
+        let steps = raw.as_array_mut().unwrap();
+        steps[0]["background_jobs"] = serde_json::json!(["job-a"]);
+        steps[0]["waits_on_jobs"] = true.into();
+        steps[1]["background_jobs"] = serde_json::json!(["job-b"]);
+        let read = steps_from_json(&raw.to_string()).unwrap();
+        assert!(read[0].background_jobs.is_empty());
+        assert_eq!(read[0].waited_jobs, vec!["job-a".to_string()]);
+        assert_eq!(read[1].background_jobs, vec!["job-b".to_string()]);
+        assert!(read[1].waited_jobs.is_empty());
     }
 
     /// A step whose helper never started is not done, the finished card says
@@ -1495,7 +1520,7 @@ mod tests {
         for (index, step) in plan.steps.iter().enumerate().skip(1) {
             assert_eq!(step.status, StepStatus::Background, "step {index}");
             assert_eq!(
-                step.background_jobs,
+                step.waited_jobs,
                 vec!["job-drupal".to_string(), "job-wordpress".to_string()],
                 "step {index} waits on both launches"
             );
