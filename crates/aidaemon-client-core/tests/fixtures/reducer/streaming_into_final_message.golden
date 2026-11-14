@@ -93,11 +93,13 @@
       "app:s1": {
         "lines": [
           {
+            "at_ms": 1767225601000,
             "kind": "user",
             "origin": "app",
             "text": "Draft the synthetic report"
           },
           {
+            "at_ms": 1767225603000,
             "kind": "assistant",
             "text": "Drafted the report."
           }

@@ -58,7 +58,6 @@ pub fn router(gateway: Arc<ClientGateway>) -> Router {
         .route("/client/v1/devices/{device_id}/revoke", post(revoke_device))
         .route("/client/v1/app", get(web_page))
         .route("/client/v1/app/", get(web_page))
-        .route("/client/v1/app/{module}", get(web_script))
         .route("/client/v1/next", get(app_root))
         .route("/client/v1/next/", get(app_index))
         .route("/client/v1/next/{*path}", get(app_file))
@@ -337,19 +336,34 @@ async fn revoke_device(
     reply(gateway.pairing.devices().await)
 }
 
-/// The web client: one page and its modules, built from `clients/web`.
-const WEB_PAGE: &str = include_str!("../web/index.html");
-const WEB_MODULES: &[(&str, &str)] = &[
-    ("app.js", include_str!("../web/app.js")),
-    ("link.js", include_str!("../web/link.js")),
-    ("platform.js", include_str!("../web/platform.js")),
-    ("state.js", include_str!("../web/state.js")),
-    ("ui.js", include_str!("../web/ui.js")),
-];
+/// Shown at `/client/v1/app` when no web build of the app is installed.
+/// Self-contained: no scripts and no external assets.
+const NOT_INSTALLED_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIdaemon</title>
+<style>
+body { font: 16px/1.5 system-ui, sans-serif; max-width: 36rem; margin: 3rem auto; padding: 0 1rem; color: #1f2328; background: #fff; }
+code { font-family: ui-monospace, monospace; font-size: 0.9em; background: #f0f1f3; padding: 0.1em 0.3em; border-radius: 4px; }
+@media (prefers-color-scheme: dark) { body { color: #e6e6e6; background: #16181c; } code { background: #2a2d33; } }
+</style>
+</head>
+<body>
+<h1>The AIdaemon web app is not installed</h1>
+<p>This daemon serves the web app from <code>~/.aidaemon/app-web</code>, and nothing is there yet.</p>
+<p>To get it, re-run the install script, which installs the web app with each release:</p>
+<p><code>curl -sSfL https://get.aidaemon.ai | bash</code></p>
+<p>Or build it from a checkout: in <code>clients/app</code> run <code>nsh package --target web</code> and copy the contents of <code>.nsh/out/AIdaemon/</code> to <code>~/.aidaemon/app-web</code>.</p>
+<p>Then reload this page.</p>
+</body>
+</html>
+"#;
 
 async fn web_page(State(gateway): State<Arc<ClientGateway>>) -> Response {
-    // With the nsh app served, the old page's links (pairing links,
-    // bookmarks) open it instead; the browser keeps the `#offer=…`.
+    // With the app's web build served, links to this path (pairing links,
+    // bookmarks) open it; the browser keeps the `#offer=…`.
     if gateway
         .config
         .app_dir
@@ -363,24 +377,10 @@ async fn web_page(State(gateway): State<Arc<ClientGateway>>) -> Response {
             (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (
                 axum::http::header::CONTENT_SECURITY_POLICY,
-                "default-src 'self'; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline'",
+                "default-src 'none'; style-src 'unsafe-inline'",
             ),
         ],
-        WEB_PAGE,
-    )
-        .into_response()
-}
-
-async fn web_script(Path(module): Path<String>) -> Response {
-    let Some((_, script)) = WEB_MODULES.iter().find(|(name, _)| *name == module) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/javascript; charset=utf-8",
-        )],
-        *script,
+        NOT_INSTALLED_PAGE,
     )
         .into_response()
 }

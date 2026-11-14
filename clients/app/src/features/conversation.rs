@@ -13,8 +13,10 @@ use crate::ui::{self, Glyph, Size, Variant, btn_icon, colors, radius, size, type
 /// A row of the transcript.
 #[derive(Debug, Clone, PartialEq)]
 enum Row {
-    User(String),
-    Assistant(String),
+    /// A day break: "Today", "Yesterday", "Mar 3".
+    Day(String),
+    User(String, u64),
+    Assistant(String, u64),
     Note(String),
     /// The reply being written and what the agent is doing.
     Live,
@@ -26,21 +28,34 @@ impl Row {
         match self {
             Self::Live => "live".into(),
             Self::Approval(id) => format!("approval-{id}"),
+            Self::Day(label) => format!("day-{label}-{index}"),
             _ => format!("line-{index}"),
         }
     }
 }
 
 fn rows(store: Store, session: &str) -> Vec<Row> {
-    let mut rows: Vec<Row> = store
-        .lines(session)
-        .into_iter()
-        .map(|line| match line {
-            Line::User { text, .. } => Row::User(text),
-            Line::Assistant { text } => Row::Assistant(text),
+    let now = crate::store::now_ms();
+    let mut rows: Vec<Row> = Vec::new();
+    let mut last_day = None;
+    for line in store.lines(session) {
+        let at = match &line {
+            Line::User { at_ms, .. } | Line::Assistant { at_ms, .. } => *at_ms,
+            Line::Note { .. } => 0,
+        };
+        if at > 0 {
+            let day = ui::time::day(at);
+            if last_day != Some(day) {
+                last_day = Some(day);
+                rows.push(Row::Day(ui::time::day_label(at, now)));
+            }
+        }
+        rows.push(match line {
+            Line::User { text, at_ms, .. } => Row::User(text, at_ms),
+            Line::Assistant { text, at_ms } => Row::Assistant(text, at_ms),
             Line::Note { text } => Row::Note(text),
-        })
-        .collect();
+        });
+    }
     if store.live(session).is_some() {
         rows.push(Row::Live);
     }
@@ -168,6 +183,10 @@ fn header(store: Store, session: Option<String>) -> View {
         .child(when(
             move || running.as_deref().is_some_and(|id| store.is_running(id)),
             move || {
+                let stopping = {
+                    let stop = stop.clone();
+                    move || stop.as_deref().is_some_and(|id| store.is_stopping(id))
+                };
                 let stop = stop.clone();
                 let press = move || {
                     if let Some(id) = &stop {
@@ -175,10 +194,59 @@ fn header(store: Store, session: Option<String>) -> View {
                     }
                 };
                 // A phone's bar keeps room for the title: Stop is a glyph.
-                if ui::touch() || store.is_compact() {
-                    ui::icon_btn(Glyph::Stop, "Stop", Size::Md, press).into_element()
-                } else {
-                    btn_icon(Glyph::Stop, "Stop", Variant::Outline, Size::Sm, press).into_element()
+                // Once asked, it says so until the turn ends.
+                when(stopping, || ui::status("Stopping…", ui::Tone::Warning)).otherwise(move || {
+                    let press = press.clone();
+                    if ui::touch() || store.is_compact() {
+                        ui::icon_btn(Glyph::Stop, "Stop", Size::Md, press).into_element()
+                    } else {
+                        btn_icon(Glyph::Stop, "Stop", Variant::Outline, Size::Sm, press)
+                            .into_element()
+                    }
+                })
+            },
+        ))
+        .child(when(
+            {
+                let s = session.clone();
+                move || s.is_some() && !store.is_compact()
+            },
+            {
+                let pin = session.clone();
+                move || {
+                    let pin = pin.clone();
+                    let label = pin.clone();
+                    let id = pin.clone().unwrap_or_default();
+                    view()
+                        .flex_row()
+                        .child(dynamic(move || {
+                            let pinned = store.is_pinned(&id);
+                            let pin = pin.clone();
+                            Some(untracked(move || {
+                                ui::icon_btn(
+                                    if pinned { Glyph::Pinned } else { Glyph::Pin },
+                                    if pinned { "Unpin" } else { "Pin to the top" },
+                                    Size::Md,
+                                    move || {
+                                        if let Some(id) = &pin {
+                                            store.toggle_pin(id)
+                                        }
+                                    },
+                                )
+                            }))
+                        }))
+                        .child(ui::icon_btn(
+                            Glyph::Copy,
+                            "Copy conversation as Markdown",
+                            Size::Md,
+                            move || {
+                                let _ = &label;
+                                if let Some(text) = store.transcript_markdown() {
+                                    set_clipboard(text);
+                                    store.say("Copied the conversation");
+                                }
+                            },
+                        ))
                 }
             },
         ))
@@ -210,9 +278,51 @@ fn welcome() -> View {
     )
 }
 
-fn transcript(store: Store, session: String) -> VirtualList {
+/// The transcript, and a "Jump to latest" pill while the owner reads back.
+fn transcript(store: Store, session: String) -> View {
     let id = session.clone();
     let all = computed(move || rows(store, &id));
+    let last_seen = signal(usize::MAX);
+    let list = element_ref();
+    view()
+        .flex_1()
+        .child(
+            transcript_list(store, session, all, last_seen)
+                .element_ref(&list)
+                .flex_1(),
+        )
+        .child(when(
+            move || {
+                let len = all.with(Vec::len);
+                let seen = last_seen.get();
+                seen != usize::MAX && len > 0 && seen + 2 < len
+            },
+            move || {
+                view()
+                    .absolute()
+                    .bottom(px(12.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .items_center()
+                    .child(
+                        ui::btn(
+                            "Jump to latest ↓",
+                            Variant::Secondary,
+                            Size::Sm,
+                            move || list.scroll_to_end(true),
+                        )
+                        .shadow_md(),
+                    )
+            },
+        ))
+}
+
+fn transcript_list(
+    store: Store,
+    session: String,
+    all: Memo<Vec<Row>>,
+    last_seen: Signal<usize>,
+) -> VirtualList {
     let count = all.with_untracked(Vec::len);
     virtual_list(
         move || all.with(Vec::len),
@@ -221,11 +331,12 @@ fn transcript(store: Store, session: String) -> VirtualList {
             let kind = computed(move || {
                 row.with(|r| {
                     r.as_ref().map(|r| match r {
-                        Row::User(_) => 0,
-                        Row::Assistant(_) => 1,
+                        Row::User(..) => 0,
+                        Row::Assistant(..) => 1,
                         Row::Note(_) => 2,
                         Row::Live => 3,
                         Row::Approval(_) => 4,
+                        Row::Day(_) => 5,
                     })
                 })
             });
@@ -237,14 +348,30 @@ fn transcript(store: Store, session: String) -> VirtualList {
                     let column = view().w_full().max_w(px(size::COLUMN)).px_4().py_2();
                     let content = move || {
                         row.with(|r| match r {
-                            Some(Row::User(t) | Row::Assistant(t) | Row::Note(t)) => t.clone(),
+                            Some(
+                                Row::User(t, _) | Row::Assistant(t, _) | Row::Note(t) | Row::Day(t),
+                            ) => t.clone(),
                             _ => String::new(),
                         })
                     };
+                    let at = move || {
+                        row.with(|r| match r.as_ref() {
+                            Some(Row::User(_, at) | Row::Assistant(_, at)) => *at,
+                            _ => 0,
+                        })
+                    };
                     match kind {
-                        0 => column.items_end().child(user_bubble(content)),
-                        1 => column.child(markdown(move || content().into(), || false)),
+                        0 => column
+                            .items_end()
+                            .gap_1()
+                            .child(user_bubble(content))
+                            .child(stamp(at)),
+                        1 => column
+                            .gap_1()
+                            .child(markdown(move || content().into(), || false))
+                            .child(reply_footer(store, content, at)),
                         2 => column.child(note(content)),
+                        5 => column.child(day_break(content)),
                         3 => column.child(live(store, session)),
                         _ => column.child(dynamic(move || {
                             let id = row.with(|r| match r {
@@ -267,12 +394,71 @@ fn transcript(store: Store, session: String) -> VirtualList {
                 .collect::<Vec<_>>()
         })
     })
+    .on_viewable_items_change(move |items: &nsh_core::element::ViewableItems| {
+        if let Some((_, last)) = items.viewable {
+            last_seen.set(last);
+        }
+    })
     .estimated_item_size(px(96.0))
     .initial_scroll_index(count.saturating_sub(1))
     .follow_end(px(48.0))
     .content_padding_top(px(12.0))
     .content_padding_bottom(px(12.0))
-    .flex_1()
+}
+
+/// When a message was said, quietly: "3:42 PM".
+fn stamp(at: impl Fn() -> u64 + 'static) -> Text {
+    text(move || {
+        let at = at();
+        if at == 0 {
+            String::new()
+        } else {
+            ui::time::clock(at)
+        }
+    })
+    .text_size(px(type_scale::XS))
+    .text_color(colors::FAINT)
+}
+
+/// Under a reply: its time and Copy.
+fn reply_footer(
+    store: Store,
+    content: impl Fn() -> String + Clone + 'static,
+    at: impl Fn() -> u64 + 'static,
+) -> View {
+    view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(stamp(at))
+        .child(ui::btn_icon(
+            Glyph::Copy,
+            "Copy",
+            Variant::Ghost,
+            Size::Sm,
+            move || {
+                set_clipboard(content());
+                store.say("Copied the reply");
+            },
+        ))
+}
+
+/// "Today", centred between hairlines.
+fn day_break(label: impl Fn() -> String + 'static) -> View {
+    view()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .py_1()
+        .child(view().flex_1().h(px(1.0)).bg(colors::LINE))
+        .child(
+            text(label)
+                .role(AccessibilityRole::Header)
+                .text_size(px(type_scale::XS))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(colors::FAINT),
+        )
+        .child(view().flex_1().h(px(1.0)).bg(colors::LINE))
 }
 
 fn user_bubble(content: impl Fn() -> String + 'static) -> View {
@@ -353,6 +539,7 @@ fn composer(store: Store, session: Option<String>) -> View {
         idiom(),
         nsh_core::platform::Idiom::Phone | nsh_core::platform::Idiom::Pad
     );
+    let terminal = idiom() == nsh_core::platform::Idiom::Terminal;
     view().items_center().px_4().pb_4().pt_2().child(
         ui::surface()
             .w_full()
@@ -405,8 +592,16 @@ fn composer(store: Store, session: Option<String>) -> View {
                     .child(
                         text(move || match (running.get(), touch) {
                             (true, true) => "Working · Stop is at the top".to_owned(),
+                            (true, false) if terminal => {
+                                format!("Working · Esc or {} stops", key_label("mod+c"))
+                            }
                             (true, false) => "Working · Esc stops".to_owned(),
                             (false, true) => String::new(),
+                            // Terminals rarely send Shift+Enter; Alt+Enter
+                            // works in all of them.
+                            (false, false) if terminal => {
+                                format!("Enter to send · {} for a new line", key_label("alt+enter"))
+                            }
                             (false, false) => {
                                 "Enter to send · Shift+Enter for a new line".to_owned()
                             }

@@ -5,7 +5,8 @@ A workbench for working with an agent: quiet, precise and dense, with what the a
 ## Targets
 
 - **Desktop and web: one family.** Pointer and keyboard first; compact controls (26/32 pt); persistent sidebar and inspector; hover on everything pressable; tooltips on icon-only controls; shortcuts for frequent commands.
-- **Terminal.** The same panes on whole cells; nsh maps the tokens to terminal colours by meaning. Every action has a key (Cmd/Ctrl+K palette, Cmd/Ctrl+N new, Cmd/Ctrl+B sidebar, Cmd/Ctrl+I activity, Esc stops). No radii or shadows are relied on to separate regions: hairlines and space do.
+- **Terminal.** Its own conventions, not the window's: a key line at the bottom names the keys for what is on screen; Ctrl+C has one meaning per state (stop the turn; otherwise press twice to quit, with a note after the first); Ctrl+Y copies the last reply; copies reach the system clipboard over OSC 52 (works over SSH and tmux with `set-clipboard on`); Alt+Enter adds a line (terminals rarely send Shift+Enter); the palette (Ctrl+K) holds every command, including answering each waiting approval. Drafts, pins and the open conversation persist in `~/.aidaemon/app-terminal`. The same panes on whole cells; nsh maps the tokens to terminal colours by meaning. No radii or shadows are relied on to separate regions: hairlines and space do.
+- **Shortcuts while typing.** nsh keeps editing keys (Esc, Cmd/Ctrl+C, Y, Z...) for a focused input unless a binding uses `KeyOptions { when: When::Always }`. App-wide keys that must work from the composer (Esc stops, Copy reply, the terminal's Ctrl+C) use it; Esc also passes through.
 - **Touch (phones, tablets, mobile browsers):** `ui::touch()` switches the size scale (`ui::fit`): controls and rows 44–52 pt, reading text 16 pt (mobile browsers zoom into smaller fields), icons 18 pt in 22 pt slots, 52 pt bars. A narrow window shows one thing at a time: the conversation, or the conversations or activity pane full-screen, reached from the header. Return adds a line; Send sends.
 - **Accessibility:** every control has a role and a name (text buttons name themselves; icon buttons take a label, which is also their tooltip and their terminal text). Decorative glyphs and dots are hidden from screen readers. Pane, conversation and card titles are headings. A conversation row reads as one item ("title, place, working"). Banners use the alert role.
 
@@ -21,7 +22,7 @@ A workbench for working with an agent: quiet, precise and dense, with what the a
 
 ## Components (`src/ui/controls.rs`)
 
-`btn`, `btn_icon`, `icon_btn` (variants primary, secondary, ghost, outline, danger, success; sizes sm and md), `field`, `badge`, `status`, `kbd`, `row`, `surface`, `separator`, `section_label`, `empty`, `working`, `code`, `banner`, `hint` and `with_hint`. Features compose these and layout primitives only. A missing look becomes a variant here first.
+`meter`, `key_line`, `btn`, `btn_icon`, `icon_btn` (variants primary, secondary, ghost, outline, danger, success; sizes sm and md), `field`, `badge`, `status`, `kbd`, `row`, `surface`, `separator`, `section_label`, `empty`, `working`, `code`, `banner`, `hint` and `with_hint`. Features compose these and layout primitives only. A missing look becomes a variant here first.
 
 ## Motion (`src/ui/motion.rs`)
 
@@ -48,3 +49,17 @@ Tokens: `FAST` 120 ms (hover and colour), `BASE` 180 ms (press, toggle), `ENTER`
 ## Copy
 
 Say what happened and what to do next, in the owner's words: "The daemon is not running", "Retrying in 3s", "Allow once", "Deny". No internal identifiers in headings. Session channels and tool names show as metadata, in monospace where they are identifiers.
+| Conversation | Reading back while replies arrive | "Jump to latest" pill (bottom, centred) when the last row is out of view; follow-end only while at the end |
+| Conversation | Stop pressed | Stop becomes "Stopping…" (warning status) until the turn ends |
+| Sidebar | A reply lands elsewhere | Filled dot and full-strength title until opened; pinned (★) first; age at the right |
+| Inbox | Work running | Elapsed time ticks each second; long tool output shows its last 8 lines with Show all / Copy |
+| System | Open | Reads on open and every 30 s; "Needs a look" (warning tint, alert role) leads when anything fails |
+| System | A reply finishes while the app is in the background | "Done: <conversation>" notification; pressing it opens the conversation |
+
+## Areas
+
+- **Conversation:** day breaks ("Today", "Yesterday", weekday, date), times under messages, Copy on every reply, Copy conversation as Markdown and Pin in the header.
+- **Inbox** (the right pane): waiting approvals of other conversations, new replies, running work, and the current turn's steps.
+- **System:** daemon version, uptime and models; what needs a look; token use per day; model call times; scheduled goals; background jobs and queues; health checks.
+
+Times are shown in the owner's zone (`ui::time`): the browser's offset on the web, the system's elsewhere.

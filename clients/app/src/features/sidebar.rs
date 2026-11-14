@@ -3,12 +3,17 @@
 
 use nsh_core::prelude::*;
 
-use crate::store::{Connection, Store, now_ms};
+use crate::store::{Connection, Page, Store, now_ms};
 use crate::ui::{self, Glyph, Tone, colors, icon, row, section_label, size, status, type_scale};
 use aidaemon_client_core::machine::DropKind;
 
 pub fn sidebar(store: Store) -> View {
-    let ids = computed(move || store.session_ids());
+    let ids = computed(move || store.visible_ids());
+    let query = signal(store.filter());
+    effect(move || {
+        let q = query.get();
+        untracked(|| store.set_filter(q));
+    });
     view()
         .w(px(size::SIDEBAR))
         .flex_1()
@@ -58,15 +63,47 @@ pub fn sidebar(store: Store) -> View {
                 .child(ui::kbd(key_label("mod+n"))),
             ),
         )
+        .child(
+            view().px_2().pt_2().child(
+                ui::field("Search conversations", query)
+                    .label("Search conversations")
+                    .w_full(),
+            ),
+        )
         .child(section_label("Conversations").px_4())
         .child(
-            scroll()
-                .flex_1()
-                .child(view().px_2().pb_2().gap(px(1.0)).child(each(
-                    ids,
-                    |id: &String| id.clone(),
-                    move |id, _| session_row(store, id.get_untracked()),
-                ))),
+            scroll().flex_1().child(
+                view()
+                    .px_2()
+                    .pb_2()
+                    .gap(px(1.0))
+                    .child(each(
+                        ids,
+                        |id: &String| id.clone(),
+                        move |id, _| session_row(store, id.get_untracked()),
+                    ))
+                    .child(when(
+                        move || ids.with(Vec::is_empty) && !store.filter().trim().is_empty(),
+                        || {
+                            text("No conversation matches.")
+                                .px_2()
+                                .py_2()
+                                .text_size(px(type_scale::SM))
+                                .text_color(colors::FAINT)
+                        },
+                    )),
+            ),
+        )
+        .child(
+            view().px_2().pb_1().child(
+                row(
+                    move || store.page() == Page::System,
+                    move || store.open_system(),
+                )
+                .accessibility_label("System: how the daemon is doing")
+                .child(icon(Glyph::System).text_color(colors::MUTED))
+                .child(text("System").flex_1().text_size(px(ui::fit::body()))),
+            ),
         )
         .child(ui::separator())
         .child(connection(store))
@@ -74,6 +111,7 @@ pub fn sidebar(store: Store) -> View {
 
 fn session_row(store: Store, id: String) -> nsh_base::ButtonElement {
     let (a, b, c, d, e) = (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
+    let (f, g, h) = (id.clone(), id.clone(), id.clone());
     let label_id = id.clone();
     row(
         move || store.selected().as_deref() == Some(a.as_str()),
@@ -81,38 +119,78 @@ fn session_row(store: Store, id: String) -> nsh_base::ButtonElement {
     )
     // Read as one item: its name, where it lives and whether it is working.
     .accessibility_label(move || {
-        let running = if store.is_running(&label_id) {
-            ", working"
-        } else {
-            ""
-        };
-        Some(SharedString::from(format!(
-            "{}, {}{running}",
-            store.title(&label_id),
-            store.place(&label_id)
-        )))
+        let id = &label_id;
+        let mut parts = vec![store.title(id), store.place(id)];
+        if store.is_pinned(id) {
+            parts.push("pinned".into());
+        }
+        if store.is_running(id) {
+            parts.push("working".into());
+        }
+        if store.is_unread(id) {
+            parts.push("new reply".into());
+        }
+        Some(SharedString::from(parts.join(", ")))
     })
+    // Working (accent, pulsing), a new reply (filled) or quiet (hollow).
     .child(
-        text(move || if store.is_running(&c) { "●" } else { "○" })
-            .w(px(size::ICON))
-            .text_center()
-            .text_size(px(8.0))
-            .text_color(move || {
-                if store.is_running(&e) {
-                    colors::ACCENT
-                } else {
-                    colors::FAINT
-                }
-            }),
+        text(move || {
+            if store.is_running(&c) || store.is_unread(&c) {
+                "●"
+            } else {
+                "○"
+            }
+        })
+        .w(px(size::ICON))
+        .text_center()
+        .text_size(px(8.0))
+        .text_color(move || {
+            if store.is_running(&e) {
+                colors::ACCENT
+            } else if store.is_unread(&e) {
+                colors::TEXT
+            } else {
+                colors::FAINT
+            }
+        }),
     )
     .child(
         view()
             .flex_1()
             .min_w(px(0.0))
             .child(
-                text(move || store.title(&d))
-                    .number_of_lines(1)
-                    .text_size(px(ui::fit::body())),
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        text(move || store.title(&d))
+                            .flex_1()
+                            .number_of_lines(1)
+                            .text_size(px(ui::fit::body()))
+                            .text_color(move || {
+                                if store.is_unread(&h) {
+                                    colors::TEXT
+                                } else {
+                                    colors::MUTED
+                                }
+                            }),
+                    )
+                    .child(
+                        text(move || if store.is_pinned(&f) { "★" } else { "" })
+                            .text_size(px(type_scale::XS))
+                            .text_color(colors::FAINT),
+                    )
+                    .child(
+                        text(move || {
+                            store
+                                .last_activity(&g)
+                                .map(|at| ui::time::ago(at, now_ms()))
+                                .unwrap_or_default()
+                        })
+                        .text_size(px(type_scale::XS))
+                        .text_color(colors::FAINT),
+                    ),
             )
             .child(
                 text(move || store.place(&id))

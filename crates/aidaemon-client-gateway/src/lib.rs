@@ -84,6 +84,10 @@ pub trait ClientHost: Send + Sync {
     fn owner(&self) -> OwnerInfo {
         OwnerInfo::default()
     }
+    /// How the daemon itself is doing; `None` when this host does not say.
+    async fn system(&self) -> Option<aidaemon_client_protocol::SystemStatus> {
+        None
+    }
 }
 
 /// Hands events to the bus in the order they were raised, from code that
@@ -429,7 +433,8 @@ impl ClientGateway {
             Command::ListSessions { .. }
             | Command::GetHistory { .. }
             | Command::GetGlance
-            | Command::GetSnapshot => Some(Scope::Observe),
+            | Command::GetSnapshot
+            | Command::GetSystem => Some(Scope::Observe),
             Command::Unknown => None,
         };
         if let Some(scope) = needs
@@ -519,6 +524,13 @@ impl ClientGateway {
                 let (seq, state) = self.snapshot().await;
                 Ok(CommandResult::Snapshot { seq, state })
             }
+            Command::GetSystem => match self.host.system().await {
+                Some(system) => Ok(CommandResult::System { system }),
+                None => Err(ProtocolError::new(
+                    ErrorCode::NotFound,
+                    "This daemon does not report its status",
+                )),
+            },
             Command::Unknown => Err(ProtocolError::new(
                 ErrorCode::Invalid,
                 "Unknown command for this gateway version",

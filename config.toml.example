@@ -496,8 +496,9 @@ include_raw_tool_args = false
 # the client gateway", restart, then run `aidaemon tui` (terminal) or
 # `aidaemon web` (browser); the local token is minted on first use and saved
 # at ~/.aidaemon/client-token. Pair a phone or another browser
-# with /pair_device in a chat or `aidaemon pair`; the web client is served
-# at /client/v1/app. /devices lists them, /revoke_device <id> cuts one off.
+# with /pair_device in a chat or `aidaemon pair`; the app's web build
+# (installed by install.sh into ~/.aidaemon/app-web) is served at
+# /client/v1/next/. /devices lists them, /revoke_device <id> cuts one off.
 # [client_gateway]
 # enabled = false
 # bind = "127.0.0.1"

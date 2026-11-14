@@ -385,28 +385,6 @@ jobs:
           cargo run -q -p aidaemon-parity-agent
           cargo test -q -p aidaemon-parity-agent
 
-  web-client:
-    name: Web client (generated types, build and reducer fixtures)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: clients/web
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: npm ci
-      - name: Types match the schema
-        run: npm run gen && git diff --exit-code src/protocol.ts
-      - name: The served build matches the source
-        run: |
-          npm run build
-          git diff --exit-code ../../crates/aidaemon-client-gateway/web
-          test -z "$(git status --porcelain ../../crates/aidaemon-client-gateway/web)"
-      - name: The TypeScript reducer passes the shared reducer fixtures
-        run: npm run test:fixtures
-
   # The app (clients/app, nsh, its own Cargo workspace): check, lint and the
   # headless tests on the real engine. Linux needs GTK 4.14 for the desktop
   # backend the binary links.

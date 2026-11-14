@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use aidaemon_client_core::machine::{DropKind, Update, request_id};
 use aidaemon_client_core::state::{Line, LiveTurn, SessionView, State, ViewRequest};
 use aidaemon_client_protocol::{
-    Approval, ApprovalDecision, Command, CommandResult, Event, ServerFrame, TaskSummary, TurnStatus,
+    Approval, ApprovalDecision, Command, CommandResult, Event, ServerFrame, SystemStatus,
+    TaskSummary, TurnStatus,
 };
 use aidaemon_client_protocol::{Pane, ViewAction};
 use nsh_core::prelude::*;
@@ -57,6 +58,33 @@ pub struct TurnLog {
     pub done: bool,
 }
 
+/// What the main area shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Page {
+    #[default]
+    Conversation,
+    /// How the daemon itself is doing.
+    System,
+}
+
+/// The System page's data, as last read.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum SystemRead {
+    #[default]
+    NotYet,
+    Loading,
+    Ready {
+        status: Box<SystemStatus>,
+        at_ms: u64,
+    },
+    Failed(String),
+}
+
+/// Where drafts are kept between runs.
+const DRAFT_KEY: &str = "aidaemon.draft.";
+const PINS_KEY: &str = "aidaemon.pins";
+const OPEN_KEY: &str = "aidaemon.open";
+
 /// Where commands go: the link of this platform.
 pub type Outbox = Box<dyn Fn(String, Command)>;
 
@@ -90,6 +118,22 @@ pub struct Store {
     /// The request of a message that starts a new session.
     starting: Stored<Option<String>>,
     next_activity: Stored<u64>,
+    page: Signal<Page>,
+    system: Signal<SystemRead>,
+    /// The request of the System read in flight.
+    system_request: Stored<Option<String>>,
+    /// The sidebar's search.
+    filter: Signal<String>,
+    /// Conversations that got a reply the owner has not looked at.
+    unread: Signal<BTreeSet<String>>,
+    /// Conversations asked to stop, until their turn ends.
+    stopping: Signal<BTreeSet<String>>,
+    /// The latest turn that finished, for "done" notifications.
+    finished: Signal<Option<(String, u64)>>,
+    /// Conversations kept at the top of the list (this device's storage).
+    pins: Signal<BTreeSet<String>>,
+    /// Seconds, for elapsed times (advanced by the shell while work runs).
+    tick: Signal<u64>,
 }
 
 /// The draft key of a conversation not started yet.
@@ -115,6 +159,97 @@ impl Store {
             fetched: stored(BTreeSet::new()),
             starting: stored(None),
             next_activity: stored(1),
+            page: signal(Page::Conversation),
+            system: signal(SystemRead::NotYet),
+            system_request: stored(None),
+            filter: signal(String::new()),
+            unread: signal(BTreeSet::new()),
+            stopping: signal(BTreeSet::new()),
+            finished: signal(None),
+            pins: signal(BTreeSet::new()),
+            tick: signal(0),
+        }
+    }
+
+    /// Put back what this device had: drafts, pins and the open conversation.
+    pub fn restore(&self) {
+        self.restore_drafts();
+        let pins: BTreeSet<String> = nsh_core::storage::Storage::get_item(PINS_KEY)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect();
+        self.pins.set(pins);
+        if let Some(open) =
+            nsh_core::storage::Storage::get_item(OPEN_KEY).filter(|id| !id.is_empty())
+        {
+            // Its history loads once the link is up (Connected asks for it).
+            self.selected.set(Some(open));
+        }
+    }
+
+    pub fn is_pinned(&self, id: &str) -> bool {
+        self.pins.with(|p| p.contains(id))
+    }
+
+    pub fn toggle_pin(&self, id: &str) {
+        self.pins.update(|p| {
+            if !p.remove(id) {
+                p.insert(id.to_owned());
+            }
+            let text = p.iter().cloned().collect::<Vec<_>>().join("\n");
+            let _ = nsh_core::storage::Storage::set_item(PINS_KEY, text);
+        });
+    }
+
+    /// The selected conversation as Markdown, for Copy conversation.
+    pub fn transcript_markdown(&self) -> Option<String> {
+        let id = self.selected.get_untracked()?;
+        let title = self.title(&id);
+        let mut out = format!("# {title}\n");
+        for line in self.lines(&id) {
+            let (who, text, at) = match line {
+                Line::User { text, at_ms, .. } => ("You", text, at_ms),
+                Line::Assistant { text, at_ms } => ("AIdaemon", text, at_ms),
+                Line::Note { text } => ("Note", text, 0),
+            };
+            let when = if at > 0 {
+                format!(
+                    " · {} {}",
+                    crate::ui::time::day_label(at, now_ms()),
+                    crate::ui::time::clock(at)
+                )
+            } else {
+                String::new()
+            };
+            out.push_str(&format!("\n**{who}**{when}\n\n{}\n", text.trim()));
+        }
+        Some(out)
+    }
+
+    /// Drafts left from the last run (this device's storage).
+    fn restore_drafts(&self) {
+        let mut drafts = BTreeMap::new();
+        for key in nsh_core::storage::Storage::get_all_keys() {
+            if let Some(session) = key.strip_prefix(DRAFT_KEY)
+                && let Some(text) = nsh_core::storage::Storage::get_item(&key)
+                && !text.trim().is_empty()
+            {
+                drafts.insert(session.to_owned(), text);
+            }
+        }
+        if !drafts.is_empty() {
+            self.drafts.update(|d| d.extend(drafts));
+        }
+    }
+
+    fn keep_draft(key: &str, text: &str) {
+        let key = format!("{DRAFT_KEY}{key}");
+        if text.trim().is_empty() {
+            nsh_core::storage::Storage::remove_item(&key);
+        } else {
+            let _ = nsh_core::storage::Storage::set_item(key, text);
         }
     }
 
@@ -189,14 +324,46 @@ impl Store {
         {
             self.starting.replace(None);
             // The draft was sent: the new conversation starts empty.
+            Self::keep_draft(NEW, "");
             self.drafts.update(|d| {
                 d.remove(NEW);
             });
             self.fetched.with(|f| f.insert(session_id.clone()));
             self.selected.set(Some(session_id.clone()));
         }
-        if let ServerFrame::Event { event, .. } = &frame {
-            self.note_activity(event);
+        match &frame {
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::System { system },
+            } if self
+                .system_request
+                .with(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.system_request.replace(None);
+                self.system.set(SystemRead::Ready {
+                    status: Box::new(system.clone()),
+                    at_ms: now_ms(),
+                });
+                return;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self
+                .system_request
+                .with(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.system_request.replace(None);
+                self.system.set(SystemRead::Failed(error.message.clone()));
+                return;
+            }
+            ServerFrame::Event {
+                event, session_id, ..
+            } => {
+                self.note_activity(event);
+                self.note_reply(session_id.as_deref(), event);
+            }
+            _ => {}
         }
         let mut request = None;
         self.state.update(|state| {
@@ -206,6 +373,144 @@ impl Store {
         if let Some(request) = request {
             self.view_request(request);
         }
+    }
+
+    /// A reply landed: unread unless the owner is looking at it; a stop
+    /// asked for is over once its turn ends.
+    fn note_reply(&self, session: Option<&str>, event: &Event) {
+        let (session, done) = match event {
+            Event::AssistantMessage { session_id, .. } => (session_id.as_str(), false),
+            Event::TurnCompleted { .. } => match session {
+                Some(session) => (session, true),
+                None => return,
+            },
+            _ => return,
+        };
+        let looking = self.page.get_untracked() == Page::Conversation
+            && self.selected.get_untracked().as_deref() == Some(session)
+            && nsh_core::element::lifecycle() == nsh_core::platform::Lifecycle::Active;
+        if !looking {
+            self.unread.update(|u| {
+                u.insert(session.to_owned());
+            });
+        }
+        if done {
+            self.stopping.update(|s| {
+                s.remove(session);
+            });
+            self.finished.set(Some((session.to_owned(), now_ms())));
+        }
+    }
+
+    // ----- The System page ---------------------------------------------------
+
+    pub fn page(&self) -> Page {
+        self.page.get()
+    }
+
+    pub fn open_system(&self) {
+        self.close_panes();
+        self.page.set(Page::System);
+        self.refresh_system();
+    }
+
+    /// Read the daemon's status again (the page's Refresh, and its timer).
+    pub fn refresh_system(&self) {
+        if self.system_request.with(|r| r.is_some()) {
+            return;
+        }
+        if !matches!(self.system.get_untracked(), SystemRead::Ready { .. }) {
+            self.system.set(SystemRead::Loading);
+        }
+        let id = self.send(Command::GetSystem);
+        self.system_request.replace(Some(id));
+    }
+
+    pub fn system(&self) -> SystemRead {
+        self.system.get()
+    }
+
+    // ----- Search, unread, stopping ------------------------------------------
+
+    pub fn filter(&self) -> String {
+        self.filter.get()
+    }
+
+    pub fn set_filter(&self, text: String) {
+        self.filter.set(text);
+    }
+
+    /// Session ids matching the sidebar's search (title, place or any loaded
+    /// message), newest first.
+    pub fn visible_ids(&self) -> Vec<String> {
+        let query = self.filter.get().trim().to_lowercase();
+        let mut ids = self.session_ids();
+        // Pinned first, each part keeping newest first.
+        ids.sort_by_key(|id| !self.is_pinned(id));
+        if query.is_empty() {
+            return ids;
+        }
+        let words: Vec<&str> = query.split_whitespace().collect();
+        ids.into_iter()
+            .filter(|id| {
+                let mut hay = format!("{} {} {id}", self.title(id), self.place(id)).to_lowercase();
+                for line in self.lines(id) {
+                    if let Line::User { text, .. } | Line::Assistant { text, .. } = line {
+                        hay.push(' ');
+                        hay.push_str(&text.to_lowercase());
+                    }
+                }
+                words.iter().all(|w| hay.contains(w))
+            })
+            .collect()
+    }
+
+    pub fn is_unread(&self, id: &str) -> bool {
+        self.unread.with(|u| u.contains(id))
+    }
+
+    pub fn unread_count(&self) -> usize {
+        self.unread.with(BTreeSet::len)
+    }
+
+    pub fn is_stopping(&self, id: &str) -> bool {
+        self.stopping.with(|s| s.contains(id)) && self.is_running(id)
+    }
+
+    /// The latest finished turn: its session and when.
+    pub fn finished(&self) -> Option<(String, u64)> {
+        self.finished.get()
+    }
+
+    /// When a conversation last had a message.
+    pub fn last_activity(&self, id: &str) -> Option<u64> {
+        self.state.with(|s| {
+            let view = s.sessions.get(id)?;
+            let line = view.lines.iter().rev().find_map(|line| match line {
+                Line::User { at_ms, .. } | Line::Assistant { at_ms, .. } if *at_ms > 0 => {
+                    Some(*at_ms)
+                }
+                _ => None,
+            });
+            let summary = view.summary.as_ref().and_then(|m| m.last_activity_ms);
+            line.max(summary)
+        })
+    }
+
+    /// The selected conversation's last reply (Copy reply).
+    pub fn last_reply(&self) -> Option<String> {
+        let id = self.selected.get_untracked()?;
+        self.state.with_untracked(|s| {
+            s.sessions
+                .get(&id)?
+                .lines
+                .iter()
+                .rev()
+                .find_map(|line| match line {
+                    Line::Assistant { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+        })
     }
 
     // ----- The agent's view moves ------------------------------------------
@@ -334,6 +639,23 @@ impl Store {
 
     pub fn toast(&self) -> Option<String> {
         self.toast.get()
+    }
+
+    /// Read to rerun once a second while work runs.
+    pub fn tick(&self) -> u64 {
+        self.tick.get()
+    }
+
+    /// The shell's second hand.
+    pub fn advance_tick(&self) {
+        if !self.state.with_untracked(|s| s.tasks.is_empty()) {
+            self.tick.update(|t| *t += 1);
+        }
+    }
+
+    /// A short note to the owner ("Copied the reply").
+    pub fn say(&self, text: impl Into<String>) {
+        self.toast.set(Some(text.into()));
     }
 
     pub fn dismiss_toast(&self) {
@@ -627,6 +949,10 @@ impl Store {
         self.selected.get()
     }
 
+    pub fn selected_untracked(&self) -> Option<String> {
+        self.selected.get_untracked()
+    }
+
     fn draft_untracked(&self) -> String {
         let key = self.selected.get_untracked().unwrap_or_default();
         self.drafts
@@ -660,12 +986,19 @@ impl Store {
 
     pub fn select(&self, id: Option<String>) {
         self.close_panes();
+        self.page.set(Page::Conversation);
+        if let Some(id) = &id {
+            self.unread.update(|u| {
+                u.remove(id);
+            });
+        }
         if let Some(id) = &id {
             self.load_history(id);
             self.inspected.set(self.latest_turn(id));
         } else {
             self.inspected.set(None);
         }
+        let _ = nsh_core::storage::Storage::set_item(OPEN_KEY, id.clone().unwrap_or_default());
         self.selected.set(id);
     }
 
@@ -685,6 +1018,7 @@ impl Store {
 
     pub fn set_draft(&self, text: String) {
         let key = self.selected.get_untracked().unwrap_or_default();
+        Self::keep_draft(&key, &text);
         self.drafts.update(|d| {
             d.insert(key, text);
         });
@@ -723,12 +1057,16 @@ impl Store {
                 }
             }
         }
+        Self::keep_draft(key.as_deref().unwrap_or(NEW), "");
         self.drafts.update(|d| {
             d.remove(key.as_deref().unwrap_or(NEW));
         });
     }
 
     pub fn stop(&self, session: &str) {
+        self.stopping.update(|s| {
+            s.insert(session.to_owned());
+        });
         self.send(Command::StopTurn {
             session_id: session.to_owned(),
         });

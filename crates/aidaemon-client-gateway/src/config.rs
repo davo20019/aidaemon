@@ -87,7 +87,7 @@ impl ClientGatewayConfig {
     }
 
     /// The path of the web client pairing links open: the nsh app when its
-    /// build is served (`app_dir`), else the built-in page.
+    /// build is served (`app_dir`), else the page saying it is not installed.
     pub fn web_app_path(&self) -> &'static str {
         match self.app_dir.as_deref().map(str::trim) {
             Some(dir) if !dir.is_empty() => "/client/v1/next/",

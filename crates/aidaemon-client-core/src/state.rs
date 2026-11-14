@@ -18,14 +18,21 @@ pub enum Line {
     User {
         text: String,
         origin: String,
+        /// When it was said (ms since the epoch); 0 when unknown.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        at_ms: u64,
     },
     Assistant {
         text: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        at_ms: u64,
     },
     /// A note from the client itself (a stopped turn, an error).
-    Note {
-        text: String,
-    },
+    Note { text: String },
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// A turn running now: its streamed text and its latest status.
@@ -44,7 +51,7 @@ pub struct SessionView {
 }
 
 /// The client's view. Its JSON form (`serde_json::to_value`) is what the
-/// shared reducer fixtures compare, in Rust and in the web client.
+/// shared reducer fixtures (`tests/fixtures/reducer/`) compare.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct State {
     /// The last durable `seq` applied.
@@ -141,7 +148,7 @@ impl State {
                 seq,
                 session_id,
                 event,
-                ..
+                at_ms,
             } => {
                 if let Some(seq) = seq {
                     if self.last_seq.is_some_and(|last| seq <= last) {
@@ -149,7 +156,7 @@ impl State {
                     }
                     self.last_seq = Some(seq);
                 }
-                self.apply_event(session_id, event);
+                self.apply_event(session_id, event, at_ms);
             }
             ServerFrame::Ack { result, .. } => self.apply_result(result),
             ServerFrame::Error { error, .. } => self.notice = Some(error.message),
@@ -186,8 +193,12 @@ impl State {
                 "user" => Line::User {
                     text: m.text,
                     origin: String::new(),
+                    at_ms: m.at_ms,
                 },
-                _ => Line::Assistant { text: m.text },
+                _ => Line::Assistant {
+                    text: m.text,
+                    at_ms: m.at_ms,
+                },
             })
             .collect();
         lines.append(&mut view.lines);
@@ -201,7 +212,7 @@ impl State {
             .find(|live| live.turn_id == turn_id)
     }
 
-    fn apply_event(&mut self, session_id: Option<String>, event: Event) {
+    fn apply_event(&mut self, session_id: Option<String>, event: Event, at_ms: u64) {
         match event {
             Event::SessionCreated { session } | Event::SessionUpdated { session } => {
                 let id = session.id.clone();
@@ -215,14 +226,16 @@ impl State {
                 ..
             } => {
                 self.touch(&session_id);
-                self.session(&session_id)
-                    .lines
-                    .push(Line::User { text, origin });
+                self.session(&session_id).lines.push(Line::User {
+                    text,
+                    origin,
+                    at_ms,
+                });
             }
             Event::AssistantMessage { session_id, text } => {
                 self.session(&session_id)
                     .lines
-                    .push(Line::Assistant { text });
+                    .push(Line::Assistant { text, at_ms });
             }
             Event::TurnStarted {
                 turn_id,
@@ -269,13 +282,13 @@ impl State {
                     {
                         self.session(&session_id)
                             .lines
-                            .push(Line::Assistant { text });
+                            .push(Line::Assistant { text, at_ms });
                     }
                     return;
                 };
                 view.live = None;
                 if !text.is_empty() {
-                    view.lines.push(Line::Assistant { text });
+                    view.lines.push(Line::Assistant { text, at_ms });
                 }
                 match state {
                     TurnState::Cancelled => view.lines.push(Line::Note {

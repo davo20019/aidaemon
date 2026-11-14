@@ -41,6 +41,8 @@ fn cleanup_inbox(dir: &str, retention: Duration) {
 
 pub(crate) struct HeartbeatSetup {
     pub(crate) coordinator: Option<crate::heartbeat::HeartbeatCoordinator>,
+    /// The coordinator's job status, for the app's System area.
+    pub(crate) telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>>,
 }
 
 pub(crate) struct HeartbeatDependencies {
@@ -114,9 +116,11 @@ pub(crate) async fn init_heartbeat_coordinator(
         execution_backend,
     } = dependencies;
     let mut heartbeat_opt: Option<crate::heartbeat::HeartbeatCoordinator> = None;
+    let mut heartbeat_telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>> = None;
 
     if config.heartbeat.enabled {
         let telemetry = Arc::new(crate::heartbeat::HeartbeatTelemetry::new());
+        heartbeat_telemetry = Some(telemetry.clone());
         let mut heartbeat = crate::heartbeat::HeartbeatCoordinator::new(
             state.clone(),
             config.heartbeat.tick_interval_secs,
@@ -536,6 +540,7 @@ pub(crate) async fn init_heartbeat_coordinator(
 
     HeartbeatSetup {
         coordinator: heartbeat_opt,
+        telemetry: heartbeat_telemetry,
     }
 }
 

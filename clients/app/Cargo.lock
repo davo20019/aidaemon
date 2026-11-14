@@ -3385,6 +3385,7 @@ version = "0.1.0"
 dependencies = [
  "aidaemon-client-core",
  "aidaemon-client-protocol",
+ "chrono",
  "crossterm",
  "dirs",
  "env_logger",

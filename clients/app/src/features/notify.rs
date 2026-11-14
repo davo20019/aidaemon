@@ -66,7 +66,38 @@ pub fn approvals(store: Store) {
             }
             if let Some(approval) = id.strip_prefix(PREFIX) {
                 store.show_approval(approval);
+            } else if let Some(session) = id.strip_prefix(REPLY) {
+                store.select(Some(session.to_owned()));
             }
         }
+    });
+}
+
+const REPLY: &str = "reply:";
+
+/// A finished turn while the app is in the background: "Reply in …".
+/// Pressing it opens that conversation.
+pub fn replies(store: Store) {
+    effect(move || {
+        let Some((session, _)) = store.finished() else {
+            return;
+        };
+        untracked(|| {
+            if lifecycle() == Lifecycle::Active {
+                return;
+            }
+            let title = store.title(&session);
+            spawn(async move {
+                if notification_permission().await != NotificationPermission::Granted {
+                    return;
+                }
+                let _ = show_notification(Notification::new(
+                    format!("{REPLY}{session}"),
+                    format!("Done: {title}"),
+                    "The assistant finished. Tap to read the reply.".to_owned(),
+                ))
+                .await;
+            });
+        });
     });
 }

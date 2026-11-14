@@ -336,6 +336,7 @@ pub async fn run(
     let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(16);
     let startup_runtime::HeartbeatSetup {
         coordinator: heartbeat_opt,
+        telemetry: heartbeat_telemetry,
     } = startup_runtime::init_heartbeat_coordinator(
         &config,
         startup_runtime::HeartbeatDependencies {
@@ -423,6 +424,15 @@ pub async fn run(
         hub.clone(),
         approval_tx.clone(),
         gateway_endpoints.client.clone(),
+        crate::startup::client_gateway::SystemSources {
+            started_at: std::time::Instant::now(),
+            models: config.provider.models.clone(),
+            pool: pool.clone(),
+            events: event_store.clone(),
+            health: health_store.clone(),
+            jobs: heartbeat_telemetry,
+            queues: queue_telemetry.clone(),
+        },
     )
     .await?;
     // Give the agent its plan_store handle so the completion phase can read the

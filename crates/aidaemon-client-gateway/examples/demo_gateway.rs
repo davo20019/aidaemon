@@ -158,14 +158,14 @@ impl ClientHost for Host {
                 id: "app:plan".into(),
                 channel: "app".into(),
                 title: Some("Plan for Acme Corp".into()),
-                last_activity_ms: Some(2),
+                last_activity_ms: Some(now_ms() - 3_600_000),
                 writable: true,
             },
             SessionSummary {
                 id: "telegram:synthetic-user-1".into(),
                 channel: "telegram".into(),
                 title: Some("Alice Rivera on Telegram".into()),
-                last_activity_ms: Some(1),
+                last_activity_ms: Some(now_ms() - 26 * 3_600_000),
                 writable: false,
             },
         ])
@@ -181,6 +181,7 @@ impl ClientHost for Host {
             ],
             _ => &[("user", "What's on today?"), ("assistant", "Two meetings.")],
         };
+        let count = lines.len() as u64;
         Ok(lines
             .iter()
             .enumerate()
@@ -188,7 +189,8 @@ impl ClientHost for Host {
                 id: format!("{session_id}-m{n}"),
                 role: role.to_string(),
                 text: text.to_string(),
-                at_ms: n as u64,
+                // A minute apart, ending an hour ago.
+                at_ms: now_ms() - 3_600_000 - (count - n as u64) * 60_000,
             })
             .collect())
     }
@@ -198,6 +200,82 @@ impl ClientHost for Host {
             "clear" => Some("Context cleared.".into()),
             _ => None,
         }
+    }
+    async fn system(&self) -> Option<aidaemon_client_protocol::SystemStatus> {
+        use aidaemon_client_protocol::*;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
+        Some(SystemStatus {
+            version: env!("CARGO_PKG_VERSION").into(),
+            uptime_secs: 5_400,
+            model: Some("model-a".into()),
+            fallback_models: vec!["model-b".into()],
+            usage: (0..7)
+                .map(|d| UsageDay {
+                    day: format!("2026-01-{:02}", 7 - d),
+                    model: "model-a".into(),
+                    input_tokens: 40_000 + d * 9_000,
+                    output_tokens: 3_000 + d * 400,
+                    requests: 20 + d,
+                })
+                .collect(),
+            model_calls: Some(ModelCalls {
+                total: 182,
+                failed: 3,
+                fell_back: 1,
+                p50_ms: 1_400,
+                p95_ms: 5_200,
+                max_ms: 9_800,
+            }),
+            schedules: vec![ScheduleInfo {
+                goal_id: "g-1".into(),
+                description: "Send the weekly summary for Acme Corp".into(),
+                status: "active".into(),
+                schedule: "every monday at 9".into(),
+                paused: false,
+                one_shot: false,
+                next_run_ms: Some(now + 3 * 3_600_000),
+                last_run_ms: Some(now - 4 * 86_400_000),
+            }],
+            jobs: vec![
+                JobInfo {
+                    name: "consolidation".into(),
+                    every_secs: 3_600,
+                    running: false,
+                    consecutive_failures: 0,
+                    last_success_ms: Some(now - 600_000),
+                    last_error: None,
+                },
+                JobInfo {
+                    name: "embeddings".into(),
+                    every_secs: 300,
+                    running: false,
+                    consecutive_failures: 2,
+                    last_success_ms: Some(now - 1_800_000),
+                    last_error: Some("The embedding model is still downloading".into()),
+                },
+            ],
+            queues: vec![QueueInfo {
+                name: "triggers".into(),
+                depth: 0,
+                capacity: 64,
+                dropped: 0,
+                failed: 0,
+                overloaded: false,
+            }],
+            checks: vec![HealthCheckInfo {
+                name: "Acme site".into(),
+                target: "https://h.example.invalid".into(),
+                status: CheckStatus::Healthy,
+                paused: false,
+                consecutive_failures: 0,
+                latency_ms: Some(140),
+                checked_ms: Some(now - 120_000),
+                error: None,
+            }],
+        })
     }
 }
 
@@ -281,4 +359,11 @@ async fn main() -> anyhow::Result<()> {
     );
     axum::serve(listener, aidaemon_client_gateway::router(gateway)).await?;
     Ok(())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
 }

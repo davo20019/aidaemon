@@ -273,6 +273,10 @@ pub enum Glyph {
     Command,
     Tool,
     Chevron,
+    Pin,
+    Pinned,
+    System,
+    Inbox,
 }
 
 impl Glyph {
@@ -297,6 +301,10 @@ impl Glyph {
             Self::Command => "⌘",
             Self::Tool => "›",
             Self::Chevron => "›",
+            Self::Pin => "☆",
+            Self::Pinned => "★",
+            Self::System => "◫",
+            Self::Inbox => "◆",
         }
     }
 }
@@ -518,5 +526,38 @@ pub fn banner(message: impl IntoReactive<SharedString>, tone: Tone) -> View {
                 .text_size(px(type_scale::SM))
                 .line_height(px(type_scale::LH_SM))
                 .text_color(colors::TEXT),
+        )
+}
+
+/// A thin bar showing a share (0–1) for scale; hidden from screen readers
+/// (the row it sits in says the numbers).
+pub fn meter(share: f32) -> View {
+    view()
+        .h(px(4.0))
+        .rounded(px(radius::SMALL))
+        .bg(colors::INSET)
+        .accessibility_elements_hidden(true)
+        .child(
+            view()
+                .h_full()
+                .w(percentage(share.clamp(0.01, 1.0)))
+                .rounded(px(radius::SMALL))
+                .bg(colors::ACCENT),
+        )
+}
+
+/// The terminal's key line: one quiet row of "Key what" pairs.
+pub fn key_line(keys: impl Fn() -> String + 'static) -> View {
+    view()
+        .flex_row()
+        .px_2()
+        .border_t_1()
+        .border_color(colors::LINE)
+        .child(
+            text(keys)
+                .flex_1()
+                .number_of_lines(1)
+                .text_size(px(type_scale::XS))
+                .text_color(colors::MUTED),
         )
 }
