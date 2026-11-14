@@ -469,6 +469,15 @@ fn screenshot_oversize_reason(bytes: &[u8]) -> Option<String> {
     None
 }
 
+/// What a call's host keeps about the request's files: its file fence (the
+/// delivery ledger, when agents share the work) and the files the request's
+/// own work produced.
+#[derive(Clone, Copy, Default)]
+struct CallFiles<'a> {
+    fence: Option<&'a std::sync::Arc<dyn aidaemon_tools::semantics::FileFence>>,
+    produced: Option<&'a aidaemon_tools::semantics::ProducedFiles>,
+}
+
 /// Result of a browser action dispatch — text for the LLM plus optional vision attachments.
 struct DispatchResult {
     text: String,
@@ -1075,8 +1084,9 @@ impl BrowserTool {
         &self,
         args: &Value,
         session_id: &str,
-        fence: Option<&std::sync::Arc<dyn aidaemon_tools::semantics::FileFence>>,
+        files: CallFiles<'_>,
     ) -> Result<DispatchResult, String> {
+        let fence = files.fence;
         // `page_for` already rejects an empty session id before any capture; we
         // additionally guard the media-delivery path below so an empty id can
         // never reach the channel.
@@ -1120,16 +1130,19 @@ impl BrowserTool {
         )
         .map_err(|e| format!("Screenshot captured but failed to save for vision context: {e}"))?;
 
-        // Every capture is noted with what it shows, so a later send_file of
-        // this saved path delivers this page's screenshot, never a file of
-        // its own beside it.
+        // Every capture is noted with what it shows, as the request's own
+        // artifact: a later send_file of this saved path (by any run of the
+        // request) delivers this page's screenshot, never a file of its own
+        // beside it, and the untrusted-call check knows the request made it.
         let kind = aidaemon_tools::semantics::DeliverableKind::Screenshot {
             page: short_page_name(&display_url).to_string(),
         };
-        if let Some(fence) = fence {
-            fence
-                .note_capture(&saved_attachment.local_path, &kind)
-                .await;
+        if let Some(produced) = files.produced {
+            produced.note_capture(
+                &saved_attachment.local_path,
+                saved_attachment.resource_id.as_deref(),
+                &kind,
+            );
         }
 
         // A capture is an observation; only the one the call declares the
@@ -1854,14 +1867,14 @@ impl BrowserTool {
         action: &str,
         args: &Value,
         session_id: &str,
-        fence: Option<&std::sync::Arc<dyn aidaemon_tools::semantics::FileFence>>,
+        files: CallFiles<'_>,
     ) -> Result<DispatchResult, String> {
         match action {
             "navigate" => self
                 .action_navigate(args, session_id)
                 .await
                 .map(DispatchResult::text_only),
-            "screenshot" => self.action_screenshot(args, session_id, fence).await,
+            "screenshot" => self.action_screenshot(args, session_id, files).await,
             "render_pdf" => self.action_render_pdf(args).await,
             "click" => self
                 .action_click(args, session_id)
@@ -1969,9 +1982,9 @@ impl BrowserTool {
         action: &str,
         args: &Value,
         session_id: &str,
-        fence: Option<&std::sync::Arc<dyn aidaemon_tools::semantics::FileFence>>,
+        files: CallFiles<'_>,
     ) -> Result<DispatchResult, String> {
-        let first = self.dispatch_action(action, args, session_id, fence).await;
+        let first = self.dispatch_action(action, args, session_id, files).await;
         let err = match first {
             Ok(ok) => return Ok(ok),
             Err(e) => e,
@@ -2004,7 +2017,7 @@ impl BrowserTool {
         if Self::action_is_safe_to_replay(action) {
             // Idempotent: retry once against a freshly-minted page.
             info!(action, "retrying idempotent browser action after reconnect");
-            return self.dispatch_action(action, args, session_id, fence).await;
+            return self.dispatch_action(action, args, session_id, files).await;
         }
 
         // Mutation: NEVER auto-replay. The connection is restored for subsequent
@@ -2304,8 +2317,12 @@ impl BrowserTool {
         }
 
         let fence = aidaemon_tools::semantics::file_fence(facts).cloned();
+        let files = CallFiles {
+            fence: fence.as_ref(),
+            produced: aidaemon_tools::semantics::produced_files(facts),
+        };
         match self
-            .dispatch_with_recovery(action, &args, session_id, fence.as_ref())
+            .dispatch_with_recovery(action, &args, session_id, files)
             .await
         {
             Ok(result) => Ok(result),

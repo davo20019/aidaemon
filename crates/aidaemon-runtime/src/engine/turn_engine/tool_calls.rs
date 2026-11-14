@@ -558,6 +558,18 @@ impl TurnEngine<'_> {
         let duration_ms = started.elapsed().as_millis() as u64;
         let failed = executed.failed();
         if !failed && !absent_before.is_empty() {
+            // A file it created there is the request's own artifact.
+            let files = scope
+                .spawn_family
+                .produced_files()
+                .claim_created(&absent_before);
+            if !files.is_empty() {
+                info!(
+                    tool = %request.name,
+                    files = ?files,
+                    "A file this request's work created is its own"
+                );
+            }
             let claimed = scope
                 .spawn_family
                 .owned_folders()
@@ -1343,6 +1355,7 @@ impl TurnEngine<'_> {
                         untrusted_seen: scope.untrusted_seen.load(Ordering::SeqCst),
                     })
                 }),
+            produced_files: Some(scope.spawn_family.produced_files().clone()),
             // The MCP tool bridged and judged at turn start, if this is one.
             mcp_tool: scope
                 .mcp_tools

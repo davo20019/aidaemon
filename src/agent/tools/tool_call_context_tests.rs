@@ -161,6 +161,7 @@ fn owner_ctx<'a>(
 ) -> ToolExecCtx<'a> {
     ToolExecCtx {
         file_fence: None,
+        produced_files: None,
         mcp_tool: None,
         owner_approval_by_kernel: false,
         session_id: SESSION,
@@ -410,6 +411,7 @@ async fn workspace_root_and_mandate_fence_are_dispatcher_facts() {
     };
     let ctx = ToolExecCtx {
         file_fence: None,
+        produced_files: None,
         mcp_tool: None,
         owner_approval_by_kernel: false,
         session_id: "slack:synthetic-guest",
@@ -490,6 +492,7 @@ async fn workspace_root_and_mandate_fence_are_dispatcher_facts() {
 fn mandate_free_ctx() -> ToolExecCtx<'static> {
     ToolExecCtx {
         file_fence: None,
+        produced_files: None,
         mcp_tool: None,
         owner_approval_by_kernel: false,
         session_id: "owner-session",

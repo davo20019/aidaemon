@@ -55,6 +55,7 @@ pub async fn maybe_handle_stop_command(
             r#"{"action": "cancel_all"}"#,
             &crate::engine::tool_exec::ToolExecCtx {
                 file_fence: None,
+                produced_files: None,
                 mcp_tool: None,
                 owner_approval_by_kernel: false,
                 session_id,

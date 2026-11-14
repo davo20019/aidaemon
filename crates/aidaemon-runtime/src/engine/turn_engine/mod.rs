@@ -1328,6 +1328,7 @@ impl TurnEngine<'_> {
                 // The request's project folder.
                 working_area: scope.project_scope.as_deref(),
                 owned_folders: scope.spawn_family.owned_folders(),
+                produced_files: scope.spawn_family.produced_files(),
             },
             owner: crate::approvals::OwnerApprovalResolver {
                 decisions: self.host,

@@ -169,7 +169,12 @@ expose secrets the work did not create (the owner's keys, tokens and other accou
 logins), or delete what the work did not create; those make the call inconsistent. \
 Everything inside the folders this request's work created (listed for you when there are \
 any) is the work's own, made by it: changing or deleting anything there is consistent, \
-whatever the file. Credentials the work itself creates for what the request asks are part of that work: \
+whatever the file. A file this request's own work produced (a capture its own tools \
+saved, a file its own calls created; listed for you when the call names any) is the work's \
+own artifact wherever it is saved: delivering it to the owner, when it is what the request \
+asks for, is consistent, and lying outside the working area or the folders the work created \
+says nothing against it. A file nothing in the request produced is judged like any other. \
+Credentials the work itself creates for what the request asks are part of that work: \
 setting up a site includes its admin login, so generating that password, keeping it in \
 the working area and reading it back to finish the setup is consistent. \
 Saving to the \
@@ -322,6 +327,34 @@ pub struct CallFacts<'a> {
     /// The folders the runtime made fresh for this request's work (its
     /// spawns' claimed `new_folders`): everything inside is the work's own.
     pub owned_folders: &'a [String],
+    /// The files and resources the call names that this request's own
+    /// work produced (its captures, the files its calls created), each as
+    /// the call names it.
+    pub produced: &'a [(String, aidaemon_tools::semantics::ProducedFile)],
+}
+
+/// Of the files and resources `arguments` name, by the tool's declared
+/// targets for the call (never its prose), the ones the request's own work
+/// produced: whichever run of the request produced them.
+pub fn produced_named_by<T: aidaemon_tools::semantics::ToolSemantics + ?Sized>(
+    tool: &T,
+    arguments: &str,
+    produced: &aidaemon_tools::semantics::ProducedFiles,
+) -> Vec<(String, aidaemon_tools::semantics::ProducedFile)> {
+    produced.named_by(&tool.call_semantics(arguments).target_hints)
+}
+
+/// The files the call names that the request's own work produced, in
+/// plain lines for the check.
+fn produced_text(produced: &[(String, aidaemon_tools::semantics::ProducedFile)]) -> String {
+    if produced.is_empty() {
+        return "none".to_string();
+    }
+    produced
+        .iter()
+        .map(|(named, file)| format!("{named} is {}", file.words()))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// What a change or delete of `target` acts on, for the check: a target
@@ -403,10 +436,13 @@ fn verifier_messages_with(
          Folders this request's work created (everything inside them is the work's own): \
          {created}\n\n\
          Proposed tool: {}\nTool description: {}\n\
-         What the call does, as its tool declares it: {}\n\nArguments:\n{}",
+         What the call does, as its tool declares it: {}\n\
+         Files this call names that this request's own work produced (its own artifacts): \
+         {}\n\nArguments:\n{}",
         Value::from(tool),
         Value::from(description),
         Value::from(effects_text(facts.effects, facts.owned_folders)),
+        Value::from(produced_text(facts.produced)),
         aidaemon_policies::wrap_untrusted(tool, &capped_arguments(arguments).to_string()),
     );
     vec![
@@ -563,6 +599,7 @@ pub async fn verify_untrusted_call_with(
         tool,
         working_area = ?facts.working_area,
         effects = %effects_text(facts.effects, facts.owned_folders),
+        produced = %produced_text(facts.produced),
         request = %aidaemon_events::text::truncate_str(origin_request, 400),
         owner_authored = origin_trusted,
         "Untrusted call verifier sees"
@@ -613,6 +650,9 @@ pub struct UntrustedVerifier<'a> {
     /// The folders the runtime made fresh for this request's work, read
     /// when a call is judged (a spawn claims them mid-turn).
     pub owned_folders: &'a aidaemon_tools::semantics::OwnedFolders,
+    /// The files the request's own work produced, read when a call is
+    /// judged (any run of the tree may have just made one).
+    pub produced_files: &'a aidaemon_tools::semantics::ProducedFiles,
 }
 
 impl UntrustedVerifier<'_> {
@@ -630,6 +670,15 @@ impl UntrustedVerifier<'_> {
         let effects =
             known.map(|candidate| candidate.call_effects(&interruption.call.arguments.to_string()));
         let owned = self.owned_folders.list();
+        let produced = known
+            .map(|candidate| {
+                produced_named_by(
+                    candidate.as_ref(),
+                    &interruption.call.arguments.to_string(),
+                    self.produced_files,
+                )
+            })
+            .unwrap_or_default();
         let verdict = verify_untrusted_call_with(
             self.gateway,
             self.origin_request,
@@ -641,6 +690,7 @@ impl UntrustedVerifier<'_> {
                 effects: effects.as_ref(),
                 working_area: self.working_area,
                 owned_folders: &owned,
+                produced: &produced,
             },
             &self.cancel,
         )
@@ -874,6 +924,7 @@ mod tests {
                 effects: Some(&effects),
                 working_area: Some("/Users/synthetic/projects/claude-drupal"),
                 owned_folders: &[],
+                produced: &[],
             },
         );
         let user = messages[1]["content"].as_str().unwrap();
@@ -927,6 +978,7 @@ mod tests {
                 effects: Some(&effects),
                 working_area: None,
                 owned_folders: &owned,
+                produced: &[],
             },
         );
         let user = messages[1]["content"].as_str().unwrap();
@@ -940,6 +992,117 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("changing or deleting anything there is consistent")
+        );
+    }
+
+    /// Live 2026-11-14: a helper sent the homepage screenshot the request's
+    /// own browser capture had saved in the daemon's inbox, and the check,
+    /// knowing nothing of it, carded the owner ("outside the project and
+    /// cannot be verified as that screenshot"). A capture any run of the
+    /// request noted reaches the check as a typed fact on the call that
+    /// sends it, whichever helper sends it; an inbox file nothing in the
+    /// request produced is not marked and stays judged like any other.
+    #[tokio::test]
+    async fn a_capture_by_one_helper_sent_by_another_is_the_requests_own() {
+        let inbox = tempfile::tempdir().unwrap();
+        let shot = inbox.path().join("ea19c410_screenshot.png");
+        let stray = inbox.path().join("0a1b2c3d_screenshot.png");
+        std::fs::write(&shot, b"png").unwrap();
+        std::fs::write(&stray, b"png").unwrap();
+        let family = crate::authority::SpawnFamily::new(Default::default());
+        // The installer helper's browser saved the capture.
+        let installer = family.clone();
+        installer.produced_files().note_capture(
+            &shot.display().to_string(),
+            Some("res_capture"),
+            &aidaemon_tools::semantics::DeliverableKind::Screenshot {
+                page: "claude-company-drupal.ddev.site".to_string(),
+            },
+        );
+        // Another helper of the same request sends it.
+        let (media_tx, _media_rx) = tokio::sync::mpsc::channel(1);
+        let send_file = aidaemon_channels::send_file::SendFileTool::new(
+            aidaemon_tools::testing::active_execution_backend(),
+            media_tx,
+            &[],
+            &inbox.path().display().to_string(),
+        );
+        let sender = family.clone();
+        let call = |path: &std::path::Path| json!({"file_path": path.display().to_string(), "caption": "Drupal homepage"});
+        let own = produced_named_by(
+            &send_file,
+            &call(&shot).to_string(),
+            sender.produced_files(),
+        );
+        assert_eq!(own.len(), 1, "{own:?}");
+        let by_id = produced_named_by(
+            &send_file,
+            &json!({"resource_id": "res_capture"}).to_string(),
+            sender.produced_files(),
+        );
+        assert_eq!(by_id.len(), 1, "{by_id:?}");
+        let unrelated = produced_named_by(
+            &send_file,
+            &call(&stray).to_string(),
+            sender.produced_files(),
+        );
+        assert!(unrelated.is_empty(), "{unrelated:?}");
+
+        let scripted = Arc::new(
+            aidaemon_core::testing::ScriptedProvider::new([]).then_repeat(
+                aidaemon_core::testing::text(
+                    r#"{"consistent":true,"reason":"the request's own capture","owner_reason":"You asked for this screenshot."}"#,
+                ),
+            ),
+        );
+        let (gateway, _) = crate::llm::gateway::test_support::gateway_with(scripted.clone()).await;
+        let judge = |produced: &[(String, aidaemon_tools::semantics::ProducedFile)],
+                     path: &std::path::Path| {
+            let gateway = &gateway;
+            let produced = produced.to_vec();
+            let arguments = call(path);
+            async move {
+                verify_untrusted_call_with(
+                    gateway,
+                    "Install Drupal and WordPress and send me a screenshot of each homepage.",
+                    true,
+                    "send_file",
+                    "Send an exact file to the user in the current chat.",
+                    &arguments,
+                    &CallFacts {
+                        produced: &produced,
+                        ..CallFacts::default()
+                    },
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+            }
+        };
+        let verdict = judge(&own, &shot).await;
+        assert!(verdict.consistent && verdict.decided, "{verdict:?}");
+        judge(&unrelated, &stray).await;
+        let seen = scripted.requests();
+        let user = |at: usize| seen[at].messages[1].content.clone();
+        let marked = user(0);
+        assert!(
+            marked.contains(&format!(
+                "{} is this request's own capture: a screenshot of claude-company-drupal.ddev.site",
+                shot.display()
+            )),
+            "{marked}"
+        );
+        assert!(
+            user(1).contains(
+                "Files this call names that this request's own work produced (its own artifacts): \"none\""
+            ),
+            "{}",
+            user(1)
+        );
+        assert!(
+            seen[0].messages[0]
+                .content
+                .clone()
+                .contains("is the work's own artifact wherever it is saved")
         );
     }
 

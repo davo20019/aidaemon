@@ -650,7 +650,12 @@ impl Tool for SpawnAgentTool {
                             conversation excerpts — give file paths and let the sub-agent read them itself. \
                             Ask only for the work and what it found: the daemon measures every \
                             helper's time (start, finish, and since the owner's request) on its own \
-                            record, so a helper never times itself or reports a duration."
+                            record, so a helper never times itself or reports a duration. \
+                            What the owner asked to receive from a piece of work (its \
+                            screenshot, its file) is that work's own deliverable: ask for it \
+                            in the task of the helper doing the work, which delivers it when \
+                            its run ends, never in a separate helper that collects and sends \
+                            what other helpers made."
                     },
                     "background": {
                         "type": "boolean",

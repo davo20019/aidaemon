@@ -2512,15 +2512,6 @@ pub trait FileFence: Send + Sync {
     async fn declare_deliverable(&self, deliverable: Deliverable) -> DeliveryPlan {
         DeliveryPlan::Now(deliverable)
     }
-
-    /// The call saved a capture at `path` that shows `kind`: a later
-    /// `send_file` of that path delivers that kind, not a file of its own.
-    async fn note_capture(&self, _path: &str, _kind: &DeliverableKind) {}
-
-    /// What a capture saved at `path` shows, when a call noted it.
-    async fn capture_kind(&self, _path: &str) -> Option<DeliverableKind> {
-        None
-    }
 }
 
 /// What a deliverable is, by kind: each run delivers one of each kind (the
@@ -3037,6 +3028,193 @@ pub fn within_owned(path: &str, folders: &[String]) -> bool {
         && folders.iter().any(|folder| {
             aidaemon_policies::resolves_within(path, std::path::Path::new(folder.trim()))
         })
+}
+
+/// How one of a request's files came to be, when the request's own work
+/// produced it ([`ProducedFiles`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProducedFile {
+    /// A capture one of the request's calls saved, showing `kind` (a
+    /// browser screenshot shows its page).
+    Capture(DeliverableKind),
+    /// A file one of the request's calls created where nothing was before.
+    Created,
+}
+
+impl ProducedFile {
+    /// What it is, in plain words for the untrusted-call check.
+    pub fn words(&self) -> String {
+        match self {
+            Self::Capture(kind) => format!("this request's own capture: {}", kind.words()),
+            Self::Created => "a file this request's own work created".to_string(),
+        }
+    }
+}
+
+/// The files a request's own work produced, shared by every run of its
+/// tree, from evidence rather than anyone's account of them: a capture a
+/// tool noted as it saved it, and a file a succeeded call created where
+/// its declared write found nothing before ([`Self::claim_created`], the
+/// file counterpart of [`OwnedFolders::claim_created`]). Each is the
+/// request's own artifact wherever it is saved (a capture lands in the
+/// daemon's inbox, outside any project). Keyed by the resolved path, and a
+/// capture also by its resource id, so either handle a later call names
+/// finds it. A planning and effect fact, never a trust source for what the
+/// file holds.
+#[derive(Debug, Clone, Default)]
+pub struct ProducedFiles(
+    std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, ProducedFile>>>,
+);
+
+impl ProducedFiles {
+    /// A capture was saved at `path` (with `resource_id`, when it has one)
+    /// and shows `kind`.
+    pub fn note_capture(&self, path: &str, resource_id: Option<&str>, kind: &DeliverableKind) {
+        let mut produced = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let capture = ProducedFile::Capture(kind.clone());
+        produced.insert(produced_key(path), capture.clone());
+        if let Some(id) = resource_id.map(str::trim).filter(|id| !id.is_empty()) {
+            produced.insert(id.to_string(), capture);
+        }
+    }
+
+    /// Ownership from evidence of creation: of `absent` (taken before a
+    /// call that then succeeded, [`OwnedFolders::absent_write_targets`]),
+    /// each path that is now a regular file was made by this request's
+    /// work. A file that existed before never joins, and a capture already
+    /// noted keeps what it shows. Returns what it claimed.
+    pub fn claim_created(&self, absent: &[std::path::PathBuf]) -> Vec<String> {
+        let created: Vec<String> = absent
+            .iter()
+            .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()))
+            .map(|path| path.display().to_string())
+            .collect();
+        let mut produced = self.0.write().unwrap_or_else(|e| e.into_inner());
+        for path in &created {
+            produced
+                .entry(produced_key(path))
+                .or_insert(ProducedFile::Created);
+        }
+        created
+    }
+
+    /// What the request's work produced at `target` (a path, or a
+    /// capture's resource id), when it produced it.
+    pub fn get(&self, target: &str) -> Option<ProducedFile> {
+        self.0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&produced_key(target))
+            .cloned()
+    }
+
+    /// What the capture saved at `path` shows, when one was noted: a later
+    /// `send_file` of that path delivers that kind, not a file of its own.
+    pub fn capture_kind(&self, path: &str) -> Option<DeliverableKind> {
+        match self.get(path)? {
+            ProducedFile::Capture(kind) => Some(kind),
+            ProducedFile::Created => None,
+        }
+    }
+
+    /// Every handle noted, each a path or a capture's resource id, with
+    /// what it is.
+    pub fn entries(&self) -> Vec<(String, ProducedFile)> {
+        self.0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(key, file)| (key.clone(), file.clone()))
+            .collect()
+    }
+
+    /// Of the files and resources a call names (its declared target
+    /// hints), the ones this request's work produced, each as named.
+    pub fn named_by(&self, hints: &[ToolTargetHint]) -> Vec<(String, ProducedFile)> {
+        hints
+            .iter()
+            .filter(|hint| {
+                matches!(
+                    hint.kind,
+                    ToolTargetHintKind::Path | ToolTargetHintKind::ResourceId
+                )
+            })
+            .filter_map(|hint| Some((hint.value.clone(), self.get(&hint.value)?)))
+            .collect()
+    }
+}
+
+/// A produced file's key, whichever spelling names it: a path as it
+/// resolves on disk (when it does), anything else (a resource id) as given.
+fn produced_key(target: &str) -> String {
+    let expanded = shellexpand::tilde(target.trim()).into_owned();
+    std::fs::canonicalize(&expanded)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or(expanded)
+}
+
+/// The request's produced files, carried in [`ToolCallContext::extensions`]
+/// by a host that keeps them.
+pub fn produced_files(facts: &ToolCallContext) -> Option<&ProducedFiles> {
+    facts.extensions.get::<ProducedFiles>()
+}
+
+#[cfg(test)]
+mod produced_file_tests {
+    use super::{DeliverableKind, ProducedFile, ProducedFiles, ToolTargetHint, ToolTargetHintKind};
+
+    /// A capture is found by its path in any spelling and by its resource
+    /// id; a file a call created joins, one that existed before does not,
+    /// and a capture keeps what it shows.
+    #[test]
+    fn the_requests_own_files_come_from_evidence() {
+        let base = tempfile::tempdir().unwrap();
+        let shot = base.path().join("ea19c410_screenshot.png");
+        std::fs::write(&shot, b"png").unwrap();
+        let page = DeliverableKind::Screenshot {
+            page: "claude-drupal.ddev.site".to_string(),
+        };
+        let produced = ProducedFiles::default();
+        produced.note_capture(&shot.display().to_string(), Some("res_1"), &page);
+        let spelled = base
+            .path()
+            .join(".")
+            .join("ea19c410_screenshot.png")
+            .display()
+            .to_string();
+        assert_eq!(produced.capture_kind(&spelled), Some(page.clone()));
+        assert_eq!(
+            produced.get("res_1"),
+            Some(ProducedFile::Capture(page.clone()))
+        );
+
+        let fresh = base.path().join("report.md");
+        let older = base.path().join("notes.md");
+        std::fs::write(&older, "x").unwrap();
+        let absent = vec![fresh.clone(), shot.clone()];
+        std::fs::write(&fresh, "x").unwrap();
+        assert_eq!(produced.claim_created(&absent).len(), 2);
+        assert_eq!(
+            produced.get(&fresh.display().to_string()),
+            Some(ProducedFile::Created)
+        );
+        assert_eq!(
+            produced.capture_kind(&shot.display().to_string()),
+            Some(page)
+        );
+        assert_eq!(produced.get(&older.display().to_string()), None);
+
+        let hints: Vec<ToolTargetHint> = [
+            (ToolTargetHintKind::Path, older.display().to_string()),
+            (ToolTargetHintKind::Path, fresh.display().to_string()),
+        ]
+        .into_iter()
+        .filter_map(|(kind, value)| ToolTargetHint::new(kind, value))
+        .collect();
+        let named = produced.named_by(&hints);
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].1, ProducedFile::Created);
+    }
 }
 
 /// The owner's trusted file roots for one turn. A path is trusted only when
