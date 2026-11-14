@@ -482,7 +482,31 @@ impl ApprovalAnswer {
         }
     }
 
-    /// Record the message whose button was pressed.
+    /// Record the message whose button was pressed: the [`MessageRef`]
+    /// that [`Channel::ask`] returned for this prompt. A channel with
+    /// buttons should always set it when the platform says which message
+    /// was pressed (keep the ref from `ask` by prompt id if it does not):
+    /// the runner then closes that exact message, by
+    /// [`edit`](Channel::edit) or [`remove_buttons`](Channel::remove_buttons),
+    /// even when the prompt is no longer known (it expired, or the process
+    /// restarted), so stale buttons never stay pressable. The conformance
+    /// kit checks it (`channel.answer_message_removes_buttons`). A typed
+    /// `/approve` answer has no message and leaves it unset.
+    ///
+    /// ```
+    /// use aidaemon_channels::{ApprovalAnswer, Conversation, ConversationKind, MessageRef, Sender};
+    ///
+    /// // `pressed` is the ref `ask` returned when it showed prompt `p1`.
+    /// let pressed = MessageRef { conversation_id: "c1".into(), message_id: "m7".into() };
+    /// let answer = ApprovalAnswer::new(
+    ///     "p1",
+    ///     "approve",
+    ///     Sender { id: "synthetic-user-1".into(), display_name: None, is_bot: false },
+    ///     Conversation { id: "c1".into(), kind: ConversationKind::Direct },
+    /// )
+    /// .with_message(pressed.clone());
+    /// assert_eq!(answer.message, Some(pressed));
+    /// ```
     pub fn with_message(mut self, message: MessageRef) -> Self {
         self.message = Some(message);
         self

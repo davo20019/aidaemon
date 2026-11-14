@@ -1,19 +1,22 @@
 //! A tool that reads a token from a secret store and leaks it (in its
 //! output and its receipt details) leaks nothing: the store registered the
-//! value, and the kernel redacts it with no `Redactor::secret` call.
+//! value, and the kernel redacts it with no `Redactor::secret` call. The
+//! store and the agent share an isolated scope, so the test registers
+//! nothing in the process-wide set.
 
 use std::sync::Arc;
 
 use aidaemon_sdk::secrets::{MemorySecretStore, SecretStore};
 use aidaemon_sdk::testing::{ScriptedProvider, call, text, tool_calls};
-use aidaemon_sdk::{Agent, FnTool, ToolAnnotations, ToolOutput, ToolSpec};
+use aidaemon_sdk::{Agent, FnTool, RedactionScope, ToolAnnotations, ToolOutput, ToolSpec};
 use serde_json::{Value, json};
 
 const TOKEN: &str = "tok_live_9f8e7d6c5b4a3210abcd";
 
 #[tokio::test]
 async fn a_token_from_the_store_never_reaches_the_model_or_the_receipts() {
-    let store = Arc::new(MemorySecretStore::new());
+    let scope = RedactionScope::isolated();
+    let store = Arc::new(MemorySecretStore::new().with_redaction_scope(scope.clone()));
     store.set("deploy_token", TOKEN).unwrap();
     let tool_store = store.clone();
     let tool = FnTool::new(
@@ -42,6 +45,7 @@ async fn a_token_from_the_store_never_reaches_the_model_or_the_receipts() {
         .model("m")
         .provider(provider.clone())
         .tool(tool)
+        .redaction_scope(scope)
         .allow_unguarded()
         .build()
         .unwrap();
@@ -50,4 +54,9 @@ async fn a_token_from_the_store_never_reaches_the_model_or_the_receipts() {
     assert!(!format!("{:?}", provider.requests()).contains(TOKEN));
     assert!(!format!("{:?}", out.receipts()).contains(TOKEN));
     assert!(!serde_json::to_string(&out.state).unwrap().contains(TOKEN));
+    assert_eq!(
+        aidaemon_sdk::redaction::redact_registered(TOKEN),
+        TOKEN,
+        "nothing leaked into the process-wide set"
+    );
 }

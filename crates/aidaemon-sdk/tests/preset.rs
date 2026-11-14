@@ -226,7 +226,8 @@ async fn effects_that_name_no_path_vouch_for_a_tool() {
 #[cfg(feature = "agents")]
 #[tokio::test]
 async fn a_sub_agent_runs_under_a_preset_parent_without_an_approval_trap() {
-    use aidaemon_sdk::agents::AgentExt;
+    // `as_tool` comes with the prelude.
+    use aidaemon_sdk::prelude::AgentExt;
 
     let helper = preset("helper")
         .provider(ScriptedProvider::new([]).then_repeat(text("HELPER-RESULT")))

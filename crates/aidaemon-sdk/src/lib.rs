@@ -148,8 +148,11 @@ pub mod __private;
 /// - **Effects and access:** `effects = path` names a
 ///   `fn(&Args) -> CallEffects`, `access = path` a
 ///   `fn(&Args) -> AccessManifest` (with `#[args]`, `Args` is your type).
-///   Without them a tool gets the kernel's defaults: no effects for a
-///   read-only call that is not egress, unknown otherwise.
+///   Without `effects` a tool gets the kernel's defaults: no effects for a
+///   read-only call that is not egress; otherwise the effects its `access`
+///   implies ([`CallEffects::from_access`]: a written path is a write, a
+///   host an egress), so an owner's denial binds the rest of the run; and
+///   unknown with neither.
 /// - `timeout_secs = N` overrides `Limits::tool_timeout`; `crate = path`
 ///   points the generated code at a re-export of `aidaemon_sdk`.
 ///
@@ -225,8 +228,9 @@ pub mod prelude {
     #[cfg(all(feature = "providers", feature = "policies"))]
     pub use crate::preset::{Preset, PresetError, preset};
 
+    /// `agent.as_tool(..)`: an agent as another agent's tool.
     #[cfg(feature = "agents")]
-    pub use crate::agents;
+    pub use crate::agents::{self, AgentExt};
     #[cfg(feature = "channels")]
     pub use crate::channels;
     #[cfg(feature = "eval")]

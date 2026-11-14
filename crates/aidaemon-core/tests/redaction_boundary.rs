@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use aidaemon_core::redaction::{SecretTooShort, redact_registered, register_secret};
+use aidaemon_core::redaction::{RedactionScope, SecretTooShort};
 use aidaemon_core::testing::{ScriptedProvider, call, text, tool_calls};
 use aidaemon_core::{
     Agent, ApprovalRisk, Event, FnTool, Hook, HookContext, InterruptKind, MemoryStore,
@@ -57,7 +57,8 @@ fn tool(name: &str, secret: &'static str) -> impl aidaemon_core::Tool + use<> {
 #[tokio::test]
 async fn a_registered_secret_is_redacted_everywhere_it_leaves_the_kernel() {
     const SECRET: &str = "tok_live_boundary_9f8e7d6c5b4a";
-    register_secret(SECRET).unwrap();
+    let scope = RedactionScope::isolated();
+    scope.register(SECRET).unwrap();
     let provider = Arc::new(ScriptedProvider::new([
         tool_calls([
             call("c1", "fetch", json!({})),
@@ -80,6 +81,7 @@ async fn a_registered_secret_is_redacted_everywhere_it_leaves_the_kernel() {
         .hook(AskBeforeWrite)
         .event_sink(move |_: RunId, event: &Event| sink.lock().unwrap().push(format!("{event:?}")))
         .store(store.clone())
+        .redaction_scope(scope)
         .allow_unguarded()
         .build()
         .unwrap();
@@ -124,10 +126,56 @@ async fn a_registered_secret_is_redacted_everywhere_it_leaves_the_kernel() {
 
 #[test]
 fn a_secret_too_short_to_redact_is_refused_not_ignored() {
-    assert_eq!(register_secret("12345"), Err(SecretTooShort { chars: 5 }));
-    register_secret("123456-registered").unwrap();
+    let scope = RedactionScope::isolated();
+    assert_eq!(scope.register("12345"), Err(SecretTooShort { chars: 5 }));
+    assert!(scope.is_empty());
+    scope.register("123456-registered").unwrap();
     assert_eq!(
-        redact_registered("code 123456-registered end"),
+        scope.redact("code 123456-registered end"),
         "code [REDACTED:secret] end"
+    );
+}
+
+/// An agent given its own scope redacts what is registered there and
+/// nothing else: another agent's secret, or the process-wide set, never
+/// garbles its output, and its secret never reaches theirs. A test agent
+/// gets a clean slate however many tests registered secrets before it.
+#[tokio::test]
+async fn an_isolated_scope_neither_leaks_in_nor_out() {
+    const MINE: &str = "tok_scope_mine_0a1b2c3d";
+    const THEIRS: &str = "tok_scope_theirs_4e5f6a7b";
+    let mine = RedactionScope::isolated();
+    let theirs = RedactionScope::isolated();
+    mine.register(MINE).unwrap();
+    theirs.register(THEIRS).unwrap();
+    aidaemon_core::redaction::register_secret("tok_scope_process_8c9d0e1f").unwrap();
+
+    let run = |scope: RedactionScope| async move {
+        let provider = Arc::new(ScriptedProvider::new([text(format!(
+            "{MINE} {THEIRS} tok_scope_process_8c9d0e1f"
+        ))]));
+        let agent = Agent::builder("scoped")
+            .model("m")
+            .provider(provider)
+            .redaction_scope(scope)
+            .allow_unguarded()
+            .build()
+            .unwrap();
+        agent.run("s", "go").await.unwrap().final_text.unwrap()
+    };
+    assert_eq!(
+        run(mine.clone()).await,
+        format!("[REDACTED:secret] {THEIRS} tok_scope_process_8c9d0e1f")
+    );
+    assert_eq!(
+        run(theirs).await,
+        format!("{MINE} [REDACTED:secret] tok_scope_process_8c9d0e1f")
+    );
+    assert!(!mine.is_process());
+    assert!(RedactionScope::process().is_process());
+    assert_eq!(
+        aidaemon_core::redaction::redact_registered(MINE),
+        MINE,
+        "an isolated scope's secret stays out of the process-wide set"
     );
 }

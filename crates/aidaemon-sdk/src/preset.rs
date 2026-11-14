@@ -1,9 +1,12 @@
 //! A short start: an agent with a provider, the required safeguards, a run
 //! store and, if you give it a workspace, the default tools, in a few lines.
 //!
+//! `preset(id)` returns a [`Preset`] builder; its `build().await` returns
+//! `Result<Agent, PresetError>`, a plain [`Agent`].
+//!
 //! ```no_run
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! let agent = aidaemon_sdk::preset("helper")
+//! let agent: aidaemon_sdk::Agent = aidaemon_sdk::preset("helper")
 //!     .provider_from_env() // ANTHROPIC_API_KEY or OPENAI_API_KEY
 //!     .instructions("You maintain this repository. Verify changes with tests.")
 //!     .workspace(".") // the default file, search and shell tools, confined here
@@ -93,6 +96,11 @@ pub type EnvProvider = (Arc<dyn Provider>, &'static str);
 /// A provider read from the environment, and its default model:
 /// `ANTHROPIC_API_KEY`, else `OPENAI_API_KEY` (with `OPENAI_BASE_URL` for
 /// any OpenAI-compatible server). `None` when neither is set.
+///
+/// The preset reads it for you: [`Preset::provider_from_env`] fails the
+/// build ([`PresetError::NoProvider`]) when no key is set, for an app that
+/// needs a real model; [`Preset::provider_from_env_or`] uses the fallback
+/// you give instead, for an example or a test that must run without a key.
 pub fn provider_from_env() -> Result<Option<EnvProvider>, PresetError> {
     let config = |err: aidaemon_providers::ConfigError| PresetError::Provider(err.to_string());
     if let Some(key) = env("ANTHROPIC_API_KEY") {
@@ -248,14 +256,21 @@ impl Preset {
     }
 
     /// Read the provider from the environment at build time (see
-    /// [`provider_from_env`]); building fails if no key is set.
+    /// [`provider_from_env`]); building fails with
+    /// [`PresetError::NoProvider`] if no key is set. Use it when the agent
+    /// needs a real model; use [`Preset::provider_from_env_or`] when it
+    /// should still run without a key (an example, a test, a demo).
     pub fn provider_from_env(mut self) -> Self {
         self.provider = ProviderChoice::Env;
         self
     }
 
     /// Read the provider from the environment, and use `fallback` (a
-    /// scripted provider, a local server) when no key is set. With the
+    /// scripted provider, a local server) when no key is set, so the build
+    /// never fails for want of a key (unlike [`Preset::provider_from_env`]).
+    /// A set key the provider cannot be built from (a malformed
+    /// `OPENAI_BASE_URL`) still fails it; `AIDAEMON_MODEL` applies only to
+    /// the env provider, never to the fallback. With the
     /// fallback and no [`Preset::model`], the model is the fallback's
     /// [`Provider::default_model`], else `"scripted"`.
     pub fn provider_from_env_or(mut self, fallback: impl Provider + 'static) -> Self {
@@ -423,6 +438,11 @@ impl Preset {
         self
     }
 
+    /// The agent: a plain [`Agent`], to run with [`Agent::run`] and
+    /// [`Agent::resume`] (or to hand to a `ChannelRunner`, or to another
+    /// agent with `AgentExt::as_tool`). Fails with a [`PresetError`] (no
+    /// provider, no model, a store or memory that would not open, an
+    /// invalid agent).
     pub async fn build(self) -> Result<Agent, PresetError> {
         let mut stand_in = false;
         let (provider, default_model) = match self.provider {

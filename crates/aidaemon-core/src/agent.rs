@@ -80,6 +80,8 @@ pub(crate) struct AgentInner {
     pub extensions: Extensions,
     /// Keys approval digests; `None` uses the process's random key.
     pub approval_key: Option<[u8; 32]>,
+    /// The registered secrets every run redacts.
+    pub redaction: crate::redaction::RedactionScope,
 }
 
 /// An agent is configuration: a stable id, a model, instructions, tools and
@@ -105,6 +107,12 @@ impl Agent {
 
     pub fn limits(&self) -> &Limits {
         &self.inner.limits
+    }
+
+    /// The registered secrets this agent's runs redact
+    /// ([`AgentBuilder::redaction_scope`]).
+    pub fn redaction_scope(&self) -> &crate::redaction::RedactionScope {
+        &self.inner.redaction
     }
 
     /// A copy of this agent with different limits (same id, tools, hooks).
@@ -298,6 +306,7 @@ pub struct AgentBuilder {
     max_output_tokens: Option<u32>,
     extensions: Extensions,
     approval_key: Option<[u8; 32]>,
+    redaction: crate::redaction::RedactionScope,
 }
 
 impl AgentBuilder {
@@ -322,6 +331,7 @@ impl AgentBuilder {
             max_output_tokens: None,
             extensions: Extensions::default(),
             approval_key: None,
+            redaction: crate::redaction::RedactionScope::process(),
         }
     }
 
@@ -453,6 +463,19 @@ impl AgentBuilder {
         self
     }
 
+    /// The registered secrets this agent's runs redact (see
+    /// [`crate::redaction`]). The default is the process-wide set
+    /// ([`RedactionScope::process`](crate::redaction::RedactionScope::process)),
+    /// where every secret store registers what it hands out. Give an agent
+    /// [`RedactionScope::isolated`](crate::redaction::RedactionScope::isolated)
+    /// to keep its secrets from other agents' runs and theirs from its own,
+    /// as a test should, and register its secrets there (its secret store
+    /// and `Redactor` take the same scope).
+    pub fn redaction_scope(mut self, scope: crate::redaction::RedactionScope) -> Self {
+        self.redaction = scope;
+        self
+    }
+
     pub fn tool_extensions(mut self, extensions: Extensions) -> Self {
         self.extensions = extensions;
         self
@@ -545,6 +568,7 @@ impl AgentBuilder {
                 max_output_tokens: self.max_output_tokens,
                 extensions: self.extensions,
                 approval_key: self.approval_key,
+                redaction: self.redaction,
             }),
         })
     }

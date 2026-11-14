@@ -471,9 +471,13 @@ pub trait Tool: Send + Sync {
 
     /// The typed effects of this call (effect class and normalized target).
     /// The default is [`CallEffects::none`] for a call that is read-only and
-    /// not egress (per [`Tool::annotations_for`]) and [`CallEffects::unknown`]
-    /// otherwise: a read from another host still sends the request off the
-    /// machine, so a tool annotated `egress` should declare its
+    /// not egress (per [`Tool::annotations_for`]). Otherwise it is what the
+    /// call's declared [`Tool::access`] implies ([`CallEffects::from_access`]:
+    /// a written path is a write effect, a host an egress effect), so an
+    /// owner's denial of the call binds the rest of the run; and
+    /// [`CallEffects::unknown`] when it declares no access: a read from
+    /// another host still sends the request off the machine, so a tool
+    /// annotated `egress` should declare its host or its
     /// [`EffectKey::egress`](crate::EffectKey::egress) target. Recomputed
     /// after a hook rewrites the arguments.
     fn effects(&self, arguments: &Value) -> CallEffects {
@@ -481,7 +485,7 @@ pub trait Tool: Send + Sync {
         if annotations.read_only && !annotations.egress {
             CallEffects::none()
         } else {
-            CallEffects::unknown()
+            CallEffects::from_access(&self.access(arguments), annotations)
         }
     }
 

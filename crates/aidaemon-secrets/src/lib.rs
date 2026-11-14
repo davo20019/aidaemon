@@ -12,7 +12,9 @@
 //! memory is wiped on drop, and creating it registers the value with
 //! [`aidaemon_core::redaction`], so every agent run in the process redacts
 //! it from model requests, events, receipts, approval questions and saved
-//! state without being told about it.
+//! state without being told about it. A store registers in the process-wide
+//! [`RedactionScope`] unless given another (`with_redaction_scope`), such as
+//! a test's isolated scope that its agent uses too.
 
 // Tests need one `unsafe` helper to set environment variables (edition 2024);
 // the library itself stays free of `unsafe`.
@@ -25,40 +27,103 @@ use std::sync::Mutex;
 
 pub mod names;
 
+pub use aidaemon_core::redaction::{RedactionScope, SecretTooShort};
+
 /// A secret value. `Debug` prints `Secret([REDACTED])`, there is no
 /// `Display`, and the memory is zeroed on drop. Creating one registers the
 /// value with the kernel's redaction ([`aidaemon_core::redaction`]), so a
 /// run that uses it never sends it out (see that module for what is
 /// covered). Read it with [`Secret::expose`] only where it is used.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Secret(zeroize::Zeroizing<String>);
+#[derive(Clone)]
+pub struct Secret {
+    value: zeroize::Zeroizing<String>,
+    redacted: bool,
+}
+
+impl PartialEq for Secret {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Eq for Secret {}
 
 impl Secret {
     /// Wrap `value` and register it for redaction. A value too short to
     /// redact (under [`aidaemon_core::redaction::MIN_SECRET_CHARS`]) is
-    /// still returned, with a warning logged (without the value): it will
-    /// appear as is wherever it is used.
-    pub fn new(value: impl Into<String>) -> Self {
+    /// refused with [`SecretTooShort`] and registers nothing: it would
+    /// appear as is wherever it is used. A store holding such a value hands
+    /// it out with [`Secret::unredacted`] instead, which says so.
+    pub fn new(value: impl Into<String>) -> Result<Self, SecretTooShort> {
+        Self::new_in(&RedactionScope::process(), value)
+    }
+
+    /// [`Secret::new`], registered in `scope` rather than the process-wide
+    /// set: the scope of the agent that uses it
+    /// (`AgentBuilder::redaction_scope`).
+    pub fn new_in(
+        scope: &RedactionScope,
+        value: impl Into<String>,
+    ) -> Result<Self, SecretTooShort> {
         let value = value.into();
-        if let Err(error) = aidaemon_core::redaction::register_secret(&value) {
-            tracing::warn!(%error, "secret not redacted");
+        scope.register(&value)?;
+        Ok(Self {
+            value: zeroize::Zeroizing::new(value),
+            redacted: true,
+        })
+    }
+
+    /// Wrap `value` without registering it for redaction: a value that is
+    /// not secret enough to hide everywhere (a short OAuth client id kept
+    /// with its secret) or too short to hide. It still never prints and is
+    /// still wiped on drop, but [`Secret::is_redacted`] is false and runs
+    /// will send it out as is.
+    pub fn unredacted(value: impl Into<String>) -> Self {
+        Self {
+            value: zeroize::Zeroizing::new(value.into()),
+            redacted: false,
         }
-        Self(zeroize::Zeroizing::new(value))
     }
 
     /// The value, for the one place that needs it.
     pub fn expose(&self) -> &str {
-        &self.0
+        &self.value
     }
 
     /// The value as a plain `String`, which is no longer wiped on drop.
     pub fn into_exposed(self) -> String {
-        self.0.to_string()
+        self.value.to_string()
     }
 
-    /// Whether the value is long enough for the kernel to redact it.
+    /// Whether runs redact the value: true for every [`Secret::new`], false
+    /// for every [`Secret::unredacted`].
     pub fn is_redacted(&self) -> bool {
-        self.0.chars().count() >= aidaemon_core::redaction::MIN_SECRET_CHARS
+        self.redacted
+    }
+}
+
+/// What a store hands out for `value`: registered for redaction, or, for
+/// a value stored earlier that is too short to redact, [`Secret::unredacted`]
+/// with a warning naming the key (never the value).
+fn handed_out(scope: &RedactionScope, key: &str, value: String) -> Secret {
+    match scope.register(&value) {
+        Ok(()) => Secret {
+            value: zeroize::Zeroizing::new(value),
+            redacted: true,
+        },
+        Err(error) => {
+            tracing::warn!(%error, key, "stored secret is not redacted");
+            Secret::unredacted(value)
+        }
+    }
+}
+
+/// Register a value a store is about to keep, so it is hidden from the
+/// moment it is set. A value too short to redact is kept (the owner's own
+/// data, such as a client id), with a warning naming the key.
+fn register_stored(scope: &RedactionScope, key: &str, value: &str) {
+    if let Err(error) = scope.register(value) {
+        tracing::warn!(%error, key, "stored secret is not redacted");
     }
 }
 
@@ -86,7 +151,8 @@ impl PartialEq<&str> for Secret {
 pub trait SecretStore: Send + Sync {
     /// Read the secret stored under `key`. Errors when it is missing.
     /// Implementations build the value with [`Secret::new`], which
-    /// registers it for redaction.
+    /// registers it for redaction (a stored value too short to redact comes
+    /// out as [`Secret::unredacted`]).
     fn get(&self, key: &str) -> anyhow::Result<Secret>;
     /// Store `value` under `key`, replacing any earlier value.
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()>;
@@ -102,11 +168,20 @@ pub trait SecretStore: Send + Sync {
 #[derive(Default)]
 pub struct MemorySecretStore {
     values: Mutex<HashMap<String, String>>,
+    scope: RedactionScope,
 }
 
 impl MemorySecretStore {
+    /// A store whose values are registered in the process-wide scope.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register what this store sets and hands out in `scope` instead (a
+    /// test's [`RedactionScope::isolated`], given to its agent too).
+    pub fn with_redaction_scope(mut self, scope: RedactionScope) -> Self {
+        self.scope = scope;
+        self
     }
 
     fn values(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
@@ -121,12 +196,12 @@ impl SecretStore for MemorySecretStore {
         self.values()
             .get(key)
             .cloned()
-            .map(Secret::new)
+            .map(|value| handed_out(&self.scope, key, value))
             .ok_or_else(|| anyhow::anyhow!("secret '{}' not set", key))
     }
 
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        let _ = aidaemon_core::redaction::register_secret(value);
+        register_stored(&self.scope, key, value);
         self.values().insert(key.to_string(), value.to_string());
         Ok(())
     }
@@ -157,6 +232,7 @@ enum EnvFileLocation {
 #[derive(Debug, Clone)]
 pub struct EnvSecretStore {
     location: EnvFileLocation,
+    scope: RedactionScope,
 }
 
 impl EnvSecretStore {
@@ -164,6 +240,7 @@ impl EnvSecretStore {
     pub fn at(path: impl Into<PathBuf>) -> Self {
         Self {
             location: EnvFileLocation::Fixed(path.into()),
+            scope: RedactionScope::process(),
         }
     }
 
@@ -179,7 +256,15 @@ impl EnvSecretStore {
                 vars: vars.into_iter().map(Into::into).collect(),
                 default: default.into(),
             },
+            scope: RedactionScope::process(),
         }
+    }
+
+    /// Register what this store sets and hands out in `scope` instead of
+    /// the process-wide set.
+    pub fn with_redaction_scope(mut self, scope: RedactionScope) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// The env file this store reads and writes now.
@@ -208,7 +293,7 @@ impl SecretStore for EnvSecretStore {
             if let Some(val) = read_env_secret_from_file(&env_path, &env_key)?
                 && !val.is_empty()
             {
-                return Ok(Secret::new(val));
+                return Ok(handed_out(&self.scope, key, val));
             }
             anyhow::bail!(
                 "Keychain disabled and env var '{}' not found in '{}'",
@@ -220,7 +305,7 @@ impl SecretStore for EnvSecretStore {
         if let Ok(val) = std::env::var(&env_key)
             && !val.is_empty()
         {
-            return Ok(Secret::new(val));
+            return Ok(handed_out(&self.scope, key, val));
         }
 
         anyhow::bail!(
@@ -231,7 +316,7 @@ impl SecretStore for EnvSecretStore {
     }
 
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        let _ = aidaemon_core::redaction::register_secret(value);
+        register_stored(&self.scope, key, value);
         upsert_env_secret(&self.env_file_path(), key, value)
     }
 
@@ -283,6 +368,13 @@ impl KeychainSecretStore {
         Self { settings, env }
     }
 
+    /// Register what this store sets and hands out in `scope` instead of
+    /// the process-wide set (the keychain and its env file alike).
+    pub fn with_redaction_scope(mut self, scope: RedactionScope) -> Self {
+        self.env = self.env.with_redaction_scope(scope);
+        self
+    }
+
     pub fn settings(&self) -> &KeychainSettings {
         &self.settings
     }
@@ -314,12 +406,12 @@ impl SecretStore for KeychainSecretStore {
         }
         self.entry(key)?
             .get_password()
-            .map(Secret::new)
+            .map(|value| handed_out(&self.env.scope, key, value))
             .map_err(|e| anyhow::anyhow!("Failed to read '{}' from OS keychain: {}", key, e))
     }
 
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        let _ = aidaemon_core::redaction::register_secret(value);
+        register_stored(&self.env.scope, key, value);
         if self.keychain_disabled() {
             return self.env.set(key, value);
         }

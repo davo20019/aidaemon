@@ -79,6 +79,7 @@ pub use provider::{
 };
 pub use quota::{Cooldown, QuotaGuard};
 pub use receipt::{InvocationStage, Receipt, ReceiptStatus};
+pub use redaction::RedactionScope;
 pub use safeguard::Safeguard;
 pub use service::{
     FnService, Schedule, Service, ServiceContext, ServiceError, ServiceEvent, ServiceGate,

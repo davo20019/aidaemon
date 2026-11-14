@@ -149,6 +149,19 @@ pub fn aidaemon_core::mandate_card::MandateConfirmationCard::essentials(&self) -
 pub fn aidaemon_core::mandate_card::MandateConfirmationCard::from_lines(&[alloc::string::String]) -> core::option::Option<Self>
 pub fn aidaemon_core::mandate_card::MandateConfirmationCard::into_lines(self) -> alloc::vec::Vec<alloc::string::String>
 pub mod aidaemon_core::redaction
+pub struct aidaemon_core::redaction::RedactionScope
+impl aidaemon_core::redaction::RedactionScope
+pub fn aidaemon_core::redaction::RedactionScope::is_empty(&self) -> bool
+pub fn aidaemon_core::redaction::RedactionScope::is_process(&self) -> bool
+pub fn aidaemon_core::redaction::RedactionScope::isolated() -> Self
+pub fn aidaemon_core::redaction::RedactionScope::len(&self) -> usize
+pub fn aidaemon_core::redaction::RedactionScope::process() -> Self
+pub fn aidaemon_core::redaction::RedactionScope::redact<'a>(&self, &'a str) -> alloc::borrow::Cow<'a, str>
+pub fn aidaemon_core::redaction::RedactionScope::register(&self, &str) -> core::result::Result<(), aidaemon_core::redaction::SecretTooShort>
+impl core::default::Default for aidaemon_core::redaction::RedactionScope
+pub fn aidaemon_core::redaction::RedactionScope::default() -> Self
+impl core::fmt::Debug for aidaemon_core::redaction::RedactionScope
+pub fn aidaemon_core::redaction::RedactionScope::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct aidaemon_core::redaction::SecretTooShort
 pub aidaemon_core::redaction::SecretTooShort::chars: usize
 pub const aidaemon_core::redaction::MIN_SECRET_CHARS: usize
@@ -636,6 +649,7 @@ impl aidaemon_core::Agent
 pub fn aidaemon_core::Agent::builder(impl core::convert::Into<alloc::string::String>) -> aidaemon_core::AgentBuilder
 pub fn aidaemon_core::Agent::id(&self) -> &str
 pub fn aidaemon_core::Agent::limits(&self) -> &aidaemon_core::Limits
+pub fn aidaemon_core::Agent::redaction_scope(&self) -> &aidaemon_core::redaction::RedactionScope
 pub async fn aidaemon_core::Agent::resume(&self, aidaemon_core::RunState, aidaemon_core::Resolution) -> core::result::Result<aidaemon_core::RunOutcome, aidaemon_core::CoreError>
 pub async fn aidaemon_core::Agent::resume_resolving(&self, aidaemon_core::RunState, aidaemon_core::Resolution, tokio_util::sync::cancellation_token::CancellationToken, &dyn aidaemon_core::InterruptResolver) -> core::result::Result<aidaemon_core::RunOutcome, aidaemon_core::CoreError>
 pub async fn aidaemon_core::Agent::resume_with_cancel(&self, aidaemon_core::RunState, aidaemon_core::Resolution, tokio_util::sync::cancellation_token::CancellationToken) -> core::result::Result<aidaemon_core::RunOutcome, aidaemon_core::CoreError>
@@ -664,6 +678,7 @@ pub fn aidaemon_core::AgentBuilder::max_output_tokens(self, u32) -> Self
 pub fn aidaemon_core::AgentBuilder::model(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::AgentBuilder::new(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::AgentBuilder::provider(self, impl aidaemon_core::Provider + 'static) -> Self
+pub fn aidaemon_core::AgentBuilder::redaction_scope(self, aidaemon_core::redaction::RedactionScope) -> Self
 pub fn aidaemon_core::AgentBuilder::retired_tool(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::AgentBuilder::stop_when(self, impl aidaemon_core::StopCondition + 'static) -> Self
 pub fn aidaemon_core::AgentBuilder::store(self, alloc::sync::Arc<dyn aidaemon_core::RunStore>) -> Self
@@ -726,6 +741,7 @@ pub aidaemon_core::CallEffects::complete: bool
 pub aidaemon_core::CallEffects::keys: alloc::vec::Vec<aidaemon_core::EffectKey>
 pub aidaemon_core::CallEffects::understood: bool
 impl aidaemon_core::CallEffects
+pub fn aidaemon_core::CallEffects::from_access(&aidaemon_core::AccessManifest, aidaemon_core::ToolAnnotations) -> Self
 pub fn aidaemon_core::CallEffects::none() -> Self
 pub fn aidaemon_core::CallEffects::touches_no_paths(&self) -> bool
 pub fn aidaemon_core::CallEffects::unknown() -> Self
@@ -952,6 +968,19 @@ pub aidaemon_core::Receipt::tool: alloc::string::String
 pub aidaemon_core::Receipt::turn: u32
 impl aidaemon_core::Receipt
 pub fn aidaemon_core::Receipt::succeeded(&self) -> bool
+pub struct aidaemon_core::RedactionScope
+impl aidaemon_core::redaction::RedactionScope
+pub fn aidaemon_core::redaction::RedactionScope::is_empty(&self) -> bool
+pub fn aidaemon_core::redaction::RedactionScope::is_process(&self) -> bool
+pub fn aidaemon_core::redaction::RedactionScope::isolated() -> Self
+pub fn aidaemon_core::redaction::RedactionScope::len(&self) -> usize
+pub fn aidaemon_core::redaction::RedactionScope::process() -> Self
+pub fn aidaemon_core::redaction::RedactionScope::redact<'a>(&self, &'a str) -> alloc::borrow::Cow<'a, str>
+pub fn aidaemon_core::redaction::RedactionScope::register(&self, &str) -> core::result::Result<(), aidaemon_core::redaction::SecretTooShort>
+impl core::default::Default for aidaemon_core::redaction::RedactionScope
+pub fn aidaemon_core::redaction::RedactionScope::default() -> Self
+impl core::fmt::Debug for aidaemon_core::redaction::RedactionScope
+pub fn aidaemon_core::redaction::RedactionScope::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct aidaemon_core::RequestOptions
 pub aidaemon_core::RequestOptions::cache_key: core::option::Option<alloc::string::String>
 pub aidaemon_core::RequestOptions::fallback_when_unspent: bool

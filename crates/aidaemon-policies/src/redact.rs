@@ -26,12 +26,14 @@ pub(crate) const MIN_LITERAL_LEN: usize = aidaemon_core::redaction::MIN_SECRET_C
 /// `aidaemon_secrets` store hands out) to everything that leaves the run:
 /// model requests, events, receipts including arguments and details, the
 /// question put to the owner and the saved state. Literals under 6
-/// characters are refused ([`Redactor::try_secret`]). Encodings of a secret
+/// characters are refused ([`Redactor::secret`] returns an error).
+/// Encodings of a secret
 /// (hex, base64, a token split in two) are not recognized.
 #[derive(Debug, Clone)]
 pub struct Redactor {
     patterns: Vec<(&'static str, Regex)>,
     literals: Vec<String>,
+    scope: aidaemon_core::RedactionScope,
 }
 
 impl Default for Redactor {
@@ -121,7 +123,17 @@ impl Redactor {
         Self {
             patterns: secret_patterns().to_vec(),
             literals: Vec::new(),
+            scope: aidaemon_core::RedactionScope::process(),
         }
+    }
+
+    /// Where a credential a tool printed is registered, so it stays hidden
+    /// wherever it shows later: the agent's own scope
+    /// (`AgentBuilder::redaction_scope`). The default is the process-wide
+    /// set.
+    pub fn redaction_scope(mut self, scope: aidaemon_core::RedactionScope) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// The `(kind, pattern)` sources in use, for tests.
@@ -135,24 +147,10 @@ impl Redactor {
 
     /// Also redact this exact value wherever it appears. A value under
     /// [`MIN_SECRET_CHARS`](aidaemon_core::redaction::MIN_SECRET_CHARS)
-    /// characters cannot be redacted without garbling ordinary text: it is
-    /// not added, and a warning is logged (without the value). Use
-    /// [`Redactor::try_secret`] to get the refusal as an error.
-    pub fn secret(self, value: impl Into<String>) -> Self {
-        let value = value.into();
-        let fallback = self.clone();
-        match self.try_secret(value) {
-            Ok(redactor) => redactor,
-            Err(error) => {
-                tracing::warn!(%error, "Redactor::secret: value not added");
-                fallback
-            }
-        }
-    }
-
-    /// Like [`Redactor::secret`], but a value too short to redact is an
-    /// error.
-    pub fn try_secret(
+    /// characters cannot be redacted without garbling ordinary text, so it
+    /// is refused with [`SecretTooShort`](aidaemon_core::redaction::SecretTooShort)
+    /// rather than dropped quietly.
+    pub fn secret(
         mut self,
         value: impl Into<String>,
     ) -> Result<Self, aidaemon_core::redaction::SecretTooShort> {
@@ -229,7 +227,8 @@ impl Hook for Redactor {
         // sends.
         let shaped = self.redact_shapes(&output.content);
         for value in labelled_credentials(&shaped) {
-            let _ = aidaemon_core::redaction::register_secret(value);
+            // Values under the minimum are never labelled credentials.
+            let _ = self.scope.register(value);
         }
         output.content = redact_labelled_credentials(&shaped);
     }
@@ -267,10 +266,14 @@ mod tests {
     }
 
     #[test]
-    fn literal_secrets_are_redacted_and_short_ones_ignored() {
+    fn literal_secrets_are_redacted_and_short_ones_refused() {
         let r = Redactor::new()
             .secret("hunter2-synthetic-password")
-            .secret("abc");
+            .unwrap();
+        assert_eq!(
+            r.clone().secret("abc").unwrap_err(),
+            aidaemon_core::redaction::SecretTooShort { chars: 3 }
+        );
         let out = r.redact("pw=hunter2-synthetic-password; abc stays");
         assert_eq!(out, "pw=[REDACTED:secret]; abc stays");
     }
