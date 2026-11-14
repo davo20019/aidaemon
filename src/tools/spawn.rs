@@ -95,6 +95,7 @@ mod tests {
     /// A synthetic ended run record.
     pub(super) fn ended_run(
         phase: RunPhase,
+        // The folders of steps no receipt confirmed (each a file write).
         unconfirmed: &[&str],
         first_step: Option<i64>,
         finished: i64,
@@ -116,7 +117,13 @@ mod tests {
             step: None,
             steps: Vec::new(),
             evidence: aidaemon_runtime::run_state::RunEvidence {
-                unconfirmed: unconfirmed.iter().map(|s| s.to_string()).collect(),
+                unconfirmed: unconfirmed
+                    .iter()
+                    .map(|path| aidaemon_runtime::run_state::UnconfirmedStep {
+                        effect: crate::traits::ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                        target: Some(path.to_string()),
+                    })
+                    .collect(),
                 ..Default::default()
             },
             failure: (phase == RunPhase::Failed)
@@ -160,13 +167,7 @@ mod tests {
         assert!(succeeded.contains("Took 1m"), "{succeeded}");
 
         let unconfirmed = render_run_result(
-            &ended_run(
-                RunPhase::Succeeded,
-                &["Capture the screenshot"],
-                None,
-                60,
-                0,
-            ),
+            &ended_run(RunPhase::Succeeded, &["/srv/site/shots"], None, 60, 0),
             "Site install",
             "Done.",
             8_000,
@@ -178,7 +179,7 @@ mod tests {
         assert!(
             unconfirmed.starts_with(
                 "\u{2705} Finished in the background: Site install\n\nDone.\n\n\
-                 Only the report above confirms this step: Capture the screenshot."
+                 Only the report above shows the files it wrote in /srv/site/shots."
             ),
             "{unconfirmed}"
         );
@@ -191,7 +192,7 @@ mod tests {
     #[test]
     fn the_result_never_repeats_the_cards_header() {
         for phase in [RunPhase::Succeeded, RunPhase::Stopped, RunPhase::Failed] {
-            let run = ended_run(phase, &["Capture the screenshot"], Some(2), 62, 0);
+            let run = ended_run(phase, &["/srv/site/shots"], Some(2), 62, 0);
             let message = render_run_result(&run, "Slow count", "Counted to 30.", 8_000, true);
             for header in [phase.headline(), phase.helper_headline(false)] {
                 assert!(!message.contains(header), "{header:?} in {message:?}");
@@ -210,8 +211,8 @@ mod tests {
                 }
                 _ => assert!(
                     message.starts_with(
-                        "Counted to 30.\n\nOnly the report above confirms this step: \
-                         Capture the screenshot."
+                        "Counted to 30.\n\nOnly the report above shows the files it \
+                         wrote in /srv/site/shots."
                     ),
                     "{message}"
                 ),

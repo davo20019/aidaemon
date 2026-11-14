@@ -195,7 +195,7 @@ pub fn run_phase(
         );
     }
     let unconfirmed = if checklist.len() > 1 {
-        let mut pending: Vec<(&String, String)> = checklist
+        let mut pending: Vec<(&String, crate::run_state::UnconfirmedStep)> = checklist
             .iter()
             .filter(|obligation| {
                 // A step that changes nothing needs no receipt: the
@@ -204,22 +204,28 @@ pub fn run_phase(
                     && !obligation.required_effect.is_empty()
             })
             .map(|obligation| {
-                let id = &obligation.id;
-                // The step in its own words: never the internal demand text
+                // What it declared, typed: never the internal demand text
                 // (live 2026-11-13: "checklist item 2 … needs a succeeded
-                // receipt carrying local_workspace_write|process_state").
+                // receipt carrying local_workspace_write|process_state"),
+                // nor its planning words (live 2026-11-14).
                 (
-                    id,
-                    obligation
-                        .step
-                        .as_deref()
-                        .map(plain_step)
-                        .unwrap_or_else(|| "a step it listed".to_string()),
+                    &obligation.id,
+                    crate::run_state::UnconfirmedStep {
+                        effect: obligation.required_effect,
+                        target: obligation.required_target.as_ref().and_then(|target| {
+                            matches!(
+                                target.kind,
+                                aidaemon_events::dialogue::RequestVerificationTargetKind::Path
+                                    | aidaemon_events::dialogue::RequestVerificationTargetKind::Url
+                            )
+                            .then(|| target.value.clone())
+                        }),
+                    },
                 )
             })
             .collect();
         pending.sort_by(|a, b| a.0.cmp(b.0));
-        pending.into_iter().map(|(_, summary)| summary).collect()
+        pending.into_iter().map(|(_, step)| step).collect()
     } else {
         Vec::new()
     };
@@ -1782,11 +1788,12 @@ mod tests {
         assert_eq!(phase.line(&evidence).unwrap().lines().count(), 1);
     }
 
-    /// A run whose steps no receipt confirmed names them in their own
-    /// words: the owner never reads the internal demand ("needs a succeeded
-    /// receipt carrying local_workspace_write|process_state").
+    /// A run whose steps no receipt confirmed says what they changed, in
+    /// plain words from their typed effects: the owner never reads the
+    /// internal demand ("needs a succeeded receipt carrying
+    /// local_workspace_write|process_state") nor the helper's planning text.
     #[test]
-    fn unconfirmed_steps_are_named_in_their_own_words() {
+    fn unconfirmed_steps_are_said_from_what_they_changed() {
         let run = aggregate(&[("pending", 2), ("pending", 64)], &[("succeeded", 2)]);
         let mut run = run;
         run.executor_claimed_outcome = Some(aidaemon_events::ExecutorClaimedOutcome::Done);
@@ -1803,9 +1810,10 @@ mod tests {
         let line = evidence.line().expect("an evidence line");
         assert_eq!(
             line,
-            "Its report is the only record of 2 steps: step 0; step 1."
+            "Its report is the only record of the files it wrote and what it sent."
         );
         for internal in [
+            "step 0",
             "receipt",
             "local_workspace_write",
             "process_state",
@@ -1877,7 +1885,13 @@ mod tests {
             Some(&sent),
         );
         assert_eq!(phase, crate::run_state::RunEnd::Succeeded);
-        assert_eq!(evidence.unconfirmed, vec!["step 0".to_string()]);
+        assert_eq!(
+            evidence.unconfirmed,
+            vec![crate::run_state::UnconfirmedStep {
+                effect: aidaemon_tools::semantics::ToolMutationEffects::PROCESS_STATE,
+                target: None,
+            }]
+        );
     }
 
     /// Live 2026-11-13: DDEV stopped on low Docker disk space and the

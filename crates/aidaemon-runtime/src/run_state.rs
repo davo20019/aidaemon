@@ -41,7 +41,7 @@ pub fn phase_of(outcome: TaskOutcome) -> RunPhase {
 /// ([`RunEnd`]), so a failed run cannot be recorded without its reason.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunEvidence {
-    pub unconfirmed: Vec<String>,
+    pub unconfirmed: Vec<UnconfirmedStep>,
     /// What its run sent the owner when it ended: each declared
     /// deliverable and what became of it. `None`: it ran outside a
     /// request's delivery ledger, so nothing recorded what it sent.
@@ -51,6 +51,65 @@ pub struct RunEvidence {
     /// the steps in its words, said as a second line under that cause.
     /// `None`: nothing was declined, or the decline is itself the cause.
     pub declined: Option<Vec<String>>,
+}
+
+/// A typed step no receipt confirmed: what it declared it would change and
+/// where. The owner reads it from these, never from the step's own text,
+/// which is the helper's planning (live 2026-11-14: "Only the report above
+/// confirms this step: Capture a homepage screenshot in the site folder…").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnconfirmedStep {
+    pub effect: aidaemon_tools::semantics::ToolMutationEffects,
+    /// The path or URL it named, when it named one.
+    pub target: Option<String>,
+}
+
+impl UnconfirmedStep {
+    /// What the step did, in a few plain words ("the files it wrote in
+    /// ~/sites/drupal").
+    pub fn what(&self) -> String {
+        use aidaemon_tools::semantics::ToolMutationEffects as E;
+        let words = [
+            (E::REMOTE_DEPLOY, "the deploy"),
+            (E::EXTERNAL_DELIVERY, "what it sent"),
+            (E::DESTRUCTIVE, "what it deleted"),
+            (E::REPOSITORY_WRITE, "the commit"),
+            (E::REMOTE_MUTATION, "the change it made online"),
+            (E::PROCESS_STATE, "the service it started or stopped"),
+            (E::SCHEDULED_WORK, "the schedule it set up"),
+            (E::MEMORY_WRITE, "what it saved to memory"),
+            (E::CONFIGURATION, "the settings it changed"),
+            (E::LOCAL_SOURCE_WRITE, "the code it changed"),
+            (E::LOCAL_WORKSPACE_WRITE, "the files it wrote"),
+            (E::LOCAL_DERIVED_WRITE, "the files it wrote"),
+        ]
+        .into_iter()
+        .find(|(effect, _)| self.effect.intersects(*effect))
+        .map_or("a change it made", |(_, words)| words);
+        match self.target.as_deref() {
+            Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+                format!("{words} for {url}")
+            }
+            Some(path) => format!("{words} in {path}"),
+            None => words.to_string(),
+        }
+    }
+}
+
+/// "a", "a and b", "a, b and c", each said once.
+fn joined(steps: &[UnconfirmedStep]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for step in steps {
+        let what = step.what();
+        if !parts.contains(&what) {
+            parts.push(what);
+        }
+    }
+    match parts.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// How a run ended: its phase, with why when it did not succeed. A run
@@ -317,23 +376,16 @@ impl RunEvidence {
     }
 
     /// The same steps, said after the report they rely on: the result
-    /// reads the report first, then which of its steps nothing but that
-    /// report confirms (`has_report`: there is a report above to point to).
+    /// reads the report first, then what nothing but that report shows
+    /// (`has_report`: there is a report above to point to).
     pub fn after_report(&self, has_report: bool) -> Option<String> {
         let source = if has_report {
             "the report above"
         } else {
             "its report"
         };
-        match self.unconfirmed.as_slice() {
-            [] => None,
-            [one] => Some(format!("Only {source} confirms this step: {one}.")),
-            many => Some(format!(
-                "Only {source} confirms these {} steps: {}.",
-                many.len(),
-                many.join("; ")
-            )),
-        }
+        (!self.unconfirmed.is_empty())
+            .then(|| format!("Only {source} shows {}.", joined(&self.unconfirmed)))
     }
 
     /// The typed steps left unconfirmed, in one plain line. They belong to
@@ -343,15 +395,12 @@ impl RunEvidence {
     /// them (live 2026-11-13: "I couldn't verify one of its steps" under a
     /// ✅ read as a failure).
     pub fn line(&self) -> Option<String> {
-        match self.unconfirmed.as_slice() {
-            [] => None,
-            [one] => Some(format!("Its report is the only record of one step: {one}.")),
-            many => Some(format!(
-                "Its report is the only record of {} steps: {}.",
-                many.len(),
-                many.join("; ")
-            )),
-        }
+        (!self.unconfirmed.is_empty()).then(|| {
+            format!(
+                "Its report is the only record of {}.",
+                joined(&self.unconfirmed)
+            )
+        })
     }
 }
 
@@ -1271,7 +1320,16 @@ mod tests {
                     waited: Duration::ZERO,
                 },
                 RunEvidence {
-                    unconfirmed: vec!["Install Drupal".to_string(), "Enable a theme".to_string()],
+                    unconfirmed: vec![
+                        UnconfirmedStep {
+                            effect: aidaemon_tools::semantics::ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                            target: Some("/srv/drupal".to_string()),
+                        },
+                        UnconfirmedStep {
+                            effect: aidaemon_tools::semantics::ToolMutationEffects::CONFIGURATION,
+                            target: None,
+                        },
+                    ],
                     delivered: Some(vec![
                         RunDelivery {
                             kind: page.clone(),
@@ -1305,8 +1363,9 @@ mod tests {
         };
         let outcome = at(ended.phase.headline());
         let body = at("Done.");
-        let evidence =
-            at("Only the report above confirms these 2 steps: Install Drupal; Enable a theme.");
+        let evidence = at(
+            "Only the report above shows the files it wrote in /srv/drupal and the settings it changed.",
+        );
         let sent = at("Sent you: Drupal homepage (at ");
         let failed = at("Couldn't send you ");
         assert!(
