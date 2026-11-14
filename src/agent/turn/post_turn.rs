@@ -50,7 +50,7 @@ mod gate_telemetry_tests {
         let provider = MockProvider::with_responses(vec![
             MockProvider::text_response("Decision: WAIT. No worthwhile action is available."),
             MockProvider::tool_call_response(
-                "manage_mandates",
+                "mandate_review",
                 &json!({
                     "action": "record_decision",
                     "outcome": "wait",

@@ -903,7 +903,7 @@ async fn mandate_executor_cannot_use_task_lead_control_plane() {
 
     for (tool, arguments) in [
         (
-            "manage_mandates",
+            "mandate_review",
             r#"{"action":"record_decision","outcome":"wait","rationale":"escape"}"#,
         ),
         (

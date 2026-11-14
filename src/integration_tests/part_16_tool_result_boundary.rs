@@ -320,7 +320,7 @@ async fn test_sdk_committed_mandate_wait_ends_the_review() {
         MockProvider::tool_call_response("manage_mandates", &draft_args),
         MockProvider::tool_call_response("manage_mandates", &create_args),
         MockProvider::text_response("The mandate is active."),
-        MockProvider::tool_call_response("manage_mandates", &wait_args),
+        MockProvider::tool_call_response("mandate_review", &wait_args),
         MockProvider::text_response("UNREACHED narration after the decision"),
     ]);
     let mut harness = setup_test_agent_with_mandates(provider).await.unwrap();
@@ -551,7 +551,7 @@ async fn test_sdk_task_lead_commits_act_and_delegates_the_mutation() {
         MockProvider::tool_call_response("manage_mandates", &mandate_args("create")),
         MockProvider::text_response("The mandate is active."),
         observe,
-        MockProvider::tool_call_response("manage_mandates", &act_args),
+        MockProvider::tool_call_response("mandate_review", &act_args),
         MockProvider::tool_call_response("manage_goal_tasks", &delegate_args),
         MockProvider::text_response("ACT committed; the executor task will post the note."),
         MockProvider::tool_call_response(

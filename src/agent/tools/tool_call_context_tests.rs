@@ -67,7 +67,7 @@ fn stand_in_facts(name: &str) -> crate::traits::ToolDispatchFacts {
             facts.spawns_child_agents = true;
             facts.goal_context = GoalContext::Goal;
         }
-        "manage_goal_tasks" | "manage_mandates" => facts.goal_context = GoalContext::MandateRun,
+        "manage_goal_tasks" | "mandate_review" => facts.goal_context = GoalContext::MandateRun,
         "computer_use" => facts.needs_live_model = true,
         _ => {}
     }
@@ -462,13 +462,13 @@ async fn workspace_root_and_mandate_fence_are_dispatcher_facts() {
         "attempt-real",
         &attempt,
     );
-    for tool in ["manage_goal_tasks", "manage_mandates"] {
+    for tool in ["manage_goal_tasks", "mandate_review"] {
         harness.agent.test_tools_mut().push(Arc::new(RecordingTool {
             name: tool,
             seen: Arc::default(),
         }));
     }
-    for tool in ["manage_goal_tasks", "manage_mandates"] {
+    for tool in ["manage_goal_tasks", "mandate_review"] {
         let facts = harness
             .agent
             .tool_call_context(tool, &mandate_free_ctx(), true, false, None)
@@ -480,7 +480,7 @@ async fn workspace_root_and_mandate_fence_are_dispatcher_facts() {
             Some("attempt-real"),
             "{tool}"
         );
-        // `manage_mandates` matches a committed decision to the fence's
+        // `mandate_review` matches a committed decision to the fence's
         // mandate before finishing the review on it.
         assert_eq!(facts.mandate_id.as_deref(), Some("mandate-real"), "{tool}");
         assert_eq!(facts.mandate_version, Some(7), "{tool}");

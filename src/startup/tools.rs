@@ -1507,6 +1507,8 @@ pub(crate) mod lint_catalog {
                 "synthetic-task".to_string(),
                 state.clone(),
             )),
+            // Registered only in a mandate review's task-lead run.
+            Arc::new(aidaemon_work::tools::mandate_review::MandateReviewTool::new(state.clone())),
         ];
         catalog.tools.extend(extra);
         catalog._keychain = Some(keychain);

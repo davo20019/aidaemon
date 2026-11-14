@@ -103,8 +103,8 @@ pub fn bounded_owner_guidance(goal_context: Option<&str>) -> Vec<String> {
     newest_first
 }
 
-/// Every `manage_mandates` action that only the internal deliberator may
-/// invoke, paired with its kernel class. This is the single source of truth
+/// Every `mandate_review` action (only the internal deliberator has the
+/// tool), paired with its kernel class. This is the single source of truth
 /// consumed by the call classifier, the tool's call semantics, and the
 /// role-gate invariant test: a deliberator-reserved action that is not listed
 /// here is unreachable inside a mandate run.
@@ -113,7 +113,7 @@ pub const DELIBERATOR_PROTOCOL_ACTIONS: &[(&str, MandateCallClass)] = &[
     ("record_measurement", MandateCallClass::RecordMeasurement),
 ];
 
-/// Kernel class for a deliberator-reserved `manage_mandates` action, or
+/// Kernel class for a `mandate_review` action, or
 /// `None` when the action is not part of the deliberator protocol.
 pub fn deliberator_protocol_class(action: &str) -> Option<MandateCallClass> {
     DELIBERATOR_PROTOCOL_ACTIONS
@@ -162,11 +162,16 @@ pub fn classify_mandate_call(
                 .map(str::to_string)
         });
 
-    if tool_name == "manage_mandates" {
+    if tool_name == crate::tools::mandate_review::MANDATE_REVIEW_TOOL {
         return action
             .as_deref()
             .and_then(deliberator_protocol_class)
             .unwrap_or(MandateCallClass::Deny);
+    }
+    // The owner's mandate tool changes policy; a run under that policy never
+    // calls it.
+    if tool_name == "manage_mandates" {
+        return MandateCallClass::Deny;
     }
     if tool_name == "manage_goal_tasks" {
         return match action.as_deref() {
@@ -276,19 +281,19 @@ pub fn mandate_denial_next_step(reason: &str, is_task_lead: bool) -> &'static st
              Perform the mutation the task describes, or call report_blocker naming what is missing."
         }
         "act_decision_required" | "current_act_decision_required" | "decision_cycle_not_act" => {
-            "Record a current ACT with manage_mandates record_decision before orchestrating, \
+            "Record a current ACT with mandate_review record_decision before orchestrating, \
              or record WAIT or ASK instead."
         }
         "cycle_budget_exhausted" | "invalid_cycle_budget" => {
-            "No mutation budget remains in this cycle; record WAIT with manage_mandates."
+            "No mutation budget remains in this cycle; record WAIT with mandate_review."
         }
         "mandate_role_forbidden" => {
             "This call is outside the task-lead protocol: observe, record the decision with \
-             manage_mandates, or orchestrate the ACT's child task."
+             mandate_review, or orchestrate the ACT's child task."
         }
         _ => {
             "Choose a call inside the mandate's confirmed scopes, or record WAIT or ASK \
-             with manage_mandates."
+             with mandate_review."
         }
     }
 }
@@ -424,27 +429,36 @@ mod tests {
     fn every_deliberator_protocol_action_is_reachable_by_the_task_lead_only() {
         for (action, expected_class) in DELIBERATOR_PROTOCOL_ACTIONS {
             let class = classify_mandate_call(
-                "manage_mandates",
+                "mandate_review",
                 &format!(r#"{{"action":"{action}"}}"#),
                 &ToolCallSemantics::administrative(),
             );
             assert_eq!(class, *expected_class, "action {action}");
             assert!(
-                role_allows_mandate_call(class, "manage_mandates", true),
+                role_allows_mandate_call(class, "mandate_review", true),
                 "task lead must be able to invoke deliberator protocol action {action}"
             );
             assert!(
-                !role_allows_mandate_call(class, "manage_mandates", false),
+                !role_allows_mandate_call(class, "mandate_review", false),
                 "executors must not invoke deliberator protocol action {action}"
             );
         }
         assert_eq!(
             classify_mandate_call(
-                "manage_mandates",
+                "mandate_review",
                 r#"{"action":"record_measurement"}"#,
                 &ToolCallSemantics::administrative(),
             ),
             MandateCallClass::RecordMeasurement
+        );
+        // The owner's tool is never part of a review run.
+        assert_eq!(
+            classify_mandate_call(
+                "manage_mandates",
+                r#"{"action":"record_decision"}"#,
+                &ToolCallSemantics::administrative(),
+            ),
+            MandateCallClass::Deny
         );
     }
 
@@ -452,7 +466,7 @@ mod tests {
     fn exact_control_calls_do_not_become_general_authority() {
         assert_eq!(
             classify_mandate_call(
-                "manage_mandates",
+                "mandate_review",
                 r#"{"action":"record_decision"}"#,
                 &ToolCallSemantics::administrative(),
             ),
@@ -581,7 +595,7 @@ mod tests {
     fn mandate_roles_are_fail_closed_at_dispatch() {
         assert!(role_allows_mandate_call(
             MandateCallClass::RecordDecision,
-            "manage_mandates",
+            "mandate_review",
             true,
         ));
         assert!(role_allows_mandate_call(
@@ -616,7 +630,7 @@ mod tests {
             false,
         ));
         for (class, tool) in [
-            (MandateCallClass::RecordDecision, "manage_mandates"),
+            (MandateCallClass::RecordDecision, "mandate_review"),
             (MandateCallClass::ProtocolObservation, "manage_goal_tasks"),
             (MandateCallClass::Observation, "web_fetch"),
             (MandateCallClass::ActControl, "manage_goal_tasks"),

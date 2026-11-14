@@ -138,7 +138,7 @@ impl SystemDirective {
                  not substitute unrelated goals, notifications, or remembered attempts for \
                  the durable mandate record."
             ),
-            Self::MandateDecisionCommitRequired => "[SYSTEM] This mandate review still has no durable decision. Plain text cannot complete the review. Your next response MUST call manage_mandates exactly once with action=\"record_decision\" and a valid ACT, WAIT, ASK, or STOP payload. Correct the validation error shown in the preceding tool result, if any. Do not return a prose decision.".to_string(),
+            Self::MandateDecisionCommitRequired => "[SYSTEM] This mandate review still has no durable decision. Plain text cannot complete the review. Your next response MUST call mandate_review exactly once with action=\"record_decision\" and a valid ACT, WAIT, ASK, or STOP payload. Correct the validation error shown in the preceding tool result, if any. Do not return a prose decision.".to_string(),
             Self::FreshConversationContext => "This is a fresh conversation context. There are no previous tasks. Focus exclusively on the current user request. Do not reference or repeat tool calls from any prior context.".to_string(),
             Self::EmptyResponseRetry => "[SYSTEM] Your previous reply was empty (no text and no tool calls). This retry is running with reduced conversation history to recover. You MUST either (1) call the required tools, or (2) reply with a concrete blocker and the missing info. Do NOT return an empty response.".to_string(),
             Self::ModelCallTimedOut { timeout_secs } => format!(

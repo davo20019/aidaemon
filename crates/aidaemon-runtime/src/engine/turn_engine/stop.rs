@@ -370,7 +370,7 @@ impl TurnEngine<'_> {
                     }
                     StopDemandVerdict::Unreachable => {
                         "Mandate deliberator returned without a durable decision, and this \
-                         run's authority does not admit manage_mandates record_decision, so \
+                         run's authority does not admit mandate_review record_decision, so \
                          no correction turn could commit one."
                     }
                 }

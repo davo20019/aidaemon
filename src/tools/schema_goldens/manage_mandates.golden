@@ -19,17 +19,7 @@
             "answer_question",
             "resolve_reconciliation",
             "cancel",
-            "record_measurement",
-            "record_decision",
             "list_intentions"
-          ],
-          "type": "string"
-        },
-        "activity_level": {
-          "enum": [
-            "quiet",
-            "active",
-            "urgent"
           ],
           "type": "string"
         },
@@ -65,20 +55,6 @@
           "minimum": 1,
           "type": "integer"
         },
-        "evidence_receipt_ids": {
-          "description": "Optional. Omit to cite this run's successful observations automatically. To cite specific ones, use the tool_call_id you issued (e.g. call_...) or the result_id in that result's receipt footer (e.g. sha256:...); receipts from other runs, failed calls, or invented IDs are rejected.",
-          "items": {
-            "maxLength": 256,
-            "type": "string"
-          },
-          "maxItems": 16,
-          "type": "array"
-        },
-        "expected_benefit": {
-          "description": "ACT: benefit of acting now instead of waiting.",
-          "maxLength": 4096,
-          "type": "string"
-        },
         "expires_at": {
           "description": "RFC3339 fixed deadline. Supported by both create and update.",
           "type": "string"
@@ -89,28 +65,6 @@
         },
         "include_terminal": {
           "type": "boolean"
-        },
-        "intention": {
-          "maxLength": 1024,
-          "type": "string"
-        },
-        "invalidation_criteria": {
-          "description": "ACT: evidence making the intervention unsafe or not worthwhile.",
-          "maxLength": 4096,
-          "type": "string"
-        },
-        "learning_evidence_receipt_ids": {
-          "description": "Optional. Receipts backing learning_note; they must also back this decision. Omit to cite the decision's evidence.",
-          "items": {
-            "maxLength": 256,
-            "type": "string"
-          },
-          "maxItems": 16,
-          "type": "array"
-        },
-        "learning_note": {
-          "maxLength": 1024,
-          "type": "string"
         },
         "limit": {
           "maximum": 10,
@@ -135,18 +89,6 @@
           "minimum": 1,
           "type": "integer"
         },
-        "measurement_confidence_bps": {
-          "maximum": 10000,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "measurement_observed_at": {
-          "type": "string"
-        },
-        "measurement_value_micros": {
-          "description": "record_measurement only, for a mandate confirmed with a measured objective. Millionths of one unit (25 engagements = 25000000).",
-          "type": "integer"
-        },
         "min_review_minutes": {
           "minimum": 1,
           "type": "integer"
@@ -163,14 +105,6 @@
         "objective": {
           "maxLength": 2048,
           "type": "string"
-        },
-        "observations": {
-          "items": {
-            "maxLength": 750,
-            "type": "string"
-          },
-          "maxItems": 8,
-          "type": "array"
         },
         "operation_scopes": {
           "items": {
@@ -245,20 +179,6 @@
           "minItems": 1,
           "type": "array"
         },
-        "outcome": {
-          "enum": [
-            "act",
-            "wait",
-            "ask",
-            "stop"
-          ],
-          "type": "string"
-        },
-        "owner_alert": {
-          "description": "WAIT only, when the policy grants owner_alerts: the one finding the owner asked to hear about, in a sentence.",
-          "maxLength": 500,
-          "type": "string"
-        },
         "owner_alerts": {
           "description": "create/update: true when the owner asked to be told what the mandate finds (e.g. tell me when it is down). Lets a review's WAIT carry owner_alert; grants no tool, target or effect.",
           "type": "boolean"
@@ -273,14 +193,6 @@
           ],
           "type": "string"
         },
-        "question": {
-          "maxLength": 500,
-          "type": "string"
-        },
-        "rationale": {
-          "maxLength": 2048,
-          "type": "string"
-        },
         "reconciliation_resolution": {
           "enum": [
             "confirmed_effect_occurred",
@@ -289,21 +201,12 @@
           ],
           "type": "string"
         },
-        "reconsider_minutes": {
-          "minimum": 1,
-          "type": "integer"
-        },
         "review_effort": {
           "enum": [
             "efficient",
             "balanced",
             "thorough"
           ],
-          "type": "string"
-        },
-        "risk": {
-          "description": "ACT: expected cost or downside, or why none is material.",
-          "maxLength": 4096,
           "type": "string"
         },
         "section": {
@@ -340,25 +243,6 @@
           },
           "maxItems": 16,
           "type": "array"
-        },
-        "termination_kind": {
-          "description": "STOP only; omit for ACT, WAIT, and ASK.",
-          "enum": [
-            "success_criteria_satisfied",
-            "stop_condition_met",
-            "safety_termination"
-          ],
-          "type": "string"
-        },
-        "termination_match": {
-          "description": "STOP only; omit for ACT, WAIT, and ASK.",
-          "maxLength": 500,
-          "type": "string"
-        },
-        "value_criterion": {
-          "description": "ACT: exact owner-confirmed success criterion advanced; legacy uses the exact objective.",
-          "maxLength": 2048,
-          "type": "string"
         }
       },
       "required": [

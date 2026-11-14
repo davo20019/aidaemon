@@ -390,6 +390,12 @@ impl TurnHost for Agent {
         )
     }
 
+    fn mandate_review_tool(&self) -> std::sync::Arc<dyn aidaemon_tools::OutcomeTool> {
+        std::sync::Arc::new(
+            aidaemon_work::tools::mandate_review::MandateReviewTool::new(self.state.clone()),
+        )
+    }
+
     fn report_blocker_tool(
         &self,
         task_id: &str,

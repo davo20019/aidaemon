@@ -8,12 +8,10 @@ use sha2::{Digest, Sha256};
 
 use crate::traits::UserRole;
 use crate::traits::{
-    Intention, Mandate, MandateActivityLevel, MandateAuthority, MandateAutonomyMode,
-    MandateDecisionCycle, MandateDecisionOutcome, MandateLearningNote, MandateObjectiveMeasurement,
-    MandateOperatingUpdates, MandateOperationScope, MandateReconciliationResolution, MandateStatus,
-    MandateStrategySnapshot, MandateSuspensionKind, MandateToolStore, ToolCallContext,
-    ToolCallMetadata, ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects, ToolOutcomeStatus, ToolRole,
+    Mandate, MandateAuthority, MandateAutonomyMode, MandateDecisionOutcome, MandateOperationScope,
+    MandateReconciliationResolution, MandateStatus, MandateStrategySnapshot, MandateSuspensionKind,
+    MandateToolStore, ToolCallContext, ToolCallMetadata, ToolCallOperation, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus, ToolRole,
 };
 use aidaemon_core::ChannelVisibility;
 use aidaemon_tools::OutcomeTool as Tool;
@@ -23,9 +21,7 @@ use crate::mandates::budget::{
     expected_default_review_cycles,
 };
 use crate::mandates::validate::{
-    MAX_EVIDENCE_RECEIPTS, MAX_LEARNING_NOTE_TEXT, MAX_POLICY_ENTRY_TEXT, clean_strings,
-    learning_note_fields_complete, normalized_learning_note, normalized_termination_fields,
-    required_bounded_trimmed, required_call_fact, required_trimmed, validate_act_evidence,
+    MAX_POLICY_ENTRY_TEXT, clean_strings, required_bounded_trimmed, required_trimmed,
     validate_bounded_strings, validate_bounded_text,
 };
 
@@ -46,23 +42,12 @@ const MAX_OBJECTIVE_TEXT: usize = 2 * 1024;
 const MAX_NAME_TEXT: usize = 80;
 const MAX_POLICY_ENTRIES: usize = 16;
 const MAX_POLICY_TEXT: usize = 8 * 1024;
-const MAX_RATIONALE_TEXT: usize = 2 * 1024;
-const MAX_OBSERVATIONS: usize = 8;
-const MAX_OBSERVATION_TEXT: usize = 750;
-const MAX_OBSERVATIONS_JSON: usize = 6 * 1024;
-const MAX_QUESTION_TEXT: usize = 500;
-const MAX_INTENTION_TEXT: usize = 1024;
-use crate::mandates::MAX_INTENTION_METADATA_TEXT;
 use crate::mandates::card::{
     CanDo, EndLimit, Ends, MandateConfirmationCard, NoticeTrigger, ReviewCadence,
 };
 const MAX_GUIDANCE_ENTRIES: usize = 10;
 const MAX_GUIDANCE_ENTRY_TEXT: usize = 1024;
 const MAX_GUIDANCE_TEXT: usize = 8 * 1024;
-/// Evidence a learning note may cite (`MandateLearningNote::validate`).
-const MAX_LEARNING_EVIDENCE_RECEIPTS: usize = 8;
-const EVIDENCE_RECEIPT_IDS_DESCRIPTION: &str = "Optional. Omit to cite this run's successful observations automatically. To cite specific ones, use the tool_call_id you issued (e.g. call_...) or the result_id in that result's receipt footer (e.g. sha256:...); receipts from other runs, failed calls, or invented IDs are rejected.";
-const LEARNING_EVIDENCE_RECEIPT_IDS_DESCRIPTION: &str = "Optional. Receipts backing learning_note; they must also back this decision. Omit to cite the decision's evidence.";
 const NAME_FIELD_DESCRIPTION: &str = "draft/create: the short name the owner gave the mandate, exactly as given; omit when none. Other actions: selects the mandate by that name when mandate_id is omitted.";
 const SOURCE_GOAL_FIELD_DESCRIPTION: &str = "Create only. Optional provenance link to a personal goal created in this exact private owner session; omit it when no compatible goal exists. Updates preserve the existing binding and ignore this field.";
 const DURATION_FIELD_DESCRIPTION: &str = "Create only, relative to activation. Updates ignore this field; use expires_at to change an existing mandate's expiry.";
@@ -90,11 +75,11 @@ impl ResolvedReviewCapacity {
     }
 }
 
-/// Owner-facing mandate administration and the internal deliberation commit point.
-///
-/// This tool deliberately does not execute delegated actions. It records the
-/// owner's authority envelope and the task lead's ACT/WAIT/ASK/STOP choice; the
-/// dispatcher enforces the envelope when an action is attempted.
+// Owner-facing mandate administration. This tool deliberately does not
+// execute delegated actions: it records the owner's authority envelope, and
+// the dispatcher enforces it when an action is attempted. A review's
+// ACT/WAIT/ASK/STOP choice is committed with `mandate_review`.
+
 /// A skill a mandate may take as its strategy, as the host's skill library
 /// holds it.
 #[derive(Debug, Clone)]
@@ -256,23 +241,6 @@ impl ManageMandatesTool {
             || args.call_session.as_deref().is_some_and(|session| {
                 session.starts_with("specialist:") || session.starts_with("sub-")
             })
-    }
-
-    /// The receipts the model cited, or, when it cited none, the run's own
-    /// successful observations. The runtime already knows which reads
-    /// happened; copying their identifiers is bookkeeping, not judgment.
-    async fn cited_or_current_run_evidence(
-        &self,
-        cited: Option<&[String]>,
-        goal_run_id: &str,
-    ) -> anyhow::Result<Vec<String>> {
-        let cited = clean_strings(cited);
-        if !cited.is_empty() {
-            return Ok(cited);
-        }
-        self.state
-            .current_run_evidence_receipt_ids(goal_run_id, MAX_EVIDENCE_RECEIPTS)
-            .await
     }
 
     fn is_private_owner_control(args: &ManageMandatesArgs) -> bool {
@@ -1982,326 +1950,6 @@ impl ManageMandatesTool {
         ))
     }
 
-    async fn record_measurement(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
-        if !Self::is_internal(args) {
-            return Ok(
-                "record_measurement is reserved for the internal mandate deliberator.".to_string(),
-            );
-        }
-        let goal_id = required_call_fact(args.call_goal_id.as_deref(), "goal")?;
-        let goal_run_id = required_call_fact(args.call_goal_run_id.as_deref(), "goal run")?;
-        let mandate = self
-            .state
-            .get_mandate_for_goal(goal_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("current goal is not a mandate controller"))?;
-        anyhow::ensure!(
-            mandate.is_active() && mandate.objective_control.is_some(),
-            "mandate has no active objective control"
-        );
-        let value_micros = args
-            .measurement_value_micros
-            .ok_or_else(|| anyhow::anyhow!("measurement_value_micros is required"))?;
-        let receipts = self
-            .cited_or_current_run_evidence(args.evidence_receipt_ids.as_deref(), goal_run_id)
-            .await?;
-        let observed_at = args
-            .measurement_observed_at
-            .clone()
-            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-        let measurement = MandateObjectiveMeasurement::new(
-            &mandate.id,
-            mandate.version,
-            goal_run_id,
-            value_micros,
-            args.measurement_confidence_bps.unwrap_or(10_000),
-            receipts,
-            &observed_at,
-        );
-        self.state
-            .record_mandate_objective_measurement(&measurement)
-            .await?;
-        let target_reached = mandate
-            .objective_control
-            .as_ref()
-            .is_some_and(|control| control.target_reached(value_micros));
-        Ok(format!(
-            "Objective measurement {} recorded for mandate {} (target_reached={target_reached}).",
-            measurement.id, mandate.id
-        ))
-    }
-
-    async fn record_decision(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
-        if !Self::is_internal(args) {
-            return Ok(
-                "record_decision is reserved for the internal mandate deliberator.".to_string(),
-            );
-        }
-        let goal_id = required_call_fact(args.call_goal_id.as_deref(), "goal")?;
-        let pinned_run_id = required_call_fact(args.call_goal_run_id.as_deref(), "goal run")?;
-        let pinned_attempt_id =
-            required_call_fact(args.call_task_attempt_id.as_deref(), "task attempt")?;
-        let mandate = self
-            .state
-            .get_mandate_for_goal(goal_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("current goal is not a mandate controller"))?;
-        anyhow::ensure!(mandate.is_active(), "mandate is not active");
-        let run = self
-            .state
-            .get_goal_runs(goal_id)
-            .await?
-            .into_iter()
-            .find(|run| run.id == pinned_run_id)
-            .ok_or_else(|| anyhow::anyhow!("pinned mandate decision run does not exist"))?;
-        anyhow::ensure!(
-            run.trigger_type == "mandate" && run.status == "running",
-            "pinned mandate decision run is no longer executable"
-        );
-        let current_run = self
-            .state
-            .get_current_goal_run(goal_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("mandate has no active decision run"))?;
-        anyhow::ensure!(
-            current_run.id == pinned_run_id,
-            "pinned mandate decision run is no longer current"
-        );
-        anyhow::ensure!(
-            self.state
-                .get_mandate_decision_for_run(&run.id)
-                .await?
-                .is_none(),
-            "this mandate run already has a decision"
-        );
-        let outcome_raw =
-            required_trimmed(args.outcome.as_deref(), "outcome")?.to_ascii_lowercase();
-        let outcome = MandateDecisionOutcome::parse(&outcome_raw)
-            .ok_or_else(|| anyhow::anyhow!("outcome must be act, wait, ask, or stop"))?;
-        // Whether ACT is admissible now (mutation budget, quota, cooldown)
-        // is decided by the store when it commits the decision.
-        let rationale =
-            required_bounded_trimmed(args.rationale.as_deref(), "rationale", MAX_RATIONALE_TEXT)?;
-        let mut decision =
-            MandateDecisionCycle::new(&mandate.id, &run.id, outcome, rationale, mandate.version);
-        decision.activity_level =
-            MandateActivityLevel::parse(args.activity_level.as_deref().unwrap_or("quiet"))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("activity_level must be quiet, active, or urgent")
-                })?;
-        let observations = clean_strings(args.observations.as_deref());
-        validate_bounded_strings(
-            &observations,
-            "observations",
-            MAX_OBSERVATIONS,
-            MAX_OBSERVATION_TEXT,
-            MAX_OBSERVATIONS_JSON,
-        )?;
-        if !observations.is_empty() {
-            decision.belief_snapshot = Some(serde_json::to_string(&observations)?);
-        }
-        decision.evidence_receipt_ids = self
-            .cited_or_current_run_evidence(args.evidence_receipt_ids.as_deref(), pinned_run_id)
-            .await?;
-        validate_bounded_strings(
-            &decision.evidence_receipt_ids,
-            "evidence_receipt_ids",
-            MAX_EVIDENCE_RECEIPTS,
-            256,
-            4 * 1024,
-        )?;
-        validate_act_evidence(outcome, &observations, &decision.evidence_receipt_ids)?;
-        decision.question = args
-            .question
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        if let Some(question) = decision.question.as_deref() {
-            validate_bounded_text(question, "question", MAX_QUESTION_TEXT)?;
-        }
-        if outcome == MandateDecisionOutcome::Ask {
-            anyhow::ensure!(
-                decision.question.is_some(),
-                "question is required when outcome is ask"
-            );
-        }
-        if let Some(alert) = args.owner_alert.as_deref() {
-            validate_bounded_text(alert, "owner_alert", MAX_QUESTION_TEXT)?;
-            anyhow::ensure!(
-                outcome == MandateDecisionOutcome::Wait,
-                "owner_alert is carried only by a WAIT"
-            );
-            anyhow::ensure!(
-                mandate.authority.owner_alerts,
-                "this mandate's confirmed policy does not include telling the owner what it finds; record WAIT without owner_alert, or ASK the owner to confirm a policy update that adds it"
-            );
-            decision.owner_alert = Some(alert.to_string());
-        }
-        (decision.termination_kind, decision.termination_match) = normalized_termination_fields(
-            outcome,
-            args.termination_kind.as_deref(),
-            args.termination_match.as_deref(),
-        )?;
-        let review_secs = args.reconsider_minutes.map_or_else(
-            || mandate.review_secs_for_activity(decision.activity_level),
-            |minutes| mandate.clamp_review_secs(Some(minutes.saturating_mul(60))),
-        );
-        if outcome != MandateDecisionOutcome::Stop {
-            decision.reconsider_at =
-                Some(mandate.bounded_next_review_at(Some(review_secs), chrono::Utc::now()));
-        }
-        let intention = if outcome == MandateDecisionOutcome::Act {
-            let description = required_bounded_trimmed(
-                args.intention.as_deref(),
-                "intention",
-                MAX_INTENTION_TEXT,
-            )?;
-            let mut intention =
-                Intention::new(&mandate.id, &decision.id, &run.id, description, rationale);
-            let value_criterion = required_bounded_trimmed(
-                args.value_criterion.as_deref(),
-                "value_criterion",
-                MAX_OBJECTIVE_TEXT,
-            )?;
-            let criterion_matches = if mandate.success_criteria.is_empty() {
-                // Compatibility for mandates created before value criteria
-                // became mandatory. Their immutable objective is the only
-                // owner-authored value anchor available.
-                value_criterion == mandate.objective
-            } else {
-                mandate
-                    .success_criteria
-                    .iter()
-                    .any(|criterion| criterion == value_criterion)
-            };
-            anyhow::ensure!(
-                criterion_matches,
-                "value_criterion must exactly match one owner-confirmed success criterion (or the immutable objective on a legacy mandate)"
-            );
-            intention.value_criterion = Some(value_criterion.to_string());
-            intention.expected_benefit = Some(
-                required_bounded_trimmed(
-                    args.expected_benefit.as_deref(),
-                    "expected_benefit",
-                    MAX_INTENTION_METADATA_TEXT,
-                )?
-                .to_string(),
-            );
-            intention.risk = Some(
-                required_bounded_trimmed(
-                    args.risk.as_deref(),
-                    "risk",
-                    MAX_INTENTION_METADATA_TEXT,
-                )?
-                .to_string(),
-            );
-            intention.invalidation_criteria = Some(
-                required_bounded_trimmed(
-                    args.invalidation_criteria.as_deref(),
-                    "invalidation_criteria",
-                    MAX_INTENTION_METADATA_TEXT,
-                )?
-                .to_string(),
-            );
-            intention
-                .validate_value_contract()
-                .map_err(anyhow::Error::msg)?;
-            let metadata = [
-                intention.expected_benefit.as_deref(),
-                intention.risk.as_deref(),
-                intention.invalidation_criteria.as_deref(),
-            ];
-            anyhow::ensure!(
-                metadata
-                    .iter()
-                    .flatten()
-                    .map(|value| value.chars().count())
-                    .sum::<usize>()
-                    <= MAX_INTENTION_METADATA_TEXT
-                    && metadata
-                        .iter()
-                        .flatten()
-                        .map(|value| value.len())
-                        .sum::<usize>()
-                        <= MAX_INTENTION_METADATA_TEXT,
-                "intention metadata exceeds its combined 4 KiB bound"
-            );
-            Some(intention)
-        } else {
-            None
-        };
-        // Learning notes are optional advisory metadata, never
-        // the authority-bearing decision itself. Structured providers can
-        // populate only part of an optional field family; do not let that
-        // prevent a valid ACT/WAIT/ASK/STOP decision from being committed.
-        // A note whose receipt ids are omitted cites the decision's own
-        // evidence (learning evidence must be a subset of it, and the model
-        // may not see ids the runtime attached), capped at the note's limit.
-        let cited_learning_evidence = clean_strings(args.learning_evidence_receipt_ids.as_deref());
-        let learning_evidence = if cited_learning_evidence.is_empty() {
-            decision
-                .evidence_receipt_ids
-                .iter()
-                .take(MAX_LEARNING_EVIDENCE_RECEIPTS)
-                .cloned()
-                .collect()
-        } else {
-            cited_learning_evidence
-        };
-        let learning_fields_complete =
-            learning_note_fields_complete(args.learning_note.as_deref(), Some(&learning_evidence));
-        let learning = if learning_fields_complete {
-            normalized_learning_note(args.learning_note.as_deref(), Some(&learning_evidence))?
-        } else {
-            None
-        };
-        let learning_note = learning.map(|(summary, evidence)| {
-            MandateLearningNote::new(
-                &mandate.id,
-                mandate.version,
-                &decision.id,
-                &summary,
-                evidence,
-            )
-        });
-        let operating_updates = MandateOperatingUpdates { learning_note };
-        self.state
-            .record_mandate_decision_with_updates(
-                &decision,
-                intention.as_ref(),
-                Some(&operating_updates),
-                Some(pinned_attempt_id),
-            )
-            .await?;
-        Ok(match outcome {
-            MandateDecisionOutcome::Act => {
-                format!(
-                    "ACT committed for mandate {}. Create only tasks necessary for this intention: {}",
-                    mandate.id,
-                    intention
-                        .as_ref()
-                        .map(|value| value.description.as_str())
-                        .unwrap_or("")
-                )
-            }
-            MandateDecisionOutcome::Wait => format!(
-                "WAIT recorded. No action tasks should be created; review again at {}.",
-                decision
-                    .reconsider_at
-                    .as_deref()
-                    .unwrap_or("the bounded default")
-            ),
-            MandateDecisionOutcome::Ask => format!(
-                "ASK recorded. The mandate is awaiting owner input: {}",
-                decision.question.as_deref().unwrap_or("")
-            ),
-            MandateDecisionOutcome::Stop => {
-                "STOP recorded. The mandate has been completed; create no tasks.".to_string()
-            }
-        })
-    }
-
     async fn list_intentions(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
         if !Self::is_private_owner_control(args) {
             return Ok(
@@ -2355,26 +2003,6 @@ struct ManageMandatesArgs {
     include_terminal: Option<bool>,
     section: Option<String>,
     limit: Option<i64>,
-    outcome: Option<String>,
-    activity_level: Option<String>,
-    rationale: Option<String>,
-    observations: Option<Vec<String>>,
-    evidence_receipt_ids: Option<Vec<String>>,
-    measurement_value_micros: Option<i64>,
-    measurement_confidence_bps: Option<u16>,
-    measurement_observed_at: Option<String>,
-    question: Option<String>,
-    owner_alert: Option<String>,
-    termination_kind: Option<String>,
-    termination_match: Option<String>,
-    reconsider_minutes: Option<i64>,
-    intention: Option<String>,
-    value_criterion: Option<String>,
-    expected_benefit: Option<String>,
-    risk: Option<String>,
-    invalidation_criteria: Option<String>,
-    learning_note: Option<String>,
-    learning_evidence_receipt_ids: Option<Vec<String>>,
     guidance: Option<String>,
     reconciliation_resolution: Option<String>,
     /// The dispatcher's facts about this call ([`Self::bind_facts`]),
@@ -2433,20 +2061,6 @@ impl ManageMandatesArgs {
         trim_optional(&mut self.priority);
         trim_optional(&mut self.review_effort);
         trim_optional(&mut self.section);
-        trim_optional(&mut self.outcome);
-        trim_optional(&mut self.activity_level);
-        trim_optional(&mut self.rationale);
-        trim_optional(&mut self.measurement_observed_at);
-        trim_optional(&mut self.question);
-        trim_optional(&mut self.owner_alert);
-        trim_optional(&mut self.termination_kind);
-        trim_optional(&mut self.termination_match);
-        trim_optional(&mut self.intention);
-        trim_optional(&mut self.value_criterion);
-        trim_optional(&mut self.expected_benefit);
-        trim_optional(&mut self.risk);
-        trim_optional(&mut self.invalidation_criteria);
-        trim_optional(&mut self.learning_note);
         trim_optional(&mut self.guidance);
         trim_optional(&mut self.reconciliation_resolution);
 
@@ -2492,6 +2106,9 @@ fn described(mut schema: Value, description: &str) -> Value {
     schema
 }
 
+/// How a call to a review action this tool no longer has is answered.
+const MOVED_ACTION_PREFIX: &str = "manage_mandates no longer has";
+
 const MANAGE_MANDATE_ACTIONS: &[&str] = &[
     "draft",
     "create",
@@ -2503,8 +2120,6 @@ const MANAGE_MANDATE_ACTIONS: &[&str] = &[
     "answer_question",
     "resolve_reconciliation",
     "cancel",
-    "record_measurement",
-    "record_decision",
     "list_intentions",
 ];
 const OPERATION_SCOPE_REQUIRED: &[&str] = &[
@@ -2514,13 +2129,6 @@ const OPERATION_SCOPE_REQUIRED: &[&str] = &[
     "target_prefixes",
     "allowed_query_params",
     "mutation_effects",
-];
-const MANDATE_OUTCOMES: &[&str] = &["act", "wait", "ask", "stop"];
-const ACTIVITY_LEVELS: &[&str] = &["quiet", "active", "urgent"];
-const TERMINATION_KINDS: &[&str] = &[
-    "success_criteria_satisfied",
-    "stop_condition_met",
-    "safety_termination",
 ];
 const RECONCILIATION_RESOLUTIONS: &[&str] = &[
     "confirmed_effect_occurred",
@@ -2539,14 +2147,6 @@ const DEFAULT_REVIEW_FIELD_DESCRIPTION: &str = "How often the mandate runs, in m
 const FIXED_DEADLINE_DESCRIPTION: &str =
     "RFC3339 fixed deadline. Supported by both create and update.";
 const OWNER_ALERTS_DESCRIPTION: &str = "create/update: true when the owner asked to be told what the mandate finds (e.g. tell me when it is down). Lets a review's WAIT carry owner_alert; grants no tool, target or effect.";
-const OWNER_ALERT_DESCRIPTION: &str = "WAIT only, when the policy grants owner_alerts: the one finding the owner asked to hear about, in a sentence.";
-const STOP_ONLY_DESCRIPTION: &str = "STOP only; omit for ACT, WAIT, and ASK.";
-const VALUE_CRITERION_DESCRIPTION: &str =
-    "ACT: exact owner-confirmed success criterion advanced; legacy uses the exact objective.";
-const EXPECTED_BENEFIT_DESCRIPTION: &str = "ACT: benefit of acting now instead of waiting.";
-const RISK_DESCRIPTION: &str = "ACT: expected cost or downside, or why none is material.";
-const INVALIDATION_DESCRIPTION: &str =
-    "ACT: evidence making the intervention unsafe or not worthwhile.";
 
 fn op_schema() -> Value {
     json!({
@@ -2597,17 +2197,11 @@ impl Tool for ManageMandatesTool {
                     "allow_observations": { "type": "boolean" },
                     "operation_scopes": op_schema(),
                     "max_mutating_actions_per_cycle": integer_range(0, 24), "max_mutating_actions_per_rolling_24h": integer_range(0, 24), "min_seconds_between_mutations": integer_min(0),
-                    "owner_alerts": described(json!({"type":"boolean"}), OWNER_ALERTS_DESCRIPTION), "owner_alert": described(bounded_text(MAX_QUESTION_TEXT), OWNER_ALERT_DESCRIPTION),
+                    "owner_alerts": described(json!({"type":"boolean"}), OWNER_ALERTS_DESCRIPTION),
                     "constraints": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), CONSTRAINT_FIELD_DESCRIPTION), "success_criteria": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), SUCCESS_FIELD_DESCRIPTION), "stop_conditions": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), STOP_FIELD_DESCRIPTION),
                     "strategy_skill": bounded_text(256), "clear_strategy": { "type": "boolean" }, "min_review_minutes": integer_min(1), "max_review_minutes": integer_min(1), "default_review_minutes": described(integer_min(1), DEFAULT_REVIEW_FIELD_DESCRIPTION),
                     "duration_minutes": described(integer_min(1), DURATION_FIELD_DESCRIPTION), "expires_at": described(json!({"type":"string"}), FIXED_DEADLINE_DESCRIPTION), "priority": described(text_enum(PRIORITIES), PRIORITY_FIELD_DESCRIPTION), "review_effort": text_enum(REVIEW_EFFORTS),
                     "include_terminal": { "type": "boolean" }, "section": text_enum(GET_SECTIONS), "limit": integer_range(1, 10),
-                    "outcome": text_enum(MANDATE_OUTCOMES), "activity_level": text_enum(ACTIVITY_LEVELS), "rationale": bounded_text(MAX_RATIONALE_TEXT),
-                    "observations": bounded_text_array(MAX_OBSERVATIONS, MAX_OBSERVATION_TEXT), "evidence_receipt_ids": described(bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), EVIDENCE_RECEIPT_IDS_DESCRIPTION), "question": bounded_text(MAX_QUESTION_TEXT),
-                    "measurement_value_micros": { "type": "integer", "description": "record_measurement only, for a mandate confirmed with a measured objective. Millionths of one unit (25 engagements = 25000000)." }, "measurement_confidence_bps": integer_range(0, 10000), "measurement_observed_at": { "type": "string" },
-                    "termination_kind": described(text_enum(TERMINATION_KINDS), STOP_ONLY_DESCRIPTION), "termination_match": described(bounded_text(MAX_POLICY_ENTRY_TEXT), STOP_ONLY_DESCRIPTION), "reconsider_minutes": integer_min(1),
-                    "intention": bounded_text(MAX_INTENTION_TEXT), "value_criterion": described(bounded_text(MAX_OBJECTIVE_TEXT), VALUE_CRITERION_DESCRIPTION), "expected_benefit": described(bounded_text(MAX_INTENTION_METADATA_TEXT), EXPECTED_BENEFIT_DESCRIPTION), "risk": described(bounded_text(MAX_INTENTION_METADATA_TEXT), RISK_DESCRIPTION), "invalidation_criteria": described(bounded_text(MAX_INTENTION_METADATA_TEXT), INVALIDATION_DESCRIPTION),
-                    "learning_note": bounded_text(MAX_LEARNING_NOTE_TEXT), "learning_evidence_receipt_ids": described(bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), LEARNING_EVIDENCE_RECEIPT_IDS_DESCRIPTION),
                     "guidance": bounded_text(MAX_GUIDANCE_ENTRY_TEXT), "reconciliation_resolution": text_enum(RECONCILIATION_RESOLUTIONS)
                 },
                 "required": ["action"],
@@ -2636,7 +2230,9 @@ impl Tool for ManageMandatesTool {
             (self.run(arguments, &facts).await?, None)
         };
         let trimmed = output.trim_start();
-        let outcome_status = if trimmed.starts_with("Mandates can only")
+        let outcome_status = if crate::tools::mandate_review::moved_action(&args.action) {
+            ToolOutcomeStatus::FailedPermanent
+        } else if trimmed.starts_with("Mandates can only")
             || trimmed.starts_with("Mandate authority can only")
             || trimmed.starts_with("Mandate intentions can only")
         {
@@ -2660,36 +2256,7 @@ impl Tool for ManageMandatesTool {
         if let Some((observations, collections)) = objective_evidence {
             outcome = outcome.with_observation_evidence(observations, collections);
         }
-        // A committed non-action decision (WAIT, ASK, STOP) completes the
-        // fenced review: the run ends on the durable decision's summary,
-        // without another model call.
-        if args.action == "record_decision"
-            && outcome_status == ToolOutcomeStatus::Succeeded
-            && let Some(summary) = self.committed_non_action_summary(&facts).await
-        {
-            outcome = outcome.with_finish(aidaemon_core::Finish::succeeded(summary));
-        }
         Ok(outcome)
-    }
-}
-
-impl ManageMandatesTool {
-    /// The summary of the committed decision of the review this call is
-    /// fenced to, when that decision is WAIT, ASK or STOP.
-    async fn committed_non_action_summary(&self, facts: &ToolCallContext) -> Option<String> {
-        let goal_run_id = facts.goal_run_id.as_deref()?;
-        let decision = self
-            .state
-            .get_mandate_decision_for_run(goal_run_id)
-            .await
-            .ok()
-            .flatten()?;
-        if Some(decision.mandate_id.as_str()) != facts.mandate_id.as_deref()
-            || Some(decision.mandate_version) != facts.mandate_version
-        {
-            return None;
-        }
-        decision.non_action_summary()
     }
 }
 
@@ -2708,8 +2275,10 @@ impl ManageMandatesTool {
             "pause" | "resume" | "answer_question" | "resolve_reconciliation" | "cancel" => {
                 self.transition(&args, &args.action).await
             }
-            "record_decision" => self.record_decision(&args).await,
-            "record_measurement" => self.record_measurement(&args).await,
+            action if crate::tools::mandate_review::moved_action(action) => Ok(format!(
+                "{MOVED_ACTION_PREFIX} `{action}`; nothing was recorded. A mandate review records it \
+                 with mandate_review, which only the review run has."
+            )),
             "list_intentions" => self.list_intentions(&args).await,
             other => anyhow::bail!("unknown manage_mandates action `{other}`"),
         }
@@ -2745,14 +2314,10 @@ impl crate::traits::ToolSemantics for ManageMandatesTool {
             Some("draft" | "list" | "get" | "list_intentions") => {
                 aidaemon_core::CallEffects::none()
             }
+            Some(action) if crate::tools::mandate_review::moved_action(action) => {
+                aidaemon_core::CallEffects::none()
+            }
             _ => aidaemon_core::CallEffects::unknown(),
-        }
-    }
-
-    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
-        crate::traits::ToolDispatchFacts {
-            goal_context: crate::traits::GoalContext::MandateRun,
-            ..Default::default()
         }
     }
 
@@ -2799,10 +2364,9 @@ impl crate::traits::ToolSemantics for ManageMandatesTool {
             });
         match action.as_deref() {
             Some("draft" | "list" | "get" | "list_intentions") => ToolCallSemantics::observation(),
-            Some(action)
-                if crate::mandates::policy::deliberator_protocol_class(action).is_some() =>
-            {
-                ToolCallSemantics::administrative()
+            // A review action this tool no longer has runs nothing.
+            Some(action) if crate::tools::mandate_review::moved_action(action) => {
+                ToolCallSemantics::observation()
             }
             _ => ToolCallSemantics::mutation_with(ToolMutationEffects::CONFIGURATION),
         }

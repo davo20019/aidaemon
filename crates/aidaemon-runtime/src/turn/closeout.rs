@@ -167,7 +167,7 @@ pub enum StopDemand {
 }
 
 /// The exact call that satisfies `StopDemand::MandateDecisionCommit`.
-pub const MANDATE_DECISION_TOOL: &str = "manage_mandates";
+pub const MANDATE_DECISION_TOOL: &str = aidaemon_work::tools::mandate_review::MANDATE_REVIEW_TOOL;
 pub const MANDATE_DECISION_CALL: &str = r#"{"action":"record_decision"}"#;
 
 impl StopDemand {
@@ -307,7 +307,7 @@ mod stop_demand_tests {
     /// actions does not admit it, so asking would spend the retry on a refusal.
     #[test]
     fn mandate_commit_is_demanded_only_when_record_decision_is_admitted() {
-        let visible = ["manage_mandates", "http_request"];
+        let visible = [MANDATE_DECISION_TOOL, "http_request"];
         let read_only = |_: &str| Some(false);
         let real_rule = |tool: &str, arguments: &str| {
             tool == MANDATE_DECISION_TOOL && !arguments.contains("record_decision")

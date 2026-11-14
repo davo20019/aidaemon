@@ -37,6 +37,7 @@ pub mod traits {
 /// decision or measurement evidence.
 pub const MANDATE_PROTOCOL_TOOLS: &[&str] = &[
     "manage_mandates",
+    "mandate_review",
     "manage_goal_tasks",
     "track_requirements",
     "report_blocker",

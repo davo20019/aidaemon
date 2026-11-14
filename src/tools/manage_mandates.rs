@@ -114,6 +114,7 @@ mod tests {
     use crate::testing::{MockProvider, setup_test_agent};
     use crate::traits::*;
     use crate::types::ChannelVisibility;
+    use aidaemon_work::tools::mandate_review::MandateReviewTool;
     use serde_json::{Value, json};
     use std::sync::Arc;
 
@@ -538,7 +539,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let tool = ManageMandatesTool::new(state.clone());
+        let tool = MandateReviewTool::new(state.clone());
 
         let result = tool
             .call_with(
@@ -787,8 +788,8 @@ mod tests {
         })
     }
 
-    fn tool_for(run: &ReviewRun) -> ManageMandatesTool {
-        ManageMandatesTool::new(run.state.clone())
+    fn tool_for(run: &ReviewRun) -> MandateReviewTool {
+        MandateReviewTool::new(run.state.clone())
     }
 
     #[tokio::test]
@@ -2508,7 +2509,7 @@ mod tests {
             .start_goal_run(&goal.id, "mandate", None, None)
             .await
             .unwrap();
-        let tool = ManageMandatesTool::new(state.clone());
+        let tool = MandateReviewTool::new(state.clone());
         let error = tool
             .call_with(
                 r#"{"action":"record_decision","outcome":"wait","rationale":"stale"}"#,
@@ -2531,6 +2532,36 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// The review actions moved to `mandate_review`: on the owner's tool
+    /// they record nothing and name where they went.
+    #[tokio::test]
+    async fn owner_tool_review_actions_name_mandate_review_and_record_nothing() {
+        use crate::traits::ToolSemantics as _;
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let tool = ManageMandatesTool::new(harness.state.clone());
+        for action in ["record_decision", "record_measurement"] {
+            let args = json!({"action": action, "outcome": "wait", "rationale": "moved"});
+            let outcome = tool
+                .execute(&args.to_string(), &owner_facts())
+                .await
+                .unwrap();
+            assert!(
+                outcome.output.contains("mandate_review"),
+                "{}",
+                outcome.output
+            );
+            assert_eq!(
+                outcome.metadata.outcome_status,
+                Some(crate::traits::ToolOutcomeStatus::FailedPermanent)
+            );
+            assert_eq!(
+                tool.call_effects(&args.to_string()),
+                aidaemon_core::CallEffects::none(),
+                "{action}"
+            );
+        }
     }
 
     /// The live "every hour check a page and tell me only if it is down"

@@ -289,6 +289,8 @@ pub trait TurnHost:
         goal_id: &str,
         goal_run_id: Option<String>,
     ) -> std::sync::Arc<dyn aidaemon_tools::OutcomeTool>;
+    /// The tool a mandate review's task lead commits its decision with.
+    fn mandate_review_tool(&self) -> std::sync::Arc<dyn aidaemon_tools::OutcomeTool>;
     /// The tool an executor of the claimed `attempt` of `task_id` reports a
     /// blocker with (`mandate`: the attempt works for a mandate).
     fn report_blocker_tool(

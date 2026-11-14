@@ -135,6 +135,11 @@ impl Agent {
             attempt_id: attempt.id.clone(),
             lease_token: attempt.lease_token.clone(),
         });
+        // A review's task lead has its commit tool, as its spawned run does.
+        let review = crate::host::TurnHost::mandate_review_tool(self);
+        if !self.tools.iter().any(|tool| tool.name() == review.name()) {
+            self.tools.push(review);
+        }
     }
 
     /// Lower the token-pressure watermark without weakening production

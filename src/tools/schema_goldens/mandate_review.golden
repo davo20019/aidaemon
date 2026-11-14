@@ -1,0 +1,149 @@
+{
+  "description": "Commit this mandate review's one decision (record_decision: act, wait, ask or stop), and for a measured objective first record the metric (record_measurement).",
+  "name": "mandate_review",
+  "schema": {
+    "description": "Commit this mandate review's one decision (record_decision: act, wait, ask or stop), and for a measured objective first record the metric (record_measurement).",
+    "name": "mandate_review",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "record_decision once per review; record_measurement before it when the mandate has a measured objective.",
+          "enum": [
+            "record_decision",
+            "record_measurement"
+          ],
+          "type": "string"
+        },
+        "activity_level": {
+          "description": "Next-review cadence: quiet = default, active = sooner, urgent = the confirmed minimum.",
+          "enum": [
+            "quiet",
+            "active",
+            "urgent"
+          ],
+          "type": "string"
+        },
+        "evidence_receipt_ids": {
+          "description": "Optional. Omit to cite this run's successful observations automatically. To cite specific ones, use the tool_call_id you issued (e.g. call_...) or the result_id in that result's receipt footer (e.g. sha256:...); receipts from other runs, failed calls, or invented IDs are rejected.",
+          "items": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
+        "expected_benefit": {
+          "description": "ACT: benefit of acting now instead of waiting.",
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "intention": {
+          "description": "ACT: the one concrete intervention to carry out.",
+          "maxLength": 1024,
+          "type": "string"
+        },
+        "invalidation_criteria": {
+          "description": "ACT: evidence making the intervention unsafe or not worthwhile.",
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "learning_evidence_receipt_ids": {
+          "description": "Optional. Receipts backing learning_note; they must also back this decision. Omit to cite the decision's evidence.",
+          "items": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
+        "learning_note": {
+          "description": "Optional advisory lesson for later reviews; never changes authority.",
+          "maxLength": 1024,
+          "type": "string"
+        },
+        "measurement_confidence_bps": {
+          "description": "record_measurement: confidence in basis points (10000 = certain; 0 = unreadable).",
+          "maximum": 10000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "measurement_observed_at": {
+          "description": "record_measurement: RFC3339 time the metric was read; omit for now.",
+          "type": "string"
+        },
+        "measurement_value_micros": {
+          "description": "record_measurement: the metric in millionths of one unit (25 engagements = 25000000); 0 when unreadable.",
+          "type": "integer"
+        },
+        "observations": {
+          "description": "What this run observed, one finding per item; ACT needs at least one.",
+          "items": {
+            "maxLength": 750,
+            "type": "string"
+          },
+          "maxItems": 8,
+          "type": "array"
+        },
+        "outcome": {
+          "description": "record_decision: the one decision.",
+          "enum": [
+            "act",
+            "wait",
+            "ask",
+            "stop"
+          ],
+          "type": "string"
+        },
+        "owner_alert": {
+          "description": "WAIT only, when the policy grants owner_alerts: the one finding the owner asked to hear about, in a sentence.",
+          "maxLength": 500,
+          "type": "string"
+        },
+        "question": {
+          "description": "ASK only: the one question for the owner.",
+          "maxLength": 500,
+          "type": "string"
+        },
+        "rationale": {
+          "description": "Why this outcome, from this run's observations.",
+          "maxLength": 2048,
+          "type": "string"
+        },
+        "reconsider_minutes": {
+          "description": "Minutes until the next review, clamped to the confirmed bounds; omit to follow activity_level.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "risk": {
+          "description": "ACT: expected cost or downside, or why none is material.",
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "termination_kind": {
+          "description": "STOP only; omit for ACT, WAIT, and ASK.",
+          "enum": [
+            "success_criteria_satisfied",
+            "stop_condition_met",
+            "safety_termination"
+          ],
+          "type": "string"
+        },
+        "termination_match": {
+          "description": "STOP only; omit for ACT, WAIT, and ASK.",
+          "maxLength": 500,
+          "type": "string"
+        },
+        "value_criterion": {
+          "description": "ACT: exact owner-confirmed success criterion advanced; legacy uses the exact objective.",
+          "maxLength": 2048,
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

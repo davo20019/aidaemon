@@ -89,16 +89,17 @@ mod tests {
     /// schema accepts, or a model that follows the prompt is refused by
     /// `additionalProperties: false`.
     #[tokio::test]
-    async fn task_lead_rules_name_only_real_manage_mandates_arguments() {
+    async fn task_lead_rules_name_only_real_mandate_review_arguments() {
         use crate::traits::Tool;
         let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
             .await
             .unwrap();
-        let tool = crate::tools::ManageMandatesTool::new(harness.state.clone());
+        let tool =
+            aidaemon_work::tools::mandate_review::MandateReviewTool::new(harness.state.clone());
         let schema = tool.schema();
         let properties = schema["parameters"]["properties"]
             .as_object()
-            .expect("manage_mandates properties");
+            .expect("mandate_review properties");
         let rules = task_lead_rules("Autopilot is owner-confirmed.", true);
         for argument in [
             "evidence_receipt_ids",
@@ -117,7 +118,7 @@ mod tests {
             assert!(rules.contains(argument), "rules no longer name {argument}");
             assert!(
                 properties.contains_key(argument),
-                "rules name {argument}, which manage_mandates does not accept"
+                "rules name {argument}, which mandate_review does not accept"
             );
         }
         for retired in [
