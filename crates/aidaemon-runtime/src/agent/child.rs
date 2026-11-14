@@ -51,7 +51,11 @@ impl Agent {
             ))
         });
         if let Some(ref spawn_tool) = spawn_tool {
-            tools.push(spawn_tool.clone());
+            crate::tool_manifest::push(
+                &mut tools,
+                crate::tool_manifest::ToolContext::Child,
+                spawn_tool.clone(),
+            );
         }
         // A plain child in a tree can hand the coordinator a decision.
         if inherited_authority
@@ -59,7 +63,11 @@ impl Agent {
             .as_ref()
             .is_some_and(|family| family.coordinates())
         {
-            tools.push(Arc::new(crate::tools::escalate::EscalateToParentTool));
+            crate::tool_manifest::push(
+                &mut tools,
+                crate::tool_manifest::ToolContext::CoordinatedChild,
+                Arc::new(crate::tools::escalate::EscalateToParentTool),
+            );
         }
 
         let mcp_registry = match mandate_execution.as_ref() {

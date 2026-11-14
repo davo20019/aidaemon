@@ -180,7 +180,11 @@ pub async fn run(
             .with_stable_subjects(stable_subjects)
             .with_state(state.clone()),
     );
-    tools.push(track_requirements_tool.clone());
+    aidaemon_runtime::tool_manifest::push(
+        &mut tools,
+        aidaemon_runtime::tool_manifest::ToolContext::Global,
+        track_requirements_tool.clone(),
+    );
 
     // 7. Agent (with deferred spawn tool wiring to break the circular dep)
     let skill_names: Vec<String> = if let Some(ref dir) = skills_dir {

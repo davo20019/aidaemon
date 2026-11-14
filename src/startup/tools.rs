@@ -177,6 +177,10 @@ pub async fn setup_tools(
     )
     .await?;
 
+    aidaemon_runtime::tool_manifest::check_declared(
+        &tools,
+        aidaemon_runtime::tool_manifest::ToolContext::Global,
+    );
     for tool in &tools {
         info!(
             name = tool.name(),
@@ -1281,8 +1285,9 @@ async fn build_base_tool(
 }
 
 /// The tool catalog as the model can see it, assembled for the schema lint
-/// and the per-tool goldens: every startup-registered tool with its feature
-/// switched on, plus the tools added outside startup (skills, the
+/// and the per-tool goldens from `aidaemon_runtime::tool_manifest`: every
+/// startup-registered tool with its feature switched on, plus an instance
+/// of every other tool the manifest declares for the catalog (skills, the
 /// checklist, sub-agents and the role-scoped tools a task, mandate run or
 /// coordinated child gets).
 #[cfg(test)]
@@ -1397,7 +1402,32 @@ pub(crate) mod lint_catalog {
         })
     }
 
-    /// Every tool the model can be offered, each feature on.
+    /// Whether this build compiles the daemon feature a tool is under.
+    pub(crate) fn compiled(entry: &aidaemon_runtime::tool_manifest::ToolEntry) -> bool {
+        match entry.feature {
+            None => true,
+            Some("browser") => cfg!(feature = "browser"),
+            Some("computer_use") => cfg!(feature = "computer_use"),
+            Some("slack") => cfg!(feature = "slack"),
+            Some(other) => panic!("{}: unknown feature {other}", entry.name),
+        }
+    }
+
+    /// The tools the manifest puts in the lint catalog, in this build.
+    pub(crate) fn linted_names() -> Vec<&'static str> {
+        aidaemon_runtime::tool_manifest::TOOL_MANIFEST
+            .iter()
+            .filter(|entry| {
+                compiled(entry) && entry.lint == aidaemon_runtime::tool_manifest::Lint::Catalog
+            })
+            .map(|entry| entry.name)
+            .collect()
+    }
+
+    /// Every tool the model can be offered, each feature on: what startup
+    /// registers in this test build, then an instance of every other tool
+    /// the manifest puts in the catalog (skills, the checklist, tools whose
+    /// startup dependency the test build lacks, and the per-run tools).
     pub(crate) async fn build_full() -> anyhow::Result<Catalog> {
         let keychain = crate::testing::KeychainIsolation::acquire();
         let mut catalog = build_registered(|config| {
@@ -1415,42 +1445,72 @@ pub(crate) mod lint_catalog {
         let state = catalog.state.clone();
         let skills_dir = catalog._guards.0.path().join("skills");
         std::fs::create_dir_all(&skills_dir)?;
-        let resolver = Arc::new(crate::skills::FileSystemResolver::new());
-        let plan_store = Arc::new(crate::plans::PlanStore::new(state.pool()).await?);
-        let extra: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(crate::tools::UseSkillTool::new(skills_dir.clone())),
-            Arc::new(crate::tools::SkillResourcesTool::new(
-                skills_dir.clone(),
-                resolver as Arc<dyn crate::skills::ResourceResolver>,
+        for name in linted_names() {
+            if catalog.tools.iter().any(|tool| tool.name() == name) {
+                continue;
+            }
+            let tool = catalog_instance(name, &state, &skills_dir).await?;
+            anyhow::ensure!(
+                tool.name() == name,
+                "the catalog instance for {name} is named {}",
+                tool.name()
+            );
+            catalog.tools.push(tool);
+        }
+        catalog._keychain = Some(keychain);
+        Ok(catalog)
+    }
+
+    /// An instance of a declared tool startup does not register in the
+    /// test build. A new manifest entry that neither startup registers
+    /// here nor has an instance fails the catalog.
+    async fn catalog_instance(
+        name: &str,
+        state: &Arc<SqliteStateStore>,
+        skills_dir: &Path,
+    ) -> anyhow::Result<Arc<dyn Tool>> {
+        let skills_dir = skills_dir.to_path_buf();
+        Ok(match name {
+            "use_skill" => Arc::new(crate::tools::UseSkillTool::new(skills_dir)),
+            "skill_resources" => Arc::new(crate::tools::SkillResourcesTool::new(
+                skills_dir,
+                Arc::new(crate::skills::FileSystemResolver::new())
+                    as Arc<dyn crate::skills::ResourceResolver>,
             )),
-            Arc::new(crate::tools::ManageSkillsTool::new(
+            "manage_skills" => Arc::new(crate::tools::ManageSkillsTool::new(
                 skills_dir,
                 state.clone(),
             )),
-            Arc::new(crate::tools::track_requirements::TrackRequirementsTool::new(plan_store)),
-            Arc::new(crate::tools::EscalateToParentTool),
+            "track_requirements" => Arc::new(
+                crate::tools::track_requirements::TrackRequirementsTool::new(Arc::new(
+                    crate::plans::PlanStore::new(state.pool()).await?,
+                )),
+            ),
+            "escalate_to_parent" => Arc::new(crate::tools::EscalateToParentTool),
             // Registered by startup only with a checkpoint manager and a
             // health store.
-            Arc::new(crate::tools::ListCheckpointsTool),
-            Arc::new(crate::tools::HealthProbeTool::new(Arc::new(
+            "list_checkpoints" => Arc::new(crate::tools::ListCheckpointsTool),
+            "health_probe" => Arc::new(crate::tools::HealthProbeTool::new(Arc::new(
                 crate::health::HealthProbeStore::new(state.pool()).await?,
             ))),
-            Arc::new(
+            "manage_goal_tasks" => Arc::new(
                 aidaemon_work::tools::manage_goal_tasks::ManageGoalTasksTool::new(
                     "synthetic-goal".to_string(),
                     state.clone(),
                 ),
             ),
-            Arc::new(crate::tools::report_blocker::ReportBlockerTool::new(
+            "report_blocker" => Arc::new(crate::tools::report_blocker::ReportBlockerTool::new(
                 "synthetic-task".to_string(),
                 state.clone(),
             )),
-            // Registered only in a mandate review's task-lead run.
-            Arc::new(aidaemon_work::tools::mandate_review::MandateReviewTool::new(state.clone())),
-        ];
-        catalog.tools.extend(extra);
-        catalog._keychain = Some(keychain);
-        Ok(catalog)
+            "mandate_review" => Arc::new(
+                aidaemon_work::tools::mandate_review::MandateReviewTool::new(state.clone()),
+            ),
+            other => anyhow::bail!(
+                "{other} is in tool_manifest's catalog but startup does not register it in \
+                 the test build and the lint catalog has no instance of it"
+            ),
+        })
     }
 }
 
@@ -1481,6 +1541,77 @@ mod tests {
             .iter()
             .map(|tool| json!({"type":"function","function": tool.schema()}))
             .collect())
+    }
+
+    /// The lint catalog is the manifest: every tool it holds is declared
+    /// for the catalog, and every tool declared for it is there.
+    #[tokio::test]
+    async fn the_lint_catalog_holds_exactly_the_declared_tools() {
+        let catalog = super::lint_catalog::build_full().await.unwrap();
+        let built: std::collections::BTreeSet<&str> =
+            catalog.tools.iter().map(|tool| tool.name()).collect();
+        let declared: std::collections::BTreeSet<&str> =
+            super::lint_catalog::linted_names().into_iter().collect();
+        assert_eq!(built, declared);
+        assert_eq!(built.len(), catalog.tools.len(), "a tool registered twice");
+    }
+
+    /// Every startup registry entry is declared in the manifest as built
+    /// there, and every manifest entry built at startup has its registry
+    /// entry.
+    #[test]
+    fn startup_registries_and_the_manifest_agree() {
+        use aidaemon_runtime::tool_manifest::{BuiltAt, TOOL_MANIFEST, ToolContext, entry};
+        // Optional groups that register tools under other names.
+        fn group_of(name: &str) -> &str {
+            match name {
+                "cli_agent" | "manage_cli_agents" => "cli_agents",
+                other => other,
+            }
+        }
+        let mut problems = Vec::new();
+        let mut expect = |name: &str, built_at: BuiltAt| match entry(name) {
+            Some(declared)
+                if declared.built_at == built_at
+                    && declared.contexts.contains(&ToolContext::Global) => {}
+            other => problems.push(format!("{name}: declared as {other:?}")),
+        };
+        for spec in BASE_TOOL_REGISTRY {
+            expect(spec.name, BuiltAt::StartupBase);
+        }
+        for spec in OPTIONAL_TOOL_REGISTRY
+            .iter()
+            .filter(|spec| spec.name != "cli_agents")
+        {
+            expect(spec.name, BuiltAt::StartupOptional);
+        }
+        for spec in RUNTIME_TOOL_MANIFEST {
+            expect(spec.name, BuiltAt::StartupRuntime);
+        }
+        for declared in TOOL_MANIFEST
+            .iter()
+            .filter(|e| super::lint_catalog::compiled(e))
+        {
+            let registered = match declared.built_at {
+                BuiltAt::StartupBase => {
+                    declared.name == "list_checkpoints"
+                        || BASE_TOOL_REGISTRY
+                            .iter()
+                            .any(|spec| spec.name == declared.name)
+                }
+                BuiltAt::StartupOptional => OPTIONAL_TOOL_REGISTRY
+                    .iter()
+                    .any(|spec| spec.name == group_of(declared.name)),
+                BuiltAt::StartupRuntime => RUNTIME_TOOL_MANIFEST
+                    .iter()
+                    .any(|spec| spec.name == declared.name),
+                _ => true,
+            };
+            if !registered {
+                problems.push(format!("{}: no startup registry entry", declared.name));
+            }
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
     }
 
     #[test]
