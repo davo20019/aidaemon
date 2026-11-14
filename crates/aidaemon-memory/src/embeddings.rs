@@ -1,25 +1,26 @@
-use fastembed::{AutoDevicePolicy, EmbeddingModel, TextEmbedding, TextInitOptions};
-use std::sync::{Arc, Mutex};
-use tokio::sync::OnceCell;
-use tokio::task;
-use tracing::info;
+use std::sync::Arc;
 
-/// Stable identifier persisted beside every derived embedding. Changing the
-/// model creates a new index generation instead of silently mixing vectors.
-pub const EMBEDDING_MODEL_ID: &str = "fastembed/all-MiniLM-L6-v2";
+use crate::Embedder;
+use crate::embed::FastEmbedder;
 
-/// fastembed 5.x's `TextEmbedding::embed` requires `&mut self`. We wrap the
-/// model in a `std::sync::Mutex` so blocking-thread callers can take it,
-/// embed, and release. Calls serialize, but embedding itself is CPU-bound
-/// and short, so this is acceptable for our usage pattern.
-type SharedModel = Arc<Mutex<TextEmbedding>>;
+/// The model the daemon runs unless `[memory] embedding_model` names
+/// another: AllMiniLM-L6-v2, quantized (384 dimensions, about a quarter of
+/// the full model's size, nearly the same vectors).
+pub const DAEMON_EMBEDDING_MODEL: &str = "AllMiniLML6V2Q";
+
+/// Id of the deterministic test vectors. Not a real model's id, so they are
+/// never mistaken for one's.
+const DETERMINISTIC_MODEL_ID: &str = "deterministic/hashed-384";
+
+/// Length of the deterministic test vectors.
+const DETERMINISTIC_DIMENSIONS: usize = 384;
 
 /// Which models a service runs. Chosen by the caller's constructor, never by
 /// a cargo feature: a test build and the shipped daemon differ only in what
 /// their code asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedderKind {
-    /// AllMiniLM-L6-v2 embeddings.
+    /// A local fastembed model.
     FastEmbed,
     /// Hashed lexical vectors, offline. For tests: nothing is downloaded or
     /// loaded.
@@ -28,7 +29,7 @@ pub enum EmbedderKind {
 
 #[derive(Clone)]
 enum Backend {
-    FastEmbed { model: Arc<OnceCell<SharedModel>> },
+    FastEmbed(Arc<FastEmbedder>),
     Deterministic,
 }
 
@@ -38,13 +39,18 @@ pub struct EmbeddingService {
 }
 
 impl EmbeddingService {
-    /// The daemon's real model: AllMiniLM-L6-v2 embeddings, not loaded until
-    /// first used.
+    /// The daemon's default model ([`DAEMON_EMBEDDING_MODEL`]), not loaded
+    /// until first used.
     pub fn fastembed() -> anyhow::Result<Self> {
+        Self::fastembed_named(DAEMON_EMBEDDING_MODEL)
+    }
+
+    /// A fastembed model by name (see [`FastEmbedder::named`]), not loaded
+    /// until first used.
+    pub fn fastembed_named(name: &str) -> anyhow::Result<Self> {
+        let embedder = FastEmbedder::named(name)?.show_download_progress(true);
         Ok(Self {
-            backend: Backend::FastEmbed {
-                model: Arc::new(OnceCell::new()),
-            },
+            backend: Backend::FastEmbed(Arc::new(embedder)),
         })
     }
 
@@ -59,32 +65,9 @@ impl EmbeddingService {
     /// Which models this service runs.
     pub fn kind(&self) -> EmbedderKind {
         match self.backend {
-            Backend::FastEmbed { .. } => EmbedderKind::FastEmbed,
+            Backend::FastEmbed(_) => EmbedderKind::FastEmbed,
             Backend::Deterministic => EmbedderKind::Deterministic,
         }
-    }
-
-    /// Returns the model, initializing it on first call.
-    async fn get_model(model: &OnceCell<SharedModel>) -> anyhow::Result<SharedModel> {
-        let model = model
-            .get_or_try_init(|| async {
-                task::spawn_blocking(|| {
-                    let mut options = TextInitOptions::default();
-                    options.model_name = EmbeddingModel::AllMiniLML6V2;
-                    // Plain CPU execution. ort's default policy registers
-                    // CoreML on macOS, which for this small model peaked near
-                    // 1 GB of memory (vs ~200 MB) and ran 2-4x slower, with
-                    // the same vectors.
-                    options.auto_device = Some(AutoDevicePolicy::PreferCPU);
-                    options.show_download_progress = true;
-                    let model = TextEmbedding::try_new(options)?;
-                    info!("Embedding model loaded (AllMiniLML6V2)");
-                    Ok::<_, anyhow::Error>(Arc::new(Mutex::new(model)))
-                })
-                .await?
-            })
-            .await?;
-        Ok(model.clone())
     }
 
     /// Compute embedding for a single string.
@@ -98,33 +81,30 @@ impl EmbeddingService {
 
     /// Compute embeddings for multiple strings.
     pub async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-        let model = match &self.backend {
-            Backend::Deterministic => {
-                return Ok(texts
-                    .iter()
-                    .map(|text| deterministic_embedding(text))
-                    .collect());
-            }
-            Backend::FastEmbed { model } => Self::get_model(model).await?,
-        };
-        task::spawn_blocking(move || {
-            let mut guard = model
-                .lock()
-                .map_err(|e| anyhow::anyhow!("embedding model mutex poisoned: {e}"))?;
-            Ok(guard.embed(texts, None)?)
-        })
-        .await?
+        match &self.backend {
+            Backend::Deterministic => Ok(texts
+                .iter()
+                .map(|text| deterministic_embedding(text))
+                .collect()),
+            Backend::FastEmbed(embedder) => Ok(embedder.embed(&texts).await?),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl crate::Embedder for EmbeddingService {
     fn model_id(&self) -> &str {
-        EMBEDDING_MODEL_ID
+        match &self.backend {
+            Backend::FastEmbed(embedder) => embedder.model_id(),
+            Backend::Deterministic => DETERMINISTIC_MODEL_ID,
+        }
     }
 
     fn dimensions(&self) -> usize {
-        384
+        match &self.backend {
+            Backend::FastEmbed(embedder) => embedder.dimensions(),
+            Backend::Deterministic => DETERMINISTIC_DIMENSIONS,
+        }
     }
 
     async fn embed(&self, texts: &[String]) -> crate::Result<Vec<Vec<f32>>> {
@@ -137,7 +117,7 @@ impl crate::Embedder for EmbeddingService {
 fn deterministic_embedding(text: &str) -> Vec<f32> {
     use std::hash::{Hash, Hasher};
 
-    const DIMENSIONS: usize = 384;
+    const DIMENSIONS: usize = DETERMINISTIC_DIMENSIONS;
     const SEMANTIC_DIMENSIONS: usize = 2;
     const LEXICAL_DIMENSIONS: usize = DIMENSIONS - SEMANTIC_DIMENSIONS;
     let mut vector = vec![0.0_f32; DIMENSIONS];

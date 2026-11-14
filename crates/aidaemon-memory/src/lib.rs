@@ -115,7 +115,7 @@ mod types;
 mod writer;
 
 #[cfg(feature = "fastembed")]
-pub use embed::FastEmbedder;
+pub use embed::{DEFAULT_FASTEMBED_MODEL, FastEmbedder};
 pub use embed::{
     Embedder, HashEmbedder, cosine, decode_embedding, decode_embedding_with_dim, encode_embedding,
 };

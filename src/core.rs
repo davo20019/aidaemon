@@ -626,7 +626,7 @@ pub async fn run_memory_export(
         .await?;
     let files = aidaemon_memory::sqlite::SqliteMemory::new(
         pool,
-        Arc::new(crate::startup::stores::daemon_embeddings()?),
+        Arc::new(crate::startup::stores::daemon_embeddings(&config)?),
     )
     .export_readable()
     .await?;

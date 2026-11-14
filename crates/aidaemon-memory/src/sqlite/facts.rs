@@ -483,7 +483,7 @@ impl SqliteMemory {
             };
             for row in rows {
                 let blob: Vec<u8> = row.get("embedding");
-                if let Ok(vector) = decode_embedding(&blob) {
+                if let Ok(vector) = self.embedding_service.decode(&blob) {
                     scores.insert(row.get("id"), cosine_similarity(query_vec, &vector));
                 }
             }
@@ -585,7 +585,7 @@ impl SqliteMemory {
             separated.push_unseparated(")");
             for row in builder.build().fetch_all(&self.pool).await? {
                 let blob: Vec<u8> = row.get("embedding");
-                if let Ok(vector) = decode_embedding(&blob) {
+                if let Ok(vector) = self.embedding_service.decode(&blob) {
                     cached.insert(row.get("content_hash"), vector);
                 }
             }
@@ -924,7 +924,7 @@ impl FactStore for SqliteMemory {
             std::collections::BTreeMap::new();
         for row in rows {
             let blob: Vec<u8> = row.get("embedding");
-            let Ok(vector) = decode_embedding(&blob) else {
+            let Ok(vector) = self.embedding_service.decode(&blob) else {
                 continue;
             };
             let category: String = row.get("category");
@@ -1246,7 +1246,7 @@ impl FactStore for SqliteMemory {
             // than storing a second copy that competes for recall slots.
             if let Some(new_vec) = embedding_blob
                 .as_deref()
-                .and_then(|blob| decode_embedding(blob).ok())
+                .and_then(|blob| self.embedding_service.decode(blob).ok())
             {
                 let candidates = sqlx::query(
                     "SELECT id, key, value, embedding FROM facts
@@ -1259,7 +1259,7 @@ impl FactStore for SqliteMemory {
                     let other_key: String = row.get("key");
                     let other_value: String = row.get("value");
                     let blob: Vec<u8> = row.get("embedding");
-                    let other_vec = decode_embedding(&blob).ok()?;
+                    let other_vec = self.embedding_service.decode(&blob).ok()?;
                     let sim = cosine_similarity(&new_vec, &other_vec);
                     facts_are_restatements(
                         category_clean,
@@ -1550,7 +1550,7 @@ impl FactStore for SqliteMemory {
         //   (prevents cross-concept supersession in the same category)
         if source == "agent"
             && let Some(ref new_emb_blob) = embedding_blob
-            && let Ok(new_vec) = decode_embedding(new_emb_blob)
+            && let Ok(new_vec) = self.embedding_service.decode(new_emb_blob)
         {
             let others = sqlx::query(
                 "SELECT id, key, value, embedding FROM facts
@@ -1588,7 +1588,7 @@ impl FactStore for SqliteMemory {
                     continue;
                 }
 
-                if let Ok(other_vec) = decode_embedding(&blob) {
+                if let Ok(other_vec) = self.embedding_service.decode(&blob) {
                     let sim = cosine_similarity(&new_vec, &other_vec);
                     // High similarity on full-fact embedding (value-aware)
                     // means these facts describe the same concept.  Only

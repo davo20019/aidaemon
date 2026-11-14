@@ -337,3 +337,73 @@ async fn fact_dedup_embeds_each_stored_key_once() {
         "existing keys must not be re-embedded: first write {first}, second {second}"
     );
 }
+
+/// Another model: its own id and dimension.
+struct OtherModel(HashEmbedder);
+
+#[async_trait]
+impl crate::Embedder for OtherModel {
+    fn model_id(&self) -> &str {
+        "synthetic/other-model"
+    }
+    fn dimensions(&self) -> usize {
+        crate::Embedder::dimensions(&self.0)
+    }
+    async fn embed(&self, texts: &[String]) -> crate::Result<Vec<Vec<f32>>> {
+        crate::Embedder::embed(&self.0, texts).await
+    }
+}
+
+#[tokio::test]
+async fn a_new_embedding_model_replaces_every_vector_of_the_old_one() {
+    let (old, _file) = open().await;
+    old.upsert_fact(
+        "project",
+        "orion_cache",
+        "kestrel holds the build cache",
+        "synthetic",
+        None,
+        FactPrivacy::Global,
+    )
+    .await
+    .unwrap();
+    assert_eq!(old.forget_other_models_vectors().await.unwrap(), 0);
+
+    let new = SqliteMemory::new(
+        old.pool().clone(),
+        Arc::new(OtherModel(HashEmbedder::new(768))),
+    );
+    assert!(new.forget_other_models_vectors().await.unwrap() > 0);
+    let left: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM memory_embeddings)
+              + (SELECT COUNT(*) FROM facts WHERE embedding IS NOT NULL)",
+    )
+    .fetch_one(new.pool())
+    .await
+    .unwrap();
+    assert_eq!(left, 0, "no vector of the old model survives");
+
+    assert_eq!(new.backfill_fact_embeddings().await.unwrap(), 1);
+    let models: Vec<(String, i64)> =
+        sqlx::query_as("SELECT DISTINCT embedding_model, embedding_dim FROM memory_embeddings")
+            .fetch_all(new.pool())
+            .await
+            .unwrap();
+    assert_eq!(models, vec![("synthetic/other-model".to_string(), 768)]);
+    assert_eq!(new.forget_other_models_vectors().await.unwrap(), 0);
+
+    // The 768-dimension vectors are read back, not rejected as the old size.
+    let query = crate::Embedder::embed(
+        &OtherModel(HashEmbedder::new(768)),
+        &["kestrel build cache".to_string()],
+    )
+    .await
+    .unwrap()
+    .remove(0);
+    assert!(
+        !new.fact_embedding_scores(&query, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

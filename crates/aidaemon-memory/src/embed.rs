@@ -158,7 +158,7 @@ impl Embedder for HashEmbedder {
 }
 
 #[cfg(feature = "fastembed")]
-pub use fast::FastEmbedder;
+pub use fast::{DEFAULT_FASTEMBED_MODEL, FastEmbedder};
 
 #[cfg(feature = "fastembed")]
 mod fast {
@@ -172,10 +172,20 @@ mod fast {
     use super::Embedder;
     use crate::error::{MemoryError, Result};
 
-    /// Local AllMiniLM-L6-v2 (384 dimensions) via fastembed, the daemon's
-    /// embedding model. The model is downloaded and loaded lazily on the
-    /// first `embed` call; loading and inference run on `spawn_blocking`.
+    /// The model [`FastEmbedder::new`] runs: AllMiniLM-L6-v2, 384
+    /// dimensions.
+    pub const DEFAULT_FASTEMBED_MODEL: &str = "AllMiniLML6V2";
+
+    /// The id vectors of AllMiniLM-L6-v2 have always been stored under.
+    const LEGACY_MINILM_ID: &str = "fastembed/all-MiniLM-L6-v2";
+
+    /// A local ONNX text-embedding model via fastembed. The model is
+    /// downloaded and loaded lazily on the first `embed` call; loading and
+    /// inference run on `spawn_blocking`.
     pub struct FastEmbedder {
+        choice: EmbeddingModel,
+        model_id: String,
+        dimensions: usize,
         cache_dir: Option<PathBuf>,
         show_download_progress: bool,
         // fastembed's `embed` takes `&mut self`: one call at a time.
@@ -183,15 +193,45 @@ mod fast {
     }
 
     impl FastEmbedder {
-        /// Model id persisted beside vectors (same as the daemon's).
-        pub const MODEL_ID: &'static str = "fastembed/all-MiniLM-L6-v2";
-
+        /// AllMiniLM-L6-v2 ([`DEFAULT_FASTEMBED_MODEL`]).
         pub fn new() -> Self {
-            Self {
+            Self::named(DEFAULT_FASTEMBED_MODEL).expect("the default model is supported")
+        }
+
+        /// Any text model fastembed supports, by its `EmbeddingModel`
+        /// variant name, case-insensitive: `"AllMiniLML6V2Q"`,
+        /// `"BGESmallENV15"`, `"ParaphraseMLMiniLML12V2"`, ...
+        pub fn named(name: &str) -> Result<Self> {
+            let choice: EmbeddingModel = name.trim().parse().map_err(|_| {
+                MemoryError::Embedding(format!(
+                    "unknown embedding model `{name}`; supported: {}",
+                    Self::supported().join(", ")
+                ))
+            })?;
+            let dimensions = TextEmbedding::get_model_info(&choice)
+                .map_err(|e| MemoryError::Embedding(e.to_string()))?
+                .dim;
+            let model_id = if choice == EmbeddingModel::AllMiniLML6V2 {
+                LEGACY_MINILM_ID.to_string()
+            } else {
+                format!("fastembed/{choice:?}")
+            };
+            Ok(Self {
+                choice,
+                model_id,
+                dimensions,
                 cache_dir: None,
                 show_download_progress: false,
                 model: OnceCell::new(),
-            }
+            })
+        }
+
+        /// The names [`FastEmbedder::named`] accepts.
+        pub fn supported() -> Vec<String> {
+            TextEmbedding::list_supported_models()
+                .into_iter()
+                .map(|info| format!("{:?}", info.model))
+                .collect()
         }
 
         /// Where model files are cached (fastembed's default otherwise).
@@ -206,13 +246,14 @@ mod fast {
         }
 
         async fn model(&self) -> Result<Arc<Mutex<TextEmbedding>>> {
+            let choice = self.choice.clone();
             let cache_dir = self.cache_dir.clone();
             let progress = self.show_download_progress;
             self.model
                 .get_or_try_init(|| async move {
                     tokio::task::spawn_blocking(move || {
-                        let mut options = TextInitOptions::new(EmbeddingModel::AllMiniLML6V2)
-                            .with_show_download_progress(progress);
+                        let mut options =
+                            TextInitOptions::new(choice).with_show_download_progress(progress);
                         // Plain CPU: ort's default registers CoreML on macOS,
                         // which costs ~5x the memory for this model and is slower.
                         options.auto_device = Some(AutoDevicePolicy::PreferCPU);
@@ -240,11 +281,11 @@ mod fast {
     #[async_trait]
     impl Embedder for FastEmbedder {
         fn model_id(&self) -> &str {
-            Self::MODEL_ID
+            &self.model_id
         }
 
         fn dimensions(&self) -> usize {
-            384
+            self.dimensions
         }
 
         async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -333,5 +374,27 @@ mod tests {
         let e = FastEmbedder::new();
         let out = e.embed(&["Mia and Zoe".to_string()]).await.unwrap();
         assert_eq!(out[0].len(), 384);
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn models_are_chosen_by_name_with_their_own_id_and_dimensions() {
+        let default = FastEmbedder::new();
+        assert_eq!(default.model_id(), "fastembed/all-MiniLM-L6-v2");
+        assert_eq!(default.dimensions(), 384);
+
+        let quantized = FastEmbedder::named("allminilml6v2q").unwrap();
+        assert_eq!(quantized.model_id(), "fastembed/AllMiniLML6V2Q");
+        assert_eq!(quantized.dimensions(), 384);
+
+        assert_eq!(
+            FastEmbedder::named("BGEBaseENV15").unwrap().dimensions(),
+            768
+        );
+        let unknown = FastEmbedder::named("no-such-model")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(unknown.contains("AllMiniLML6V2Q"), "{unknown}");
     }
 }

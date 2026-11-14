@@ -3,7 +3,8 @@
 
 use super::*;
 use aidaemon_core::ChannelVisibility;
-use aidaemon_memory::embeddings::EMBEDDING_MODEL_ID;
+/// Any model id: these tests write and search the index under it directly.
+const EMBEDDING_MODEL_ID: &str = "synthetic/test-model";
 use aidaemon_memory::records::*;
 use aidaemon_memory::stores::GraphSearchScope;
 

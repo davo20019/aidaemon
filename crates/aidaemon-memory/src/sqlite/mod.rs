@@ -45,12 +45,9 @@ pub use facts::{
 pub use retention::{MemoryRetention, MemoryRetentionPolicy, MemoryRetentionStats};
 pub use schema::{migrate, rebuild_memory_fts_projections};
 
-/// Dimension of the vectors in databases written so far (AllMiniLM-L6-v2).
+/// Dimension of the test embedders' vectors.
+#[cfg(test)]
 const EMBEDDING_DIM: usize = 384;
-
-fn decode_embedding(blob: &[u8]) -> anyhow::Result<Vec<f32>> {
-    decode_embedding_with_dim(blob, EMBEDDING_DIM).map_err(anyhow::Error::from)
-}
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     crate::cosine(a, b)
@@ -129,6 +126,13 @@ impl QueryMemo {
 impl StoreModels {
     fn model_id(&self) -> String {
         self.embedder.model_id().to_string()
+    }
+
+    /// A stored vector of this model's dimension (binary, or the legacy
+    /// JSON form); anything else is an error, never a vector of another
+    /// length.
+    fn decode(&self, blob: &[u8]) -> anyhow::Result<Vec<f32>> {
+        decode_embedding_with_dim(blob, self.embedder.dimensions()).map_err(anyhow::Error::from)
     }
 
     async fn embed(&self, text: String) -> anyhow::Result<Vec<f32>> {

@@ -23,7 +23,7 @@ pub fn handle_node_command(args: &[String], config_path: &Path) -> anyhow::Resul
         let resolved =
             crate::startup::db_security::resolve_db_path(config_path, &config.state.db_path);
         config.state.db_path = resolved.to_string_lossy().into_owned();
-        let embeddings = Arc::new(crate::startup::stores::daemon_embeddings()?);
+        let embeddings = Arc::new(crate::startup::stores::daemon_embeddings(&config)?);
         let state = crate::startup::stores::open_daemon_state(&config, embeddings).await?;
         let store = Arc::new(super::store::NodeStore::new(
             state.pool(),

@@ -184,6 +184,11 @@ working_memory_cap = 50
 # [memory]
 # backend = "daemon"
 # path = "aidaemon-memory.db"
+# Local embedding model (fastembed name), e.g. "AllMiniLML6V2Q" (default),
+# "AllMiniLML6V2", "BGESmallENV15", "BGEBaseENV15" (768 dims) or
+# "ParaphraseMLMiniLML12V2" (multilingual). Changing it re-embeds stored
+# memory once, in the background; lexical recall works meanwhile.
+# embedding_model = "AllMiniLML6V2Q"
 
 # Exact user/assistant recall follows this canonical-event retention window.
 # Set messages_days = 0 for opt-in permanent active-database history.

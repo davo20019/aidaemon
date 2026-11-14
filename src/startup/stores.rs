@@ -28,8 +28,9 @@ pub struct StoreBundle {
 
 /// The embedder every daemon process uses: the real models, loaded on
 /// first use. Tests build their own (`EmbeddingService::deterministic`).
-pub fn daemon_embeddings() -> anyhow::Result<EmbeddingService> {
-    EmbeddingService::fastembed().map_err(|e| anyhow::anyhow!("Failed to init embeddings: {}", e))
+pub fn daemon_embeddings(config: &AppConfig) -> anyhow::Result<EmbeddingService> {
+    EmbeddingService::fastembed_named(&config.memory.embedding_model)
+        .map_err(|e| anyhow::anyhow!("[memory] embedding_model: {e:#}"))
 }
 
 /// Opens the daemon's state database as every daemon process does: in WAL
@@ -52,8 +53,11 @@ pub async fn build_stores(
     config: &AppConfig,
     paths: crate::execution::LexicalPaths,
 ) -> anyhow::Result<StoreBundle> {
-    let embedding_service = Arc::new(daemon_embeddings()?);
-    info!("Embedding service initialized (AllMiniLML6V2)");
+    let embedding_service = Arc::new(daemon_embeddings(config)?);
+    info!(
+        model = %config.memory.embedding_model,
+        "Embedding service initialized"
+    );
 
     // Before the migrations in `open_daemon_state` change the schema.
     super::db_upkeep::snapshot_before_upgrade(&config.state).await;
@@ -69,16 +73,34 @@ pub async fn build_stores(
     // Another memory system leaves the daemon's tables as they are.
     let own_memory = config.memory.backend == crate::config::MemoryBackend::Daemon;
     if own_memory {
-        if let Ok(count) = state.memory().backfill_episode_embeddings().await
-            && count > 0
-        {
-            info!(count, "Backfilled missing episode embeddings");
-        }
-
-        if let Ok(count) = state.memory().backfill_fact_embeddings().await
-            && count > 0
-        {
-            info!(count, "Backfilled missing fact embeddings");
+        // A changed `[memory] embedding_model` re-embeds everything: off the
+        // startup path, while lexical recall serves. Procedures and error
+        // solutions follow through the memory jobs' learning backfill.
+        let model_changed = match state.memory().forget_other_models_vectors().await {
+            Ok(dropped) => dropped > 0,
+            Err(error) => {
+                tracing::warn!(%error, "Could not check the stored embedding model");
+                false
+            }
+        };
+        let backfill_state = state.clone();
+        let backfill = async move {
+            let memory = backfill_state.memory();
+            if let Ok(count) = memory.backfill_episode_embeddings().await
+                && count > 0
+            {
+                info!(count, "Backfilled missing episode embeddings");
+            }
+            if let Ok(count) = memory.backfill_fact_embeddings().await
+                && count > 0
+            {
+                info!(count, "Backfilled missing fact embeddings");
+            }
+        };
+        if model_changed {
+            tokio::spawn(backfill);
+        } else {
+            backfill.await;
         }
     }
 
@@ -230,11 +252,15 @@ mod tests {
     /// feature a test build turns on.
     #[tokio::test]
     async fn the_daemon_store_journals_in_wal_with_the_real_models() {
-        let embeddings = daemon_embeddings().unwrap();
+        let mut config: AppConfig = toml::from_str("[provider]\napi_key = \"test-key\"\n").unwrap();
+        let embeddings = daemon_embeddings(&config).unwrap();
         assert_eq!(embeddings.kind(), EmbedderKind::FastEmbed);
+        assert_eq!(
+            aidaemon_memory::Embedder::model_id(&embeddings),
+            "fastembed/AllMiniLML6V2Q"
+        );
 
         let dir = tempfile::tempdir().unwrap();
-        let mut config: AppConfig = toml::from_str("[provider]\napi_key = \"test-key\"\n").unwrap();
         config.state.db_path = dir.path().join("state.db").display().to_string();
         let state = open_daemon_state(&config, Arc::new(embeddings))
             .await

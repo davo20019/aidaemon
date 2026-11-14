@@ -172,7 +172,7 @@ impl EpisodeStore for SqliteMemory {
                     .copied()
                     .or_else(|| {
                         row.get::<Option<Vec<u8>>, _>("embedding")
-                            .and_then(|blob| decode_embedding(&blob).ok())
+                            .and_then(|blob| self.embedding_service.decode(&blob).ok())
                             .map(|vec| cosine_similarity(query_vec, &vec))
                     })
                     .or_else(|| {
@@ -250,7 +250,7 @@ impl EpisodeStore for SqliteMemory {
                     .copied()
                     .or_else(|| {
                         row.get::<Option<Vec<u8>>, _>("embedding")
-                            .and_then(|blob| decode_embedding(&blob).ok())
+                            .and_then(|blob| self.embedding_service.decode(&blob).ok())
                             .map(|vec| cosine_similarity(query_vec, &vec))
                     })
                     .or_else(|| {

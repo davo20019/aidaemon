@@ -284,6 +284,11 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub learn_from_history: bool,
+    /// The local embedding model, by fastembed's model name
+    /// (`AllMiniLML6V2Q`, `BGESmallENV15`, `ParaphraseMLMiniLML12V2`, ...).
+    /// Changing it re-embeds the stored memory once, in the background.
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
 }
 
 impl Default for MemoryConfig {
@@ -292,8 +297,13 @@ impl Default for MemoryConfig {
             backend: MemoryBackend::default(),
             path: default_sdk_memory_path(),
             learn_from_history: false,
+            embedding_model: default_embedding_model(),
         }
     }
+}
+
+fn default_embedding_model() -> String {
+    aidaemon_memory::embeddings::DAEMON_EMBEDDING_MODEL.to_string()
 }
 
 fn default_sdk_memory_path() -> String {

@@ -369,7 +369,7 @@ impl SqliteMemory {
                 .await?;
 
         if let Some(blob) = row.get::<Option<Vec<u8>>, _>("embedding")
-            && let Ok(embedding) = decode_embedding(&blob)
+            && let Ok(embedding) = self.embedding_service.decode(&blob)
         {
             self.embedding_index
                 .upsert(EmbeddingItem {
@@ -435,7 +435,7 @@ impl SqliteMemory {
                 .fetch_one(&self.pool)
                 .await?;
         if let Some(blob) = row.get::<Option<Vec<u8>>, _>("embedding")
-            && let Ok(embedding) = decode_embedding(&blob)
+            && let Ok(embedding) = self.embedding_service.decode(&blob)
         {
             self.embedding_index
                 .upsert(EmbeddingItem {
@@ -572,7 +572,7 @@ impl SqliteMemory {
                 after_id = id;
                 let content: String = row.get("trigger_pattern");
                 let blob: Vec<u8> = row.get("trigger_embedding");
-                if let Ok(embedding) = decode_embedding(&blob) {
+                if let Ok(embedding) = self.embedding_service.decode(&blob) {
                     self.upsert_owner_embedding("procedure", id, "trigger", &content, embedding)
                         .await?;
                     procedure_count += 1;
@@ -608,7 +608,7 @@ impl SqliteMemory {
                 after_id = id;
                 let content: String = row.get("error_pattern");
                 let blob: Vec<u8> = row.get("error_embedding");
-                if let Ok(embedding) = decode_embedding(&blob) {
+                if let Ok(embedding) = self.embedding_service.decode(&blob) {
                     self.upsert_owner_embedding("error_solution", id, "error", &content, embedding)
                         .await?;
                     error_count += 1;

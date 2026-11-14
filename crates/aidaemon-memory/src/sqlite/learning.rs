@@ -141,7 +141,7 @@ impl LearningStore for SqliteMemory {
         .map_err(|error| store_error(error.into()))?;
         Ok(blobs
             .iter()
-            .filter_map(|blob| decode_embedding(blob).ok())
+            .filter_map(|blob| self.embedding_service.decode(blob).ok())
             .collect())
     }
 

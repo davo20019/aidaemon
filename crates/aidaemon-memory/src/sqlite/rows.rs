@@ -91,7 +91,7 @@ impl SqliteMemory {
                     .copied()
                     .or_else(|| {
                         row.get::<Option<Vec<u8>>, _>("embedding")
-                            .and_then(|blob| decode_embedding(&blob).ok())
+                            .and_then(|blob| self.embedding_service.decode(&blob).ok())
                             .map(|vec| cosine_similarity(query_vec, &vec))
                     })
                     .or_else(|| {
@@ -188,6 +188,45 @@ impl SqliteMemory {
             tracing::warn!(%error, episode_id, "Deferred episode memory projection");
         }
         Ok(())
+    }
+
+    /// Drops every vector another embedding model wrote, so the backfills
+    /// re-embed with this one. Two models' vectors do not share a space:
+    /// compared, they score noise, even at the same dimension. The vectors
+    /// on `facts`, `episodes`, `procedures` and `error_solutions` carry no
+    /// model, so they go too when the index holds another model's.
+    /// Every row of `memory_embeddings` is derived (from those columns, or
+    /// recomputed on demand), so the whole index is dropped with them.
+    /// Returns how many of another model's indexed vectors there were (0:
+    /// nothing changed).
+    pub async fn forget_other_models_vectors(&self) -> anyhow::Result<u64> {
+        let model = self.embedding_service.model_id();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let dropped = sqlx::query("DELETE FROM memory_embeddings WHERE embedding_model != ?")
+            .bind(&model)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if dropped == 0 {
+            tx.rollback().await?;
+            return Ok(0);
+        }
+        for statement in [
+            "UPDATE facts SET embedding = NULL WHERE embedding IS NOT NULL",
+            "UPDATE episodes SET embedding = NULL WHERE embedding IS NOT NULL",
+            "UPDATE procedures SET trigger_embedding = NULL WHERE trigger_embedding IS NOT NULL",
+            "UPDATE error_solutions SET error_embedding = NULL WHERE error_embedding IS NOT NULL",
+            "DELETE FROM memory_embeddings",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        tracing::info!(
+            dropped,
+            model = %model,
+            "Embedding model changed: dropped the old model's vectors to re-embed"
+        );
+        Ok(dropped)
     }
 
     /// Backfill missing episode embeddings.
@@ -713,7 +752,7 @@ impl SqliteMemory {
             let score = if let Some(score) = indexed_scores.get(&procedure.id) {
                 *score
             } else if let Some(blob) = embedding {
-                if let Ok(vec) = decode_embedding(&blob) {
+                if let Ok(vec) = self.embedding_service.decode(&blob) {
                     cosine_similarity(&query_vec, &vec)
                 } else {
                     0.0
@@ -1079,7 +1118,7 @@ impl SqliteMemory {
             let score = if let Some(score) = indexed_scores.get(&solution.id) {
                 *score
             } else if let Some(blob) = embedding {
-                if let Ok(vec) = decode_embedding(&blob) {
+                if let Ok(vec) = self.embedding_service.decode(&blob) {
                     cosine_similarity(&query_vec, &vec)
                 } else {
                     0.0

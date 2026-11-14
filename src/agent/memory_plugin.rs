@@ -128,11 +128,23 @@ pub(crate) async fn configured_memory(
                 side_calls.provider(crate::llm_runtime::side_calls::SideCall::FactExtraction),
                 fast_model,
             );
-            let builder = aidaemon_memory::Memory::builder(
-                Arc::new(store),
-                Arc::new(aidaemon_memory::FastEmbedder::new()),
-            )
-            .extractor(extractor);
+            let embedder: Arc<dyn aidaemon_memory::Embedder> =
+                match aidaemon_memory::FastEmbedder::named(&config.embedding_model) {
+                    Ok(embedder) => Arc::new(embedder),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "[memory] embedding_model is not usable; using the daemon's memory"
+                        );
+                        return ConfiguredMemory::daemons_own();
+                    }
+                };
+            let store: Arc<dyn aidaemon_memory::MemoryStore> = Arc::new(store);
+            reembed_in_background(aidaemon_memory::Memory::builder(
+                store.clone(),
+                embedder.clone(),
+            ));
+            let builder = aidaemon_memory::Memory::builder(store, embedder).extractor(extractor);
             tracing::info!(path = %config.path, "Memory backend: aidaemon-memory");
             let system: Arc<dyn aidaemon_policies::MemorySystem> =
                 Arc::new(aidaemon_memory::ScopedMemory::new(builder));
@@ -725,4 +737,37 @@ mod tests {
         assert_eq!(learned_after_one_turn(false).await, 1);
         assert_eq!(learned_after_one_turn(true).await, 0);
     }
+}
+
+/// Gives every record of the `sdk` store a vector from the configured model:
+/// after `[memory] embedding_model` changes, until this pass finishes, the
+/// old vectors are ignored and recall is lexical.
+#[cfg(feature = "sdk-memory")]
+fn reembed_in_background(builder: aidaemon_memory::MemoryBuilder) {
+    let memory = builder.build();
+    tokio::spawn(async move {
+        let mut cursor = None;
+        let mut updated = 0usize;
+        loop {
+            match memory
+                .reembed_batch(aidaemon_memory::MAX_REEMBED_BATCH, cursor.as_ref())
+                .await
+            {
+                Ok(report) => {
+                    updated += report.updated;
+                    match report.next {
+                        Some(next) => cursor = Some(next),
+                        None => break,
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Re-embedding the sdk memory store stopped");
+                    break;
+                }
+            }
+        }
+        if updated > 0 {
+            tracing::info!(updated, "Re-embedded the sdk memory store");
+        }
+    });
 }
