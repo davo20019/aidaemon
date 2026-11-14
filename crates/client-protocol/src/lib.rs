@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 4;
+pub const PROTOCOL_MINOR: u16 = 5;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -111,6 +111,10 @@ pub enum ServerFrame {
         owner: OwnerInfo,
         /// The newest `seq` in the log when the socket opened.
         latest_seq: u64,
+        /// First-run setup still to finish (protocol 1.5). `None`: the
+        /// daemon is set up.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        setup: Option<SetupState>,
     },
     /// Everything a client needs when it cannot resume: drop the cache and
     /// start from this state. Events after `seq` follow.
@@ -289,6 +293,11 @@ pub enum Command {
     /// change asks for approval first, and the reply says so; its result
     /// then arrives as a `settings_updated` event.
     ChangeSettings { change: SettingsChange },
+    /// Where first-run setup stands (protocol 1.5).
+    GetSetup,
+    /// A step of first-run setup (protocol 1.5). A daemon still in setup
+    /// answers only this, `get_setup` and pings.
+    Setup { action: SetupAction },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -393,6 +402,10 @@ pub enum CommandResult {
     /// `change_settings`: done, or waiting for an approval.
     SettingsChanged {
         outcome: SettingsOutcome,
+    },
+    /// `get_setup` and `setup`: where setup stands now.
+    Setup {
+        setup: SetupState,
     },
     #[serde(other)]
     #[schemars(skip)]
@@ -699,6 +712,199 @@ pub enum SettingsOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// First-run setup (protocol 1.5)
+// ---------------------------------------------------------------------------
+
+/// Where first-run setup stands.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct SetupState {
+    pub step: SetupStep,
+    /// Models already on this machine (a sign-in, a key in the
+    /// environment), each tried once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub found: Vec<FoundModel>,
+    /// Every provider the owner may pick, subscription sign-in first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderOption>,
+    /// The model that passed its test, in plain words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// A subscription sign-in under way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<SignIn>,
+    /// The chats this daemon can be reached on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<ChannelOption>,
+    /// A chat connected in this setup, waiting for (or past) its first
+    /// message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<ChannelWait>,
+    /// What the owner should know (where secrets were stored, why a check
+    /// failed), in plain words.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
+    /// The daemon runs on a machine of its own (a server), not this
+    /// computer: what it says about sleep and sign-in differs.
+    #[serde(default)]
+    pub on_server: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupStep {
+    /// Connect a model (required).
+    #[default]
+    Model,
+    /// The model works and the daemon is starting with it.
+    Starting,
+    /// Reach the agent from a phone (may be skipped).
+    Channel,
+    /// Set up.
+    Done,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// How a provider is paid for.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Billing {
+    /// Uses a subscription the owner already pays for; it has limits.
+    Plan,
+    /// Billed per token by the provider.
+    PerToken,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// A model connection already on this machine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct FoundModel {
+    /// The provider preset (`openai_chatgpt`, `openai`, ...).
+    pub preset: String,
+    /// The provider and model, in plain words.
+    pub name: String,
+    /// Where it was found ("ChatGPT sign-in on this computer").
+    pub source: String,
+    pub billing: Billing,
+    /// It answered a test call.
+    pub works: bool,
+    /// Why not, when it did not.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+/// A provider the owner may connect.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ProviderOption {
+    pub preset: String,
+    pub name: String,
+    pub billing: Billing,
+    /// Connected with an API key (else with a sign-in).
+    pub needs_key: bool,
+    /// Where to get one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_url: String,
+    /// The owner names the address (a custom endpoint).
+    #[serde(default)]
+    pub needs_base_url: bool,
+    /// The model it starts with.
+    pub model: String,
+}
+
+/// A subscription sign-in waiting for the owner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct SignIn {
+    /// Open this in a browser.
+    pub url: String,
+    /// The browser cannot return to the daemon by itself: paste the address
+    /// it ends on (`finish_sign_in`).
+    #[serde(default)]
+    pub paste: bool,
+}
+
+/// A chat the daemon can be reached on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ChannelOption {
+    /// `telegram`, `slack` or `discord`.
+    pub platform: String,
+    pub name: String,
+    /// Where to make a bot and get its token.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub help_url: String,
+    /// It takes a second token (Slack's app token).
+    #[serde(default)]
+    pub needs_app_token: bool,
+}
+
+/// A chat connected during setup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ChannelWait {
+    pub platform: String,
+    /// The bot, as the owner finds it (`@synthetic_bot`).
+    pub bot: String,
+    /// The owner's first message arrived and was answered there.
+    #[serde(default)]
+    pub connected: bool,
+}
+
+/// One step of first-run setup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SetupAction {
+    /// Look for models on this machine again, and test them.
+    Detect,
+    /// Use `found` entry `index` (from 0).
+    UseFound { index: u32 },
+    /// Start the subscription sign-in. `paste`: the browser is on another
+    /// device and cannot reach the daemon's sign-in listener.
+    SignIn {
+        #[serde(default)]
+        paste: bool,
+    },
+    /// The address the sign-in's browser ended on.
+    FinishSignIn { redirect: String },
+    /// Connect a provider with an API key (`None` for one that needs none);
+    /// it is tested before anything is saved.
+    ConnectModel {
+        provider: ProviderChoice,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<SecretText>,
+    },
+    /// Connect a chat bot by its token.
+    ConnectChannel {
+        platform: String,
+        token: SecretText,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_token: Option<SecretText>,
+    },
+    /// Leave the chat step for later.
+    SkipChannel,
+    /// The chat step is done.
+    Finish,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// A feature the agent can ask to have turned on.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Feature {
+    /// Browsing websites.
+    Browser,
+    /// Understanding voice notes.
+    Voice,
+    /// Seeing and using this computer's screen.
+    ComputerUse,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+// ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 
@@ -729,6 +935,10 @@ pub enum Event {
     AssistantMessage {
         session_id: String,
         text: String,
+        /// Things the owner might ask next, shown as prompts to press
+        /// (protocol 1.5).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        suggestions: Vec<String>,
     },
     TurnStarted {
         turn_id: String,
@@ -796,6 +1006,20 @@ pub enum Event {
         ok: bool,
         message: String,
     },
+    /// Ephemeral: first-run setup moved on (a sign-in finished, a model
+    /// passed its test, a channel heard its first message); protocol 1.5.
+    SetupUpdated {
+        setup: SetupState,
+    },
+    /// The agent needs a feature that is off for what it was asked to do
+    /// (protocol 1.5). The client offers to turn it on; nothing changes
+    /// until the owner does.
+    FeatureRequested {
+        session_id: String,
+        feature: Feature,
+        /// What it is needed for, in the agent's words.
+        reason: String,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -810,6 +1034,7 @@ impl Event {
                 | Event::TurnStatus { .. }
                 | Event::ViewAction { .. }
                 | Event::SettingsUpdated { .. }
+                | Event::SetupUpdated { .. }
         )
     }
 
@@ -831,6 +1056,8 @@ impl Event {
             Event::GoalUpdated { .. } => "goal_updated",
             Event::ViewAction { .. } => "view_action",
             Event::SettingsUpdated { .. } => "settings_updated",
+            Event::SetupUpdated { .. } => "setup_updated",
+            Event::FeatureRequested { .. } => "feature_requested",
             Event::Unknown => "unknown",
         }
     }
@@ -1718,7 +1945,8 @@ mod tests {
         assert!(
             Event::AssistantMessage {
                 session_id: "s".into(),
-                text: "x".into()
+                text: "x".into(),
+                suggestions: Vec::new(),
             }
             .is_durable()
         );

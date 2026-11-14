@@ -30,6 +30,7 @@ mod config;
 mod observer;
 pub mod pairing;
 mod server;
+pub mod setup;
 pub mod token;
 pub mod views;
 
@@ -44,8 +45,8 @@ use aidaemon_channels::turns::{MidRunPlacement, Turn, TurnDeps, TurnRunner};
 use aidaemon_client_protocol::{
     Applies, ApprovalDecision, ClientKind, Command, CommandResult, ErrorCode, Event, Glance,
     HistoryMessage, LastReply, MemoryItem, MidRun, OwnerInfo, ProtocolError, Risk, Scope,
-    SearchHit, ServerFrame, SessionSummary, Settings, SettingsChange, SettingsOutcome,
-    SlashCommand, Snapshot, TaskState, TaskSummary,
+    SearchHit, ServerFrame, SessionSummary, Settings, SettingsChange, SettingsOutcome, SetupAction,
+    SetupState, SlashCommand, Snapshot, TaskState, TaskSummary,
 };
 use aidaemon_store_sqlite::SqliteClientEventLog;
 use aidaemon_tools::semantics::UserRole;
@@ -130,6 +131,17 @@ pub trait ClientHost: Send + Sync {
 
     /// A signed-in client sent a command: it reaches the gateway.
     fn client_seen(&self) {}
+
+    /// First-run setup still to finish; `None` when there is none.
+    async fn setup(&self) -> Option<SetupState> {
+        None
+    }
+
+    /// Take a step of first-run setup. `Err`: it could not be taken, and
+    /// why, in plain words.
+    async fn setup_step(&self, _action: SetupAction) -> Result<SetupState, String> {
+        Err("This daemon is already set up".to_string())
+    }
 }
 
 /// What a settings change needs before it runs.
@@ -156,6 +168,11 @@ pub struct SettingsDone {
 
 /// The session a settings change's approval card belongs to.
 pub const SETTINGS_SESSION: &str = "app:settings";
+
+/// A new app conversation's id.
+pub fn new_app_session_id() -> String {
+    format!("{APP_SESSION_PREFIX}{}", uuid::Uuid::new_v4().simple())
+}
 
 /// How long a settings change waits for its approval.
 const SETTINGS_APPROVAL_WAIT: Duration = Duration::from_secs(10 * 60);
@@ -380,6 +397,11 @@ impl ClientGateway {
         self.host.owner()
     }
 
+    /// First-run setup still to finish.
+    pub async fn setup(&self) -> Option<SetupState> {
+        self.host.setup().await
+    }
+
     pub fn pairing(&self) -> &Arc<Pairing> {
         &self.pairing
     }
@@ -508,8 +530,11 @@ impl ClientGateway {
             | Command::SearchMessages { .. }
             | Command::ListCommands
             | Command::ListMemories
-            | Command::GetSettings => Some(Scope::Observe),
-            Command::ForgetMemory { .. } | Command::ChangeSettings { .. } => Some(Scope::Chat),
+            | Command::GetSettings
+            | Command::GetSetup => Some(Scope::Observe),
+            Command::ForgetMemory { .. }
+            | Command::ChangeSettings { .. }
+            | Command::Setup { .. } => Some(Scope::Chat),
             Command::Unknown => None,
         };
         if let Some(scope) = needs
@@ -668,6 +693,26 @@ impl ClientGateway {
                 }
             },
             Command::ChangeSettings { change } => self.change_settings(change, caller).await,
+            Command::GetSetup => Ok(CommandResult::Setup {
+                setup: self.host.setup().await.unwrap_or_else(|| SetupState {
+                    step: aidaemon_client_protocol::SetupStep::Done,
+                    ..SetupState::default()
+                }),
+            }),
+            Command::Setup { action } => {
+                let setup = self
+                    .host
+                    .setup_step(action)
+                    .await
+                    .map_err(|message| ProtocolError::new(ErrorCode::Invalid, message))?;
+                self.publisher.publish(
+                    None,
+                    Event::SetupUpdated {
+                        setup: setup.clone(),
+                    },
+                );
+                Ok(CommandResult::Setup { setup })
+            }
             Command::Unknown => Err(ProtocolError::new(
                 ErrorCode::Invalid,
                 "Unknown command for this gateway version",
@@ -704,9 +749,22 @@ impl ClientGateway {
                 risk,
                 other_device,
             } => {
-                let not_from = other_device
+                let mut warnings = warnings;
+                let mut not_from = other_device
                     .then(|| caller.principal.device_id.clone())
                     .flatten();
+                // With no other device or chat to ask, the device asking
+                // confirms it itself, on a card that says what widens.
+                if let Some(device) = not_from.as_deref()
+                    && !self.another_approver(device).await
+                {
+                    not_from = None;
+                    warnings.push(
+                        "No other device or chat is connected, so this device confirms it. \
+                         Only allow it if you asked for it just now."
+                            .to_string(),
+                    );
+                }
                 let other_device = not_from.is_some();
                 self.runner
                     .register_session(SETTINGS_SESSION, APP_CHANNEL)
@@ -763,6 +821,80 @@ impl ClientGateway {
                 })
             }
         }
+    }
+
+    /// Whether anyone but device `device_id` can answer an approval: another
+    /// paired device, or a chat.
+    async fn another_approver(&self, device_id: &str) -> bool {
+        let devices = self.pairing.devices().await.unwrap_or_default();
+        if devices
+            .iter()
+            .any(|d| !d.revoked && d.device_id != device_id)
+        {
+            return true;
+        }
+        self.hub
+            .channel_names()
+            .await
+            .iter()
+            .any(|name| name != APP_CHANNEL)
+    }
+
+    /// Start an app conversation with a message from the daemon itself (the
+    /// first-run greeting), with prompts the owner may press. The host keeps
+    /// the message in `session_id`'s history first ([`new_app_session_id`]).
+    pub async fn post_greeting(
+        &self,
+        session_id: &str,
+        title: &str,
+        text: &str,
+        suggestions: Vec<String>,
+    ) {
+        let session_id = session_id.to_string();
+        self.runner.register_session(&session_id, APP_CHANNEL).await;
+        self.publisher.publish(
+            Some(session_id.clone()),
+            Event::SessionCreated {
+                session: SessionSummary {
+                    id: session_id.clone(),
+                    channel: APP_CHANNEL.to_string(),
+                    title: Some(title.to_string()),
+                    last_activity_ms: Some(bus::now_ms()),
+                    writable: true,
+                },
+            },
+        );
+        self.publisher.publish(
+            Some(session_id.clone()),
+            Event::AssistantMessage {
+                session_id: session_id.clone(),
+                text: text.to_string(),
+                suggestions,
+            },
+        );
+    }
+
+    /// The agent needs `feature`, which is off: every client offers to turn
+    /// it on.
+    pub fn feature_requested(
+        &self,
+        session_id: &str,
+        feature: aidaemon_client_protocol::Feature,
+        reason: &str,
+    ) {
+        self.publisher.publish(
+            Some(session_id.to_string()),
+            Event::FeatureRequested {
+                session_id: session_id.to_string(),
+                feature,
+                reason: reason.to_string(),
+            },
+        );
+    }
+
+    /// Tell every client where setup stands.
+    pub fn setup_updated(&self, setup: SetupState) {
+        self.publisher.publish(None, Event::SetupUpdated { setup });
     }
 
     fn settings_updated(&self, ok: bool, message: String) {

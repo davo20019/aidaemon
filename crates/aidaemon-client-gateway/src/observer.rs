@@ -286,6 +286,7 @@ impl TurnSurface for AppSurface {
             Event::AssistantMessage {
                 session_id: self.session_id.clone(),
                 text: text.to_string(),
+                suggestions: Vec::new(),
             },
         );
         Ok(Vec::new())
@@ -335,6 +336,7 @@ impl TurnSurface for ChatReplySurface {
             Event::AssistantMessage {
                 session_id: self.session_id.clone(),
                 text: text.to_string(),
+                suggestions: Vec::new(),
             },
         );
         Ok(Vec::new())
@@ -384,6 +386,7 @@ impl AppChannel {
             Event::AssistantMessage {
                 session_id: session_id.to_string(),
                 text,
+                suggestions: Vec::new(),
             },
         );
     }

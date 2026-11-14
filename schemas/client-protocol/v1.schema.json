@@ -327,6 +327,21 @@
       ],
       "type": "object"
     },
+    "Billing": {
+      "description": "How a provider is paid for.",
+      "oneOf": [
+        {
+          "const": "plan",
+          "description": "Uses a subscription the owner already pays for; it has limits.",
+          "type": "string"
+        },
+        {
+          "const": "per_token",
+          "description": "Billed per token by the provider.",
+          "type": "string"
+        }
+      ]
+    },
     "BotInfo": {
       "description": "A bot connected at runtime.",
       "properties": {
@@ -500,6 +515,54 @@
       },
       "required": [
         "device_id"
+      ],
+      "type": "object"
+    },
+    "ChannelOption": {
+      "description": "A chat the daemon can be reached on.",
+      "properties": {
+        "help_url": {
+          "description": "Where to make a bot and get its token.",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "needs_app_token": {
+          "default": false,
+          "description": "It takes a second token (Slack's app token).",
+          "type": "boolean"
+        },
+        "platform": {
+          "description": "`telegram`, `slack` or `discord`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "platform",
+        "name"
+      ],
+      "type": "object"
+    },
+    "ChannelWait": {
+      "description": "A chat connected during setup.",
+      "properties": {
+        "bot": {
+          "description": "The bot, as the owner finds it (`@synthetic_bot`).",
+          "type": "string"
+        },
+        "connected": {
+          "default": false,
+          "description": "The owner's first message arrived and was answered there.",
+          "type": "boolean"
+        },
+        "platform": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "platform",
+        "bot"
       ],
       "type": "object"
     },
@@ -982,6 +1045,36 @@
             "change"
           ],
           "type": "object"
+        },
+        {
+          "description": "Where first-run setup stands (protocol 1.5).",
+          "properties": {
+            "type": {
+              "const": "get_setup",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A step of first-run setup (protocol 1.5). A daemon still in setup\nanswers only this, `get_setup` and pings.",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/SetupAction"
+            },
+            "type": {
+              "const": "setup",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "action"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1282,6 +1375,23 @@
             "outcome"
           ],
           "type": "object"
+        },
+        {
+          "description": "`get_setup` and `setup`: where setup stands now.",
+          "properties": {
+            "setup": {
+              "$ref": "#/$defs/SetupState"
+            },
+            "type": {
+              "const": "setup",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "setup"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1557,6 +1667,13 @@
             "session_id": {
               "type": "string"
             },
+            "suggestions": {
+              "description": "Things the owner might ask next, shown as prompts to press\n(protocol 1.5).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "text": {
               "type": "string"
             },
@@ -1817,6 +1934,49 @@
             "message"
           ],
           "type": "object"
+        },
+        {
+          "description": "Ephemeral: first-run setup moved on (a sign-in finished, a model\npassed its test, a channel heard its first message); protocol 1.5.",
+          "properties": {
+            "setup": {
+              "$ref": "#/$defs/SetupState"
+            },
+            "type": {
+              "const": "setup_updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "setup"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The agent needs a feature that is off for what it was asked to do\n(protocol 1.5). The client offers to turn it on; nothing changes\nuntil the owner does.",
+          "properties": {
+            "feature": {
+              "$ref": "#/$defs/Feature"
+            },
+            "reason": {
+              "description": "What it is needed for, in the agent's words.",
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "feature_requested",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "feature",
+            "reason"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1838,6 +1998,62 @@
       "required": [
         "frames",
         "next_since"
+      ],
+      "type": "object"
+    },
+    "Feature": {
+      "description": "A feature the agent can ask to have turned on.",
+      "oneOf": [
+        {
+          "const": "browser",
+          "description": "Browsing websites.",
+          "type": "string"
+        },
+        {
+          "const": "voice",
+          "description": "Understanding voice notes.",
+          "type": "string"
+        },
+        {
+          "const": "computer_use",
+          "description": "Seeing and using this computer's screen.",
+          "type": "string"
+        }
+      ]
+    },
+    "FoundModel": {
+      "description": "A model connection already on this machine.",
+      "properties": {
+        "billing": {
+          "$ref": "#/$defs/Billing"
+        },
+        "detail": {
+          "description": "Why not, when it did not.",
+          "type": "string"
+        },
+        "name": {
+          "description": "The provider and model, in plain words.",
+          "type": "string"
+        },
+        "preset": {
+          "description": "The provider preset (`openai_chatgpt`, `openai`, ...).",
+          "type": "string"
+        },
+        "source": {
+          "description": "Where it was found (\"ChatGPT sign-in on this computer\").",
+          "type": "string"
+        },
+        "works": {
+          "description": "It answered a test call.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "preset",
+        "name",
+        "source",
+        "billing",
+        "works"
       ],
       "type": "object"
     },
@@ -2444,6 +2660,45 @@
       ],
       "type": "object"
     },
+    "ProviderOption": {
+      "description": "A provider the owner may connect.",
+      "properties": {
+        "billing": {
+          "$ref": "#/$defs/Billing"
+        },
+        "key_url": {
+          "description": "Where to get one.",
+          "type": "string"
+        },
+        "model": {
+          "description": "The model it starts with.",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "needs_base_url": {
+          "default": false,
+          "description": "The owner names the address (a custom endpoint).",
+          "type": "boolean"
+        },
+        "needs_key": {
+          "description": "Connected with an API key (else with a sign-in).",
+          "type": "boolean"
+        },
+        "preset": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "preset",
+        "name",
+        "billing",
+        "needs_key",
+        "model"
+      ],
+      "type": "object"
+    },
     "QueueInfo": {
       "properties": {
         "capacity": {
@@ -2675,6 +2930,17 @@
                 "$ref": "#/$defs/Capability"
               },
               "type": "array"
+            },
+            "setup": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SetupState"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "First-run setup still to finish (protocol 1.5). `None`: the\ndaemon is set up."
             },
             "type": {
               "const": "welcome",
@@ -3254,6 +3520,277 @@
           "type": "object"
         }
       ]
+    },
+    "SetupAction": {
+      "description": "One step of first-run setup.",
+      "oneOf": [
+        {
+          "description": "Look for models on this machine again, and test them.",
+          "properties": {
+            "kind": {
+              "const": "detect",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Use `found` entry `index` (from 0).",
+          "properties": {
+            "index": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "use_found",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "index"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Start the subscription sign-in. `paste`: the browser is on another\ndevice and cannot reach the daemon's sign-in listener.",
+          "properties": {
+            "kind": {
+              "const": "sign_in",
+              "type": "string"
+            },
+            "paste": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The address the sign-in's browser ended on.",
+          "properties": {
+            "kind": {
+              "const": "finish_sign_in",
+              "type": "string"
+            },
+            "redirect": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "redirect"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Connect a provider with an API key (`None` for one that needs none);\nit is tested before anything is saved.",
+          "properties": {
+            "key": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SecretText"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "const": "connect_model",
+              "type": "string"
+            },
+            "provider": {
+              "$ref": "#/$defs/ProviderChoice"
+            }
+          },
+          "required": [
+            "kind",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Connect a chat bot by its token.",
+          "properties": {
+            "app_token": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SecretText"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "const": "connect_channel",
+              "type": "string"
+            },
+            "platform": {
+              "type": "string"
+            },
+            "token": {
+              "$ref": "#/$defs/SecretText"
+            }
+          },
+          "required": [
+            "kind",
+            "platform",
+            "token"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Leave the chat step for later.",
+          "properties": {
+            "kind": {
+              "const": "skip_channel",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The chat step is done.",
+          "properties": {
+            "kind": {
+              "const": "finish",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SetupState": {
+      "description": "Where first-run setup stands.",
+      "properties": {
+        "channel": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChannelWait"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A chat connected in this setup, waiting for (or past) its first\nmessage."
+        },
+        "channels": {
+          "description": "The chats this daemon can be reached on.",
+          "items": {
+            "$ref": "#/$defs/ChannelOption"
+          },
+          "type": "array"
+        },
+        "found": {
+          "description": "Models already on this machine (a sign-in, a key in the\nenvironment), each tried once.",
+          "items": {
+            "$ref": "#/$defs/FoundModel"
+          },
+          "type": "array"
+        },
+        "model": {
+          "description": "The model that passed its test, in plain words.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notices": {
+          "description": "What the owner should know (where secrets were stored, why a check\nfailed), in plain words.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "on_server": {
+          "default": false,
+          "description": "The daemon runs on a machine of its own (a server), not this\ncomputer: what it says about sleep and sign-in differs.",
+          "type": "boolean"
+        },
+        "providers": {
+          "description": "Every provider the owner may pick, subscription sign-in first.",
+          "items": {
+            "$ref": "#/$defs/ProviderOption"
+          },
+          "type": "array"
+        },
+        "sign_in": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SignIn"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A subscription sign-in under way."
+        },
+        "step": {
+          "$ref": "#/$defs/SetupStep"
+        }
+      },
+      "required": [
+        "step"
+      ],
+      "type": "object"
+    },
+    "SetupStep": {
+      "oneOf": [
+        {
+          "const": "model",
+          "description": "Connect a model (required).",
+          "type": "string"
+        },
+        {
+          "const": "starting",
+          "description": "The model works and the daemon is starting with it.",
+          "type": "string"
+        },
+        {
+          "const": "channel",
+          "description": "Reach the agent from a phone (may be skipped).",
+          "type": "string"
+        },
+        {
+          "const": "done",
+          "description": "Set up.",
+          "type": "string"
+        }
+      ]
+    },
+    "SignIn": {
+      "description": "A subscription sign-in waiting for the owner.",
+      "properties": {
+        "paste": {
+          "default": false,
+          "description": "The browser cannot return to the daemon by itself: paste the address\nit ends on (`finish_sign_in`).",
+          "type": "boolean"
+        },
+        "url": {
+          "description": "Open this in a browser.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
     },
     "SlashCommand": {
       "description": "A slash command, as a completion list shows it.",

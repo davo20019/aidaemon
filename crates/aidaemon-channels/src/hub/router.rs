@@ -298,6 +298,16 @@ impl ChannelHub {
         name
     }
 
+    /// The names of the channels registered now.
+    pub async fn channel_names(&self) -> Vec<String> {
+        self.channels
+            .read()
+            .await
+            .iter()
+            .map(|c| c.name())
+            .collect()
+    }
+
     /// Get a reference to the shared session map.
     #[allow(dead_code)]
     pub fn session_map(&self) -> &SessionMap {

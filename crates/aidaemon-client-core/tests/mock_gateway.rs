@@ -103,6 +103,7 @@ async fn the_link_resumes_and_resends_unanswered_commands() {
                 Event::AssistantMessage {
                     session_id: "app:s1".into(),
                     text: format!("note {seq}"),
+                    suggestions: Vec::new(),
                 },
             )))
             .await

@@ -74,7 +74,7 @@ pub async fn serve(gateway: Arc<ClientGateway>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
@@ -93,7 +93,7 @@ fn authenticate(gateway: &ClientGateway, headers: &HeaderMap) -> Result<Principa
         .ok_or_else(|| error_response(ErrorCode::Unauthorized, "A valid client token is required"))
 }
 
-fn status_of(code: ErrorCode) -> StatusCode {
+pub(crate) fn status_of(code: ErrorCode) -> StatusCode {
     match code {
         ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
         ErrorCode::Forbidden => StatusCode::FORBIDDEN,
@@ -105,7 +105,7 @@ fn status_of(code: ErrorCode) -> StatusCode {
     }
 }
 
-fn error_response(code: ErrorCode, message: &str) -> Response {
+pub(crate) fn error_response(code: ErrorCode, message: &str) -> Response {
     (
         status_of(code),
         Json(ServerFrame::Error {
@@ -219,7 +219,7 @@ fn owner_only(gateway: &ClientGateway, headers: &HeaderMap) -> Result<(), Respon
     }
 }
 
-fn body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Response> {
+pub(crate) fn body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Response> {
     serde_json::from_slice(bytes)
         .map_err(|error| error_response(ErrorCode::Invalid, &error.to_string()))
 }
@@ -338,7 +338,7 @@ async fn revoke_device(
 
 /// Shown at `/client/v1/app` when no web build of the app is installed.
 /// Self-contained: no scripts and no external assets.
-const NOT_INSTALLED_PAGE: &str = r#"<!doctype html>
+pub(crate) const NOT_INSTALLED_PAGE: &str = r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -392,7 +392,7 @@ async fn app_root() -> Response {
 }
 
 async fn app_index(State(gateway): State<Arc<ClientGateway>>, headers: HeaderMap) -> Response {
-    serve_app_file(&gateway, "index.html", &headers).await
+    serve_app_file(&gateway.config, "index.html", &headers).await
 }
 
 async fn app_file(
@@ -400,12 +400,15 @@ async fn app_file(
     Path(path): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    serve_app_file(&gateway, &path, &headers).await
+    serve_app_file(&gateway.config, &path, &headers).await
 }
 
-async fn serve_app_file(gateway: &ClientGateway, path: &str, request: &HeaderMap) -> Response {
-    let Some(dir) = gateway
-        .config
+pub(crate) async fn serve_app_file(
+    config: &crate::ClientGatewayConfig,
+    path: &str,
+    request: &HeaderMap,
+) -> Response {
+    let Some(dir) = config
         .app_dir
         .as_deref()
         .map(str::trim)
@@ -731,6 +734,7 @@ async fn run_socket(
             server_capabilities: vec![Capability::Compact, Capability::ViewActions],
             owner: gateway.owner(),
             latest_seq: latest,
+            setup: gateway.setup().await,
         },
     )
     .await?;

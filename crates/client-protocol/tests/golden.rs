@@ -104,6 +104,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::ForgetMemory { .. } => "forget_memory",
         Command::GetSettings => "get_settings",
         Command::ChangeSettings { .. } => "change_settings",
+        Command::GetSetup => "get_setup",
+        Command::Setup { .. } => "setup",
         Command::Unknown => "unknown",
     }
 }
@@ -136,6 +138,7 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Forgotten { .. } => "forgotten",
         CommandResult::Settings { .. } => "settings",
         CommandResult::SettingsChanged { .. } => "settings_changed",
+        CommandResult::Setup { .. } => "setup",
         CommandResult::Unknown => "unknown",
     }
 }
@@ -251,9 +254,62 @@ fn client_samples() -> Vec<ClientFrame> {
                 },
             },
         ),
+        command("5d0c2b1e-0013", Command::GetSetup),
+        command(
+            "5d0c2b1e-0014",
+            Command::Setup {
+                action: SetupAction::ConnectModel {
+                    provider: ProviderChoice {
+                        preset: "openrouter".into(),
+                        primary_model: "synthetic/model-1".into(),
+                        ..ProviderChoice::default()
+                    },
+                    key: Some(SecretText("sk-synthetic-not-a-key".into())),
+                },
+            },
+        ),
         command("5d0c2b1e-000b", Command::Unknown),
         ClientFrame::Ping,
     ]
+}
+
+fn setup_state() -> SetupState {
+    SetupState {
+        step: SetupStep::Model,
+        found: vec![FoundModel {
+            preset: "openai_chatgpt".into(),
+            name: "OpenAI (ChatGPT subscription) · gpt-synthetic".into(),
+            source: "ChatGPT sign-in on this computer".into(),
+            billing: Billing::Plan,
+            works: true,
+            detail: String::new(),
+        }],
+        providers: vec![ProviderOption {
+            preset: "openrouter".into(),
+            name: "OpenRouter".into(),
+            billing: Billing::PerToken,
+            needs_key: true,
+            key_url: "https://openrouter.ai/keys".into(),
+            needs_base_url: false,
+            model: "synthetic/model-1".into(),
+        }],
+        model: None,
+        sign_in: Some(SignIn {
+            url: "https://auth.example.invalid/authorize?state=synthetic".into(),
+            paste: true,
+        }),
+        channels: vec![ChannelOption {
+            platform: "telegram".into(),
+            name: "Telegram".into(),
+            help_url: "https://t.me/BotFather".into(),
+            needs_app_token: false,
+        }],
+        channel: None,
+        notices: vec![
+            "Secrets are kept in /home/synthetic/.aidaemon/.env (no keychain here).".into(),
+        ],
+        on_server: true,
+    }
 }
 
 fn event(seq: Option<u64>, event: Event) -> ServerFrame {
@@ -281,6 +337,7 @@ fn server_samples() -> Vec<ServerFrame> {
                 name: Some("Alice Rivera".into()),
             },
             latest_seq: 42,
+            setup: Some(setup_state()),
         },
         ServerFrame::Snapshot {
             seq: 42,
@@ -302,6 +359,7 @@ fn server_samples() -> Vec<ServerFrame> {
             Event::AssistantMessage {
                 session_id: "app:6c1f".into(),
                 text: "Got it, I'll start on that as soon as this finishes.".into(),
+                suggestions: Vec::new(),
             },
         ),
         event(
@@ -390,6 +448,29 @@ fn server_samples() -> Vec<ServerFrame> {
             Event::SettingsUpdated {
                 ok: true,
                 message: "Updated provider.models.default".into(),
+            },
+        ),
+        event(
+            None,
+            Event::SetupUpdated {
+                setup: SetupState {
+                    step: SetupStep::Channel,
+                    model: Some("OpenAI (ChatGPT subscription) · gpt-synthetic".into()),
+                    channel: Some(ChannelWait {
+                        platform: "telegram".into(),
+                        bot: "@synthetic_bot".into(),
+                        connected: true,
+                    }),
+                    ..SetupState::default()
+                },
+            },
+        ),
+        event(
+            Some(9),
+            Event::FeatureRequested {
+                session_id: "app:6c1f".into(),
+                feature: Feature::Browser,
+                reason: "to read the synthetic report page".into(),
             },
         ),
         ack(CommandResult::MessageAccepted {
@@ -597,6 +678,9 @@ fn server_samples() -> Vec<ServerFrame> {
                 approval_id: "a-7f3e-2".into(),
                 other_device: true,
             },
+        }),
+        ack(CommandResult::Setup {
+            setup: setup_state(),
         }),
         ack(CommandResult::Unknown),
         ServerFrame::Error {

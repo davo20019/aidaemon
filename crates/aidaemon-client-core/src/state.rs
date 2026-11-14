@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use aidaemon_client_protocol::{
-    Approval, CommandResult, Event, HistoryMessage, ServerFrame, SessionSummary, Snapshot,
-    TaskState, TaskSummary, TurnState, TurnStatus, ViewAction,
+    Approval, CommandResult, Event, Feature, HistoryMessage, ServerFrame, SessionSummary,
+    SetupState, Snapshot, TaskState, TaskSummary, TurnState, TurnStatus, ViewAction,
 };
 
 /// One line of a transcript.
@@ -61,6 +61,10 @@ pub struct SessionView {
     pub summary: Option<SessionSummary>,
     pub lines: Vec<Line>,
     pub live: Option<LiveTurn>,
+    /// What the owner might ask next, offered under the last reply until
+    /// they say something.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<String>,
 }
 
 /// The client's view. Its JSON form (`serde_json::to_value`) is what the
@@ -80,6 +84,21 @@ pub struct State {
     /// client takes it ([`State::take_view_request`]). Never touches the
     /// approvals, the work or the transcripts.
     pub view_request: Option<ViewRequest>,
+    /// First-run setup still to finish, as the daemon last said; `None`
+    /// once it is set up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupState>,
+    /// Features the agent asked for and the owner has not answered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feature_requests: Vec<FeatureRequest>,
+}
+
+/// The agent needs a feature that is off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FeatureRequest {
+    pub session_id: String,
+    pub feature: Feature,
+    pub reason: String,
 }
 
 /// A view move the agent asked for, and why.
@@ -112,6 +131,15 @@ pub fn status_text(status: &TurnStatus) -> String {
 }
 
 impl State {
+    fn set_setup(&mut self, setup: SetupState) {
+        self.setup = (setup.step != aidaemon_client_protocol::SetupStep::Done).then_some(setup);
+    }
+
+    /// The owner answered the request for `feature` (turned it on or not).
+    pub fn settle_feature(&mut self, feature: Feature) {
+        self.feature_requests.retain(|r| r.feature != feature);
+    }
+
     fn session(&mut self, id: &str) -> &mut SessionView {
         if !self.sessions.contains_key(id) {
             self.order.insert(0, id.to_string());
@@ -173,7 +201,10 @@ impl State {
             }
             ServerFrame::Ack { result, .. } => self.apply_result(result),
             ServerFrame::Error { error, .. } => self.notice = Some(error.message),
-            ServerFrame::Welcome { .. } | ServerFrame::Pong => {}
+            ServerFrame::Welcome { setup, .. } => {
+                self.setup = setup.filter(|s| s.step != aidaemon_client_protocol::SetupStep::Done)
+            }
+            ServerFrame::Pong => {}
         }
     }
 
@@ -193,6 +224,7 @@ impl State {
             CommandResult::Stopped { report } | CommandResult::Reply { text: report } => {
                 self.notice = Some(report)
             }
+            CommandResult::Setup { setup } => self.set_setup(setup),
             _ => {}
         }
     }
@@ -247,16 +279,36 @@ impl State {
                 ..
             } => {
                 self.touch(&session_id);
-                self.session(&session_id).lines.push(Line::User {
+                let view = self.session(&session_id);
+                view.suggestions.clear();
+                view.lines.push(Line::User {
                     text,
                     origin,
                     at_ms,
                 });
             }
-            Event::AssistantMessage { session_id, text } => {
-                self.session(&session_id)
-                    .lines
-                    .push(Line::Assistant { text, at_ms });
+            Event::AssistantMessage {
+                session_id,
+                text,
+                suggestions,
+            } => {
+                let view = self.session(&session_id);
+                view.lines.push(Line::Assistant { text, at_ms });
+                view.suggestions = suggestions;
+            }
+            Event::SetupUpdated { setup } => self.set_setup(setup),
+            Event::FeatureRequested {
+                session_id,
+                feature,
+                reason,
+            } => {
+                self.feature_requests
+                    .retain(|r| !(r.session_id == session_id && r.feature == feature));
+                self.feature_requests.push(FeatureRequest {
+                    session_id,
+                    feature,
+                    reason,
+                });
             }
             Event::TurnStarted {
                 turn_id,

@@ -1,0 +1,15 @@
+{
+  "command": {
+    "action": {
+      "key": "sk-synthetic-not-a-key",
+      "kind": "connect_model",
+      "provider": {
+        "preset": "openrouter",
+        "primary_model": "synthetic/model-1"
+      }
+    },
+    "type": "setup"
+  },
+  "request_id": "5d0c2b1e-0014",
+  "type": "command"
+}
