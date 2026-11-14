@@ -628,11 +628,14 @@ impl<'a> Driver<'a> {
                 }
                 let available: Vec<&str> =
                     self.agent.specs.iter().map(|s| s.name.as_str()).collect();
-                let reason = format!(
-                    "unknown tool `{}`. Available tools: {}",
-                    call.name,
-                    available.join(", ")
-                );
+                let reason = match self.agent.retired.get(&call.name) {
+                    Some(note) => format!("unknown tool `{}`: it was retired. {note}", call.name),
+                    None => format!(
+                        "unknown tool `{}`. Available tools: {}",
+                        call.name,
+                        available.join(", ")
+                    ),
+                };
                 let (receipt, output) = rejection(
                     self.state.run_id,
                     &call,
