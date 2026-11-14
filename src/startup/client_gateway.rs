@@ -273,7 +273,7 @@ impl SystemSources {
                 goal_id,
                 description,
                 status,
-                outcome: outcome.filter(|o| !o.trim().is_empty()),
+                outcome: outcome.as_deref().and_then(outcome_words),
                 started_ms: stored_ms(&started).unwrap_or(0),
                 finished_ms: finished.as_deref().and_then(stored_ms),
                 session_id: Some(session_id).filter(|s| !s.is_empty()),
@@ -295,6 +295,23 @@ impl SystemSources {
             runs,
         }
     }
+}
+
+/// A run's report as the owner reads it: a bare status code
+/// (`mandate_act_satisfied`) becomes words ("Mandate act satisfied").
+fn outcome_words(outcome: &str) -> Option<String> {
+    let outcome = outcome.trim();
+    if outcome.is_empty() {
+        return None;
+    }
+    if outcome.contains(char::is_whitespace) || !outcome.contains('_') {
+        return Some(outcome.to_owned());
+    }
+    let words = outcome.replace('_', " ");
+    let mut chars = words.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
 }
 
 /// The tool names in a stored `tool_calls_json`, in order.
@@ -786,7 +803,20 @@ fn devices_text(devices: &[aidaemon_client_protocol::DeviceInfo]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{snippet, tool_names};
+    use super::{outcome_words, snippet, tool_names};
+
+    #[test]
+    fn a_status_code_outcome_reads_as_words() {
+        assert_eq!(
+            outcome_words("mandate_act_satisfied").as_deref(),
+            Some("Mandate act satisfied")
+        );
+        assert_eq!(
+            outcome_words("Sent the digest.").as_deref(),
+            Some("Sent the digest.")
+        );
+        assert_eq!(outcome_words("  "), None);
+    }
 
     #[test]
     fn tool_names_read_both_stored_shapes() {
