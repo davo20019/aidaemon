@@ -81,7 +81,7 @@ background tasks`.
   `aidaemon_memory::sqlite`. Events and run aggregate:
   `crates/aidaemon-events` (host adapter in `src/events/`).
 - `src/memory/`, `src/plans/`, `src/channels/` (Telegram, Slack, Discord, hub).
-- Clients: `clients/app/` is the one nsh (Native Shell) Rust app for desktop, web and terminal (its own Cargo workspace; read `clients/app/AGENTS.md`). Shared client logic is `crates/aidaemon-client-core` (`machine::LinkMachine`, reducer, sign-in). `clients/web`, `clients/desktop` and `aidaemon-tui` are being replaced by it.
+- Clients: `clients/app/` is the one nsh (Native Shell) Rust app for desktop, web and terminal (its own Cargo workspace; read `clients/app/AGENTS.md`). Shared client logic is `crates/aidaemon-client-core` (`machine::LinkMachine`, reducer, sign-in). `clients/web` is being replaced by it.
 - Specialists: prompts in `specialists/<kind>.md`, user overrides in
   `~/.aidaemon/specialists/`, code in `src/agent/specialists/`, exposed via
   `spawn_agent`.

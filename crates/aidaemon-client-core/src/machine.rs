@@ -31,7 +31,7 @@ pub const RETRY_MAX: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientIdentity {
     pub kind: ClientKind,
-    /// The program's name (`aidaemon-tui`).
+    /// The program's name (`aidaemon-app`).
     pub name: String,
     pub version: Option<String>,
 }
