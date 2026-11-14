@@ -22,13 +22,13 @@ data="$(sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep 'memory_recall:' || true)"
 
 count() { echo "$data" | grep -c "$1" || true; }
 
-searches=$(count 'explicit fact search reranked')
+searches=$(count 'explicit fact search')
 expansions=$(echo "$data" | grep 'neighborhood expansion' | grep -vc '(no entities)' || true)
 no_entities=$(count 'neighborhood expansion (no entities)')
 misses=$(count 'relational denial despite memory results')
 
 echo "memory-recall telemetry  ($LOG)"
-echo "  explicit searches (reranked):         $searches"
+echo "  explicit searches:                    $searches"
 echo "  neighborhood expansions (added > 0):  $expansions"
 echo "  expansions with no entities:          $no_entities"
 echo "  SEARCHED-BUT-DENIED (Phase-1 miss):   $misses   <-- the Phase 2 signal"

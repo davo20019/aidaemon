@@ -523,22 +523,11 @@ impl ManageMemoriesTool {
                     return Ok(format!("No memories matching '{}'.", query));
                 }
 
-                // "Relevant" only when a relevance floor judged the pool;
-                // otherwise every candidate would be called relevant.
-                let counts = if report.floor_applied {
-                    format!(
-                        "{} shown, {} relevant of {} considered",
-                        report.hits.len(),
-                        report.passed_floor,
-                        report.considered
-                    )
-                } else {
-                    format!(
-                        "{} shown of {} considered",
-                        report.hits.len(),
-                        report.considered
-                    )
-                };
+                let counts = format!(
+                    "{} shown of {} considered",
+                    report.hits.len(),
+                    report.considered
+                );
                 let mut output = format!(
                     "══ Stored facts matching '{}' ({}) ══\n\
                      IMPORTANT: Use these EXACT values when answering — do not substitute or infer.\n\n",
@@ -583,12 +572,6 @@ impl ManageMemoriesTool {
                         learned,
                         evidence,
                         marker
-                    ));
-                }
-                if report.floor_applied && report.passed_floor > report.hits.len() {
-                    output.push_str(&format!(
-                        "({} more relevant; raise limit to see them.)\n",
-                        report.passed_floor - report.hits.len()
                     ));
                 }
                 if !report.related.is_empty() {

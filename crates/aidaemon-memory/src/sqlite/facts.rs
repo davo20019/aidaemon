@@ -720,40 +720,6 @@ impl SqliteMemory {
             })
             .collect()
     }
-
-    /// Rerank `docs` against the query, or `None` when there is no reranker
-    /// or it fails (the caller then falls back to its unreranked order).
-    /// `deadline` is the whole search's (`StoreModels::rerank_deadline`).
-    async fn explicit_search_rerank(
-        &self,
-        query: &str,
-        docs: Vec<String>,
-        deadline: Option<tokio::time::Instant>,
-        step: &'static str,
-    ) -> Option<Vec<(usize, f32)>> {
-        let deadline = deadline?;
-        if docs.is_empty() {
-            return Some(Vec::new());
-        }
-        match self
-            .embedding_service
-            .rerank(query.to_string(), docs, deadline)
-            .await
-        {
-            Ok(scores) => Some(scores),
-            Err(error) => {
-                tracing::warn!(target: "memory_recall", %error, step, "explicit fact search: rerank unavailable; using unreranked order");
-                None
-            }
-        }
-    }
-
-    fn rerank_floor(&self) -> Option<crate::search::RelevanceFloor> {
-        self.embedding_service
-            .reranker
-            .as_ref()
-            .and_then(|reranker| reranker.relevance_floor())
-    }
 }
 
 #[async_trait]
@@ -784,20 +750,8 @@ impl FactStore for SqliteMemory {
 
         let stage = std::time::Instant::now();
         let pool = search::candidates(&facts, &lexical, &cosine, config);
-        let docs: Vec<String> = pool
-            .iter()
-            .map(|c| {
-                let f = &facts[c.index];
-                build_fact_embedding_text(&f.category, &f.key, &f.value)
-            })
-            .collect();
-        let rerank_deadline = self.embedding_service.rerank_deadline();
-        let reranked = self
-            .explicit_search_rerank(query, docs, rerank_deadline, "hits")
-            .await;
-        let floor = self.rerank_floor();
-        let mut report = search::rank(&facts, &pool, reranked.as_deref(), floor, limit, config);
-        let rerank_ms = stage.elapsed().as_millis() as u64;
+        let mut report = search::rank(&facts, &pool, limit, config);
+        let rank_ms = stage.elapsed().as_millis() as u64;
 
         // Expansion seeds come only from the hits actually returned.
         let stage = std::time::Instant::now();
@@ -840,35 +794,16 @@ impl FactStore for SqliteMemory {
                 neighbors.sort_by(|a, b| prior(b).total_cmp(&prior(a)).then(a.id.cmp(&b.id)));
                 neighbors.truncate(config.related_pool);
             }
-            let docs: Vec<String> = neighbors
+            let scores: Vec<(usize, f32)> = neighbors
                 .iter()
-                .map(|f| build_fact_embedding_text(&f.category, &f.key, &f.value))
+                .enumerate()
+                .map(|(i, f)| (i, prior(f)))
                 .collect();
-            let related = match self
-                .explicit_search_rerank(query, docs, rerank_deadline, "related")
-                .await
-            {
-                Some(scores) => {
-                    search::rank_related(&neighbors, &scores, floor, report.best_score(), config)
-                }
-                None => {
-                    let scores: Vec<(usize, f32)> = neighbors
-                        .iter()
-                        .enumerate()
-                        .map(|(i, f)| (i, prior(f)))
-                        .collect();
-                    // No floor: a relationship cluster (a parent of the
-                    // person searched) shares no words with the query, so a
-                    // cosine cutoff would drop exactly the designed case.
-                    search::rank_related(&neighbors, &scores, None, None, config)
-                }
-            };
-            report.related = related;
+            report.related = search::rank_related(&neighbors, &scores, config);
         }
         let expand_ms = stage.elapsed().as_millis() as u64;
 
-        // Scores of the leading hits, so a relevance floor can be chosen
-        // from evidence: `key=score (kind)`.
+        // Scores of the leading hits: `key=score (kind)`.
         let summarize = |hits: &[search::SearchHit]| {
             hits.iter()
                 .take(3)
@@ -883,13 +818,11 @@ impl FactStore for SqliteMemory {
             load_ms,
             lexical_ms,
             embed_ms,
-            rerank_ms,
+            rank_ms,
             expand_ms,
             considered = report.considered,
-            passed_floor = report.passed_floor,
             returned = report.hits.len(),
             related = report.related.len(),
-            reranked = report.reranked,
             top = %top,
             related_top = %related_top,
             "explicit fact search"

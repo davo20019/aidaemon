@@ -403,8 +403,7 @@ mod tests {
         assert!(!partner.value.to_lowercase().contains("spouse"));
     }
 
-    /// Every labelled query through the pure pipeline (fake cosine, no
-    /// reranker): the answer is returned within its limit, and no forbidden
+    /// Every labelled query through the pure pipeline (fake cosine): the answer is returned within its limit, and no forbidden
     /// fact appears in the hits or the related list.
     #[test]
     fn ranking_metrics_meet_bar() {
@@ -423,7 +422,7 @@ mod tests {
                 .map(|(i, f)| (i, fake_cosine(q.query, f)))
                 .collect();
             let pool = candidates(&facts, &lexical, &cosine, &cfg);
-            let report = rank(&facts, &pool, None, None, q.limit, &cfg);
+            let report = rank(&facts, &pool, q.limit, &cfg);
             let hits: Vec<Fact> = report.hits.iter().map(|h| h.fact.clone()).collect();
 
             let ranked: Vec<String> = hits.iter().map(|f| f.id.to_string()).collect();
@@ -440,7 +439,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, f)| (i, fake_cosine(q.query, f)))
                 .collect();
-            let related = rank_related(&neighbors, &scores, None, None, &cfg);
+            let related = rank_related(&neighbors, &scores, &cfg);
             assert!(related.len() <= cfg.related_max);
             for hit in report.hits.iter().chain(&related) {
                 assert!(

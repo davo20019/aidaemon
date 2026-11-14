@@ -80,44 +80,10 @@ pub struct ExactChannelIds;
 
 impl ChannelIds for ExactChannelIds {}
 
-/// Cross-encoder reordering of search candidates. Optional: without one, or
-/// when one fails, results keep their embedding order.
-#[async_trait]
-pub trait Reranker: Send + Sync {
-    /// `(input index, score)` pairs, most relevant first.
-    async fn rerank(
-        &self,
-        query: String,
-        documents: Vec<String>,
-    ) -> anyhow::Result<Vec<(usize, f32)>>;
-
-    /// The score below which a reranked search candidate is not relevant
-    /// and is dropped (exact-key matches are kept regardless). The scale is
-    /// specific to the model: cross-encoders emit logits or probabilities
-    /// with different ranges, so only the implementation can say. `None`
-    /// disables the floor, and the search pool caps are the only gate.
-    fn relevance_floor(&self) -> Option<crate::search::RelevanceFloor> {
-        None
-    }
-
-    /// How long a search waits for its reranks (all of them together)
-    /// before it keeps the unreranked order. Reranking only refines an answer the search already
-    /// has, so a model starved of CPU (or queued behind another rerank) must
-    /// cost the search a bounded wait, never minutes.
-    fn deadline(&self) -> std::time::Duration {
-        DEFAULT_RERANK_DEADLINE
-    }
-}
-
-/// [`Reranker::deadline`]'s default: a few times a cross-encoder's normal
-/// latency on a few dozen short facts.
-pub const DEFAULT_RERANK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
-
-/// The store's embedding and reranking models.
+/// The store's embedding model.
 #[derive(Clone)]
 pub(crate) struct StoreModels {
     embedder: Arc<dyn Embedder>,
-    reranker: Option<Arc<dyn Reranker>>,
     /// Recent single-text embeddings, shared by every clone.
     queries: Arc<QueryMemo>,
 }
@@ -194,40 +160,6 @@ impl StoreModels {
         );
         Ok(vectors)
     }
-
-    /// When a search that starts reranking now must be done with it: one
-    /// [`Reranker::deadline`] covers every rerank the search makes (its hits
-    /// and then its related facts), so a slow model costs a search one
-    /// bounded wait, not one per step. `None` without a reranker.
-    fn rerank_deadline(&self) -> Option<tokio::time::Instant> {
-        self.reranker
-            .as_ref()
-            .map(|reranker| tokio::time::Instant::now() + reranker.deadline())
-    }
-
-    async fn rerank(
-        &self,
-        query: String,
-        documents: Vec<String>,
-        deadline: tokio::time::Instant,
-    ) -> anyhow::Result<Vec<(usize, f32)>> {
-        match &self.reranker {
-            Some(reranker) => {
-                if deadline <= tokio::time::Instant::now() {
-                    anyhow::bail!("the search's rerank budget is spent");
-                }
-                tokio::time::timeout_at(deadline, reranker.rerank(query, documents))
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "rerank missed the search's {:?} deadline",
-                            reranker.deadline()
-                        )
-                    })?
-            }
-            None => anyhow::bail!("no reranker configured"),
-        }
-    }
 }
 
 /// Long-term memory in SQLite.
@@ -252,7 +184,6 @@ impl SqliteMemory {
             pool,
             embedding_service: StoreModels {
                 embedder,
-                reranker: None,
                 queries: Arc::default(),
             },
             fact_upsert_lock: Arc::new(Mutex::new(())),
@@ -260,12 +191,6 @@ impl SqliteMemory {
             clean_error_text: str::to_string,
             messages: None,
         }
-    }
-
-    /// Reorders explicit fact searches with `reranker`.
-    pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
-        self.embedding_service.reranker = Some(reranker);
-        self
     }
 
     /// Compares and derives channel ids the host's way.
@@ -410,7 +335,6 @@ mod query_memo_tests {
         });
         let models = StoreModels {
             embedder: embedder.clone(),
-            reranker: None,
             queries: Arc::default(),
         };
         (models, embedder)

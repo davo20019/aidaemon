@@ -8,7 +8,6 @@
 //!     --test recall_quality_eval -- --ignored --nocapture
 //! ```
 //!
-//! `AIDAEMON_EVAL_RERANK=1` adds the daemon's cross-encoder reranker.
 //! `AIDAEMON_EVAL_NOISE` sets the number of unrelated facts (default 400).
 //!
 //! The report has four parts:
@@ -35,7 +34,7 @@ use aidaemon_memory::records::{
     PersonalEntityCandidate, PersonalFactCandidate, PersonalMemoryWrite,
 };
 use aidaemon_memory::retrieval_eval::evaluate_ranked;
-use aidaemon_memory::sqlite::{Reranker, SqliteMemory, migrate};
+use aidaemon_memory::sqlite::{SqliteMemory, migrate};
 use aidaemon_memory::stores::FactStore;
 use aidaemon_memory::{FactPrivacy, FastEmbedder};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -219,21 +218,6 @@ const NOISE_TOPICS: &[&str] = &[
     "a blog post about minimalism",
 ];
 
-struct JinaReranker(Mutex<fastembed::TextRerank>);
-
-#[async_trait::async_trait]
-impl Reranker for JinaReranker {
-    async fn rerank(
-        &self,
-        query: String,
-        documents: Vec<String>,
-    ) -> anyhow::Result<Vec<(usize, f32)>> {
-        let docs: Vec<&String> = documents.iter().collect();
-        let ranked = self.0.lock().unwrap().rerank(&query, docs, false, None)?;
-        Ok(ranked.into_iter().map(|r| (r.index, r.score)).collect())
-    }
-}
-
 fn model_cache() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.fastembed_cache")
 }
@@ -252,15 +236,7 @@ async fn memory() -> (tempfile::TempDir, SqliteMemory) {
         .unwrap();
     migrate(&pool).await.unwrap();
     let embedder = FastEmbedder::new().cache_dir(model_cache());
-    let mut memory = SqliteMemory::new(pool, Arc::new(embedder));
-    if std::env::var("AIDAEMON_EVAL_RERANK").is_ok_and(|v| v == "1") {
-        let options = fastembed::RerankInitOptions::new(
-            fastembed::RerankerModel::JINARerankerV2BaseMultilingual,
-        )
-        .with_cache_dir(model_cache());
-        let model = fastembed::TextRerank::try_new(options).unwrap();
-        memory = memory.with_reranker(Arc::new(JinaReranker(Mutex::new(model))));
-    }
+    let memory = SqliteMemory::new(pool, Arc::new(embedder));
     (dir, memory)
 }
 

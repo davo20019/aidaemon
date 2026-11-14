@@ -1,14 +1,13 @@
 //! Explicit fact search ranking, pure and database-free.
 //!
-//! A store gathers facts and scores (cosine, rerank) and hands them here as
+//! A store gathers facts and cosine scores and hands them here as
 //! plain data; every ranking decision lives in this module so any backend
 //! gets the same order:
 //!
 //! - [`LexicalIndex`]: term-weighted (BM25-style idf) lexical scoring, with
 //!   exact-key and full-phrase hits pinned first.
 //! - [`candidates`] and [`rank`]: lexical and semantic nominations become one
-//!   pool, ordered by one score: the reranker's when there is one (with its
-//!   relevance floor), else reciprocal rank fusion, which needs no score
+//!   pool, ordered by reciprocal rank fusion, which needs no score
 //!   calibration and so works with any embedder.
 //! - [`rank_related`]: expansion candidates scored against the same query,
 //!   capped and returned apart from the main hits.
@@ -32,8 +31,8 @@ pub fn tokenize(text: &str) -> Vec<String> {
 }
 
 /// Most facts pinned by containing the whole query phrase. A phrase that
-/// many facts mention would otherwise pin them all past the floor and send
-/// them all to the reranker. Exact-key pins are not capped.
+/// many facts mention would otherwise pin them all ahead of every better
+/// answer. Exact-key pins are not capped.
 const MAX_PHRASE_PINS: usize = 5;
 
 /// Every lowercased alphanumeric word, in order: the unit a phrase match
@@ -237,41 +236,6 @@ impl Default for FactSearchConfig {
     }
 }
 
-/// The reranker's relevance bar, in its own score scale (cross-encoders emit
-/// logits or probabilities with model-specific ranges, so only the reranker
-/// can say).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RelevanceFloor {
-    /// Lowest score kept for a candidate the lexical scorer also nominated.
-    /// Cross-encoders score keyword-list queries low even for the right
-    /// fact, so independent lexical evidence earns a lower bar.
-    pub lexical: f32,
-    /// Lowest score kept for a candidate only the embedding nominated.
-    pub semantic: f32,
-    /// A related fact must also score within this much of the top hit:
-    /// related context is extra, so it must be close to what was asked.
-    pub related_gap: Option<f32>,
-}
-
-impl RelevanceFloor {
-    /// One bar for every candidate and no related gap.
-    pub fn uniform(floor: f32) -> Self {
-        Self {
-            lexical: floor,
-            semantic: floor,
-            related_gap: None,
-        }
-    }
-
-    fn for_candidate(&self, candidate: &Candidate) -> f32 {
-        if candidate.lexical_rank.is_some() || candidate.pinned {
-            self.lexical
-        } else {
-            self.semantic
-        }
-    }
-}
-
 /// Why a fact is in the results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchKind {
@@ -285,7 +249,7 @@ pub enum MatchKind {
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub fact: Fact,
-    /// Rerank score when reranked, else the fusion score.
+    /// Reciprocal rank fusion score.
     pub score: f32,
     pub kind: MatchKind,
 }
@@ -299,20 +263,6 @@ pub struct FactSearchReport {
     pub related: Vec<SearchHit>,
     /// Size of the candidate union.
     pub considered: usize,
-    /// Candidates that cleared the relevance floor (`>= hits.len()`).
-    pub passed_floor: usize,
-    pub reranked: bool,
-    /// A relevance floor judged the candidates. Without one, `passed_floor`
-    /// counts every candidate and says nothing about relevance.
-    pub floor_applied: bool,
-}
-
-impl FactSearchReport {
-    /// The highest score among the hits. Not the first hit's: pinned hits
-    /// sort first whatever their score.
-    pub fn best_score(&self) -> Option<f32> {
-        self.hits.iter().map(|hit| hit.score).reduce(f32::max)
-    }
 }
 
 /// One pooled candidate. Ranks start at 1.
@@ -326,7 +276,7 @@ pub struct Candidate {
 }
 
 /// The candidate union in a deterministic order (lexical order, then
-/// semantic-only in semantic order), for the caller to rerank.
+/// semantic-only in semantic order).
 ///
 /// `cosine` holds `(fact index, cosine)`. Pinned lexical hits are always
 /// kept. Duplicate facts (same id, or same category, key and value, as a
@@ -416,44 +366,17 @@ fn min_rank(a: Option<usize>, b: Option<usize>) -> Option<usize> {
     }
 }
 
-/// The final order.
-///
-/// `rerank` holds `(position in candidates, score)`; `None` orders by
-/// reciprocal rank fusion. `floor` applies only to reranked scores: an
-/// unpinned candidate scoring below it is dropped (a candidate the reranker
-/// did not score counts as below it). Pinned candidates come first, then by
-/// score descending, then newest, then lowest id.
+/// The final order, by reciprocal rank fusion: pinned candidates first,
+/// then by score descending, then newest, then lowest id.
 pub fn rank(
     facts: &[Fact],
     candidates: &[Candidate],
-    rerank: Option<&[(usize, f32)]>,
-    floor: Option<RelevanceFloor>,
     limit: usize,
     cfg: &FactSearchConfig,
 ) -> FactSearchReport {
-    let rerank_scores: Option<HashMap<usize, f32>> =
-        rerank.map(|scores| scores.iter().copied().collect());
     let mut scored: Vec<(&Candidate, f32)> = candidates
         .iter()
-        .enumerate()
-        .filter_map(|(position, candidate)| {
-            let score = match &rerank_scores {
-                Some(scores) => {
-                    let score = scores.get(&position).copied();
-                    let clears = match (score, floor) {
-                        (Some(score), Some(floor)) => score >= floor.for_candidate(candidate),
-                        (Some(_), None) => true,
-                        (None, _) => false,
-                    };
-                    if !clears && !candidate.pinned && floor.is_some() {
-                        return None;
-                    }
-                    score.unwrap_or(f32::NEG_INFINITY)
-                }
-                None => rrf_score(candidate, cfg.rrf_k),
-            };
-            Some((candidate, score))
-        })
+        .map(|candidate| (candidate, rrf_score(candidate, cfg.rrf_k)))
         .collect();
     scored.sort_by(|(a, a_score), (b, b_score)| {
         b.pinned
@@ -461,7 +384,6 @@ pub fn rank(
             .then(b_score.total_cmp(a_score))
             .then_with(|| newest_first(&facts[a.index], &facts[b.index]))
     });
-    let passed_floor = scored.len();
     let hits = scored
         .into_iter()
         .take(limit)
@@ -484,41 +406,25 @@ pub fn rank(
         hits,
         related: Vec::new(),
         considered: candidates.len(),
-        passed_floor,
-        reranked: rerank.is_some(),
-        floor_applied: rerank.is_some() && floor.is_some(),
     }
 }
 
-/// Rank expansion-eligible facts with the same scores as the main hits and
-/// cap them at `cfg.related_max`. `scores` holds `(position in neighbors,
-/// score)`; a neighbor with no score is left out, as is one below the
-/// floor's lexical bar or, with a `related_gap`, more than that gap below
-/// `top_hit` (the best main hit's score). Neighbors are nominated by typed
-/// structure (a shared namespace, a relationship link), independent
-/// evidence like a lexical match, so they get the lexical bar.
-/// Ties break by `recall_count`, then lowest id: recall frequency is never a
+/// Rank expansion-eligible facts and cap them at `cfg.related_max`.
+/// `scores` holds `(position in neighbors, score)`; a neighbor with no score
+/// is left out. There is no score floor: a relationship cluster (a parent of
+/// the person searched) shares no words with the query, so a cutoff would
+/// drop exactly the designed case. Ties break by `recall_count`, then lowest id: recall frequency is never a
 /// relevance signal, only a tie breaker.
 pub fn rank_related(
     neighbors: &[&Fact],
     scores: &[(usize, f32)],
-    floor: Option<RelevanceFloor>,
-    top_hit: Option<f32>,
     cfg: &FactSearchConfig,
 ) -> Vec<SearchHit> {
-    let bar = floor.map(|floor| {
-        let gap_bar = floor
-            .related_gap
-            .zip(top_hit)
-            .map_or(f32::NEG_INFINITY, |(gap, top)| top - gap);
-        floor.lexical.max(gap_bar)
-    });
     let mut seen = HashSet::new();
     let mut scored: Vec<(&Fact, f32)> = scores
         .iter()
         .filter(|(position, _)| seen.insert(*position))
         .filter_map(|(position, score)| neighbors.get(*position).map(|f| (*f, *score)))
-        .filter(|(_, score)| bar.is_none_or(|bar| *score >= bar))
         .collect();
     scored.sort_by(|(a, a_score), (b, b_score)| {
         b_score
@@ -647,65 +553,28 @@ mod tests {
         let cosine: Vec<(usize, f32)> = (60..65).map(|i| (i, 0.5)).collect();
         let pool = candidates(&facts, &lex, &cosine, &cfg);
         assert_eq!(pool.len(), 30, "lexical capped at 25, plus 5 semantic");
-        let rerank: Vec<(usize, f32)> = pool
-            .iter()
-            .enumerate()
-            .map(|(p, c)| (p, if c.index >= 60 { 0.9 } else { 0.1 }))
-            .collect();
-        let report = rank(&facts, &pool, Some(&rerank), None, 10, &cfg);
+        let report = rank(&facts, &pool, 10, &cfg);
         let ids = hit_ids(&report);
         for i in 61..=65 {
             assert!(ids.contains(&i), "semantic-only fact {i} hidden: {ids:?}");
         }
-        assert!(report.reranked);
+        assert_eq!(report.considered, 30);
     }
 
     #[test]
-    fn floor_drops_weak_candidates_and_reports_counts() {
-        let facts = filler(50);
-        let cfg = FactSearchConfig {
-            lexical_pool: 50,
-            ..FactSearchConfig::default()
-        };
-        let lex: Vec<LexicalHit> = (0..50).map(|i| lexical(i, false)).collect();
-        let pool = candidates(&facts, &lex, &[], &cfg);
-        let rerank: Vec<(usize, f32)> = (0..50)
-            .map(|p| (p, if p % 12 == 0 && p > 0 { 0.8 } else { -2.0 }))
-            .collect();
-        let report = rank(
-            &facts,
-            &pool,
-            Some(&rerank),
-            Some(RelevanceFloor::uniform(0.0)),
-            10,
-            &cfg,
-        );
-        assert_eq!(report.hits.len(), 4);
-        assert_eq!(report.passed_floor, 4);
-        assert_eq!(report.considered, 50);
-    }
-
-    #[test]
-    fn pinned_survives_floor() {
+    fn pinned_leads_whatever_its_fusion_score() {
         let facts = filler(5);
         let cfg = FactSearchConfig::default();
-        let lex = vec![lexical(3, true), lexical(0, false), lexical(1, false)];
-        let pool = candidates(&facts, &lex, &[], &cfg);
-        let rerank = vec![(0, -5.0), (1, 0.9), (2, 0.7)];
-        let report = rank(
-            &facts,
-            &pool,
-            Some(&rerank),
-            Some(RelevanceFloor::uniform(0.0)),
-            10,
-            &cfg,
-        );
+        let lex = vec![lexical(0, false), lexical(1, false), lexical(3, true)];
+        let cosine = vec![(0, 0.9), (1, 0.8)];
+        let pool = candidates(&facts, &lex, &cosine, &cfg);
+        let report = rank(&facts, &pool, 10, &cfg);
         assert_eq!(hit_ids(&report), vec![4, 1, 2]);
         assert_eq!(report.hits[0].kind, MatchKind::Exact);
     }
 
     #[test]
-    fn no_reranker_uses_rrf() {
+    fn fusion_orders_by_both_ranks() {
         let facts = filler(3);
         let cfg = FactSearchConfig::default();
         // Fact 0 is lexical rank 1 only; fact 1 is lexical rank 2 and
@@ -713,21 +582,9 @@ mod tests {
         let lex = vec![lexical(0, false), lexical(1, false)];
         let cosine = vec![(1, 0.9), (2, 0.8)];
         let pool = candidates(&facts, &lex, &cosine, &cfg);
-        let report = rank(
-            &facts,
-            &pool,
-            None,
-            Some(RelevanceFloor::uniform(10.0)),
-            10,
-            &cfg,
-        );
+        let report = rank(&facts, &pool, 10, &cfg);
         assert_eq!(hit_ids(&report), vec![2, 1, 3]);
         assert_eq!(report.hits[0].kind, MatchKind::Both);
-        assert!(!report.reranked);
-        assert_eq!(
-            report.passed_floor, 3,
-            "the floor applies to reranked scores only"
-        );
     }
 
     #[test]
@@ -736,7 +593,7 @@ mod tests {
         let cfg = FactSearchConfig::default();
         let lex = LexicalIndex::build(&facts).score("deploy staging");
         let pool = candidates(&facts, &lex, &[], &cfg);
-        let report = rank(&facts, &pool, None, None, 20, &cfg);
+        let report = rank(&facts, &pool, 20, &cfg);
         let expected: Vec<i64> = lex.iter().take(20).map(|h| facts[h.index].id).collect();
         assert_eq!(hit_ids(&report), expected);
     }
@@ -752,7 +609,7 @@ mod tests {
             .map(|(i, f)| (i, fx::fake_cosine("home city", f)))
             .collect();
         let pool = candidates(&facts, &lex, &cosine, &cfg);
-        let report = rank(&facts, &pool, None, None, 10, &cfg);
+        let report = rank(&facts, &pool, 10, &cfg);
         let ids = hit_ids(&report);
         assert!(ids.contains(&fx::HOME_CITY), "{ids:?}");
         assert!(!ids.contains(&fx::HOME_CITY_PROJECTION), "{ids:?}");
@@ -771,15 +628,8 @@ mod tests {
             .enumerate()
             .map(|(p, f)| (p, if f.id == fx::FATHER_NAME { 0.4 } else { -1.0 }))
             .collect();
-        let related = rank_related(
-            &neighbors,
-            &scores,
-            Some(RelevanceFloor::uniform(0.0)),
-            None,
-            &cfg,
-        );
-        let ids: Vec<i64> = related.iter().map(|h| h.fact.id).collect();
-        assert_eq!(ids, vec![fx::FATHER_NAME]);
+        let related = rank_related(&neighbors, &scores, &cfg);
+        assert_eq!(related[0].fact.id, fx::FATHER_NAME);
     }
 
     #[test]
@@ -788,13 +638,7 @@ mod tests {
         let cfg = FactSearchConfig::default();
         let neighbors: Vec<&Fact> = facts.iter().collect();
         let scores: Vec<(usize, f32)> = (0..30).map(|p| (p, 0.5 + p as f32 / 100.0)).collect();
-        let related = rank_related(
-            &neighbors,
-            &scores,
-            Some(RelevanceFloor::uniform(0.0)),
-            None,
-            &cfg,
-        );
+        let related = rank_related(&neighbors, &scores, &cfg);
         assert_eq!(related.len(), 5);
         assert_eq!(related[0].fact.id, 30, "best score first");
     }
@@ -807,8 +651,6 @@ mod tests {
         let related = rank_related(
             &neighbors,
             &[(0, 0.5), (1, 0.5)],
-            None,
-            None,
             &FactSearchConfig::default(),
         );
         assert_eq!(related[0].fact.id, 2);
@@ -820,73 +662,6 @@ mod tests {
         let hits = LexicalIndex::build(&facts).score("report");
         assert_eq!(hits.len(), 1);
         assert!(!hits[0].pinned);
-    }
-
-    #[test]
-    fn lexical_evidence_earns_the_lower_bar() {
-        let facts = corpus();
-        let cfg = FactSearchConfig::default();
-        let pool = vec![
-            Candidate {
-                index: 0,
-                lexical_rank: Some(1),
-                semantic_rank: None,
-                pinned: false,
-            },
-            Candidate {
-                index: 1,
-                lexical_rank: None,
-                semantic_rank: Some(1),
-                pinned: false,
-            },
-        ];
-        let floor = RelevanceFloor {
-            lexical: -3.0,
-            semantic: -2.0,
-            related_gap: None,
-        };
-        // Both score -2.5: only the lexically nominated one clears its bar.
-        let report = rank(
-            &facts,
-            &pool,
-            Some(&[(0, -2.5), (1, -2.5)]),
-            Some(floor),
-            10,
-            &cfg,
-        );
-        let ids: Vec<i64> = report.hits.iter().map(|h| h.fact.id).collect();
-        assert_eq!(ids, vec![facts[0].id]);
-        assert_eq!(report.passed_floor, 1);
-    }
-
-    #[test]
-    fn related_must_stay_close_to_the_top_hit() {
-        let facts = corpus();
-        let neighbors: Vec<&Fact> = facts.iter().take(3).collect();
-        let floor = RelevanceFloor {
-            lexical: -3.0,
-            semantic: -3.0,
-            related_gap: Some(2.0),
-        };
-        // Top hit 1.0: the bar is max(-3.0, 1.0 - 2.0) = -1.0.
-        let related = rank_related(
-            &neighbors,
-            &[(0, -0.5), (1, -1.5), (2, -2.9)],
-            Some(floor),
-            Some(1.0),
-            &FactSearchConfig::default(),
-        );
-        let ids: Vec<i64> = related.iter().map(|h| h.fact.id).collect();
-        assert_eq!(ids, vec![neighbors[0].id]);
-        // Without a top hit only the absolute bar applies.
-        let related = rank_related(
-            &neighbors,
-            &[(0, -0.5), (1, -1.5), (2, -2.9)],
-            Some(floor),
-            None,
-            &FactSearchConfig::default(),
-        );
-        assert_eq!(related.len(), 3);
     }
 
     #[test]
@@ -923,36 +698,5 @@ mod tests {
         assert_eq!(pinned.len(), MAX_PHRASE_PINS + 1);
         assert!(pinned.iter().any(|h| facts[h.index].id == 100));
         assert_eq!(hits.len(), 41, "unpinned phrase matches still score");
-    }
-
-    #[test]
-    fn best_score_ignores_pin_order() {
-        let facts = corpus();
-        let pool = vec![
-            Candidate {
-                index: 0,
-                lexical_rank: Some(1),
-                semantic_rank: None,
-                pinned: true,
-            },
-            Candidate {
-                index: 1,
-                lexical_rank: Some(2),
-                semantic_rank: Some(1),
-                pinned: false,
-            },
-        ];
-        // The pinned exact-key hit leads with a low rerank score.
-        let report = rank(
-            &facts,
-            &pool,
-            Some(&[(0, -2.8), (1, 1.5)]),
-            Some(RelevanceFloor::uniform(-3.0)),
-            10,
-            &FactSearchConfig::default(),
-        );
-        assert_eq!(report.hits[0].fact.id, facts[0].id, "pinned first");
-        assert_eq!(report.best_score(), Some(1.5));
-        assert_eq!(FactSearchReport::default().best_score(), None);
     }
 }

@@ -170,7 +170,7 @@ impl SqliteStateStore {
         embeddings: Arc<E>,
     ) -> anyhow::Result<Self>
     where
-        E: aidaemon_memory::Embedder + aidaemon_memory::sqlite::Reranker + 'static,
+        E: aidaemon_memory::Embedder + 'static,
     {
         Self::open(
             db_path,
@@ -183,7 +183,7 @@ impl SqliteStateStore {
     }
 
     /// Opens (or creates) the database at `db_path` and brings its schema
-    /// up to date. `embeddings` embeds and reranks long-term memory;
+    /// up to date. `embeddings` embeds long-term memory;
     /// `options` says how the database journals.
     pub async fn open<E>(
         db_path: &str,
@@ -193,7 +193,7 @@ impl SqliteStateStore {
         options: StoreOptions,
     ) -> anyhow::Result<Self>
     where
-        E: aidaemon_memory::Embedder + aidaemon_memory::sqlite::Reranker + 'static,
+        E: aidaemon_memory::Embedder + 'static,
     {
         let journal_mode_name = options.journal.mode_name();
         let journal_mode_pragma = options.journal.pragma();
@@ -379,7 +379,7 @@ pub fn sqlite_memory<E>(
     embeddings: Arc<E>,
 ) -> aidaemon_memory::sqlite::SqliteMemory
 where
-    E: aidaemon_memory::Embedder + aidaemon_memory::sqlite::Reranker + 'static,
+    E: aidaemon_memory::Embedder + 'static,
 {
     fn without_scaffolding(error: &str) -> String {
         error
@@ -388,9 +388,8 @@ where
             .collect::<Vec<_>>()
             .join("\n")
     }
-    aidaemon_memory::sqlite::SqliteMemory::new(pool.clone(), embeddings.clone())
+    aidaemon_memory::sqlite::SqliteMemory::new(pool.clone(), embeddings)
         .with_message_log(Arc::new(crate::history::EventHistory::new(pool, None)))
-        .with_reranker(embeddings)
         .with_channel_ids(Arc::new(crate::history::SessionChannelIds))
         .with_error_cleaner(without_scaffolding)
 }
