@@ -458,6 +458,17 @@ impl TurnEngine<'_> {
                 )
             })
             .unwrap_or_default();
+        // The folders this request's work made are its own, and so is any
+        // site one of them serves by its project's own configuration: the
+        // browser opens those without a card, for every run of the request
+        // (live 2026-11-13: a helper was asked to approve opening the
+        // `ddev` site of the folder it had just created).
+        let site_grant =
+            crate::approvals::grant_session(self.approval_session_id(), scope.session_id);
+        aidaemon_tools::local_sites::note_folders(
+            &site_grant,
+            &scope.spawn_family.owned_folders().list(),
+        );
         let executed = match self
             .execute_tool_with_watchdog_outcome(&request.name, arguments, &ctx)
             .await
@@ -538,6 +549,7 @@ impl TurnEngine<'_> {
                     folders = ?claimed,
                     "A folder this request's work created is its own"
                 );
+                aidaemon_tools::local_sites::note_folders(&site_grant, &claimed);
             }
         }
         let trust =

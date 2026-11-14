@@ -36,6 +36,11 @@ const MAX_URLS_PER_TEXT: usize = 16;
 static SITES: LazyLock<Mutex<HashMap<String, HashMap<String, Instant>>>> =
     LazyLock::new(Mutex::default);
 
+/// The folders each grant session's request owns ([`note_folders`]): a
+/// site one of them serves, by the project's own configuration, is the
+/// request's own.
+static FOLDERS: LazyLock<Mutex<HashMap<String, Vec<String>>>> = LazyLock::new(Mutex::default);
+
 /// The `http(s)://` addresses written in `text`, in order, without
 /// duplicates.
 fn urls_in(text: &str) -> Vec<String> {
@@ -173,15 +178,232 @@ pub async fn note_sites_in(grant_session: &str, text: &str) {
 }
 
 /// Whether the work in `grant_session` set up the local site `key`, or the
-/// owner's request named it.
+/// owner's request named it, or one of the folders its request owns serves
+/// it ([`note_folders`], [`project_hosts`]).
 pub fn is_noted(grant_session: &str, key: &str) -> bool {
-    let Ok(sites) = SITES.lock() else {
-        return false;
+    let noted = SITES.lock().is_ok_and(|sites| {
+        sites
+            .get(grant_session)
+            .and_then(|session| session.get(key))
+            .is_some_and(|at| at.elapsed() < KEEP_FOR)
+    });
+    noted || served_from_owned(grant_session, key)
+}
+
+/// Record the folders the request in `grant_session` owns (made by its own
+/// work: [`crate::semantics::OwnedFolders`]). Whatever their projects
+/// serve, now or once configured, is the request's own site; nothing else
+/// is added by them.
+pub fn note_folders(grant_session: &str, folders: &[String]) {
+    if grant_session.trim().is_empty() || folders.is_empty() {
+        return;
+    }
+    let Ok(mut known) = FOLDERS.lock() else {
+        return;
     };
-    sites
-        .get(grant_session)
-        .and_then(|session| session.get(key))
-        .is_some_and(|at| at.elapsed() < KEEP_FOR)
+    let kept = known.entry(grant_session.to_string()).or_default();
+    for folder in folders {
+        if std::path::Path::new(folder.trim()).is_absolute() && !kept.contains(folder) {
+            kept.push(folder.clone());
+        }
+    }
+    let excess = kept.len().saturating_sub(MAX_PER_SESSION);
+    kept.drain(..excess);
+}
+
+/// Whether one of the folders `grant_session`'s request owns serves the
+/// site `key` by its project's own configuration.
+fn served_from_owned(grant_session: &str, key: &str) -> bool {
+    let folders = FOLDERS
+        .lock()
+        .ok()
+        .and_then(|known| known.get(grant_session).cloned())
+        .unwrap_or_default();
+    !folders_serving(key, &folders).is_empty()
+}
+
+/// The folders among `folders` whose project configuration serves `host`
+/// (compared without case). A folder with no project configuration serves
+/// nothing.
+pub fn folders_serving(host: &str, folders: &[String]) -> Vec<String> {
+    let host = host.trim().trim_end_matches('.').to_lowercase();
+    if host.is_empty() {
+        return Vec::new();
+    }
+    folders
+        .iter()
+        .filter(|folder| project_hosts(std::path::Path::new(folder.trim())).contains(&host))
+        .cloned()
+        .collect()
+}
+
+/// The host names a local project folder serves, read from the project's
+/// own configuration: a `ddev` project's `.ddev/config.yaml` (and its
+/// `config.*.yaml` overrides, applied in name order as `ddev` does) gives
+/// its `name` (the folder's name when unset), `project_tld` (else the
+/// global configuration's, else `ddev`'s default), `additional_hostnames`
+/// (each under that domain) and `additional_fqdns`. Lowercase, without
+/// duplicates; empty when the folder holds no such project.
+pub fn project_hosts(folder: &std::path::Path) -> Vec<String> {
+    const DDEV_DEFAULT_TLD: &str = "ddev.site";
+    let config_dir = folder.join(".ddev");
+    let Ok(base) = std::fs::read_to_string(config_dir.join("config.yaml")) else {
+        return Vec::new();
+    };
+    let mut overrides: Vec<std::path::PathBuf> = std::fs::read_dir(&config_dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with("config.")
+                                && name.ends_with(".yaml")
+                                && name != "config.yaml"
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    overrides.sort();
+    let mut config = TopLevel::default();
+    config.apply(&base);
+    for path in overrides {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            config.apply(&text);
+        }
+    }
+    let name = config
+        .scalar("name")
+        .or_else(|| {
+            folder
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let tld = config
+        .scalar("project_tld")
+        .or_else(|| {
+            let home = dirs::home_dir()?;
+            let text = std::fs::read_to_string(home.join(".ddev/global_config.yaml")).ok()?;
+            let mut global = TopLevel::default();
+            global.apply(&text);
+            global.scalar("project_tld")
+        })
+        .unwrap_or_else(|| DDEV_DEFAULT_TLD.to_string());
+    let tld = tld.trim_matches('.');
+    let mut hosts: Vec<String> = Vec::new();
+    let mut add = |host: String| {
+        let host = host.trim().trim_end_matches('.').to_lowercase();
+        if !host.is_empty() && !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    };
+    if !name.trim().is_empty() {
+        add(format!("{}.{tld}", name.trim()));
+    }
+    for extra in config.list("additional_hostnames") {
+        add(format!("{extra}.{tld}"));
+    }
+    for fqdn in config.list("additional_fqdns") {
+        add(fqdn);
+    }
+    hosts
+}
+
+/// The top-level keys of a project's YAML configuration file: scalars and
+/// lists of scalars (block `- item` or flow `[a, b]`), which is all a
+/// project's served names are written as. Nested mappings are skipped.
+#[derive(Default)]
+struct TopLevel {
+    values: HashMap<String, Vec<String>>,
+}
+
+impl TopLevel {
+    /// Read `text`, its keys replacing earlier ones (an override file).
+    fn apply(&mut self, text: &str) {
+        let mut current: Option<String> = None;
+        for line in text.lines() {
+            let content = strip_comment(line);
+            if content.trim().is_empty() {
+                continue;
+            }
+            let indented = content.starts_with([' ', '\t']);
+            let trimmed = content.trim();
+            if indented || trimmed.starts_with('-') {
+                if let (Some(key), Some(item)) = (current.as_ref(), trimmed.strip_prefix('-')) {
+                    let item = unquote(item.trim());
+                    if !item.is_empty() {
+                        self.values.entry(key.clone()).or_default().push(item);
+                    }
+                }
+                continue;
+            }
+            current = None;
+            let Some((key, value)) = trimmed.split_once(':') else {
+                continue;
+            };
+            let key = key.trim().to_string();
+            let value = value.trim();
+            let items: Vec<String> = match value.strip_prefix('[').and_then(|v| v.strip_suffix(']'))
+            {
+                Some(flow) => flow
+                    .split(',')
+                    .map(|item| unquote(item.trim()))
+                    .filter(|item| !item.is_empty())
+                    .collect(),
+                None if value.is_empty() => {
+                    current = Some(key.clone());
+                    Vec::new()
+                }
+                None => vec![unquote(value)],
+            };
+            self.values.insert(key, items);
+        }
+    }
+
+    fn scalar(&self, key: &str) -> Option<String> {
+        match self.values.get(key).map(Vec::as_slice) {
+            Some([one]) if !one.is_empty() => Some(one.clone()),
+            _ => None,
+        }
+    }
+
+    fn list(&self, key: &str) -> Vec<String> {
+        self.values.get(key).cloned().unwrap_or_default()
+    }
+}
+
+/// A YAML line without its trailing comment (a `#` outside quotes that
+/// starts the line or follows a space).
+fn strip_comment(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut previous = ' ';
+    for (at, c) in line.char_indices() {
+        match quote {
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' && previous.is_whitespace() => return &line[..at],
+            None => {}
+        }
+        previous = c;
+    }
+    line
+}
+
+/// A YAML scalar without its surrounding quotes.
+fn unquote(value: &str) -> String {
+    let value = value.trim();
+    for q in ['"', '\''] {
+        if let Some(inner) = value.strip_prefix(q).and_then(|v| v.strip_suffix(q)) {
+            return inner.to_string();
+        }
+    }
+    value.to_string()
 }
 
 #[cfg(test)]
@@ -294,6 +516,73 @@ mod tests {
             keys,
             vec!["localhost:5173".to_string(), "shop.localhost".to_string()]
         );
+    }
+
+    fn ddev_project(root: &std::path::Path, folder: &str, config: &str) -> String {
+        let folder = root.join(folder);
+        std::fs::create_dir_all(folder.join(".ddev")).unwrap();
+        std::fs::write(folder.join(".ddev/config.yaml"), config).unwrap();
+        folder.display().to_string()
+    }
+
+    /// The names a project serves come from its own configuration, not
+    /// from the shape of a host name.
+    #[test]
+    fn a_project_serves_the_names_its_configuration_gives() {
+        let root = tempfile::tempdir().unwrap();
+        let site = ddev_project(
+            root.path(),
+            "claude-company-wordpress-20261113",
+            "name: claude-company-wordpress-20261113 # the project\n\
+             type: wordpress\n\
+             additional_hostnames:\n  - \"admin\"\n\
+             additional_fqdns: [shop.example.test]\n\
+             web_environment: []\n\
+             hooks:\n  post-start:\n    - exec: echo hi\n",
+        );
+        assert_eq!(
+            project_hosts(std::path::Path::new(&site)),
+            vec![
+                "claude-company-wordpress-20261113.ddev.site".to_string(),
+                "admin.ddev.site".to_string(),
+                "shop.example.test".to_string(),
+            ]
+        );
+        // An override file changes the name; the project's own TLD wins.
+        std::fs::write(
+            std::path::Path::new(&site).join(".ddev/config.local.yaml"),
+            "name: renamed\nproject_tld: test\nadditional_hostnames: []\n",
+        )
+        .unwrap();
+        assert_eq!(
+            project_hosts(std::path::Path::new(&site)),
+            vec!["renamed.test".to_string(), "shop.example.test".to_string()]
+        );
+        // No project configuration: it serves nothing.
+        let plain = root.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(project_hosts(&plain).is_empty());
+    }
+
+    /// Live 2026-11-13: a helper that created a `ddev` project in its own
+    /// new folder was asked to approve opening that project's site. A site
+    /// served from a folder the request owns is its own; another project's
+    /// site stays gated.
+    #[test]
+    fn a_site_served_from_an_owned_folder_is_the_requests_own() {
+        let root = tempfile::tempdir().unwrap();
+        let own = ddev_project(root.path(), "own-site", "name: own-site\n");
+        ddev_project(root.path(), "other-site", "name: other-site\n");
+        let grant = "test:local-sites-owned";
+        assert!(!is_noted(grant, "own-site.ddev.site"));
+        note_folders(grant, std::slice::from_ref(&own));
+        assert!(is_noted(grant, "own-site.ddev.site"));
+        assert!(is_noted(grant, "OWN-SITE.ddev.site"));
+        assert!(!is_noted(grant, "other-site.ddev.site"));
+        assert!(!is_noted(
+            "test:local-sites-elsewhere",
+            "own-site.ddev.site"
+        ));
     }
 
     #[tokio::test]
