@@ -1680,11 +1680,13 @@ pub struct ToolCallMetadata {
     /// handed off is still running when the model wants to stop.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub background_settled: bool,
-    /// The name, as the owner reads it, of the run this call left running
-    /// in the background (a helper, a command, a CLI agent): the turn's
-    /// launch line names its runs from these, never from the call's text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub background_run_label: Option<String>,
+    /// The names, as the owner reads them, of the runs this call left
+    /// running in the background (a helper, a command, a CLI agent; every
+    /// child of a batch call, in order): the turn's launch line names its
+    /// runs from these, never from the call's text (live 2026-11-14: a
+    /// batch of two named only its first child).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_run_labels: Vec<String>,
     /// The declared checklist items (their indices) this call took on: a
     /// launch hands them to the job it starts (`checklist_items`). Typed
     /// attribution of work to declared items, never read from text.

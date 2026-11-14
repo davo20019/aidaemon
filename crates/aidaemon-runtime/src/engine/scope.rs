@@ -220,7 +220,7 @@ pub struct TurnScope<'a> {
     /// while the job runs.
     pub background_ack: std::sync::Mutex<Option<String>>,
     /// The names of the runs this turn left running in the background, in
-    /// launch order (each call's typed `background_run_label`): the turn's
+    /// launch order (each call's typed `background_run_labels`): the turn's
     /// launch line names them all
     /// ([`crate::background_run::started_group_in_background`]).
     pub background_runs: std::sync::Mutex<Vec<String>>,

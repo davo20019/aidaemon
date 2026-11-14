@@ -778,6 +778,19 @@ impl RunStates {
         }
     }
 
+    /// Whether run `id` is one of a group of runs one turn started, whose
+    /// request is answered once, by a continuation of that turn, after the
+    /// last of them ends ([`Self::group_end`]). Asked before its end is
+    /// given: that continuation, not the runs' ends, then settles the
+    /// request's own steps.
+    pub fn answered_together(&self, id: &str) -> bool {
+        self.groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .any(|group| group.members.len() > 1 && group.members.iter().any(|member| member == id))
+    }
+
     /// Run `id`'s result is ready (`end`). A run alone in its group, or in
     /// none, is [`GroupTurn::Alone`]; otherwise its end is held until every
     /// member's is, and the call that brings the last one gets them all, in

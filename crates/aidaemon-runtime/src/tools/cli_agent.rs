@@ -5204,7 +5204,7 @@ impl CliAgentTool {
         }
         outcome.metadata.background_settled = settled && !left_in_background;
         if outcome.metadata.background_started {
-            outcome.metadata.background_run_label = run_label;
+            outcome.metadata.background_run_labels = run_label.into_iter().collect();
         }
         Ok(outcome)
     }

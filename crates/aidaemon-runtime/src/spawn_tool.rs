@@ -336,6 +336,9 @@ pub fn combine_batch(
     // helpers installed a site each in one call, and the card said it
     // couldn't verify either: the batch result had dropped their items).
     let mut checklist_items: Vec<usize> = Vec::new();
+    // Each child it left running, by its own name: the launch line names
+    // them all (live 2026-11-14: it named only the batch's first child).
+    let mut run_labels: Vec<String> = Vec::new();
     // Each child started is its own run: a batch of two launches two.
     let mut launched_runs = 0;
     let mut truncation: Option<aidaemon_tools::semantics::TruncationInfo> = None;
@@ -351,6 +354,7 @@ pub fn combine_batch(
         match run {
             Ok(outcome) => {
                 launched_runs += outcome.metadata.launched_runs.max(1);
+                run_labels.extend(outcome.metadata.background_run_labels.iter().cloned());
                 for item in &outcome.metadata.checklist_items {
                     if !checklist_items.contains(item) {
                         checklist_items.push(*item);
@@ -398,7 +402,9 @@ pub fn combine_batch(
     outcome.metadata.checklist_items = checklist_items;
     outcome.metadata.launched_runs = launched_runs;
     if background {
-        return Ok(outcome.handed_to_background());
+        let mut outcome = outcome.handed_to_background();
+        outcome.metadata.background_run_labels = run_labels;
+        return Ok(outcome);
     }
     outcome.metadata.outcome_status = Some(if all_succeeded {
         aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded
@@ -1553,7 +1559,7 @@ pub fn background_spawn_outcome(name: &str) -> ToolCallOutcome {
         SourceTrust::Trusted,
     )
     .handed_to_background();
-    outcome.metadata.background_run_label = Some(name.trim().to_string());
+    outcome.metadata.background_run_labels = vec![name.trim().to_string()];
     outcome
 }
 
@@ -1964,11 +1970,16 @@ mod group_tests {
         }
     }
 
+    /// The work a group answer's continuation does, run when the parent is
+    /// asked to write it.
+    type Continuation = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
+
     /// A parent that records the group answers it is asked to write.
     #[derive(Default)]
     struct Parent {
         answers: std::sync::Mutex<Vec<RunsAnswer>>,
         runs: Arc<RunStates>,
+        continuation: std::sync::Mutex<Option<Continuation>>,
     }
 
     #[async_trait::async_trait]
@@ -2005,6 +2016,10 @@ mod group_tests {
         async fn mark_executor_task_timeout(&self, _task_id: &str, _timeout_secs: u64) {}
         async fn answer_after_runs(&self, answer: RunsAnswer) -> anyhow::Result<bool> {
             self.answers.lock().unwrap().push(answer);
+            let continuation = self.continuation.lock().unwrap().take();
+            if let Some(continuation) = continuation {
+                continuation().await;
+            }
             Ok(true)
         }
         async fn deliver_background_child_result(
@@ -2292,6 +2307,201 @@ mod group_tests {
         assert!(followup.contains("It waited 1m 24s of that"), "{followup}");
         assert!(followup.contains("Drupal is up.") && followup.contains("WordPress is up."));
         assert!(followup.contains("don't list them again"), "{followup}");
+    }
+
+    /// Live 2026-11-14 (Drupal and WordPress in parallel, a folder check and
+    /// a report of the times): the last helper's end settled the parent's
+    /// own steps as "nothing was left working on it" before the group
+    /// answer did them, and both install rows named both folders. The
+    /// steps no run took on are the answer's turn's: they stay open through
+    /// the runs' ends, its receipt and its own update tick them, and the
+    /// card settles from the plan as the answer left it. Each install row
+    /// names only its own run's folder.
+    #[tokio::test]
+    async fn the_group_answer_settles_the_parents_own_steps() {
+        use aidaemon_work::plans::{ChecklistItem, StepStatus};
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(aidaemon_work::plans::PlanStore::new(pool).await.unwrap());
+        let item = |description: &str, units: Vec<usize>, observes: bool| ChecklistItem {
+            description: description.to_string(),
+            status: StepStatus::Pending,
+            depends_on: Vec::new(),
+            required_mutation_effects: Default::default(),
+            requires_observation: observes,
+            expected_targets: Vec::new(),
+            owner_units: units,
+        };
+        let plan = plans
+            .upsert_checklist_graph(
+                "chat",
+                Some("task-1"),
+                "track_requirements",
+                &[
+                    item("Install Drupal with DDEV", vec![0], false),
+                    item("Install WordPress with DDEV", vec![0], false),
+                    item("Check the current projects folder state", vec![], true),
+                    item(
+                        "Report each agent's measured completion time",
+                        vec![1],
+                        false,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        // One owner unit ("install both") on two rows: each child of the
+        // batch takes its own row, not both.
+        assert_eq!(plan.launch_steps(&[0], &[0]), vec![0]);
+        assert_eq!(plan.launch_steps(&[1], &[0]), vec![1]);
+        let parent = Arc::new(Parent::default());
+        let runs = parent.runs.clone();
+        let mut ended = Vec::new();
+        for (job, label, step, folder) in [
+            (
+                "job-drupal",
+                "Install Drupal",
+                0,
+                "/p/claude-company-drupal-2",
+            ),
+            (
+                "job-wordpress",
+                "Install WordPress",
+                1,
+                "/p/claude-company-wordpress-2",
+            ),
+        ] {
+            plans
+                .link_background_job("chat", Some("task-1"), &[step], job)
+                .await
+                .unwrap()
+                .unwrap();
+            let (tx, rx) = mpsc::unbounded_channel();
+            runs.begin(job, "chat", label, Some(tx));
+            runs.link_steps(job, &[step]);
+            runs.for_request(job, "task-1");
+            runs.join_group(job, "chat#task-1");
+            runs.note_folders(job, &[folder.to_string()]);
+            ended.push((job, label, rx));
+        }
+        let routed = |name: &str| ResultRoute {
+            plans: Some(plans.clone()),
+            plan_session: Some("chat".to_string()),
+            ..route(&parent, name)
+        };
+
+        // The group's answer: a continuation of the same request checks the
+        // folder (its observation receipt) and reports the times (its own
+        // checklist update). The runs' ends left both steps to it.
+        let continuation_plans = plans.clone();
+        let plan_id = plan.id.clone();
+        *parent.continuation.lock().unwrap() = Some(Box::new(move || {
+            Box::pin(async move {
+                let plans = continuation_plans;
+                let open = plans.get(&plan_id).await.unwrap().unwrap();
+                for index in [2, 3] {
+                    assert!(
+                        matches!(
+                            open.steps[index].status,
+                            StepStatus::Pending | StepStatus::InProgress
+                        ),
+                        "{open:?}"
+                    );
+                    assert_eq!(open.steps[index].not_done, None, "{open:?}");
+                }
+                plans
+                    .carry_into_turn("chat", "task-2")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                plans
+                    .reconcile_checklist_after_tool_success(
+                        "chat",
+                        &aidaemon_work::traits::ToolCallSemantics::observation(),
+                        "receipt-ls",
+                        "claude-company-drupal-2 claude-company-wordpress-2",
+                    )
+                    .await
+                    .unwrap()
+                    .expect("the folder check ticks from its receipt");
+                plans
+                    .modify(&plan_id, |plan| {
+                        plan.steps[3].status = StepStatus::Completed;
+                        plan.steps[3].completed_at = Some(chrono::Utc::now());
+                        true
+                    })
+                    .await
+                    .unwrap();
+            })
+        }));
+
+        for (job, label, rx) in ended {
+            finish(&runs, job, &format!("{label} is up."));
+            deliver_when_run_ends(rx, routed(label)).await;
+        }
+        assert_eq!(parent.answers.lock().unwrap().len(), 1);
+        let plan = plans.get(&plan.id).await.unwrap().unwrap();
+        for step in &plan.steps {
+            assert_eq!(step.status, StepStatus::Completed, "{plan:?}");
+            assert_eq!(step.not_done, None, "{plan:?}");
+        }
+        assert_eq!(
+            plan.steps[0].made_folders,
+            vec!["/p/claude-company-drupal-2"]
+        );
+        assert_eq!(
+            plan.steps[1].made_folders,
+            vec!["/p/claude-company-wordpress-2"]
+        );
+        let card = plan.card();
+        assert!(card.text.contains("Done · 4 of 4"), "{}", card.text);
+        assert!(!card.text.contains("Not done"), "{}", card.text);
+        assert!(
+            !card
+                .text
+                .contains("claude-company-wordpress-2, claude-company-drupal-2"),
+            "{}",
+            card.text
+        );
+        assert!(runs.get("job-drupal").is_none(), "the records are let go");
+    }
+
+    /// A batch call's launch line names every child it left running, not
+    /// only the first (live 2026-11-14: "Started in the background" named
+    /// Drupal and never WordPress).
+    #[test]
+    fn a_batch_launch_names_every_child() {
+        let combined = combine_batch(
+            vec![
+                (
+                    "Install Drupal".to_string(),
+                    Ok(background_spawn_outcome("Install Drupal")),
+                ),
+                (
+                    "Install WordPress".to_string(),
+                    Ok(background_spawn_outcome("Install WordPress")),
+                ),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            combined.metadata.background_run_labels,
+            vec![
+                "Install Drupal".to_string(),
+                "Install WordPress".to_string()
+            ]
+        );
+        assert_eq!(
+            crate::background_run::started_group_in_background(
+                &combined.metadata.background_run_labels
+            ),
+            "Started 2 in the background: Install Drupal and Install WordPress. I'll answer \
+             when both finish."
+        );
     }
 
     /// Live 2026-11-13 (Drupal and WordPress, 8:16:45 AM request): the

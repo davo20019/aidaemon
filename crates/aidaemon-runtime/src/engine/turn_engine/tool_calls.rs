@@ -860,24 +860,23 @@ impl TurnEngine<'_> {
                 // the run on the tool's finish.
                 let mut handed_off = false;
                 // The runs this turn leaves running: a call that left one
-                // there names it, and the turn's launch line names them all.
-                let launched = outcome
-                    .metadata
-                    .background_run_label
-                    .as_deref()
-                    .filter(|_| {
-                        !outcome.metadata.detached
+                // there names it (a batch, each of its children), and the
+                // turn's launch line names them all.
+                let launched = Some(&outcome.metadata.background_run_labels)
+                    .filter(|labels| {
+                        !labels.is_empty()
+                            && !outcome.metadata.detached
                             && outcome.metadata.outcome_status
                                 != Some(
                                     aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent,
                                 )
                     })
-                    .map(|label| {
+                    .map(|labels| {
                         let mut runs = scope
                             .background_runs
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        runs.push(label.to_string());
+                        runs.extend(labels.iter().cloned());
                         crate::background_run::started_group_in_background(&runs)
                     });
                 // Track the jobs this run left running whose result the

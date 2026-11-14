@@ -2037,6 +2037,7 @@ mod child_runtime_tests {
             chat,
             "job-own-card",
             crate::plans::JobEnd::Succeeded,
+            false,
         )
         .await;
         let edits = hub.edits.lock().unwrap().clone();
@@ -2112,6 +2113,7 @@ mod child_runtime_tests {
             chat,
             "job-unknown",
             crate::plans::JobEnd::Failed,
+            false,
         )
         .await;
         assert!(!shown, "no card shows it: its result says how it ended");
@@ -2612,6 +2614,7 @@ mod child_runtime_tests {
             chat,
             "job-race",
             crate::plans::JobEnd::Succeeded,
+            false,
         )
         .await;
         assert!(ended.elapsed() < Duration::from_secs(2));

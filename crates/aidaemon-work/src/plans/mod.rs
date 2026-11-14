@@ -456,11 +456,23 @@ impl TaskPlan {
     /// whose named item is not a step of this plan, but which names the
     /// owner's unit, takes on the plan's own step for that unit, never a
     /// new row.
+    ///
+    /// A unit one of its named steps already carries is taken on through
+    /// that step: the launch's own row for the unit, not every row of it.
+    /// Several steps can share one unit ("install both sites"); a batch's
+    /// children each name their own, and expanding the shared unit gave
+    /// every child every row, so each row read both children's folders
+    /// (live 2026-11-14: "Install Drupal … (made claude-company-wordpress-2,
+    /// claude-company-drupal-2)").
     pub fn launch_steps(&self, named: &[usize], owner_units: &[usize]) -> Vec<usize> {
         let mut steps: Vec<usize> = named
             .iter()
             .copied()
             .filter(|index| *index < self.steps.len())
+            .collect();
+        let through_named: Vec<usize> = steps
+            .iter()
+            .flat_map(|index| self.steps[*index].owner_units.iter().copied())
             .collect();
         if !owner_units.is_empty() {
             for step in &self.steps {
@@ -469,6 +481,10 @@ impl TaskPlan {
                         .owner_units
                         .iter()
                         .all(|unit| owner_units.contains(unit))
+                    && !step
+                        .owner_units
+                        .iter()
+                        .any(|unit| through_named.contains(unit))
                     && !steps.contains(&step.index)
                 {
                     steps.push(step.index);
@@ -795,9 +811,14 @@ impl TaskPlan {
                 changed = true;
             }
         }
-        if changed {
-            self.status = self.resolved_status();
+        // Every step already has its outcome (the request's last turn did
+        // the rest): the plan's own state follows them, so its header never
+        // reads "Working" over rows that are all settled.
+        let resolved = self.resolved_status();
+        if changed || self.status != resolved {
+            self.status = resolved;
             self.updated_at = now;
+            changed = true;
         }
         changed
     }

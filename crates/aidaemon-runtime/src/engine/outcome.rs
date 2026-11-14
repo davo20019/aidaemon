@@ -202,8 +202,15 @@ impl TurnVerdict {
             .ok()
             .and_then(|reply| reply.clone());
         // A handed-off run stopped with its work still running: partial work,
-        // whatever the kernel's completed status would otherwise credit.
-        let handed_off = matches!(outcome.status, sdk::RunStatus::Completed) && handoff.is_some();
+        // whatever the kernel's completed status would otherwise credit. A
+        // run ended by a launch's own finish is handed off too: the kernel
+        // keeps a batch's first finish, so its reply named only the first
+        // launch, while the recorded handoff names every run the turn left
+        // running (live 2026-11-14: two helpers started, the reply named one).
+        let handed_off = matches!(
+            outcome.status,
+            sdk::RunStatus::Completed | sdk::RunStatus::Finished { .. }
+        ) && handoff.is_some();
         let task_outcome = if handed_off && task_outcome == TaskOutcome::Succeeded {
             TaskOutcome::Partial
         } else {

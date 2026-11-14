@@ -6538,7 +6538,11 @@ impl TerminalTool {
                         detached: detach,
                         completion_notifications_enabled: notifier_started,
                         semantics: background_semantics,
-                        background_run_label: run_label.clone().filter(|_| notifier_started),
+                        background_run_labels: run_label
+                            .clone()
+                            .filter(|_| notifier_started)
+                            .into_iter()
+                            .collect(),
                         ..ToolCallMetadata::default()
                     },
                     output: msg,
