@@ -186,6 +186,10 @@ pub const TOOL_MANIFEST: &[ToolEntry] = &[
         ..optional("client_view", "client_gateway.enabled")
     },
     ToolEntry {
+        lint: Lint::Skipped("reads which features are off on the running gateway"),
+        ..optional("request_feature", "client_gateway.enabled")
+    },
+    ToolEntry {
         feature: Some("slack"),
         ..optional("read_channel_history", "always (Slack build)")
     },

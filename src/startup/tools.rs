@@ -340,6 +340,7 @@ enum OptionalToolId {
     CliAgents,
     HealthProbe,
     ClientView,
+    RequestFeature,
     #[cfg(feature = "slack")]
     SlackChannelHistory,
 }
@@ -474,6 +475,11 @@ const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
     OptionalToolSpec {
         id: OptionalToolId::ClientView,
         name: "client_view",
+        enabled_if: optional_enabled_client_gateway,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::RequestFeature,
+        name: "request_feature",
         enabled_if: optional_enabled_client_gateway,
     },
     #[cfg(feature = "slack")]
@@ -884,6 +890,16 @@ pub async fn register_optional_tools(
                 tools.push(Arc::new(crate::tools::ClientViewTool::new(Arc::new(
                     crate::startup::client_gateway::GatewayViews,
                 ))));
+            }
+            OptionalToolId::RequestFeature => {
+                if !config.tools.is_enabled("request_feature") {
+                    continue;
+                }
+                tools.push(Arc::new(
+                    aidaemon_client_gateway::client_feature::FeatureRequestTool::new(Arc::new(
+                        crate::startup::client_gateway::GatewayFeatures::of(config),
+                    )),
+                ));
             }
             #[cfg(feature = "slack")]
             OptionalToolId::SlackChannelHistory => {

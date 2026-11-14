@@ -669,6 +669,50 @@ impl aidaemon_client_gateway::client_view::ClientViews for GatewayViews {
     }
 }
 
+/// Features the agent may ask the owner to turn on: those off in the
+/// config the daemon started with (each takes effect at a restart), shown
+/// on the running gateway's apps.
+pub(crate) struct GatewayFeatures {
+    off: Vec<aidaemon_client_protocol::Feature>,
+}
+
+impl GatewayFeatures {
+    pub(crate) fn of(config: &AppConfig) -> Self {
+        use aidaemon_client_protocol::Feature;
+        let mut off = Vec::new();
+        if cfg!(feature = "browser") && !config.browser.enabled {
+            off.push(Feature::Browser);
+        }
+        if !config.files.stt.enabled {
+            off.push(Feature::Voice);
+        }
+        if cfg!(feature = "computer_use") && !config.computer_use.enabled {
+            off.push(Feature::ComputerUse);
+        }
+        Self { off }
+    }
+}
+
+impl aidaemon_client_gateway::client_feature::FeatureRequests for GatewayFeatures {
+    fn off(&self) -> Vec<aidaemon_client_protocol::Feature> {
+        if running().is_none() {
+            return Vec::new();
+        }
+        self.off.clone()
+    }
+
+    fn request(
+        &self,
+        session_id: &str,
+        feature: aidaemon_client_protocol::Feature,
+        reason: &str,
+    ) -> Result<(), String> {
+        let gateway = running().ok_or_else(|| "the Client Gateway is off".to_string())?;
+        gateway.feature_requested(session_id, feature, reason);
+        Ok(())
+    }
+}
+
 /// The running gateway, for the chat's device commands; unset while it is
 /// off.
 static GATEWAY: std::sync::OnceLock<Arc<ClientGateway>> = std::sync::OnceLock::new();

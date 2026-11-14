@@ -259,6 +259,9 @@ pub fn run() -> anyhow::Result<()> {
             "install-service" => {
                 return daemon::install_service();
             }
+            "service" => {
+                return handle_service_command(&args[2..]);
+            }
             "check-update" => {
                 println!("Checking for updates...");
                 match updater::Updater::check_for_update() {
@@ -579,6 +582,41 @@ fn handle_migrate_command(args: &[String], default_config_path: &Path) -> anyhow
         config_path.display()
     );
     Ok(())
+}
+
+/// `aidaemon service install [--dir DIR] | uninstall`: run the daemon at
+/// login for this user, with no administrator rights.
+fn handle_service_command(args: &[String]) -> anyhow::Result<()> {
+    match args.first().map(String::as_str) {
+        Some("install") => {
+            let dir = match args.iter().position(|a| a == "--dir") {
+                Some(at) => PathBuf::from(
+                    args.get(at + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--dir needs a directory"))?,
+                ),
+                None => daemon::default_home()?,
+            };
+            daemon::install_user_service(&dir)?;
+            println!(
+                "AIdaemon runs at login from {} and is starting now.",
+                dir.display()
+            );
+            Ok(())
+        }
+        Some("uninstall") => {
+            daemon::uninstall_user_service()?;
+            println!("AIdaemon no longer runs at login. Its files are kept.");
+            Ok(())
+        }
+        _ => {
+            println!("Usage:");
+            println!(
+                "  aidaemon service install [--dir DIR]   run at login (default ~/.aidaemon), start now"
+            );
+            println!("  aidaemon service uninstall             stop it and stop running at login");
+            Ok(())
+        }
+    }
 }
 
 fn handle_setup_command(args: &[String], default_config_path: &Path) -> anyhow::Result<()> {

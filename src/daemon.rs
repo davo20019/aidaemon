@@ -154,11 +154,20 @@ pub const MACOS_BUNDLE_ID: &str = "ai.aidaemon";
 /// `computer_use` permission grants survive rebuilds.
 #[cfg(target_os = "macos")]
 pub fn install_service() -> anyhow::Result<()> {
+    install_macos_agent(&std::env::current_dir()?)?;
+    println!("Run: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.aidaemon.plist");
+    println!("Then grant Accessibility + Screen Recording to aidaemon — see COMPUTER_USE_MACOS.md");
+    Ok(())
+}
+
+/// Build the signed app bundle and write the launchd agent running it in
+/// `working_dir`. Returns the plist's path.
+#[cfg(target_os = "macos")]
+fn install_macos_agent(working_dir: &std::path::Path) -> anyhow::Result<String> {
     use std::path::PathBuf;
     use std::process::Command;
 
     let exe = std::env::current_exe()?;
-    let working_dir = std::env::current_dir()?;
     let home = std::env::var("HOME")?;
 
     // Use user-private log directory instead of world-readable /tmp
@@ -264,14 +273,130 @@ pub fn install_service() -> anyhow::Result<()> {
     );
     println!("Plist written to {path}");
     println!("Logs will be written to {log_dir}/");
-    println!("Run: launchctl bootstrap gui/$(id -u) {path}");
-    println!("Then grant Accessibility + Screen Recording to aidaemon — see COMPUTER_USE_MACOS.md");
-    Ok(())
+    Ok(path)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn install_service() -> anyhow::Result<()> {
-    anyhow::bail!("Service installation is only supported on Linux and macOS");
+    anyhow::bail!("Use `aidaemon service install` on this platform");
+}
+
+/// Where a per-user install keeps its config, database and logs.
+pub fn default_home() -> anyhow::Result<std::path::PathBuf> {
+    Ok(dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("no home directory"))?
+        .join(".aidaemon"))
+}
+
+fn run_quiet(program: &str, args: &[&str]) -> anyhow::Result<std::process::Output> {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run {program}: {e}"))
+}
+
+/// Run the daemon at login for this user, in `dir`, and start it now. No
+/// administrator rights: a launchd agent (macOS), a systemd user unit
+/// (Linux) or a logon task (Windows). Running it again replaces it.
+pub fn install_user_service(dir: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(target_os = "macos")]
+    {
+        let plist = install_macos_agent(dir)?;
+        let uid = run_quiet("id", &["-u"])?;
+        let target = format!("gui/{}", String::from_utf8_lossy(&uid.stdout).trim());
+        // A loaded agent is replaced.
+        let _ = run_quiet(
+            "launchctl",
+            &["bootout", &format!("{target}/{MACOS_BUNDLE_ID}")],
+        );
+        let started = run_quiet("launchctl", &["bootstrap", &target, &plist])?;
+        anyhow::ensure!(
+            started.status.success(),
+            "launchctl bootstrap failed: {}",
+            String::from_utf8_lossy(&started.stderr).trim()
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let exe = std::env::current_exe()?;
+        let units = dirs::config_dir()
+            .ok_or_else(|| anyhow::anyhow!("no config directory"))?
+            .join("systemd/user");
+        std::fs::create_dir_all(&units)?;
+        let unit = format!(
+            "[Unit]\nDescription=AIdaemon\nAfter=network-online.target\n\n[Service]\nType=simple\n\
+             ExecStart={}\nWorkingDirectory={}\nRestart=on-failure\nRestartSec=10\n\n\
+             [Install]\nWantedBy=default.target\n",
+            exe.display(),
+            dir.display()
+        );
+        std::fs::write(units.join("aidaemon.service"), unit)?;
+        run_quiet("systemctl", &["--user", "daemon-reload"])?;
+        let started = run_quiet("systemctl", &["--user", "enable", "--now", "aidaemon"])?;
+        anyhow::ensure!(
+            started.status.success(),
+            "systemctl --user enable --now aidaemon failed: {}",
+            String::from_utf8_lossy(&started.stderr).trim()
+        );
+        // A user unit stops at logout unless the user lingers.
+        let _ = run_quiet("loginctl", &["enable-linger"]);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let exe = std::env::current_exe()?;
+        let command = format!(
+            "cmd /c cd /d \"{}\" && \"{}\"",
+            dir.display(),
+            exe.display()
+        );
+        let created = run_quiet(
+            "schtasks",
+            &[
+                "/Create", "/F", "/SC", "ONLOGON", "/RL", "LIMITED", "/TN", "AIdaemon", "/TR",
+                &command,
+            ],
+        )?;
+        anyhow::ensure!(
+            created.status.success(),
+            "schtasks /Create failed: {}",
+            String::from_utf8_lossy(&created.stderr).trim()
+        );
+        let _ = run_quiet("schtasks", &["/Run", "/TN", "AIdaemon"])?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    anyhow::bail!("Running at login is not supported on this platform");
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+/// Stop the per-user service and remove it.
+pub fn uninstall_user_service() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let uid = run_quiet("id", &["-u"])?;
+        let target = format!("gui/{}", String::from_utf8_lossy(&uid.stdout).trim());
+        let _ = run_quiet(
+            "launchctl",
+            &["bootout", &format!("{target}/{MACOS_BUNDLE_ID}")],
+        );
+        if let Some(home) = dirs::home_dir() {
+            let _ = std::fs::remove_file(home.join("Library/LaunchAgents/ai.aidaemon.plist"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = run_quiet("systemctl", &["--user", "disable", "--now", "aidaemon"]);
+        if let Some(config) = dirs::config_dir() {
+            let _ = std::fs::remove_file(config.join("systemd/user/aidaemon.service"));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = run_quiet("schtasks", &["/End", "/TN", "AIdaemon"]);
+        let _ = run_quiet("schtasks", &["/Delete", "/F", "/TN", "AIdaemon"]);
+    }
+    Ok(())
 }
 
 /// Prevent macOS idle sleep for the lifetime of the daemon.
