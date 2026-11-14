@@ -6,9 +6,9 @@ pub use aidaemon_runtime::tools::manage_automations::*;
 mod tests {
     use super::*;
     use crate::testing::CallWithFacts;
+    use crate::traits::ToolCalls as _;
     use crate::testing::{MockProvider, setup_test_agent};
     use crate::tools::ManageMandatesTool;
-    use crate::tools::ManageMemoriesTool;
     use crate::traits::StateStore;
     use crate::traits::ToolCallContext;
     use crate::types::ChannelVisibility;
@@ -36,7 +36,6 @@ mod tests {
 
     struct Fixture {
         state: Arc<dyn StateStore>,
-        memory: Arc<dyn aidaemon_memory::stores::MemoryStores>,
         tool: ManageAutomationsTool,
         /// Scheduled automations by name, recorded when created.
         scheduled: std::sync::Mutex<std::collections::HashMap<String, String>>,
@@ -47,11 +46,9 @@ mod tests {
     async fn fixture() -> Fixture {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
         let state: Arc<dyn StateStore> = harness.state.clone();
-        let memory = harness.state.memory_stores();
-        let tool = ManageAutomationsTool::new(state.clone(), memory.clone());
+        let tool = ManageAutomationsTool::new(state.clone());
         Fixture {
             state,
-            memory,
             tool,
             scheduled: Default::default(),
             _harness: harness,
@@ -60,7 +57,7 @@ mod tests {
 
     impl Fixture {
         async fn reminder(&self, name: &str, when: &str) -> String {
-            let output = crate::tools::SetReminderTool::new(self.state.clone(), self.memory())
+            let output = crate::tools::SetReminderTool::new(self.state.clone())
                 .call_with(
                     &json!({"message": "Check the oven.", "when": when, "name": name}).to_string(),
                     owner(),
@@ -91,12 +88,11 @@ mod tests {
         }
 
         async fn scheduled_work(&self, name: &str, schedule: &str) -> String {
-            let output = ManageMemoriesTool::new(self.state.clone(), self.memory())
+            let output = crate::tools::ScheduleTaskTool::new(self.state.clone())
                 .call_with(
                     &json!({
-                        "action": "create_scheduled_goal",
-                        "goal": "Summarize the synthetic inbox",
-                        "schedule": schedule,
+                        "task": "Summarize the synthetic inbox",
+                        "when": schedule,
                         "name": name,
                     })
                     .to_string(),
@@ -126,10 +122,6 @@ mod tests {
                 )
                 .await
                 .unwrap()
-        }
-
-        fn memory(&self) -> Arc<dyn aidaemon_memory::stores::MemoryStores> {
-            self.memory.clone()
         }
 
         async fn call(&self, args: Value) -> String {
@@ -166,7 +158,7 @@ mod tests {
                 .starts_with("Reminder set")
         );
         let work = f.scheduled_work("Inbox digest", "every day at 9am").await;
-        assert!(work.contains("Confirmed and activated"), "{work}");
+        assert!(work.starts_with("Scheduled \"Inbox digest\""), "{work}");
         let watch = f.watching("Status watch").await;
         assert!(watch.contains("Activated mandate"), "{watch}");
 
@@ -329,7 +321,7 @@ mod tests {
             "{refused}"
         );
 
-        let set = crate::tools::SetReminderTool::new(f.state.clone(), f.memory())
+        let set = crate::tools::SetReminderTool::new(f.state.clone())
             .call_with(
                 &json!({"message": "Stretch.", "when": "every day at 3pm"}).to_string(),
                 owner(),
@@ -377,5 +369,187 @@ mod tests {
                 .unwrap();
             assert_eq!(answer, OWNER_ONLY);
         }
+    }
+
+    #[tokio::test]
+    async fn edit_reschedules_renames_and_snoozes_one_scheduled_automation() {
+        let f = fixture().await;
+        f.scheduled_work("Inbox digest", "every day at 9am").await;
+
+        let edited = f
+            .call(json!({"action": "edit", "name": "Inbox digest", "when": "every weekday at 7am", "new_name": "Morning digest"}))
+            .await;
+        assert!(
+            edited.starts_with("Edited \"Inbox digest\": renamed it \"Morning digest\"; its schedule is now Every weekday at 7:00 AM"),
+            "{edited}"
+        );
+        let id = f.scheduled.lock().unwrap().get("Inbox digest").cloned().unwrap();
+        let schedules = f.state.get_schedules_for_goal(&id).await.unwrap();
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].cron_expr, "0 7 * * 1-5");
+        let shown = f.call(json!({"action": "show", "name": "morning digest"})).await;
+        assert!(shown.contains("How often: Every weekday at 7:00 AM"), "{shown}");
+
+        let snoozed = f
+            .call(json!({"action": "edit", "name": "Morning digest", "snooze_until": "in 3 days"}))
+            .await;
+        assert!(snoozed.contains("its next run moved to"), "{snoozed}");
+        let schedule = f.state.get_schedules_for_goal(&id).await.unwrap().remove(0);
+        // The cadence stays; only the next run moved.
+        assert_eq!(schedule.cron_expr, "0 7 * * 1-5");
+        let next = chrono::DateTime::parse_from_rfc3339(&schedule.next_run_at).unwrap();
+        assert!(next > chrono::Utc::now() + chrono::Duration::days(2), "{next}");
+
+        // A recurring snooze, a one-time reschedule of recurring work and a
+        // name already taken are refused, and change nothing.
+        for (args, refusal) in [
+            (json!({"action": "edit", "name": "Morning digest", "snooze_until": "every day at 8am"}), "`snooze_until` is one time"),
+            (json!({"action": "edit", "name": "Morning digest", "when": "tomorrow at 9am"}), "recurs; to make it a one-time one"),
+        ] {
+            let answer = f.call(args).await;
+            assert!(answer.contains(refusal), "{answer}");
+        }
+        f.watching("Status watch").await;
+        let taken = f
+            .call(json!({"action": "edit", "name": "Morning digest", "new_name": "Status watch"}))
+            .await;
+        assert!(taken.starts_with("An automation is already named"), "{taken}");
+        assert_eq!(
+            f.state.get_schedules_for_goal(&id).await.unwrap()[0].cron_expr,
+            "0 7 * * 1-5"
+        );
+    }
+
+    #[tokio::test]
+    async fn several_refs_cancel_together_and_nothing_cancels_by_matching_words() {
+        let f = fixture().await;
+        f.reminder("Oven", "every weekday at 8am").await;
+        f.reminder("Stretch", "every day at 3pm").await;
+        f.reminder("Water", "every day at 4pm").await;
+        let refs: Vec<String> = ["Oven", "Stretch"]
+            .iter()
+            .map(|name| f.scheduled.lock().unwrap().get(*name).cloned().unwrap()[..8].to_string())
+            .collect();
+        let cancelled = f.call(json!({"action": "cancel", "ids": refs})).await;
+        assert_eq!(cancelled.lines().count(), 2, "{cancelled}");
+        assert_eq!(f.scheduled_status("Oven").await, "cancelled");
+        assert_eq!(f.scheduled_status("Stretch").await, "cancelled");
+        assert_eq!(f.scheduled_status("Water").await, "active");
+        // A word from a name is not a ref.
+        let outcome = f
+            .tool
+            .call_with_execution_context(
+                &json!({"action": "cancel", "ids": ["Water"]}).to_string(),
+                None,
+                owner(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult)
+        );
+        assert_eq!(f.scheduled_status("Water").await, "active");
+    }
+
+    #[tokio::test]
+    async fn run_now_starts_a_run_of_named_scheduled_work() {
+        let f = fixture().await;
+        f.scheduled_work("Inbox digest", "every day at 9am").await;
+        let outcome = f
+            .tool
+            .call_with_execution_context(
+                &json!({"action": "run_now", "name": "Inbox digest"}).to_string(),
+                None,
+                owner(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(crate::traits::ToolOutcomeStatus::Succeeded),
+            "{}",
+            outcome.output
+        );
+        let id = f.scheduled.lock().unwrap().get("Inbox digest").cloned().unwrap();
+        assert_eq!(f.state.get_tasks_for_goal(&id).await.unwrap().len(), 1);
+        // A paused one does not run, and that is no success.
+        f.call(json!({"action": "pause", "name": "Inbox digest"})).await;
+        let refused = f
+            .tool
+            .call_with_execution_context(
+                &json!({"action": "run_now", "id": id}).to_string(),
+                None,
+                owner(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            refused.metadata.outcome_status,
+            Some(crate::traits::ToolOutcomeStatus::Succeeded),
+            "{}",
+            refused.output
+        );
+    }
+
+    #[tokio::test]
+    async fn health_checks_are_listed_paused_and_cancelled_here() {
+        let f = fixture().await;
+        let store = Arc::new(
+            crate::health::HealthProbeStore::new(f._harness.state.pool())
+                .await
+                .unwrap(),
+        );
+        let tool = ManageAutomationsTool::new(f.state.clone()).with_health_probes(Some(store.clone()));
+        let mut probe = crate::health::HealthProbe::new(
+            "Synthetic site".to_string(),
+            crate::health::ProbeType::Http,
+            "https://status.example.test/".to_string(),
+            "*/5 * * * *".to_string(),
+            "tool".to_string(),
+        );
+        probe.next_run_at = chrono::Utc::now() + chrono::Duration::minutes(5);
+        store.upsert_probe(&probe).await.unwrap();
+        let call = |args: Value| {
+            let tool = &tool;
+            async move { tool.call_with(&args.to_string(), owner()).await.unwrap() }
+        };
+        let list = call(json!({"action": "list", "kind": "probe"})).await;
+        assert!(
+            list.contains("\"Synthetic site\" · Health check · Every 5 minutes · On"),
+            "{list}"
+        );
+        let paused = call(json!({"action": "pause", "name": "synthetic site"})).await;
+        assert!(paused.starts_with("Paused \"Synthetic site\" (probe)"), "{paused}");
+        assert!(store.get_probe(&probe.id).await.unwrap().unwrap().is_paused);
+        let cancelled = call(json!({"action": "cancel", "name": "Synthetic site"})).await;
+        assert!(cancelled.starts_with("Cancelled \"Synthetic site\" (probe)"), "{cancelled}");
+        assert!(store.get_probe(&probe.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_moved_schedule_action_names_its_new_home_and_runs_nothing() {
+        let f = fixture().await;
+        f.reminder("Oven", "every weekday at 8am").await;
+        let id = f.scheduled.lock().unwrap().get("Oven").cloned().unwrap();
+        let memories = crate::tools::ManageMemoriesTool::new(f.state.clone(), f._harness.state.memory_stores());
+        let outcome = memories
+            .call_with_execution_context(
+                &json!({"action": "cancel_scheduled", "goal_id": id}).to_string(),
+                None,
+                owner(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(crate::traits::ToolOutcomeStatus::FailedPermanent)
+        );
+        assert!(
+            outcome.output.contains("Use manage_automations cancel"),
+            "{}",
+            outcome.output
+        );
+        assert_eq!(f.scheduled_status("Oven").await, "active");
     }
 }

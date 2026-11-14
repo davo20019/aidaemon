@@ -571,6 +571,11 @@ impl TurnEngine<'_> {
         }
         let mut builder = sdk::Agent::builder("aidaemon")
             .attest(sdk::Safeguard::Scope)
+            .retired_tool(
+                "scheduled_goal_runs",
+                "Use manage_automations: run_now, history, last_failure, set_budget, \
+                 update_instructions or bind_workspace, by the automation's name or ref.",
+            )
             .model(model.clone())
             .provider(HostProvider {
                 calls: calls_tx.clone(),

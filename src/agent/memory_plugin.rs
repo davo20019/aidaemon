@@ -555,7 +555,7 @@ mod tests {
         // manage_memories keeps only its goal actions.
         let actions = offered_actions(log.last().unwrap(), "manage_memories");
         assert!(
-            actions.contains(&"list_scheduled".to_string()),
+            actions.contains(&"list_goals".to_string()),
             "{actions:?}"
         );
         assert!(!actions.contains(&"search".to_string()), "{actions:?}");
@@ -598,7 +598,8 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(narrowed.len(), MANAGE_MEMORIES_GOAL_ACTIONS.len());
-        assert!(check_goal_action(&json!({"action": "pause_scheduled"})).is_ok());
+        assert!(check_goal_action(&json!({"action": "complete_goal"})).is_ok());
+        assert!(check_goal_action(&json!({"action": "pause_scheduled"})).is_err());
         assert!(check_goal_action(&json!({"action": "forget"})).is_err());
         assert!(check_goal_action(&json!({})).is_err());
         assert_eq!(

@@ -3529,44 +3529,6 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
     }
 }
 
-/// `scheduled_goal_runs` with its high-impact flag cleared, so a plain test
-/// turn offers it; its call semantics are the real tool's.
-struct OfferedGoalRuns(crate::tools::ScheduledGoalRunsTool);
-
-#[async_trait::async_trait]
-impl crate::traits::Tool for OfferedGoalRuns {
-    fn name(&self) -> &str {
-        crate::traits::Tool::name(&self.0)
-    }
-    fn description(&self) -> &str {
-        crate::traits::Tool::description(&self.0)
-    }
-    fn schema(&self) -> serde_json::Value {
-        crate::traits::Tool::schema(&self.0)
-    }
-    async fn execute(
-        &self,
-        arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-        let output: anyhow::Result<String> =
-            async move { crate::traits::ToolCalls::call(&self.0, arguments).await }.await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
-    }
-}
-
-impl crate::traits::ToolSemantics for OfferedGoalRuns {
-    fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
-        crate::traits::ToolSemantics::call_semantics(&self.0, arguments)
-    }
-    fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            high_impact_write: false,
-            ..crate::traits::ToolSemantics::capabilities(&self.0)
-        }
-    }
-}
-
 /// Binding a goal's workspace makes a future trusted root, so after
 /// untrusted content it goes to the verifier like any other egress call.
 #[tokio::test]
@@ -3587,22 +3549,20 @@ async fn bind_workspace_after_untrusted_content_is_verified() {
     );
     let bind_call = serde_json::json!({
         "action": "bind_workspace",
-        "goal_id": "synthetic-goal-1",
+        "id": "synthetic-goal-1",
         "workspace_path": "/tmp/aidaemon-test/drop",
     })
     .to_string();
     let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
         MockProvider::with_responses(vec![
             MockProvider::tool_call_response("page_probe", PAGE_CALL),
-            MockProvider::tool_call_response("scheduled_goal_runs", &bind_call),
+            MockProvider::tool_call_response("manage_automations", &bind_call),
             MockProvider::text_response(r#"{"consistent":false,"reason":"not requested"}"#),
             MockProvider::text_response("Nothing was changed."),
         ]),
         vec![
             Arc::new(PageProbe),
-            Arc::new(OfferedGoalRuns(crate::tools::ScheduledGoalRunsTool::new(
-                goal_store,
-            ))),
+            Arc::new(crate::tools::ManageAutomationsTool::new(goal_store)),
         ],
         None,
     )
@@ -3623,7 +3583,7 @@ async fn bind_workspace_after_untrusted_content_is_verified() {
         "{decisions:?} {:?}",
         tool_results_seen(&harness).await
     );
-    assert_eq!(decisions[0]["tool"], "scheduled_goal_runs");
+    assert_eq!(decisions[0]["tool"], "manage_automations");
 }
 
 /// A broad bound workspace adds no root through any source, including the

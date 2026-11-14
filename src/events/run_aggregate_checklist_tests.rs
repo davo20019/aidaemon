@@ -100,11 +100,11 @@ fn unbound_checklist_target_no_longer_leaves_an_all_success_audit_partial() {
         ToolTargetHint::new(ToolTargetHintKind::ResourceId, "objective:sha256:synthetic").unwrap();
     let receipts = || {
         vec![
-            call("goal-runs", "scheduled_goal_runs"),
+            call("goal-runs", "manage_automations"),
             with_exact_observations(
                 result(
                     "goal-runs",
-                    "scheduled_goal_runs",
+                    "manage_automations",
                     ToolOutcomeStatus::Succeeded,
                     0,
                     ToolCallSemantics::observation(),

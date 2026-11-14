@@ -1,58 +1,54 @@
 //! `set_reminder`: a plain reminder in two typed fields.
 //!
-//! The same scheduling path as `manage_memories(create_scheduled_goal)` with a
-//! typed `reminder`, behind a schema that cannot pick the wrong action or drop
-//! the schedule: `message` and `when`, both required.
+//! The same creation path as `schedule_task` with a typed `reminder`, behind
+//! a schema that cannot drop the schedule: `message` and `when`, both
+//! required. The path answers with a typed outcome, so a refusal is never
+//! read as a reminder set.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{Map, Value, json};
+use serde::Deserialize;
+use serde_json::{Value, json};
 
-use crate::tools::manage_memories::ManageMemoriesTool;
-use crate::tools::traits::{
-    AutomationStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolOutcomeStatus,
-};
+use crate::tools::schedule_task::{ScheduleRequest, ScheduledWork};
+use crate::tools::traits::{AutomationStore, Tool, ToolCallSemantics, ToolCapabilities};
 
 pub struct SetReminderTool {
-    scheduler: ManageMemoriesTool,
+    work: ScheduledWork,
 }
 
 impl SetReminderTool {
-    pub fn new(
-        state: Arc<dyn AutomationStore>,
-        store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
-    ) -> Self {
+    pub fn new(state: Arc<dyn AutomationStore>) -> Self {
         Self {
-            scheduler: ManageMemoriesTool::new(state, store),
+            work: ScheduledWork::new(state),
         }
     }
 }
 
-/// The equivalent `manage_memories` call. It runs with this call's
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReminderArgs {
+    message: String,
+    when: String,
+    name: Option<String>,
+}
+
+/// The reminder as a scheduling request. It runs with this call's
 /// dispatcher facts (session, role, channel), so ownership and scoping
 /// checks apply unchanged.
-fn scheduler_arguments(arguments: &str) -> anyhow::Result<String> {
-    let args: Map<String, Value> = serde_json::from_str(arguments)?;
-    let field = |name: &str| {
-        args.get(name)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    };
-    let message = field("message").ok_or_else(|| anyhow::anyhow!("'message' is required"))?;
-    let when = field("when").ok_or_else(|| anyhow::anyhow!("'when' is required"))?;
-    let mut call = Map::new();
-    call.insert("action".into(), json!("create_scheduled_goal"));
-    call.insert("goal".into(), json!(message));
-    call.insert("schedule".into(), json!(when));
-    call.insert("reminder".into(), json!(message));
-    if let Some(name) = field("name") {
-        call.insert("name".into(), json!(name));
-    }
-    Ok(Value::Object(call).to_string())
+fn reminder_request(arguments: &str) -> anyhow::Result<ScheduleRequest> {
+    let args: ReminderArgs = serde_json::from_str(arguments)?;
+    let message = args.message.trim();
+    let when = args.when.trim();
+    anyhow::ensure!(!message.is_empty(), "'message' is required");
+    anyhow::ensure!(!when.is_empty(), "'when' is required");
+    Ok(ScheduleRequest {
+        task: message.to_string(),
+        when: when.to_string(),
+        name: args.name,
+        reminder: Some(message.to_string()),
+    })
 }
 
 #[async_trait]
@@ -62,7 +58,7 @@ impl Tool for SetReminderTool {
     }
 
     fn description(&self) -> &str {
-        "Set up a scheduled automation that only sends the user a reminder message at a time or on a cadence. Nothing else runs when it fires. For scheduled work, use manage_memories create_scheduled_goal."
+        "Set up a scheduled automation that only sends the user a reminder message at a time or on a cadence. Nothing else runs when it fires. For scheduled work, use schedule_task."
     }
 
     fn schema(&self) -> Value {
@@ -87,26 +83,11 @@ impl Tool for SetReminderTool {
         arguments: &str,
         facts: &crate::tools::traits::ToolCallContext,
     ) -> anyhow::Result<crate::tools::traits::ToolCallOutcome> {
-        let facts = facts.clone();
-
-        let output = self
-            .scheduler
-            .run(&scheduler_arguments(arguments)?, &facts)
-            .await?;
-        let outcome_status = if output.starts_with("Reminder set") {
-            ToolOutcomeStatus::Succeeded
-        } else {
-            // Duplicate, owner-only refusal or an unparseable time.
-            ToolOutcomeStatus::FailedPermanent
-        };
-        Ok(ToolCallOutcome {
-            output,
-            metadata: ToolCallMetadata {
-                outcome_status: Some(outcome_status),
-                ..ToolCallMetadata::default()
-            },
-            finish: None,
-        })
+        Ok(self
+            .work
+            .create(&reminder_request(arguments)?, facts)
+            .await?
+            .into_tool_outcome())
     }
 }
 
@@ -139,7 +120,7 @@ mod tests {
 
     #[test]
     fn missing_fields_are_errors() {
-        assert!(scheduler_arguments(r#"{"message":"x","when":""}"#).is_err());
-        assert!(scheduler_arguments(r#"{"when":"in 2h"}"#).is_err());
+        assert!(reminder_request(r#"{"message":"x","when":""}"#).is_err());
+        assert!(reminder_request(r#"{"when":"in 2h"}"#).is_err());
     }
 }

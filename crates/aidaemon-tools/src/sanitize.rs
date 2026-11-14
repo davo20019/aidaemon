@@ -791,6 +791,7 @@ fn friendly_tool_label(name: &str) -> String {
         "search_history" => "checking exact history",
         "manage_memories" | "remember_fact" | "manage_people" => "updating memory",
         "set_reminder" => "setting a reminder",
+        "schedule_task" => "scheduling a task",
         // Any other tool reads as its name in words (`check_environment` →
         // "check environment"), never as an identifier.
         other => return other.replace(['_', '-'], " ").trim().to_string(),
@@ -855,9 +856,6 @@ fn memory_action_is_read(action: &str) -> bool {
             | "export"
             | "audit"
             | "list_goals"
-            | "list_scheduled"
-            | "list_scheduled_matching"
-            | "diagnose_scheduled"
     )
 }
 
@@ -1093,8 +1091,6 @@ mod tests {
             "search_episodes",
             "list",
             "list_goals",
-            "list_scheduled",
-            "diagnose_scheduled",
         ] {
             let (label, _) =
                 user_facing_tool_activity("manage_memories", read, ChannelVisibility::Private);
@@ -1107,8 +1103,8 @@ mod tests {
         for write in [
             "forget",
             "set_privacy",
-            "create_scheduled_goal",
-            "trigger_now",
+            "create_personal_goal",
+            "complete_goal",
         ] {
             let (label, summary) =
                 user_facing_tool_activity("manage_memories", write, ChannelVisibility::Private);

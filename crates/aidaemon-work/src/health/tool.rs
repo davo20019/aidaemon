@@ -71,7 +71,7 @@ impl Tool for HealthProbeTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["create", "list", "delete", "pause", "resume", "run_now", "status"]
+                        "enum": ["create", "list", "run_now", "status"]
                     },
                     "name": {
                         "type": "string"
@@ -152,13 +152,10 @@ impl Tool for HealthProbeTool {
             match args.action.as_str() {
                 "create" => self.create(args).await,
                 "list" => self.list().await,
-                "delete" => self.delete(args).await,
-                "pause" => self.pause(args).await,
-                "resume" => self.resume(args).await,
                 "run_now" => self.run_now(args).await,
                 "status" => self.status(args).await,
                 other => Ok(format!(
-                "Unknown action '{}'. Use: create, list, delete, pause, resume, run_now, status",
+                "Unknown action '{}'. Use: create, list, run_now, status. Pause, resume or cancel a probe with manage_automations.",
                 other
             )),
             }
@@ -344,72 +341,6 @@ impl HealthProbeTool {
         }
 
         Ok(output)
-    }
-
-    async fn delete(&self, args: HealthProbeArgs) -> anyhow::Result<String> {
-        let id = match args.id.as_deref() {
-            Some(id) if !id.is_empty() => id,
-            _ => return Ok("Error: 'id' is required for delete".to_string()),
-        };
-
-        // First check if it exists and get the name for logging
-        let probe = self.store.get_probe(id).await?;
-        if probe.is_none() {
-            return Ok(format!("No health probe found with ID '{}'", id));
-        }
-
-        let deleted = self.store.delete_probe(id).await?;
-        if deleted {
-            info!(id = %id, "Deleted health probe");
-            Ok(format!("Deleted health probe {}", id))
-        } else {
-            Ok(format!("No health probe found with ID '{}'", id))
-        }
-    }
-
-    async fn pause(&self, args: HealthProbeArgs) -> anyhow::Result<String> {
-        let id = match args.id.as_deref() {
-            Some(id) if !id.is_empty() => id,
-            _ => return Ok("Error: 'id' is required for pause".to_string()),
-        };
-
-        let paused = self.store.pause_probe(id).await?;
-        if paused {
-            info!(id = %id, "Paused health probe");
-            Ok(format!("Paused health probe {}", id))
-        } else {
-            Ok(format!("No health probe found with ID '{}'", id))
-        }
-    }
-
-    async fn resume(&self, args: HealthProbeArgs) -> anyhow::Result<String> {
-        let id = match args.id.as_deref() {
-            Some(id) if !id.is_empty() => id,
-            _ => return Ok("Error: 'id' is required for resume".to_string()),
-        };
-
-        // Get the probe to recompute next run
-        let probe = match self.store.get_probe(id).await? {
-            Some(p) => p,
-            None => return Ok(format!("No health probe found with ID '{}'", id)),
-        };
-
-        let next_run = match compute_next_run(&probe.schedule) {
-            Ok(dt) => dt,
-            Err(e) => return Ok(format!("Error computing next run: {}", e)),
-        };
-
-        let resumed = self.store.resume_probe(id, next_run).await?;
-        if resumed {
-            info!(id = %id, "Resumed health probe");
-            Ok(format!(
-                "Resumed health probe {}. Next run: {}",
-                id,
-                crate::schedule::owner_time(&next_run)
-            ))
-        } else {
-            Ok(format!("No health probe found with ID '{}'", id))
-        }
     }
 
     async fn run_now(&self, args: HealthProbeArgs) -> anyhow::Result<String> {

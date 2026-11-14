@@ -1,8 +1,8 @@
 {
-  "description": "Set up a scheduled automation that only sends the user a reminder message at a time or on a cadence. Nothing else runs when it fires. For scheduled work, use manage_memories create_scheduled_goal.",
+  "description": "Set up a scheduled automation that only sends the user a reminder message at a time or on a cadence. Nothing else runs when it fires. For scheduled work, use schedule_task.",
   "name": "set_reminder",
   "schema": {
-    "description": "Set up a scheduled automation that only sends the user a reminder message at a time or on a cadence. Nothing else runs when it fires. For scheduled work, use manage_memories create_scheduled_goal.",
+    "description": "Set up a scheduled automation that only sends the user a reminder message at a time or on a cadence. Nothing else runs when it fires. For scheduled work, use schedule_task.",
     "name": "set_reminder",
     "parameters": {
       "additionalProperties": false,

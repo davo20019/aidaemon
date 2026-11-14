@@ -16,6 +16,7 @@ pub mod manage_memories;
 pub mod policy_metrics;
 pub mod report_blocker;
 pub mod run_command;
+pub mod schedule_task;
 pub mod search_history;
 mod semantic_command_risk;
 pub mod set_reminder;

@@ -8,17 +8,17 @@ generate_image 921 231
 git_commit 599 150
 git_info 609 153
 goal_trace 812 203
-health_probe 1259 315
+health_probe 1233 309
 http_request 2463 616
 list_checkpoints 500 125
 manage_api 1292 323
-manage_automations 811 203
+manage_automations 1886 472
 manage_config 962 241
 manage_goal_tasks 1658 415
 manage_http_auth 830 208
 manage_mandates 6641 1661
 manage_mcp 726 182
-manage_memories 1276 319
+manage_memories 727 182
 manage_node_monitors 3130 783
 manage_oauth 1120 280
 manage_people 1030 258
@@ -32,14 +32,14 @@ read_node_sensors 473 119
 remember_fact 2434 609
 report_blocker 1599 400
 run_command 1039 260
-scheduled_goal_runs 831 208
+schedule_task 695 174
 search_files 677 170
 search_history 1440 360
 self_diagnose 1123 281
 send_file 722 181
 send_node_audio 584 146
 service_status 586 147
-set_reminder 671 168
+set_reminder 647 162
 share_memory 438 110
 skill_resources 631 158
 spawn_agent 6018 1505
@@ -51,5 +51,5 @@ use_skill 483 121
 web_fetch 647 162
 web_search 1326 332
 write_file 1068 267
-TOTAL 75008 18752 (52 tools)
-PER_CALL 31761 7941 (14 core: terminal remember_fact manage_memories set_reminder manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 35 deferred)
+TOTAL 75348 18837 (52 tools)
+PER_CALL 32922 8231 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 34 deferred)

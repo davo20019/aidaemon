@@ -481,8 +481,8 @@ mod tests {
         // R53: an owner audit consulted only `manage_mandates list`, which
         // reported the scheduled-goal collection as `0/0 (complete)` because
         // the one scheduled objective had been created through a sibling
-        // channel session of the same owner. `scheduled_goal_runs overview`
-        // saw it. One collection ID must have one membership everywhere.
+        // channel session of the same owner. The scheduled-run overview
+        // (now behind `manage_automations list`) saw it. One collection ID must have one membership everywhere.
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
         let state = harness.state.clone();
         let now = chrono::Utc::now().to_rfc3339();
@@ -515,7 +515,7 @@ mod tests {
         }
 
         let mandates = crate::tools::manage_mandates::ManageMandatesTool::new(state.clone());
-        let runs = crate::tools::scheduled_goal_runs::ScheduledGoalRunsTool::new(state.clone());
+        let automations = crate::tools::ManageAutomationsTool::new(state.clone());
 
         let mandate_view = mandates
             .call_with_execution_context(
@@ -530,8 +530,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let runs_view = runs
-            .call_with_status_outcome(r#"{"action":"overview"}"#, None)
+        let runs_view = automations
+            .call_with_execution_context(
+                r#"{"action":"list"}"#,
+                None,
+                crate::traits::ToolCallContext {
+                    session_id: "owner-bot-a:1001".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 

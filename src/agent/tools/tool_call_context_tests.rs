@@ -575,10 +575,6 @@ async fn fact_reading_tools_receive_call_context() {
             "manage_memories",
             json!({"action": "create_personal_goal", "goal": "Synthetic reading goal"}),
         ),
-        (
-            "manage_memories",
-            json!({"action": "cancel_scheduled", "goal_id": "all"}),
-        ),
         ("self_diagnose", json!({"action": "list_tasks"})),
     ];
     for (tool, arguments) in calls {

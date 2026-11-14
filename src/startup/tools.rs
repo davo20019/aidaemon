@@ -26,7 +26,7 @@ use crate::tools::{
     ListCheckpointsTool, ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool,
     ManageMandatesTool, ManageMcpTool, ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool,
     PolicyMetricsTool, ProjectInspectTool, ReadFileTool, RememberFactTool, RunCommandTool,
-    ScheduledGoalRunsTool, SearchFilesTool, SearchHistoryTool, SendFileTool, ServiceStatusTool,
+    SearchFilesTool, SearchHistoryTool, SendFileTool, ServiceStatusTool,
     ShareMemoryTool, SpawnAgentTool, SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool,
     WebSearchTool, WriteFileTool,
 };
@@ -122,6 +122,7 @@ pub async fn setup_tools(
         event_store.clone(),
         approval_capacity,
         media_capacity,
+        health_store.clone(),
     )
     .await?;
 
@@ -229,10 +230,10 @@ enum BaseToolId {
     ShareMemory,
     ManageMemories,
     SetReminder,
+    ScheduleTask,
     ManageMandates,
     ManageAutomations,
     SearchHistory,
-    ScheduledGoalRuns,
     GoalTrace,
     ToolTrace,
     PolicyMetrics,
@@ -282,6 +283,10 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
         name: "set_reminder",
     },
     BaseToolSpec {
+        id: BaseToolId::ScheduleTask,
+        name: "schedule_task",
+    },
+    BaseToolSpec {
         id: BaseToolId::ManageMandates,
         name: "manage_mandates",
     },
@@ -292,10 +297,6 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
     BaseToolSpec {
         id: BaseToolId::SearchHistory,
         name: "search_history",
-    },
-    BaseToolSpec {
-        id: BaseToolId::ScheduledGoalRuns,
-        name: "scheduled_goal_runs",
     },
     BaseToolSpec {
         id: BaseToolId::GoalTrace,
@@ -652,6 +653,7 @@ pub async fn build_base_tools(
     event_store: Arc<EventStore>,
     approval_queue_capacity: usize,
     media_queue_capacity: usize,
+    health_store: Option<Arc<HealthProbeStore>>,
 ) -> anyhow::Result<BaseToolsBundle> {
     let checkpoint_manager = aidaemon_tools::checkpoints::install_manager(
         &config.checkpoints,
@@ -687,6 +689,7 @@ pub async fn build_base_tools(
             pool.clone(),
             event_store.clone(),
             approval_tx.clone(),
+            health_store.clone(),
         )
         .await?;
         info!(
@@ -1175,6 +1178,7 @@ async fn build_base_tool(
     pool: SqlitePool,
     event_store: Arc<EventStore>,
     approval_tx: ApprovalBroker,
+    health_store: Option<Arc<HealthProbeStore>>,
 ) -> anyhow::Result<BuiltBaseTool> {
     let built = match tool_id {
         BaseToolId::SystemInfo => BuiltBaseTool {
@@ -1229,10 +1233,11 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::SetReminder => BuiltBaseTool {
-            tool: Arc::new(crate::tools::SetReminderTool::new(
-                state,
-                memory.store.clone(),
-            )),
+            tool: Arc::new(crate::tools::SetReminderTool::new(state)),
+            terminal_tool: None,
+        },
+        BaseToolId::ScheduleTask => BuiltBaseTool {
+            tool: Arc::new(crate::tools::ScheduleTaskTool::new(state)),
             terminal_tool: None,
         },
         BaseToolId::ManageMandates => BuiltBaseTool {
@@ -1249,10 +1254,9 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::ManageAutomations => BuiltBaseTool {
-            tool: Arc::new(crate::tools::ManageAutomationsTool::new(
-                state,
-                memory.store.clone(),
-            )),
+            tool: Arc::new(
+                crate::tools::ManageAutomationsTool::new(state).with_health_probes(health_store),
+            ),
             terminal_tool: None,
         },
         BaseToolId::SearchHistory => BuiltBaseTool {
@@ -1264,10 +1268,6 @@ async fn build_base_tool(
                     search
                 })
             },
-            terminal_tool: None,
-        },
-        BaseToolId::ScheduledGoalRuns => BuiltBaseTool {
-            tool: Arc::new(ScheduledGoalRunsTool::new(state)),
             terminal_tool: None,
         },
         BaseToolId::GoalTrace => BuiltBaseTool {
@@ -1412,6 +1412,7 @@ pub(crate) mod lint_catalog {
             event_store.clone(),
             32,
             8,
+            None,
         )
         .await?;
         let _optional = register_optional_tools(
@@ -1849,6 +1850,7 @@ mod tests {
             event_store,
             8,
             8,
+            None,
         )
         .await
         .unwrap();
