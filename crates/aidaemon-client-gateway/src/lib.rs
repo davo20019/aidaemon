@@ -309,6 +309,12 @@ impl ClientGateway {
         &self.views
     }
 
+    /// The path of the web client pairing links open
+    /// ([`ClientGatewayConfig::web_app_path`]).
+    pub fn web_app_path(&self) -> &'static str {
+        self.config.web_app_path()
+    }
+
     /// Where devices reach the gateway now: the live tunnel origin, else
     /// `public_url` from config, else the loopback address.
     pub fn public_url(&self) -> String {

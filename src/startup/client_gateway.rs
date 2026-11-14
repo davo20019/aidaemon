@@ -278,8 +278,9 @@ pub(crate) fn web_link(
     offer: &aidaemon_client_protocol::PairingOffer,
 ) -> String {
     format!(
-        "{}/client/v1/app#offer={}&code={}&fp={}",
+        "{}{}#offer={}&code={}&fp={}",
         gateway.public_url(),
+        gateway.web_app_path(),
         offer.offer_id,
         offer.code,
         offer.fingerprint

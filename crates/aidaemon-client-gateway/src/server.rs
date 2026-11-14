@@ -59,9 +59,9 @@ pub fn router(gateway: Arc<ClientGateway>) -> Router {
         .route("/client/v1/app", get(web_page))
         .route("/client/v1/app/", get(web_page))
         .route("/client/v1/app/{module}", get(web_script))
-        .route("/client/v2/app", get(app_root))
-        .route("/client/v2/app/", get(app_index))
-        .route("/client/v2/app/{*path}", get(app_file))
+        .route("/client/v1/next", get(app_root))
+        .route("/client/v1/next/", get(app_index))
+        .route("/client/v1/next/{*path}", get(app_file))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .with_state(gateway)
 }
@@ -378,7 +378,7 @@ async fn web_script(Path(module): Path<String>) -> Response {
 /// The nsh app's web build: `app_dir` from the config, read file by file.
 /// Only plain relative paths inside the directory are served.
 async fn app_root() -> Response {
-    axum::response::Redirect::permanent("/client/v2/app/").into_response()
+    axum::response::Redirect::permanent("/client/v1/next/").into_response()
 }
 
 async fn app_index(State(gateway): State<Arc<ClientGateway>>, headers: HeaderMap) -> Response {

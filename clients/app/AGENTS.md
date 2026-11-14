@@ -22,10 +22,10 @@ A plain `cargo check --target wasm32-unknown-unknown` needs
 `src/link/random.rs` supplies the backend).
 
 The web build is served by the gateway from `[client_gateway] app_dir`
-at `/client/v2/app/` (same origin, so sign-in needs no CORS). The demo
+at `/client/v1/next/` (same origin, so sign-in needs no CORS). The demo
 gateway serves it with
 `AIDAEMON_APP_DIR=<path to .nsh/out/AIdaemon> cargo run -p aidaemon-client-gateway --example demo_gateway -- <port>`;
-its pairing link approves itself (use `/client/v2/app/#offer=…`).
+its pairing link approves itself (use `/client/v1/next/#offer=…`).
 
 ## Invariants
 
