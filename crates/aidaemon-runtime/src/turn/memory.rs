@@ -83,6 +83,17 @@ pub fn check_goal_action(arguments: &serde_json::Value) -> Result<(), String> {
     }
 }
 
+/// What is known about a turn when its message arrives: enough to start
+/// recall, not yet its task or its memory policy.
+#[derive(Clone)]
+pub struct MemoryWarmup {
+    pub session_id: String,
+    pub user_text: String,
+    pub user_role: UserRole,
+    pub channel_ctx: ChannelContext,
+    pub depth: usize,
+}
+
 /// Everything a plugin needs to scope memory for one turn.
 #[derive(Clone)]
 pub struct MemoryTurn {
@@ -135,11 +146,11 @@ pub struct MemoryParts {
 pub trait MemoryPlugin: Send + Sync {
     async fn turn(&self, turn: &MemoryTurn) -> MemoryParts;
 
-    /// Starts preparing recall for `user_text` (for example its query
-    /// embedding) when the message arrives, before the turn's memory policy
-    /// is settled. It must read and write no memory and return at once; the
-    /// turn's recall uses whatever is ready.
-    fn warm(&self, _user_text: &str) {}
+    /// Starts recall for a message as it arrives, before the turn's memory
+    /// policy is settled. It must write nothing and return at once, and what
+    /// it reads may reach the turn only through [`MemoryPlugin::turn`], when
+    /// that turn may read memory and recalls for the same inputs.
+    fn warm(&self, _warmup: &MemoryWarmup) {}
 
     /// The daemon memory tools ([`DAEMON_MEMORY_TOOLS`]) this plugin owns.
     fn owned_daemon_tools(&self) -> &'static [&'static str] {

@@ -73,11 +73,6 @@ pub trait HistorySearchStore: Send + Sync {
 /// Layer-2 facts storage and retrieval (including privacy + channel provenance).
 #[async_trait]
 pub trait FactStore: Send + Sync {
-    /// Prepares what searching for `query` needs (its embedding), so the
-    /// turn's recall finds it ready. Reads and writes no memory: it may run
-    /// before the turn's memory policy is settled.
-    async fn warm_query(&self, _query: &str) {}
-
     /// Reconcile an entity-aware personal-memory write atomically.
     async fn reconcile_personal_memory(
         &self,

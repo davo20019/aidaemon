@@ -607,11 +607,19 @@ pub async fn run_bootstrap(
         .await
     };
     let user_text = user_text_enriched.as_str();
-    // Recall searches for this text at the first model call; preparing it
-    // now (the query embedding) overlaps the rest of bootstrap. It reads
-    // and writes no memory, so it needs no memory policy yet.
+    // Recall starts now, beside the rest of bootstrap; the turn adopts it
+    // at its first model call only if its memory policy allows reading and
+    // its inputs match. It writes nothing until then.
     if !is_mandate_execution {
-        agent.memory_plugin().warm(user_text);
+        agent
+            .memory_plugin()
+            .warm(&crate::turn::memory::MemoryWarmup {
+                session_id: session_id.to_string(),
+                user_text: user_text.to_string(),
+                user_role,
+                channel_ctx: channel_ctx.clone(),
+                depth: agent.depth(),
+            });
     }
     // Resume checkpoints can contain prior tool arguments/results and broader
     // owner authority. A collaborator starts a fresh scoped turn instead of

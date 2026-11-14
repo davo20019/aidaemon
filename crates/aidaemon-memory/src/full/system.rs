@@ -9,7 +9,9 @@ use aidaemon_tools::services::SettingsStore;
 use async_trait::async_trait;
 
 use super::jobs::{JobCall, JobsHost, MemoryJobs};
-use super::recall::{FullRecall, RecallHost, RecallSettings, RecallSource, RecallTurn};
+use super::recall::{
+    FullRecall, RecallHost, RecallSettings, RecallSource, RecallTurn, SpeculativeRecall,
+};
 use super::tools;
 use super::transcript::{TranscriptLog, TranscriptRecorder};
 use crate::render::RecallGoal;
@@ -40,6 +42,9 @@ pub struct FullMemory {
     recorder: Option<Arc<TranscriptRecorder>>,
     /// What [`FullMemory::open`] opened, for [`FullMemory::with_background`].
     opened: Option<Opened>,
+    /// Recall started when a session's latest message arrived
+    /// ([`FullMemory::speculate`]), waiting for that turn.
+    speculative: std::sync::Mutex<std::collections::HashMap<String, SpeculativeRecall>>,
 }
 
 struct Opened {
@@ -71,7 +76,35 @@ impl FullMemory {
             jobs: None,
             recorder: None,
             opened: None,
+            speculative: std::sync::Mutex::default(),
         }
+    }
+
+    /// Starts recall for a message as it arrives, before its turn's memory
+    /// policy is settled, so the turn's first model call finds the block
+    /// ready. Nothing is written and nothing reaches a turn unless that
+    /// turn may read memory and recalls for exactly these inputs; a newer
+    /// message in the session replaces (and stops) an unclaimed one.
+    pub fn speculate(&self, turn: RecallTurn, host: Arc<dyn RecallHost>) {
+        let Some(speculative) = SpeculativeRecall::start(self.recall.clone(), host, turn) else {
+            return;
+        };
+        if let Ok(mut pending) = self.speculative.lock() {
+            pending.insert(speculative.session_id().to_string(), speculative);
+        }
+    }
+
+    /// The session's speculative recall, when it is `turn`'s block. One
+    /// that is not is dropped, which stops it.
+    fn claim_speculative(&self, turn: &RecallTurn) -> Option<SpeculativeRecall> {
+        let speculative = self.speculative.lock().ok()?.remove(&turn.session_id)?;
+        let serves = speculative.serves(turn);
+        tracing::info!(
+            session_id = %turn.session_id,
+            adopted = serves,
+            "Speculative recall claimed"
+        );
+        serves.then_some(speculative)
     }
 
     /// Run `jobs` as this system's [`services`](MemorySystem::services).
@@ -231,7 +264,12 @@ impl MemorySystem for FullMemory {
             };
         // Recall starts now, beside the rest of the turn's setup; the
         // injection hook awaits it at the first model call.
-        let recall = FullRecall::new(self.recall.clone(), host, recall_turn).prefetch();
+        let recall = match self.claim_speculative(&recall_turn) {
+            Some(speculative) => {
+                FullRecall::new(self.recall.clone(), host, recall_turn).adopt(speculative)
+            }
+            None => FullRecall::new(self.recall.clone(), host, recall_turn).prefetch(),
+        };
         let mut hooks: Vec<Arc<dyn Hook>> = vec![Arc::new(MemoryInjection::new(recall))];
         hooks.extend(extra);
         // Only the owner's own turns teach the jobs.
@@ -313,6 +351,151 @@ mod tests {
 
     /// A recall started early renders the same block the model call would
     /// have rendered itself, and the first render takes it.
+    /// Counts the decision points recorded through it.
+    #[derive(Default)]
+    struct CountingHost {
+        decisions: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RecallHost for CountingHost {
+        async fn active_goals(&self) -> anyhow::Result<Vec<RecallGoal>> {
+            Ok(Vec::new())
+        }
+
+        async fn people_enabled(&self) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn decision(
+            &self,
+            _turn: &RecallTurn,
+            _kind: super::super::recall::RecallDecision,
+            _summary: String,
+            _metadata: serde_json::Value,
+        ) {
+            self.decisions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    async fn teal_source() -> Arc<RecallSource> {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::sqlite::migrate(&pool).await.unwrap();
+        let store = SqliteMemory::new(pool, Arc::new(crate::HashEmbedder::new(384)));
+        crate::stores::FactStore::upsert_fact(
+            &store,
+            "preference",
+            "favorite_color",
+            "teal",
+            "user",
+            None,
+            crate::records::FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+        Arc::new(RecallSource::new(
+            Arc::new(store),
+            RecallSettings {
+                max_facts: 10,
+                assistant_name: None,
+            },
+        ))
+    }
+
+    fn arriving_turn() -> RecallTurn {
+        RecallTurn {
+            user_text: Some("what is my favorite color?".into()),
+            ..plain_turn(&MemoryTurn {
+                session_id: "test:synthetic-user".into(),
+                scope: "owner".into(),
+                read: true,
+                write: false,
+                explicit_writes_only: false,
+                learning: Default::default(),
+                host: Default::default(),
+            })
+        }
+    }
+
+    /// Recall started on arrival renders the turn's block, and its writes
+    /// (here the decision points) are made by the turn that adopts it, on
+    /// that turn's host, only when the block is used.
+    #[tokio::test]
+    async fn an_adopted_speculative_recall_renders_the_block_and_writes_as_its_turn() {
+        let source = teal_source().await;
+        let mut turn = arriving_turn();
+        turn.task_id = "task-synthetic-1".into();
+        let plain = FullRecall::new(source.clone(), Arc::new(NoHost), turn.clone())
+            .render_block("")
+            .await;
+
+        let early_host = Arc::new(CountingHost::default());
+        let speculative =
+            SpeculativeRecall::start(source.clone(), early_host.clone(), arriving_turn()).unwrap();
+        assert!(speculative.serves(&turn));
+        let turn_host = Arc::new(CountingHost::default());
+        let adopted = FullRecall::new(source, turn_host.clone(), turn).adopt(speculative);
+        let note = aidaemon_policies::Recall::render(&adopted, "test:synthetic-user", "", 5)
+            .await
+            .unwrap();
+        assert_eq!(note, plain);
+        assert!(note.contains("teal"), "{note}");
+        let decisions =
+            |host: &CountingHost| host.decisions.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            decisions(&early_host),
+            0,
+            "a speculative render writes nothing"
+        );
+        assert!(
+            decisions(&turn_host) >= 1,
+            "the adopting turn records its recall"
+        );
+    }
+
+    /// Only the turn it was started for may take it: a turn that may not
+    /// read memory, or recalls for other inputs, never sees what it read.
+    #[tokio::test]
+    async fn a_speculative_recall_serves_only_its_own_allowed_turn() {
+        let source = teal_source().await;
+        let speculative =
+            SpeculativeRecall::start(source, Arc::new(NoHost), arriving_turn()).unwrap();
+        let mut forbidden = arriving_turn();
+        forbidden.allowed = false;
+        assert!(!speculative.serves(&forbidden));
+        let mut other_text = arriving_turn();
+        other_text.user_text = Some("and my favorite food?".into());
+        assert!(!speculative.serves(&other_text));
+        let mut public = arriving_turn();
+        public.visibility = ChannelVisibility::PublicExternal;
+        public.personal = false;
+        assert!(!speculative.serves(&public));
+        let mut child = arriving_turn();
+        child.depth = 1;
+        assert!(!speculative.serves(&child));
+        let mut later_task = arriving_turn();
+        later_task.task_id = "task-synthetic-2".into();
+        assert!(speculative.serves(&later_task));
+    }
+
+    /// A newer message replaces an unclaimed recall, and a turn that is not
+    /// the speculative one's drops it and recalls on its own.
+    #[tokio::test]
+    async fn the_memory_system_hands_a_speculative_recall_only_to_a_matching_turn() {
+        let memory = FullMemory::new(teal_source().await);
+        memory.speculate(arriving_turn(), Arc::new(NoHost));
+        let mut forbidden = arriving_turn();
+        forbidden.allowed = false;
+        assert!(memory.claim_speculative(&forbidden).is_none());
+        assert!(
+            memory.claim_speculative(&arriving_turn()).is_none(),
+            "dropped on mismatch"
+        );
+        memory.speculate(arriving_turn(), Arc::new(NoHost));
+        assert!(memory.claim_speculative(&arriving_turn()).is_some());
+    }
+
     #[tokio::test]
     async fn a_prefetched_recall_renders_the_same_block() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();

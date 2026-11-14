@@ -49,7 +49,7 @@ pub(crate) use writer::{DaemonMemoryWriter, MemoryWrites, WriterSettings};
 #[cfg(test)]
 pub(crate) use aidaemon_runtime::turn::memory::MANAGE_MEMORIES_GOAL_ACTIONS;
 pub(crate) use aidaemon_runtime::turn::memory::{
-    DAEMON_MEMORY_TOOLS, MemoryParts, MemoryPlugin, MemoryTurn,
+    DAEMON_MEMORY_TOOLS, MemoryParts, MemoryPlugin, MemoryTurn, MemoryWarmup,
 };
 #[cfg(test)]
 pub(crate) use aidaemon_runtime::turn::memory::{
@@ -170,6 +170,8 @@ pub(crate) struct DaemonMemory {
     inner: Arc<DaemonMemoryInner>,
     /// The full memory system as the daemon serves it.
     served: SystemMemory,
+    /// The same system, for recall started when a message arrives.
+    full: Arc<aidaemon_memory::full::FullMemory>,
 }
 
 pub(crate) struct DaemonMemoryInner {
@@ -219,8 +221,9 @@ impl DaemonMemory {
             record_decision_points,
         });
         let host_inner = inner.clone();
-        let served = SystemMemory::new(Arc::new(aidaemon_memory::full::FullMemory::new(recall)))
-            .with_host_facts(Arc::new(move |turn: &MemoryTurn| {
+        let full = Arc::new(aidaemon_memory::full::FullMemory::new(recall));
+        let served =
+            SystemMemory::new(full.clone()).with_host_facts(Arc::new(move |turn: &MemoryTurn| {
                 let config = &host_inner.context_window_config;
                 let writer = DaemonMemoryWriter::new(
                     turn.clone(),
@@ -237,7 +240,11 @@ impl DaemonMemory {
                     hooks: vec![Arc::new(writer)],
                 })
             }));
-        Self { inner, served }
+        Self {
+            inner,
+            served,
+            full,
+        }
     }
 }
 
@@ -341,16 +348,14 @@ impl MemoryPlugin for DaemonMemory {
         self.served.turn(turn).await
     }
 
-    fn warm(&self, user_text: &str) {
-        if user_text.trim().is_empty() {
+    fn warm(&self, warmup: &MemoryWarmup) {
+        if warmup.user_text.trim().is_empty() {
             return;
         }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let store = self.inner.store.clone();
-        let text = user_text.to_string();
-        runtime.spawn(async move { store.warm_query(&text).await });
+        self.full.speculate(
+            recall::warmup_recall_turn(warmup),
+            recall::DaemonRecall::speculative_host(&self.inner),
+        );
     }
 
     fn owned_daemon_tools(&self) -> &'static [&'static str] {

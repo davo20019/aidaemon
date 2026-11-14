@@ -150,9 +150,101 @@ pub struct FullRecall {
     source: Arc<RecallSource>,
     host: Arc<dyn RecallHost>,
     turn: RecallTurn,
-    /// The turn's memory block, started by [`Self::prefetch`] before the
-    /// first model call asks for it.
-    pub(super) prefetched: std::sync::Mutex<Option<tokio::task::JoinHandle<String>>>,
+    /// The turn's memory block, started by [`Self::prefetch`] or adopted
+    /// from a [`SpeculativeRecall`] before the first model call asks for
+    /// it, with the writes it left for this turn to make.
+    pub(super) prefetched: std::sync::Mutex<Option<tokio::task::JoinHandle<Rendered>>>,
+    /// Set while rendering speculatively: writes are kept here instead of
+    /// made, for the turn that adopts the block.
+    deferred: Option<Arc<std::sync::Mutex<Vec<RecallEffect>>>>,
+}
+
+/// A rendered block and the writes rendering it left undone.
+pub(super) type Rendered = (String, Vec<RecallEffect>);
+
+/// A write recall makes as it renders. A speculative render keeps them so
+/// that only a turn that shows the block records it.
+#[derive(Debug)]
+pub(super) enum RecallEffect {
+    /// The speaker is a known person: their last interaction is now.
+    TouchPerson(i64),
+    /// These facts and episodes were shown.
+    Recalled { facts: Vec<i64>, episodes: Vec<i64> },
+    /// A diagnostic decision point.
+    Decision {
+        kind: RecallDecision,
+        summary: String,
+        metadata: serde_json::Value,
+    },
+}
+
+/// Recall started when a message arrives, before the turn's memory policy
+/// is settled: it renders as if memory were allowed and makes no write.
+/// The turn adopts it only when it recalls with exactly these inputs and
+/// may read memory ([`Self::serves`]); otherwise it is dropped, which stops
+/// it, and nothing it read reaches the turn.
+pub struct SpeculativeRecall {
+    turn: RecallTurn,
+    handle: Option<tokio::task::JoinHandle<Rendered>>,
+}
+
+impl SpeculativeRecall {
+    /// Starts rendering `turn`'s block now. `None` outside a Tokio runtime
+    /// or for a turn with no request text.
+    pub fn start(
+        source: Arc<RecallSource>,
+        host: Arc<dyn RecallHost>,
+        turn: RecallTurn,
+    ) -> Option<Self> {
+        turn.user_text.as_ref()?;
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let mut speculative_turn = turn.clone();
+        speculative_turn.allowed = true;
+        let effects = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut worker = FullRecall::new(source, host, speculative_turn.clone());
+        worker.deferred = Some(effects.clone());
+        let handle = runtime.spawn(async move {
+            let block = worker.render_block("").await;
+            let effects = effects
+                .lock()
+                .map(|mut effects| std::mem::take(&mut *effects))
+                .unwrap_or_default();
+            (block, effects)
+        });
+        Some(Self {
+            turn: speculative_turn,
+            handle: Some(handle),
+        })
+    }
+
+    /// The session this recall was started for.
+    pub fn session_id(&self) -> &str {
+        &self.turn.session_id
+    }
+
+    /// Whether this render is `turn`'s block: the turn may read memory and
+    /// recalls for the same text, speaker, audience and depth. The task id
+    /// is the one input that may differ (it did not exist yet).
+    pub fn serves(&self, turn: &RecallTurn) -> bool {
+        let started = &self.turn;
+        turn.allowed
+            && started.session_id == turn.session_id
+            && started.user_text == turn.user_text
+            && started.owner == turn.owner
+            && started.personal == turn.personal
+            && started.visibility == turn.visibility
+            && started.channel_id == turn.channel_id
+            && started.sender_id == turn.sender_id
+            && started.depth == turn.depth
+    }
+}
+
+impl Drop for SpeculativeRecall {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl FullRecall {
@@ -162,6 +254,55 @@ impl FullRecall {
             host,
             turn,
             prefetched: std::sync::Mutex::new(None),
+            deferred: None,
+        }
+    }
+
+    /// This turn's recall takes over `speculative`'s render; its writes
+    /// are made, as this turn's, when the block is taken.
+    pub fn adopt(self, mut speculative: SpeculativeRecall) -> Self {
+        if let (Some(handle), Ok(mut prefetched)) =
+            (speculative.handle.take(), self.prefetched.lock())
+        {
+            *prefetched = Some(handle);
+        }
+        self
+    }
+
+    /// Records `effect`, or keeps it for the adopting turn while rendering
+    /// speculatively.
+    async fn effect(&self, effect: RecallEffect) {
+        if let Some(deferred) = &self.deferred {
+            if let Ok(mut deferred) = deferred.lock() {
+                deferred.push(effect);
+            }
+            return;
+        }
+        self.apply(effect).await;
+    }
+
+    async fn apply(&self, effect: RecallEffect) {
+        let store = &self.source.store;
+        match effect {
+            RecallEffect::TouchPerson(person_id) => {
+                if let Err(error) = store.touch_person_interaction(person_id).await {
+                    warn!(%error, "failed to record person interaction");
+                }
+            }
+            RecallEffect::Recalled { facts, episodes } => {
+                if let Err(error) = store.record_memory_recall(&facts, &episodes).await {
+                    tracing::debug!(%error, "Failed to record rendered memory recall");
+                }
+            }
+            RecallEffect::Decision {
+                kind,
+                summary,
+                metadata,
+            } => {
+                self.host
+                    .decision(&self.turn, kind, summary, metadata)
+                    .await;
+            }
         }
     }
 
@@ -178,7 +319,7 @@ impl FullRecall {
             return self;
         };
         let worker = Self::new(self.source.clone(), self.host.clone(), self.turn.clone());
-        let handle = runtime.spawn(async move { worker.render_block("").await });
+        let handle = runtime.spawn(async move { (worker.render_block("").await, Vec::new()) });
         if let Ok(mut prefetched) = self.prefetched.lock() {
             *prefetched = Some(handle);
         }
@@ -189,7 +330,11 @@ impl FullRecall {
     /// failed, so the caller renders it itself.
     async fn take_prefetched(&self) -> Option<String> {
         let handle = self.prefetched.lock().ok()?.take()?;
-        handle.await.ok()
+        let (block, effects) = handle.await.ok()?;
+        for effect in effects {
+            self.apply(effect).await;
+        }
+        Some(block)
     }
 
     /// Starts the recall filter over `facts`, when the host judges
@@ -273,21 +418,19 @@ impl FullRecall {
         // The selection digest (id + content hash per entity) makes a
         // profile change self-explaining across turns.
         if !digest.is_empty() {
-            self.host
-                .decision(
-                    turn,
-                    RecallDecision::CoreProfileSelection,
-                    format!("Core profile selection: {} entities", digest.len()),
-                    json!({
-                        "code": "core_profile_digest",
-                        "count": digest.len(),
-                        "entities": digest
-                            .iter()
-                            .map(|(id, h)| json!({ "id": id, "h": h }))
-                            .collect::<Vec<_>>(),
-                    }),
-                )
-                .await;
+            self.effect(RecallEffect::Decision {
+                kind: RecallDecision::CoreProfileSelection,
+                summary: format!("Core profile selection: {} entities", digest.len()),
+                metadata: json!({
+                    "code": "core_profile_digest",
+                    "count": digest.len(),
+                    "entities": digest
+                        .iter()
+                        .map(|(id, h)| json!({ "id": id, "h": h }))
+                        .collect::<Vec<_>>(),
+                }),
+            })
+            .await;
         }
         profile_str
     }
@@ -437,9 +580,7 @@ impl FullRecall {
             } else if let Some(ref sender_id) = turn.sender_id {
                 match store.get_person_by_platform_id(sender_id).await {
                     Ok(Some(person)) => {
-                        if let Err(error) = store.touch_person_interaction(person.id).await {
-                            warn!(%error, "failed to record person interaction");
-                        }
+                        self.effect(RecallEffect::TouchPerson(person.id)).await;
                         let facts = or_logged(
                             store.get_person_facts(person.id, None).await,
                             "person_facts",
@@ -518,16 +659,14 @@ impl FullRecall {
             scheduled_goals_tool: self.host.offers_scheduled_goals(),
         };
         let report = render_memory_section(&memory_context, source.settings.max_facts);
-        if let Err(error) = store
-            .record_memory_recall(&report.rendered_fact_ids, &report.rendered_episode_ids)
-            .await
-        {
-            tracing::debug!(%error, "Failed to record rendered memory recall");
-        }
-        host.decision(
-            turn,
-            RecallDecision::MemoryRetrieval,
-            format!(
+        self.effect(RecallEffect::Recalled {
+            facts: report.rendered_fact_ids.clone(),
+            episodes: report.rendered_episode_ids.clone(),
+        })
+        .await;
+        self.effect(RecallEffect::Decision {
+            kind: RecallDecision::MemoryRetrieval,
+            summary: format!(
                 "Memory fetched/rendered: facts={}/{} episodes={}/{} procedures={}/{}",
                 facts.len(),
                 report.rendered_fact_ids.len(),
@@ -536,7 +675,7 @@ impl FullRecall {
                 procedures.len(),
                 report.rendered_procedure_ids.len()
             ),
-            json!({
+            metadata: json!({
                 "policy": if allowed { "allowed" } else { "suppressed" },
                 "pipeline_suppressed": !allowed,
                 "fetched": {
@@ -558,7 +697,7 @@ impl FullRecall {
                     "pattern_ids": report.rendered_pattern_ids
                 }
             }),
-        )
+        })
         .await;
         info!(
             session_id = %turn.session_id,

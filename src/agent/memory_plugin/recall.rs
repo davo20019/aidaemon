@@ -37,8 +37,36 @@ impl DaemonRecall {
             state: memory.state.clone(),
             side_calls: memory.side_calls.clone(),
             record_decision_points: memory.record_decision_points,
-            turn,
+            turn: Some(turn),
         })
+    }
+
+    /// The host for a recall started before its turn exists.
+    pub(crate) fn speculative_host(memory: &DaemonMemoryInner) -> Arc<dyn RecallHost> {
+        Arc::new(DaemonRecallHost {
+            state: memory.state.clone(),
+            side_calls: memory.side_calls.clone(),
+            record_decision_points: memory.record_decision_points,
+            turn: None,
+        })
+    }
+}
+
+/// What recall knows about a message as it arrives: its turn's inputs with
+/// no task yet, as if memory were allowed (the turn checks that).
+pub(crate) fn warmup_recall_turn(warmup: &super::MemoryWarmup) -> RecallTurn {
+    let owner = warmup.user_role == UserRole::Owner;
+    RecallTurn {
+        session_id: warmup.session_id.clone(),
+        task_id: String::new(),
+        user_text: Some(warmup.user_text.clone()),
+        owner,
+        personal: owner && warmup.channel_ctx.should_inject_personal_memory(),
+        visibility: warmup.channel_ctx.visibility,
+        channel_id: warmup.channel_ctx.channel_id.clone(),
+        sender_id: warmup.channel_ctx.sender_id.clone(),
+        allowed: true,
+        depth: warmup.depth,
     }
 }
 
@@ -64,7 +92,9 @@ struct DaemonRecallHost {
     state: Arc<dyn crate::traits::StateStore>,
     side_calls: crate::llm_runtime::gateway::SideCallGateway,
     record_decision_points: bool,
-    turn: MemoryTurn,
+    /// The turn decision points are recorded on; `None` for a speculative
+    /// recall, whose decision points the adopting turn records.
+    turn: Option<MemoryTurn>,
 }
 
 #[async_trait]
@@ -134,16 +164,16 @@ impl RecallHost for DaemonRecallHost {
         summary: String,
         metadata: serde_json::Value,
     ) {
-        if !self.record_decision_points {
+        let Some(turn) = self.turn.as_ref().filter(|_| self.record_decision_points) else {
             return;
-        }
+        };
         let decision_type = match kind {
             RecallDecision::CoreProfileSelection => DecisionType::CoreProfileSelection,
             RecallDecision::MemoryRetrieval => DecisionType::MemoryRetrieval,
         };
         crate::agent::graceful::emit_decision_point_event(
-            &self.turn.emitter,
-            &self.turn.task_id,
+            &turn.emitter,
+            &turn.task_id,
             0,
             decision_type,
             DiagnosticSeverity::Info,

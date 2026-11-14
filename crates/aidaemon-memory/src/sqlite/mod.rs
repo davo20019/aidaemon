@@ -128,8 +128,7 @@ const QUERY_MEMO_CAPACITY: usize = 8;
 /// The last few single-text embeddings. One turn's recall searches facts,
 /// episodes, procedures and error solutions for the same message at once;
 /// with this they share one model run instead of queueing four behind the
-/// model's lock, and a warm-up started when the message arrives (see
-/// `FactStore::warm_query`) leaves the vector ready for all of them. A text
+/// model's lock. A text
 /// always has the same vector, so an entry never goes stale; one being
 /// computed is awaited, not recomputed, and a failed run leaves its entry
 /// empty for the next caller to retry.
