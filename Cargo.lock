@@ -363,6 +363,7 @@ dependencies = [
  "aidaemon-eval",
  "aidaemon-policies",
  "aidaemon-providers",
+ "aidaemon-runtime",
  "async-trait",
  "futures",
  "serde",
