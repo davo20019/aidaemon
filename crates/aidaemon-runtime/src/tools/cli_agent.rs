@@ -3118,7 +3118,7 @@ impl CliAgentTool {
                 }
             }
             if run_phase.phase() != crate::run_state::RunPhase::Succeeded {
-                crate::spawn_tool::release_new_folders(&folders_for_task);
+                crate::helper_run::folders::release_new_folders(&folders_for_task);
             }
             // Persist completion even if the caller timed out and moved the task to background.
             if invocation_id != 0 {
@@ -5360,7 +5360,10 @@ impl CliAgentTool {
                 let made_folders = if args.new_folders.is_empty() {
                     Vec::new()
                 } else {
-                    match crate::spawn_tool::claim_request_folders(&args.new_folders, facts) {
+                    match crate::helper_run::folders::claim_request_folders(
+                        &args.new_folders,
+                        facts,
+                    ) {
                         Ok(made) => made,
                         Err(error) => return Ok(format!("Blocked: {error}")),
                     }
@@ -5454,7 +5457,7 @@ impl CliAgentTool {
                 // (only while still empty), as for a sub-agent.
                 let started = matches!(&output, Ok(text) if !run_did_not_start(text));
                 if !started {
-                    crate::spawn_tool::release_request_folders(&made_folders, facts);
+                    crate::helper_run::folders::release_request_folders(&made_folders, facts);
                 }
                 output
             }

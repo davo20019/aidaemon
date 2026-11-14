@@ -337,7 +337,7 @@ impl SpawnFamily {
     }
 
     /// The folders the runtime made fresh for this request's work, shared
-    /// by every run of the tree ([`crate::spawn_tool::claim_new_folders`]
+    /// by every run of the tree ([`crate::helper_run::folders::claim_new_folders`]
     /// records them here as it makes them).
     pub fn owned_folders(&self) -> &aidaemon_tools::semantics::OwnedFolders {
         &self.0.owned_folders
@@ -405,7 +405,7 @@ pub struct ChildDeclaration {
     /// Files or directories the child will change, resolved.
     pub scope: Vec<String>,
     /// Folders made fresh for this child's work (absolute; the spawn
-    /// created them empty, see `spawn_tool::claim_new_folders`).
+    /// created them empty, see `crate::helper_run::folders::claim_new_folders`).
     pub new_folders: Vec<String>,
     /// Who wins where that scope overlaps a running sibling's, if stated.
     pub precedence: Option<crate::coordination::Precedence>,

@@ -1238,6 +1238,26 @@ async fn cancel_keeps_a_scheduled_reminder_that_is_not_running() {
     );
 }
 
+/// `/clear` starts the session over from the core tools: the deferred tools
+/// it loaded are forgotten, another session's are kept.
+#[tokio::test]
+async fn clear_session_context_forgets_the_sessions_loaded_tools() {
+    use aidaemon_runtime::engine::loaded_tools;
+    let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), Vec::new())
+        .await
+        .unwrap();
+    let session = "telegram:synthetic-clear-loaded-1";
+    let other = "telegram:synthetic-clear-loaded-2";
+    loaded_tools::for_session(session).load("browser");
+    loaded_tools::for_session(other).load("browser");
+
+    harness.agent.clear_session_context(session).await.unwrap();
+
+    assert!(!loaded_tools::for_session(session).contains("browser"));
+    assert!(loaded_tools::for_session(other).contains("browser"));
+    loaded_tools::clear(other);
+}
+
 /// Through the real agent: a spawn whose setup fails (here, a task lead
 /// with no goal) gives its place back, and a child that ran keeps it.
 #[tokio::test]

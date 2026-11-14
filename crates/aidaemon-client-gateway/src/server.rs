@@ -59,6 +59,9 @@ pub fn router(gateway: Arc<ClientGateway>) -> Router {
         .route("/client/v1/app", get(web_page))
         .route("/client/v1/app/", get(web_page))
         .route("/client/v1/app/{module}", get(web_script))
+        .route("/client/v1/next", get(app_root))
+        .route("/client/v1/next/", get(app_index))
+        .route("/client/v1/next/{*path}", get(app_file))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .with_state(gateway)
 }
@@ -344,7 +347,17 @@ const WEB_MODULES: &[(&str, &str)] = &[
     ("ui.js", include_str!("../web/ui.js")),
 ];
 
-async fn web_page() -> Response {
+async fn web_page(State(gateway): State<Arc<ClientGateway>>) -> Response {
+    // With the nsh app served, the old page's links (pairing links,
+    // bookmarks) open it instead; the browser keeps the `#offer=…`.
+    if gateway
+        .config
+        .app_dir
+        .as_deref()
+        .is_some_and(|d| !d.trim().is_empty())
+    {
+        return axum::response::Redirect::temporary("/client/v1/next/").into_response();
+    }
     (
         [
             (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -370,6 +383,137 @@ async fn web_script(Path(module): Path<String>) -> Response {
         *script,
     )
         .into_response()
+}
+
+/// The nsh app's web build: `app_dir` from the config, read file by file.
+/// Only plain relative paths inside the directory are served.
+async fn app_root() -> Response {
+    axum::response::Redirect::permanent("/client/v1/next/").into_response()
+}
+
+async fn app_index(State(gateway): State<Arc<ClientGateway>>, headers: HeaderMap) -> Response {
+    serve_app_file(&gateway, "index.html", &headers).await
+}
+
+async fn app_file(
+    State(gateway): State<Arc<ClientGateway>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    serve_app_file(&gateway, &path, &headers).await
+}
+
+async fn serve_app_file(gateway: &ClientGateway, path: &str, request: &HeaderMap) -> Response {
+    let Some(dir) = gateway
+        .config
+        .app_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(relative) = app_path(path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let root = std::path::Path::new(dir);
+    let file = root.join(&relative);
+    // Symlinks must stay inside the directory too.
+    let (Ok(root), Ok(real)) = (
+        tokio::fs::canonicalize(root).await,
+        tokio::fs::canonicalize(&file).await,
+    ) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !real.starts_with(&root) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // The build ships Brotli and gzip copies beside each file.
+    let accepts = request
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let mut encoding = None;
+    let mut bytes = None;
+    for (name, suffix) in [("br", ".br"), ("gzip", ".gz")] {
+        if accepts
+            .split(',')
+            .any(|e| e.trim().split(';').next() == Some(name))
+            && let Ok(found) = tokio::fs::read(format!("{}{suffix}", real.display())).await
+        {
+            encoding = Some(name);
+            bytes = Some(found);
+            break;
+        }
+    }
+    let bytes = match bytes {
+        Some(bytes) => bytes,
+        None => match tokio::fs::read(&real).await {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        },
+    };
+    let mut headers = vec![(axum::http::header::CONTENT_TYPE, content_type(&relative))];
+    if let Some(encoding) = encoding {
+        headers.push((axum::http::header::CONTENT_ENCODING, encoding));
+        headers.push((axum::http::header::VARY, "accept-encoding"));
+    }
+    // The page names its files by content hash: they never change, and the
+    // page itself is always checked, so a new build shows on the next load.
+    if relative.ends_with(".html") || relative.ends_with(".webmanifest") {
+        headers.push((axum::http::header::CACHE_CONTROL, "no-cache"));
+    } else if relative
+        .split('/')
+        .next_back()
+        .is_some_and(|name| name.split('.').count() >= 3)
+    {
+        headers.push((
+            axum::http::header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable",
+        ));
+    }
+    if relative.ends_with(".html") {
+        headers.push((
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' ws: wss:; \
+             style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:",
+        ));
+    }
+    let mut response = (StatusCode::OK, bytes).into_response();
+    for (name, value) in headers {
+        if let Ok(value) = value.parse() {
+            response.headers_mut().insert(name, value);
+        }
+    }
+    response
+}
+
+/// `path` as plain relative components, or `None` for anything that could
+/// leave the directory.
+fn app_path(path: &str) -> Option<String> {
+    let path = path.trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    let parts: Vec<&str> = path.split('/').collect();
+    let plain = parts
+        .iter()
+        .all(|part| !part.is_empty() && *part != "." && *part != ".." && !part.contains('\\'));
+    plain.then(|| parts.join("/"))
+}
+
+fn content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or_default() {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "wasm" => "application/wasm",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        _ => "application/octet-stream",
+    }
 }
 
 async fn http_command(
@@ -720,6 +864,20 @@ async fn replay(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn app_paths_stay_inside_the_directory() {
+        use super::app_path;
+        assert_eq!(app_path("").as_deref(), Some("index.html"));
+        assert_eq!(app_path("nsh.wasm").as_deref(), Some("nsh.wasm"));
+        assert_eq!(
+            app_path("assets/fonts/a.woff2").as_deref(),
+            Some("assets/fonts/a.woff2")
+        );
+        for escape in ["../config.toml", "a/../../b", "a//b", "./x", "a\\..\\b"] {
+            assert_eq!(app_path(escape), None, "{escape}");
+        }
+    }
+
     use super::*;
 
     /// Every route this listener mounts sits under `/client/v1`: an exposure

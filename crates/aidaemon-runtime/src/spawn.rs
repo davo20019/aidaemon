@@ -1407,7 +1407,7 @@ pub struct RunsAnswer {
     /// That request's task: the continuation continues it.
     pub parent_task_id: Option<String>,
     /// The runs' results and measured times, from their records
-    /// ([`crate::spawn_tool::group_followup`]).
+    /// ([`crate::helper_run::delivery::group_followup`]).
     pub followup: String,
     /// When the owner's request that started the runs came in, how many
     /// ran and when the last ended: the answer's total is measured against
@@ -1431,7 +1431,7 @@ pub struct ConversationRequest {
     /// When the owner's request this continues came in and the runs it
     /// waited on, when the continuation gives its final answer: the
     /// request's total, from then to the answer, is rendered under it when
-    /// it adds to the runs' times ([`crate::spawn_tool::answer_sent_line`]).
+    /// it adds to the runs' times ([`crate::run_state::timing::answer_sent_line`]).
     pub clock: Option<crate::run_state::RequestClock>,
 }
 
@@ -1687,7 +1687,7 @@ mod tests {
             "You declined one of its steps, so it went on without it: step 1."
         );
         assert_eq!(
-            crate::spawn_tool::job_end(phase.phase(), phase.failure()),
+            crate::helper_run::delivery::job_end(phase.phase(), phase.failure()),
             aidaemon_work::plans::JobEnd::Declined
         );
     }

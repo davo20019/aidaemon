@@ -1,0 +1,44 @@
+{
+  "name": "AIdaemon",
+  "cssVars": {
+    "theme": {
+      "radius": "7px"
+    },
+    "light": {
+      "background": "#f7f7f5",
+      "foreground": "#16171a",
+      "card": "#ffffff",
+      "card-foreground": "var(--foreground)",
+      "popover": "#ffffff",
+      "popover-foreground": "var(--foreground)",
+      "primary": "#16171a",
+      "primary-foreground": "#ffffff",
+      "secondary": "#e8e8e4",
+      "secondary-foreground": "var(--foreground)",
+      "muted": "#e8e8e4",
+      "muted-foreground": "#5d6168",
+      "accent": "#e8e8e4",
+      "accent-foreground": "var(--foreground)",
+      "destructive": "#c2332f",
+      "border": "#dcdcd6",
+      "input": "#dcdcd6",
+      "ring": "#0b7a6e"
+    },
+    "dark": {
+      "background": "#0f1012",
+      "foreground": "#eceef1",
+      "card": "#1a1b1f",
+      "popover": "#1a1b1f",
+      "primary": "#eceef1",
+      "primary-foreground": "#111214",
+      "secondary": "#22242a",
+      "muted": "#22242a",
+      "muted-foreground": "#9196a0",
+      "accent": "#22242a",
+      "destructive": "#ff6b66",
+      "border": "#2a2c31",
+      "input": "#2a2c31",
+      "ring": "#45d2bf"
+    }
+  }
+}

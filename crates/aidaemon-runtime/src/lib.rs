@@ -78,6 +78,7 @@ pub mod spawn_tool;
 pub mod specialists;
 pub mod state;
 pub mod stores;
+pub mod tool_manifest;
 pub mod tools;
 pub mod turn;
 pub mod turn_runtime;

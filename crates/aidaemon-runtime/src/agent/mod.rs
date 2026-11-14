@@ -746,10 +746,13 @@ impl Agent {
 
     /// Reset a session's conversation context non-destructively (events remain
     /// for memory + audit). Backs `/clear`. Also drops the in-memory turn
-    /// anchor so the next context build re-initializes past the new boundary.
+    /// anchor so the next context build re-initializes past the new boundary,
+    /// and the deferred tools the session loaded, so it starts from the core
+    /// tools again.
     pub async fn clear_session_context(&self, session_id: &str) -> anyhow::Result<()> {
         self.state.clear_session_context(session_id).await?;
         self.runtime.turn_anchors.write().await.remove(session_id);
+        crate::engine::loaded_tools::clear(session_id);
         Ok(())
     }
 

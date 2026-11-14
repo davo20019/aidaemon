@@ -871,8 +871,9 @@ fn handle_pair_command(args: &[String], config_path: &Path, open_web: bool) -> a
         .filter(|url| !url.trim().is_empty())
         .unwrap_or_else(|| settings.public_url());
     let link = format!(
-        "{}/client/v1/app#offer={}&code={}&fp={}",
+        "{}{}#offer={}&code={}&fp={}",
         public_url.trim_end_matches('/'),
+        settings.web_app_path(),
         offer.offer_id,
         offer.code,
         offer.fingerprint
@@ -890,8 +891,11 @@ fn handle_pair_command(args: &[String], config_path: &Path, open_web: bool) -> a
     }
     if open_web {
         let local = format!(
-            "http://{address}/client/v1/app#offer={}&code={}&fp={}",
-            offer.offer_id, offer.code, offer.fingerprint
+            "http://{address}{}#offer={}&code={}&fp={}",
+            settings.web_app_path(),
+            offer.offer_id,
+            offer.code,
+            offer.fingerprint
         );
         match open_in_browser(&local) {
             Ok(()) => println!("Opened the web client in your browser."),

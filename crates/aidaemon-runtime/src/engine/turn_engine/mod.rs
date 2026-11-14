@@ -1510,7 +1510,7 @@ impl TurnEngine<'_> {
                 ) {
                     let now = chrono::Utc::now();
                     let finished =
-                        crate::spawn_tool::request_finished(Some(requested_at), &after, now);
+                        crate::run_state::timing::request_finished(Some(requested_at), &after, now);
                     if let Some(tx) = scope.status_tx.as_ref() {
                         let _ = tx.try_send(StatusUpdate::Finished {
                             by_me: finished.by_me.clone(),

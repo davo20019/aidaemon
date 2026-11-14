@@ -20,6 +20,8 @@ use tokio::sync::mpsc;
 pub use aidaemon_core::card::RunPhase;
 use aidaemon_core::card::{HelperView, Step};
 
+pub mod timing;
+
 /// The phase a child's typed end outcome gives.
 pub fn phase_of(outcome: TaskOutcome) -> RunPhase {
     match outcome {
@@ -493,7 +495,9 @@ impl RunState {
             since_request: self
                 .requested_at
                 .zip(self.ended_at)
-                .map(|(requested, ended)| crate::spawn_tool::since_request_view(requested, ended)),
+                .map(|(requested, ended)| {
+                    crate::run_state::timing::since_request_view(requested, ended)
+                }),
         }
     }
 }
@@ -549,7 +553,7 @@ pub fn request_began(ends: &[GroupEnd]) -> Option<DateTime<Utc>> {
 /// What a request's answer is measured against: when the owner asked, how
 /// many runs it waited on, and when the last of them ended. It decides
 /// whether the answer's own time adds anything to the runs' times
-/// ([`crate::spawn_tool::answer_sent_line`]).
+/// ([`crate::run_state::timing::answer_sent_line`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestClock {
     pub requested: DateTime<Utc>,
@@ -988,7 +992,7 @@ impl RunTimes {
     /// after your request." Each figure says what it measures; none is left
     /// for anyone to work out.
     pub fn line(&self) -> String {
-        use crate::spawn_tool::{compact, owner_clock_range};
+        use timing::{compact, owner_clock_range};
         let mut line = format!(
             "Took {} ({})",
             compact(self.took()),
@@ -1225,7 +1229,7 @@ mod tests {
             assert_eq!(ended.failure.as_ref(), Some(&failure));
             assert_eq!(ended.line(), Some(reason.clone()));
             assert_eq!(ended.view().reason, Some(reason.clone()));
-            let result = crate::spawn_tool::render_run_result(
+            let result = crate::helper_run::delivery::render_run_result(
                 &ended,
                 "measuring caches and app data",
                 "",
@@ -1287,8 +1291,13 @@ mod tests {
                 report(),
             )
             .expect("it ends");
-        let result =
-            crate::spawn_tool::render_run_result(&ended, "Install Drupal", "Done.", 100, false);
+        let result = crate::helper_run::delivery::render_run_result(
+            &ended,
+            "Install Drupal",
+            "Done.",
+            100,
+            false,
+        );
         let at = |needle: &str| {
             result
                 .find(needle)

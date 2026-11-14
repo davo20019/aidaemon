@@ -15,6 +15,10 @@
 use crate::authority::{ChildDeclaration, InheritedAuthority, ResolvedAuthority};
 use crate::run_state::{RunEnd, RunEvidence, RunFailure};
 
+pub mod card;
+pub mod delivery;
+pub mod folders;
+
 /// What one helper call declared about the work it starts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HelperSpec {
@@ -23,7 +27,7 @@ pub struct HelperSpec {
     /// What the helper is for, in the caller's words.
     pub mission: String,
     /// Folders made fresh for this work (absolute, created empty by
-    /// [`crate::spawn_tool::claim_new_folders`]).
+    /// [`crate::helper_run::folders::claim_new_folders`]).
     pub new_folders: Vec<String>,
     /// Files or directories the helper will change.
     pub scope: Vec<String>,
@@ -210,7 +214,7 @@ pub fn program_phase(end: &ProgramEnd) -> (RunEnd, RunEvidence) {
 pub fn mission_rules(new_folders: &[String]) -> String {
     format!(
         "{}\n\n{}",
-        crate::spawn_tool::new_folders_note(new_folders),
+        crate::helper_run::folders::new_folders_note(new_folders),
         crate::specialists::compose::OWN_DURATION_RULE
     )
 }

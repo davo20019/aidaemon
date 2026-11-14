@@ -246,7 +246,11 @@ impl TurnEngine<'_> {
                     tools.push(tool.clone());
                 }
             }
-            tools.push(self.mandate_review_tool());
+            crate::tool_manifest::push(
+                &mut tools,
+                crate::tool_manifest::ToolContext::MandateReview,
+                self.mandate_review_tool(),
+            );
         }
 
         let has_cli_agent = if mandate.is_none() {
@@ -275,7 +279,11 @@ impl TurnEngine<'_> {
                 .flatten()
                 .map(|run| run.id),
         };
-        tools.push(self.goal_tasks_tool(goal_id, goal_run_id));
+        crate::tool_manifest::push(
+            &mut tools,
+            crate::tool_manifest::ToolContext::TaskLead,
+            self.goal_tasks_tool(goal_id, goal_run_id),
+        );
 
         let goal_context = self
             .work()
@@ -1185,7 +1193,11 @@ impl TurnEngine<'_> {
                     if let Some(tid) = task_id
                         && let Some(attempt) = task_attempt.clone()
                     {
-                        tools.push(self.report_blocker_tool(tid, attempt, mandate.is_some()));
+                        crate::tool_manifest::push(
+                            &mut tools,
+                            crate::tool_manifest::ToolContext::TaskAttempt,
+                            self.report_blocker_tool(tid, attempt, mandate.is_some()),
+                        );
                     }
                     // The kind resolved here writes the prompt and is passed
                     // to `spawn_child_inner`, which applies its tools and

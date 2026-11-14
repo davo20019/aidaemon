@@ -8,7 +8,7 @@
 //! a paired device key that trades a signed challenge for a short-lived
 //! grant, kept in a [`keystore::KeyStore`]).
 //!
-//! The terminal UI and the desktop app link it; the web client keeps a
+//! The terminal UI and the nsh app (`clients/app`) link it; the web client keeps a
 //! TypeScript reducer held to the same behaviour by shared fixtures.
 //!
 //! With default features off, what is left has no I/O and builds for

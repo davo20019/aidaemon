@@ -79,6 +79,17 @@ impl ClientHost for DaemonClientHost {
             .into_iter()
             .filter(|m| matches!(m.role.as_str(), "user" | "assistant"))
             .filter(|m| m.tool_calls_json.is_none())
+            // Runtime continuations and system notices ride as user-role
+            // turns for the model; they are not what the owner said.
+            .filter(|m| {
+                !m.annotations.iter().any(|a| {
+                    matches!(
+                        a,
+                        crate::traits::MessageAnnotation::InternalContinuation
+                            | crate::traits::MessageAnnotation::EntireSystemNotice
+                    )
+                })
+            })
             .filter_map(|m| {
                 let text = m.content.filter(|text| !text.trim().is_empty())?;
                 Some(HistoryMessage {
@@ -278,8 +289,9 @@ pub(crate) fn web_link(
     offer: &aidaemon_client_protocol::PairingOffer,
 ) -> String {
     format!(
-        "{}/client/v1/app#offer={}&code={}&fp={}",
+        "{}{}#offer={}&code={}&fp={}",
         gateway.public_url(),
+        gateway.web_app_path(),
         offer.offer_id,
         offer.code,
         offer.fingerprint

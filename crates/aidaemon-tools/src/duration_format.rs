@@ -54,6 +54,24 @@ pub fn compact_elapsed_timestamps(
     compact_chrono_duration(ended - started, zero_style)
 }
 
+/// How long ago an RFC 3339 timestamp was, in its largest whole unit
+/// ("3d ago", "5h ago", "12m ago", "just now"); "n/a" when it does not parse.
+pub fn format_age(ts: &str) -> String {
+    let Some(dt) = parse_ts(ts) else {
+        return "n/a".to_string();
+    };
+    let age = chrono::Utc::now() - dt;
+    if age.num_days() > 0 {
+        format!("{}d ago", age.num_days())
+    } else if age.num_hours() > 0 {
+        format!("{}h ago", age.num_hours())
+    } else if age.num_minutes() > 0 {
+        format!("{}m ago", age.num_minutes())
+    } else {
+        "just now".to_string()
+    }
+}
+
 fn parse_ts(ts: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(ts)
         .ok()
@@ -65,6 +83,16 @@ mod tests {
     use chrono::Duration;
 
     use super::*;
+
+    #[test]
+    fn format_age_names_the_largest_whole_unit() {
+        let ago = |age: Duration| format_age(&(chrono::Utc::now() - age).to_rfc3339());
+        assert_eq!(ago(Duration::days(3) + Duration::hours(5)), "3d ago");
+        assert_eq!(ago(Duration::hours(5) + Duration::minutes(2)), "5h ago");
+        assert_eq!(ago(Duration::minutes(12)), "12m ago");
+        assert_eq!(ago(Duration::seconds(5)), "just now");
+        assert_eq!(format_age("not a time"), "n/a");
+    }
 
     #[test]
     fn compact_seconds_preserves_zero_units() {

@@ -35,6 +35,11 @@ pub struct ClientGatewayConfig {
     /// HTTPS URL), put in pairing links. Empty: the loopback address.
     #[serde(default)]
     pub public_url: Option<String>,
+    /// A directory holding the nsh app's published web build (`nsh package
+    /// --target web` in `clients/app`), served at `/client/v1/next/` from
+    /// the gateway's own origin. Empty: not served.
+    #[serde(default)]
+    pub app_dir: Option<String>,
 }
 
 fn default_bind() -> String {
@@ -64,6 +69,7 @@ impl Default for ClientGatewayConfig {
             max_events: default_max_events(),
             watch_risk_ceiling: default_watch_risk_ceiling(),
             public_url: None,
+            app_dir: None,
         }
     }
 }
@@ -77,6 +83,15 @@ impl ClientGatewayConfig {
                 Ok(IpAddr::V6(ip)) => format!("http://[{ip}]:{}", self.port),
                 _ => format!("http://{}:{}", self.bind, self.port),
             },
+        }
+    }
+
+    /// The path of the web client pairing links open: the nsh app when its
+    /// build is served (`app_dir`), else the built-in page.
+    pub fn web_app_path(&self) -> &'static str {
+        match self.app_dir.as_deref().map(str::trim) {
+            Some(dir) if !dir.is_empty() => "/client/v1/next/",
+            _ => "/client/v1/app",
         }
     }
 

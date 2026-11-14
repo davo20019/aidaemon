@@ -38,25 +38,6 @@ fn compact_provenance_excerpt(text: &str) -> String {
     crate::text::truncate_chars(&single_line, 180)
 }
 
-fn format_age(ts: &str) -> String {
-    let Some(dt) = chrono::DateTime::parse_from_rfc3339(ts)
-        .ok()
-        .map(|d| d.with_timezone(&chrono::Utc))
-    else {
-        return "n/a".to_string();
-    };
-    let age = chrono::Utc::now() - dt;
-    if age.num_days() > 0 {
-        format!("{}d ago", age.num_days())
-    } else if age.num_hours() > 0 {
-        format!("{}h ago", age.num_hours())
-    } else if age.num_minutes() > 0 {
-        format!("{}m ago", age.num_minutes())
-    } else {
-        "just now".to_string()
-    }
-}
-
 fn canonical_personal_display_key(key: &str) -> String {
     match key.trim().to_ascii_lowercase().as_str() {
         "birthday" | "date_of_birth" | "dob" => "birth_date".to_string(),
@@ -576,7 +557,7 @@ impl ManageMemoriesTool {
                     // temporal questions ("when did I tell you X?") directly from
                     // search results instead of reaching for the wrong tool.
                     let learned_ts = f.first_seen_at.unwrap_or(f.created_at).to_rfc3339();
-                    let learned = format_age(&learned_ts);
+                    let learned = aidaemon_tools::duration_format::format_age(&learned_ts);
                     let evidence = f
                         .source_excerpt
                         .as_deref()
@@ -687,7 +668,8 @@ impl ManageMemoriesTool {
                 };
                 let mut output = header;
                 for e in &episodes {
-                    let when = format_age(&e.created_at.to_rfc3339());
+                    let when =
+                        aidaemon_tools::duration_format::format_age(&e.created_at.to_rfc3339());
                     output.push_str(&format!("• [{}] {}", when, e.summary.trim()));
                     if let Some(topics) = e.topics.as_ref().filter(|t| !t.is_empty()) {
                         output.push_str(&format!(" (topics: {})", topics.join(", ")));

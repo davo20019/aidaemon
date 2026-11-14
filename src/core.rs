@@ -180,7 +180,11 @@ pub async fn run(
             .with_stable_subjects(stable_subjects)
             .with_state(state.clone()),
     );
-    tools.push(track_requirements_tool.clone());
+    aidaemon_runtime::tool_manifest::push(
+        &mut tools,
+        aidaemon_runtime::tool_manifest::ToolContext::Global,
+        track_requirements_tool.clone(),
+    );
 
     // 7. Agent (with deferred spawn tool wiring to break the circular dep)
     let skill_names: Vec<String> = if let Some(ref dir) = skills_dir {
@@ -324,7 +328,7 @@ pub async fn run(
 
     // Background sub-agents do not survive a restart: tell their chats. Done
     // before channels start, so nothing running now can be mistaken for lost.
-    crate::tools::spawn::report_interrupted_background_children(
+    aidaemon_runtime::helper_run::delivery::report_interrupted_background_children(
         &(state.clone() as Arc<dyn crate::traits::NotificationStore>),
     )
     .await;
