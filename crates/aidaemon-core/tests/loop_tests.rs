@@ -2426,3 +2426,70 @@ fn a_message_saved_before_reasoning_existed_still_reads() {
     let saved = serde_json::to_value(Message::assistant("Hello.", vec![])).unwrap();
     assert!(saved.get("reasoning").is_none(), "{saved}");
 }
+
+// ---------- deferred tools ----------
+
+/// A deferred tool's schema stays out of the request, listed by
+/// `load_tools`, until loaded: by `load_tools`, or by calling it directly,
+/// which runs it like any call. The loaded set outlives the run.
+#[tokio::test]
+async fn deferred_tools_are_sent_once_loaded() {
+    let provider = ScriptedProvider::new([
+        tool_calls([call("c1", "load_tools", json!({"names": ["echo"]}))]),
+        tool_calls([call("c2", "echo", json!({"text": "ping"}))]),
+        text("done"),
+    ]);
+    let loaded = aidaemon_core::LoadedTools::new();
+    let (counting, calls) = counting("count", ToolAnnotations::READ_ONLY);
+    let agent = base(provider.clone())
+        .deferred_tool_arc(Arc::new(echo_tool()))
+        .deferred_tool_arc(Arc::new(counting))
+        .loaded_tools(loaded.clone())
+        .build()
+        .unwrap();
+    let out = agent.run("s1", "echo ping").await.unwrap();
+    assert!(out.is_completed());
+
+    let names = |index: usize| -> Vec<String> {
+        provider.requests()[index]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect()
+    };
+    assert_eq!(names(0), vec!["load_tools"]);
+    let index = &provider.requests()[0].tools[0].description;
+    assert!(
+        index.contains("- count:") && index.contains("- echo:"),
+        "{index}"
+    );
+    assert_eq!(names(1), vec!["load_tools", "echo"]);
+    assert!(
+        tool_messages(&out.state)
+            .iter()
+            .any(|(_, content)| content == "ping")
+    );
+    assert_eq!(loaded.names(), vec!["echo"]);
+
+    // Called directly before it was loaded: it runs, and is loaded after.
+    let provider =
+        ScriptedProvider::new([tool_calls([call("c1", "count", json!({}))]), text("done")]);
+    let agent = base(provider.clone())
+        .deferred_tool_arc(Arc::new(echo_tool()))
+        .deferred_tool_arc(Arc::new(CountingTool {
+            name: "count",
+            annotations: ToolAnnotations::READ_ONLY,
+            calls: calls.clone(),
+        }))
+        .loaded_tools(loaded.clone())
+        .build()
+        .unwrap();
+    agent.run("s1", "count").await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let second: Vec<String> = provider.requests()[1]
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
+    assert_eq!(second, vec!["load_tools", "count", "echo"]);
+}

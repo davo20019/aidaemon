@@ -611,6 +611,12 @@ impl<'a> Driver<'a> {
                 continue;
             }
 
+            // A deferred tool called before it was loaded is loaded now and
+            // runs like any other call: the schema check below still judges
+            // its arguments, and the next request carries its schema.
+            if self.agent.deferred.contains(&call.name) {
+                self.agent.loaded.load(&call.name);
+            }
             // Deterministic checks come before any policy, so a malformed
             // proposal never reaches a hook or a human.
             let Some(tool) = self.agent.tools.get(&call.name).cloned() else {
@@ -1510,7 +1516,16 @@ impl<'a> Driver<'a> {
         ModelRequest {
             model: self.agent.model.clone(),
             messages,
-            tools: self.agent.specs.clone(),
+            tools: self
+                .agent
+                .specs
+                .iter()
+                .filter(|spec| {
+                    !self.agent.deferred.contains(&spec.name)
+                        || self.agent.loaded.contains(&spec.name)
+                })
+                .cloned()
+                .collect(),
             tool_choice: ToolChoice::Auto,
             max_output_tokens: self.agent.max_output_tokens,
             ..Default::default()

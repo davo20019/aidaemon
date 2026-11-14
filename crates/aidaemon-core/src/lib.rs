@@ -41,6 +41,7 @@ mod state;
 mod store;
 mod stuck;
 mod tool;
+mod tool_loading;
 mod untrusted;
 
 #[cfg(feature = "testing")]
@@ -94,6 +95,7 @@ pub use tool::{
     ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput, ToolResult,
     check_argument_types, check_arguments, strip_reserved_arguments,
 };
+pub use tool_loading::{LOAD_TOOLS, LoadedTools};
 
 pub use untrusted::{
     UNTRUSTED_EGRESS_INTERRUPT, UntrustedHook, UntrustedMode, is_untrusted_egress,
