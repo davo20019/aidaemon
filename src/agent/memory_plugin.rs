@@ -645,12 +645,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             harness.agent.memory_plugin().owned_daemon_tools(),
-            [
-                "remember_fact",
-                "manage_memories",
-                "manage_people",
-                "share_memory"
-            ]
+            ["remember_fact", "manage_memories", "manage_people"]
         );
         use aidaemon_runtime::engine::tool_roster::ToolRoster as _;
         let roster = |agent: &crate::agent::Agent| {

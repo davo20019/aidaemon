@@ -105,12 +105,7 @@ fn memory_system_tool_facts(read_only: bool) -> MemoryToolFacts {
     }
 }
 
-const DAEMON_TOOLS: &[&str] = &[
-    "remember_fact",
-    "share_memory",
-    "manage_memories",
-    "manage_people",
-];
+const DAEMON_TOOLS: &[&str] = &["remember_fact", "manage_memories", "manage_people"];
 
 /// The full memory system's tool facts, with `manage_memories` as the
 /// daemon offers it: memory and goal actions in one tool.

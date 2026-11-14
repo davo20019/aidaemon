@@ -261,7 +261,21 @@ impl Tool for ManageMemoriesTool {
     }
 }
 
+#[async_trait]
 impl crate::tools::traits::ToolSemantics for ManageMemoriesTool {
+    /// `set_privacy` asks the owner when it widens who may see a fact (the
+    /// memory tool's card); no other action needs one.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::tools::traits::ApprovalCall<'_>,
+        _facts: &ToolCallContext,
+    ) -> crate::tools::traits::OwnerApprovalNeed {
+        if call.refused {
+            return crate::tools::traits::OwnerApprovalNeed::NotNeeded;
+        }
+        self.memory.privacy_approval(call.arguments).await
+    }
+
     fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
         crate::tools::traits::ToolDispatchFacts {
             offering: aidaemon_tools::semantics::Offering::Core,

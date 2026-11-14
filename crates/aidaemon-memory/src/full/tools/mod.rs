@@ -1,5 +1,5 @@
 //! The full memory system's tools: `remember_fact`, `manage_memories`,
-//! `manage_people` and `share_memory`, over the memory stores.
+//! and `manage_people`, over the memory stores.
 //!
 //! Each is an [`OutcomeTool`](aidaemon_tools::OutcomeTool), so a host with its
 //! own dispatcher (receipts, approvals, result fitting) runs it directly and
@@ -25,24 +25,17 @@ use crate::stores::MemoryStores;
 mod manage_memories;
 mod manage_people;
 mod remember_fact;
-mod share_memory;
 
 pub use manage_memories::{
     MEMORY_ACTIONS, ManageMemoriesTool, memory_parameters, unknown_action_message,
 };
 pub use manage_people::ManagePeopleTool;
 pub use remember_fact::{RememberFactTool, call_deletes_facts};
-pub use share_memory::ShareMemoryTool;
 
 /// The names of the full memory system's tools.
-pub const TOOL_NAMES: &[&str] = &[
-    "remember_fact",
-    "manage_memories",
-    "manage_people",
-    "share_memory",
-];
+pub const TOOL_NAMES: &[&str] = &["remember_fact", "manage_memories", "manage_people"];
 
-/// The four tools over `store`. `settings` holds the `people_enabled`
+/// The three tools over `store`. `settings` holds the `people_enabled`
 /// switch `manage_people` reads and sets.
 pub fn outcome_tools(
     store: Arc<dyn MemoryStores>,
@@ -50,7 +43,6 @@ pub fn outcome_tools(
 ) -> Vec<Arc<dyn OutcomeTool>> {
     vec![
         Arc::new(RememberFactTool::new(store.clone())),
-        Arc::new(ShareMemoryTool::new(store.clone())),
         Arc::new(ManageMemoriesTool::new(store.clone())),
         Arc::new(ManagePeopleTool::new(settings, store)),
     ]
@@ -201,11 +193,6 @@ pub fn tool_facts() -> HashMap<String, MemoryToolFacts> {
             write_only(Some(UserMemory), true, true, |arguments| {
                 !call_deletes_facts(arguments)
             }),
-        ),
-        // Widens who may see a fact already stored.
-        (
-            "share_memory",
-            write_only(Some(UserMemory), false, false, |_| false),
         ),
         ("manage_memories", manage_memories),
         ("manage_people", manage_people),

@@ -47,7 +47,6 @@ pub use cli_agent::CliAgentTool;
 pub use computer_use::ComputerUseTool;
 pub use config_manager::ConfigManagerTool;
 mod escalate;
-pub use aidaemon_memory::full::tools::ShareMemoryTool;
 pub use aidaemon_memory::full::tools::{ManagePeopleTool, RememberFactTool};
 pub use aidaemon_tools::http_request;
 pub use aidaemon_tools::system::SystemInfoTool;

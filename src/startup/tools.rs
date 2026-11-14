@@ -26,8 +26,7 @@ use crate::tools::{
     ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool, ManageMandatesTool, ManageMcpTool,
     ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool, PolicyMetricsTool, ReadFileTool,
     RememberFactTool, RunCommandTool, SearchFilesTool, SearchHistoryTool, SendFileTool,
-    ShareMemoryTool, SpawnAgentTool, SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool,
-    WriteFileTool,
+    SpawnAgentTool, SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::traits::Tool;
 use crate::traits::store_prelude::*;
@@ -226,7 +225,6 @@ enum BaseToolId {
     SystemInfo,
     Terminal,
     RememberFact,
-    ShareMemory,
     ManageMemories,
     SetReminder,
     ScheduleTask,
@@ -261,10 +259,6 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
     BaseToolSpec {
         id: BaseToolId::RememberFact,
         name: "remember_fact",
-    },
-    BaseToolSpec {
-        id: BaseToolId::ShareMemory,
-        name: "share_memory",
     },
     BaseToolSpec {
         id: BaseToolId::ManageMemories,
@@ -1210,10 +1204,6 @@ async fn build_base_tool(
         }
         BaseToolId::RememberFact => BuiltBaseTool {
             tool: Arc::new(RememberFactTool::new(memory.store.clone())),
-            terminal_tool: None,
-        },
-        BaseToolId::ShareMemory => BuiltBaseTool {
-            tool: Arc::new(ShareMemoryTool::new(memory.store.clone())),
             terminal_tool: None,
         },
         BaseToolId::ManageMemories => BuiltBaseTool {

@@ -576,6 +576,10 @@ impl TurnEngine<'_> {
                 "Use manage_automations: run_now, history, last_failure, set_budget, \
                  update_instructions or bind_workspace, by the automation's name or ref.",
             )
+            .retired_tool(
+                "share_memory",
+                "Use manage_memories with action \"set_privacy\" and privacy \"global\".",
+            )
             .retired_tool("git_info", "Use terminal: git status, git log, git diff.")
             .retired_tool("git_commit", "Use terminal: git add and git commit.")
             .retired_tool(

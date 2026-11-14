@@ -546,12 +546,7 @@ async fn the_default_memory_remembers_across_runs() {
         .iter()
         .map(|spec| spec.name.clone())
         .collect();
-    for tool in [
-        "remember_fact",
-        "manage_memories",
-        "manage_people",
-        "share_memory",
-    ] {
+    for tool in ["remember_fact", "manage_memories", "manage_people"] {
         assert!(names.contains(&tool.to_string()), "{names:?}");
     }
     let outcome = agent

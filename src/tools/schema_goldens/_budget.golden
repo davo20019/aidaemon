@@ -37,7 +37,6 @@ self_diagnose 1123 281
 send_file 722 181
 send_node_audio 584 146
 set_reminder 647 162
-share_memory 438 110
 skill_resources 631 158
 spawn_agent 6018 1505
 system_info 267 67
@@ -47,5 +46,5 @@ use_skill 483 121
 web_fetch 647 162
 web_search 1326 332
 write_file 1068 267
-TOTAL 75542 18886 (48 tools)
-PER_CALL 31471 7868 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 29 deferred)
+TOTAL 75104 18776 (47 tools)
+PER_CALL 31386 7847 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 28 deferred)
