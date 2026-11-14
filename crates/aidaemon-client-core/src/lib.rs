@@ -10,13 +10,22 @@
 //!
 //! The terminal UI and the desktop app link it; the web client keeps a
 //! TypeScript reducer held to the same behaviour by shared fixtures.
+//!
+//! With default features off, what is left has no I/O and builds for
+//! `wasm32-unknown-unknown`: the reducer, the link's rules ([`machine`]),
+//! device keys, and sign-in over any [`signin::Http`]. Feature `native`
+//! (on by default) adds the tokio link and reqwest.
 
 pub mod keystore;
+#[cfg(feature = "native")]
 pub mod link;
+pub mod machine;
 pub mod signin;
 pub mod state;
 
 pub use keystore::{FileKeyStore, KeyStore, StoredDevice};
-pub use link::{Auth, ClientIdentity, Disconnect, DropKind, LinkConfig, Update};
+#[cfg(feature = "native")]
+pub use link::{Auth, LinkConfig};
+pub use machine::{ClientIdentity, Disconnect, DropKind, LinkMachine, Update};
 pub use signin::DeviceKey;
 pub use state::State;

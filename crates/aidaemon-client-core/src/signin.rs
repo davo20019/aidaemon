@@ -89,52 +89,62 @@ impl std::fmt::Display for SignInError {
 
 impl std::error::Error for SignInError {}
 
-fn classify(error: reqwest::Error) -> SignInError {
-    if error.is_connect() || error.is_timeout() {
-        SignInError::Unreachable(error.to_string())
-    } else {
-        SignInError::Failed(error.to_string())
-    }
+/// A reply as the sign-in code reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpReply {
+    pub status: u16,
+    pub body: String,
+}
+
+/// The few HTTP calls sign-in and pairing make, so any client can bring its
+/// own network stack (reqwest natively, a UI framework's `fetch` in a
+/// browser). Futures need not be `Send`.
+pub trait Http {
+    /// POST a JSON body. A failure to reach the gateway at all is
+    /// [`SignInError::Unreachable`].
+    fn post_json(
+        &self,
+        url: &str,
+        body: String,
+    ) -> impl std::future::Future<Output = Result<HttpReply, SignInError>>;
+    fn get(&self, url: &str) -> impl std::future::Future<Output = Result<HttpReply, SignInError>>;
+    /// Wait `duration` (between pairing polls).
+    fn sleep(&self, duration: Duration) -> impl std::future::Future<Output = ()>;
 }
 
 /// POST `body` to `base + path` and read a `T`, or the gateway's error.
 async fn post<B: serde::Serialize, T: serde::de::DeserializeOwned>(
-    http: &reqwest::Client,
+    http: &impl Http,
     base: &str,
     path: &str,
     body: &B,
 ) -> Result<T, SignInError> {
-    let response = http
-        .post(format!("{}{path}", base.trim_end_matches('/')))
-        .json(body)
-        .send()
-        .await
-        .map_err(classify)?;
-    read(response).await
+    let body = serde_json::to_string(body).map_err(|e| SignInError::Failed(e.to_string()))?;
+    read(
+        http.post_json(&format!("{}{path}", base.trim_end_matches('/')), body)
+            .await?,
+    )
 }
 
-async fn read<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
-) -> Result<T, SignInError> {
-    let status = response.status();
-    let text = response.text().await.map_err(classify)?;
-    if status.is_success() {
-        return serde_json::from_str(&text).map_err(|e| SignInError::Failed(e.to_string()));
+/// A gateway reply as a `T`, or as the error it names.
+pub fn read<T: serde::de::DeserializeOwned>(reply: HttpReply) -> Result<T, SignInError> {
+    if (200..300).contains(&reply.status) {
+        return serde_json::from_str(&reply.body).map_err(|e| SignInError::Failed(e.to_string()));
     }
-    let message = match serde_json::from_str::<ServerFrame>(&text) {
+    let message = match serde_json::from_str::<ServerFrame>(&reply.body) {
         Ok(ServerFrame::Error { error, .. }) => error.message,
-        _ => status.to_string(),
+        _ => format!("HTTP {}", reply.status),
     };
-    if status.is_client_error() {
+    if (400..500).contains(&reply.status) {
         Err(SignInError::Refused(message))
     } else {
         Err(SignInError::Failed(message))
     }
 }
 
-/// Sign `device` in: a challenge, its signature, a grant.
-pub async fn sign_in(
-    http: &reqwest::Client,
+/// Sign `device` in over `http`: a challenge, its signature, a grant.
+pub async fn sign_in_with(
+    http: &impl Http,
     device: &StoredDevice,
 ) -> Result<AccessGrant, SignInError> {
     let key = DeviceKey::from_stored(device).map_err(|e| SignInError::Refused(e.to_string()))?;
@@ -174,10 +184,10 @@ pub struct PairRequest {
     pub fingerprint: Option<String>,
 }
 
-/// Pair: redeem the offer with a new key, then wait (polling every
-/// `poll`) until the owner approves. Returns the identity to keep.
-pub async fn pair(
-    http: &reqwest::Client,
+/// Pair over `http`: redeem the offer with a new key, then wait (polling
+/// every `poll`) until the owner approves. Returns the identity to keep.
+pub async fn pair_with(
+    http: &impl Http,
     request: &PairRequest,
     poll: Duration,
 ) -> anyhow::Result<StoredDevice> {
@@ -205,17 +215,13 @@ pub async fn pair(
         enrollment.state,
         EnrollmentState::Open | EnrollmentState::Pending
     ) {
-        tokio::time::sleep(poll).await;
-        let response = http
-            .get(format!(
-                "{}/client/v1/enrollments/{}",
-                request.gateway.trim_end_matches('/'),
-                request.offer_id
-            ))
-            .send()
-            .await
-            .map_err(classify)?;
-        enrollment = read(response).await?;
+        http.sleep(poll).await;
+        let url = format!(
+            "{}/client/v1/enrollments/{}",
+            request.gateway.trim_end_matches('/'),
+            request.offer_id
+        );
+        enrollment = read(http.get(&url).await?)?;
     }
     match (enrollment.state, enrollment.device_id) {
         (EnrollmentState::Approved, Some(device_id)) => Ok(StoredDevice {
@@ -234,11 +240,11 @@ pub struct GrantCache {
 }
 
 impl GrantCache {
-    /// A token good for at least [`RENEW_BEFORE`], signing in again when
-    /// the one held is older.
-    pub async fn token(
+    /// A token good for at least [`RENEW_BEFORE`], signing in again over
+    /// `http` when the one held is older.
+    pub async fn token_with(
         &mut self,
-        http: &reqwest::Client,
+        http: &impl Http,
         device: &StoredDevice,
         now_ms: u64,
     ) -> Result<String, SignInError> {
@@ -248,7 +254,7 @@ impl GrantCache {
         {
             return Ok(grant.access_token.clone());
         }
-        let grant = sign_in(http, device).await?;
+        let grant = sign_in_with(http, device).await?;
         let token = grant.access_token.clone();
         self.grant = Some(grant);
         Ok(token)
@@ -260,6 +266,81 @@ impl GrantCache {
     }
 }
 
+#[cfg(feature = "native")]
+pub use native::*;
+
+/// reqwest and tokio: what the terminal UI and the Tauri shell use.
+#[cfg(feature = "native")]
+mod native {
+    use super::*;
+
+    impl Http for reqwest::Client {
+        async fn post_json(&self, url: &str, body: String) -> Result<HttpReply, SignInError> {
+            let response = self
+                .post(url)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .map_err(classify)?;
+            reply(response).await
+        }
+
+        async fn get(&self, url: &str) -> Result<HttpReply, SignInError> {
+            reply(self.get(url).send().await.map_err(classify)?).await
+        }
+
+        async fn sleep(&self, duration: Duration) {
+            tokio::time::sleep(duration).await;
+        }
+    }
+
+    fn classify(error: reqwest::Error) -> SignInError {
+        if error.is_connect() || error.is_timeout() {
+            SignInError::Unreachable(error.to_string())
+        } else {
+            SignInError::Failed(error.to_string())
+        }
+    }
+
+    async fn reply(response: reqwest::Response) -> Result<HttpReply, SignInError> {
+        let status = response.status().as_u16();
+        let body = response.text().await.map_err(classify)?;
+        Ok(HttpReply { status, body })
+    }
+
+    /// Sign `device` in: a challenge, its signature, a grant.
+    pub async fn sign_in(
+        http: &reqwest::Client,
+        device: &StoredDevice,
+    ) -> Result<AccessGrant, SignInError> {
+        sign_in_with(http, device).await
+    }
+
+    /// Pair: redeem the offer with a new key, then wait (polling every
+    /// `poll`) until the owner approves. Returns the identity to keep.
+    pub async fn pair(
+        http: &reqwest::Client,
+        request: &PairRequest,
+        poll: Duration,
+    ) -> anyhow::Result<StoredDevice> {
+        pair_with(http, request, poll).await
+    }
+
+    impl GrantCache {
+        /// [`GrantCache::token_with`] over reqwest.
+        pub async fn token(
+            &mut self,
+            http: &reqwest::Client,
+            device: &StoredDevice,
+            now_ms: u64,
+        ) -> Result<String, SignInError> {
+            self.token_with(http, device, now_ms).await
+        }
+    }
+}
+
+#[cfg(feature = "native")]
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -302,6 +383,7 @@ mod tests {
         assert!(!format!("{key:?}").contains(&key.secret_b64()));
     }
 
+    #[cfg(feature = "native")]
     #[tokio::test]
     async fn a_gateway_that_is_not_there_is_unreachable() {
         let stored = StoredDevice {

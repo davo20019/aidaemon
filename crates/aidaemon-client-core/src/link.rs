@@ -8,27 +8,19 @@
 //! connected, or dropped with why and when it tries again, so a client can
 //! tell "the daemon is not running" from "this device was refused".
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
-use aidaemon_client_protocol::{
-    Capability, ClientFrame, ClientInfo, ClientKind, Command, ErrorCode, ProtocolVersion,
-    ServerFrame,
-};
+use aidaemon_client_protocol::{Capability, ClientFrame, Command};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::keystore::KeyStore;
+pub use crate::machine::{
+    ClientIdentity, Disconnect, DropKind, LinkMachine, Tick, Update, http_base, request_id,
+};
 use crate::signin::{self, GrantCache, SignInError};
-
-const PING_EVERY: Duration = Duration::from_secs(25);
-/// Two missed pongs.
-const SILENT_LIMIT: Duration = Duration::from_secs(60);
-const RETRY_MIN: Duration = Duration::from_millis(500);
-const RETRY_MAX: Duration = Duration::from_secs(10);
 
 /// How the link proves who it is.
 #[derive(Clone)]
@@ -50,15 +42,6 @@ impl std::fmt::Debug for Auth {
     }
 }
 
-/// What the client says it is in `hello`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientIdentity {
-    pub kind: ClientKind,
-    /// The program's name (`aidaemon-tui`).
-    pub name: String,
-    pub version: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub struct LinkConfig {
     /// `ws://127.0.0.1:8788/client/v1/ws`
@@ -78,52 +61,6 @@ impl LinkConfig {
     }
 }
 
-/// `ws://host:port/client/v1/ws` as `http://host:port`.
-pub fn http_base(url: &str) -> String {
-    let (scheme, rest) = match url.split_once("://") {
-        Some(("wss", rest)) => ("https", rest),
-        Some(("ws", rest)) => ("http", rest),
-        Some((other, rest)) => (other, rest),
-        None => ("http", url),
-    };
-    let host = rest.split('/').next().unwrap_or(rest);
-    format!("{scheme}://{host}")
-}
-
-/// Why a connection ended, as far as a client should tell the owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DropKind {
-    /// Nothing answered at the address: the daemon (or its gateway) is not
-    /// running.
-    DaemonNotRunning,
-    /// The token or device was refused; retrying alone will not fix it.
-    Unauthorized,
-    /// The daemon speaks another major protocol version.
-    VersionUnsupported,
-    /// The connection was lost; it comes back by itself.
-    Dropped,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Disconnect {
-    pub kind: DropKind,
-    pub reason: String,
-    /// When the link tries again.
-    pub retry_in: Duration,
-}
-
-/// What the link tells the app.
-#[allow(clippy::large_enum_variant)] // Frames dominate; boxing buys nothing here.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Update {
-    /// Signing in and opening the socket.
-    Connecting,
-    /// The socket is open and `hello` is sent.
-    Connected,
-    Disconnected(Disconnect),
-    Frame(ServerFrame),
-}
-
 /// Start the link; send commands on the returned sender.
 pub fn spawn(
     config: LinkConfig,
@@ -134,23 +71,14 @@ pub fn spawn(
     tx
 }
 
-/// A new request id.
-pub fn request_id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
 struct Link {
     config: LinkConfig,
     updates: mpsc::UnboundedSender<Update>,
     commands: mpsc::UnboundedReceiver<(String, Command)>,
-    /// The last durable `seq` delivered to the app.
-    cursor: Option<u64>,
-    /// Commands sent but not answered, by request id.
-    pending: BTreeMap<String, Command>,
+    machine: LinkMachine,
     http: reqwest::Client,
     grant: GrantCache,
-    /// The gateway refused the token on the last socket.
-    refused: Option<String>,
+    started: tokio::time::Instant,
 }
 
 async fn run(
@@ -158,50 +86,43 @@ async fn run(
     updates: mpsc::UnboundedSender<Update>,
     commands: mpsc::UnboundedReceiver<(String, Command)>,
 ) {
+    let machine = LinkMachine::new(
+        config.client.clone(),
+        config.device.clone(),
+        config.capabilities.clone(),
+    );
     let mut link = Link {
         config,
         updates,
         commands,
-        cursor: None,
-        pending: BTreeMap::new(),
+        machine,
         http: reqwest::Client::new(),
         grant: GrantCache::default(),
-        refused: None,
+        started: tokio::time::Instant::now(),
     };
-    let mut wait = RETRY_MIN;
     loop {
         if link.updates.send(Update::Connecting).is_err() {
             return;
         }
-        let (kind, reason) = match link.session().await {
+        let disconnect = match link.session().await {
             Ok(Ended::AppGone) => return,
-            Ok(Ended::Dropped(kind, reason)) => {
-                if kind == DropKind::Dropped {
-                    wait = RETRY_MIN;
-                }
-                (kind, reason)
-            }
-            Err(failure) => failure,
+            Ok(Ended::Closed(disconnect)) => disconnect,
+            Err((kind, reason)) => link.machine.failed(kind, reason),
         };
-        if kind == DropKind::Unauthorized {
+        if disconnect.kind == DropKind::Unauthorized {
             link.grant.drop_grant();
         }
-        let disconnect = Disconnect {
-            kind,
-            reason,
-            retry_in: wait,
-        };
+        let wait = disconnect.retry_in;
         if link.updates.send(Update::Disconnected(disconnect)).is_err() {
             return;
         }
         tokio::time::sleep(wait).await;
-        wait = (wait * 2).min(RETRY_MAX);
     }
 }
 
 enum Ended {
     AppGone,
-    Dropped(DropKind, String),
+    Closed(Disconnect),
 }
 
 type Failure = (DropKind, String);
@@ -227,31 +148,8 @@ fn connect_failure(error: tokio_tungstenite::tungstenite::Error) -> Failure {
 }
 
 impl Link {
-    fn deliver(&mut self, frame: ServerFrame) -> bool {
-        match &frame {
-            ServerFrame::Event { seq: Some(seq), .. } | ServerFrame::Snapshot { seq, .. } => {
-                self.cursor = Some(*seq);
-            }
-            ServerFrame::Ack { request_id, .. }
-            | ServerFrame::Error {
-                request_id: Some(request_id),
-                ..
-            } => {
-                self.pending.remove(request_id);
-            }
-            ServerFrame::Error {
-                request_id: None,
-                error,
-            } if matches!(
-                error.code,
-                ErrorCode::Unauthorized | ErrorCode::VersionUnsupported
-            ) =>
-            {
-                self.refused = Some(error.message.clone());
-            }
-            _ => {}
-        }
-        self.updates.send(Update::Frame(frame)).is_ok()
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// The token for this connection.
@@ -290,79 +188,61 @@ impl Link {
         let (mut socket, _) = tokio_tungstenite::connect_async(request)
             .await
             .map_err(connect_failure)?;
-        let hello = ClientFrame::Hello {
-            version: ProtocolVersion::CURRENT,
-            client: ClientInfo {
-                kind: self.config.client.kind,
-                name: self.config.client.name.clone(),
-                version: self.config.client.version.clone(),
-                device: self.config.device.clone(),
-            },
-            capabilities: self.config.capabilities.clone(),
-            resume_from: self.cursor,
-            token: None,
-        };
         let send = |frame: &ClientFrame| {
             serde_json::to_string(frame)
                 .map(Message::text)
                 .map_err(failed)
         };
-        socket.send(send(&hello)?).await.map_err(failed)?;
+        let opening = self.machine.opened(self.now_ms());
+        let mut frames = opening.iter();
+        if let Some(hello) = frames.next() {
+            socket.send(send(hello)?).await.map_err(failed)?;
+        }
         if self.updates.send(Update::Connected).is_err() {
             return Ok(Ended::AppGone);
         }
-        self.refused = None;
-        for (request_id, command) in self.pending.clone() {
-            let frame = ClientFrame::Command {
-                request_id,
-                command,
-            };
-            socket.send(send(&frame)?).await.map_err(failed)?;
+        for frame in frames {
+            socket.send(send(frame)?).await.map_err(failed)?;
         }
-        let mut ping = tokio::time::interval(PING_EVERY);
-        ping.tick().await;
-        let mut last_heard = tokio::time::Instant::now();
-        let closed = |refused: &Option<String>, fallback: String| match refused {
-            Some(why) => Ended::Dropped(DropKind::Unauthorized, why.clone()),
-            None => Ended::Dropped(DropKind::Dropped, fallback),
-        };
+        let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
+        ticks.tick().await;
         loop {
             tokio::select! {
                 incoming = socket.next() => {
                     let message = match incoming {
                         Some(Ok(message)) => message,
-                        Some(Err(error)) => return Ok(closed(&self.refused, error.to_string())),
-                        None => return Ok(closed(&self.refused, "the gateway closed the connection".into())),
+                        Some(Err(error)) => return Ok(Ended::Closed(self.machine.closed(error.to_string()))),
+                        None => return Ok(Ended::Closed(self.machine.closed("the gateway closed the connection"))),
                     };
-                    last_heard = tokio::time::Instant::now();
+                    let now = self.now_ms();
                     match message {
                         Message::Text(text) => {
-                            let Ok(frame) = serde_json::from_str::<ServerFrame>(&text) else {
-                                continue;
-                            };
-                            if !self.deliver(frame) {
+                            if let Some(frame) = self.machine.received(&text, now)
+                                && self.updates.send(Update::Frame(frame)).is_err()
+                            {
                                 return Ok(Ended::AppGone);
                             }
                         }
                         Message::Close(_) => {
-                            return Ok(closed(&self.refused, "the gateway closed the connection".into()))
+                            return Ok(Ended::Closed(self.machine.closed("the gateway closed the connection")))
                         }
-                        _ => {}
+                        _ => self.machine.heard(now),
                     }
                 }
                 command = self.commands.recv() => {
                     let Some((request_id, command)) = command else {
                         return Ok(Ended::AppGone);
                     };
-                    self.pending.insert(request_id.clone(), command.clone());
-                    let frame = ClientFrame::Command { request_id, command };
-                    socket.send(send(&frame)?).await.map_err(failed)?;
-                }
-                _ = ping.tick() => {
-                    if last_heard.elapsed() > SILENT_LIMIT {
-                        return Ok(Ended::Dropped(DropKind::Dropped, "no answer from the gateway".into()));
+                    if let Some(frame) = self.machine.command(request_id, command) {
+                        socket.send(send(&frame)?).await.map_err(failed)?;
                     }
-                    socket.send(send(&ClientFrame::Ping)?).await.map_err(failed)?;
+                }
+                _ = ticks.tick() => {
+                    match self.machine.tick(self.now_ms()) {
+                        Tick::Wait => {}
+                        Tick::Ping(frame) => socket.send(send(&frame)?).await.map_err(failed)?,
+                        Tick::Dead(disconnect) => return Ok(Ended::Closed(disconnect)),
+                    }
                 }
             }
         }
@@ -372,18 +252,6 @@ impl Link {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_http_base_follows_the_socket_scheme() {
-        assert_eq!(
-            http_base("ws://127.0.0.1:8788/client/v1/ws"),
-            "http://127.0.0.1:8788"
-        );
-        assert_eq!(
-            http_base("wss://daemon.example.invalid/client/v1/ws"),
-            "https://daemon.example.invalid"
-        );
-    }
 
     #[tokio::test]
     async fn nothing_listening_reads_as_the_daemon_not_running() {
@@ -399,7 +267,7 @@ mod tests {
                 url: format!("ws://127.0.0.1:{port}/client/v1/ws"),
                 auth: Auth::LocalToken("acg_synthetic".into()),
                 client: ClientIdentity {
-                    kind: ClientKind::Tui,
+                    kind: aidaemon_client_protocol::ClientKind::Tui,
                     name: "test".into(),
                     version: None,
                 },
