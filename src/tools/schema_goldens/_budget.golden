@@ -40,10 +40,10 @@ skill_resources 631 158
 spawn_agent 6608 1652
 system_info 267 67
 terminal 3878 970
-track_requirements 5961 1491
+track_requirements 6098 1525
 use_skill 483 121
 web_fetch 647 162
 web_search 1326 332
 write_file 1068 267
-TOTAL 75986 18997 (46 tools)
-PER_CALL 32387 8097 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 27 deferred)
+TOTAL 76123 19031 (46 tools)
+PER_CALL 32524 8131 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 27 deferred)
