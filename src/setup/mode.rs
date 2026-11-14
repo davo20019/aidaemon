@@ -64,6 +64,11 @@ pub(crate) async fn run(config_path: &Path) -> anyhow::Result<()> {
     let gateway_config = crate::startup::client_gateway::with_installed_app(
         aidaemon_client_gateway::ClientGatewayConfig {
             enabled: true,
+            // A second daemon on one machine needs another port.
+            port: std::env::var("AIDAEMON_GATEWAY_PORT")
+                .ok()
+                .and_then(|p| p.trim().parse().ok())
+                .unwrap_or(aidaemon_client_gateway::ClientGatewayConfig::default().port),
             ..Default::default()
         },
     );
@@ -85,6 +90,7 @@ pub(crate) async fn run(config_path: &Path) -> anyhow::Result<()> {
     })
     .await?;
 
+    let listener = aidaemon_client_gateway::setup::bind(&gateway).await?;
     eprintln!();
     eprintln!("  AIdaemon is not set up yet.");
     eprintln!("  On this computer: open the AIdaemon app.");
@@ -116,7 +122,7 @@ pub(crate) async fn run(config_path: &Path) -> anyhow::Result<()> {
         });
     }
 
-    let served = aidaemon_client_gateway::setup::serve(gateway).await;
+    let served = aidaemon_client_gateway::setup::serve(gateway, listener).await;
     pool.close().await;
     served?;
     if !config_path.exists() {

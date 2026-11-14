@@ -165,13 +165,23 @@ db_path = "aidaemon.db"
 "#;
 
 fn switch_call(choice: &ProviderChoice) -> serde_json::Value {
+    // A custom endpoint's preset names placeholder models: the one the
+    // owner named does every job unless they name others.
+    let custom = preset(&choice.preset).is_some_and(|p| p.requires_custom_base_url);
+    let or_primary = |model: &str| {
+        if model.is_empty() && custom {
+            choice.primary_model.clone()
+        } else {
+            model.to_string()
+        }
+    };
     json!({
         "action": "switch_provider",
         "provider": choice.preset,
         "base_url": choice.base_url,
         "primary_model": choice.primary_model,
-        "fast_model": choice.fast_model,
-        "smart_model": choice.smart_model,
+        "fast_model": or_primary(&choice.fast_model),
+        "smart_model": or_primary(&choice.smart_model),
     })
 }
 
@@ -274,8 +284,29 @@ pub(crate) async fn save(
         let _ = std::fs::remove_file(&staged);
         return Err(reason);
     }
+    // A setup on another port (a second daemon) keeps it.
+    if let Some(port) = std::env::var("AIDAEMON_GATEWAY_PORT")
+        .ok()
+        .and_then(|p| p.trim().parse::<i64>().ok())
+    {
+        let text = std::fs::read_to_string(&staged).map_err(|e| e.to_string())?;
+        let mut table: toml::Table = text.parse().map_err(|e| format!("{e}"))?;
+        if let Some(gateway) = table
+            .get_mut("client_gateway")
+            .and_then(toml::Value::as_table_mut)
+        {
+            gateway.insert("port".into(), toml::Value::Integer(port));
+        }
+        std::fs::write(
+            &staged,
+            toml::to_string_pretty(&table).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     std::fs::rename(&staged, config_path).map_err(|e| format!("Could not save the config: {e}"))?;
+    // `switch_provider` backs up the staged file before it writes it.
     for leftover in [
+        staged.with_extension("toml.bak"),
         staged.with_extension("setup.bak"),
         staged.with_extension("setup.lastgood"),
     ] {
@@ -693,6 +724,9 @@ mod tests {
         let config = crate::config::AppConfig::load(&config_path).unwrap();
         assert_eq!(config.provider.api_key, "sk-synthetic-good");
         assert!(config.client_gateway.enabled);
+        // A custom endpoint's one model does every job.
+        assert_eq!(config.provider.models.fast, "synthetic-model");
+        assert!(!dir.path().join("config.toml.toml.bak").exists());
         let progress = super::super::progress::load(&config_path).unwrap();
         assert!(!progress.channel_done && !progress.on_server);
         drop(isolation);

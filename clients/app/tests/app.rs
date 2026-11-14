@@ -131,7 +131,9 @@ fn first_run_connects_a_model_then_offers_a_chat_and_greets() -> Result<(), Stri
     feed([frame(
         r#"{"type":"event","at_ms":1,"event":{"type":"setup_updated","setup":{"step":"starting","model":"OpenRouter · synthetic/model-1"}}}"#,
     )]);
-    app.wait_for("OpenRouter · synthetic/model-1 answered its test. AIdaemon is starting with it…")?;
+    app.wait_for(
+        "OpenRouter · synthetic/model-1 answered its test. AIdaemon is starting with it…",
+    )?;
     feed([frame(
         r#"{"type":"event","at_ms":2,"event":{"type":"setup_updated","setup":{"step":"channel","model":"OpenRouter · synthetic/model-1","channels":[{"platform":"telegram","name":"Telegram","help_url":"https://t.me/BotFather"}],"channel":{"platform":"telegram","bot":"@synthetic_bot"}}}}"#,
     )]);

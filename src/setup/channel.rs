@@ -19,10 +19,10 @@ const GREETING_TITLE: &str = "Welcome";
 /// What the agent says first: who it is, what it may do on its own and
 /// what it asks about, and what to try.
 pub(crate) fn greeting(agent_name: &str, on_server: bool) -> (String, Vec<String>) {
-    let name = if agent_name.trim().is_empty() {
-        "AIdaemon"
-    } else {
-        agent_name.trim()
+    // The default name reads as the product's.
+    let name = match agent_name.trim() {
+        "" | "aidaemon" => "AIdaemon",
+        name => name,
     };
     let place = if on_server {
         "I run on your server, around the clock"

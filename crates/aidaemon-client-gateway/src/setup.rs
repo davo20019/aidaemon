@@ -187,12 +187,22 @@ pub fn router(gateway: Arc<SetupGateway>) -> Router {
         .with_state(gateway)
 }
 
-/// Serve on the configured loopback address until setup stops.
-pub async fn serve(gateway: Arc<SetupGateway>) -> anyhow::Result<()> {
-    let stop = gateway.stop.clone();
+/// Take the configured loopback address, so a clash is known before
+/// anything is printed about it.
+pub async fn bind(gateway: &SetupGateway) -> anyhow::Result<tokio::net::TcpListener> {
     let addr = gateway.config.bind_addr()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(%addr, "Client Gateway listening for setup");
+    tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        anyhow::anyhow!("could not listen on {addr} ({e}); is another AIdaemon running?")
+    })
+}
+
+/// Serve on `listener` ([`bind`]) until setup stops.
+pub async fn serve(
+    gateway: Arc<SetupGateway>,
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<()> {
+    let stop = gateway.stop.clone();
+    info!(addr = ?listener.local_addr().ok(), "Client Gateway listening for setup");
     axum::serve(listener, router(gateway))
         .with_graceful_shutdown(async move { stop.cancelled().await })
         .await?;

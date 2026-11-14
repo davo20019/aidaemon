@@ -135,6 +135,16 @@ fn offers(store: Store, session: Option<String>) -> View {
                                         store.dismiss_feature(feature);
                                     } else {
                                         store.enable_feature(feature);
+                                        // macOS grants screen and input use in
+                                        // System Settings.
+                                        if feature
+                                            == aidaemon_client_protocol::Feature::ComputerUse
+                                            && cfg!(target_os = "macos")
+                                        {
+                                            drop(open_url(
+                                                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+                                            ));
+                                        }
                                     }
                                 }
                             }))

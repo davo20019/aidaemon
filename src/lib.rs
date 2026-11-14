@@ -355,6 +355,9 @@ pub fn run() -> anyhow::Result<()> {
             .enable_all()
             .build()?
             .block_on(setup::mode::run(&config_path))?;
+        // Setup wrote the database key to the env file this process read
+        // before it existed: read it again, as a fresh start would.
+        load_startup_env_file(&env_file_path);
     }
 
     // Load config — if corrupted, try restoring from .lastgood first (proven

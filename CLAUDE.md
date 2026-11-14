@@ -81,6 +81,9 @@ background tasks`.
   `aidaemon_memory::sqlite`. Events and run aggregate:
   `crates/aidaemon-events` (host adapter in `src/events/`).
 - `src/memory/`, `src/plans/`, `src/channels/` (Telegram, Slack, Discord, hub).
+- `src/setup/`: first run. No config runs setup mode (the gateway crate's
+  `setup` router, no agent) until a model passes its test; the running
+  daemon's client host then serves the chat step and the greeting.
 - Clients: `clients/app/` is the one nsh (Native Shell) Rust app for desktop, web and terminal (its own Cargo workspace; read `clients/app/AGENTS.md`). Shared client logic is `crates/aidaemon-client-core` (`machine::LinkMachine`, reducer, sign-in). The gateway serves its web build (installed to `~/.aidaemon/app-web`) at `/client/v1/next/`; releases ship `aidaemon-app` and `aidaemon-app-web.tar.gz`.
 - Specialists: prompts in `specialists/<kind>.md`, user overrides in
   `~/.aidaemon/specialists/`, code in `src/agent/specialists/`, exposed via
