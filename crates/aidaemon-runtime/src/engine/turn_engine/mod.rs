@@ -857,16 +857,24 @@ impl TurnEngine<'_> {
                 .with_grants(approvals.grants_for(&grant_session))
                 .workspace_root(self.execution_backend_handle().workspace_root().as_str());
         let secrets = self.configured_secret_literals(engine).await;
-        let egress = secrets
-            .iter()
-            .fold(aidaemon_policies::EgressGuard::new(), |guard, secret| {
-                guard.secret(secret.clone())
-            });
-        let ledger_redactor = secrets
-            .iter()
-            .fold(aidaemon_policies::Redactor::new(), |redactor, secret| {
-                redactor.secret(secret.clone())
-            });
+        let mut egress = aidaemon_policies::EgressGuard::new();
+        let mut ledger_redactor = aidaemon_policies::Redactor::new();
+        for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+            // A configured value too short to match safely is left out of
+            // both, and said so once per turn (without the value).
+            match (
+                egress.clone().secret(secret.clone()),
+                ledger_redactor.clone().secret(secret.clone()),
+            ) {
+                (Ok(guard), Ok(redactor)) => {
+                    egress = guard;
+                    ledger_redactor = redactor;
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    warn!(%error, "A configured secret is too short for the secret scan");
+                }
+            }
+        }
         // The turn's tools by name, as the dispatcher resolves them: a
         // daemon tool wins over an MCP tool of the same name.
         let mut turn_tools: std::collections::HashMap<

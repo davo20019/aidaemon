@@ -41,14 +41,20 @@ impl EgressGuard {
         }
     }
 
-    /// Also refuse calls carrying this exact value. Values shorter than the
-    /// redactor's minimum are ignored, as there.
-    pub fn secret(mut self, value: impl Into<String>) -> Self {
+    /// Also refuse calls carrying this exact value. A value shorter than
+    /// the redactor's minimum is refused, as there: matching every `abc`
+    /// would block ordinary calls.
+    pub fn secret(
+        mut self,
+        value: impl Into<String>,
+    ) -> Result<Self, aidaemon_core::redaction::SecretTooShort> {
         let value = value.into();
-        if value.chars().count() >= MIN_LITERAL_LEN {
-            self.literals.push(value);
+        let chars = value.chars().count();
+        if chars < MIN_LITERAL_LEN {
+            return Err(aidaemon_core::redaction::SecretTooShort { chars });
         }
-        self
+        self.literals.push(value);
+        Ok(self)
     }
 
     /// Add a custom pattern; `kind` names it in the refusal.
@@ -218,7 +224,9 @@ mod tests {
             "aws_access_key",
         );
         // Configured literal secrets too.
-        let guard = EgressGuard::new().secret("acme-synthetic-token-123");
+        let guard = EgressGuard::new()
+            .secret("acme-synthetic-token-123")
+            .unwrap();
         blocked(
             &judge(
                 &guard,
@@ -232,6 +240,14 @@ mod tests {
         assert_eq!(
             judge(&guard, &annotated, json!({"body": "hello Alice Rivera"})).await,
             ToolDecision::Allow
+        );
+    }
+
+    #[test]
+    fn a_too_short_literal_is_refused_not_dropped() {
+        assert_eq!(
+            EgressGuard::new().secret("1234").unwrap_err(),
+            aidaemon_core::redaction::SecretTooShort { chars: 4 }
         );
     }
 
@@ -268,7 +284,7 @@ mod tests {
     async fn egress_guard_scans_raw_urls() {
         let annotated = info(true, CallEffects::unknown());
         // Passwords in the userinfo are scanned as written.
-        let guard = EgressGuard::new().secret("9fA3kLmn0pQ");
+        let guard = EgressGuard::new().secret("9fA3kLmn0pQ").unwrap();
         blocked(
             &judge(
                 &guard,
@@ -278,7 +294,7 @@ mod tests {
             .await,
             "secret",
         );
-        let guard = EgressGuard::new().secret("12345678");
+        let guard = EgressGuard::new().secret("12345678").unwrap();
         blocked(
             &judge(
                 &guard,

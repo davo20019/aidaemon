@@ -39,7 +39,7 @@ async fn redactor_literals_and_shapes_reach_receipts_events_and_state() {
         .model("m")
         .provider(provider.clone())
         .tool(tool)
-        .hook(Redactor::default().secret(TOKEN))
+        .hook(Redactor::default().secret(TOKEN).unwrap())
         .event_sink(move |_: RunId, e: &Event| sink.lock().unwrap().push(format!("{e:?}")))
         .allow_unguarded()
         .build()
@@ -62,7 +62,10 @@ async fn redactor_literals_and_shapes_reach_receipts_events_and_state() {
 
 #[test]
 fn a_too_short_literal_is_an_error_not_a_silent_no_op() {
-    assert!(Redactor::default().try_secret("12345").is_err());
-    let r = Redactor::default().try_secret("123456").unwrap();
+    assert_eq!(
+        Redactor::default().secret("12345").unwrap_err(),
+        aidaemon_core::redaction::SecretTooShort { chars: 5 }
+    );
+    let r = Redactor::default().secret("123456").unwrap();
     assert_eq!(r.redact("code 123456 end"), "code [REDACTED:secret] end");
 }
