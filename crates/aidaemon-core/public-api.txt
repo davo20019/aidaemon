@@ -664,6 +664,7 @@ pub fn aidaemon_core::AgentBuilder::max_output_tokens(self, u32) -> Self
 pub fn aidaemon_core::AgentBuilder::model(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::AgentBuilder::new(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::AgentBuilder::provider(self, impl aidaemon_core::Provider + 'static) -> Self
+pub fn aidaemon_core::AgentBuilder::retired_tool(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::AgentBuilder::stop_when(self, impl aidaemon_core::StopCondition + 'static) -> Self
 pub fn aidaemon_core::AgentBuilder::store(self, alloc::sync::Arc<dyn aidaemon_core::RunStore>) -> Self
 pub fn aidaemon_core::AgentBuilder::stuck_detection(self, aidaemon_core::StuckConfig) -> Self
