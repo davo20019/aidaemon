@@ -9,7 +9,8 @@ use aidaemon_client_core::machine::{DropKind, Update, request_id};
 use aidaemon_client_core::state::{Line, LiveTurn, SessionView, State, ViewRequest};
 use aidaemon_client_protocol::{
     Approval, ApprovalDecision, Command, CommandResult, Event, MemoryItem, MidRun, SearchHit,
-    ServerFrame, SlashCommand, SystemStatus, TaskSummary, TurnStatus,
+    ServerFrame, Settings, SettingsChange, SettingsOutcome, SlashCommand, SystemStatus,
+    TaskSummary, TurnStatus,
 };
 use aidaemon_client_protocol::{Pane, ViewAction};
 use nsh_core::prelude::*;
@@ -67,6 +68,8 @@ pub enum Page {
     System,
     /// What the daemon remembers about the owner.
     Memory,
+    /// The daemon's settings.
+    Settings,
 }
 
 /// How much of each turn's tool use the transcript shows.
@@ -136,6 +139,16 @@ pub enum MemoryRead {
     NotYet,
     Loading,
     Ready(Vec<MemoryItem>),
+    Failed(String),
+}
+
+/// The Settings page's data, as last read.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum SettingsRead {
+    #[default]
+    NotYet,
+    Loading,
+    Ready(Box<Settings>),
     Failed(String),
 }
 
@@ -214,6 +227,13 @@ pub struct Store {
     search_request: Stored<Option<String>>,
     memories: Signal<MemoryRead>,
     memories_request: Stored<Option<String>>,
+    settings: Signal<SettingsRead>,
+    settings_request: Stored<Option<String>>,
+    /// Settings changes sent and not yet answered.
+    settings_changes: Stored<BTreeSet<String>>,
+    /// Changes waiting for an approval, and whether another device must
+    /// give it.
+    settings_waiting: Signal<BTreeMap<String, bool>>,
 }
 
 /// The draft key of a conversation not started yet.
@@ -254,6 +274,10 @@ impl Store {
             search_request: stored(None),
             memories: signal(MemoryRead::NotYet),
             memories_request: stored(None),
+            settings: signal(SettingsRead::NotYet),
+            settings_request: stored(None),
+            settings_changes: stored(BTreeSet::new()),
+            settings_waiting: signal(BTreeMap::new()),
         }
     }
 
@@ -522,6 +546,87 @@ impl Store {
                 self.memories.set(MemoryRead::Failed(error.message.clone()));
                 return;
             }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Settings { settings },
+            } if self
+                .settings_request
+                .with(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.settings_request.replace(None);
+                self.settings
+                    .set(SettingsRead::Ready(Box::new(settings.clone())));
+                return;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self
+                .settings_request
+                .with(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.settings_request.replace(None);
+                self.settings
+                    .set(SettingsRead::Failed(error.message.clone()));
+                return;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::SettingsChanged { outcome },
+            } => {
+                self.settings_changes.with(|c| c.remove(request_id));
+                match outcome {
+                    SettingsOutcome::Done { message, .. } => self.say(message.clone()),
+                    SettingsOutcome::AwaitingApproval {
+                        approval_id,
+                        other_device,
+                    } => {
+                        let other = *other_device;
+                        let id = approval_id.clone();
+                        self.settings_waiting.update(|w| {
+                            w.insert(id, other);
+                        });
+                        self.say(if other {
+                            "Approve it on another device, or on the daemon's computer"
+                        } else {
+                            "Waiting for your approval"
+                        });
+                    }
+                    SettingsOutcome::Unknown => {}
+                }
+                return;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self.settings_changes.with(|c| c.remove(request_id)) => {
+                self.say(error.message.clone());
+                return;
+            }
+            ServerFrame::Event {
+                event: Event::SettingsUpdated { message, .. },
+                ..
+            } => {
+                self.say(message.clone());
+                if matches!(self.settings.get_untracked(), SettingsRead::Ready(_))
+                    || self.page.get_untracked() == Page::Settings
+                {
+                    self.refresh_settings();
+                }
+                return;
+            }
+            ServerFrame::Event {
+                event: Event::ApprovalResolved { approval_id, .. },
+                ..
+            } if self
+                .settings_waiting
+                .with_untracked(|w| w.contains_key(approval_id)) =>
+            {
+                let id = approval_id.clone();
+                self.settings_waiting.update(|w| {
+                    w.remove(&id);
+                });
+            }
             ServerFrame::Event {
                 event, session_id, ..
             } => {
@@ -639,6 +744,41 @@ impl Store {
         self.send(Command::ForgetMemory {
             memory_id: id.to_owned(),
         });
+    }
+
+    // ----- The Settings page -------------------------------------------------
+
+    pub fn open_settings(&self) {
+        self.close_panes();
+        self.page.set(Page::Settings);
+        self.refresh_settings();
+    }
+
+    pub fn refresh_settings(&self) {
+        if self.settings_request.with(|r| r.is_some()) {
+            return;
+        }
+        if !matches!(self.settings.get_untracked(), SettingsRead::Ready(_)) {
+            self.settings.set(SettingsRead::Loading);
+        }
+        let id = self.send(Command::GetSettings);
+        self.settings_request.replace(Some(id));
+    }
+
+    pub fn settings(&self) -> SettingsRead {
+        self.settings.get()
+    }
+
+    /// Ask the daemon to make `change`; the answer arrives as a note, and
+    /// the page reads the settings again when it lands.
+    pub fn change_settings(&self, change: SettingsChange) {
+        let id = self.send(Command::ChangeSettings { change });
+        self.settings_changes.with(|c| c.insert(id));
+    }
+
+    /// Settings changes waiting for an approval.
+    pub fn settings_waiting(&self) -> usize {
+        self.settings_waiting.with(BTreeMap::len)
     }
 
     // ----- Search of every conversation ------------------------------------

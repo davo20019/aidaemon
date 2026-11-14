@@ -170,6 +170,17 @@ pub fn sidebar(store: Store) -> View {
                 .child(text("Memory").flex_1().text_size(px(ui::fit::body()))),
             ),
         )
+        .child(
+            view().px_2().pb_1().child(
+                row(
+                    move || store.page() == Page::Settings,
+                    move || store.open_settings(),
+                )
+                .accessibility_label("Settings: change how the daemon runs")
+                .child(icon(Glyph::Settings).text_color(colors::MUTED))
+                .child(text("Settings").flex_1().text_size(px(ui::fit::body()))),
+            ),
+        )
         .child(ui::separator())
         .child(connection(store))
 }

@@ -95,3 +95,18 @@ fn the_agent_moves_the_view_and_says_why() -> Result<(), String> {
     app.wait_for("Moved to Plan for Acme Corp · the plan is ready")?;
     Ok(())
 }
+
+#[test]
+fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What should we work on?")?;
+    feed([Update::Connected]);
+    app.press("Settings: change how the daemon runs")?;
+    app.wait_for("Reading settings…")?;
+    feed([frame(
+        r#"{"type":"event","at_ms":1,"event":{"type":"settings_updated","ok":true,"message":"Updated memory.retention_days = 30"}}"#,
+    )]);
+    app.wait_for("Updated memory.retention_days = 30")?;
+    Ok(())
+}

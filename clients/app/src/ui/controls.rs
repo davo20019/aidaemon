@@ -344,6 +344,11 @@ pub fn field(placeholder: &'static str, value: Signal<String>) -> Input {
         .focus(|s| s.border_color(colors::ACCENT))
 }
 
+/// A one-line field for a secret: masked, never filled in by the platform.
+pub fn secret_field(placeholder: &'static str, value: Signal<String>) -> Input {
+    field(placeholder, value).masked(true).auto_correct(false)
+}
+
 /// A small label with a tone: a status, a count, a risk.
 pub fn badge(label: impl IntoReactive<SharedString>, tone: Tone) -> View {
     view()

@@ -122,6 +122,11 @@ pub fn shell(store: Store) -> View {
                     crate::features::memory::page(store).key("memory")
                 }));
             }
+            if store.page() == crate::store::Page::Settings {
+                return Some(untracked(|| {
+                    crate::features::settings::page(store).key("settings")
+                }));
+            }
             if store.page() == crate::store::Page::System {
                 return Some(untracked(|| {
                     crate::features::system::page(store).key("system")
@@ -211,6 +216,7 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
             .shortcut("mod+,"),
     );
     items.push(CommandItem::new("memory", "Memory: what the daemon remembers").group("View"));
+    items.push(CommandItem::new("settings", "Settings: change how the daemon runs").group("View"));
     items.push(
         CommandItem::new(
             "activity",
@@ -287,6 +293,7 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                                 "inspector" => store.open_inspector(),
                                 "system" => store.open_system(),
                                 "memory" => store.open_memory(),
+                                "settings" => store.open_settings(),
                                 "activity" => store.cycle_activity_mode(),
                                 "copy-reply" => copy_reply(store),
                                 "copy-all" => {

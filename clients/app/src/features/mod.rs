@@ -6,5 +6,6 @@ pub mod inspector;
 pub mod memory;
 pub mod notify;
 pub mod pairing;
+pub mod settings;
 pub mod sidebar;
 pub mod system;

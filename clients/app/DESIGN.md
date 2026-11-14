@@ -22,7 +22,7 @@ A workbench for working with an agent: quiet, precise and dense, with what the a
 
 ## Components (`src/ui/controls.rs`)
 
-`meter`, `key_line`, `btn`, `btn_icon`, `icon_btn` (variants primary, secondary, ghost, outline, danger, success; sizes sm and md), `field`, `badge`, `status`, `kbd`, `row`, `surface`, `separator`, `section_label`, `empty`, `working`, `code`, `banner`, `hint` and `with_hint`. Features compose these and layout primitives only. A missing look becomes a variant here first.
+`meter`, `key_line`, `btn`, `btn_icon`, `icon_btn` (variants primary, secondary, ghost, outline, danger, success; sizes sm and md), `field`, `secret_field` (masked), `badge`, `status`, `kbd`, `row`, `surface`, `separator`, `section_label`, `empty`, `working`, `code`, `banner`, `hint` and `with_hint`. Features compose these and layout primitives only. A missing look becomes a variant here first.
 
 ## Motion (`src/ui/motion.rs`)
 
@@ -65,12 +65,15 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | Sidebar | Searching | Titles filter at once; the daemon's matches in every conversation follow under "In messages" with a snippet, who said it and when |
 | System | A goal ran in the last day | "While you were away": each run with Done, Running, Failed, Stopped or "No report" (warning: finished without saying what it did); failed and silent runs also go to "Needs a look" |
 | Terminal | Quit | The open conversation prints to the normal scrollback as Markdown |
+| Settings | A change is sent | The daemon's answer stays as a note at the top until dismissed; guarded changes say they wait for approval (or for another device) and a banner counts them |
+| Settings | Saved changes not yet in effect | Info banner with Reload, warning banner with Restart |
 
 ## Areas
 
 - **Conversation:** day breaks ("Today", "Yesterday", weekday, date), times under messages, Copy on every reply, Copy conversation as Markdown and Pin in the header.
 - **Inbox** (the right pane): waiting approvals of other conversations, new replies, running work, and the current turn's steps.
 - **Memory:** what the daemon remembers about the owner, newest first, filterable, each with Forget.
+- **Settings:** every setting of the daemon by config table (folded; filtering opens them), each with its value or "default (example: …)", "asks" when it needs approval, and when it takes effect; Edit in place as TOML, booleans as Turn on/off, secrets stored masked and never shown; any other key by path; providers and failover; runtime bots and MCP servers; moving the database and rotating its key; Reload and Restart.
 - **System:** daemon version, uptime and models; what needs a look; token use per day; model call times; scheduled goals; background jobs and queues; health checks.
 
 Times are shown in the owner's zone (`ui::time`): the browser's offset on the web, the system's elsewhere.
