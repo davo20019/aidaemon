@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aidaemon_core::card::{
-    ActivityKind, CardEnd, HelperView, PlanCard, RunPhase, Step, run_attempts, superseded_line,
-    superseded_runs,
+    ActivityKind, CardEnd, HelperView, PlanCard, RunPhase, Step, SupersededBy,
+    finished_by_turn_line, run_attempts, superseded_line, superseded_runs,
 };
 use aidaemon_tools::status::StatusUpdate;
 
@@ -56,12 +56,13 @@ impl CardView<'_> {
 /// the turn's own step.
 pub fn render_card(view: &CardView<'_>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
-    // A run a later run took its plan steps over from is history: one quiet
-    // line, never a failure in the header or the total (live 2026-11-13: "A
-    // helper didn't finish · 3 of 3 done" and "1 didn't finish" over a
-    // Drupal step a second helper finished).
+    // A run a later attempt took its plan steps over from (a later run, or
+    // the turn itself) is history: one quiet line, never a failure in the
+    // header or the total (live 2026-11-13: "A helper didn't finish · 3 of 3
+    // done" and "1 didn't finish" over a Drupal step a second helper
+    // finished).
     let records: Vec<&HelperView> = view.helpers.iter().map(|(helper, _)| helper).collect();
-    let superseded = superseded_runs(&records);
+    let superseded = superseded_runs(&records, view.plan);
     let attempts = run_attempts(&records);
     let current: Vec<&(HelperView, Option<Duration>)> = view
         .helpers
@@ -82,12 +83,13 @@ pub fn render_card(view: &CardView<'_>) -> Option<String> {
     }
     for (index, (helper, elapsed)) in view.helpers.iter().enumerate() {
         match superseded[index] {
-            Some(later) => parts.push(superseded_line(
+            Some(SupersededBy::Run(later)) => parts.push(superseded_line(
                 helper,
                 attempts[index],
                 records[later],
                 attempts[later],
             )),
+            Some(SupersededBy::Turn) => parts.push(finished_by_turn_line(helper, attempts[index])),
             None => parts.push(helper_block(helper, *elapsed)),
         }
     }
@@ -133,13 +135,13 @@ fn plan_with_run_header(plan: &PlanCard, current: &[&(HelperView, Option<Duratio
 
 /// With several helpers on the card, once every one ended: how long after
 /// the owner's request the last of them ended, from their run records, and
-/// how the current runs (those no later run superseded) ended. One helper's
-/// own line already says it.
+/// how the current runs (those no later attempt superseded) ended. One
+/// current helper's own line already says it.
 fn since_request_total(
     helpers: &[(HelperView, Option<Duration>)],
     current: &[&(HelperView, Option<Duration>)],
 ) -> Option<String> {
-    if helpers.len() < 2
+    if current.len() < 2
         || helpers
             .iter()
             .any(|(helper, _)| !helper.phase.is_terminal())
@@ -674,6 +676,14 @@ mod tests {
                 .skip(1)
                 .filter(|line| line.starts_with('✅'))
                 .count(),
+            finished_steps: text
+                .lines()
+                .skip(1)
+                .filter(|line| !line.trim().is_empty())
+                .enumerate()
+                .filter(|(_, line)| line.starts_with('✅'))
+                .map(|(index, _)| index)
+                .collect(),
             // A plan still being worked through says so in its header.
             settled: !text.starts_with("📋") && !text.starts_with("⚙️") && !text.starts_with("🧭"),
         }
@@ -1274,6 +1284,59 @@ mod tests {
     /// done, the header and the total say nothing failed, and the first try
     /// is one quiet history line. The retry is linked by its typed plan
     /// step, not its name: the two names differ.
+    /// A step's outcome is its latest attempt's, whoever made it: the turn
+    /// finishing a step after its helper stopped supersedes that helper's
+    /// end, so the header and total follow the steps (live 2026-11-14: "A
+    /// helper didn't finish · 5 of 5 done" over a Drupal setup the turn
+    /// finished itself, "Finished by me after the helper").
+    #[test]
+    fn the_turn_finishing_a_helpers_step_supersedes_its_end() {
+        let helper = |label: &str, phase: RunPhase, step: usize| {
+            HelperView {
+                took: Some("Took 2m.".to_string()),
+                since_request: Some(aidaemon_core::card::SinceRequest {
+                    secs: 120,
+                    words: "2m after your request (11:36:00 AM to 11:38:00 AM ET)".to_string(),
+                }),
+                ..ended(label, phase, false)
+            }
+            .for_steps(&[step])
+        };
+        let helpers = vec![
+            (helper("Install WordPress", RunPhase::Succeeded, 0), None),
+            (helper("Install Drupal", RunPhase::Stopped, 1), None),
+        ];
+        let done = plan("✅ Done · 3 of 3 steps\n\n✅ a\n\n✅ b\n\n✅ c", 3);
+        let card = render_card(&CardView {
+            plan: Some(&done),
+            helpers: helpers.clone(),
+            finished: Some("✅ Finished by me after the helper: Install Drupal"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(card.starts_with("✅ Done · 3 of 3 steps"), "{card}");
+        assert!(!card.contains("A helper didn't finish"), "{card}");
+        assert!(
+            !card.contains("didn't finish,") && !card.contains("1 didn't finish"),
+            "{card}"
+        );
+        assert!(
+            card.contains("Install Drupal: first try didn't finish; I finished it myself"),
+            "{card}"
+        );
+
+        // Its step still open: the helper's end stands.
+        let open = plan("✅ Done · 2 of 3 steps\n\n✅ a\n\n⏹️ b\n\n✅ c", 3);
+        let card = render_card(&CardView {
+            plan: Some(&open),
+            helpers,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!card.contains("I finished it myself"), "{card}");
+        assert!(card.contains("1 didn't finish"), "{card}");
+    }
+
     #[test]
     fn a_retried_step_reads_done_with_its_first_try_as_history() {
         let plan = plan("✅ Done · 3 of 3 steps\n\n✅ a\n\n✅ b\n\n✅ c", 3);

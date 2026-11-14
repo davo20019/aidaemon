@@ -46,6 +46,9 @@ pub aidaemon_core::card::StepEvidence::ModelSaid
 pub aidaemon_core::card::StepEvidence::Settled
 impl aidaemon_core::card::StepEvidence
 pub fn aidaemon_core::card::StepEvidence::is_settled(&self) -> bool
+pub enum aidaemon_core::card::SupersededBy
+pub aidaemon_core::card::SupersededBy::Run(usize)
+pub aidaemon_core::card::SupersededBy::Turn
 pub struct aidaemon_core::card::HelperView
 pub aidaemon_core::card::HelperView::background: bool
 pub aidaemon_core::card::HelperView::label: alloc::string::String
@@ -60,6 +63,7 @@ pub fn aidaemon_core::card::HelperView::for_steps(self, &[usize]) -> Self
 pub fn aidaemon_core::card::HelperView::running(&str, bool, core::option::Option<aidaemon_core::card::Step>) -> Self
 pub struct aidaemon_core::card::PlanCard
 pub aidaemon_core::card::PlanCard::done: usize
+pub aidaemon_core::card::PlanCard::finished_steps: alloc::vec::Vec<usize>
 pub aidaemon_core::card::PlanCard::settled: bool
 pub aidaemon_core::card::PlanCard::steps: usize
 pub aidaemon_core::card::PlanCard::text: alloc::string::String
@@ -68,9 +72,10 @@ pub fn aidaemon_core::card::PlanCard::header_with_runs(&self, &[aidaemon_core::c
 pub struct aidaemon_core::card::SinceRequest
 pub aidaemon_core::card::SinceRequest::secs: u64
 pub aidaemon_core::card::SinceRequest::words: alloc::string::String
+pub fn aidaemon_core::card::finished_by_turn_line(&aidaemon_core::card::HelperView, usize) -> alloc::string::String
 pub fn aidaemon_core::card::run_attempts(&[&aidaemon_core::card::HelperView]) -> alloc::vec::Vec<usize>
 pub fn aidaemon_core::card::superseded_line(&aidaemon_core::card::HelperView, usize, &aidaemon_core::card::HelperView, usize) -> alloc::string::String
-pub fn aidaemon_core::card::superseded_runs(&[&aidaemon_core::card::HelperView]) -> alloc::vec::Vec<core::option::Option<usize>>
+pub fn aidaemon_core::card::superseded_runs(&[&aidaemon_core::card::HelperView], core::option::Option<&aidaemon_core::card::PlanCard>) -> alloc::vec::Vec<core::option::Option<aidaemon_core::card::SupersededBy>>
 pub mod aidaemon_core::conformance
 pub mod aidaemon_core::conformance::provider_checks
 pub const aidaemon_core::conformance::provider_checks::COMPLETE_MATCHES_STREAM: &str
@@ -647,12 +652,14 @@ pub fn aidaemon_core::AgentBuilder::allow_unguarded(self) -> Self
 pub fn aidaemon_core::AgentBuilder::approval_key(self, [u8; 32]) -> Self
 pub fn aidaemon_core::AgentBuilder::attest(self, aidaemon_core::Safeguard) -> Self
 pub fn aidaemon_core::AgentBuilder::build(self) -> core::result::Result<aidaemon_core::Agent, aidaemon_core::BuildError>
+pub fn aidaemon_core::AgentBuilder::deferred_tool_arc(self, alloc::sync::Arc<dyn aidaemon_core::Tool>) -> Self
 pub fn aidaemon_core::AgentBuilder::event_sink(self, impl aidaemon_core::EventSink + 'static) -> Self
 pub fn aidaemon_core::AgentBuilder::event_sink_arc(self, alloc::sync::Arc<dyn aidaemon_core::EventSink>) -> Self
 pub fn aidaemon_core::AgentBuilder::hook(self, impl aidaemon_core::Hook + 'static) -> Self
 pub fn aidaemon_core::AgentBuilder::hook_arc(self, alloc::sync::Arc<dyn aidaemon_core::Hook>) -> Self
 pub fn aidaemon_core::AgentBuilder::instructions(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::AgentBuilder::limits(self, aidaemon_core::Limits) -> Self
+pub fn aidaemon_core::AgentBuilder::loaded_tools(self, aidaemon_core::LoadedTools) -> Self
 pub fn aidaemon_core::AgentBuilder::max_output_tokens(self, u32) -> Self
 pub fn aidaemon_core::AgentBuilder::model(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::AgentBuilder::new(impl core::convert::Into<alloc::string::String>) -> Self
@@ -843,6 +850,12 @@ pub aidaemon_core::Limits::timeout: core::option::Option<core::time::Duration>
 pub aidaemon_core::Limits::tool_timeout: core::time::Duration
 impl core::default::Default for aidaemon_core::Limits
 pub fn aidaemon_core::Limits::default() -> Self
+pub struct aidaemon_core::LoadedTools(_)
+impl aidaemon_core::LoadedTools
+pub fn aidaemon_core::LoadedTools::contains(&self, &str) -> bool
+pub fn aidaemon_core::LoadedTools::load(&self, &str) -> bool
+pub fn aidaemon_core::LoadedTools::names(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn aidaemon_core::LoadedTools::new() -> Self
 pub struct aidaemon_core::MemoryStore
 impl aidaemon_core::MemoryStore
 pub fn aidaemon_core::MemoryStore::events(&self, aidaemon_core::RunId) -> alloc::vec::Vec<aidaemon_core::Event>
@@ -1151,6 +1164,7 @@ pub fn aidaemon_core::Usage::billable_tokens(&self) -> u64
 pub const aidaemon_core::AUTHORITY_BLOCKED: &str
 pub const aidaemon_core::EGRESS_BLOCKED: &str
 pub const aidaemon_core::HARD_TURN_CAP: u32
+pub const aidaemon_core::LOAD_TOOLS: &str
 pub const aidaemon_core::OWNER_DECLINED: &str
 pub const aidaemon_core::OWNER_UNANSWERED: &str
 pub const aidaemon_core::RUN_STATE_SCHEMA: u32

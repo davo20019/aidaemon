@@ -220,13 +220,30 @@ impl HelperView {
     }
 }
 
-/// Which runs on a card a later run superseded: one that ended without
-/// succeeding, started for plan steps every one of which a later run on the
-/// card was also started for. Its step's outcome is the later run's, so it
-/// is history: it never counts as a failure in the card's header or total.
-/// `helpers` are in the order they started; the result is index for index.
-/// Linked only by the runs' typed plan steps, never by their names.
-pub fn superseded_runs(helpers: &[&HelperView]) -> Vec<Option<usize>> {
+/// What took a run's plan steps over after it ended without succeeding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersededBy {
+    /// A later run on the card, by its index, was started for all of them.
+    Run(usize),
+    /// The turn itself finished them: the plan reads each done (or not
+    /// needed) although the run didn't do them.
+    Turn,
+}
+
+/// Which runs on a card were superseded: one that ended without succeeding
+/// whose plan steps a later attempt took over. A step's outcome is its
+/// latest attempt's, whoever made it: a later run started for every one of
+/// its steps, else the turn itself, when the plan's records read each of
+/// them finished. Superseded, the run is history: it never counts as a
+/// failure in the card's header or total (live 2026-11-14: "A helper didn't
+/// finish · 5 of 5 done" over a Drupal setup the turn finished after its
+/// helper stopped). `helpers` are in the order they started; the result is
+/// index for index. Linked only by the runs' typed plan steps and the
+/// plan's step records, never by names or text.
+pub fn superseded_runs(
+    helpers: &[&HelperView],
+    plan: Option<&PlanCard>,
+) -> Vec<Option<SupersededBy>> {
     helpers
         .iter()
         .enumerate()
@@ -243,9 +260,32 @@ pub fn superseded_runs(helpers: &[&HelperView]) -> Vec<Option<usize>> {
                 .enumerate()
                 .skip(index + 1)
                 .rfind(|(_, later)| helper.steps.iter().all(|step| later.steps.contains(step)))
-                .map(|(later, _)| later)
+                .map(|(later, _)| SupersededBy::Run(later))
+                .or_else(|| {
+                    plan.is_some_and(|plan| {
+                        helper
+                            .steps
+                            .iter()
+                            .all(|step| plan.finished_steps.contains(step))
+                    })
+                    .then_some(SupersededBy::Turn)
+                })
         })
         .collect()
+}
+
+/// A run the turn itself finished after it: one quiet line ("Drupal
+/// install: first try didn't finish; I finished it myself").
+pub fn finished_by_turn_line(earlier: &HelperView, attempt: usize) -> String {
+    let ended = match earlier.phase {
+        RunPhase::Failed => "failed",
+        _ => "didn't finish",
+    };
+    format!(
+        "\u{21aa}\u{fe0f} {}: {} try {ended}; I finished it myself",
+        earlier.label.trim(),
+        ordinal(attempt),
+    )
 }
 
 /// A superseded run's one quiet line: its try, how it ended and what the
@@ -313,6 +353,10 @@ pub struct PlanCard {
     pub steps: usize,
     /// Its steps done.
     pub done: usize,
+    /// The steps (zero-based) whose latest outcome is finished: done, or
+    /// set aside as not needed. A run that ended short on steps all listed
+    /// here was superseded by the turn ([`superseded_runs`]).
+    pub finished_steps: Vec<usize>,
     /// Its records say how it ended: no step is left for its turn to do
     /// (each is done, set aside, failed, or handed to a run). Only a settled
     /// plan's header is a verdict the card's runs could contradict; one

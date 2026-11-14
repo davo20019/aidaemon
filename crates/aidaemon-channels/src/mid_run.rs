@@ -336,6 +336,7 @@ mod tests {
                 text: "☑ one\n☐ two".into(),
                 steps: 2,
                 done: 1,
+                finished_steps: Vec::new(),
                 settled: false,
             }),
         );

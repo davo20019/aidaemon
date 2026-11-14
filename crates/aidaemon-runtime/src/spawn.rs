@@ -1864,6 +1864,7 @@ mod tests {
                 text: rendered_checklist(5, 5),
                 steps: 5,
                 done: 5,
+                finished_steps: Vec::new(),
                 settled: true,
             }))
             .await
@@ -1873,6 +1874,7 @@ mod tests {
                 text: rendered_checklist(1, 4),
                 steps: 4,
                 done: 1,
+                finished_steps: Vec::new(),
                 settled: false,
             }))
             .await

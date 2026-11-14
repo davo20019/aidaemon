@@ -695,6 +695,12 @@ impl TaskPlan {
             text: self.render_compact_checklist(),
             steps: self.steps.len(),
             done: self.completed_steps(),
+            finished_steps: self
+                .steps
+                .iter()
+                .filter(|step| matches!(step.status, StepStatus::Completed | StepStatus::Skipped))
+                .map(|step| step.index)
+                .collect(),
             settled: !self
                 .steps
                 .iter()
