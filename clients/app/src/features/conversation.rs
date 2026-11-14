@@ -64,7 +64,55 @@ pub fn page(store: Store, session: Option<String>) -> View {
         .min_w(px(0.0))
         .child(header(store, session.clone()))
         .child(view().flex_1().child(body))
+        .child(notices(store))
         .child(composer(store, session))
+}
+
+/// What the agent's view moves say: a move offered while the owner types,
+/// and a short note after one was taken.
+fn notices(store: Store) -> View {
+    // A note leaves by itself after a few seconds.
+    effect(move || {
+        if store.toast().is_some() {
+            set_timeout(std::time::Duration::from_secs(6), move || {
+                store.dismiss_toast()
+            });
+        }
+    });
+    view()
+        .items_center()
+        .px_4()
+        .child(when(
+            move || store.suggestion().is_some(),
+            move || {
+                ui::banner(
+                    move || store.suggestion().unwrap_or_default(),
+                    ui::Tone::Accent,
+                )
+                .child(ui::btn(
+                    format!("Go  {}", key_label("mod+g")),
+                    Variant::Primary,
+                    ui::Size::Sm,
+                    move || store.take_suggestion(),
+                ))
+                .child(ui::btn(
+                    "Dismiss",
+                    Variant::Ghost,
+                    ui::Size::Sm,
+                    move || store.dismiss_suggestion(),
+                ))
+            },
+        ))
+        .child(when(
+            move || store.toast().is_some() && store.suggestion().is_none(),
+            move || {
+                ui::banner(move || store.toast().unwrap_or_default(), ui::Tone::Neutral).child(
+                    ui::btn("Dismiss", Variant::Ghost, ui::Size::Sm, move || {
+                        store.dismiss_toast()
+                    }),
+                )
+            },
+        ))
 }
 
 fn header(store: Store, session: Option<String>) -> View {

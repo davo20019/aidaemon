@@ -97,6 +97,14 @@ pub fn card(store: Store, approval: Approval) -> View {
     let id = approval.id.clone();
     ui::surface()
         .border_color(risk_tone.color())
+        // The card a view move brought up stands out until answered.
+        .style_when(
+            {
+                let id = approval.id.clone();
+                move || store.spotlight().as_deref() == Some(id.as_str())
+            },
+            |s| s.border_2().border_color(colors::ACCENT),
+        )
         .p_4()
         .gap_3()
         .role(AccessibilityRole::Group)

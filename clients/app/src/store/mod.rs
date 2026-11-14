@@ -6,10 +6,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aidaemon_client_core::machine::{DropKind, Update, request_id};
-use aidaemon_client_core::state::{Line, LiveTurn, SessionView, State};
+use aidaemon_client_core::state::{Line, LiveTurn, SessionView, State, ViewRequest};
 use aidaemon_client_protocol::{
     Approval, ApprovalDecision, Command, CommandResult, Event, ServerFrame, TaskSummary, TurnStatus,
 };
+use aidaemon_client_protocol::{Pane, ViewAction};
 use nsh_core::prelude::*;
 
 /// The connection to the daemon, as the owner should see it.
@@ -68,6 +69,16 @@ pub struct Store {
     turns: Signal<BTreeMap<String, TurnLog>>,
     /// The turn the inspector follows: the latest of the selected session.
     inspected: Signal<Option<String>>,
+    /// The side panes, which the owner and the agent's view moves open.
+    sidebar: Signal<bool>,
+    inspector: Signal<bool>,
+    /// A view move the agent asked for while the owner was typing: offered,
+    /// not taken.
+    suggestion: Signal<Option<ViewRequest>>,
+    /// The approval a view move brought into view, shown highlighted.
+    spotlight: Signal<Option<String>>,
+    /// What the app last told the owner about a move (or anything else).
+    toast: Signal<Option<String>>,
     outbox: Stored<Option<Outbox>>,
     /// Commands queued before the link was up.
     queued: Stored<Vec<(String, Command)>>,
@@ -90,6 +101,11 @@ impl Store {
             drafts: signal(BTreeMap::new()),
             turns: signal_with(BTreeMap::new(), SignalEquals::Never),
             inspected: signal(None),
+            sidebar: signal(true),
+            inspector: signal(true),
+            suggestion: signal(None),
+            spotlight: signal(None),
+            toast: signal(None),
             outbox: stored(None),
             queued: stored(Vec::new()),
             fetched: stored(BTreeSet::new()),
@@ -178,7 +194,162 @@ impl Store {
         if let ServerFrame::Event { event, .. } = &frame {
             self.note_activity(event);
         }
-        self.state.update(|state| state.apply(frame));
+        let mut request = None;
+        self.state.update(|state| {
+            state.apply(frame);
+            request = state.take_view_request();
+        });
+        if let Some(request) = request {
+            self.view_request(request);
+        }
+    }
+
+    // ----- The agent's view moves ------------------------------------------
+
+    /// A move the agent asked for: taken now, or offered while the owner
+    /// has a draft (a move never sends anything but the reads it needs).
+    fn view_request(&self, request: ViewRequest) {
+        if !self.draft_untracked().trim().is_empty() {
+            self.suggestion.set(Some(request));
+        } else {
+            self.suggestion.set(None);
+            self.move_view(request);
+        }
+    }
+
+    /// The move offered, in words.
+    pub fn suggestion(&self) -> Option<String> {
+        let request = self.suggestion.get()?;
+        let reason = if request.reason.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", request.reason.trim())
+        };
+        Some(format!(
+            "The assistant suggests {}{reason}.",
+            self.describe(&request.action)
+        ))
+    }
+
+    pub fn take_suggestion(&self) {
+        if let Some(request) = self.suggestion.get_untracked() {
+            self.suggestion.set(None);
+            self.move_view(request);
+        }
+    }
+
+    pub fn dismiss_suggestion(&self) {
+        self.suggestion.set(None);
+    }
+
+    fn describe(&self, action: &ViewAction) -> String {
+        self.state.with_untracked(|s| match action {
+            ViewAction::OpenSession { session_id } => format!("opening {}", s.title(session_id)),
+            ViewAction::ShowApproval { approval_id } => match s.approvals.get(approval_id) {
+                Some(a) => format!("looking at the approval \"{}\"", a.summary),
+                None => "an approval that is no longer waiting".into(),
+            },
+            ViewAction::ShowTask { task_id } => match s.tasks.get(task_id) {
+                Some(t) => format!("looking at work #{} {}", t.number, t.description),
+                None => "work that is no longer running".into(),
+            },
+            ViewAction::FocusPane { pane } => format!("the {} pane", pane_name(*pane)),
+            ViewAction::NewSession => "a new conversation".into(),
+            ViewAction::ShowDevices => "your paired devices".into(),
+            ViewAction::Unknown => "something this version cannot show".into(),
+        })
+    }
+
+    fn move_view(&self, request: ViewRequest) {
+        let what = self.describe(&request.action);
+        let note = match request.action {
+            ViewAction::OpenSession { session_id } => {
+                self.select(Some(session_id));
+                format!("Moved to {}", what.trim_start_matches("opening "))
+            }
+            ViewAction::ShowApproval { approval_id } => {
+                let session = self.state.with_untracked(|s| {
+                    s.approvals.get(&approval_id).map(|a| a.session_id.clone())
+                });
+                match session {
+                    Some(session) => {
+                        self.select(Some(session));
+                        self.spotlight.set(Some(approval_id));
+                        "Showing the approval: read it, then answer".into()
+                    }
+                    None => format!("Could not show {what}"),
+                }
+            }
+            ViewAction::ShowTask { task_id } => {
+                let session = self
+                    .state
+                    .with_untracked(|s| s.tasks.get(&task_id).map(|t| t.session_id.clone()));
+                match session {
+                    Some(session) => {
+                        self.select(Some(session));
+                        self.inspector.set(true);
+                        format!("Showing {}", what.trim_start_matches("looking at "))
+                    }
+                    None => format!("Could not show {what}"),
+                }
+            }
+            ViewAction::FocusPane { pane } => {
+                match pane {
+                    Pane::Sessions => self.sidebar.set(true),
+                    Pane::Approvals | Pane::Tasks => self.inspector.set(true),
+                    Pane::Chat | Pane::Unknown => {}
+                }
+                format!("Moved to {what}")
+            }
+            ViewAction::NewSession => {
+                self.select(None);
+                "Ready for a new conversation".into()
+            }
+            ViewAction::ShowDevices => {
+                "Paired devices: ask your agent for /devices (not shown in this app yet)".into()
+            }
+            ViewAction::Unknown => return,
+        };
+        let reason = request.reason.trim();
+        self.toast.set(Some(if reason.is_empty() {
+            note
+        } else {
+            format!("{note} · {reason}")
+        }));
+    }
+
+    pub fn toast(&self) -> Option<String> {
+        self.toast.get()
+    }
+
+    pub fn dismiss_toast(&self) {
+        self.toast.set(None);
+    }
+
+    pub fn spotlight(&self) -> Option<String> {
+        self.spotlight.get()
+    }
+
+    // ----- Panes -----------------------------------------------------------
+
+    pub fn sidebar_open(&self) -> bool {
+        self.sidebar.get()
+    }
+
+    pub fn inspector_open(&self) -> bool {
+        self.inspector.get()
+    }
+
+    pub fn toggle_sidebar(&self) {
+        self.sidebar.update(|s| *s = !*s);
+    }
+
+    pub fn toggle_inspector(&self) {
+        self.inspector.update(|s| *s = !*s);
+    }
+
+    pub fn set_inspector(&self, open: bool) {
+        self.inspector.set(open);
     }
 
     fn note_activity(&self, event: &Event) {
@@ -396,6 +567,12 @@ impl Store {
         self.selected.get()
     }
 
+    fn draft_untracked(&self) -> String {
+        let key = self.selected.get_untracked().unwrap_or_default();
+        self.drafts
+            .with_untracked(|d| d.get(&key).cloned().unwrap_or_default())
+    }
+
     pub fn draft(&self) -> String {
         let key = self.selected.get().unwrap_or_default();
         self.drafts
@@ -522,6 +699,16 @@ impl Store {
 impl Default for Store {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn pane_name(pane: Pane) -> &'static str {
+    match pane {
+        Pane::Sessions => "conversations",
+        Pane::Chat => "chat",
+        Pane::Approvals => "approvals",
+        Pane::Tasks => "running work",
+        Pane::Unknown => "unknown",
     }
 }
 

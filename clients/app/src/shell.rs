@@ -14,14 +14,14 @@ pub fn shell(store: Store) -> View {
     let terminal = idiom() == Idiom::Terminal;
     let wide = computed(move || window().width.0 >= 1180.0);
     let roomy = computed(move || window().width.0 >= 760.0);
-    let show_sidebar = signal(true);
-    let show_inspector = signal(!terminal);
+    store.set_inspector(!terminal);
     let palette = signal(false);
 
     on_key("mod+k", move |_| palette.update(|open| *open = !*open));
     on_key("mod+n", move |_| store.select(None));
-    on_key("mod+b", move |_| show_sidebar.update(|s| *s = !*s));
-    on_key("mod+i", move |_| show_inspector.update(|s| *s = !*s));
+    on_key("mod+b", move |_| store.toggle_sidebar());
+    on_key("mod+i", move |_| store.toggle_inspector());
+    on_key("mod+g", move |_| store.take_suggestion());
     on_key("escape", move |_| {
         if let Some(id) = store.selected()
             && store.is_running(&id)
@@ -35,7 +35,10 @@ pub fn shell(store: Store) -> View {
         .flex_row()
         .child(
             view()
-                .style_when(move || !(show_sidebar.get() && roomy.get()), |s| s.hidden())
+                .style_when(
+                    move || !(store.sidebar_open() && roomy.get()),
+                    |s| s.hidden(),
+                )
                 .child(sidebar(store)),
         )
         .child(dynamic(move || {
@@ -54,22 +57,15 @@ pub fn shell(store: Store) -> View {
         .child(
             view()
                 .style_when(
-                    move || !(show_inspector.get() && wide.get()),
+                    move || !(store.inspector_open() && wide.get()),
                     |s| s.hidden(),
                 )
                 .child(inspector(store)),
         )
-        .child(when(palette, move || {
-            palette_dialog(store, palette, show_sidebar, show_inspector)
-        }))
+        .child(when(palette, move || palette_dialog(store, palette)))
 }
 
-fn palette_dialog(
-    store: Store,
-    open: Signal<bool>,
-    show_sidebar: Signal<bool>,
-    show_inspector: Signal<bool>,
-) -> impl IntoElement {
+fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
     let mut items = vec![
         CommandItem::new("new", "New conversation")
             .group("Conversation")
@@ -112,8 +108,8 @@ fn palette_dialog(
                             open.set(false);
                             match id.as_ref() {
                                 "new" => store.select(None),
-                                "sidebar" => show_sidebar.update(|s| *s = !*s),
-                                "inspector" => show_inspector.update(|s| *s = !*s),
+                                "sidebar" => store.toggle_sidebar(),
+                                "inspector" => store.toggle_inspector(),
                                 other => {
                                     if let Some(session) = other.strip_prefix("go:") {
                                         store.select(Some(session.to_owned()));

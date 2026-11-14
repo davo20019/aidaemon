@@ -20,7 +20,7 @@ A workbench for working with an agent: quiet, precise and dense, with what the a
 
 ## Components (`src/ui/controls.rs`)
 
-`btn`, `btn_icon`, `icon_btn` (variants primary, secondary, ghost, outline, danger, success; sizes sm and md), `field`, `badge`, `status`, `kbd`, `row`, `surface`, `separator`, `section_label`, `empty`, `working`, `code`, `hint` and `with_hint`. Features compose these and layout primitives only. A missing look becomes a variant here first.
+`btn`, `btn_icon`, `icon_btn` (variants primary, secondary, ghost, outline, danger, success; sizes sm and md), `field`, `badge`, `status`, `kbd`, `row`, `surface`, `separator`, `section_label`, `empty`, `working`, `code`, `banner`, `hint` and `with_hint`. Features compose these and layout primitives only. A missing look becomes a variant here first.
 
 ## Motion (`src/ui/motion.rs`)
 
@@ -39,6 +39,9 @@ Tokens: `FAST` 120 ms (hover and colour), `BASE` 180 ms (press, toggle), `ENTER`
 | Conversation | Agent working | Pulse on the status dot (`animate_pulse`) |
 | Inspector, sidebar | Panes fold at narrow widths | Hidden by style, state kept |
 | Palette | Opens | Native dialog presentation |
+| Conversation | Agent offers a view move while you type | Banner (accent tint) with Go (Cmd/Ctrl+G) and Dismiss; nothing moves until taken |
+| Conversation | Agent moved the view | Neutral note banner, leaves after 6 s |
+| Approval card | Brought up by a move | Border thickens to accent until answered |
 
 ## Copy
 

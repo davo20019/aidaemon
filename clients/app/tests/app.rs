@@ -73,3 +73,20 @@ fn offline_says_why() -> Result<(), String> {
     app.wait_for("The daemon is not running")?;
     Ok(())
 }
+
+#[test]
+fn the_agent_moves_the_view_and_says_why() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-2","channel":"app","title":"Plan for Acme Corp","writable":true}]}}"#,
+        ),
+        frame(
+            r#"{"type":"event","seq":1,"at_ms":1,"event":{"type":"view_action","action":{"kind":"open_session","session_id":"app:synthetic-2"},"reason":"the plan is ready"}}"#,
+        ),
+    ]);
+    app.wait_for("Moved to Plan for Acme Corp · the plan is ready")?;
+    Ok(())
+}

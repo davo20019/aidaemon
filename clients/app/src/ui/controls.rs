@@ -426,3 +426,27 @@ pub fn code(value: impl IntoReactive<SharedString>) -> Text {
         .text_size(px(type_scale::SM))
         .text_color(colors::TEXT)
 }
+
+/// A message strip in the content column: what happened or is offered,
+/// then its actions (added by the caller as children).
+pub fn banner(message: impl IntoReactive<SharedString>, tone: Tone) -> View {
+    view()
+        .w_full()
+        .max_w(px(size::COLUMN))
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .mt_2()
+        .px_3()
+        .py_2()
+        .rounded(px(radius::CONTROL))
+        .bg(tone.tint())
+        .role(AccessibilityRole::Alert)
+        .child(
+            text(message)
+                .flex_1()
+                .text_size(px(type_scale::SM))
+                .line_height(px(type_scale::LH_SM))
+                .text_color(colors::TEXT),
+        )
+}
