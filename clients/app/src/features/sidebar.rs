@@ -89,7 +89,7 @@ fn session_row(store: Store, id: String) -> nsh_base::ButtonElement {
                     .text_size(px(type_scale::BASE)),
             )
             .child(
-                text(move || store.channel(&id).unwrap_or_default())
+                text(move || store.place(&id))
                     .number_of_lines(1)
                     .text_size(px(type_scale::XS))
                     .text_color(colors::FAINT),

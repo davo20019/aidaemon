@@ -291,8 +291,38 @@ impl Store {
         self.state.with(|s| s.order.clone())
     }
 
+    /// A conversation's name: the daemon's title, else its first message,
+    /// else where it lives ("Slack conversation").
     pub fn title(&self, id: &str) -> String {
-        self.state.with(|s| s.title(id))
+        self.state.with(|s| {
+            let view = s.sessions.get(id);
+            if let Some(title) = view.and_then(|v| v.summary.as_ref()).and_then(|m| m.title.clone()) {
+                return title;
+            }
+            let first = view.and_then(|v| {
+                v.lines.iter().find_map(|line| match line {
+                    Line::User { text, .. } => Some(text.lines().next().unwrap_or_default().trim().to_owned()),
+                    _ => None,
+                })
+            });
+            match first.filter(|t| !t.is_empty()) {
+                Some(text) if text.chars().count() > 60 => {
+                    format!("{}…", text.chars().take(60).collect::<String>().trim_end())
+                }
+                Some(text) => text,
+                None => format!("{} conversation", platform_name(id)),
+            }
+        })
+    }
+
+    /// Where a conversation lives, for its second line: platform and place.
+    pub fn place(&self, id: &str) -> String {
+        let channel = self.channel(id).unwrap_or_default();
+        let platform = platform_name(id);
+        match channel.split_once(':') {
+            Some((_, bot)) if !bot.is_empty() => format!("{platform} · {bot}"),
+            _ => platform.to_owned(),
+        }
     }
 
     pub fn channel(&self, id: &str) -> Option<String> {
@@ -478,6 +508,23 @@ impl Store {
 impl Default for Store {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The platform a session id names (`aidaemon:slack:…`, `app:…`).
+pub fn platform_name(id: &str) -> &'static str {
+    let lower = id.to_ascii_lowercase();
+    let has = |word: &str| lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|part| part == word);
+    if lower.starts_with("app:") {
+        "App"
+    } else if has("slack") {
+        "Slack"
+    } else if has("discord") {
+        "Discord"
+    } else if has("telegram") || lower.contains("_bot:") {
+        "Telegram"
+    } else {
+        "Chat"
     }
 }
 
