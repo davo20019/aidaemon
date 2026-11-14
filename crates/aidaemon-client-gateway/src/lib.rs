@@ -173,6 +173,9 @@ pub struct ClientGateway {
     turns: TurnDeps,
     host: Arc<dyn ClientHost>,
     active: Arc<Mutex<HashSet<String>>>,
+    /// Chat conversations' contexts, for replies from the app.
+    contexts: observer::Contexts,
+    hub: Arc<ChannelHub>,
     pub(crate) config: ClientGatewayConfig,
     endpoints: aidaemon_core::EndpointSource,
     pub(crate) token_file: PathBuf,
@@ -218,11 +221,13 @@ impl ClientGateway {
         }
 
         let active = Arc::new(Mutex::new(HashSet::new()));
+        let contexts = observer::Contexts::default();
         deps.turns.watch.set(Arc::new(GatewayObserver {
             publisher: publisher.clone(),
             ids: ids.clone(),
             active: active.clone(),
             running: Mutex::default(),
+            contexts: contexts.clone(),
         }));
         deps.hub.set_approval_tap(approvals.clone());
         deps.hub
@@ -250,6 +255,8 @@ impl ClientGateway {
             turns: deps.turns,
             host: deps.host,
             active,
+            contexts,
+            hub: deps.hub.clone(),
             config: deps.config,
             endpoints: deps.endpoints,
             token_file: deps.token_file,
@@ -535,6 +542,75 @@ impl ClientGateway {
         })
     }
 
+    /// A message from the app into a chat's own conversation: echoed to the
+    /// chat, then run as a turn of that conversation, under the context its
+    /// channel last gave it (its visibility decides what memory the turn may
+    /// use). A conversation not seen this boot runs as public, so nothing
+    /// private reaches a shared channel. The answer goes to the chat, and
+    /// the app sees the turn as its own.
+    async fn reply_in_chat(
+        &self,
+        request_id: &str,
+        session_id: String,
+        text: String,
+    ) -> Result<CommandResult, ProtocolError> {
+        let known = self
+            .contexts
+            .lock()
+            .ok()
+            .and_then(|contexts| contexts.get(&session_id).cloned());
+        let channel_ctx = match known {
+            Some(context) => context,
+            None => {
+                let platform = self
+                    .hub
+                    .session_map()
+                    .read()
+                    .await
+                    .get(&session_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ProtocolError::new(
+                            ErrorCode::NotFound,
+                            "That conversation's chat is not connected right now",
+                        )
+                    })?;
+                let mut context = aidaemon_channels::context::ChannelContext::private(&platform);
+                context.visibility = aidaemon_core::ChannelVisibility::Public;
+                context
+            }
+        };
+        self.hub
+            .send_text(&session_id, &format!("↪ From the AIdaemon app: {text}"))
+            .await
+            .map_err(|error| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("Could not post to that chat: {error}"),
+                )
+            })?;
+        let turn = Turn {
+            session_id: session_id.clone(),
+            text,
+            attachments: Vec::new(),
+            user_role: UserRole::Owner,
+            channel_ctx,
+            dedup_key: Some(request_id.to_string()),
+            ingress_timing: None,
+        };
+        let surface = Arc::new(observer::ChatReplySurface {
+            publisher: self.publisher.clone(),
+            hub: self.hub.clone(),
+            session_id: session_id.clone(),
+        });
+        let runner = self.runner.clone();
+        tokio::spawn(async move { runner.submit(surface, turn).await });
+        Ok(CommandResult::MessageAccepted {
+            session_id,
+            new_session: false,
+        })
+    }
+
     async fn send_message(
         &self,
         request_id: &str,
@@ -561,12 +637,8 @@ impl ClientGateway {
                 true,
             ),
             Some(session_id) if session_id.starts_with(APP_SESSION_PREFIX) => (session_id, false),
-            Some(_) => {
-                return Err(ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "Sessions of other chats are read-only here: post from that chat, or start \
-                     a new session",
-                ));
+            Some(session_id) => {
+                return self.reply_in_chat(request_id, session_id, text).await;
             }
         };
         self.runner.register_session(&session_id, APP_CHANNEL).await;

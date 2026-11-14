@@ -16,12 +16,35 @@ use crate::types::UserRole;
 /// The `[client_gateway]` table of the config file, read without resolving
 /// the rest (which would touch the keychain). Missing or invalid: defaults.
 pub(crate) fn settings_from_file(config_path: &std::path::Path) -> ClientGatewayConfig {
-    std::fs::read_to_string(config_path)
-        .ok()
-        .and_then(|text| text.parse::<toml::Table>().ok())
-        .and_then(|table| table.get("client_gateway").cloned())
-        .and_then(|value| value.try_into().ok())
-        .unwrap_or_default()
+    with_installed_app(
+        std::fs::read_to_string(config_path)
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .and_then(|table| table.get("client_gateway").cloned())
+            .and_then(|value| value.try_into().ok())
+            .unwrap_or_default(),
+    )
+}
+
+/// Where `install.sh` puts the app's web build.
+pub(crate) fn installed_app_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|home| home.join(".aidaemon").join("app-web"))
+}
+
+/// `config` serving the installed web build when it names none and one is
+/// installed: an install needs no `app_dir` line.
+pub(crate) fn with_installed_app(mut config: ClientGatewayConfig) -> ClientGatewayConfig {
+    let unset = config
+        .app_dir
+        .as_deref()
+        .is_none_or(|d| d.trim().is_empty());
+    if unset
+        && let Some(dir) = installed_app_dir()
+        && dir.join("index.html").is_file()
+    {
+        config.app_dir = Some(dir.to_string_lossy().into_owned());
+    }
+    config
 }
 
 /// The local token, minting one when there is none that still works.
@@ -64,7 +87,9 @@ impl ClientHost for DaemonClientHost {
             .await?
             .into_iter()
             .map(|(id, channel)| SessionSummary {
-                writable: channel == aidaemon_client_gateway::APP_CHANNEL,
+                // The app replies into chat conversations too (routed to
+                // their chat by the gateway).
+                writable: true,
                 id,
                 channel,
                 title: None,
@@ -184,7 +209,7 @@ pub async fn start(
             commands: deps.command_context(),
         }),
         log,
-        config: config.client_gateway.clone(),
+        config: with_installed_app(config.client_gateway.clone()),
         endpoints,
         token_file: aidaemon_client_gateway::token::token_file(&config.client_gateway),
         approvals: Some(confirm_tx),

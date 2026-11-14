@@ -452,7 +452,8 @@ async fn http_mode_runs_a_turn_and_long_polls_its_events() {
             ..
         }
     ));
-    // Another chat's session is read-only from here.
+    // A reply into another chat's conversation needs that chat connected:
+    // this one is not, so it is refused, not lost.
     let refused = f
         .post(
             &[],
@@ -467,7 +468,7 @@ async fn http_mode_runs_a_turn_and_long_polls_its_events() {
         )
         .await;
     assert!(
-        matches!(&refused, ServerFrame::Error { error, .. } if error.code == ErrorCode::Forbidden),
+        matches!(&refused, ServerFrame::Error { error, .. } if error.code == ErrorCode::NotFound),
         "{refused:?}"
     );
 }

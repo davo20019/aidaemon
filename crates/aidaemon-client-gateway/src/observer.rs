@@ -56,7 +56,14 @@ pub struct GatewayObserver {
     pub(crate) active: Arc<Mutex<HashSet<String>>>,
     /// Turns running now, for their start time and description.
     pub(crate) running: Mutex<std::collections::HashMap<u64, (String, u64)>>,
+    /// Each chat conversation as its own channel last saw it: what a reply
+    /// from the app into that conversation runs under.
+    pub(crate) contexts: Contexts,
 }
+
+/// Chat conversations' channel contexts, by session.
+pub(crate) type Contexts =
+    Arc<Mutex<std::collections::HashMap<String, aidaemon_channels::context::ChannelContext>>>;
 
 fn status_of(update: &StatusUpdate) -> Option<TurnStatus> {
     let n = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
@@ -141,6 +148,11 @@ fn status_of(update: &StatusUpdate) -> Option<TurnStatus> {
 impl TurnObserver for GatewayObserver {
     fn turn_started(&self, turn: &TurnStart<'_>) {
         let started = now_ms();
+        if turn.platform != APP_CHANNEL
+            && let Ok(mut contexts) = self.contexts.lock()
+        {
+            contexts.insert(turn.session_id.to_string(), turn.channel_ctx.clone());
+        }
         if let Ok(mut active) = self.active.lock() {
             active.insert(turn.session_id.to_string());
         }
@@ -297,6 +309,63 @@ impl TurnSurface for AppSurface {
             state: aidaemon_events::ResponseDeliveryState::PlatformAcknowledged,
             message_ids: Vec::new(),
             error: None,
+        }
+    }
+}
+
+/// A reply from the app into a chat's own conversation (Slack, Telegram,
+/// Discord): the agent's answer goes to that chat through the hub, and the
+/// app sees it as it sees its own turns.
+pub struct ChatReplySurface {
+    pub(crate) publisher: Publisher,
+    pub(crate) hub: Arc<aidaemon_channels::hub::ChannelHub>,
+    pub(crate) session_id: String,
+}
+
+#[async_trait]
+impl TurnSurface for ChatReplySurface {
+    fn platform(&self) -> &'static str {
+        APP_CHANNEL
+    }
+
+    async fn say(&self, text: &str) -> anyhow::Result<Vec<String>> {
+        self.hub.send_text(&self.session_id, text).await?;
+        self.publisher.publish(
+            Some(self.session_id.clone()),
+            Event::AssistantMessage {
+                session_id: self.session_id.clone(),
+                text: text.to_string(),
+            },
+        );
+        Ok(Vec::new())
+    }
+
+    fn show_working(&self, _stop: CancellationToken, _heartbeat: Arc<AtomicU64>, _stale: u64) {}
+
+    fn show_status(
+        &self,
+        mut updates: mpsc::Receiver<StatusUpdate>,
+        _private: bool,
+    ) -> Result<JoinHandle<()>, mpsc::Receiver<StatusUpdate>> {
+        // The observer publishes every update to the app.
+        Ok(tokio::spawn(async move {
+            while updates.recv().await.is_some() {}
+        }))
+    }
+
+    /// The answer goes to the chat; the app gets it with the turn's end.
+    async fn deliver(&self, _envelope: &AgentResponseEnvelope, reply: &str) -> Delivered {
+        match self.hub.send_text(&self.session_id, reply).await {
+            Ok(()) => Delivered {
+                state: aidaemon_events::ResponseDeliveryState::PlatformAcknowledged,
+                message_ids: Vec::new(),
+                error: None,
+            },
+            Err(error) => Delivered {
+                state: aidaemon_events::ResponseDeliveryState::Failed,
+                message_ids: Vec::new(),
+                error: Some(error.to_string()),
+            },
         }
     }
 }

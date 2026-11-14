@@ -462,8 +462,15 @@ async fn serve_app_file(gateway: &ClientGateway, path: &str, request: &HeaderMap
     // page itself is always checked, so a new build shows on the next load.
     if relative.ends_with(".html") || relative.ends_with(".webmanifest") {
         headers.push((axum::http::header::CACHE_CONTROL, "no-cache"));
-    } else if relative.split('/').next_back().is_some_and(|name| name.split('.').count() >= 3) {
-        headers.push((axum::http::header::CACHE_CONTROL, "public, max-age=31536000, immutable"));
+    } else if relative
+        .split('/')
+        .next_back()
+        .is_some_and(|name| name.split('.').count() >= 3)
+    {
+        headers.push((
+            axum::http::header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable",
+        ));
     }
     if relative.ends_with(".html") {
         headers.push((

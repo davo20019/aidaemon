@@ -8,6 +8,11 @@ publish = false
 
 [workspace]
 
+# `aidaemon app` and `aidaemon tui` launch it by this name.
+[[bin]]
+name = "aidaemon-app"
+path = "src/main.rs"
+
 [dependencies]
 nsh-core = "=0.5.0"
 nsh-base = "=0.5.0"

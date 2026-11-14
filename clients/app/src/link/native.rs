@@ -28,8 +28,16 @@ fn gateway_url() -> String {
         .unwrap_or_else(|| DEFAULT_URL.to_owned())
 }
 
-/// The owner's local token (`aidaemon client-token`).
+/// The owner's local token: from `aidaemon app` / `aidaemon tui`
+/// (`AIDAEMON_CLIENT_TOKEN`), else the saved copy (`aidaemon client-token`).
 fn local_token() -> Option<String> {
+    if let Some(token) = std::env::var("AIDAEMON_CLIENT_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+    {
+        return Some(token);
+    }
     let path = std::env::var_os("AIDAEMON_CLIENT_TOKEN_FILE")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".aidaemon").join("client-token")))?;

@@ -270,6 +270,10 @@ pub struct TurnStart<'a> {
     pub user_role: UserRole,
     /// How the running-work list names it.
     pub description: &'a str,
+    /// The conversation as its channel saw it on this turn (visibility,
+    /// sender, workspace grant): what a later turn into the same
+    /// conversation from another surface must run under.
+    pub channel_ctx: &'a crate::context::ChannelContext,
 }
 
 /// A turn as it ends, for a [`TurnObserver`].
@@ -722,6 +726,7 @@ impl TurnRunner {
                     attachments: &attachments,
                     user_role: role,
                     description: &description,
+                    channel_ctx: &channel_ctx,
                 });
             }
             self.live.begin(&session_id, task_id);
