@@ -3,7 +3,8 @@
 //! with the mouse captured. Input goes through NSH's own crossterm
 //! conversion, the one its terminal host uses.
 
-use std::io;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::{event, execute, terminal};
@@ -39,9 +40,58 @@ impl Drop for Session {
     }
 }
 
+/// The terminal's own clipboard: a copy goes to the system clipboard through
+/// OSC 52 (most terminals, and over SSH and tmux with `set-clipboard on`),
+/// and is kept here for pastes inside the app.
+#[derive(Default)]
+struct Osc52 {
+    text: Mutex<Option<String>>,
+}
+
+impl nsh_core::clipboard::ClipboardBackend for Osc52 {
+    fn text(&self) -> Option<String> {
+        self.text.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set_text(&self, text: Option<String>) {
+        if let Some(text) = &text {
+            let mut out = io::stdout();
+            let _ = write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()));
+            let _ = out.flush();
+        }
+        *self.text.lock().unwrap_or_else(|e| e.into_inner()) = text;
+    }
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 pub fn run() -> io::Result<()> {
     let mut options = AppOptions::default();
     options.ui_sets = vec![nsh_base::registry(), nsh_app_aidaemon::registry()];
+    options.clipboard = Some(Arc::new(Osc52::default()));
+    // Drafts, pins and the open conversation outlive the run.
+    if let Some(home) = dirs::home_dir() {
+        options.storage = Some(nsh_engine::FileStorage::open(
+            home.join(".aidaemon").join("app-terminal"),
+        ));
+    }
     let _session = Session::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut view = AppView::new(options);
@@ -56,4 +106,16 @@ pub fn run() -> io::Result<()> {
             Ok(RunEvent::Idle)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn base64_matches_the_standard() {
+        assert_eq!(super::base64(b""), "");
+        assert_eq!(super::base64(b"f"), "Zg==");
+        assert_eq!(super::base64(b"fo"), "Zm8=");
+        assert_eq!(super::base64(b"foo"), "Zm9v");
+        assert_eq!(super::base64(b"hello world"), "aGVsbG8gd29ybGQ=");
+    }
 }

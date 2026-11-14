@@ -4,6 +4,7 @@
 pub mod controls;
 pub mod motion;
 pub mod theme;
+pub mod time;
 
 pub use controls::*;
 pub use theme::{Tone, colors, fit, radius, size, text as type_scale, touch};

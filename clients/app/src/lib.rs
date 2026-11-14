@@ -54,6 +54,7 @@ pub fn Offline() -> impl IntoElement {
 pub fn App() -> impl IntoElement {
     let store = store::Store::new();
     provide_context(store);
+    store.restore();
     link::start(store);
     view()
         .flex_1()
