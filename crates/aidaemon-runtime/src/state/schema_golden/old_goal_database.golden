@@ -65,6 +65,11 @@ index idx_task_lifecycle_session_state on task_lifecycle
 CREATE INDEX idx_task_lifecycle_session_state
          ON task_lifecycle(session_id, state)
 
+index idx_events_spawned_by on events
+CREATE INDEX idx_events_spawned_by
+         ON events(json_extract(data, '$.spawned_by.task_id'))
+         WHERE event_type = 'task_start'
+
 index idx_events_consolidation on events
 CREATE INDEX idx_events_consolidation
          ON events(consolidated_at) WHERE consolidated_at IS NULL
