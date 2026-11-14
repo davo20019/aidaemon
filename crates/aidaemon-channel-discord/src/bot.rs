@@ -16,13 +16,14 @@ use aidaemon_channels::context::ChannelContext;
 use aidaemon_channels::hub::{
     ChannelCapabilities, ChannelHub, DynamicBotStore, HubChannel, MediaKind, MediaMessage,
 };
+use aidaemon_channels::live_status::SurfaceSink;
 use aidaemon_channels::prompts::Prompts;
 use aidaemon_channels::slash::{CommandCategory, CommandDef, build_help_text, shared_commands};
 use aidaemon_channels::split_message;
 use aidaemon_channels::turns::{Turn, TurnRunner, TurnSurface, repeat_while_working};
 use aidaemon_channels::{
     Channel as _, ChannelEvent, CommandSpec, Conversation, ConversationKind, InboundMessage,
-    OutboundFile, OutboundMessage,
+    MessageRef, OutboundFile, OutboundMessage,
 };
 use aidaemon_core::ChannelVisibility;
 use aidaemon_events::attachments::sanitize_filename;
@@ -102,10 +103,61 @@ impl Outlet {
     }
 }
 
+/// A Discord turn's status card: one message, edited in place as the turn
+/// works and removed when the reply says what was done, so status never
+/// piles up as separate italic lines above the answer.
+struct CardSink {
+    transport: Arc<SdkDiscord>,
+    conversation: Conversation,
+}
+
+impl CardSink {
+    fn message(&self, message_id: &str) -> MessageRef {
+        MessageRef {
+            conversation_id: self.conversation.id.clone(),
+            message_id: message_id.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl SurfaceSink for CardSink {
+    async fn create(&self, text: &str) -> anyhow::Result<Option<String>> {
+        let sent = self
+            .transport
+            .send(&self.conversation, &OutboundMessage::text(text))
+            .await?;
+        Ok(Some(sent.message_id))
+    }
+
+    async fn edit(&self, message_id: &str, text: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .transport
+            .edit(&self.message(message_id), text)
+            .await
+            .is_ok())
+    }
+
+    async fn delete(&self, message_id: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .transport
+            .delete(&self.message(message_id))
+            .await
+            .is_ok())
+    }
+}
+
 #[async_trait]
 impl TurnSurface for Outlet {
     fn platform(&self) -> &'static str {
         "discord"
+    }
+
+    fn card_sink(&self) -> Option<Arc<dyn SurfaceSink>> {
+        Some(Arc::new(CardSink {
+            transport: self.transport.clone(),
+            conversation: self.conversation.clone(),
+        }))
     }
 
     async fn say(&self, text: &str) -> anyhow::Result<Vec<String>> {
@@ -764,5 +816,19 @@ mod tests {
         assert_eq!(base_session_id("helper_bot:discord:dm:42"), "discord:dm:42");
         assert_eq!(base_session_id("helper_bot:discord:ch:77"), "discord:ch:77");
         assert_eq!(base_session_id("slack:C1"), "slack:C1");
+    }
+
+    /// A Discord turn's status is one card the runner edits and removes,
+    /// never a separate italic line per step left above the reply.
+    #[test]
+    fn a_discord_chat_hands_its_card_to_the_runner() {
+        let outlet = Outlet {
+            transport: Arc::new(SdkDiscord::new("synthetic-token")),
+            conversation: Conversation {
+                id: "synthetic-dm-1".into(),
+                kind: ConversationKind::Direct,
+            },
+        };
+        assert!(outlet.card_sink().is_some());
     }
 }
