@@ -2989,10 +2989,11 @@ impl SpawnAgentTool {
                 steps: card_steps,
                 // Stopped by the owner: its header says so, with no reason
                 // line.
-                reason: run_end
-                    .failure()
-                    .filter(|_| !run_end.stopped_by_owner())
-                    .map(crate::run_state::RunFailure::reason),
+                reason: match &result {
+                    _ if run_end.stopped_by_owner() => None,
+                    Ok(run) => run_end.reason(&run.evidence),
+                    Err(_) => run_end.reason(&Default::default()),
+                },
                 stopped_by_owner: run_end.stopped_by_owner(),
                 took: Some(times.line()),
                 since_request: since,
@@ -3005,18 +3006,20 @@ impl SpawnAgentTool {
                 // facts; its reply is only the body.
                 let response = match &run.end {
                     RunEnd::Succeeded => run.response,
-                    RunEnd::Stopped(why) => {
-                        let why = why
-                            .as_ref()
-                            .map(|failure| format!("{}\n\n", failure.reason()))
+                    RunEnd::Stopped(_) => {
+                        let why = run
+                            .end
+                            .reason(&run.evidence)
+                            .map(|why| format!("{why}\n\n"))
                             .unwrap_or_default();
                         format!(
                             "\u{26a0}\u{fe0f} Sub-agent incomplete\n\n{why}{}",
                             run.response
                         )
                     }
-                    RunEnd::Failed(failure) => {
-                        let reason = format!("{}\n\n", failure.reason());
+                    RunEnd::Failed(_) => {
+                        let reason =
+                            format!("{}\n\n", run.end.reason(&run.evidence).unwrap_or_default());
                         let delivered =
                             crate::coordination::delivery_lines(run.evidence.delivered.as_deref())
                                 .map(|lines| format!("\n{lines}"))

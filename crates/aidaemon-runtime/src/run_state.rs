@@ -44,6 +44,11 @@ pub struct RunEvidence {
     /// deliverable and what became of it. `None`: it ran outside a
     /// request's delivery ledger, so nothing recorded what it sent.
     pub delivered: Option<Vec<crate::coordination::RunDelivery>>,
+    /// The owner also declined some of its steps, while another cause
+    /// explains how it ended ([`crate::spawn::run_phase`]'s precedence):
+    /// the steps in its words, said as a second line under that cause.
+    /// `None`: nothing was declined, or the decline is itself the cause.
+    pub declined: Option<Vec<String>>,
 }
 
 /// How a run ended: its phase, with why when it did not succeed. A run
@@ -73,9 +78,13 @@ impl RunEnd {
     /// evidence: why it did not succeed, else the typed steps left
     /// unconfirmed.
     pub fn line(&self, evidence: &RunEvidence) -> Option<String> {
-        self.failure()
-            .map(RunFailure::reason)
-            .or_else(|| evidence.line())
+        self.reason(evidence).or_else(|| evidence.line())
+    }
+
+    /// Why it did not succeed: its primary cause, then a step the owner
+    /// declined as a second line ([`RunEvidence::declined_line`]).
+    pub fn reason(&self, evidence: &RunEvidence) -> Option<String> {
+        reasons(self.failure(), evidence)
     }
 
     /// The owner stopped it: a stop the card says plainly ("Stopped by
@@ -282,7 +291,29 @@ impl RunFailure {
     }
 }
 
+/// A run's reasons in their one order: the primary cause of its end, then
+/// any step the owner declined as a second line. Never the decline alone
+/// when another cause ended it.
+fn reasons(failure: Option<&RunFailure>, evidence: &RunEvidence) -> Option<String> {
+    let primary = failure.map(RunFailure::reason)?;
+    Some(match evidence.declined_line() {
+        Some(declined) => format!("{primary}\n{declined}"),
+        None => primary,
+    })
+}
+
 impl RunEvidence {
+    /// The steps the owner declined while another cause ended the run, in
+    /// one plain line under that cause.
+    pub fn declined_line(&self) -> Option<String> {
+        let steps = self.declined.as_ref()?;
+        Some(match steps.as_slice() {
+            [] => "You also declined one of its steps.".to_string(),
+            [one] => format!("You also declined one of its steps: {one}."),
+            many => format!("You also declined some of its steps: {}.", many.join("; ")),
+        })
+    }
+
     /// The same steps, said after the report they rely on: the result
     /// reads the report first, then which of its steps nothing but that
     /// report confirms (`has_report`: there is a report above to point to).
@@ -403,7 +434,7 @@ impl RunState {
     /// renderer of a run's reason, for its card, its result and the
     /// parent's continuation alike.
     pub fn reason(&self) -> Option<String> {
-        self.failure.as_ref().map(RunFailure::reason)
+        reasons(self.failure.as_ref(), &self.evidence)
     }
 
     /// The owner stopped it ([`RunEnd::stopped_by_owner`]).
@@ -1147,6 +1178,7 @@ mod tests {
                             },
                         },
                     ]),
+                    declined: None,
                 },
                 report(),
             )

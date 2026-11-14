@@ -102,8 +102,6 @@ pub struct WorkRecord {
     /// It ended with a typed success of its own (a sub-agent's end record).
     /// A CLI agent has no typed verdict: its process ending is not one.
     pub succeeded: bool,
-    /// The owner declined something it asked: that explains a stop.
-    pub owner_declined: bool,
     /// Work it started still runs: that explains a stop.
     pub still_running: bool,
     /// Its steps that needed a change, in order, each with whether a
@@ -124,15 +122,16 @@ pub struct WorkRecord {
 
 /// A run that did none of its work, from its typed records: it did not
 /// succeed, it declared a change, none of its steps was done, nothing it did
-/// changed anything, nothing it declared was delivered, and neither the
-/// owner's answer nor work still running explains the stop. Such a run
+/// changed anything, nothing it declared was delivered, and no work still
+/// running explains the stop. A step the owner declined does not change
+/// that: it is said beside it ([`crate::spawn::run_phase`]). Such a run
 /// failed: whatever its reply says, nothing it was sent to do happened. The
 /// one rule for every helper. A run sent to look or to deliver declared no
 /// change and is never judged by it (live 2026-11-13: two "Capture …
 /// screenshot" helpers delivered their photos and ended "nothing was
 /// changed").
 pub fn nothing_done(record: &WorkRecord) -> Option<RunFailure> {
-    if record.succeeded || record.owner_declined || record.still_running {
+    if record.succeeded || record.still_running {
         return None;
     }
     let a_step_done = record.change_steps.iter().any(|(_, done)| *done);
@@ -189,7 +188,6 @@ pub fn program_phase(end: &ProgramEnd) -> (RunEnd, RunEvidence) {
     }
     let record = WorkRecord {
         succeeded: false,
-        owner_declined: false,
         still_running: false,
         change_steps: if end.expects_change {
             vec![(end.step.clone(), false)]
@@ -319,11 +317,6 @@ mod tests {
         );
         // Nothing to change: a look around is its work.
         assert_eq!(nothing_done(&record(&[], false)), None);
-        let explained = WorkRecord {
-            owner_declined: true,
-            ..record(&[("Install WordPress", false)], false)
-        };
-        assert_eq!(nothing_done(&explained), None);
     }
 
     /// Live 2026-11-13: a helper sent to capture and deliver a homepage

@@ -103,6 +103,18 @@ pub fn run_phase(
             RunEvidence::default(),
         );
     };
+    // One precedence for why it ended: the primary cause (short of a
+    // resource, an error that ended it, nothing done) wins, and a step the
+    // owner declined is then said second; the decline is the cause only
+    // when nothing else explains the end (live 2026-11-14: a helper that
+    // failed on network timeouts to an unreachable host read "You declined
+    // one of its steps, so it went on without it").
+    let declined = (outcome != TaskOutcome::Succeeded && aggregate.owner_declined())
+        .then(|| declined_steps(aggregate));
+    let secondary = || RunEvidence {
+        declined: declined.clone(),
+        ..RunEvidence::default()
+    };
     // It ran out of something the owner can free: that is why, whatever
     // else its steps say, and its end offers the step that frees it.
     if let (Some(resource), false) = (
@@ -114,7 +126,22 @@ pub fn run_phase(
             TaskOutcome::Failed => RunEnd::Failed(failure),
             _ => RunEnd::Stopped(Some(failure)),
         };
-        return (end, RunEvidence::default());
+        return (end, secondary());
+    }
+    // An error ended it: its runtime recorded it.
+    if outcome == TaskOutcome::Failed
+        && let Some(error) = end
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|error| !error.is_empty())
+    {
+        return (
+            RunEnd::Failed(RunFailure::Errored {
+                error: error.to_string(),
+            }),
+            secondary(),
+        );
     }
     let delivered_steps = delivered_steps(aggregate, delivered);
     // Its steps, a delivered step as done: the delivery record is its proof.
@@ -136,18 +163,18 @@ pub fn run_phase(
             .iter()
             .any(crate::coordination::RunDelivery::reached_owner)
     });
-    // The owner declined a step it asked to take: that is why it ended
-    // short, whatever else its records say. Its deliveries stay delivered.
-    if outcome != TaskOutcome::Succeeded && aggregate.owner_declined() {
+    // It did none of its work: that is why, even when the owner also
+    // declined a step.
+    if let Some(failure) = nothing_done(outcome, &checklist, aggregate, delivered_any) {
+        return (RunEnd::Failed(failure), secondary());
+    }
+    // Nothing else explains it: the owner declined a step it asked to
+    // take, so it ended short. Its deliveries stay delivered.
+    if let Some(steps) = declined {
         return (
-            RunEnd::Stopped(Some(RunFailure::Declined {
-                steps: declined_steps(aggregate),
-            })),
+            RunEnd::Stopped(Some(RunFailure::Declined { steps })),
             RunEvidence::default(),
         );
-    }
-    if let Some(failure) = nothing_done(outcome, &checklist, aggregate, delivered_any) {
-        return (RunEnd::Failed(failure), RunEvidence::default());
     }
     let only_receipts_missing = outcome == TaskOutcome::Partial
         && end.status == aidaemon_events::TaskStatus::Completed
@@ -319,7 +346,6 @@ fn nothing_done(
     steps.sort_by(|a, b| a.0.cmp(b.0));
     crate::helper_run::nothing_done(&crate::helper_run::WorkRecord {
         succeeded: outcome == TaskOutcome::Succeeded,
-        owner_declined: aggregate.owner_declined(),
         still_running: aggregate.has_background_in_flight(),
         change_steps: steps
             .into_iter()
@@ -1661,6 +1687,96 @@ mod tests {
             crate::spawn_tool::job_end(phase.phase(), phase.failure()),
             aidaemon_work::plans::JobEnd::Declined
         );
+    }
+
+    /// One precedence for a run's reasons: the primary cause of its end
+    /// (an error that ended it, nothing done) wins, and a step the owner
+    /// declined is said second; the decline is the cause only when nothing
+    /// else explains the end (live 2026-11-14: a helper that failed on
+    /// network timeouts to an unreachable host read "You declined one of
+    /// its steps, so it went on without it").
+    #[test]
+    fn the_primary_cause_wins_and_a_declined_step_is_said_second() {
+        let end = |error: Option<&str>| -> aidaemon_events::TaskEndData {
+            serde_json::from_value(serde_json::json!({
+                "task_id": "t",
+                "status": if error.is_some() { "failed" } else { "completed" },
+                "duration_secs": 1,
+                "iterations": 1,
+                "tool_calls_count": 3,
+                "error": error,
+            }))
+            .unwrap()
+        };
+        let declined = |mut run: RunAggregate| {
+            let op = serde_json::from_value(serde_json::json!({
+                "operation_id": "op-declined",
+                "tool_name": "terminal",
+                "dispatched": false,
+                "owner_declined": true,
+                "mutating": true,
+                "obligation_ids": ["task:t/obligation:checklist:0"],
+            }))
+            .unwrap();
+            run.operations.insert("op-declined".to_string(), op);
+            run
+        };
+        // It looked around (read-only), changed nothing, and the owner
+        // declined one probe: nothing done is the cause.
+        let run = declined(aggregate(&[("pending", 2)], &[("succeeded", 0)]));
+        let (phase, evidence) = run_phase(TaskOutcome::Partial, Some(&end(None)), Some(&run), None);
+        assert_eq!(
+            phase,
+            crate::run_state::RunEnd::Failed(RunFailure::NothingDone {
+                undone: vec!["step 0".to_string()]
+            })
+        );
+        assert_eq!(evidence.declined, Some(vec!["step 0".to_string()]));
+        let line = phase.line(&evidence).unwrap();
+        let mut lines = line.lines();
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .starts_with("It ended without doing any of its work"),
+            "{line}"
+        );
+        assert_eq!(
+            lines.next(),
+            Some("You also declined one of its steps: step 0.")
+        );
+        assert!(!line.contains("went on without it"), "{line}");
+
+        // An error ended it: the error is the cause.
+        let run = declined(aggregate(&[("pending", 2)], &[("succeeded", 0)]));
+        let (phase, evidence) = run_phase(
+            TaskOutcome::Failed,
+            Some(&end(Some("connection timed out to 10.255.255.1"))),
+            Some(&run),
+            None,
+        );
+        let line = phase.line(&evidence).unwrap();
+        assert!(
+            line.starts_with("It stopped on an error: connection timed out"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with("You also declined one of its steps: step 0."),
+            "{line}"
+        );
+
+        // Nothing else explains it: the decline is the cause, said once.
+        let run = declined(aggregate(
+            &[("satisfied", 2), ("pending", 2)],
+            &[("succeeded", 2)],
+        ));
+        let (phase, evidence) = run_phase(TaskOutcome::Partial, Some(&end(None)), Some(&run), None);
+        assert!(matches!(
+            phase,
+            crate::run_state::RunEnd::Stopped(Some(RunFailure::Declined { .. }))
+        ));
+        assert_eq!(evidence.declined, None);
+        assert_eq!(phase.line(&evidence).unwrap().lines().count(), 1);
     }
 
     /// A run whose steps no receipt confirmed names them in their own
