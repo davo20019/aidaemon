@@ -2646,6 +2646,7 @@ pub fn background_spawn_outcome(name: &str) -> ToolCallOutcome {
 impl aidaemon_tools::semantics::ToolSemantics for SpawnAgentTool {
     fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
         aidaemon_tools::semantics::ToolDispatchFacts {
+            offering: aidaemon_tools::semantics::Offering::Core,
             task_lead_delegation: true,
             spawns_child_agents: true,
             // Each child runs under its own deadline, which pauses while the

@@ -166,7 +166,6 @@ impl Tool for ManagePeopleTool {
 impl aidaemon_tools::semantics::ToolSemantics for ManagePeopleTool {
     fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
         aidaemon_tools::semantics::ToolDispatchFacts {
-            always_offered: true,
             status_from_arguments: true,
             ..Default::default()
         }

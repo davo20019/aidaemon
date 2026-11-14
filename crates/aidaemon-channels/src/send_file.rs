@@ -577,7 +577,6 @@ impl SendReply {
 impl aidaemon_tools::semantics::ToolSemantics for SendFileTool {
     fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
         aidaemon_tools::semantics::ToolDispatchFacts {
-            always_offered: true,
             delivers_files: true,
             ..Default::default()
         }

@@ -1,13 +1,9 @@
 use crate::traits::AgentRole;
 use aidaemon_runtime::engine::chat_work::ChatWorkControl as _;
 
+/// Offered tools: sent with their schema, or listed by `load_tools`.
 fn extract_tool_names(defs: &[serde_json::Value]) -> Vec<String> {
-    defs.iter()
-        .filter_map(|def| def.get("function"))
-        .filter_map(|f| f.get("name"))
-        .filter_map(|n| n.as_str())
-        .map(ToString::to_string)
-        .collect()
+    crate::testing::offered_tool_names(defs)
 }
 
 struct HighImpactCliAgentMock;

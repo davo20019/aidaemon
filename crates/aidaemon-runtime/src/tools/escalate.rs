@@ -95,7 +95,7 @@ impl Tool for EscalateToParentTool {
 impl crate::tools::traits::ToolSemantics for EscalateToParentTool {
     fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
         crate::tools::traits::ToolDispatchFacts {
-            always_offered: true,
+            offering: aidaemon_tools::semantics::Offering::Scoped,
             ..Default::default()
         }
     }

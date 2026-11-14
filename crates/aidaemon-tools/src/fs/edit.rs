@@ -280,7 +280,7 @@ core_tool!(
 impl crate::semantics::ToolSemantics for EditFile {
     fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
         crate::semantics::ToolDispatchFacts {
-            always_offered: true,
+            offering: crate::semantics::Offering::Core,
             checkpoints_writes: true,
             file_guard: crate::semantics::FileGuard::Writes,
             ..Default::default()

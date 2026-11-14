@@ -1841,6 +1841,31 @@ impl Drop for EnvVars {
     }
 }
 
+/// The tools a model request offers: those whose schema it carries, and
+/// the deferred ones `load_tools` lists by name (callable, schema sent once
+/// loaded).
+pub fn offered_tool_names(defs: &[serde_json::Value]) -> Vec<String> {
+    let mut names = Vec::new();
+    for def in defs {
+        let function = def.get("function").unwrap_or(def);
+        let Some(name) = function.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        names.push(name.to_string());
+        if name == aidaemon_core::LOAD_TOOLS {
+            let description = function
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            names.extend(description.lines().filter_map(|line| {
+                let entry = line.strip_prefix("- ")?;
+                Some(entry.split(':').next()?.trim().to_string())
+            }));
+        }
+    }
+    names
+}
+
 #[cfg(test)]
 mod keychain_isolation_tests {
     use super::{EnvVars, KeychainIsolation};

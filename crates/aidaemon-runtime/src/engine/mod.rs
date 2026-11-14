@@ -15,6 +15,7 @@ pub mod compaction;
 pub mod deferral;
 pub mod dispatcher;
 pub mod hooks;
+pub mod loaded_tools;
 pub mod mandate_run;
 pub mod outcome;
 pub mod provider;

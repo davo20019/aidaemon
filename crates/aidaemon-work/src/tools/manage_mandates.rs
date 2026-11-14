@@ -2781,7 +2781,6 @@ impl crate::traits::ToolSemantics for ManageMandatesTool {
 
     fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
         crate::traits::ToolDispatchFacts {
-            always_offered: true,
             goal_context: crate::traits::GoalContext::MandateRun,
             ..Default::default()
         }

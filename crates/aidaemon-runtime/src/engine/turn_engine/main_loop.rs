@@ -2,7 +2,6 @@
 //! transcript, then the run on the kernel ([`TurnEngine::handle_message_sdk`]).
 
 use super::*;
-use crate::engine::tool_roster::ToolRoster as _;
 use crate::turn::bootstrap::{BootstrapCtx, BootstrapData, BootstrapOutcome};
 use crate::turn::completion_contract::{CompletionContract, CompletionProgress};
 use crate::turn::execution_state::{
@@ -485,8 +484,8 @@ impl TurnEngine<'_> {
             learning,
             active_untrusted_external_reference_skills,
             restrict_untrusted_external_reference_tools,
-            available_capabilities,
-            base_tool_defs,
+            available_capabilities: _,
+            base_tool_defs: _,
             mut tool_defs,
             mut policy_bundle,
             llm_router,
@@ -823,18 +822,6 @@ impl TurnEngine<'_> {
                         .select_for_profile(policy_bundle.policy.model_profile)
                         .to_string();
                 }
-            if epistemic_uncertainty >= 0.55
-                && guided_model
-                && self.turn_runtime().policy_config.tool_filter_enforce
-            {
-                tool_defs = self.filter_tool_definitions_for_policy(
-                    &base_tool_defs,
-                    &available_capabilities,
-                    &policy_bundle.policy,
-                    policy_bundle.risk_score,
-                    false,
-                );
-            }
             self.emit_decision_point(
                 &emitter,
                 &task_id,

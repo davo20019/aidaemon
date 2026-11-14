@@ -607,6 +607,15 @@ impl TurnEngine<'_> {
         // only while the active plugin owns them; `manage_memories` keeps
         // its goal actions under any plugin.
         let bridge_roots = Arc::new(trust_roots.clone());
+        let task_lead = matches!(self.role(), aidaemon_events::traits::AgentRole::TaskLead);
+        let loaded_tools = crate::engine::loaded_tools::for_session(session_id);
+        // The owner's own, unnarrowed turns list every connected MCP tool and
+        // defer the non-core tools; a narrowed run gets only what its offer
+        // named, all of it sent.
+        let every_mcp_tool = user_role == UserRole::Owner
+            && channel_ctx.active_workspace_grant(user_role).is_none()
+            && channel_ctx.visibility != aidaemon_core::ChannelVisibility::PublicExternal
+            && self.mandate_execution().is_none();
         // The request's tree: its runs share one budget, one coordination
         // ledger and the folders its work made for itself, which every tool
         // reads when it judges where an effect lands.
@@ -637,31 +646,58 @@ impl TurnEngine<'_> {
                         ),
                         DaemonToolOffer::Hidden => continue,
                     };
-                builder = builder.tool(
-                    turn_tool(
-                        spec,
-                        tool.clone(),
-                        goal_actions_only,
-                        calls_tx.clone(),
-                        bridge_roots.clone(),
-                    )
-                    .with_owned_folders(owned_folders.clone()),
-                );
+                let bridged = turn_tool(
+                    spec,
+                    tool.clone(),
+                    goal_actions_only,
+                    calls_tx.clone(),
+                    bridge_roots.clone(),
+                )
+                .with_owned_folders(owned_folders.clone());
+                // Core tools are sent on every call; the rest are listed by
+                // `load_tools` until the run (or an earlier turn of this
+                // session) loads them.
+                let facts = tool.dispatch_facts();
+                // Only the owner's own, unnarrowed turns defer: a narrowed
+                // offer (public channel, workspace grant, mandate, guest) is
+                // already short, and is sent whole.
+                let core = !every_mcp_tool
+                    || facts.offering.always_sent()
+                    || (task_lead && facts.task_lead_delegation);
+                builder = if core {
+                    builder.tool(bridged)
+                } else {
+                    builder.deferred_tool_arc(Arc::new(bridged))
+                };
             }
         }
-        // The offered MCP-registry tools, bridged the same way so every
-        // kernel hook judges them. A daemon tool of the same name wins (the
-        // dispatcher resolves it first). The set is fixed at turn start: a
-        // server added mid-run is offered from the next turn.
+        // Every connected MCP server's tools, bridged the same way so every
+        // kernel hook judges them, and deferred: `load_tools` lists them. The
+        // ones the message named (`mcp:<server>`) are loaded up front. A
+        // daemon tool of the same name wins (the dispatcher resolves it
+        // first). The set is fixed at turn start: a server added mid-run is
+        // offered from the next turn. A run whose offer is narrowed (a
+        // mandate, a workspace grant, a role) gets only what was offered.
         let mut mcp_tools: Vec<Arc<dyn aidaemon_tools::OutcomeTool>> = Vec::new();
         if user_role != UserRole::Public {
             {
-                let mut names: Vec<&String> = offered_tools
+                let offered_mcp: Vec<String> = offered_tools
                     .iter()
                     .filter(|name| !self.tools().iter().any(|tool| tool.name() == name.as_str()))
+                    .cloned()
                     .collect();
+                for name in &offered_mcp {
+                    loaded_tools.load(name);
+                }
+                let mut names: Vec<String> = if every_mcp_tool {
+                    self.mcp_tool_names().await
+                } else {
+                    offered_mcp
+                };
+                names.retain(|name| !self.tools().iter().any(|tool| tool.name() == name.as_str()));
                 names.sort();
-                for name in names {
+                names.dedup();
+                for name in &names {
                     let Some(tool) = self.mcp_tool(name).await else {
                         continue;
                     };
@@ -675,7 +711,7 @@ impl TurnEngine<'_> {
                         warn!(tool = %name, "MCP tool name is not a valid kernel tool name; not offered");
                         continue;
                     }
-                    builder = builder.tool(
+                    let bridged = Arc::new(
                         turn_tool(
                             tool_spec(tool.as_ref()),
                             tool.clone(),
@@ -685,10 +721,16 @@ impl TurnEngine<'_> {
                         )
                         .with_owned_folders(owned_folders.clone()),
                     );
+                    builder = if every_mcp_tool {
+                        builder.deferred_tool_arc(bridged)
+                    } else {
+                        builder.tool_arc(bridged)
+                    };
                     mcp_tools.push(tool);
                 }
             }
         }
+        builder = builder.loaded_tools(loaded_tools.clone());
         // Memory hooks run after the ledger stop, so a rejected final answer
         // never reaches a memory writer. Summarization and learning belong to
         // the turn, so they run whatever the memory plugin.

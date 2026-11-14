@@ -8,7 +8,9 @@ generate_image 921 231
 git_commit 599 150
 git_info 609 153
 goal_trace 812 203
+health_probe 1259 315
 http_request 2463 616
+list_checkpoints 500 125
 manage_api 1292 323
 manage_automations 811 203
 manage_config 962 241
@@ -49,4 +51,5 @@ use_skill 483 121
 web_fetch 647 162
 web_search 1326 332
 write_file 1068 267
-TOTAL 73249 18313 (50 tools)
+TOTAL 75008 18752 (52 tools)
+PER_CALL 31761 7941 (14 core: terminal remember_fact manage_memories set_reminder manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 35 deferred)

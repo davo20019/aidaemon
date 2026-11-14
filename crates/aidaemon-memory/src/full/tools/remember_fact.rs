@@ -416,7 +416,7 @@ impl Tool for RememberFactTool {
 impl aidaemon_tools::semantics::ToolSemantics for RememberFactTool {
     fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
         aidaemon_tools::semantics::ToolDispatchFacts {
-            always_offered: true,
+            offering: aidaemon_tools::semantics::Offering::Core,
             ..Default::default()
         }
     }

@@ -661,6 +661,7 @@ impl TrackRequirementsTool {
 impl crate::traits::ToolSemantics for TrackRequirementsTool {
     fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
         crate::traits::ToolDispatchFacts {
+            offering: aidaemon_tools::semantics::Offering::Core,
             requirement_checklist: true,
             ..Default::default()
         }

@@ -572,12 +572,8 @@ async fn cadence_inside_draft_only_mandate_request_is_model_directed_not_schedul
 
     let calls = harness.provider.call_log.lock().await;
     let first_call = calls.first().expect("model received the request directly");
-    let tool_names = first_call
-        .tools
-        .iter()
-        .filter_map(|tool| tool["function"]["name"].as_str())
-        .collect::<Vec<_>>();
-    assert!(tool_names.contains(&"manage_mandates"));
+    let tool_names = crate::testing::offered_tool_names(&first_call.tools);
+    assert!(tool_names.iter().any(|name| name == "manage_mandates"));
 }
 
 #[tokio::test]
@@ -1065,16 +1061,7 @@ async fn test_slack_command_request_llm_payload() {
     let call = &call_log[0];
 
     // Check tool definitions are present
-    let tool_names: Vec<String> = call
-        .tools
-        .iter()
-        .filter_map(|t| {
-            t.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .map(String::from)
-        })
-        .collect();
+    let tool_names = crate::testing::offered_tool_names(&call.tools);
     assert!(!tool_names.is_empty(), "No tools provided to LLM");
     // In test harness we only have system_info, but in production terminal would be here
     assert!(

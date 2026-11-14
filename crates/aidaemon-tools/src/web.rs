@@ -1143,7 +1143,7 @@ impl crate::semantics::ToolSemantics for WebFetch {
 
     fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
         crate::semantics::ToolDispatchFacts {
-            always_offered: true,
+            offering: crate::semantics::Offering::Core,
             network_reach: crate::semantics::NetworkReach::PublicOnly,
             same_tool_streak: crate::semantics::SameToolStreak::Versatile,
             ..Default::default()

@@ -25,6 +25,10 @@ const ALLOWED: &[(&str, &str)] = &[
         "the main loop, including its own compaction",
     ),
     ("src/agent/runtime/llm.rs", "the main loop's failover"),
+    (
+        "crates/aidaemon-runtime/src/engine/turn_engine/",
+        "the main loop (moved from src/agent/runtime/sdk_engine), including its own compaction",
+    ),
 ];
 const RAW_ACCESS: &[&str] = &[
     "snapshot.provider()",

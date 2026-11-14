@@ -664,6 +664,15 @@ impl crate::tools::traits::ToolSemantics for ReportBlockerTool {
         ToolRole::Action
     }
 
+    /// Exists only in a task's own run, where reporting a blocker is part
+    /// of the job.
+    fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
+        aidaemon_tools::semantics::ToolDispatchFacts {
+            offering: aidaemon_tools::semantics::Offering::Scoped,
+            ..Default::default()
+        }
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,

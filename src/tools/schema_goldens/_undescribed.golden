@@ -1,4 +1,12 @@
 goal_trace.action
+health_probe.action
+health_probe.config
+health_probe.config.method
+health_probe.config.timeout_secs
+health_probe.description
+health_probe.id
+health_probe.name
+health_probe.type
 manage_api.action
 manage_api.allowed_domains
 manage_api.authorize_url

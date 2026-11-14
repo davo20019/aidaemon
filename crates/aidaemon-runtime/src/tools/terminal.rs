@@ -7858,7 +7858,7 @@ impl crate::tools::traits::ToolSemantics for TerminalTool {
             runs_as_judged: true,
             keeps_own_grants: true,
             shell_command_line: true,
-            always_offered: true,
+            offering: aidaemon_tools::semantics::Offering::Core,
             same_tool_streak: crate::tools::traits::SameToolStreak::Versatile,
             records_launch_trust: true,
             goal_context: crate::tools::traits::GoalContext::BackgroundDelivery,

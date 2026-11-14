@@ -819,7 +819,7 @@ impl Tool for WebSearch {
 impl crate::semantics::ToolSemantics for WebSearch {
     fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
         crate::semantics::ToolDispatchFacts {
-            always_offered: true,
+            offering: crate::semantics::Offering::Core,
             same_tool_streak: crate::semantics::SameToolStreak::Versatile,
             ..Default::default()
         }

@@ -1490,6 +1490,12 @@ pub(crate) mod lint_catalog {
             )),
             Arc::new(crate::tools::track_requirements::TrackRequirementsTool::new(plan_store)),
             Arc::new(crate::tools::EscalateToParentTool),
+            // Registered by startup only with a checkpoint manager and a
+            // health store.
+            Arc::new(crate::tools::ListCheckpointsTool),
+            Arc::new(crate::tools::HealthProbeTool::new(Arc::new(
+                crate::health::HealthProbeStore::new(state.pool()).await?,
+            ))),
             Arc::new(
                 aidaemon_work::tools::manage_goal_tasks::ManageGoalTasksTool::new(
                     "synthetic-goal".to_string(),

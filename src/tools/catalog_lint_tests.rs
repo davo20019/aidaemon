@@ -202,6 +202,40 @@ async fn catalog_budget() {
         total.div_ceil(4),
         sizes.len()
     ));
+    // What an owner's turn sends before it loads anything: the core tools'
+    // schemas and the `load_tools` index (one line per deferred tool).
+    use aidaemon_tools::semantics::Offering;
+    let core: Vec<_> = tools
+        .iter()
+        .filter(|tool| tool.dispatch_facts().offering == Offering::Core)
+        .collect();
+    let deferred: Vec<_> = tools
+        .iter()
+        .filter(|tool| tool.dispatch_facts().offering == Offering::Deferred)
+        .collect();
+    let index: usize = deferred
+        .iter()
+        .map(|tool| {
+            let line = tool.description().split(". ").next().unwrap_or_default();
+            format!("\n- {}: {}", tool.name(), line).len()
+        })
+        .sum::<usize>()
+        + 600;
+    let per_call = core
+        .iter()
+        .map(|tool| rendered_chars(tool.as_ref()))
+        .sum::<usize>()
+        + index;
+    rendered.push_str(&format!(
+        "PER_CALL {per_call} {} ({} core: {}; {} deferred)\n",
+        per_call.div_ceil(4),
+        core.len(),
+        core.iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>()
+            .join(" "),
+        deferred.len()
+    ));
     let over: Vec<_> = sizes
         .iter()
         .filter(|(_, chars)| **chars > MAX_TOOL_CHARS)

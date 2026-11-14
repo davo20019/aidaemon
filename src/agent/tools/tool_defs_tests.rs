@@ -517,8 +517,6 @@ async fn task_lead_policy_filter_keeps_delegation_tools_exposed() {
         &defs,
         &capabilities,
         &ExecutionPolicy::for_profile(ModelProfile::Balanced),
-        0.3419,
-        false,
     );
     let names: Vec<String> = filtered
         .iter()

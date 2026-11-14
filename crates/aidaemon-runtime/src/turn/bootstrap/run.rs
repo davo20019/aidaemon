@@ -47,16 +47,6 @@ impl GateFilterStage {
             shadow_after_count: None,
         }
     }
-
-    fn shadow(stage: &'static str, before_count: usize, shadow_after_count: usize) -> Self {
-        Self {
-            stage,
-            before_count,
-            after_count: before_count,
-            action: "shadow_observed",
-            shadow_after_count: Some(shadow_after_count),
-        }
-    }
 }
 
 fn build_tool_filter_gate_telemetry(
@@ -940,12 +930,10 @@ pub async fn run_bootstrap(
     let policy_bundle =
         crate::policy::signals::build_policy_bundle(user_text, &available_capabilities, false);
     if !tool_defs.is_empty() {
-        let shadow_filtered = agent.filter_tool_definitions_for_policy(
+        let filtered = agent.filter_tool_definitions_for_policy(
             &tool_defs,
             &available_capabilities,
             &policy_bundle.policy,
-            policy_bundle.risk_score,
-            false,
         );
         POLICY_METRICS
             .tool_exposure_samples
@@ -955,36 +943,19 @@ pub async fn run_bootstrap(
             .fetch_add(tool_defs.len() as u64, Ordering::Relaxed);
         POLICY_METRICS
             .tool_exposure_after_sum
-            .fetch_add(shadow_filtered.len() as u64, Ordering::Relaxed);
-        if agent.turn_runtime().policy_config.policy_shadow_mode {
-            info!(
-                session_id,
-                task_id = %task_id,
-                exposed_before = tool_defs.len(),
-                exposed_after = shadow_filtered.len(),
-                risk_score = policy_bundle.risk_score,
-                profile = ?policy_bundle.policy.model_profile,
-                "Policy tool filter shadow comparison"
-            );
-        }
-        if agent.turn_runtime().policy_config.tool_filter_enforce && !autonomous_bootstrap {
+            .fetch_add(filtered.len() as u64, Ordering::Relaxed);
+        if !autonomous_bootstrap {
             tool_filter_stages.push(GateFilterStage::new(
                 "policy_filter",
                 tool_defs.len(),
-                shadow_filtered.len(),
-                if tool_defs.len() == shadow_filtered.len() {
+                filtered.len(),
+                if tool_defs.len() == filtered.len() {
                     "passed"
                 } else {
                     "filtered"
                 },
             ));
-            tool_defs = shadow_filtered;
-        } else {
-            tool_filter_stages.push(GateFilterStage::shadow(
-                "policy_filter",
-                tool_defs.len(),
-                shadow_filtered.len(),
-            ));
+            tool_defs = filtered;
         }
     }
 

@@ -57,6 +57,29 @@ pub enum ToolRole {
     Universal,
 }
 
+/// How a tool is offered to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Offering {
+    /// Sent on every call: without it the agent cannot do its everyday
+    /// work (run commands, read and change files, reach the web, keep
+    /// memory, schedule, track its checklist, delegate).
+    Core,
+    /// Exists only in a role-scoped run (a task's, a mandate run's or a
+    /// coordinated child's own tools), where it is sent on every call.
+    Scoped,
+    /// Listed by name and one line in `load_tools`; its schema is sent once
+    /// loaded (by `load_tools` or by calling it).
+    #[default]
+    Deferred,
+}
+
+impl Offering {
+    /// Sent on every call where the tool is registered.
+    pub fn always_sent(self) -> bool {
+        matches!(self, Self::Core | Self::Scoped)
+    }
+}
+
 /// Typed facts about how the dispatcher and the engine treat a tool. A tool
 /// states them about itself; nothing keys on its name. Several can hold for
 /// one tool, so they are flags beside [`ToolRole`] (which scopes tools by
@@ -75,10 +98,10 @@ pub struct ToolDispatchFacts {
     /// kernel's access manifest carries so the approval policy's
     /// catastrophic-command check sees it (the terminal).
     pub shell_command_line: bool,
-    /// The tool survives every profile and approval pruning of the offered
-    /// tools: without it the agent cannot do its core work (write and edit
-    /// files, run commands, keep memory, reach the web, deliver files).
-    pub always_offered: bool,
+    /// Whether the tool's schema is sent on every model call
+    /// ([`Offering::Core`]) or listed by name until the run loads it
+    /// ([`Offering::Deferred`], the default).
+    pub offering: Offering,
     /// A task lead keeps the tool through pruning: it is its delegation
     /// surface (`spawn_agent`, `cli_agent`, `manage_goal_tasks`).
     pub task_lead_delegation: bool,

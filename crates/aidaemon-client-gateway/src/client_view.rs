@@ -171,7 +171,7 @@ impl ToolSemantics for ClientViewTool {
     /// it to turns from an app that can be moved.
     fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
         aidaemon_tools::semantics::ToolDispatchFacts {
-            always_offered: true,
+            offering: aidaemon_tools::semantics::Offering::Core,
             ..Default::default()
         }
     }
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn it_survives_profile_pruning() {
         let tool = ClientViewTool::new(Arc::new(Views::default()));
-        assert!(tool.dispatch_facts().always_offered);
+        assert!(tool.dispatch_facts().offering == aidaemon_tools::semantics::Offering::Core);
     }
 
     #[test]

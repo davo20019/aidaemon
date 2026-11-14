@@ -646,7 +646,7 @@ impl crate::tools::traits::ToolSemantics for ManageMemoriesTool {
 
     fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
         crate::tools::traits::ToolDispatchFacts {
-            always_offered: true,
+            offering: aidaemon_tools::semantics::Offering::Core,
             status_from_arguments: true,
             ..Default::default()
         }

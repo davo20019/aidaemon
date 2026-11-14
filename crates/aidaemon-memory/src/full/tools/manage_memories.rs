@@ -178,7 +178,7 @@ impl Tool for ManageMemoriesTool {
 impl aidaemon_tools::semantics::ToolSemantics for ManageMemoriesTool {
     fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
         aidaemon_tools::semantics::ToolDispatchFacts {
-            always_offered: true,
+            offering: aidaemon_tools::semantics::Offering::Core,
             status_from_arguments: true,
             ..Default::default()
         }

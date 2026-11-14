@@ -13,7 +13,7 @@ use aidaemon_tools::semantics::{ToolCapabilities, UserRole};
 use serde_json::{Value, json};
 
 use crate::host::TurnHost;
-use crate::policy::execution::{ApprovalMode, ExecutionPolicy, ModelProfile};
+use crate::policy::execution::{ApprovalMode, ExecutionPolicy};
 use crate::policy::metrics::POLICY_METRICS;
 use crate::turn::helpers::{tool_name_from_definition, visibility_allows_desktop_control};
 
@@ -251,111 +251,40 @@ pub trait ToolRoster: TurnHost {
         roster
     }
 
-    /// `defs` narrowed to what `policy` allows at `risk_score` (`widen`:
-    /// only reorder). Essential tools (`always_offered`, and a task lead's
-    /// `task_lead_delegation` tools) survive every filter and sort first.
+    /// `defs` narrowed to what `policy` allows. The only narrowing is
+    /// typed: with `ApprovalMode::Auto` a tool that always needs approval
+    /// is left out, unless it is core (`Offering::Core`, or a task lead's
+    /// delegation tools). The size of the offer is the kernel's business
+    /// (core tools plus `load_tools` for the rest), never a count cut here.
     fn filter_tool_definitions_for_policy(
         &self,
         defs: &[Value],
         capabilities: &HashMap<String, ToolCapabilities>,
         policy: &ExecutionPolicy,
-        risk_score: f32,
-        widen: bool,
     ) -> Vec<Value> {
-        let mut ordered: Vec<(Value, String, ToolCapabilities)> = defs
-            .iter()
-            .filter_map(|def| {
-                let name = tool_name_from_definition(def)?.to_string();
-                let caps = capabilities.get(&name).copied().unwrap_or_default();
-                Some((def.clone(), name, caps))
-            })
-            .collect();
-
-        // Without the essential tools the agent can read files but never
-        // write them, cannot keep memory or reach the web (the model then
-        // resorts to terminal curl/grep workarounds).
+        if !matches!(policy.approval_mode, ApprovalMode::Auto) {
+            return defs.to_vec();
+        }
         let task_lead = matches!(self.role(), AgentRole::TaskLead);
-        let essential: HashSet<&str> = self
+        let core: HashSet<&str> = self
             .tools()
             .iter()
             .filter(|tool| {
                 let facts = tool.dispatch_facts();
-                facts.always_offered || (task_lead && facts.task_lead_delegation)
+                facts.offering.always_sent() || (task_lead && facts.task_lead_delegation)
             })
             .map(|tool| tool.name())
             .collect();
-        let is_policy_essential = |name: &str| essential.contains(name);
-
-        // Stable prioritization: essential tools first (before truncation can
-        // cut them off), then read-only + idempotent.
-        ordered.sort_by_key(|(_, name, caps)| {
-            (
-                !is_policy_essential(name),
-                !caps.read_only,
-                caps.needs_approval,
-                !caps.idempotent,
-                caps.high_impact_write,
-                caps.external_side_effect,
-            )
-        });
-
-        if widen {
-            return ordered.into_iter().map(|(d, _, _)| d).collect();
-        }
-
-        let mut filtered = ordered;
-        let low_risk = risk_score < 0.34 && matches!(policy.model_profile, ModelProfile::Cheap);
-
-        if low_risk {
-            // Essential + read-only tools, filled up to 5 from the sorted list.
-            let mut keep: Vec<_> = filtered
-                .iter()
-                .filter(|(_, name, c)| c.read_only || is_policy_essential(name))
-                .cloned()
-                .collect();
-            if keep.len() < 5 {
-                for candidate in filtered.iter().cloned() {
-                    if keep.iter().any(|(_, n, _)| n == &candidate.1) {
-                        continue;
-                    }
-                    keep.push(candidate);
-                    if keep.len() >= 5 {
-                        break;
-                    }
-                }
-            }
-            keep.truncate(16);
-            return keep.into_iter().map(|(d, _, _)| d).collect();
-        }
-
-        match policy.model_profile {
-            ModelProfile::Cheap => {
-                filtered.retain(|(_, name, caps)| {
-                    is_policy_essential(name) || caps.read_only || !caps.high_impact_write
-                });
-                filtered.truncate(16);
-            }
-            ModelProfile::Balanced => {
-                if risk_score < 0.55 {
-                    filtered.retain(|(_, name, caps)| {
-                        is_policy_essential(name) || caps.read_only || !caps.high_impact_write
-                    });
-                }
-                filtered.truncate(20);
-            }
-            ModelProfile::Strong => {
-                // Capable, but not an unbounded tool surface.
-                filtered.truncate(28);
-            }
-        }
-
-        if matches!(policy.approval_mode, ApprovalMode::Auto) {
-            filtered.retain(|(_, name, caps)| {
-                is_policy_essential(name) || caps.read_only || !caps.needs_approval
-            });
-        }
-
-        filtered.into_iter().map(|(d, _, _)| d).collect()
+        defs.iter()
+            .filter(|def| {
+                let Some(name) = tool_name_from_definition(def) else {
+                    return true;
+                };
+                let caps = capabilities.get(name).copied().unwrap_or_default();
+                core.contains(name) || caps.read_only || !caps.needs_approval
+            })
+            .cloned()
+            .collect()
     }
 }
 

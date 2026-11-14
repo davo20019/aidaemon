@@ -300,6 +300,7 @@ impl SearchFiles {
 impl crate::semantics::ToolSemantics for SearchFiles {
     fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
         crate::semantics::ToolDispatchFacts {
+            offering: crate::semantics::Offering::Core,
             same_tool_streak: crate::semantics::SameToolStreak::Versatile,
             ..Default::default()
         }
