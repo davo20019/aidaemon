@@ -355,3 +355,41 @@ async fn an_approval_is_asked_with_buttons_and_answered_by_a_press() {
     let edited = mock.wait_for(|r| r.method == "PATCH").await;
     assert_eq!(edited.body["components"], json!([]));
 }
+
+/// A kept status card settles after its turn through the hub: Discord
+/// edits and deletes the message in place.
+#[tokio::test]
+async fn the_hub_edits_and_deletes_a_discord_message_in_place() {
+    let mock = MockDiscord::start().await;
+    let (channel, _harness) = channel(&mock, MockProvider::new(), vec![OWNER], vec![OWNER]).await;
+    let session = "discord:ch:100000000000000800";
+
+    assert!(
+        channel
+            .edit_text(
+                session,
+                "100000000000000900",
+                "✅ Finished in the background"
+            )
+            .await
+            .unwrap()
+    );
+    let edit = mock
+        .wait_for(|r| {
+            r.method == "PATCH"
+                && r.path == "/channels/100000000000000800/messages/100000000000000900"
+        })
+        .await;
+    assert_eq!(edit.body["content"], "✅ Finished in the background");
+
+    assert!(
+        channel
+            .delete_message(session, "100000000000000900")
+            .await
+            .unwrap()
+    );
+    mock.wait_for(|r| {
+        r.method == "DELETE" && r.path == "/channels/100000000000000800/messages/100000000000000900"
+    })
+    .await;
+}

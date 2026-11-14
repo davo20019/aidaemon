@@ -76,6 +76,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
 struct Outlet {
     transport: Arc<SdkDiscord>,
     conversation: Conversation,
+    /// Where a kept card is registered for what outlives the turn (a
+    /// background helper ending) to settle; `None` outside a turn or before
+    /// startup wires the hub.
+    kept: Option<(Arc<ChannelHub>, String)>,
 }
 
 impl Outlet {
@@ -160,6 +164,15 @@ impl TurnSurface for Outlet {
         }))
     }
 
+    /// A card that stays in the chat can still change after the turn: a
+    /// background job settles the steps it was handed, a helper its header.
+    /// The hub edits it through [`HubChannel::edit_text`].
+    async fn card_kept(&self, message_id: &str) {
+        if let Some((hub, session_id)) = &self.kept {
+            hub.register_checklist_surface(session_id, message_id).await;
+        }
+    }
+
     async fn say(&self, text: &str) -> anyhow::Result<Vec<String>> {
         self.say_all(text).await
     }
@@ -237,6 +250,14 @@ impl DiscordBot {
     }
 
     /// Set the channel hub reference for dynamic bot registration.
+    /// The channel hub, once startup wired it.
+    fn hub(&self) -> Option<Arc<ChannelHub>> {
+        self.channel_hub
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(Weak::upgrade))
+    }
+
     pub fn set_channel_hub(&self, hub: Weak<ChannelHub>) {
         if let Ok(mut guard) = self.channel_hub.write() {
             *guard = Some(hub);
@@ -415,9 +436,10 @@ impl DiscordBot {
             return;
         };
         let guild = message.conversation.kind != ConversationKind::Direct;
-        let outlet = Outlet {
+        let mut outlet = Outlet {
             transport: self.transport(),
             conversation: message.conversation.clone(),
+            kept: None,
         };
         // Server members may talk to the bot (as guests); DMs need access.
         if !guild && !self.is_authorized(user_id) && !self.try_auto_claim(user_id).await {
@@ -490,6 +512,7 @@ impl DiscordBot {
         self.runner
             .register_session(&session_id, &self.channel_name())
             .await;
+        outlet.kept = self.hub().map(|hub| (hub, session_id.clone()));
         info!(session_id, "Received Discord message from user {}", user_id);
         self.runner
             .submit(
@@ -535,6 +558,7 @@ impl DiscordBot {
         Ok(Outlet {
             transport: self.transport(),
             conversation: self.conversation_for(session_id).await?,
+            kept: None,
         })
     }
 
@@ -708,6 +732,44 @@ impl HubChannel for DiscordBot {
             .map_err(|e| anyhow::anyhow!("Failed to send Discord message: {}", e))
     }
 
+    async fn send_text_tracked(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let ids = self
+            .outlet_for(session_id)
+            .await?
+            .say_all(text)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send Discord message: {}", e))?;
+        Ok(ids.last().cloned())
+    }
+
+    /// Edits in place (a kept status card settling after its turn).
+    async fn edit_text(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<bool> {
+        let conversation = self.conversation_for(session_id).await?;
+        let message = MessageRef {
+            conversation_id: conversation.id,
+            message_id: message_id.to_string(),
+        };
+        Ok(self.transport().edit(&message, text).await.is_ok())
+    }
+
+    async fn delete_message(&self, session_id: &str, message_id: &str) -> anyhow::Result<bool> {
+        let conversation = self.conversation_for(session_id).await?;
+        let message = MessageRef {
+            conversation_id: conversation.id,
+            message_id: message_id.to_string(),
+        };
+        Ok(self.transport().delete(&message).await.is_ok())
+    }
+
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
         let conversation = self.conversation_for(session_id).await?;
         let (bytes, name) = match &media.kind {
@@ -828,6 +890,7 @@ mod tests {
                 id: "synthetic-dm-1".into(),
                 kind: ConversationKind::Direct,
             },
+            kept: None,
         };
         assert!(outlet.card_sink().is_some());
     }
