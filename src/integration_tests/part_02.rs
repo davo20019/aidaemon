@@ -87,8 +87,8 @@ async fn test_relevant_active_goal_is_rendered_in_owner_prompt() {
         "The bounded relevant-memory tail should include the active goal"
     );
     assert!(
-        content.contains("scheduled_goals"),
-        "System prompt should reference scheduled_goals tool for on-demand access"
+        content.contains("manage_automations(action='list')"),
+        "System prompt should reference manage_automations for on-demand access"
     );
 }
 

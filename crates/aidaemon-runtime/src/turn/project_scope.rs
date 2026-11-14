@@ -586,7 +586,7 @@ pub fn unify_current_turn_scopes(scopes: &[String]) -> Option<String> {
 }
 
 /// A workspace the goal was explicitly bound to (`context.project_scope`,
-/// written by `scheduled_goal_runs bind_workspace` or an earlier recovery).
+/// written by `manage_automations bind_workspace` or an earlier recovery).
 /// Typed durable state: it must be an existing absolute directory. This
 /// binding outranks anything inferred from mission or request text.
 /// Where a turn's workspace binding came from. Only an `Explicit` binding

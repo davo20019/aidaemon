@@ -92,7 +92,7 @@ pub fn effective_alias_roots(
 
 /// A workspace the goal/task was explicitly bound to (`context.project_scope`)
 /// takes precedence over anything derived from mission text. The binding is
-/// typed durable state written by `scheduled_goal_runs bind_workspace` or an
+/// typed durable state written by `manage_automations bind_workspace` or an
 /// earlier recovery; it must be an existing absolute directory.
 pub fn bound_project_scope_from_context(context: Option<&str>) -> Option<String> {
     crate::turn::project_scope::bound_workspace_from_goal_context(context)

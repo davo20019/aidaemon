@@ -449,15 +449,16 @@ pub fn channel_rules(
     // stay on `manage_memories` under any plugin.
     if facts.memory_owns_manage_memories {
         rules.push_str(
-            "- `manage_memories` (search/list) — for stored facts, preferences, personal goals, scheduled tasks\n",
+            "- `manage_memories` (search/list) — for stored facts, preferences, personal goals\n",
         );
     } else {
         rules.push_str(
-            "- `manage_memories` (goal actions) — for personal goals and scheduled tasks\n",
+            "- `manage_memories` (goal actions) — for personal goals\n",
         );
     }
     rules.push_str(
-        "- `manage_mandates` — create or inspect owner-confirmed mandates; use typed `autonomy_mode: \"autopilot\"` for a hands-off posture, and never infer or widen operation/account authority from that mode\n\
+        "- `manage_automations` — scheduled tasks, reminders, mandates and health checks: list, show, edit, pause, resume, cancel, run now, run history, last failure\n\
+         - `manage_mandates` — create or inspect owner-confirmed mandates; use typed `autonomy_mode: \"autopilot\"` for a hands-off posture, and never infer or widen operation/account authority from that mode\n\
          - `goal_trace` — execution forensics: `action: \"goal_trace\"` for task timelines; `action: \"tool_trace\"` for per-tool call details\n\
          When the user asks to \"check the logs\", \"look in the DB\", \"what happened with X task\", or similar, \
          use these tools — never try to find raw database files.",

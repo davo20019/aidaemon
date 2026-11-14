@@ -1154,7 +1154,7 @@ impl ManageMandatesTool {
         // no such authority model: `goal.session_id` only records which owner
         // channel created the goal, and the owner reaches the daemon through
         // several sessions. Enumerating that collection through the shared
-        // loader keeps its membership identical to `scheduled_goal_runs`, so a
+        // loader keeps its membership identical to `manage_automations list`, so a
         // `complete` coverage here really does prove absence (R53).
         let (scheduled_goals, scheduled_coverage) =
             crate::tools::objective_status::load_scheduled_goal_collection(
@@ -1196,7 +1196,7 @@ impl ManageMandatesTool {
             // lifecycle (schedule, latest run, recovery). Project the shared
             // authoritative readout here so an owner audit that consults the
             // mandate surface sees the same typed answer as
-            // `scheduled_goal_runs` instead of reporting "unknown".
+            // `manage_automations` instead of reporting "unknown".
             let schedules = self.state.get_schedules_for_goal(&mandate.goal_id).await?;
             let runs = self.state.get_goal_runs(&mandate.goal_id).await?;
             let recovery = self

@@ -120,7 +120,7 @@ mod tests {
     #[tokio::test]
     async fn mandate_list_projects_the_objective_lifecycle_readout() {
         // An owner audit that consults the mandate surface must see the same
-        // authoritative schedule/run/recovery answer as scheduled_goal_runs,
+        // authoritative schedule/run/recovery answer as manage_automations,
         // not report the objective "unknown".
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
         let state = harness.state.clone();

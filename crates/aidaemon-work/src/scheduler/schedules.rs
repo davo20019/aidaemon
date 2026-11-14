@@ -235,7 +235,7 @@ impl GoalCycle {
                 id: recovery_task_id.clone(),
                 goal_id: goal_id.clone(),
                 description: format!(
-                    "Directly recover and finish: {} [SYSTEM: automatic recovery attempt {attempt} of {} after {} consecutive failed runs (typed cause {}). The schedule is paused until this run completes with verified receipts. Earlier failures recorded in the ledger are historical evidence from a previous environment, not proof that their cause persists: re-run the previously failing step once in this attempt and judge from its fresh receipt before concluding that recovery is exhausted. If the objective's repository or workspace is not present in the attempt workspace, locate it with project_inspect and bind it with scheduled_goal_runs bind_workspace before reporting a blocker.]",
+                    "Directly recover and finish: {} [SYSTEM: automatic recovery attempt {attempt} of {} after {} consecutive failed runs (typed cause {}). The schedule is paused until this run completes with verified receipts. Earlier failures recorded in the ledger are historical evidence from a previous environment, not proof that their cause persists: re-run the previously failing step once in this attempt and judge from its fresh receipt before concluding that recovery is exhausted. If the objective's repository or workspace is not present in the attempt workspace, locate it with project_inspect and bind it with manage_automations bind_workspace before reporting a blocker.]",
                     goal.description,
                     Self::ESCALATED_RECOVERY_MAX_ATTEMPTS,
                     recovery.consecutive_failures,

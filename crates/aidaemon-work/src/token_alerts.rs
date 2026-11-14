@@ -296,8 +296,8 @@ fn build_goal_alert_message(spike: &GoalSpike) -> String {
 
     msg.push_str(&format!(
         "Suggested action: cancel/pause this schedule if unexpected.\n\
-         - manage_memories(action='cancel_scheduled', goal_id='{}')\n\
-         - manage_memories(action='pause_scheduled', goal_id='{}')",
+         - manage_automations(action='cancel', id='{}')\n\
+         - manage_automations(action='pause', id='{}')",
         spike.goal_id, spike.goal_id
     ));
 
