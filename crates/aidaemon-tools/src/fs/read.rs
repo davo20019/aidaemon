@@ -131,6 +131,18 @@ impl crate::semantics::ToolSemantics for ReadFile {
             offering: crate::semantics::Offering::Core,
             same_tool_streak: crate::semantics::SameToolStreak::Versatile,
             file_guard: crate::semantics::FileGuard::Reads,
+            recap: crate::semantics::RecapKind::FileRead,
+            activity: crate::semantics::ToolActivity::Fixed(
+                aidaemon_core::card::ActivityKind::Read,
+            ),
+            opens_project_instructions: true,
+            status_label: Some("reading a file"),
+            result_fit: crate::semantics::ResultFit {
+                pages_spilled_results: true,
+                ..Default::default()
+            },
+            evidence: crate::semantics::EvidenceSource::FileRead,
+            semantic_scope: Some(crate::semantics::ToolSemanticScope::LocalWorkspace),
             ..Default::default()
         }
     }

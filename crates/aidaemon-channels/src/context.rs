@@ -272,11 +272,9 @@ mod workspace_grant_tests {
         assert!(!read_grant.allows_tool("write_file"));
         for dangerous in [
             "terminal",
-            "run_command",
             "cli_agent",
             "spawn_agent",
             "send_file",
-            "git_commit",
             "manage_config",
             "manage_memories",
             "browser",

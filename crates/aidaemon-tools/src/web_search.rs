@@ -821,6 +821,12 @@ impl crate::semantics::ToolSemantics for WebSearch {
         crate::semantics::ToolDispatchFacts {
             offering: crate::semantics::Offering::Core,
             same_tool_streak: crate::semantics::SameToolStreak::Versatile,
+            recap: crate::semantics::RecapKind::Search,
+            activity: crate::semantics::ToolActivity::Fixed(aidaemon_core::card::ActivityKind::Web),
+            channel_reach: crate::semantics::ChannelReach::Public,
+            evidence: crate::semantics::EvidenceSource::WebSearch,
+            semantic_scope: Some(crate::semantics::ToolSemanticScope::ExternalRemote),
+            status_label: Some("searching the web"),
             ..Default::default()
         }
     }

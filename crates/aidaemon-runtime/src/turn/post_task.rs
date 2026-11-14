@@ -21,7 +21,7 @@ pub struct LearningContext {
     /// skipped.
     pub memory_persistence_allowed: bool,
     pub intent_domains: Vec<String>,
-    pub tool_calls: Vec<String>,     // "tool_name(summary)"
+    pub tool_calls: Vec<LearnedCall>,
     pub errors: Vec<(String, bool)>, // (error_text, was_recovered)
     pub first_error: Option<String>,
     pub recovery_actions: Vec<String>,
@@ -34,6 +34,53 @@ pub struct LearningContext {
     pub task_outcome: Option<TaskOutcome>,
 }
 
+/// One call as post-task learning records it: its `tool_name(summary)`
+/// line (marked when it was rejected or failed, as memory reads it), and the
+/// typed facts the recap counts it by: the tool's `recap` kind and whether
+/// it ran to completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearnedCall {
+    pub line: String,
+    /// What the call's arguments say, in a few words.
+    pub summary: String,
+    pub recap: aidaemon_tools::semantics::RecapKind,
+    /// Refused before it ran.
+    pub rejected: bool,
+    /// Ran and failed.
+    pub failed: bool,
+}
+
+impl LearnedCall {
+    pub fn new(
+        name: &str,
+        summary: String,
+        recap: aidaemon_tools::semantics::RecapKind,
+        rejected: bool,
+        failed: bool,
+    ) -> Self {
+        let line = format!("{name}({summary})");
+        let line = if rejected {
+            format!("{line} [REJECTED]")
+        } else if failed {
+            format!("{line} [FAILED]")
+        } else {
+            line
+        };
+        Self {
+            line,
+            summary,
+            recap,
+            rejected,
+            failed,
+        }
+    }
+
+    /// The call ran to completion: activity a recap may claim.
+    pub fn completed(&self) -> bool {
+        !self.rejected && !self.failed
+    }
+}
+
 impl LearningContext {
     /// What the full memory system learns from: this run, with the first
     /// error stripped of the daemon's scaffolding lines.
@@ -42,7 +89,7 @@ impl LearningContext {
             user_text: self.user_text,
             persistence_allowed: self.memory_persistence_allowed,
             intent_domains: self.intent_domains,
-            tool_calls: self.tool_calls,
+            tool_calls: self.tool_calls.into_iter().map(|call| call.line).collect(),
             errors: self.errors,
             first_error: self.first_error.map(|error| {
                 error
@@ -399,23 +446,23 @@ pub fn redact_error_line_for_summary(key_line: &str) -> String {
     aidaemon_tools::sanitize::redact_secrets(&windows_summarized)
 }
 
-///
-/// Parses entries like `"read_file(Hero.jsx)"` and `"terminal(\`pip install fpdf\`)"` into
-/// grouped categories so the next interaction can understand what was already done.
+/// The calls' activity, grouped by each tool's typed recap kind so the next
+/// interaction can understand what was already done.
 ///
 /// Recap for internal/LLM context — keeps raw command text so the model can see
 /// exactly what already ran (helps avoid re-running the same command).
-pub fn categorize_tool_calls(tool_calls: &[String]) -> String {
+pub fn categorize_tool_calls(tool_calls: &[LearnedCall]) -> String {
     categorize_tool_calls_inner(tool_calls, false)
 }
 
 /// Recap for user-facing replies — redacts raw shell commands to a count so they
 /// never reach chat, while keeping file / search / source detail.
-pub fn categorize_tool_calls_user_facing(tool_calls: &[String]) -> String {
+pub fn categorize_tool_calls_user_facing(tool_calls: &[LearnedCall]) -> String {
     categorize_tool_calls_inner(tool_calls, true)
 }
 
-fn categorize_tool_calls_inner(tool_calls: &[String], redact_commands: bool) -> String {
+fn categorize_tool_calls_inner(tool_calls: &[LearnedCall], redact_commands: bool) -> String {
+    use aidaemon_tools::semantics::RecapKind;
     let mut files_read: Vec<&str> = Vec::new();
     let mut files_written: Vec<&str> = Vec::new();
     let mut commands_run: Vec<&str> = Vec::new();
@@ -426,30 +473,11 @@ fn categorize_tool_calls_inner(tool_calls: &[String], redact_commands: bool) -> 
 
     let mut failed_mutations: Vec<&str> = Vec::new();
 
-    for entry in tool_calls {
-        // Detect and strip [FAILED] suffix — failed tool calls are tracked
-        // separately so activity summaries don't claim success on failures.
-        let (clean_entry, is_failed, was_rejected) =
-            if let Some(stripped) = entry.strip_suffix(" [FAILED]") {
-                (stripped, true, false)
-            } else if let Some(stripped) = entry.strip_suffix(" [REJECTED]") {
-                (stripped, false, true)
-            } else {
-                (entry.as_str(), false, false)
-            };
-
-        // Parse "tool_name(summary)" format
-        let (name, args) = match clean_entry.find('(') {
-            Some(idx) => {
-                let name = &clean_entry[..idx];
-                let args = clean_entry[idx + 1..].trim_end_matches(')');
-                (name, args)
-            }
-            None => (clean_entry, ""),
-        };
-
-        // Failed write/edit operations go to a separate bucket.
-        if is_failed && matches!(name, "write_file" | "edit_file") {
+    for call in tool_calls {
+        let args = call.summary.as_str();
+        // Failed file writes go to a separate bucket, so activity summaries
+        // don't claim success on failures.
+        if call.failed && call.recap == RecapKind::FileWrite {
             if !args.is_empty() {
                 failed_mutations.push(args);
             }
@@ -459,18 +487,18 @@ fn categorize_tool_calls_inner(tool_calls: &[String], redact_commands: bool) -> 
         // not completed activity. Its concrete outcome remains in the tool
         // receipt/model context and must not become “Files read” or “Commands
         // run” in a fallback completion card.
-        if is_failed || was_rejected {
+        if !call.completed() {
             continue;
         }
 
-        match name {
-            "read_file" => files_read.push(args),
-            "write_file" | "edit_file" => files_written.push(args),
-            "terminal" | "run_command" => commands_run.push(args),
-            "send_file" | "send_media" => files_sent.push(args),
-            "web_search" | "search_files" => searches.push(args),
-            "web_fetch" | "http_request" => external_reads.push(args),
-            _ => {
+        match call.recap {
+            RecapKind::FileRead => files_read.push(args),
+            RecapKind::FileWrite => files_written.push(args),
+            RecapKind::Command => commands_run.push(args),
+            RecapKind::FileSent => files_sent.push(args),
+            RecapKind::Search => searches.push(args),
+            RecapKind::ExternalRead => external_reads.push(args),
+            RecapKind::Other => {
                 if !args.is_empty() {
                     other.push(args);
                 }
@@ -550,6 +578,37 @@ fn categorize_tool_calls_inner(tool_calls: &[String], redact_commands: bool) -> 
 mod tests {
     use super::*;
 
+    /// Calls written as the learning line (`name(summary)`, maybe marked
+    /// `[FAILED]` or `[REJECTED]`), with the recap kind the real tool of that
+    /// name declares.
+    fn learned(lines: Vec<String>) -> Vec<LearnedCall> {
+        use aidaemon_tools::semantics::RecapKind;
+        lines
+            .into_iter()
+            .map(|line| {
+                let (line, rejected, failed) = match line.strip_suffix(" [REJECTED]") {
+                    Some(rest) => (rest.to_string(), true, false),
+                    None => match line.strip_suffix(" [FAILED]") {
+                        Some(rest) => (rest.to_string(), false, true),
+                        None => (line, false, false),
+                    },
+                };
+                let (name, summary) = line.split_once('(').unwrap_or((&line, ""));
+                let recap = match name {
+                    "read_file" => RecapKind::FileRead,
+                    "write_file" | "edit_file" => RecapKind::FileWrite,
+                    "terminal" => RecapKind::Command,
+                    "send_file" => RecapKind::FileSent,
+                    "web_search" | "search_files" => RecapKind::Search,
+                    "web_fetch" | "http_request" => RecapKind::ExternalRead,
+                    _ => RecapKind::Other,
+                };
+                let summary = summary.strip_suffix(')').unwrap_or(summary).to_string();
+                LearnedCall::new(name, summary, recap, rejected, failed)
+            })
+            .collect()
+    }
+
     #[test]
     fn test_categorize_tool_calls_groups_correctly() {
         let calls = vec![
@@ -562,7 +621,7 @@ mod tests {
             "web_search(top things Chantilly VA)".to_string(),
             "read_file(chantilly-va-site)".to_string(),
         ];
-        let result = categorize_tool_calls(&calls);
+        let result = categorize_tool_calls(&learned(calls.clone()));
         assert!(result.contains("Files read:"));
         assert!(result.contains("Hero.jsx"));
         assert!(result.contains("chantilly-va-site"));
@@ -581,8 +640,8 @@ mod tests {
             "terminal(`cd '/tmp' && timeout 45s python3 /tmp/netprobe6.py`)".to_string(),
             "terminal(`cd '/tmp' && python3 /tmp/netprobe6.py`)".to_string(),
         ];
-        let internal = categorize_tool_calls(&calls);
-        let user = categorize_tool_calls_user_facing(&calls);
+        let internal = categorize_tool_calls(&learned(calls.clone()));
+        let user = categorize_tool_calls_user_facing(&learned(calls.clone()));
         // Internal recap keeps the raw command so the model can see what ran.
         assert!(internal.contains("cd '/tmp'"));
         // User-facing recap NEVER surfaces a raw shell command.
@@ -607,8 +666,8 @@ mod tests {
             "read_file(synthetic.toml) [REJECTED]".to_string(),
             "terminal(`/usr/bin/false`) [FAILED]".to_string(),
         ];
-        assert!(categorize_tool_calls(&calls).is_empty());
-        assert!(categorize_tool_calls_user_facing(&calls).is_empty());
+        assert!(categorize_tool_calls(&learned(calls.clone())).is_empty());
+        assert!(categorize_tool_calls_user_facing(&learned(calls.clone())).is_empty());
     }
 
     #[test]
@@ -616,7 +675,7 @@ mod tests {
         let calls: Vec<String> = (0..20)
             .map(|i| format!("read_file(file_{}.rs)", i))
             .collect();
-        let result = categorize_tool_calls(&calls);
+        let result = categorize_tool_calls(&learned(calls.clone()));
         // Should include max 15 files
         assert!(result.contains("file_14.rs"));
         assert!(!result.contains("file_15.rs"));
@@ -628,12 +687,12 @@ mod tests {
             user_text: "Create a PDF".to_string(),
             memory_persistence_allowed: true,
             intent_domains: vec![],
-            tool_calls: vec![
+            tool_calls: learned(vec![
                 "read_file(App.jsx)".to_string(),
                 "terminal(`pip install fpdf`)".to_string(),
                 "write_file(gen.py)".to_string(),
                 "send_file(out.pdf)".to_string(),
-            ],
+            ]),
             errors: vec![],
             first_error: None,
             recovery_actions: vec![],
@@ -668,7 +727,7 @@ mod tests {
             user_text: "big task".to_string(),
             memory_persistence_allowed: true,
             intent_domains: vec![],
-            tool_calls: calls,
+            tool_calls: learned(calls),
             errors: vec![],
             first_error: None,
             recovery_actions: vec![],
@@ -688,10 +747,10 @@ mod tests {
             user_text: "run the scheduled build".to_string(),
             memory_persistence_allowed: true,
             intent_domains: vec![],
-            tool_calls: vec![
+            tool_calls: learned(vec![
                 "system_info({})".to_string(),
                 "write_file(index.html)".to_string(),
-            ],
+            ]),
             errors: vec![("temporary issue".to_string(), false)],
             first_error: None,
             recovery_actions: vec![],
@@ -715,12 +774,12 @@ mod tests {
             user_text: "deploy the app".to_string(),
             memory_persistence_allowed: true,
             intent_domains: vec![],
-            tool_calls: vec![
+            tool_calls: learned(vec![
                 "read_file(main.rs)".to_string(),
                 "terminal(`cargo build`)".to_string(),
                 "write_file(deploy.sh)".to_string(),
                 "terminal(`./deploy.sh`)".to_string(),
-            ],
+            ]),
             errors: vec![],
             first_error: None,
             recovery_actions: vec![],
@@ -808,7 +867,7 @@ mod tests {
             user_text: "do something".to_string(),
             memory_persistence_allowed: true,
             intent_domains: vec![],
-            tool_calls: vec![],
+            tool_calls: learned(vec![]),
             errors: vec![(error.to_string(), false)],
             first_error: None,
             recovery_actions: vec![],
@@ -870,7 +929,7 @@ mod tests {
             user_text: "inspect homepage".to_string(),
             memory_persistence_allowed: true,
             intent_domains: vec!["web".to_string()],
-            tool_calls: vec!["browser(navigate)".to_string()],
+            tool_calls: learned(vec!["browser(navigate)".to_string()]),
             errors: vec![],
             first_error: None,
             recovery_actions: vec![],

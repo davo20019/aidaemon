@@ -381,10 +381,10 @@ where
     ))
 }
 
-/// The `shell` kit's `run_command`, over a shared "OrbStack is running" flag.
+/// The `shell` kit's `terminal`, over a shared "OrbStack is running" flag.
 fn orbstack_shell(running: Arc<std::sync::atomic::AtomicBool>) -> Arc<dyn Tool> {
     fn_tool(
-        "run_command",
+        "terminal",
         "Run a shell command on the owner's laptop (the owner allows this)",
         &["command"],
         ToolAnnotations::WRITE,
@@ -447,14 +447,14 @@ fn orbstack_shell(running: Arc<std::sync::atomic::AtomicBool>) -> Arc<dyn Tool> 
 ///   files, each naming the next, the last holding [`TRAIL_CODE`].
 /// - `service`: `build_site` (write, `project`) fails with a Docker
 ///   connection error until `start_service` (write, `service`) has run;
-///   `service_status` (read-only, `service`) reports the container engine
+///   `check_service` (read-only, `service`) reports the container engine
 ///   stopped, then running.
-/// - `shell`: `run_command` (write, `command`), a scripted shell on the
+/// - `shell`: `terminal` (write, `command`), a scripted shell on the
 ///   owner's laptop: `ddev` commands fail with the same Docker error until
 ///   a command starts OrbStack (`orb start`, `open -a OrbStack`); `ddev`
 ///   then answers with the project's URL (`school` unless `--project-name=` says otherwise), `orb status` with the engine's
 ///   state, anything else with no output.
-/// - `delegate`: that `run_command` and a `spawn_agent` (write, `mission`)
+/// - `delegate`: that `terminal` and a `spawn_agent` (write, `mission`)
 ///   whose sub-agent reports the Docker error as incomplete work until
 ///   OrbStack runs, then the site's URL.
 pub fn kit_tools(kit: &str) -> Result<Vec<Arc<dyn Tool>>, FactoryError> {
@@ -637,7 +637,7 @@ pub fn kit_tools(kit: &str) -> Result<Vec<Arc<dyn Tool>>, FactoryError> {
             let (status, start, build) = (running.clone(), running.clone(), running);
             vec![
                 fn_tool(
-                    "service_status",
+                    "check_service",
                     "Status of a local service or app on this machine",
                     &["service"],
                     ToolAnnotations::READ_ONLY,

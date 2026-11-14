@@ -500,7 +500,7 @@ pub fn classify_tool_result_failure(
         // For terminal commands that produced substantial output (>500 chars),
         // the command clearly ran and returned data (e.g., pytest with failing
         // tests). Only treat short-output non-zero exits as real failures.
-        if matches!(tool_name, "terminal" | "run_command") && cleaned.len() > 500 {
+        if tool_name == "terminal" && cleaned.len() > 500 {
             return None;
         }
         return Some(classify_text_error(&lower));
@@ -515,7 +515,7 @@ pub fn classify_tool_result_failure(
     // in the output (e.g. pytest headers, test names containing "error")
     // are content, not actual errors. Only flag short outputs.
     if !saw_success_http_status && looks_like_error_signal(&lower) {
-        if matches!(tool_name, "terminal" | "run_command") && cleaned.len() > 500 {
+        if tool_name == "terminal" && cleaned.len() > 500 {
             return None;
         }
         return Some(classify_text_error(&lower));
@@ -544,9 +544,7 @@ pub fn classify_tool_result_failure_with_args(
         return classified;
     }
 
-    if !matches!(tool_name, "terminal" | "run_command")
-        || !looks_like_empty_tool_output(result_text)
-    {
+    if tool_name != "terminal" || !looks_like_empty_tool_output(result_text) {
         return None;
     }
 
@@ -660,7 +658,7 @@ pub fn classify_tool_result_failure_with_context(
                 // Test runner with failures: not an error, let LLM interpret
             }
             // Explicit terminal success should not be reclassified by text scanning.
-            if matches!(tool_name, "terminal" | "run_command") {
+            if tool_name == "terminal" {
                 return None;
             }
         }
@@ -1005,7 +1003,7 @@ mod tool_error_detection_tests {
 
     #[test]
     fn detects_nonzero_exit_without_prefix() {
-        let classified = classify_tool_result_failure("run_command", "$ make test (exit: 2, 22ms)");
+        let classified = classify_tool_result_failure("terminal", "$ make test (exit: 2, 22ms)");
         assert_eq!(classified, Some(ToolFailureClass::Semantic));
     }
 
@@ -1027,7 +1025,7 @@ mod tool_error_detection_tests {
     fn detects_embedded_json_error_payload_with_command_header() {
         let result =
             "$ curl -s https://api.example.com (exit: 0, 9ms)\n\n{\"error\":\"not found\"}";
-        let classified = classify_tool_result_failure("run_command", result);
+        let classified = classify_tool_result_failure("terminal", result);
         assert_eq!(classified, Some(ToolFailureClass::Semantic));
     }
 

@@ -123,7 +123,7 @@ mod tests {
                 "Sure, I can help.\n[INTENT_GATE] {\"can_answer_now\":false}",
             ),
         ];
-        let messages = extract_recent_parent_messages(&history, 6);
+        let messages = extract_recent_parent_messages(&history, 6, |_| Default::default());
         assert_eq!(messages.len(), 2);
         let assistant_content = messages[1]
             .get("content")
@@ -166,7 +166,7 @@ mod tests {
             msg("assistant", "I fetched the results and sent the file."),
         ];
 
-        let messages = extract_recent_parent_messages(&history, 6);
+        let messages = extract_recent_parent_messages(&history, 6, |_| Default::default());
         assert!(messages.iter().any(|row| {
             row.get("role").and_then(|v| v.as_str()) == Some("tool")
                 && row
@@ -207,7 +207,7 @@ mod tests {
             ),
         ];
 
-        let messages = extract_recent_parent_messages(&history, 6);
+        let messages = extract_recent_parent_messages(&history, 6, |_| Default::default());
         assert!(messages.iter().any(|row| {
             row.get("role").and_then(|v| v.as_str()) == Some("tool")
                 && row
@@ -241,7 +241,7 @@ mod tests {
             msg("assistant", "That page fetch failed."),
         ];
 
-        let messages = extract_recent_parent_messages(&history, 6);
+        let messages = extract_recent_parent_messages(&history, 6, |_| Default::default());
         assert!(messages.iter().any(|row| {
             row.get("role").and_then(|v| v.as_str()) == Some("tool")
                 && row.get("content").and_then(|v| v.as_str()).is_some_and(|content| {
@@ -268,7 +268,7 @@ mod tests {
             msg("assistant", "The tests failed."),
         ];
 
-        let messages = extract_recent_parent_messages(&history, 6);
+        let messages = extract_recent_parent_messages(&history, 6, |_| Default::default());
         assert!(messages.iter().any(|row| {
             row.get("role").and_then(|v| v.as_str()) == Some("tool")
                 && row

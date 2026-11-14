@@ -1146,6 +1146,15 @@ impl crate::semantics::ToolSemantics for WebFetch {
             offering: crate::semantics::Offering::Core,
             network_reach: crate::semantics::NetworkReach::PublicOnly,
             same_tool_streak: crate::semantics::SameToolStreak::Versatile,
+            recap: crate::semantics::RecapKind::ExternalRead,
+            activity: crate::semantics::ToolActivity::Fixed(aidaemon_core::card::ActivityKind::Web),
+            status_label: Some("fetching a page"),
+            result_fit: crate::semantics::ResultFit {
+                compact_json: true,
+                ..Default::default()
+            },
+            evidence: crate::semantics::EvidenceSource::RemoteRead,
+            semantic_scope: Some(crate::semantics::ToolSemanticScope::ExternalRemote),
             ..Default::default()
         }
     }

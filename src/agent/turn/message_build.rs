@@ -449,7 +449,13 @@ mod tests {
         let tool_defs: Vec<Value> = Vec::new();
         let mut pending_system_messages = Vec::new();
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
-        let completed_tool_calls = vec!["system_info({})".to_string()];
+        let completed_tool_calls = vec![aidaemon_runtime::turn::post_task::LearnedCall::new(
+            "system_info",
+            "{}".to_string(),
+            Default::default(),
+            false,
+            false,
+        )];
 
         let mut ctx = MessageBuildCtx {
             session_id: "test-session",
@@ -1160,7 +1166,13 @@ mod tests {
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
         let mut pending_system_messages = vec![SystemDirective::FreshConversationContext];
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
-        let completed_tool_calls = vec!["system_info({})".to_string()];
+        let completed_tool_calls = vec![aidaemon_runtime::turn::post_task::LearnedCall::new(
+            "system_info",
+            "{}".to_string(),
+            Default::default(),
+            false,
+            false,
+        )];
         let system_prompt = "Root agent operating guidance and tool policy. ".repeat(650);
 
         let mut ctx = MessageBuildCtx {

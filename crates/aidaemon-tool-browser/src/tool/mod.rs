@@ -2499,6 +2499,8 @@ impl aidaemon_tools::semantics::ToolSemantics for BrowserTool {
             keeps_own_grants: true,
             network_reach: aidaemon_tools::semantics::NetworkReach::PublicAndLoopback,
             file_guard: aidaemon_tools::semantics::FileGuard::SensitiveReads,
+            evidence: aidaemon_tools::semantics::EvidenceSource::RemoteRead,
+            semantic_scope: Some(aidaemon_tools::semantics::ToolSemanticScope::ExternalRemote),
             ..Default::default()
         }
     }

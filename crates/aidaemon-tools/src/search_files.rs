@@ -302,6 +302,14 @@ impl crate::semantics::ToolSemantics for SearchFiles {
         crate::semantics::ToolDispatchFacts {
             offering: crate::semantics::Offering::Core,
             same_tool_streak: crate::semantics::SameToolStreak::Versatile,
+            recap: crate::semantics::RecapKind::Search,
+            activity: crate::semantics::ToolActivity::Fixed(
+                aidaemon_core::card::ActivityKind::Search,
+            ),
+            project_dir_argument: crate::semantics::ProjectDirArgument::SearchRoot,
+            evidence: crate::semantics::EvidenceSource::FileSearch,
+            semantic_scope: Some(crate::semantics::ToolSemanticScope::LocalWorkspace),
+            status_label: Some("searching files"),
             ..Default::default()
         }
     }

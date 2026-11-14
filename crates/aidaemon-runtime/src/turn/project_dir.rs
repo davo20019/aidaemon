@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 
 use aidaemon_events::traits::{ToolCallSemantics, ToolTargetHintKind};
+use aidaemon_tools::semantics::ProjectDirArgument;
 
 const PATH_ARGUMENT_KEYS: &[&str] = &[
     "path",
@@ -178,7 +179,7 @@ fn collect_project_dirs_from_value(
 
 pub fn extract_project_dirs_from_tool_args(
     backend: &dyn aidaemon_tools::ExecutionBackend,
-    tool_name: &str,
+    argument: ProjectDirArgument,
     args_json: &str,
 ) -> Vec<String> {
     let parsed = match serde_json::from_str::<Value>(args_json) {
@@ -187,7 +188,7 @@ pub fn extract_project_dirs_from_tool_args(
     };
 
     let mut dirs = Vec::new();
-    if tool_name == "terminal" {
+    if argument == ProjectDirArgument::ShellWorkingDir {
         if let Some(cwd) = parsed.get("cwd") {
             collect_project_dirs_from_value(backend, cwd, Some("cwd"), &mut dirs);
         }
@@ -206,14 +207,11 @@ pub fn extract_project_dirs_from_tool_args(
 /// directories mirror the just-in-time behavior of established coding agents.
 pub fn project_instruction_targets_for_tool_call(
     backend: &dyn aidaemon_tools::ExecutionBackend,
-    tool_name: &str,
+    facts: &aidaemon_tools::semantics::ToolDispatchFacts,
     args_json: &str,
     semantics: &ToolCallSemantics,
 ) -> Vec<String> {
-    if !matches!(
-        tool_name,
-        "read_file" | "write_file" | "edit_file" | "terminal" | "run_command"
-    ) {
+    if !facts.opens_project_instructions {
         return Vec::new();
     }
 
@@ -227,7 +225,9 @@ pub fn project_instruction_targets_for_tool_call(
             targets.push(hint.value.clone());
         }
     }
-    for directory in extract_project_dirs_from_tool_args(backend, tool_name, args_json) {
+    for directory in
+        extract_project_dirs_from_tool_args(backend, facts.project_dir_argument, args_json)
+    {
         if !targets.iter().any(|existing| existing == &directory) {
             targets.push(directory);
         }
@@ -236,27 +236,19 @@ pub fn project_instruction_targets_for_tool_call(
     targets
 }
 
-fn project_dir_arg_key_for_tool(tool_name: &str) -> Option<&'static str> {
-    match tool_name {
-        "search_files" | "check_environment" => Some("path"),
-        "run_command" | "cli_agent" => Some("working_dir"),
-        _ => None,
-    }
-}
-
 pub fn project_dir_from_tool_args(
     backend: &dyn aidaemon_tools::ExecutionBackend,
-    tool_name: &str,
+    argument: ProjectDirArgument,
     args_json: &str,
 ) -> Option<String> {
-    extract_project_dirs_from_tool_args(backend, tool_name, args_json)
+    extract_project_dirs_from_tool_args(backend, argument, args_json)
         .into_iter()
         .next()
 }
 
 pub fn maybe_inject_project_dir_into_tool_args(
     backend: &dyn aidaemon_tools::ExecutionBackend,
-    tool_name: &str,
+    argument: ProjectDirArgument,
     args_json: &str,
     known_project_dir: Option<&str>,
 ) -> Option<(String, String)> {
@@ -267,7 +259,7 @@ pub fn maybe_inject_project_dir_into_tool_args(
 
     let mut parsed = serde_json::from_str::<Value>(args_json).ok()?;
     let obj = parsed.as_object_mut()?;
-    if tool_name == "terminal" {
+    if argument == ProjectDirArgument::ShellWorkingDir {
         if ["working_dir", "cwd"].iter().any(|key| {
             obj.get(*key)
                 .and_then(|v| v.as_str())
@@ -299,7 +291,7 @@ pub fn maybe_inject_project_dir_into_tool_args(
         return Some((updated, injected_dir));
     }
 
-    let key = project_dir_arg_key_for_tool(tool_name)?;
+    let key = argument.injected_key()?;
     if obj
         .get(key)
         .and_then(|v| v.as_str())
@@ -308,7 +300,7 @@ pub fn maybe_inject_project_dir_into_tool_args(
         return None;
     }
 
-    let injected_dir = if matches!(tool_name, "run_command" | "cli_agent") {
+    let injected_dir = if argument == ProjectDirArgument::WorkingDir {
         // Scaffolding flow: if the target project dir doesn't exist yet, use
         // the nearest existing parent as working_dir so creation commands can run.
         resolve_injected_working_dir(backend, project_dir)
@@ -326,7 +318,7 @@ mod tests {
     use super::*;
 
     fn maybe_inject_project_dir_into_tool_args(
-        tool_name: &str,
+        tool_name: ProjectDirArgument,
         args_json: &str,
         known_project_dir: Option<&str>,
     ) -> Option<(String, String)> {
@@ -338,7 +330,10 @@ mod tests {
         )
     }
 
-    fn project_dir_from_tool_args(tool_name: &str, args_json: &str) -> Option<String> {
+    fn project_dir_from_tool_args(
+        tool_name: ProjectDirArgument,
+        args_json: &str,
+    ) -> Option<String> {
         super::project_dir_from_tool_args(
             &*aidaemon_tools::testing::active_execution_backend(),
             tool_name,
@@ -346,7 +341,10 @@ mod tests {
         )
     }
 
-    fn extract_project_dirs_from_tool_args(tool_name: &str, args_json: &str) -> Vec<String> {
+    fn extract_project_dirs_from_tool_args(
+        tool_name: ProjectDirArgument,
+        args_json: &str,
+    ) -> Vec<String> {
         super::extract_project_dirs_from_tool_args(
             &*aidaemon_tools::testing::active_execution_backend(),
             tool_name,
@@ -354,14 +352,24 @@ mod tests {
         )
     }
 
+    /// A tool whose touches open project instructions, finding its
+    /// directory as `argument` says.
+    fn opening(argument: ProjectDirArgument) -> aidaemon_tools::semantics::ToolDispatchFacts {
+        aidaemon_tools::semantics::ToolDispatchFacts {
+            opens_project_instructions: true,
+            project_dir_argument: argument,
+            ..Default::default()
+        }
+    }
+
     fn project_instruction_targets_for_tool_call(
-        tool_name: &str,
+        facts: aidaemon_tools::semantics::ToolDispatchFacts,
         args_json: &str,
         semantics: &ToolCallSemantics,
     ) -> Vec<String> {
         super::project_instruction_targets_for_tool_call(
             &*aidaemon_tools::testing::active_execution_backend(),
-            tool_name,
+            &facts,
             args_json,
             semantics,
         )
@@ -407,9 +415,12 @@ mod tests {
     #[test]
     fn injects_project_dir_when_path_missing() {
         let args = r#"{"glob":"*.html"}"#;
-        let (updated, injected) =
-            maybe_inject_project_dir_into_tool_args("search_files", args, Some("/tmp/myproj"))
-                .expect("injection");
+        let (updated, injected) = maybe_inject_project_dir_into_tool_args(
+            ProjectDirArgument::SearchRoot,
+            args,
+            Some("/tmp/myproj"),
+        )
+        .expect("injection");
         assert_eq!(injected, "/tmp/myproj");
         assert!(updated.contains(r#""path":"/tmp/myproj""#));
     }
@@ -417,8 +428,11 @@ mod tests {
     #[test]
     fn does_not_override_existing_project_path() {
         let args = r#"{"glob":"*.html","path":"/tmp/explicit"}"#;
-        let updated =
-            maybe_inject_project_dir_into_tool_args("search_files", args, Some("/tmp/inferred"));
+        let updated = maybe_inject_project_dir_into_tool_args(
+            ProjectDirArgument::SearchRoot,
+            args,
+            Some("/tmp/inferred"),
+        );
         assert!(updated.is_none());
     }
 
@@ -433,7 +447,7 @@ mod tests {
     fn extracts_project_dirs_from_nested_path_arguments() {
         let args =
             r#"{"path":"./workspace/app","changes":[{"file_path":"./workspace/app/src/main.rs"}]}"#;
-        let dirs = extract_project_dirs_from_tool_args("edit_file", args);
+        let dirs = extract_project_dirs_from_tool_args(ProjectDirArgument::AnyPath, args);
         assert!(!dirs.is_empty());
         assert!(dirs.iter().any(|d| d.ends_with("/workspace/app")));
     }
@@ -441,7 +455,7 @@ mod tests {
     #[test]
     fn terminal_command_text_does_not_declare_project_scope() {
         let args = r#"{"command":"cd ~/projects/demo && npm run build"}"#;
-        let dirs = extract_project_dirs_from_tool_args("terminal", args);
+        let dirs = extract_project_dirs_from_tool_args(ProjectDirArgument::ShellWorkingDir, args);
         assert!(dirs.is_empty());
     }
 
@@ -450,7 +464,7 @@ mod tests {
         let read_semantics = ToolCallSemantics::observation()
             .with_target_hint(ToolTargetHintKind::Path, "crates/widget/src/lib.rs");
         let targets = project_instruction_targets_for_tool_call(
-            "read_file",
+            opening(ProjectDirArgument::AnyPath),
             r#"{"path":"crates/widget/src/lib.rs"}"#,
             &read_semantics,
         );
@@ -461,7 +475,10 @@ mod tests {
         );
         assert!(
             project_instruction_targets_for_tool_call(
-                "search_files",
+                aidaemon_tools::semantics::ToolDispatchFacts {
+                    project_dir_argument: ProjectDirArgument::SearchRoot,
+                    ..Default::default()
+                },
                 r#"{"path":"crates/widget","glob":"*.rs"}"#,
                 &read_semantics,
             )
@@ -474,7 +491,7 @@ mod tests {
         let args =
             r#"{"command":"sed -i '' crates/widget/src/lib.rs && cargo test","cwd":"/tmp/repo"}"#;
         let targets = project_instruction_targets_for_tool_call(
-            "terminal",
+            opening(ProjectDirArgument::ShellWorkingDir),
             args,
             &ToolCallSemantics::mutation(),
         );
@@ -490,7 +507,7 @@ mod tests {
         std::fs::create_dir_all(&project).expect("create project");
         let args = r#"{"command":"pwd && ls dist"}"#;
         let (updated, injected) = maybe_inject_project_dir_into_tool_args(
-            "terminal",
+            ProjectDirArgument::ShellWorkingDir,
             args,
             Some(project.to_string_lossy().as_ref()),
         )
@@ -533,7 +550,7 @@ mod tests {
         std::fs::create_dir_all(&inferred).expect("create inferred project");
         let args = r#"{"command":"cd /tmp/explicit && npm run build"}"#;
         let (updated, injected) = maybe_inject_project_dir_into_tool_args(
-            "terminal",
+            ProjectDirArgument::ShellWorkingDir,
             args,
             Some(inferred.to_string_lossy().as_ref()),
         )
@@ -563,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn run_command_injection_falls_back_to_existing_parent_when_target_missing() {
+    fn working_dir_injection_falls_back_to_existing_parent_when_target_missing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent = tmp.path().join("projects");
         std::fs::create_dir_all(&parent).expect("create parent");
@@ -571,7 +588,7 @@ mod tests {
         let args = r#"{"command":"pwd"}"#;
 
         let (updated, injected) = maybe_inject_project_dir_into_tool_args(
-            "run_command",
+            ProjectDirArgument::WorkingDir,
             args,
             Some(target.to_string_lossy().as_ref()),
         )
@@ -589,7 +606,7 @@ mod tests {
         let args = r#"{"action":"run","prompt":"inspect the logs"}"#;
 
         let (updated, injected) = maybe_inject_project_dir_into_tool_args(
-            "cli_agent",
+            ProjectDirArgument::WorkingDir,
             args,
             Some(project.to_string_lossy().as_ref()),
         )
@@ -659,7 +676,8 @@ mod tests {
             r#"{{"file_path":"{}"}}"#,
             src.join("posts.js").to_string_lossy()
         );
-        let extracted = project_dir_from_tool_args("edit_file", &args).expect("project dir");
+        let extracted =
+            project_dir_from_tool_args(ProjectDirArgument::AnyPath, &args).expect("project dir");
         assert_eq!(extracted, root.to_string_lossy());
     }
 
@@ -672,7 +690,7 @@ mod tests {
                 "path": path.clone()
             })
             .to_string();
-            let dirs = extract_project_dirs_from_tool_args("search_files", &args);
+            let dirs = extract_project_dirs_from_tool_args(ProjectDirArgument::SearchRoot, &args);
             let unique: std::collections::HashSet<String> = dirs.iter().cloned().collect();
             prop_assert_eq!(dirs.len(), unique.len());
         }

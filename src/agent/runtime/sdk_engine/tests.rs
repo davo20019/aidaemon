@@ -1412,10 +1412,13 @@ fn same_tool_streaks_follow_the_guard_limits() {
 #[test]
 fn learning_records_each_call_with_its_outcome() {
     let args = r#"{"path":"notes.txt"}"#;
-    let ok = learning_tool_summary("read_file", args, false, false);
+    let read = aidaemon_tools::semantics::RecapKind::FileRead;
+    let ok = learning_tool_summary("read_file", args, read, false, false).line;
     assert!(ok.starts_with("read_file(") && !ok.contains('['), "{ok}");
-    assert!(learning_tool_summary("read_file", args, false, true).ends_with(" [FAILED]"));
-    assert!(learning_tool_summary("read_file", args, true, true).ends_with(" [REJECTED]"));
+    let failed = learning_tool_summary("read_file", args, read, false, true);
+    assert!(failed.line.ends_with(" [FAILED]") && !failed.completed());
+    let rejected = learning_tool_summary("read_file", args, read, true, true);
+    assert!(rejected.line.ends_with(" [REJECTED]") && rejected.rejected);
 }
 
 #[test]
@@ -1483,11 +1486,20 @@ fn task_budget_warns_once_at_eighty_percent() {
 #[test]
 fn learning_records_errors_and_the_recovery_after_them() {
     let mut learning = crate::agent::memory_plugin::test_support::learning("build it");
-    record_call_for_learning(&mut learning, "terminal(ok)".into(), "fine", false);
+    let command = |summary: &str, failed: bool| {
+        aidaemon_runtime::turn::post_task::LearnedCall::new(
+            "terminal",
+            summary.to_string(),
+            aidaemon_tools::semantics::RecapKind::Command,
+            false,
+            failed,
+        )
+    };
+    record_call_for_learning(&mut learning, command("ok", false), "fine", false);
     assert!(learning.errors.is_empty() && learning.recovery_actions.is_empty());
     record_call_for_learning(
         &mut learning,
-        "terminal(make) [FAILED]".into(),
+        command("make", true),
         "Error: make: no rule",
         true,
     );
@@ -1499,7 +1511,7 @@ fn learning_records_errors_and_the_recovery_after_them() {
         learning.errors,
         vec![("Error: make: no rule".to_string(), false)]
     );
-    record_call_for_learning(&mut learning, "terminal(make build)".into(), "built", false);
+    record_call_for_learning(&mut learning, command("make build", false), "built", false);
     assert_eq!(
         learning.recovery_actions,
         vec!["terminal(make build)".to_string()]
@@ -1550,11 +1562,27 @@ fn final_replies_are_sanitized_and_never_a_bare_done() {
     assert!(gutted.contains("couldn't recover"), "{gutted}");
     let with_work = finalize_reply(
         "[SYSTEM] only markers",
-        &["write_file(notes.txt)".to_string()],
+        &[aidaemon_runtime::turn::post_task::LearnedCall::new(
+            "write_file",
+            "notes.txt".to_string(),
+            aidaemon_tools::semantics::RecapKind::FileWrite,
+            false,
+            false,
+        )],
         None,
     );
     assert!(!with_work.trim().is_empty() && !with_work.contains("[SYSTEM]"));
-    let empty_after_work = finalize_reply("", &["write_file(notes.txt)".to_string()], None);
+    let empty_after_work = finalize_reply(
+        "",
+        &[aidaemon_runtime::turn::post_task::LearnedCall::new(
+            "write_file",
+            "notes.txt".to_string(),
+            aidaemon_tools::semantics::RecapKind::FileWrite,
+            false,
+            false,
+        )],
+        None,
+    );
     assert!(
         !empty_after_work.trim().is_empty()
             && !empty_after_work.starts_with("I wasn't able to process"),

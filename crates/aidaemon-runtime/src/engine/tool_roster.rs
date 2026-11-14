@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use aidaemon_channels::context::ChannelContext;
-use aidaemon_core::ChannelVisibility;
 use aidaemon_events::traits::AgentRole;
 use aidaemon_tools::semantics::{ToolCapabilities, UserRole};
 use serde_json::{Value, json};
@@ -15,16 +14,7 @@ use serde_json::{Value, json};
 use crate::host::TurnHost;
 use crate::policy::execution::{ApprovalMode, ExecutionPolicy};
 use crate::policy::metrics::POLICY_METRICS;
-use crate::turn::helpers::{tool_name_from_definition, visibility_allows_desktop_control};
-
-/// The tools a public external channel may ever be offered.
-pub const PUBLIC_EXTERNAL_TOOLS: &[&str] = &["web_search", "remember_fact", "system_info"];
-
-/// Tools that drive the owner's physical machine (desktop GUI automation).
-/// An inbound chat message (or the bot's own content echoed back in a shared
-/// channel) must never launch them, so they are offered only in 1-on-1 DMs and
-/// internal sessions.
-pub const DESKTOP_CONTROL_TOOLS: &[&str] = &["computer_use"];
+use crate::turn::helpers::tool_name_from_definition;
 
 fn validate_required_fields_contract(parameters: &Value) -> Result<(), String> {
     let properties = parameters
@@ -206,13 +196,15 @@ pub trait ToolRoster: TurnHost {
             });
         }
 
-        // Channel-visibility class is session-static and so stays in the core.
-        if channel_ctx.visibility == ChannelVisibility::PublicExternal {
-            defs.retain(|d| {
-                tool_name_from_definition(d)
-                    .is_some_and(|name| PUBLIC_EXTERNAL_TOOLS.contains(&name))
-            });
-        }
+        // Channel-visibility class is session-static and so stays in the
+        // core: each tool's `channel_reach` says where it may be offered.
+        let mut no_caps = HashMap::new();
+        crate::turn::helpers::restrict_to_channel_reach(
+            &mut defs,
+            &mut no_caps,
+            channel_ctx.visibility,
+            |name| self.registered_tool_facts(name).channel_reach,
+        );
         // Daemon memory tools follow the active memory plugin, as on turns.
         let owned_memory_tools = self.memory_plugin().owned_daemon_tools();
         defs = defs
@@ -229,15 +221,6 @@ pub trait ToolRoster: TurnHost {
                 }
             })
             .collect();
-        // Desktop control is never advertised outside DMs/internal sessions.
-        if !visibility_allows_desktop_control(channel_ctx.visibility) {
-            defs.retain(|d| {
-                tool_name_from_definition(d)
-                    .map(|name| !DESKTOP_CONTROL_TOOLS.contains(&name))
-                    .unwrap_or(true)
-            });
-        }
-
         let mut roster: Vec<(String, String)> = defs
             .iter()
             .filter_map(|d| {

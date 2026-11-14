@@ -16,12 +16,12 @@ input: >
   homepage URL.
 script:
   - tool_calls: [{ name: spawn_agent, arguments: { mission: "Set up the DDEV Drupal site in ~/projects/school" } }]
-  - tool_calls: [{ name: run_command, arguments: { command: "orb start" } }]
+  - tool_calls: [{ name: terminal, arguments: { command: "orb start" } }]
   - tool_calls: [{ name: spawn_agent, arguments: { mission: "Start the DDEV Drupal site in ~/projects/school" } }]
   - text: The site is up at https://school.ddev.site (OrbStack was stopped; I started it).
 expect:
   status: completed
-  tool_call_counts: { spawn_agent: 2, run_command: 1 }
+  tool_call_counts: { spawn_agent: 2, terminal: 1 }
   final_text_contains: [school.ddev.site]
 live_expect:
   status: completed

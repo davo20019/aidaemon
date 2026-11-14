@@ -243,6 +243,7 @@ impl aidaemon_tools::semantics::ToolSemantics for ManageMemoriesTool {
         aidaemon_tools::semantics::ToolDispatchFacts {
             offering: aidaemon_tools::semantics::Offering::Core,
             status_from_arguments: true,
+            activity: aidaemon_tools::semantics::ToolActivity::Memory,
             ..Default::default()
         }
     }

@@ -205,7 +205,6 @@ pub fn terminal_canonicalizer(
                     .and_then(|known| known.clone());
                 let call = tool_calls::canonicalize_call(
                     Some(turn.tool.as_ref()),
-                    "terminal",
                     raw,
                     &tool_calls::CanonFacts {
                         backend: &*turn.backend,

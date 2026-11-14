@@ -12,14 +12,14 @@ input: >
   Set up a local DDEV Drupal site for a high school in ~/projects/school
   (DDEV project name `school`) and tell me its homepage URL.
 script:
-  - tool_calls: [{ name: run_command, arguments: { command: "cd ~/projects/school && ddev config --project-type=drupal11 --project-name=school && ddev start" } }]
-  - tool_calls: [{ name: run_command, arguments: { command: "orb status" } }]
-  - tool_calls: [{ name: run_command, arguments: { command: "orb start" } }]
-  - tool_calls: [{ name: run_command, arguments: { command: "cd ~/projects/school && ddev start --project-name=school" } }]
+  - tool_calls: [{ name: terminal, arguments: { command: "cd ~/projects/school && ddev config --project-type=drupal11 --project-name=school && ddev start" } }]
+  - tool_calls: [{ name: terminal, arguments: { command: "orb status" } }]
+  - tool_calls: [{ name: terminal, arguments: { command: "orb start" } }]
+  - tool_calls: [{ name: terminal, arguments: { command: "cd ~/projects/school && ddev start --project-name=school" } }]
   - text: The site is up at https://school.ddev.site (OrbStack was stopped; I started it first).
 expect:
   status: completed
-  receipt_statuses: { run_command: [failed, succeeded, succeeded, succeeded] }
+  receipt_statuses: { terminal: [failed, succeeded, succeeded, succeeded] }
   final_text_contains: [school.ddev.site]
 live_expect:
   status: completed

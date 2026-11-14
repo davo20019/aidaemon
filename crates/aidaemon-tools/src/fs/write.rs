@@ -256,6 +256,14 @@ impl crate::semantics::ToolSemantics for WriteFile {
             offering: crate::semantics::Offering::Core,
             checkpoints_writes: true,
             file_guard: crate::semantics::FileGuard::Writes,
+            recap: crate::semantics::RecapKind::FileWrite,
+            activity: crate::semantics::ToolActivity::Fixed(
+                aidaemon_core::card::ActivityKind::Write,
+            ),
+            opens_project_instructions: true,
+            semantic_scope: Some(crate::semantics::ToolSemanticScope::LocalWorkspace),
+            low_signal_result: true,
+            status_label: Some("writing a file"),
             ..Default::default()
         }
     }

@@ -109,37 +109,21 @@ pub fn extract_json_object(raw: &str) -> Option<String> {
     }
 }
 
-/// Desktop-control tools, offered only in direct and internal sessions.
-pub const DESKTOP_CONTROL_TOOLS: &[&str] = &["computer_use"];
-
-/// Whether desktop-control tools may be exposed in a conversation of this
-/// visibility. Only direct messages (`Private`) and internal/system sessions
-/// (`Internal`, e.g. the scheduler or spawned sub-agents) qualify. Group and
-/// public channels never do, so another participant's message cannot reach
-/// the desktop.
-pub fn visibility_allows_desktop_control(visibility: aidaemon_core::ChannelVisibility) -> bool {
-    matches!(
-        visibility,
-        aidaemon_core::ChannelVisibility::Private | aidaemon_core::ChannelVisibility::Internal
-    )
-}
-
-/// Strip desktop-control tools from `defs`/`caps` when the channel visibility
-/// does not permit them. No-op for `Private`/`Internal`.
-pub fn restrict_desktop_control_for_visibility(
+/// Keep in `defs`/`caps` only the tools a conversation of `visibility` may
+/// be offered, by each tool's `channel_reach` fact (`reach`; a tool the
+/// daemon did not register, such as an MCP tool, is `Shared`). A public
+/// external channel sees only the tools that declare themselves public; a
+/// group or public channel never sees one that drives the owner's machine.
+pub fn restrict_to_channel_reach(
     defs: &mut Vec<Value>,
     caps: &mut std::collections::HashMap<String, aidaemon_tools::semantics::ToolCapabilities>,
     visibility: aidaemon_core::ChannelVisibility,
+    reach: impl Fn(&str) -> aidaemon_tools::semantics::ChannelReach,
 ) {
-    if visibility_allows_desktop_control(visibility) {
-        return;
-    }
     defs.retain(|d| {
-        tool_name_from_definition(d)
-            .map(|name| !DESKTOP_CONTROL_TOOLS.contains(&name))
-            .unwrap_or(true)
+        tool_name_from_definition(d).is_none_or(|name| reach(name).offered_in(visibility))
     });
-    caps.retain(|name, _| !DESKTOP_CONTROL_TOOLS.contains(&name.as_str()));
+    caps.retain(|name, _| reach(name).offered_in(visibility));
 }
 
 /// Tools that read outside content, kept from a turn an untrusted external

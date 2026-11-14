@@ -11,6 +11,27 @@
 
 use aidaemon_events::RunObligation;
 use aidaemon_events::traits::ToolSemanticScope;
+use aidaemon_tools::semantics::ToolDispatchFacts;
+
+/// What closeout knows about a registered tool: whether it only reads, and
+/// the dispatch facts it states. A tool closeout does not know (an MCP or
+/// custom tool) has none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KnownTool {
+    pub read_only: bool,
+    pub facts: ToolDispatchFacts,
+}
+
+impl KnownTool {
+    /// The domain the tool works in: a memory tool's from its memory facts,
+    /// else the one it declares.
+    fn scope(&self, tool: &str) -> Option<ToolSemanticScope> {
+        match crate::turn::tool_facts::memory_tool_facts(tool) {
+            Some(facts) => facts.scope,
+            None => self.facts.semantic_scope,
+        }
+    }
+}
 
 /// Static authority view used to test whether a tool may still be invoked.
 pub struct ClosingAuthority<'a> {
@@ -62,17 +83,17 @@ impl<'a> ClosingAuthority<'a> {
                 .any(|name| name == tool)
     }
 
-    /// Whether Authority admits invoking `tool` at all. `read_only` is the
-    /// registered tool's declared capability (None for unknown tools, which
-    /// stay admissible so a custom tool is never declared unavailable
+    /// Whether Authority admits invoking `tool` at all. `known` is what the
+    /// registered tool declares (None for unknown tools, which stay
+    /// admissible so a custom tool is never declared unavailable
     /// prematurely).
-    pub fn admits_tool(&self, tool: &str, read_only: Option<bool>) -> bool {
-        self.refusal_reason(tool, read_only).is_none()
+    pub fn admits_tool(&self, tool: &str, known: Option<KnownTool>) -> bool {
+        self.refusal_reason(tool, known).is_none()
     }
 
     /// The first check that refuses `tool`, in evaluation order, or `None`
     /// when Authority admits it.
-    pub fn refusal_reason(&self, tool: &str, read_only: Option<bool>) -> Option<&'static str> {
+    pub fn refusal_reason(&self, tool: &str, known: Option<KnownTool>) -> Option<&'static str> {
         if self.forbids_tool_use {
             return Some("forbids_tool_use");
         }
@@ -87,13 +108,17 @@ impl<'a> ClosingAuthority<'a> {
         // Exact beats broad: a tool the request named explicitly is admitted
         // even when a scope-level prohibition would otherwise cover it (the
         // same rule as an exact write path beating a directory root).
+        let scope = match &known {
+            Some(known) => known.scope(tool),
+            None => crate::turn::tool_facts::memory_tool_facts(tool).and_then(|facts| facts.scope),
+        };
         if !explicitly_allowed
-            && let Some(scope) = crate::turn::tool_facts::fallback_tool_semantic_scope(tool)
+            && let Some(scope) = scope
             && self.forbidden_tool_scopes.contains(&scope)
         {
             return Some("forbidden_scope");
         }
-        if self.forbids_mutation && read_only == Some(false) {
+        if self.forbids_mutation && known.is_some_and(|known| !known.read_only) {
             return Some("forbids_mutation");
         }
         None
@@ -106,9 +131,9 @@ pub fn obligation_admissible(
     obligation: &RunObligation,
     authority: &ClosingAuthority<'_>,
     visible_tools: &[&str],
-    read_only: impl Fn(&str) -> Option<bool>,
+    known: impl Fn(&str) -> Option<KnownTool>,
 ) -> bool {
-    let admits = |tool: &str| authority.admits_tool(tool, read_only(tool));
+    let admits = |tool: &str| authority.admits_tool(tool, known(tool));
     if let Some(predicate) = obligation.receipt.as_ref()
         && !predicate.tool_names.is_empty()
     {
@@ -124,15 +149,23 @@ pub fn obligation_admissible(
         let candidates = crate::turn::inquiry::candidate_tools_for_requirements(
             std::slice::from_ref(requirement),
             visible_tools.iter().copied().filter(|tool| admits(tool)),
+            |tool| {
+                known(tool)
+                    .map(|known| known.facts.evidence)
+                    .unwrap_or_default()
+            },
         );
         if !candidates.is_empty() {
             return true;
         }
         // Unknown/dynamic tools without a static evidence model remain
         // possible candidates rather than being declared unavailable.
-        return visible_tools
-            .iter()
-            .any(|tool| !crate::turn::inquiry::has_static_evidence_model(tool) && admits(tool));
+        return visible_tools.iter().any(|tool| {
+            let source = known(tool)
+                .map(|known| known.facts.evidence)
+                .unwrap_or_default();
+            !crate::turn::inquiry::has_static_evidence_model(tool, source) && admits(tool)
+        });
     }
     // A mutation obligation with no exact predicate: any admissible mutating
     // tool could still perform it unless Authority forbids mutation outright.
@@ -140,7 +173,7 @@ pub fn obligation_admissible(
         return !authority.forbids_mutation
             && visible_tools
                 .iter()
-                .any(|tool| read_only(tool) != Some(true) && admits(tool));
+                .any(|tool| known(tool).is_none_or(|known| !known.read_only) && admits(tool));
     }
     visible_tools.iter().any(|tool| admits(tool))
 }
@@ -220,14 +253,14 @@ pub fn stop_demand_verdict(
     used: u32,
     authority: &ClosingAuthority<'_>,
     visible_tools: &[&str],
-    read_only: impl Fn(&str) -> Option<bool>,
+    known: impl Fn(&str) -> Option<KnownTool>,
     control_plane_call: impl Fn(&str, &str) -> bool,
 ) -> StopDemandVerdict {
     let reachable = match demand {
         StopDemand::MandateDecisionCommit => {
             let tool = MANDATE_DECISION_TOOL;
             visible_tools.contains(&tool)
-                && authority.admits_tool(tool, read_only(tool))
+                && authority.admits_tool(tool, known(tool))
                 && (!authority.admits_only_as_control_plane(tool)
                     || control_plane_call(tool, MANDATE_DECISION_CALL))
         }
@@ -250,22 +283,50 @@ pub fn stop_demand_verdict(
 mod stop_demand_tests {
     use super::*;
 
+    /// What closeout knows of a tool in these tests: whether it reads, and
+    /// the evidence source and scope the real tool of that name declares
+    /// (a name with no such tool declares neither).
+    fn declared(tool: &str, read_only: bool) -> Option<KnownTool> {
+        use aidaemon_tools::semantics::EvidenceSource as E;
+        use aidaemon_tools::semantics::ToolSemanticScope as S;
+        let (evidence, semantic_scope) = match tool {
+            "manage_mandates" => (E::Mandates, Some(S::GoalState)),
+            "goal_trace" => (E::GoalTrace, Some(S::GoalState)),
+            "manage_goal_tasks" => (E::GoalRecords, Some(S::GoalState)),
+            "http_request" | "browser" => (E::RemoteRead, Some(S::ExternalRemote)),
+            "web_search" => (E::WebSearch, Some(S::ExternalRemote)),
+            "read_file" => (E::FileRead, Some(S::LocalWorkspace)),
+            "terminal" => (E::Shell, Some(S::LocalWorkspace)),
+            "write_file" => (E::None, Some(S::LocalWorkspace)),
+            "read_node_health" | "read_node_sensors" => (E::NodeReading, None),
+            _ => (E::None, None),
+        };
+        Some(KnownTool {
+            read_only,
+            facts: ToolDispatchFacts {
+                evidence,
+                semantic_scope,
+                ..ToolDispatchFacts::default()
+            },
+        })
+    }
+
     /// The resolved authority's level and tool set become the closing view:
     /// read-only forbids mutation, an empty set forbids tools, nothing else.
     #[test]
     fn closing_authority_from_resolved_reads_level_and_tool_set() {
         let full = ClosingAuthority::from_resolved(&aidaemon_core::Authority::full());
         assert!(!full.forbids_mutation && !full.forbids_tool_use);
-        assert!(full.admits_tool("write_file", Some(false)));
+        assert!(full.admits_tool("write_file", declared("write_file", false)));
 
         let read_only = ClosingAuthority::from_resolved(&aidaemon_core::Authority::read_only());
         assert!(read_only.forbids_mutation && !read_only.forbids_tool_use);
-        assert!(!read_only.admits_tool("write_file", Some(false)));
-        assert!(read_only.admits_tool("read_file", Some(true)));
+        assert!(!read_only.admits_tool("write_file", declared("write_file", false)));
+        assert!(read_only.admits_tool("read_file", declared("read_file", true)));
 
         let none = ClosingAuthority::from_resolved(&aidaemon_core::Authority::no_tools());
         assert!(none.forbids_tool_use);
-        assert!(!none.admits_tool("read_file", Some(true)));
+        assert!(!none.admits_tool("read_file", declared("read_file", true)));
     }
 
     /// A request that forbids tools asks for no tool work at closeout, even
@@ -275,21 +336,21 @@ mod stop_demand_tests {
         let obligation_tools = ["read_file"];
         let quiet = ClosingAuthority::from_resolved(&aidaemon_core::Authority::full())
             .without_tool_demands(true);
-        assert!(!quiet.admits_tool("read_file", Some(true)));
+        assert!(!quiet.admits_tool("read_file", declared("read_file", true)));
         assert_eq!(
             stop_demand_verdict(
                 StopDemand::GuiClickVerification,
                 0,
                 &quiet,
                 &obligation_tools,
-                |_| Some(true),
+                |tool| declared(tool, true),
                 |_, _| false,
             ),
             StopDemandVerdict::Unreachable
         );
         let normal = ClosingAuthority::from_resolved(&aidaemon_core::Authority::full())
             .without_tool_demands(false);
-        assert!(normal.admits_tool("read_file", Some(true)));
+        assert!(normal.admits_tool("read_file", declared("read_file", true)));
     }
 
     fn authority<'a>(allowed: &'a [String], control_plane: &'a [String]) -> ClosingAuthority<'a> {
@@ -308,7 +369,7 @@ mod stop_demand_tests {
     #[test]
     fn mandate_commit_is_demanded_only_when_record_decision_is_admitted() {
         let visible = [MANDATE_DECISION_TOOL, "http_request"];
-        let read_only = |_: &str| Some(false);
+        let read_only = |tool: &str| declared(tool, false);
         let real_rule = |tool: &str, arguments: &str| {
             tool == MANDATE_DECISION_TOOL && !arguments.contains("record_decision")
         };
@@ -399,6 +460,34 @@ mod stop_demand_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What closeout knows of a tool in these tests: whether it reads, and
+    /// the evidence source and scope the real tool of that name declares
+    /// (a name with no such tool declares neither).
+    fn declared(tool: &str, read_only: bool) -> Option<KnownTool> {
+        use aidaemon_tools::semantics::EvidenceSource as E;
+        use aidaemon_tools::semantics::ToolSemanticScope as S;
+        let (evidence, semantic_scope) = match tool {
+            "manage_mandates" => (E::Mandates, Some(S::GoalState)),
+            "goal_trace" => (E::GoalTrace, Some(S::GoalState)),
+            "manage_goal_tasks" => (E::GoalRecords, Some(S::GoalState)),
+            "http_request" | "browser" => (E::RemoteRead, Some(S::ExternalRemote)),
+            "web_search" => (E::WebSearch, Some(S::ExternalRemote)),
+            "read_file" => (E::FileRead, Some(S::LocalWorkspace)),
+            "terminal" => (E::Shell, Some(S::LocalWorkspace)),
+            "write_file" => (E::None, Some(S::LocalWorkspace)),
+            "read_node_health" | "read_node_sensors" => (E::NodeReading, None),
+            _ => (E::None, None),
+        };
+        Some(KnownTool {
+            read_only,
+            facts: ToolDispatchFacts {
+                evidence,
+                semantic_scope,
+                ..ToolDispatchFacts::default()
+            },
+        })
+    }
     use aidaemon_events::traits::{
         EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
         RequestReceiptPredicate, ToolMutationEffects,
@@ -447,7 +536,7 @@ mod tests {
             ..RequestReceiptPredicate::default()
         };
         let obligation = obligation(Some(predicate), None, ToolMutationEffects::NONE);
-        let read_only = |tool: &str| Some(tool != "write_file");
+        let read_only = |tool: &str| declared(tool, tool != "write_file");
         assert!(obligation_admissible(
             &obligation,
             &authority(false, &[]),
@@ -489,7 +578,7 @@ mod tests {
             &obligation,
             &authority,
             &["terminal", "read_file"],
-            |_| Some(false)
+            |tool| declared(tool, false)
         ));
         let none_allowed: Vec<String> = Vec::new();
         let authority = ClosingAuthority {
@@ -500,7 +589,7 @@ mod tests {
             &obligation,
             &authority,
             &["terminal", "read_file"],
-            |_| Some(false)
+            |tool| declared(tool, false)
         ));
     }
 
@@ -517,7 +606,7 @@ mod tests {
             target: None,
         };
         let obligation = obligation(None, Some(requirement), ToolMutationEffects::NONE);
-        let read_only = |_: &str| Some(true);
+        let read_only = |tool: &str| declared(tool, true);
         assert!(obligation_admissible(
             &obligation,
             &authority(true, &[]),
@@ -554,7 +643,7 @@ mod tests {
         };
         let obligation = obligation(None, Some(requirement), ToolMutationEffects::NONE);
         let authority = authority(true, &[]);
-        let read_only = |tool: &str| Some(tool == "check_remote");
+        let read_only = |tool: &str| declared(tool, tool == "check_remote");
         for visible in [
             vec!["check_remote"],
             vec!["manage_mandates", "check_remote"],
@@ -618,6 +707,11 @@ mod tests {
         let candidates = crate::turn::inquiry::candidate_tools_for_requirements(
             std::slice::from_ref(&requirement),
             visible,
+            |tool| {
+                declared(tool, true)
+                    .map(|known| known.facts.evidence)
+                    .unwrap_or_default()
+            },
         );
         assert_eq!(candidates.len(), 10);
         assert!(!candidates.iter().any(|tool| tool == "web_search"));
@@ -631,14 +725,14 @@ mod tests {
             &obligation,
             &authority,
             &visible,
-            |_| Some(true)
+            |tool| declared(tool, true)
         ));
     }
 
     #[test]
     fn mutation_obligation_is_unreachable_under_a_read_only_contract() {
         let obligation = obligation(None, None, ToolMutationEffects::LOCAL_WORKSPACE_WRITE);
-        let read_only = |tool: &str| Some(tool == "read_file");
+        let read_only = |tool: &str| declared(tool, tool == "read_file");
         assert!(obligation_admissible(
             &obligation,
             &authority(false, &[]),

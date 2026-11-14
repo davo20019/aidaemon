@@ -564,6 +564,14 @@ impl ReadChannelHistoryTool {
 }
 
 impl aidaemon_tools::semantics::ToolSemantics for ReadChannelHistoryTool {
+    fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
+        aidaemon_tools::semantics::ToolDispatchFacts {
+            evidence: aidaemon_tools::semantics::EvidenceSource::ConversationHistory,
+            semantic_scope: Some(aidaemon_tools::semantics::ToolSemanticScope::ConversationHistory),
+            ..Default::default()
+        }
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: true,

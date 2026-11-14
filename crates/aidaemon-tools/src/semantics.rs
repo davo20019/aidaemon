@@ -143,6 +143,215 @@ pub struct ToolDispatchFacts {
     /// The status line summarizes a finished call from its arguments, not
     /// its result (memory and people edits, whose result text is terse).
     pub status_from_arguments: bool,
+    /// What a run's activity recap counts a finished call as.
+    pub recap: RecapKind,
+    /// What kind of work every card shows a call as.
+    pub activity: ToolActivity,
+    /// The words a live status ping uses for the tool ("reading a file").
+    /// `None`: its name in words.
+    pub status_label: Option<&'static str>,
+    /// Which argument names the project directory a call works in, and how
+    /// the turn's known project directory fills it when it is empty.
+    pub project_dir_argument: ProjectDirArgument,
+    /// The paths a call touches open their project's instructions on first
+    /// access (reads, writes and command working directories; broad
+    /// searches do not).
+    pub opens_project_instructions: bool,
+    /// How the engine fits the call's result for the model.
+    pub result_fit: ResultFit,
+    /// Which conversations the tool may be offered in.
+    pub channel_reach: ChannelReach,
+    /// What a substantive result from the call can serve as evidence for.
+    pub evidence: EvidenceSource,
+    /// The domain the tool inspects or changes, when it states no
+    /// per-call semantics.
+    pub semantic_scope: Option<ToolSemanticScope>,
+    /// A result that says only that it worked (a write's confirmation):
+    /// the turn's recent-work context leaves it out.
+    pub low_signal_result: bool,
+}
+
+/// What a run's activity recap counts a finished call as (see
+/// [`ToolDispatchFacts::recap`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum RecapKind {
+    /// Counted only by what its summary says.
+    #[default]
+    Other,
+    /// A file was read.
+    FileRead,
+    /// A file was written or edited.
+    FileWrite,
+    /// A command ran.
+    Command,
+    /// A file was sent to the user.
+    FileSent,
+    /// The web or the files were searched.
+    Search,
+    /// An external source was read.
+    ExternalRead,
+}
+
+/// What kind of work a call is on every card (see
+/// [`ToolDispatchFacts::activity`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolActivity {
+    /// A check, or a change when the call's admitted semantics mutate.
+    #[default]
+    ByEffect,
+    /// Always this kind.
+    Fixed(aidaemon_core::card::ActivityKind),
+    /// Memory: recalling when the call only reads, remembering when it
+    /// changes what is kept.
+    Memory,
+}
+
+impl ToolActivity {
+    /// The kind a call of this tool shows as, given whether its admitted
+    /// semantics mutate state.
+    pub fn kind(self, mutates: bool) -> aidaemon_core::card::ActivityKind {
+        use aidaemon_core::card::ActivityKind;
+        match self {
+            Self::Fixed(kind) => kind,
+            Self::Memory if mutates => ActivityKind::Remember,
+            Self::Memory => ActivityKind::Recall,
+            Self::ByEffect if mutates => ActivityKind::Change,
+            Self::ByEffect => ActivityKind::Check,
+        }
+    }
+}
+
+/// Which argument of a call names the directory it works in (see
+/// [`ToolDispatchFacts::project_dir_argument`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProjectDirArgument {
+    /// Any path-like argument names a project directory; none is filled.
+    #[default]
+    AnyPath,
+    /// The search root, `path`: filled with the known project directory.
+    SearchRoot,
+    /// The working directory, `working_dir`: filled with the known project
+    /// directory, or its nearest existing parent when it is not made yet.
+    WorkingDir,
+    /// A shell: only `working_dir` or `cwd` names the directory (paths in
+    /// the command are its data), filled as [`Self::WorkingDir`] and only
+    /// when the call carries a command or script.
+    ShellWorkingDir,
+}
+
+impl ProjectDirArgument {
+    /// The argument the known project directory fills, if any.
+    pub const fn injected_key(self) -> Option<&'static str> {
+        match self {
+            Self::AnyPath => None,
+            Self::SearchRoot => Some("path"),
+            Self::WorkingDir | Self::ShellWorkingDir => Some("working_dir"),
+        }
+    }
+}
+
+/// How the engine fits a call's result for the model (see
+/// [`ToolDispatchFacts::result_fit`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResultFit {
+    /// The result is the model's working data and stays inline and whole,
+    /// never spilled or compressed (the desktop's accessibility tree).
+    pub preserve_inline: bool,
+    /// A trusted result may carry the tool's internal control markers,
+    /// stripped before the model sees it.
+    pub strip_control_markers: bool,
+    /// A large result is a structured API body, compacted losslessly.
+    pub compact_json: bool,
+    /// A large error is process output, cut to its head and tail.
+    pub cap_large_errors: bool,
+    /// The model can page through a spilled result with this tool, so an
+    /// oversized result may be spilled to a file instead of compressed.
+    pub pages_spilled_results: bool,
+}
+
+/// Which conversations a tool may be offered in (see
+/// [`ToolDispatchFacts::channel_reach`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChannelReach {
+    /// Any conversation except a public external channel.
+    #[default]
+    Shared,
+    /// Every conversation, a public external channel included.
+    Public,
+    /// It drives the owner's machine: only direct messages and internal
+    /// sessions, never a shared or public channel.
+    DirectOnly,
+}
+
+impl ChannelReach {
+    /// Whether a tool of this reach may be offered in a conversation of
+    /// `visibility`. The one rule for which tools a channel may see.
+    pub fn offered_in(self, visibility: ChannelVisibility) -> bool {
+        match self {
+            Self::Public => true,
+            Self::Shared => visibility != ChannelVisibility::PublicExternal,
+            Self::DirectOnly => matches!(
+                visibility,
+                ChannelVisibility::Private | ChannelVisibility::Internal
+            ),
+        }
+    }
+}
+
+/// What a substantive result from a tool can serve as evidence for, by the
+/// kind of source it reads (see [`ToolDispatchFacts::evidence`]). The
+/// capabilities each source supports live with the evidence ontology.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum EvidenceSource {
+    /// No static evidence model: what the call supports is learnt from
+    /// its result's own semantics.
+    #[default]
+    None,
+    /// Goal and task forensics: a targeted trace, or a recent listing.
+    GoalTrace,
+    /// The owner's mandates, by action.
+    Mandates,
+    /// Goal tasks and automations: their state and record.
+    GoalRecords,
+    /// Past conversation.
+    ConversationHistory,
+    /// A remote page or API, read directly.
+    RemoteRead,
+    /// A connected node's readings.
+    NodeReading,
+    /// What a connected node did.
+    NodeAction,
+    /// A web search: advisory.
+    WebSearch,
+    /// A local file read.
+    FileRead,
+    /// A local file search.
+    FileSearch,
+    /// A shell on this computer.
+    Shell,
+    /// This computer's state.
+    HostInfo,
+    /// The daemon's own diagnostics.
+    Diagnostics,
+}
+
+impl EvidenceSource {
+    /// Every source with an evidence model.
+    pub const MODELED: [Self; 13] = [
+        Self::GoalTrace,
+        Self::Mandates,
+        Self::GoalRecords,
+        Self::ConversationHistory,
+        Self::RemoteRead,
+        Self::NodeReading,
+        Self::NodeAction,
+        Self::WebSearch,
+        Self::FileRead,
+        Self::FileSearch,
+        Self::Shell,
+        Self::HostInfo,
+        Self::Diagnostics,
+    ];
 }
 
 /// Which of a tool's paths are judged against the secret and sensitive

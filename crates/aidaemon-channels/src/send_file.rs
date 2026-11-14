@@ -578,6 +578,7 @@ impl aidaemon_tools::semantics::ToolSemantics for SendFileTool {
     fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
         aidaemon_tools::semantics::ToolDispatchFacts {
             delivers_files: true,
+            recap: aidaemon_tools::semantics::RecapKind::FileSent,
             ..Default::default()
         }
     }

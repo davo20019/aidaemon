@@ -1719,6 +1719,11 @@ impl crate::tools::traits::ToolSemantics for ComputerUseTool {
             // App approvals are kept per session and per bundle, and
             // consequential ones per call, by the tool (`record_owner_answer`).
             keeps_own_grants: true,
+            result_fit: aidaemon_tools::semantics::ResultFit {
+                preserve_inline: true,
+                ..Default::default()
+            },
+            channel_reach: aidaemon_tools::semantics::ChannelReach::DirectOnly,
             ..Default::default()
         }
     }

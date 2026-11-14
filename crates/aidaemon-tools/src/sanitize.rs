@@ -794,141 +794,50 @@ pub fn extract_uuid_identifiers(text: &str) -> Vec<String> {
 /// Maximum length of a user-facing status-ping summary (characters, not bytes).
 const STATUS_SUMMARY_MAX_CHARS: usize = 80;
 
-/// Map an internal tool name to a friendly, user-facing label for live status
-/// pings. Internal orchestration names (`spawn_agent`, `cli_agent`) and raw tool
-/// names should never surface to the user. Unknown names pass through unchanged
-/// so nothing silently breaks.
-fn friendly_tool_label(name: &str) -> String {
-    match name {
-        "spawn_agent" => "delegating to a specialist",
-        "cli_agent" => "delegating to a CLI agent",
-        "read_file" => "reading a file",
-        "write_file" => "writing a file",
-        "edit_file" => "editing a file",
-        "search_files" => "searching files",
-        "terminal" | "run_command" => "running a command",
-        "web_search" => "searching the web",
-        "web_fetch" => "fetching a page",
-        "search_history" => "checking exact history",
-        "manage_memories" | "remember_fact" | "manage_people" => "updating memory",
-        "set_reminder" => "setting a reminder",
-        "schedule_task" => "scheduling a task",
-        // Any other tool reads as its name in words (`check_environment` →
-        // "check environment"), never as an identifier.
-        other => return other.replace(['_', '-'], " ").trim().to_string(),
+/// The words a status ping uses for a tool: its own label, else its name in
+/// words (`check_environment` -> "check environment"), never an identifier.
+fn friendly_tool_label(name: &str, facts: &crate::semantics::ToolDispatchFacts) -> String {
+    match facts.status_label {
+        Some(label) => label.to_string(),
+        None => name.replace(['_', '-'], " ").trim().to_string(),
     }
-    .to_string()
-}
-
-/// What kind of work a call is, as every card shows it: from the tool's
-/// typed identity, its dispatch facts (`delegates`) and its admitted
-/// semantics (`mutates`), never from its text. A tool without a kind of
-/// its own reads as a check or a change.
-pub fn tool_activity_kind(
-    name: &str,
-    action: &str,
-    delegates: bool,
-    mutates: bool,
-) -> aidaemon_core::card::ActivityKind {
-    use aidaemon_core::card::ActivityKind;
-    if delegates {
-        return ActivityKind::Delegate;
-    }
-    match name {
-        "spawn_agent" | "cli_agent" => ActivityKind::Delegate,
-        "read_file" => ActivityKind::Read,
-        "search_files" => ActivityKind::Search,
-        "write_file" | "edit_file" => ActivityKind::Write,
-        "terminal" | "run_command" => ActivityKind::Run,
-        "web_search" | "web_fetch" => ActivityKind::Web,
-        "search_history" => ActivityKind::Recall,
-        "manage_memories" | "manage_people" => {
-            let action = action
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if memory_action_is_read(&action) {
-                ActivityKind::Recall
-            } else {
-                ActivityKind::Remember
-            }
-        }
-        "remember_fact" => ActivityKind::Remember,
-        "set_reminder" => ActivityKind::Remind,
-        _ if mutates => ActivityKind::Change,
-        _ => ActivityKind::Check,
-    }
-}
-
-/// Whether a `manage_memories`/`manage_people` action only reads state (so the
-/// status ping should say "checking memory" rather than "updating memory").
-/// Unknown/new actions default to write — never mislabel a mutation as a read.
-fn memory_action_is_read(action: &str) -> bool {
-    matches!(
-        action,
-        "search"
-            | "search_episodes"
-            | "list"
-            | "view"
-            | "recall"
-            | "get"
-            | "find"
-            | "export"
-            | "audit"
-            | "list_goals"
-    )
-}
-
-/// Tools whose summaries carry raw commands and absolute paths. For these we
-/// suppress the summary entirely so only the friendly label shows.
-fn summary_is_command_bearing(name: &str) -> bool {
-    matches!(name, "terminal" | "run_command")
 }
 
 /// Produce a user-facing `(label, clean_summary)` pair for a live status ping
-/// (`StatusUpdate::ToolStart` / `ToolComplete`). Relabels internal/technical tool
-/// names to friendly text and sanitizes the summary so raw commands, absolute
-/// paths, and secrets never leak to the user.
+/// (`StatusUpdate::ToolStart` / `ToolComplete`), from the tool's dispatch
+/// facts and whether the call's admitted semantics mutate state, never from
+/// its name: the label is the tool's own (`status_label`), and the summary
+/// is cleaned so raw commands, absolute paths and secrets never leak.
 ///
-/// - The label hides orchestration internals like `spawn_agent`.
-/// - Command-bearing tools (terminal) return an empty summary unless the channel
-///   is a private 1-on-1 DM (`ChannelVisibility::Private`); in a DM the redacted
-///   command is shown (home paths shortened, secrets scrubbed).
-/// - All other summaries are passed through `redact_secrets` and length-capped
-///   using char-safe truncation.
+/// - A shell's summary (`shell_command_line`) is its command: dropped.
+/// - Memory tools read as checking or updating memory, without the action.
+/// - Every other summary passes through `redact_secrets`, length-capped by
+///   characters.
 pub fn user_facing_tool_activity(
     name: &str,
     summary: &str,
-    visibility: aidaemon_core::ChannelVisibility,
+    facts: &crate::semantics::ToolDispatchFacts,
+    mutates: bool,
 ) -> (String, String) {
-    // `manage_memories`/`manage_people` carry the action ("search", "list",
-    // "forget", …) as their summary. A read action rendered with the static
-    // "updating memory" label produced contradictory text like
-    // "Using updating memory: search...". Pick the verb from the action and
-    // drop the now-redundant action summary.
-    if matches!(name, "manage_memories" | "manage_people") {
-        let action = summary
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let label = if memory_action_is_read(&action) {
-            "checking memory"
-        } else {
+    // Memory tools carry the action ("search", "forget", ...) as their
+    // summary. The call's admitted semantics say whether it reads or changes
+    // memory, and the action summary is then redundant.
+    if facts.activity == crate::semantics::ToolActivity::Memory {
+        let label = if mutates {
             "updating memory"
+        } else {
+            "checking memory"
         };
         return (label.to_string(), String::new());
     }
 
-    let label = friendly_tool_label(name);
+    let label = friendly_tool_label(name, facts);
 
-    if summary_is_command_bearing(name) {
+    if facts.shell_command_line {
         // Never expose the raw command / absolute paths in any user-facing
         // surface. The full command stays in tool results and logs for the LLM.
         return (label, String::new());
     }
-    let _ = visibility; // retained for signature compatibility / other callers
 
     let cleaned = shorten_home_dir(summary);
     let cleaned = redact_secrets(&cleaned);
@@ -939,17 +848,43 @@ pub fn user_facing_tool_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aidaemon_core::ChannelVisibility;
+
+    use crate::semantics::{ToolActivity, ToolDispatchFacts};
+
+    fn labelled(label: &'static str) -> ToolDispatchFacts {
+        ToolDispatchFacts {
+            status_label: Some(label),
+            ..ToolDispatchFacts::default()
+        }
+    }
+
+    fn shell() -> ToolDispatchFacts {
+        ToolDispatchFacts {
+            shell_command_line: true,
+            ..labelled("running a command")
+        }
+    }
+
+    fn memory() -> ToolDispatchFacts {
+        ToolDispatchFacts {
+            activity: ToolActivity::Memory,
+            ..ToolDispatchFacts::default()
+        }
+    }
 
     #[test]
     fn a_tool_without_a_friendly_label_reads_as_words() {
         let (label, _) = user_facing_tool_activity(
             "check_environment",
             "/Users/synthetic-user/projects",
-            ChannelVisibility::Private,
+            &ToolDispatchFacts::default(),
+            false,
         );
         assert_eq!(label, "check environment");
-        assert_eq!(friendly_tool_label("terminal"), "running a command");
+        assert_eq!(
+            friendly_tool_label("terminal", &shell()),
+            "running a command"
+        );
     }
 
     #[test]
@@ -1038,104 +973,45 @@ mod tests {
     }
 
     #[test]
-    fn user_facing_activity_relabels_internal_tool_names() {
+    fn user_facing_activity_uses_the_tools_own_label() {
         let (label, _summary) = user_facing_tool_activity(
             "spawn_agent",
             "executor: do the thing",
-            ChannelVisibility::Private,
+            &labelled("delegating to a specialist"),
+            false,
         );
         assert_eq!(label, "delegating to a specialist");
-        assert_ne!(label, "spawn_agent");
         assert!(!label.contains("spawn_agent"));
-
-        let (label, _) =
-            user_facing_tool_activity("cli_agent", "claude working", ChannelVisibility::Private);
-        assert_eq!(label, "delegating to a CLI agent");
-    }
-
-    #[test]
-    fn user_facing_activity_hides_raw_command_outside_private_dm() {
-        let summary = "`cd ~/projects/resume/google && pdftotext resume.pdf -`";
-        for vis in [
-            ChannelVisibility::PrivateGroup,
-            ChannelVisibility::Public,
-            ChannelVisibility::PublicExternal,
-            ChannelVisibility::Internal,
-        ] {
-            let (label, clean) = user_facing_tool_activity("terminal", summary, vis);
-            assert_eq!(label, "running a command");
-            assert!(clean.is_empty(), "{vis:?} must suppress the command");
-        }
-    }
-
-    #[test]
-    fn command_summary_suppressed_in_private_dm() {
-        let (label, summary) = user_facing_tool_activity(
-            "terminal",
-            "`cd '/tmp' && python3 /tmp/netprobe3.py`",
-            aidaemon_core::ChannelVisibility::Private,
-        );
-        assert_eq!(label, "running a command");
-        assert_eq!(summary, "", "raw command must not reach chat even in a DM");
     }
 
     #[test]
     fn user_facing_activity_suppresses_all_commands() {
-        // Commands are now suppressed in all channel visibilities, including Private.
-        // The full command still flows to the LLM via tool results — this only
-        // changes the user-facing status text projection.
-        let summary = "`curl -H \"Authorization: Bearer xyz789\" https://api.example.com`";
-        let (label, clean) =
-            user_facing_tool_activity("terminal", summary, ChannelVisibility::Private);
-        assert_eq!(label, "running a command");
-        assert_eq!(
-            clean, "",
-            "commands must never appear in user-facing status"
-        );
+        // A shell's summary is its command: never in user-facing status. The
+        // full command still flows to the LLM via tool results.
+        for summary in [
+            "`cd ~/projects/resume/google && pdftotext resume.pdf -`",
+            "`curl -H \"Authorization: Bearer xyz789\" https://api.example.com`",
+        ] {
+            let (label, clean) = user_facing_tool_activity("terminal", summary, &shell(), true);
+            assert_eq!(label, "running a command");
+            assert!(clean.is_empty(), "commands must never appear: {clean}");
+        }
     }
 
     #[test]
-    fn user_facing_activity_memory_search_reads_not_updates() {
+    fn user_facing_activity_memory_reads_by_semantics_not_action() {
         // Regression: a memory search rendered as "updating memory: search".
         let (label, summary) =
-            user_facing_tool_activity("manage_memories", "search", ChannelVisibility::Private);
+            user_facing_tool_activity("manage_memories", "search", &memory(), false);
         assert_eq!(label, "checking memory");
         assert!(
             summary.is_empty(),
             "redundant bare action should be dropped"
         );
-        // Rendered as the channel would: clean, no contradictory verb.
-        assert_eq!(format!("Using {label}..."), "Using checking memory...");
-
-        for read in ["search", "search_episodes", "list", "list_goals"] {
-            let (label, _) =
-                user_facing_tool_activity("manage_memories", read, ChannelVisibility::Private);
-            assert_eq!(label, "checking memory", "action {read} should read");
-        }
-    }
-
-    #[test]
-    fn user_facing_activity_memory_writes_stay_updating() {
-        for write in [
-            "forget",
-            "set_privacy",
-            "create_personal_goal",
-            "complete_goal",
-        ] {
-            let (label, summary) =
-                user_facing_tool_activity("manage_memories", write, ChannelVisibility::Private);
-            assert_eq!(label, "updating memory", "action {write} should write");
-            assert!(summary.is_empty());
-        }
-        // manage_people follows the same read/write split.
-        assert_eq!(
-            user_facing_tool_activity("manage_people", "view John", ChannelVisibility::Private).0,
-            "checking memory"
-        );
-        assert_eq!(
-            user_facing_tool_activity("manage_people", "add Jane", ChannelVisibility::Private).0,
-            "updating memory"
-        );
+        let (label, summary) =
+            user_facing_tool_activity("manage_people", "add Jane", &memory(), true);
+        assert_eq!(label, "updating memory");
+        assert!(summary.is_empty());
     }
 
     #[test]
@@ -1143,7 +1019,8 @@ mod tests {
         let (label, clean) = user_facing_tool_activity(
             "some_future_tool",
             "did something useful",
-            ChannelVisibility::Private,
+            &ToolDispatchFacts::default(),
+            false,
         );
         assert_eq!(label, "some future tool");
         assert_eq!(clean, "did something useful");
@@ -1153,7 +1030,7 @@ mod tests {
     fn user_facing_activity_caps_long_summary() {
         let long = "a".repeat(300);
         let (_label, clean) =
-            user_facing_tool_activity("web_search", &long, ChannelVisibility::Private);
+            user_facing_tool_activity("web_search", &long, &labelled("searching the web"), false);
         assert!(clean.chars().count() <= STATUS_SUMMARY_MAX_CHARS);
     }
 

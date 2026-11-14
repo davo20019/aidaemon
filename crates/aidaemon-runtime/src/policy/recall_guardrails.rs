@@ -111,7 +111,7 @@ pub fn text_relates_to_critical_identity(text: &str) -> bool {
 /// Execution tools blocked when delegation mode is active.
 /// Keep spawn_agent available for task-lead orchestration.
 pub fn is_delegation_blocked_tool(name: &str) -> bool {
-    matches!(name, "terminal" | "browser" | "run_command")
+    matches!(name, "terminal" | "browser")
 }
 
 #[cfg(test)]
@@ -161,7 +161,6 @@ mod tests {
     fn identifies_delegation_blocked_tools() {
         assert!(is_delegation_blocked_tool("terminal"));
         assert!(is_delegation_blocked_tool("browser"));
-        assert!(is_delegation_blocked_tool("run_command"));
         assert!(!is_delegation_blocked_tool("spawn_agent"));
         assert!(!is_delegation_blocked_tool("cli_agent"));
         assert!(!is_delegation_blocked_tool("web_search"));
@@ -174,7 +173,6 @@ mod tests {
             json!({"type":"function","function":{"name":"cli_agent"}}),
             json!({"type":"function","function":{"name":"web_search"}}),
             json!({"type":"function","function":{"name":"browser"}}),
-            json!({"type":"function","function":{"name":"run_command"}}),
             json!({"type":"function","function":{"name":"spawn_agent"}}),
             json!({"type":"function","function":{"name":"remember_fact"}}),
         ];

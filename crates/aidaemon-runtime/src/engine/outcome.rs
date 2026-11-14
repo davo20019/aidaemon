@@ -192,7 +192,7 @@ impl TurnVerdict {
     pub fn final_reply(
         &self,
         outcome: &sdk::RunOutcome,
-        tool_calls: &[String],
+        tool_calls: &[crate::turn::post_task::LearnedCall],
         visibility: aidaemon_core::ChannelVisibility,
     ) -> (String, TaskStatus, TaskOutcome) {
         let (reply, status, task_outcome) = self.resolve(outcome);

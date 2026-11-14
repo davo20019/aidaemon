@@ -561,6 +561,14 @@ impl Tool for GoalTraceTool {
 }
 
 impl crate::traits::ToolSemantics for GoalTraceTool {
+    fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
+        aidaemon_tools::semantics::ToolDispatchFacts {
+            evidence: aidaemon_tools::semantics::EvidenceSource::GoalTrace,
+            semantic_scope: Some(aidaemon_tools::semantics::ToolSemanticScope::GoalState),
+            ..Default::default()
+        }
+    }
+
     /// Goal traces replay past tool results and messages, whoever wrote them.
     fn output_trust(
         &self,

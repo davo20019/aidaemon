@@ -2779,6 +2779,10 @@ impl aidaemon_tools::semantics::ToolSemantics for SpawnAgentTool {
             // that already finished, the moment it fired.
             manages_own_timeout: true,
             goal_context: aidaemon_tools::semantics::GoalContext::Goal,
+            activity: aidaemon_tools::semantics::ToolActivity::Fixed(
+                aidaemon_core::card::ActivityKind::Delegate,
+            ),
+            status_label: Some("delegating to a specialist"),
             ..Default::default()
         }
     }

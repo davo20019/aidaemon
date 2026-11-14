@@ -267,6 +267,7 @@ pub fn assimilate_continuation_receipt(
     contract: &CompletionContract,
     progress: &mut CompletionProgress,
     evidence: &aidaemon_events::store::ContinuationToolEvidence,
+    source: aidaemon_tools::semantics::EvidenceSource,
     parent_task_id: &str,
     parent_result_id: &str,
 ) -> Option<ContinuationReceiptAssimilation> {
@@ -283,6 +284,7 @@ pub fn assimilate_continuation_receipt(
     let mut metadata = receipt.to_metadata();
     crate::turn::tool_dispatch::complete_tool_result_semantics(
         &evidence.result.name,
+        source,
         &raw_arguments,
         &receipt.semantics,
         &mut metadata,
@@ -742,6 +744,7 @@ impl TurnEngine<'_> {
                             &turn_context.completion_contract,
                             &mut completion_progress,
                             &evidence,
+                            self.registered_tool_facts(&evidence.result.name).evidence,
                             parent_task_id,
                             parent_result_id,
                         ) {
@@ -859,6 +862,7 @@ impl TurnEngine<'_> {
                         .and_then(|function| function.get("name"))
                         .and_then(serde_json::Value::as_str)
                 }),
+                |name| self.registered_tool_facts(name).evidence,
             );
             let outstanding_needs = turn_context
                 .completion_contract
