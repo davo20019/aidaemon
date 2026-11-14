@@ -206,6 +206,16 @@ fn git_ref_command_only_lists(cmd: &str) -> bool {
 /// How long a confined-tier process may run.
 pub(crate) const CONFINED_TIER_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long each Git preflight probe may run. A cold `xcrun` (its first run
+/// after boot or an Xcode update) can take well over 5 s, and a probe that
+/// times out fails the learner's command, so probes get room to finish.
+const GIT_PROBE_TIMEOUT_SECS: u64 = 60;
+
+/// The macOS developer-tool Git, resolved once per process: `xcrun --find`
+/// is slow cold and its answer does not change while the daemon runs.
+#[cfg(target_os = "macos")]
+static MACOS_GIT: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+
 /// A confined-tier process that ran: its output, the directory it ran in,
 /// and the paths it read beyond that (Git's metadata).
 pub(crate) struct ConfinedRun {
@@ -236,9 +246,13 @@ pub(crate) async fn run_confined(
     let mut reads = read_paths.to_vec();
     let mut adapter_read_paths = Vec::new();
     if is_git_command {
-        let preflight =
-            fs_utils::run_cmd_backend(&**backend, "git rev-parse --show-toplevel", Some(&dir), 5)
-                .await?;
+        let preflight = fs_utils::run_cmd_backend(
+            &**backend,
+            "git rev-parse --show-toplevel",
+            Some(&dir),
+            GIT_PROBE_TIMEOUT_SECS,
+        )
+        .await?;
         if preflight.exit_code != 0 {
             anyhow::bail!(
                 "Git preflight failed: execution directory '{}' is not inside a repository. \
@@ -250,7 +264,7 @@ pub(crate) async fn run_confined(
             &**backend,
             "git rev-parse --path-format=absolute --git-dir --git-common-dir",
             Some(&dir),
-            5,
+            GIT_PROBE_TIMEOUT_SECS,
         )
         .await?;
         if metadata.exit_code != 0 {
@@ -272,15 +286,25 @@ pub(crate) async fn run_confined(
     // attempting a cache write during a read-only observation.
     #[cfg(target_os = "macos")]
     let executable_command = if is_git_command {
-        let resolved =
-            fs_utils::run_cmd_backend(&**backend, "xcrun --find git", Some(&dir), 5).await?;
-        if resolved.exit_code != 0 {
-            anyhow::bail!("Could not resolve the macOS Git executable before confinement.");
-        }
-        let git_path = resolved.stdout.trim();
-        if !git_path.starts_with('/') || git_path.contains(['\n', '\r']) {
-            anyhow::bail!("macOS returned an invalid Git executable path.");
-        }
+        let git_path = MACOS_GIT
+            .get_or_try_init(|| async {
+                let resolved = fs_utils::run_cmd_backend(
+                    &**backend,
+                    "xcrun --find git",
+                    Some(&dir),
+                    GIT_PROBE_TIMEOUT_SECS,
+                )
+                .await?;
+                if resolved.exit_code != 0 {
+                    anyhow::bail!("Could not resolve the macOS Git executable before confinement.");
+                }
+                let git_path = resolved.stdout.trim().to_string();
+                if !git_path.starts_with('/') || git_path.contains(['\n', '\r']) {
+                    anyhow::bail!("macOS returned an invalid Git executable path.");
+                }
+                Ok(git_path)
+            })
+            .await?;
         format!(
             "'{}'{}",
             git_path.replace('\'', "'\"'\"'"),
