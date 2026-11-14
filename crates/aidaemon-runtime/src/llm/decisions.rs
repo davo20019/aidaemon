@@ -80,6 +80,9 @@ pub mod digest_keys {
     pub const RELATIONSHIP: &str = "relationship";
     pub const IDENTITY: &str = "identity";
     pub const TIER: &str = "tier";
+    /// Whether the message asks for anything to change; a confident "no"
+    /// lets the turn skip the request compiler.
+    pub const ASKS_CHANGE: &str = "asks_change";
 }
 
 impl Decision {
@@ -119,6 +122,13 @@ impl Decision {
                         key: digest_keys::TIER,
                         min_confidence: 0.6,
                         sources: ANY_SOURCE,
+                    },
+                    // Skipping the request compiler drops the owner's units
+                    // for the turn, so only a calibrated, clear "no" acts.
+                    ActsOn {
+                        key: digest_keys::ASKS_CHANGE,
+                        min_confidence: 0.8,
+                        sources: CALIBRATED,
                     },
                 ],
             },

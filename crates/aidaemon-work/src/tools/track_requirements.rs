@@ -293,9 +293,9 @@ impl Tool for TrackRequirementsTool {
     fn description(&self) -> &str {
         "Declare the typed checklist of what the current request requires, BEFORE your first \
          operation whenever the request changes anything (a file, a remote system, a deployment, \
-         a schedule, a setting) or sends or publishes anything, even if it is one operation, and \
-         whenever it names two or more distinct operations, deliverables, or targets (an ordered \
-         sequence like create/write/read/remove/verify is one item per step). \
+         a schedule, a setting) or sends or publishes anything, even if it is one operation; such \
+         a request naming two or more distinct operations, deliverables, or targets gets one item \
+         each (an ordered sequence like create/write/read/remove/verify is one item per step). \
          Give each item its exact targets (paths/URLs) and mutation_effects, or requires_observation \
          for reads/verifications. The runtime compiles typed items into obligations closed only by \
          real tool receipts and will keep asking for open reachable items, so declare exactly what \
@@ -319,8 +319,9 @@ impl Tool for TrackRequirementsTool {
          example, earlier results exist and redoing the work would replace or duplicate them): \
          your final answer is then that one question. Earlier results are never by themselves \
          the answer to an instruction to do the work. \
-         Skip this only for a single read-only lookup, a plain answer or conversation, or when \
-         the user forbids it."
+         Skip this for a request that only looks or reports (finding, listing, counting, reading, \
+         checking, however many lookups it takes: answer every part in your reply), a plain \
+         answer or conversation, or when the user forbids it."
     }
 
     fn schema(&self) -> Value {

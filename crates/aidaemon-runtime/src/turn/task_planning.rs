@@ -396,6 +396,17 @@ pub fn owner_units_note(units: &[aidaemon_events::traits::RequestWorkUnit]) -> O
             )
         })
         .collect();
+    // Looks only: closeout demands none of them (`uncovered_owner_units`
+    // counts units asking for change), so they need no checklist; the reply
+    // answers each.
+    if units.iter().all(|unit| !unit.asks_change) {
+        return Some(format!(
+            "[What the owner asked for] Compiled from the owner's message:\n{}\n\
+             These only ask to look or report: answer every one of them in your reply. \
+             They need no checklist.",
+            lines.join("\n")
+        ));
+    }
     Some(format!(
         "[What the owner asked for] Compiled from the owner's message, apart from your plan:\n{}\n\
          Your checklist answers for each of these: give every item the owner_units it carries out. \
@@ -532,6 +543,14 @@ pub fn turn_digest_request(
             TIERS,
         ),
     );
+    request.insert(
+        digest_keys::ASKS_CHANGE,
+        Question::yes_no_described(
+            "Does the current user message ask for anything to be made, changed, installed, set up, removed, sent, published or scheduled? A reply that approves, answers or settles an earlier request asks for what that request asked.",
+            "Yes: carrying it out changes something or sends something, in any language.",
+            "No: it only asks to look at, find, check, count, explain or report something, or asks for nothing (thanks, a greeting, a remark).",
+        ),
+    );
     TurnDigestRequest {
         request,
         antecedents,
@@ -567,6 +586,16 @@ pub fn digest_relationship(
 }
 
 /// Whether the digest flags the message as identity-critical.
+/// The digest said, clearly enough to act on, that the message asks for
+/// nothing to change: the request compiler's units would all be looks,
+/// which closeout never demands, so the turn need not wait for them.
+pub fn digest_asks_no_change(outcome: &crate::llm::decisions::DecisionOutcome) -> bool {
+    outcome
+        .acted(crate::llm::decisions::digest_keys::ASKS_CHANGE)
+        .and_then(aidaemon_decisions::Answer::p_yes)
+        .is_some_and(|p| p < 0.5)
+}
+
 pub fn digest_identity(outcome: &crate::llm::decisions::DecisionOutcome) -> bool {
     outcome
         .acted(crate::llm::decisions::digest_keys::IDENTITY)
@@ -688,7 +717,82 @@ mod tests {
             note.contains("1. Homepage screenshot (to look at"),
             "{note}"
         );
+        assert!(note.contains("Your checklist answers"), "{note}");
         assert!(owner_units_note(&[]).is_none());
+    }
+
+    /// The compiler is skipped only on a calibrated, confident "no change"
+    /// that the turn acts on; a shadow, a guess or a "yes" keeps it.
+    #[test]
+    fn only_a_confident_calibrated_no_skips_the_compiler() {
+        use crate::llm::decisions::{Decision, digest_keys};
+        use aidaemon_decisions::{Answer, ConfidenceSource, DecisionResponse};
+        let outcome = |p_yes: f32, source: ConfidenceSource, acting: bool| {
+            let mut answers = std::collections::BTreeMap::new();
+            answers.insert(
+                digest_keys::ASKS_CHANGE.to_string(),
+                Answer::yes_no(p_yes, source),
+            );
+            crate::llm::decide::gated_for_tests(
+                Decision::TurnDigest,
+                DecisionResponse::new("scripted", answers, Default::default()),
+                acting,
+            )
+        };
+        assert!(digest_asks_no_change(&outcome(
+            0.05,
+            ConfidenceSource::Calibrated,
+            true
+        )));
+        assert!(!digest_asks_no_change(&outcome(
+            0.3,
+            ConfidenceSource::Calibrated,
+            true
+        )));
+        assert!(!digest_asks_no_change(&outcome(
+            0.95,
+            ConfidenceSource::Calibrated,
+            true
+        )));
+        assert!(!digest_asks_no_change(&outcome(
+            0.05,
+            ConfidenceSource::SelfReported,
+            true
+        )));
+        assert!(!digest_asks_no_change(&outcome(
+            0.05,
+            ConfidenceSource::Calibrated,
+            false
+        )));
+    }
+
+    /// The digest always asks whether the message asks for change.
+    #[test]
+    fn the_digest_asks_whether_the_message_asks_for_change() {
+        let digest = turn_digest_request("list the files in src", None);
+        assert!(
+            digest
+                .request
+                .questions
+                .contains_key(crate::llm::decisions::digest_keys::ASKS_CHANGE)
+        );
+    }
+
+    /// Units that only look or report ask for no checklist: closeout never
+    /// demands them, and a checklist for "list these files and count them"
+    /// cost a live turn six extra model rounds (2026-11-14).
+    #[test]
+    fn looks_only_units_ask_for_no_checklist() {
+        let units = parse_owner_units(
+            r#"{"schema_version":1,"units":[{"what":"List the files","asks_change":false},{"what":"Count them","asks_change":false}]}"#,
+        )
+        .unwrap();
+        let note = owner_units_note(&units).unwrap();
+        assert!(note.contains("0. List the files (to look at"), "{note}");
+        assert!(note.contains("1. Count them (to look at"), "{note}");
+        assert!(note.contains("answer every one of them"), "{note}");
+        assert!(!note.contains("Your checklist answers"), "{note}");
+        assert!(!note.contains("owner_units"), "{note}");
     }
 
     #[test]

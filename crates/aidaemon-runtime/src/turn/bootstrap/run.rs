@@ -577,6 +577,7 @@ pub async fn run_bootstrap(
     let user_role = ctx.user_role;
     let channel_ctx = ctx.channel_ctx.clone();
     info!(session_id, "Bootstrap phase started");
+    let bootstrap_started = std::time::Instant::now();
 
     let is_mandate_execution = agent.works_for_mandate();
     anyhow::ensure!(
@@ -1084,9 +1085,21 @@ pub async fn run_bootstrap(
                 .flatten(),
         )
     });
+    // The digest can spare the turn the request compiler when it saw what
+    // the compiler sees: the whole conversation, or no conversation at all.
+    // A follow-up the ingress already typed asks the digest without the
+    // conversation, so its "asks for no change" could miss what an approval
+    // settles; the compiler runs there as before.
+    let compiles_units =
+        !(ctx.internal_continuation || planner_skip_reason.is_some() || agent.works_for_mandate());
+    let digest_gates_units = compiles_units
+        && digest.is_some()
+        && digest_mode == crate::settings::DecisionMode::On
+        && (relationship_needed || planner_context.is_none());
     let digest_awaited = digest.is_some()
         && digest_mode == crate::settings::DecisionMode::On
         && (relationship_needed
+            || digest_gates_units
             || agent
                 .side_calls()
                 .decision_mode(crate::llm::decisions::Decision::ModelRoute)
@@ -1111,7 +1124,7 @@ pub async fn run_bootstrap(
     // The request compiler reads only a message a person wrote, beside the
     // router and the digest.
     let compile_units = async {
-        if ctx.internal_continuation || planner_skip_reason.is_some() || agent.works_for_mandate() {
+        if !compiles_units {
             return None;
         }
         crate::turn::task_planning::compile_owner_units(
@@ -1169,8 +1182,52 @@ pub async fn run_bootstrap(
             None => (router.await, None),
         }
     };
-    let ((relationship_fallback, digest_outcome), owner_units) =
-        tokio::join!(relationship_and_digest, compile_units);
+    // The compiler runs beside the digest. When the digest answers first
+    // that the message asks for no change, the compiler is dropped: its
+    // units would all be looks, which closeout never demands.
+    let planner_started = std::time::Instant::now();
+    let (relationship_fallback, digest_outcome, digest_ms, owner_units, request_units) = {
+        let mut compile_units = std::pin::pin!(compile_units);
+        let mut relationship_and_digest = std::pin::pin!(relationship_and_digest);
+        let mut compiled_first = None;
+        let (relationship_fallback, digest_outcome) = tokio::select! {
+            shaped = &mut relationship_and_digest => shaped,
+            units = &mut compile_units => {
+                compiled_first = Some(units);
+                relationship_and_digest.await
+            }
+        };
+        let digest_ms = planner_started.elapsed().as_millis() as u64;
+        let (owner_units, request_units) = match compiled_first {
+            Some(units) => (
+                units,
+                if compiles_units {
+                    "compiled"
+                } else {
+                    "not_run"
+                },
+            ),
+            None if digest_gates_units
+                && digest_outcome
+                    .as_ref()
+                    .is_some_and(crate::turn::task_planning::digest_asks_no_change) =>
+            {
+                (None, "skipped_no_change")
+            }
+            None => (compile_units.await, "compiled"),
+        };
+        (
+            relationship_fallback,
+            digest_outcome,
+            digest_ms,
+            owner_units,
+            request_units,
+        )
+    };
+    let planner_ms = planner_started.elapsed().as_millis() as u64;
+    let before_planner_ms = planner_started
+        .duration_since(bootstrap_started)
+        .as_millis() as u64;
     if let Some(outcome) = digest_outcome.as_ref() {
         annotate_identity(agent.messages(), session_id, &user_msg_id, outcome).await;
     }
@@ -1397,6 +1454,7 @@ pub async fn run_bootstrap(
     // MISS a `Core prompt invalidated component=...` line is logged there. Option
     // (b) in the plan — chosen for the smaller diff since assemble + render already
     // co-locate at that call site.
+    let prompt_started = std::time::Instant::now();
     let (
         core_prompt_bytes,
         fresh_task_context_tail,
@@ -1417,6 +1475,7 @@ pub async fn run_bootstrap(
         project_instruction_scope,
     )
     .await?;
+    let prompt_ms = prompt_started.elapsed().as_millis() as u64;
 
     // A skill the user explicitly asked for this turn narrows the roster when
     // it is an external API reference.
@@ -1516,6 +1575,19 @@ pub async fn run_bootstrap(
         harness_eval,
     };
 
+    // One line per turn that splits bootstrap's time by stage. The planner
+    // stage is the digest, router and request compiler; each side call also
+    // logs its own "Side call finished" / "Decision finished" line.
+    info!(
+        session_id,
+        total_ms = bootstrap_started.elapsed().as_millis() as u64,
+        before_planner_ms,
+        digest_ms,
+        planner_ms,
+        request_units,
+        prompt_ms,
+        "Bootstrap timing"
+    );
     Ok(BootstrapOutcome::Continue(Box::new(data)))
 }
 
