@@ -45,15 +45,6 @@ __pycache__/
 # copied into crates/aidaemon-client-gateway/web).
 !clients/web/*.json
 clients/web/dist/
-# The desktop app's manifests, Tauri config, capabilities and icons; its
-# copy of the web build and Tauri's outputs are generated.
-!clients/desktop/*.json
-!clients/desktop/src-tauri/*.json
-!clients/desktop/src-tauri/capabilities/*.json
-clients/desktop/dist/
-clients/desktop/node_modules/
-clients/desktop/src-tauri/target/
-clients/desktop/src-tauri/gen/
 *.png
 *.txt
 *.pdf
@@ -120,5 +111,3 @@ crates/EXTENDING.md
 crates/PUBLISHING.md
 crates/aidaemon-core/DESIGN.md
 crates/aidaemon-eval/RESULTS.md
-# The desktop app's icons (after the *.png rule above).
-!clients/desktop/src-tauri/icons/*.png

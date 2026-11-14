@@ -1,7 +1,6 @@
 //! The connection to the daemon's Client Gateway. On the desktops and in a
 //! terminal it is `aidaemon-client-core`'s own link (the one the old TUI
-//! and the Tauri shell use), run on NSH's background threads; its updates
-//! come back to the engine thread and into the [`Store`].
+//! uses), run on NSH's background threads; its updates come back to the engine thread and into the [`Store`].
 
 use crate::store::Store;
 

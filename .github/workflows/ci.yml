@@ -407,37 +407,33 @@ jobs:
       - name: The TypeScript reducer passes the shared reducer fixtures
         run: npm run test:fixtures
 
-  # The desktop app (clients/desktop, its own Cargo workspace): build only,
-  # one job per OS. Signing and release bundles live in release.yml.
-  desktop:
-    name: Desktop app build (${{ matrix.os }})
+  # The app (clients/app, nsh, its own Cargo workspace): check, lint and the
+  # headless tests on the real engine. Linux needs GTK 4.14 for the desktop
+  # backend the binary links.
+  app:
+    name: App (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-22.04, windows-latest]
+        os: [macos-latest, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
-        working-directory: clients/desktop
+        working-directory: clients/app
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
       - name: Install Rust
         run: rustup toolchain install && rustc --version
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev libssl-dev pkg-config
-      - run: npm install
-      - name: Bundle the web client
-        run: npm run build:web
-      - name: Build the shell (no bundle, no signing)
-        run: npm run tauri -- build --no-bundle --debug
-      - name: Shell unit tests
-        working-directory: clients/desktop/src-tauri
+          sudo apt-get install -y libgtk-4-dev clang pkg-config
+      - name: Check
+        run: cargo check --all-targets
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Headless tests
         run: cargo test -q
 
   build-check:

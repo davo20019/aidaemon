@@ -1,6 +1,6 @@
 //! Where a paired device keeps its identity: the gateway it paired with, the
 //! device id it was given and its private key. [`FileKeyStore`] keeps it in
-//! one file readable by the owner only; the desktop app adds an OS keychain
+//! one file readable by the owner only; a client may add an OS keychain
 //! implementation.
 
 use std::path::{Path, PathBuf};

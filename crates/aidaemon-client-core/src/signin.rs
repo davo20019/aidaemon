@@ -334,7 +334,8 @@ impl GrantCache {
 #[cfg(feature = "native")]
 pub use native::*;
 
-/// reqwest and tokio: what the terminal UI and the Tauri shell use.
+/// reqwest and tokio: what the terminal UI and the nsh app's desktop and
+/// terminal builds use.
 #[cfg(feature = "native")]
 mod native {
     use super::*;
