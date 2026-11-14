@@ -88,8 +88,28 @@ struct ManageArgs {
     query: Option<String>,
 }
 
-const TOOL_DESCRIPTION: &str =
-    "Memories. search=facts; search_episodes=past chats. Store via remember_fact.";
+const TOOL_DESCRIPTION: &str = "Memories. search=stored facts; search_episodes=generated summaries of past chats (exact messages: search_history). Store via remember_fact.";
+
+/// The memory actions' parameters, each described. A host that offers more
+/// actions on the same tool (personal goals) extends this map.
+pub fn memory_parameters() -> serde_json::Map<String, Value> {
+    let Value::Object(map) = json!({
+        "action": { "type": "string", "enum": MEMORY_ACTIONS, "description": "forget and set_privacy name one fact by category and key." },
+        "limit": { "type": "integer", "description": "Max results." },
+        "category": { "type": "string", "description": "forget/set_privacy: the fact's category; list: filter." },
+        "key": { "type": "string", "description": "forget/set_privacy: the fact's key." },
+        "privacy": { "type": "string", "enum": ["global", "channel", "private"], "description": "set_privacy: who may see it." },
+        "query": { "type": "string", "description": "search: what to find. search_episodes: a topic, or omit for the latest chats." }
+    }) else {
+        unreachable!("a JSON object literal")
+    };
+    map
+}
+
+/// The answer to an action the tool does not have, naming the ones it has.
+pub fn unknown_action_message(action: &str, actions: &[&str]) -> String {
+    format!("Unknown action: '{action}'. Use {}.", actions.join(", "))
+}
 
 fn manage_memories_schema() -> Value {
     json!({
@@ -97,17 +117,7 @@ fn manage_memories_schema() -> Value {
         "description": TOOL_DESCRIPTION,
         "parameters": {
             "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": MEMORY_ACTIONS
-                },
-                "limit": { "type": "integer" },
-                "category": { "type": "string" },
-                "key": { "type": "string" },
-                "privacy": { "type": "string", "enum": ["global", "channel", "private"] },
-                "query": { "type": "string" }
-            },
+            "properties": memory_parameters(),
             "required": ["action"],
             "additionalProperties": false
         }
@@ -621,10 +631,7 @@ impl ManageMemoriesTool {
                 );
                 Ok(output)
             }
-            other => Ok(format!(
-                "Unknown action: '{}'. Use list, health, repair, forget, set_privacy, search or search_episodes.",
-                other
-            )),
+            other => Ok(unknown_action_message(other, MEMORY_ACTIONS)),
         }
     }
 }

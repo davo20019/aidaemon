@@ -81,15 +81,6 @@ manage_mandates.review_effort
 manage_mandates.section
 manage_mandates.strategy_skill
 manage_mcp.action
-manage_memories.action
-manage_memories.category
-manage_memories.goal
-manage_memories.goal_id
-manage_memories.key
-manage_memories.limit
-manage_memories.priority
-manage_memories.privacy
-manage_memories.query
 manage_oauth.account_id
 manage_oauth.account_id_pointer
 manage_oauth.action

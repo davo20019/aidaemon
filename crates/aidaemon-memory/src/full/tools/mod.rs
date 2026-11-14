@@ -27,7 +27,9 @@ mod manage_people;
 mod remember_fact;
 mod share_memory;
 
-pub use manage_memories::{MEMORY_ACTIONS, ManageMemoriesTool};
+pub use manage_memories::{
+    MEMORY_ACTIONS, ManageMemoriesTool, memory_parameters, unknown_action_message,
+};
 pub use manage_people::ManagePeopleTool;
 pub use remember_fact::{RememberFactTool, call_deletes_facts};
 pub use share_memory::ShareMemoryTool;
