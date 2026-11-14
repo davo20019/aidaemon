@@ -29,20 +29,35 @@ pub fn shell(store: Store) -> View {
     on_key("mod+b", move |_| store.open_sidebar());
     on_key("mod+i", move |_| store.open_inspector());
     on_key("mod+g", move |_| store.take_suggestion());
-    on_key("escape", move |_| {
-        if let Some(id) = store.selected()
-            && store.is_running(&id)
-        {
-            store.stop(&id);
-        }
-    });
+    // Fires while typing too (an input would keep Esc to itself), and
+    // still reaches the input after.
+    on_key_with(
+        "escape",
+        KeyOptions {
+            pass_through: true,
+            ..always()
+        },
+        move |_| {
+            // Esc closes what is open first (the terminal's palette does not
+            // see it), then stops the turn.
+            if palette.get_untracked() {
+                palette.set(false);
+                return;
+            }
+            if let Some(id) = store.selected()
+                && store.is_running(&id)
+            {
+                store.stop(&id);
+            }
+        },
+    );
     // Copy the last reply, anywhere.
-    on_key("mod+shift+c", move |_| copy_reply(store));
+    on_key_with("mod+shift+c", always(), move |_| copy_reply(store));
     on_key("mod+,", move |_| store.open_system());
     if terminal {
         // One meaning per state: stop the turn; else press twice to quit.
         let armed = stored(0_u64);
-        on_key("ctrl+c", move |_| {
+        on_key_with("mod+c", always(), move |_| {
             if let Some(id) = store.selected_untracked()
                 && store.is_running(&id)
             {
@@ -56,7 +71,7 @@ pub fn shell(store: Store) -> View {
                 store.say("Press Ctrl+C again to quit");
             }
         });
-        on_key("ctrl+y", move |_| copy_reply(store));
+        on_key_with("mod+y", always(), move |_| copy_reply(store));
     }
 
     let main = view()
@@ -127,6 +142,14 @@ pub fn shell(store: Store) -> View {
     }
 }
 
+/// A binding that fires while the composer has the keyboard too.
+fn always() -> KeyOptions {
+    KeyOptions {
+        when: nsh_core::keymap::When::Always,
+        ..KeyOptions::default()
+    }
+}
+
 fn copy_reply(store: Store) {
     match store.last_reply() {
         Some(reply) => {
@@ -149,10 +172,10 @@ pub fn key_line(store: Store) -> View {
         if let Some(id) = store.selected()
             && store.is_running(&id)
         {
-            keys.push(("Ctrl+C".into(), "stop"));
+            keys.push((key_label("mod+c"), "stop"));
         } else {
-            keys.push(("Ctrl+Y".into(), "copy reply"));
-            keys.push(("Ctrl+C ×2".into(), "quit"));
+            keys.push((key_label("mod+y"), "copy reply"));
+            keys.push((format!("{} ×2", key_label("mod+c")), "quit"));
         }
         keys.into_iter()
             .map(|(key, what)| format!("{key} {what}"))
@@ -170,7 +193,7 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
         CommandItem::new("sidebar", "Show or hide the sidebar")
             .group("View")
             .shortcut("mod+b"),
-        CommandItem::new("inspector", "Show or hide the activity panel")
+        CommandItem::new("inspector", "Show or hide the inbox")
             .group("View")
             .shortcut("mod+i"),
     ];

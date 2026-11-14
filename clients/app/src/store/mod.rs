@@ -184,7 +184,8 @@ impl Store {
         if let Some(open) =
             nsh_core::storage::Storage::get_item(OPEN_KEY).filter(|id| !id.is_empty())
         {
-            self.select(Some(open));
+            // Its history loads once the link is up (Connected asks for it).
+            self.selected.set(Some(open));
         }
     }
 

@@ -539,6 +539,7 @@ fn composer(store: Store, session: Option<String>) -> View {
         idiom(),
         nsh_core::platform::Idiom::Phone | nsh_core::platform::Idiom::Pad
     );
+    let terminal = idiom() == nsh_core::platform::Idiom::Terminal;
     view().items_center().px_4().pb_4().pt_2().child(
         ui::surface()
             .w_full()
@@ -591,8 +592,16 @@ fn composer(store: Store, session: Option<String>) -> View {
                     .child(
                         text(move || match (running.get(), touch) {
                             (true, true) => "Working · Stop is at the top".to_owned(),
+                            (true, false) if terminal => {
+                                format!("Working · Esc or {} stops", key_label("mod+c"))
+                            }
                             (true, false) => "Working · Esc stops".to_owned(),
                             (false, true) => String::new(),
+                            // Terminals rarely send Shift+Enter; Alt+Enter
+                            // works in all of them.
+                            (false, false) if terminal => {
+                                format!("Enter to send · {} for a new line", key_label("alt+enter"))
+                            }
                             (false, false) => {
                                 "Enter to send · Shift+Enter for a new line".to_owned()
                             }

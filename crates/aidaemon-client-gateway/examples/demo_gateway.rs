@@ -158,14 +158,14 @@ impl ClientHost for Host {
                 id: "app:plan".into(),
                 channel: "app".into(),
                 title: Some("Plan for Acme Corp".into()),
-                last_activity_ms: Some(2),
+                last_activity_ms: Some(now_ms() - 3_600_000),
                 writable: true,
             },
             SessionSummary {
                 id: "telegram:synthetic-user-1".into(),
                 channel: "telegram".into(),
                 title: Some("Alice Rivera on Telegram".into()),
-                last_activity_ms: Some(1),
+                last_activity_ms: Some(now_ms() - 26 * 3_600_000),
                 writable: false,
             },
         ])
@@ -181,6 +181,7 @@ impl ClientHost for Host {
             ],
             _ => &[("user", "What's on today?"), ("assistant", "Two meetings.")],
         };
+        let count = lines.len() as u64;
         Ok(lines
             .iter()
             .enumerate()
@@ -188,7 +189,8 @@ impl ClientHost for Host {
                 id: format!("{session_id}-m{n}"),
                 role: role.to_string(),
                 text: text.to_string(),
-                at_ms: n as u64,
+                // A minute apart, ending an hour ago.
+                at_ms: now_ms() - 3_600_000 - (count - n as u64) * 60_000,
             })
             .collect())
     }
@@ -357,4 +359,11 @@ async fn main() -> anyhow::Result<()> {
     );
     axum::serve(listener, aidaemon_client_gateway::router(gateway)).await?;
     Ok(())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
 }
