@@ -211,6 +211,61 @@ impl CallEffects {
         }
     }
 
+    /// The effects a call's declared access implies, for a tool that
+    /// declares [`crate::Tool::access`] but not [`crate::Tool::effects`]:
+    /// every written path ([`EffectKey::path`]) a [`EffectClass::Write`]
+    /// (and a [`EffectClass::Delete`] too for a destructive tool), every
+    /// host contacted an [`EffectClass::Egress`] (`host:port`, the port
+    /// from the declaration, else the scheme's, https for a bare host), every command a
+    /// [`EffectClass::Process`] named by its program. A read-only tool
+    /// changes nothing, so only its hosts count. Never `complete`: the tool
+    /// declared what it touches, not that the list is all it does. A
+    /// relative path names no key (declare absolute paths, as
+    /// `Workspace::declare` gives). [`CallEffects::unknown`] for an empty
+    /// manifest.
+    ///
+    /// With these keys an owner's denial binds the rest of the run: a later
+    /// call that writes the same path, by any tool, is refused.
+    pub fn from_access(
+        access: &crate::AccessManifest,
+        annotations: crate::ToolAnnotations,
+    ) -> Self {
+        let mut keys: Vec<EffectKey> = Vec::new();
+        let mut push = |key: EffectKey| {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        };
+        if !annotations.read_only {
+            for path in &access.writes {
+                if let Some(key) = EffectKey::path(EffectClass::Write, path) {
+                    if annotations.destructive {
+                        push(EffectKey {
+                            class: EffectClass::Delete,
+                            target: key.target.clone(),
+                        });
+                    }
+                    push(key);
+                }
+            }
+            for command in &access.commands {
+                if let Some(program) = program_name(command) {
+                    push(EffectKey::named(EffectClass::Process, program));
+                }
+            }
+        }
+        for host in &access.hosts {
+            if let Some(key) = host_effect(host) {
+                push(key);
+            }
+        }
+        Self {
+            keys,
+            complete: false,
+            understood: false,
+        }
+    }
+
     /// The tool vouches that the call changes no file: the list is
     /// `complete` and names no path. For a call that may change things
     /// (whose default effects are [`CallEffects::unknown`]), scope and
@@ -221,6 +276,42 @@ impl CallEffects {
     pub fn touches_no_paths(&self) -> bool {
         self.complete && !self.keys.iter().any(|key| key.class.is_path())
     }
+}
+
+/// The program a declared command runs: its first word, without its
+/// directory.
+fn program_name(command: &str) -> Option<&str> {
+    let first = command.split_whitespace().next()?;
+    let program = first.rsplit('/').next().unwrap_or(first);
+    (!program.is_empty()).then_some(program)
+}
+
+/// The egress effect of a declared host: `host`, `host:port`, or a URL
+/// (`scheme://user@host:port/path`).
+fn host_effect(declared: &str) -> Option<EffectKey> {
+    let declared = declared.trim();
+    let (scheme, rest) = match declared.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        None => ("https", declared),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        // An IPv6 literal: `[::1]` or `[::1]:8080`.
+        let (host, after) = bracketed.split_once(']')?;
+        (host, after.strip_prefix(':').and_then(|p| p.parse().ok()))
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                (host, port.parse().ok())
+            }
+            _ => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(EffectKey::egress(scheme, host, port))
 }
 
 /// How much is at stake in an approval request.

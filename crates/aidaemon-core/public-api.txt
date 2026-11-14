@@ -741,6 +741,7 @@ pub aidaemon_core::CallEffects::complete: bool
 pub aidaemon_core::CallEffects::keys: alloc::vec::Vec<aidaemon_core::EffectKey>
 pub aidaemon_core::CallEffects::understood: bool
 impl aidaemon_core::CallEffects
+pub fn aidaemon_core::CallEffects::from_access(&aidaemon_core::AccessManifest, aidaemon_core::ToolAnnotations) -> Self
 pub fn aidaemon_core::CallEffects::none() -> Self
 pub fn aidaemon_core::CallEffects::touches_no_paths(&self) -> bool
 pub fn aidaemon_core::CallEffects::unknown() -> Self

@@ -31,6 +31,7 @@ stability promise.
 - `aidaemon-tools`: the shell refuses a command when its backend cannot enforce a restriction the shell was given (`Shell::deny_read`, or an explicit `Shell::allow_network(false)`), instead of running it unrestricted on `LocalSandbox`. New `Sandbox::enforces_deny_read` and `Sandbox::enforces_network_off` (default `false`). `DockerSandbox` now covers denied paths inside the workspace. Bubblewrap and seatbelt deny reads of `HOME_SECRET_PATHS` under `$HOME` by default (`default_deny_read(..)` replaces the list; `SeatbeltSandbox` is no longer a unit struct).
 
 ### Fixed
+- `aidaemon-core`: a tool that declares `access` but not `effects` gets the effects its access implies (`CallEffects::from_access`: written paths as writes, plus deletes for a destructive tool; hosts as egress; commands as processes; never `complete`), instead of unknown effects. An owner's denial of such a call now binds the rest of the run: the same write by any tool is refused.
 - `aidaemon-policies`: `ContextWindow` pins the user's latest message as well as the first, so a second question is never dropped behind big tool rounds.
 
 ### Removed
