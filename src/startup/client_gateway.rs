@@ -76,11 +76,194 @@ pub(crate) fn static_origins(config: &ClientGatewayConfig) -> Vec<String> {
 pub(crate) struct DaemonClientHost {
     pub state: Arc<dyn StateStore>,
     pub commands: crate::channels::commands::CommandContext,
+    pub system: SystemSources,
+}
+
+/// What the app's System area reads: the daemon's models, token use, model
+/// call timings, schedules, background jobs, queues and health checks.
+pub(crate) struct SystemSources {
+    pub started_at: std::time::Instant,
+    pub models: aidaemon_providers::routing::ModelsConfig,
+    pub pool: sqlx::SqlitePool,
+    pub events: Arc<crate::events::EventStore>,
+    pub health: Option<Arc<crate::health::HealthProbeStore>>,
+    pub jobs: Option<Arc<crate::heartbeat::HeartbeatTelemetry>>,
+    pub queues: Arc<crate::queue_telemetry::QueueTelemetry>,
+}
+
+/// A stored time (RFC 3339 or SQLite's `YYYY-MM-DD HH:MM:SS`, UTC) in ms.
+fn stored_ms(text: &str) -> Option<u64> {
+    let at = chrono::DateTime::parse_from_rfc3339(text)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").map(|t| t.and_utc())
+        })
+        .ok()?;
+    u64::try_from(at.timestamp_millis()).ok()
+}
+
+impl SystemSources {
+    async fn status(&self) -> aidaemon_client_protocol::SystemStatus {
+        use aidaemon_client_protocol::*;
+        let usage = sqlx::query_as::<_, (Option<String>, String, i64, i64, i64)>(
+            "SELECT date(created_at) AS day, model, SUM(input_tokens), SUM(output_tokens), \
+             COUNT(*) FROM token_usage WHERE created_at >= datetime('now', '-7 days') \
+             GROUP BY day, model ORDER BY day DESC, model",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(day, model, input, output, requests)| UsageDay {
+            day: day.unwrap_or_default(),
+            model,
+            input_tokens: input.max(0) as u64,
+            output_tokens: output.max(0) as u64,
+            requests: requests.max(0) as u64,
+        })
+        .collect();
+        let since = chrono::Utc::now() - chrono::Duration::hours(24);
+        let model_calls = self
+            .events
+            .get_llm_stats(since)
+            .await
+            .ok()
+            .filter(|stats| stats.total_calls > 0)
+            .map(|stats| ModelCalls {
+                total: stats.total_calls,
+                failed: stats.failed_calls,
+                fell_back: stats.fell_back_count,
+                p50_ms: stats.p50_latency_ms,
+                p95_ms: stats.p95_latency_ms,
+                max_ms: stats.max_latency_ms,
+            });
+        type ScheduleRow = (
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            Option<String>,
+            String,
+        );
+        let schedules = sqlx::query_as::<_, ScheduleRow>(
+            "SELECT s.goal_id, g.description, g.status, s.original_schedule, s.is_paused, \
+             s.is_one_shot, s.last_run_at, s.next_run_at FROM goal_schedules s \
+             JOIN goals g ON g.id = s.goal_id ORDER BY s.next_run_at ASC LIMIT 100",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(
+            |(goal_id, description, status, schedule, paused, one_shot, last, next)| ScheduleInfo {
+                goal_id,
+                description,
+                status,
+                schedule,
+                paused: paused != 0,
+                one_shot: one_shot != 0,
+                next_run_ms: stored_ms(&next),
+                last_run_ms: last.as_deref().and_then(stored_ms),
+            },
+        )
+        .collect();
+        let jobs = self
+            .jobs
+            .as_ref()
+            .map(|jobs| jobs.snapshots())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|job| JobInfo {
+                name: job.name,
+                every_secs: job.interval_secs,
+                running: job.is_running,
+                consecutive_failures: job.consecutive_failures,
+                last_success_ms: job.last_success_at.as_deref().and_then(stored_ms),
+                last_error: job.last_error.filter(|_| job.consecutive_failures > 0),
+            })
+            .collect();
+        let queues = self
+            .queues
+            .snapshots()
+            .into_iter()
+            .map(|queue| QueueInfo {
+                name: queue.name,
+                depth: queue.current_depth as u64,
+                capacity: queue.capacity as u64,
+                dropped: queue.dropped_total,
+                failed: queue.failed_total,
+                overloaded: queue.overload_active,
+            })
+            .collect();
+        let mut checks = Vec::new();
+        if let Some(store) = &self.health {
+            for probe in store.list_probes().await.unwrap_or_default() {
+                let latest = store.get_latest_result(&probe.id).await.ok().flatten();
+                let failures = store
+                    .count_consecutive_failures(&probe.id)
+                    .await
+                    .unwrap_or(0);
+                let status = match latest.as_ref().map(|r| &r.status) {
+                    None => CheckStatus::Unknown,
+                    Some(crate::health::probes::ProbeStatus::Healthy) => {
+                        let slow = probe
+                            .latency_threshold_ms
+                            .zip(latest.as_ref().and_then(|r| r.latency_ms))
+                            .is_some_and(|(limit, took)| took > limit);
+                        if slow {
+                            CheckStatus::Degraded
+                        } else {
+                            CheckStatus::Healthy
+                        }
+                    }
+                    Some(_) => CheckStatus::Unhealthy,
+                };
+                checks.push(HealthCheckInfo {
+                    name: probe.name,
+                    target: probe.target,
+                    status,
+                    paused: probe.is_paused,
+                    consecutive_failures: failures,
+                    latency_ms: latest.as_ref().and_then(|r| r.latency_ms),
+                    checked_ms: latest
+                        .as_ref()
+                        .and_then(|r| u64::try_from(r.checked_at.timestamp_millis()).ok()),
+                    error: latest.and_then(|r| r.error_message),
+                });
+            }
+        }
+        let model = Some(self.models.default_model.clone()).filter(|m| !m.is_empty());
+        SystemStatus {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            model,
+            fallback_models: self.models.fallback_models.clone(),
+            usage,
+            model_calls,
+            schedules,
+            jobs,
+            queues,
+            checks,
+        }
+    }
 }
 
 #[async_trait]
 impl ClientHost for DaemonClientHost {
     async fn sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
+        let last: std::collections::HashMap<String, String> =
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT session_id, MAX(created_at) FROM events \
+                 WHERE event_type IN ('user_message', 'assistant_response') \
+                 GROUP BY session_id",
+            )
+            .fetch_all(&self.system.pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         Ok(self
             .state
             .load_session_channels()
@@ -90,12 +273,16 @@ impl ClientHost for DaemonClientHost {
                 // The app replies into chat conversations too (routed to
                 // their chat by the gateway).
                 writable: true,
+                last_activity_ms: last.get(&id).and_then(|at| stored_ms(at)),
                 id,
                 channel,
                 title: None,
-                last_activity_ms: None,
             })
             .collect())
+    }
+
+    async fn system(&self) -> Option<aidaemon_client_protocol::SystemStatus> {
+        Some(self.system.status().await)
     }
 
     async fn history(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<HistoryMessage>> {
@@ -181,6 +368,7 @@ pub async fn start(
     hub: Arc<ChannelHub>,
     approvals: crate::tools::ApprovalBroker,
     endpoints: aidaemon_core::EndpointSource,
+    system: SystemSources,
 ) -> anyhow::Result<()> {
     if !config.client_gateway.enabled {
         return Ok(());
@@ -207,6 +395,7 @@ pub async fn start(
         host: Arc::new(DaemonClientHost {
             state: deps.state.clone(),
             commands: deps.command_context(),
+            system,
         }),
         log,
         config: with_installed_app(config.client_gateway.clone()),

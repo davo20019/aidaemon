@@ -441,6 +441,23 @@
       ],
       "type": "object"
     },
+    "CheckStatus": {
+      "oneOf": [
+        {
+          "enum": [
+            "healthy",
+            "degraded",
+            "unhealthy"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Not run yet.",
+          "type": "string"
+        }
+      ]
+    },
     "ClientFrame": {
       "description": "A frame from a client to the daemon.",
       "oneOf": [
@@ -783,6 +800,19 @@
             "type"
           ],
           "type": "object"
+        },
+        {
+          "description": "How the daemon itself is doing: version, models, usage, schedules,\nbackground jobs, queues and health checks (protocol 1.2).",
+          "properties": {
+            "type": {
+              "const": "get_system",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -954,6 +984,22 @@
             "type",
             "seq",
             "state"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "system": {
+              "$ref": "#/$defs/SystemStatus"
+            },
+            "type": {
+              "const": "system",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "system"
           ],
           "type": "object"
         }
@@ -1504,6 +1550,57 @@
       ],
       "type": "object"
     },
+    "HealthCheckInfo": {
+      "properties": {
+        "checked_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "consecutive_failures": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "latency_ms": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "paused": {
+          "type": "boolean"
+        },
+        "status": {
+          "$ref": "#/$defs/CheckStatus"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "target",
+        "status",
+        "paused",
+        "consecutive_failures"
+      ],
+      "type": "object"
+    },
     "HistoryMessage": {
       "description": "One message of a session's transcript.",
       "properties": {
@@ -1589,6 +1686,47 @@
         }
       ]
     },
+    "JobInfo": {
+      "properties": {
+        "consecutive_failures": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "every_secs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_success_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "running": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "every_secs",
+        "running",
+        "consecutive_failures"
+      ],
+      "type": "object"
+    },
     "LastReply": {
       "properties": {
         "at_ms": {
@@ -1611,6 +1749,50 @@
         "turn_id",
         "text",
         "at_ms"
+      ],
+      "type": "object"
+    },
+    "ModelCalls": {
+      "properties": {
+        "failed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fell_back": {
+          "description": "Calls answered by a fallback model.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p50_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p95_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total",
+        "failed",
+        "fell_back",
+        "p50_ms",
+        "p95_ms",
+        "max_ms"
       ],
       "type": "object"
     },
@@ -1743,6 +1925,45 @@
       ],
       "type": "object"
     },
+    "QueueInfo": {
+      "properties": {
+        "capacity": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "depth": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dropped": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "overloaded": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "depth",
+        "capacity",
+        "dropped",
+        "failed",
+        "overloaded"
+      ],
+      "type": "object"
+    },
     "RedeemRequest": {
       "description": "`POST /client/v1/enrollments/redeem`.",
       "properties": {
@@ -1809,6 +2030,55 @@
         "critical"
       ],
       "type": "string"
+    },
+    "ScheduleInfo": {
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "last_run_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "next_run_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "one_shot": {
+          "type": "boolean"
+        },
+        "paused": {
+          "type": "boolean"
+        },
+        "schedule": {
+          "description": "The schedule as the owner wrote it (\"every weekday at 9\").",
+          "type": "string"
+        },
+        "status": {
+          "description": "The goal's status (\"active\", \"paused\", ...).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "goal_id",
+        "description",
+        "status",
+        "schedule",
+        "paused",
+        "one_shot"
+      ],
+      "type": "object"
     },
     "Scope": {
       "description": "What a device's token may do.",
@@ -2073,6 +2343,87 @@
       ],
       "type": "string"
     },
+    "SystemStatus": {
+      "description": "How the daemon itself is doing, for the app's System area.",
+      "properties": {
+        "checks": {
+          "default": [],
+          "description": "The owner's health checks of their own services.",
+          "items": {
+            "$ref": "#/$defs/HealthCheckInfo"
+          },
+          "type": "array"
+        },
+        "fallback_models": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "jobs": {
+          "default": [],
+          "description": "The daemon's own background jobs (memory upkeep, pruning, ...).",
+          "items": {
+            "$ref": "#/$defs/JobInfo"
+          },
+          "type": "array"
+        },
+        "model": {
+          "description": "The model normal requests use, and the ones tried when it fails.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_calls": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelCalls"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Model calls over the last 24 hours; `None` when not recorded."
+        },
+        "queues": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/QueueInfo"
+          },
+          "type": "array"
+        },
+        "schedules": {
+          "default": [],
+          "description": "Scheduled goals, soonest first.",
+          "items": {
+            "$ref": "#/$defs/ScheduleInfo"
+          },
+          "type": "array"
+        },
+        "uptime_secs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "usage": {
+          "default": [],
+          "description": "Tokens per day and model, newest day first (the last 7 days).",
+          "items": {
+            "$ref": "#/$defs/UsageDay"
+          },
+          "type": "array"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "uptime_secs"
+      ],
+      "type": "object"
+    },
     "TaskState": {
       "enum": [
         "running",
@@ -2303,6 +2654,40 @@
           "type": "object"
         }
       ]
+    },
+    "UsageDay": {
+      "properties": {
+        "day": {
+          "description": "`YYYY-MM-DD`, UTC.",
+          "type": "string"
+        },
+        "input_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "model": {
+          "type": "string"
+        },
+        "output_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "day",
+        "model",
+        "input_tokens",
+        "output_tokens",
+        "requests"
+      ],
+      "type": "object"
     },
     "ViewAction": {
       "description": "Where the agent asks a client to take its view. Every variant only\nchanges what is on screen: none carries a decision, a message or a\ndevice, so none can answer an approval or act for the owner. Kinds a\nclient does not know read as `Unknown` and are ignored.",

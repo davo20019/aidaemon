@@ -97,6 +97,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::RunSlash { .. } => "run_slash",
         Command::GetGlance => "get_glance",
         Command::GetSnapshot => "get_snapshot",
+        Command::GetSystem => "get_system",
         Command::Unknown => "unknown",
     }
 }
@@ -122,6 +123,7 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Reply { .. } => "reply",
         CommandResult::Glance { .. } => "glance",
         CommandResult::Snapshot { .. } => "snapshot",
+        CommandResult::System { .. } => "system",
         CommandResult::Unknown => "unknown",
     }
 }
@@ -210,6 +212,7 @@ fn client_samples() -> Vec<ClientFrame> {
         ),
         command("5d0c2b1e-0009", Command::GetGlance),
         command("5d0c2b1e-000a", Command::GetSnapshot),
+        command("5d0c2b1e-000c", Command::GetSystem),
         command("5d0c2b1e-000b", Command::Unknown),
         ClientFrame::Ping,
     ]
@@ -387,6 +390,65 @@ fn server_samples() -> Vec<ServerFrame> {
         ack(CommandResult::Snapshot {
             seq: 42,
             state: snapshot(),
+        }),
+        ack(CommandResult::System {
+            system: SystemStatus {
+                version: "0.0.0-synthetic".into(),
+                uptime_secs: 3_600,
+                model: Some("model-a".into()),
+                fallback_models: vec!["model-b".into()],
+                usage: vec![UsageDay {
+                    day: "2026-01-01".into(),
+                    model: "model-a".into(),
+                    input_tokens: 12_000,
+                    output_tokens: 900,
+                    requests: 14,
+                }],
+                model_calls: Some(ModelCalls {
+                    total: 14,
+                    failed: 1,
+                    fell_back: 0,
+                    p50_ms: 1_200,
+                    p95_ms: 4_800,
+                    max_ms: 6_100,
+                }),
+                schedules: vec![ScheduleInfo {
+                    goal_id: "g-1".into(),
+                    description: "Send the synthetic weekly summary".into(),
+                    status: "active".into(),
+                    schedule: "every monday at 9".into(),
+                    paused: false,
+                    one_shot: false,
+                    next_run_ms: Some(1_767_600_000_000),
+                    last_run_ms: None,
+                }],
+                jobs: vec![JobInfo {
+                    name: "consolidation".into(),
+                    every_secs: 3_600,
+                    running: false,
+                    consecutive_failures: 0,
+                    last_success_ms: Some(1_767_225_000_000),
+                    last_error: None,
+                }],
+                queues: vec![QueueInfo {
+                    name: "triggers".into(),
+                    depth: 0,
+                    capacity: 64,
+                    dropped: 0,
+                    failed: 0,
+                    overloaded: false,
+                }],
+                checks: vec![HealthCheckInfo {
+                    name: "Synthetic site".into(),
+                    target: "https://h.example.invalid".into(),
+                    status: CheckStatus::Healthy,
+                    paused: false,
+                    consecutive_failures: 0,
+                    latency_ms: Some(120),
+                    checked_ms: Some(1_767_225_500_000),
+                    error: None,
+                }],
+            },
         }),
         ack(CommandResult::Unknown),
         ServerFrame::Error {

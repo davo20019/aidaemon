@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 2;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -259,6 +259,9 @@ pub enum Command {
     GetGlance,
     /// The state a snapshot frame carries, on demand.
     GetSnapshot,
+    /// How the daemon itself is doing: version, models, usage, schedules,
+    /// background jobs, queues and health checks (protocol 1.2).
+    GetSystem,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -323,6 +326,9 @@ pub enum CommandResult {
     Snapshot {
         seq: u64,
         state: Snapshot,
+    },
+    System {
+        system: SystemStatus,
     },
     #[serde(other)]
     #[schemars(skip)]
@@ -833,6 +839,119 @@ pub struct Snapshot {
     pub sessions: Vec<SessionSummary>,
     pub running_tasks: Vec<TaskSummary>,
     pub pending_approvals: Vec<Approval>,
+}
+
+/// How the daemon itself is doing, for the app's System area.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
+pub struct SystemStatus {
+    pub version: String,
+    pub uptime_secs: u64,
+    /// The model normal requests use, and the ones tried when it fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_models: Vec<String>,
+    /// Tokens per day and model, newest day first (the last 7 days).
+    #[serde(default)]
+    pub usage: Vec<UsageDay>,
+    /// Model calls over the last 24 hours; `None` when not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_calls: Option<ModelCalls>,
+    /// Scheduled goals, soonest first.
+    #[serde(default)]
+    pub schedules: Vec<ScheduleInfo>,
+    /// The daemon's own background jobs (memory upkeep, pruning, ...).
+    #[serde(default)]
+    pub jobs: Vec<JobInfo>,
+    #[serde(default)]
+    pub queues: Vec<QueueInfo>,
+    /// The owner's health checks of their own services.
+    #[serde(default)]
+    pub checks: Vec<HealthCheckInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct UsageDay {
+    /// `YYYY-MM-DD`, UTC.
+    pub day: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub requests: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ModelCalls {
+    pub total: u64,
+    pub failed: u64,
+    /// Calls answered by a fallback model.
+    pub fell_back: u64,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub max_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ScheduleInfo {
+    pub goal_id: String,
+    pub description: String,
+    /// The goal's status ("active", "paused", ...).
+    pub status: String,
+    /// The schedule as the owner wrote it ("every weekday at 9").
+    pub schedule: String,
+    pub paused: bool,
+    pub one_shot: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct JobInfo {
+    pub name: String,
+    pub every_secs: u64,
+    pub running: bool,
+    pub consecutive_failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+pub struct QueueInfo {
+    pub name: String,
+    pub depth: u64,
+    pub capacity: u64,
+    pub dropped: u64,
+    pub failed: u64,
+    pub overloaded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct HealthCheckInfo {
+    pub name: String,
+    pub target: String,
+    pub status: CheckStatus,
+    pub paused: bool,
+    pub consecutive_failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Healthy,
+    Degraded,
+    Unhealthy,
+    /// Not run yet.
+    Unknown,
 }
 
 /// A watch's one-call view.
