@@ -892,7 +892,11 @@ mod intent_routing_path_override_tests {
 
     #[test]
     fn infer_intent_gate_forces_tools_for_unix_paths() {
-        let d = infer_intent_gate("/Users/alice/project/file.txt", "");
+        // An absolute path counts only when it reaches this machine's
+        // filesystem, so the path sits under a directory every host has
+        // (`/Users` exists on macOS only).
+        let path = std::env::temp_dir().join("alice/project/file.txt");
+        let d = infer_intent_gate(&path.display().to_string(), "");
         assert_eq!(d.needs_tools, Some(true));
     }
 
