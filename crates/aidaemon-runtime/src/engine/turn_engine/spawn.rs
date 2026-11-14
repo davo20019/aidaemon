@@ -1842,8 +1842,15 @@ impl TurnEngine<'_> {
             self.running_children()
                 .enter(chat, &card_name, task, &child_session, run.as_deref())
         });
-        // Each helper gets its own header on the chat's card.
-        let in_background = run.is_some();
+        // Each helper gets its own header on the chat's card. Waited-on and
+        // background helpers both have a run record; whether it runs in the
+        // background is the record's.
+        let in_background = run.as_deref().is_some_and(|id| {
+            self.running_children()
+                .runs()
+                .get(id)
+                .is_none_or(|record| record.background)
+        });
         if let Some(tx) = status_tx.as_ref() {
             let _ = tx.try_send(StatusUpdate::Helper(
                 aidaemon_core::card::HelperView::running(

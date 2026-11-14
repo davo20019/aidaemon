@@ -363,6 +363,10 @@ impl ChannelAgentRuntime for Agent {
         self.running_children.for_session(session_id)
     }
 
+    async fn chat_runs(&self, session_id: &str) -> aidaemon_channels::ports::ChatRuns {
+        crate::engine::chat_work::ChatWorkControl::chat_runs(self, session_id).await
+    }
+
     async fn chat_work(&self, session_id: &str) -> aidaemon_channels::ports::ChatWorkView {
         crate::engine::chat_work::ChatWorkControl::chat_work(self, session_id).await
     }

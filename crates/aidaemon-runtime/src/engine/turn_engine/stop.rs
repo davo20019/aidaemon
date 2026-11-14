@@ -406,7 +406,12 @@ impl TurnEngine<'_> {
             used,
             &authority,
             &visible_tools,
-            |name| find(name).map(|tool| tool.capabilities().read_only),
+            |name| {
+                find(name).map(|tool| crate::turn::closeout::KnownTool {
+                    read_only: tool.capabilities().read_only,
+                    facts: tool.dispatch_facts(),
+                })
+            },
             |name, arguments| {
                 find(name).is_some_and(|tool| tool.owner_control_plane_call(arguments))
             },
@@ -650,18 +655,21 @@ impl TurnEngine<'_> {
             scope.user_role,
             scope.owned_memory_tools,
         );
-        let read_only = |name: &str| {
+        let known = |name: &str| {
             self.tools()
                 .iter()
                 .find(|tool| tool.name() == name)
-                .map(|tool| tool.capabilities().read_only)
+                .map(|tool| crate::turn::closeout::KnownTool {
+                    read_only: tool.capabilities().read_only,
+                    facts: tool.dispatch_facts(),
+                })
         };
         let decision = aggregate.closeout(|obligation| {
             crate::turn::closeout::obligation_admissible(
                 obligation,
                 &authority,
                 &visible_tools,
-                read_only,
+                known,
             )
         });
         let reachable = match &decision {

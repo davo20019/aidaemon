@@ -2399,7 +2399,7 @@ mod tests {
             "wrangler whoami",
         ] {
             let arguments = json!({ "action": "run", "command": command }).to_string();
-            for tool in ["terminal", "run_command"] {
+            for tool in ["terminal"] {
                 assert_eq!(
                     manager
                         .begin_for_tool(tool, &arguments, &ToolCallContext::default())

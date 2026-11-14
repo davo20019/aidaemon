@@ -327,6 +327,13 @@ impl ReadNodeSensorsTool {
 }
 
 impl aidaemon_tools::semantics::ToolSemantics for ReadNodeSensorsTool {
+    fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
+        aidaemon_tools::semantics::ToolDispatchFacts {
+            evidence: aidaemon_tools::semantics::EvidenceSource::NodeReading,
+            ..Default::default()
+        }
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: true,
@@ -438,6 +445,13 @@ impl ReadNodeHealthTool {
 }
 
 impl aidaemon_tools::semantics::ToolSemantics for ReadNodeHealthTool {
+    fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
+        aidaemon_tools::semantics::ToolDispatchFacts {
+            evidence: aidaemon_tools::semantics::EvidenceSource::NodeReading,
+            ..Default::default()
+        }
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: true,
@@ -512,6 +526,13 @@ impl Tool for SendNodeAudioTool {
 }
 
 impl aidaemon_tools::semantics::ToolSemantics for SendNodeAudioTool {
+    fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
+        aidaemon_tools::semantics::ToolDispatchFacts {
+            evidence: aidaemon_tools::semantics::EvidenceSource::NodeAction,
+            ..Default::default()
+        }
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,

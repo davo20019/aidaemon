@@ -95,6 +95,10 @@ impl crate::tools::traits::ToolSemantics for SetReminderTool {
     fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
         crate::tools::traits::ToolDispatchFacts {
             offering: aidaemon_tools::semantics::Offering::Core,
+            activity: aidaemon_tools::semantics::ToolActivity::Fixed(
+                aidaemon_core::card::ActivityKind::Remind,
+            ),
+            status_label: Some("setting a reminder"),
             ..Default::default()
         }
     }

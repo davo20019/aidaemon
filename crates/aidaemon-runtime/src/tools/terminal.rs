@@ -7985,6 +7985,20 @@ impl crate::tools::traits::ToolSemantics for TerminalTool {
             same_tool_streak: crate::tools::traits::SameToolStreak::Versatile,
             records_launch_trust: true,
             goal_context: crate::tools::traits::GoalContext::BackgroundDelivery,
+            recap: aidaemon_tools::semantics::RecapKind::Command,
+            activity: aidaemon_tools::semantics::ToolActivity::Fixed(
+                aidaemon_core::card::ActivityKind::Run,
+            ),
+            project_dir_argument: aidaemon_tools::semantics::ProjectDirArgument::ShellWorkingDir,
+            opens_project_instructions: true,
+            status_label: Some("running a command"),
+            result_fit: aidaemon_tools::semantics::ResultFit {
+                strip_control_markers: true,
+                pages_spilled_results: true,
+                ..Default::default()
+            },
+            evidence: aidaemon_tools::semantics::EvidenceSource::Shell,
+            semantic_scope: Some(aidaemon_tools::semantics::ToolSemanticScope::LocalWorkspace),
             ..Default::default()
         }
     }

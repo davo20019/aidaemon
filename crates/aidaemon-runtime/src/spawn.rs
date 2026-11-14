@@ -490,6 +490,8 @@ pub struct ListedChildView {
     pub request: Option<String>,
     /// Its latest step, as `/tasks` and the status reply give it.
     pub step: Option<aidaemon_core::card::Step>,
+    /// The helper run it is: its record's id.
+    pub run: Option<String>,
 }
 
 /// A chat's running turn, recorded while it runs.
@@ -672,6 +674,7 @@ impl RunningChildren {
                     },
                     request: child.request.clone(),
                     step,
+                    run: child.run.clone(),
                 }
             })
             .collect()

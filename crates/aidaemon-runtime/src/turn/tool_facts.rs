@@ -13,7 +13,7 @@ use aidaemon_events::traits::{
         Attribution, CausalExplanation, Content, CurrentState, HistoricalRecord, Outcome,
     },
     EvidenceTemporalScope::{Both, Current},
-    ToolEvidenceCapability, ToolSemanticScope,
+    ToolEvidenceCapability,
     ToolSemanticScope::{GoalState, UserMemory},
 };
 
@@ -30,27 +30,6 @@ pub fn memory_tool_facts(name: &str) -> Option<Arc<MemoryToolFacts>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(name)
         .cloned()
-}
-
-/// The semantic scope of a tool that states none: a memory tool's from its
-/// facts, the standard tools' by name.
-pub fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemanticScope> {
-    if let Some(facts) = memory_tool_facts(tool_name) {
-        return facts.scope;
-    }
-    match tool_name {
-        "web_search" | "web_fetch" | "http_request" | "browser" => {
-            Some(ToolSemanticScope::ExternalRemote)
-        }
-        "read_file" | "search_files" | "edit_file" | "write_file" | "terminal" => {
-            Some(ToolSemanticScope::LocalWorkspace)
-        }
-        "read_channel_history" | "search_history" => Some(ToolSemanticScope::ConversationHistory),
-        "manage_goal_tasks" | "schedule_task" | "goal_trace" | "manage_mandates"
-        | "mandate_review" | "manage_automations" => Some(ToolSemanticScope::GoalState),
-        "system_info" | "check_environment" => Some(ToolSemanticScope::HostLocal),
-        _ => None,
-    }
 }
 
 /// The memory tools whose evidence is modeled.

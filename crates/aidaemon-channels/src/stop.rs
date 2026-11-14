@@ -41,6 +41,8 @@ pub struct WorkEntry {
     pub started_at: DateTime<Utc>,
     /// What it is: `None` for a chat turn.
     pub work: Option<ChatWorkKind>,
+    /// The helper run it is, when it is one.
+    pub run: Option<String>,
     /// The request that started it: entries sharing one are stopped together.
     group: String,
     target: Target,
@@ -70,6 +72,7 @@ impl WorkList {
                 title: entry.title.clone(),
                 elapsed: (now - entry.started_at).to_std().unwrap_or_default(),
                 work: entry.work,
+                run: entry.run.clone(),
             })
             .collect()
     }
@@ -113,6 +116,7 @@ impl WorkList {
                 step: None,
                 started_at,
                 work: Some(ChatWorkKind::SubAgent),
+                run: Some(format!("run:{number}")),
                 group: group.to_string(),
                 target: Target::Work(format!("test:{number}")),
             })
@@ -144,6 +148,7 @@ async fn build_list(registry: &TaskRegistry, session_id: &str, view: ChatWorkVie
             step: None,
             started_at: entry.started_at,
             work: None,
+            run: None,
             group: view
                 .current_request
                 .clone()
@@ -160,6 +165,7 @@ async fn build_list(registry: &TaskRegistry, session_id: &str, view: ChatWorkVie
             step: item.step.clone(),
             started_at: item.started_at,
             work: Some(item.kind),
+            run: item.run.clone(),
             group: item
                 .request
                 .clone()

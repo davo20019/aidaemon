@@ -243,6 +243,7 @@ impl aidaemon_tools::semantics::ToolSemantics for ManagePeopleTool {
     fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
         aidaemon_tools::semantics::ToolDispatchFacts {
             status_from_arguments: true,
+            activity: aidaemon_tools::semantics::ToolActivity::Memory,
             ..Default::default()
         }
     }

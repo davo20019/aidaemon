@@ -357,6 +357,11 @@ impl aidaemon_tools::semantics::ToolSemantics for RememberFactTool {
     fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
         aidaemon_tools::semantics::ToolDispatchFacts {
             offering: aidaemon_tools::semantics::Offering::Core,
+            activity: aidaemon_tools::semantics::ToolActivity::Fixed(
+                aidaemon_core::card::ActivityKind::Remember,
+            ),
+            channel_reach: aidaemon_tools::semantics::ChannelReach::Public,
+            status_label: Some("updating memory"),
             ..Default::default()
         }
     }

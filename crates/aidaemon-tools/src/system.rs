@@ -95,6 +95,15 @@ impl Tool for SystemInfoTool {
 }
 
 impl crate::semantics::ToolSemantics for SystemInfoTool {
+    fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
+        crate::semantics::ToolDispatchFacts {
+            channel_reach: crate::semantics::ChannelReach::Public,
+            evidence: crate::semantics::EvidenceSource::HostInfo,
+            semantic_scope: Some(crate::semantics::ToolSemanticScope::HostLocal),
+            ..Default::default()
+        }
+    }
+
     fn tool_role(&self) -> ToolRole {
         ToolRole::Universal
     }

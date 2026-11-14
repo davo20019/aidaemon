@@ -47,11 +47,14 @@ pub fn reply_defect(text: &str, latest_tool_output: Option<&str>) -> Option<Repl
 /// fallback instead of an empty or gutted answer (never a bare "Done.").
 /// After tool work the fallback describes that work: the receipts, not a
 /// silent model, say whether anything happened.
-pub fn finalize_reply(text: &str, tool_calls: &[String], response_note: Option<&str>) -> String {
+pub fn finalize_reply(
+    text: &str,
+    tool_calls: &[crate::turn::post_task::LearnedCall],
+    response_note: Option<&str>,
+) -> String {
     if text.trim().is_empty() {
         if !tool_calls.is_empty() {
-            let refs: Vec<&str> = tool_calls.iter().map(String::as_str).collect();
-            return crate::turn::completion_checks::build_activity_summary_reply(&refs);
+            return crate::turn::completion_checks::build_activity_summary_reply(tool_calls);
         }
         return crate::turn::completion_checks::build_empty_response_fallback(response_note);
     }
@@ -67,8 +70,7 @@ pub fn finalize_reply(text: &str, tool_calls: &[String], response_note: Option<&
          again and I'll re-gather the details."
             .to_string()
     } else {
-        let refs: Vec<&str> = tool_calls.iter().map(String::as_str).collect();
-        crate::turn::completion_checks::build_activity_summary_reply(&refs)
+        crate::turn::completion_checks::build_activity_summary_reply(tool_calls)
     }
 }
 

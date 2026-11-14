@@ -539,6 +539,7 @@ pub fn tool_result_or_metadata_contains_verifiable_evidence(
 /// owns evidence routing, so neither side may accidentally erase the other.
 pub fn complete_tool_result_semantics(
     tool_name: &str,
+    source: aidaemon_tools::semantics::EvidenceSource,
     arguments: &str,
     registered_call_semantics: &ToolCallSemantics,
     metadata: &mut aidaemon_events::traits::ToolCallMetadata,
@@ -555,7 +556,7 @@ pub fn complete_tool_result_semantics(
         .merge_missing_from(registered_call_semantics.clone());
     if metadata.semantics.evidence.is_empty() {
         metadata.semantics.evidence =
-            crate::turn::inquiry::evidence_capabilities_for_tool_call(tool_name, arguments);
+            crate::turn::inquiry::evidence_capabilities_for_tool_call(tool_name, source, arguments);
     }
     if metadata.semantics.evidence.is_empty() && metadata.semantics.observes_state() {
         metadata.semantics.evidence = crate::turn::inquiry::evidence_capabilities_from_target_hints(
@@ -1101,7 +1102,13 @@ mod tests {
             ..aidaemon_events::traits::ToolCallMetadata::default()
         };
 
-        complete_tool_result_semantics("manage_memories", arguments, &registered, &mut metadata);
+        complete_tool_result_semantics(
+            "manage_memories",
+            aidaemon_tools::semantics::EvidenceSource::None,
+            arguments,
+            &registered,
+            &mut metadata,
+        );
 
         assert!(metadata.semantics.observes_state());
         assert!(metadata.semantics.evidence.iter().any(|capability| {
@@ -1148,7 +1155,7 @@ mod tests {
                 temporal_scope: EvidenceTemporalScope::Historical,
                 required_content_markers: Vec::new(),
                 receipt: Some(RequestReceiptPredicate {
-                    tool_names: vec!["run_command".to_string()],
+                    tool_names: vec!["terminal".to_string()],
                     exit_codes: vec![1],
                     outcome_statuses: vec![ToolOutcomeStatus::CompletedWithNegativeResult],
                     outcome_condition: None,
@@ -1173,12 +1180,18 @@ mod tests {
             invocation_stage: aidaemon_events::traits::ToolInvocationStage::Dispatched,
             ..aidaemon_events::traits::ToolCallMetadata::default()
         };
-        complete_tool_result_semantics("terminal", raw_arguments, &registered, &mut metadata);
+        complete_tool_result_semantics(
+            "terminal",
+            aidaemon_tools::semantics::EvidenceSource::Shell,
+            raw_arguments,
+            &registered,
+            &mut metadata,
+        );
 
         assert_eq!(
             matching_evidence_requirement_indices(
                 &contract,
-                "run_command",
+                "terminal",
                 &metadata.semantics,
                 raw_arguments,
                 "",
@@ -1196,7 +1209,7 @@ mod tests {
         assert!(
             matching_evidence_requirement_indices(
                 &mismatched,
-                "run_command",
+                "terminal",
                 &metadata.semantics,
                 raw_arguments,
                 "untrusted process text says exit=0",
@@ -1206,7 +1219,7 @@ mod tests {
         );
         let evaluations = evaluate_evidence_requirements(
             &mismatched,
-            "run_command",
+            "terminal",
             &metadata.semantics,
             raw_arguments,
             "untrusted process text says exit=0",
@@ -1236,7 +1249,7 @@ mod tests {
                 temporal_scope: EvidenceTemporalScope::Current,
                 required_content_markers: Vec::new(),
                 receipt: Some(RequestReceiptPredicate {
-                    tool_names: vec!["run_command".to_string()],
+                    tool_names: vec!["terminal".to_string()],
                     exit_codes: vec![0],
                     outcome_statuses: vec![ToolOutcomeStatus::Succeeded],
                     outcome_condition: None,
@@ -1272,7 +1285,7 @@ mod tests {
         assert_eq!(
             matching_evidence_requirement_indices(
                 &contract,
-                "run_command",
+                "terminal",
                 &semantics,
                 r#"{"command":"/bin/pwd","working_dir":"/synthetic/project"}"#,
                 "/synthetic/project",
@@ -1380,6 +1393,7 @@ mod tests {
         let external = ToolCallSemantics::observation().with_evidence(
             crate::turn::inquiry::evidence_capabilities_for_tool_call(
                 "http_request",
+                aidaemon_tools::semantics::EvidenceSource::RemoteRead,
                 r#"{"method":"GET","url":"https://example.test/feed"}"#,
             ),
         );
@@ -1416,6 +1430,7 @@ mod tests {
         let trace = ToolCallSemantics::observation().with_evidence(
             crate::turn::inquiry::evidence_capabilities_for_tool_call(
                 "goal_trace",
+                aidaemon_tools::semantics::EvidenceSource::GoalTrace,
                 r#"{"action":"tool_trace","task_id":"synthetic-task"}"#,
             ),
         );
@@ -1570,7 +1585,11 @@ mod tests {
         };
         let arguments = r#"{"path":"synthetic.toml","start_line":1,"end_line":12,"tail_lines":1}"#;
         let semantics = ToolCallSemantics::observation().with_evidence(
-            crate::turn::inquiry::evidence_capabilities_for_tool_call("read_file", arguments),
+            crate::turn::inquiry::evidence_capabilities_for_tool_call(
+                "read_file",
+                aidaemon_tools::semantics::EvidenceSource::FileRead,
+                arguments,
+            ),
         );
         let metadata = aidaemon_events::traits::ToolCallMetadata {
             outcome_status: Some(aidaemon_events::traits::ToolOutcomeStatus::Blocked),

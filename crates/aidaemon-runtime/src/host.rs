@@ -276,6 +276,15 @@ pub trait TurnHost:
     ) -> std::sync::Arc<dyn crate::spawn::ChildAgent>;
     /// The agent's tools (their task-end hooks run when a task ends).
     fn tools(&self) -> &[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>];
+    /// The dispatch facts the registered tool `name` states; the defaults
+    /// for a name the agent did not register (an MCP tool).
+    fn registered_tool_facts(&self, name: &str) -> aidaemon_tools::semantics::ToolDispatchFacts {
+        self.tools()
+            .iter()
+            .find(|tool| tool.name() == name)
+            .map(|tool| tool.dispatch_facts())
+            .unwrap_or_default()
+    }
     /// The root agent's full tool list, handed down so a task lead's
     /// executors get the working tools it lacks; `None` when the agent's own
     /// tools are the full list.

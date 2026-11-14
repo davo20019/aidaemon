@@ -122,8 +122,6 @@ async fn test_delegation_executor_hides_competing_tools_when_cli_agent_available
         Arc::new(MockTool::new("cli_agent", "delegation tool", "ok"))
             as Arc<dyn crate::traits::Tool>,
         Arc::new(MockTool::new("browser", "browser tool", "ok")) as Arc<dyn crate::traits::Tool>,
-        Arc::new(MockTool::new("run_command", "run command tool", "ok"))
-            as Arc<dyn crate::traits::Tool>,
     ];
     let harness = setup_full_stack_test_agent_with_extra_tools(provider, extra_tools)
         .await
@@ -155,7 +153,6 @@ async fn test_delegation_executor_hides_competing_tools_when_cli_agent_available
     assert!(names.contains(&"cli_agent".to_string()));
     assert!(!names.contains(&"terminal".to_string()));
     assert!(!names.contains(&"browser".to_string()));
-    assert!(!names.contains(&"run_command".to_string()));
 }
 
 #[tokio::test]
@@ -166,8 +163,6 @@ async fn test_delegation_executor_keeps_competing_tools_when_cli_agent_unavailab
         Arc::new(MockTool::new("cli_agent", "delegation tool", "ok").with_availability(false))
             as Arc<dyn crate::traits::Tool>,
         Arc::new(MockTool::new("browser", "browser tool", "ok")) as Arc<dyn crate::traits::Tool>,
-        Arc::new(MockTool::new("run_command", "run command tool", "ok"))
-            as Arc<dyn crate::traits::Tool>,
     ];
     let harness = setup_full_stack_test_agent_with_extra_tools(provider, extra_tools)
         .await
@@ -199,7 +194,6 @@ async fn test_delegation_executor_keeps_competing_tools_when_cli_agent_unavailab
     assert!(!names.contains(&"cli_agent".to_string()));
     assert!(names.contains(&"terminal".to_string()));
     assert!(names.contains(&"browser".to_string()));
-    assert!(names.contains(&"run_command".to_string()));
 }
 
 #[tokio::test]

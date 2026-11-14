@@ -1179,6 +1179,8 @@ impl crate::tools::traits::ToolSemantics for ManageAutomationsTool {
     fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
         crate::tools::traits::ToolDispatchFacts {
             offering: aidaemon_tools::semantics::Offering::Core,
+            evidence: aidaemon_tools::semantics::EvidenceSource::GoalRecords,
+            semantic_scope: Some(aidaemon_tools::semantics::ToolSemanticScope::GoalState),
             ..Default::default()
         }
     }

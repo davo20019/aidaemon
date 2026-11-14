@@ -79,6 +79,7 @@ fn extract_args_summary(tool_name: &str, args_json: &str) -> String {
     };
 
     match tool_name {
+        // `run_command` is retired; older transcripts still hold its calls.
         "terminal" | "run_command" => parsed
             .get("command")
             .and_then(|v| v.as_str())
@@ -150,6 +151,7 @@ fn first_string_value(parsed: &Value) -> String {
 /// Extract a short outcome description based on the tool type and result content.
 fn extract_outcome(tool_name: &str, result: &str) -> String {
     match tool_name {
+        // `run_command` is retired; older transcripts still hold its results.
         "terminal" | "run_command" => extract_terminal_outcome(result),
         "http_request" => extract_http_outcome(result),
         "read_file" => extract_read_file_outcome(result),

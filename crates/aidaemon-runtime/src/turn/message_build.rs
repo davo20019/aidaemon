@@ -22,7 +22,7 @@ pub struct MessageBuildCtx<'a> {
     pub user_text: &'a str,
     /// Attachments for the current user turn (images saved to inbox).
     pub current_attachments: &'a [MessageAttachment],
-    pub completed_tool_calls: &'a [String],
+    pub completed_tool_calls: &'a [crate::turn::post_task::LearnedCall],
     pub model: &'a str,
     /// Pillar A: message-zero bytes (session-static CORE prompt). Byte-stable
     /// across the within-task loop so the prefix cache reuses it.
@@ -426,16 +426,11 @@ pub fn build_empty_response_retry_messages(existing: &[Value], user_text: &str) 
     recovered
 }
 
-pub fn tool_is_low_info_for_checkpoint(tool_name: &str) -> bool {
-    matches!(tool_name, "write_file" | "edit_file" | "check_environment")
-        || crate::turn::tool_facts::memory_tool_facts(tool_name)
-            .is_some_and(|facts| facts.low_signal_result)
-}
-
 pub fn build_execution_checkpoint_message(
     user_text: &str,
-    completed_tool_calls: &[String],
+    completed_tool_calls: &[crate::turn::post_task::LearnedCall],
     current_interaction: &[&Message],
+    facts: impl Fn(&str) -> aidaemon_tools::semantics::ToolDispatchFacts,
 ) -> Option<String> {
     let trimmed_user = user_text.trim();
     if trimmed_user.is_empty() || completed_tool_calls.is_empty() {
@@ -448,7 +443,12 @@ pub fn build_execution_checkpoint_message(
             return None;
         }
         let tool_name = message.tool_name.as_deref().unwrap_or("").trim();
-        if tool_name.is_empty() || tool_is_low_info_for_checkpoint(tool_name) {
+        if tool_name.is_empty()
+            || crate::turn::turn_context::is_low_info_recent_tool_context(
+                tool_name,
+                &facts(tool_name),
+            )
+        {
             return None;
         }
         let content = message.primary_content()?;
@@ -1121,7 +1121,12 @@ pub async fn build_turn_messages(
     // current interaction). Appended at the tail further below.
     let execution_checkpoint = if iteration > 1 {
         let current_interaction: Vec<&Message> = current_turn.messages.iter().collect();
-        build_execution_checkpoint_message(user_text, completed_tool_calls, &current_interaction)
+        build_execution_checkpoint_message(
+            user_text,
+            completed_tool_calls,
+            &current_interaction,
+            |name| host.registered_tool_facts(name),
+        )
     } else {
         None
     };

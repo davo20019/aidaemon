@@ -15,6 +15,8 @@ const STRUCTURED_JSON_COMPACT_MIN_CHARS: usize = 2_000;
 
 pub struct FitScope<'a> {
     pub tool_name: &'a str,
+    /// The called tool's dispatch facts: how its result is fitted.
+    pub facts: aidaemon_tools::semantics::ToolDispatchFacts,
     pub session_id: &'a str,
     pub task_id: &'a str,
     pub model: &'a str,
@@ -55,7 +57,7 @@ pub trait ToolResultFit: TurnHost {
         let untrusted = scope.trust == aidaemon_core::SourceTrust::Untrusted;
         let result_text = if untrusted && !result_metadata.untrusted_verbatim {
             aidaemon_tools::sanitize::sanitize_external_content(&result_text)
-        } else if !untrusted && !result_is_err && scope.tool_name == "terminal" {
+        } else if !untrusted && !result_is_err && scope.facts.result_fit.strip_control_markers {
             aidaemon_tools::sanitize::strip_internal_control_markers(&result_text)
         } else {
             result_text
@@ -85,11 +87,12 @@ pub trait ToolResultFit: TurnHost {
         result_metadata: &mut ToolCallMetadata,
     ) -> String {
         let tool_name = scope.tool_name;
+        let fit = scope.facts.result_fit;
 
-        // `cli_agent` errors can be extremely large (process output, stack
+        // A process's errors can be extremely large (its output, stack
         // traces). Truncate aggressively to prevent context blow-up and
         // runaway retries.
-        if tool_name == "cli_agent" && result_is_err {
+        if fit.cap_large_errors && result_is_err {
             let char_len = result_text.chars().count();
             if char_len > 2000 {
                 let head: String = result_text.chars().take(500).collect();
@@ -102,8 +105,8 @@ pub trait ToolResultFit: TurnHost {
                     .rev()
                     .collect();
                 result_text = format!(
-                    "{}\n\n[... cli_agent error output truncated ({} chars total) ...]\n\n{}",
-                    head, char_len, tail
+                    "{}\n\n[... {} error output truncated ({} chars total) ...]\n\n{}",
+                    head, tool_name, char_len, tail
                 );
                 if let Some(provenance) = result_metadata.result_provenance.as_mut() {
                     provenance.mark_model_view_truncated(&result_text);
@@ -121,10 +124,10 @@ pub trait ToolResultFit: TurnHost {
             .context_window_config
             .tool_result_chars_for(scope.model);
 
-        // read_file results with typed metadata get line-boundary paging with
-        // an explicit continuation hint instead of destructive mid-drop
+        // A file read's typed metadata gives line-boundary paging with an
+        // explicit continuation hint instead of destructive mid-drop
         // compression: the model can keep reading from the exact cut point.
-        let read_file_metadata = (tool_name == "read_file" && !result_is_err)
+        let read_file_metadata = (!result_is_err)
             .then_some(result_metadata.read_file.as_ref())
             .flatten();
         if let Some(read_metadata) = read_file_metadata {
@@ -143,7 +146,7 @@ pub trait ToolResultFit: TurnHost {
         // losslessly BEFORE the size checks; this can also keep a result
         // inline that would otherwise spill. Small bodies stay pretty-printed
         // for model readability.
-        if matches!(tool_name, "http_request" | "web_fetch")
+        if fit.compact_json
             && !result_is_err
             && result_text.chars().count() > STRUCTURED_JSON_COMPACT_MIN_CHARS
             && let Some(compacted) = crate::context_budget::compact_embedded_json(&result_text)
@@ -158,7 +161,7 @@ pub trait ToolResultFit: TurnHost {
         }
 
         // Oversized successful results are spilled to a temp file when the
-        // model has a filesystem recovery path (read_file or terminal): it
+        // model has a tool that pages through one (`pages_spilled_results`): it
         // then pages / jq / greps the full data instead of losing the middle
         // to lossy head+tail compression. No recovery path → fall back to
         // lossy compression. Errors are never spilled.
@@ -166,16 +169,17 @@ pub trait ToolResultFit: TurnHost {
         if original_chars <= max_chars {
             return result_text;
         }
-        // The computer_use accessibility tree is the model's working data: it
-        // must stay inline and complete so the model can target an element
-        // directly. Spilling it sends the planner into a read_file/terminal
-        // loop instead of clicking; head+tail compression would drop mid-tree
-        // controls. So never spill or compress it.
-        let keep_inline = tool_name == "computer_use" || result_metadata.preserve_inline;
+        // A result that is the model's working data (the desktop's
+        // accessibility tree, `preserve_inline`) must stay inline and
+        // complete so the model can target an element directly. Spilling it
+        // sends the planner into a paging loop instead of clicking; head+tail
+        // compression would drop mid-tree controls. So never spill or
+        // compress it.
+        let keep_inline = fit.preserve_inline || result_metadata.preserve_inline;
         let has_fs_recovery = self
             .tools()
             .iter()
-            .any(|t| matches!(t.name(), "read_file" | "terminal") && t.is_available());
+            .any(|t| t.dispatch_facts().result_fit.pages_spilled_results && t.is_available());
         let spilled =
             if !result_is_err && has_fs_recovery && !keep_inline && !scope.mandate_execution {
                 aidaemon_tools::result_spill::build_spilled_preview_for_backend(

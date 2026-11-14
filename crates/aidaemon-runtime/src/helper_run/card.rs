@@ -164,6 +164,41 @@ async fn job_plan(
         })
 }
 
+/// A waited-on helper's status channel: its own steps go on its run record,
+/// and its line on the card is drawn from that record ([`RunState::view`]),
+/// as a background helper's is. Every other update passes through.
+///
+/// [`RunState::view`]: crate::run_state::RunState::view
+pub fn record_waited_steps(
+    parent: Option<mpsc::Sender<StatusUpdate>>,
+    runs: Arc<crate::run_state::RunStates>,
+    id: String,
+    label: String,
+) -> Option<mpsc::Sender<StatusUpdate>> {
+    let parent = parent?;
+    let (tx, mut rx) = mpsc::channel::<StatusUpdate>(64);
+    tokio::spawn(async move {
+        while let Some(update) = rx.recv().await {
+            let update = match update {
+                StatusUpdate::Helper(view) if view.label == label && !view.phase.is_terminal() => {
+                    if let Some(step) = view.step.clone() {
+                        runs.step(&id, step);
+                    }
+                    match runs.get(&id) {
+                        Some(run) if !run.phase.is_terminal() => StatusUpdate::Helper(run.view()),
+                        _ => continue,
+                    }
+                }
+                other => other,
+            };
+            if parent.send(update).await.is_err() {
+                break;
+            }
+        }
+    });
+    Some(tx)
+}
+
 /// A background helper's status channel: every update goes on to its
 /// parent's, and its own steps are also noted for its line on the card and
 /// shown there once its turn has ended (live 2026-11-13: the turn's live

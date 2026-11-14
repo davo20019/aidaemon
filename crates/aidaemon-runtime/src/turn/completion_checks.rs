@@ -259,16 +259,15 @@ pub fn tool_output_requires_final_synthesis(tool_name: &str, tool_output: &str) 
             || structured_json_value(trimmed).is_some())
 }
 
-pub fn build_activity_summary_reply(tool_calls: &[&str]) -> String {
-    let calls: Vec<String> = tool_calls.iter().map(|call| (*call).to_string()).collect();
-    let summary = post_task::categorize_tool_calls_user_facing(&calls);
+pub fn build_activity_summary_reply(tool_calls: &[post_task::LearnedCall]) -> String {
+    let summary = post_task::categorize_tool_calls_user_facing(tool_calls);
     if !summary.trim().is_empty() {
         return summary.trim().to_string();
     }
 
     let external_only = tool_calls
         .iter()
-        .any(|call| call.starts_with("http_request(") || call.starts_with("web_fetch("));
+        .any(|call| call.recap == aidaemon_tools::semantics::RecapKind::ExternalRead);
     if external_only {
         "I checked the requested external sources, but I still need a final confirmation before I can claim success."
             .to_string()
@@ -510,7 +509,23 @@ mod tests {
 
     #[test]
     fn activity_summary_lists_tool_calls() {
-        let calls = vec!["terminal(mkdir -p /tmp/foo)", "write_file(/tmp/foo/bar.py)"];
+        use aidaemon_tools::semantics::RecapKind;
+        let calls = vec![
+            crate::turn::post_task::LearnedCall::new(
+                "terminal",
+                "mkdir -p /tmp/foo".into(),
+                RecapKind::Command,
+                false,
+                false,
+            ),
+            crate::turn::post_task::LearnedCall::new(
+                "write_file",
+                "/tmp/foo/bar.py".into(),
+                RecapKind::FileWrite,
+                false,
+                false,
+            ),
+        ];
         let reply = build_activity_summary_reply(&calls);
         assert!(reply.contains("Commands run:"));
         assert!(reply.contains("Files written:"));

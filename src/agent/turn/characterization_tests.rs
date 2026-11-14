@@ -86,7 +86,7 @@ impl crate::traits::ToolSemantics for RejectingArgumentTool {
 async fn typed_expected_negative_receipt_completes_without_validation_retry() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response(
-            "run_command",
+            "synthetic_process",
             r#"{"command":"/usr/bin/false","working_dir":"/tmp"}"#,
         ),
         MockProvider::text_response(
@@ -94,7 +94,7 @@ async fn typed_expected_negative_receipt_completes_without_validation_retry() {
         ),
     ]);
     let negative_receipt_tool = MockTool::new(
-        "run_command",
+        "synthetic_process",
         "Synthetic typed process observation",
         "$ /usr/bin/false (exit: 1)",
     )

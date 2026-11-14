@@ -32,6 +32,13 @@ fn bundled_tools_pass_the_tool_kit() {
                 tool.as_ref(),
                 ToolKitOptions::default().valid_arguments(json!({"path": "a.txt"})),
             ),
+            // A single edit or an `edits` batch: one of the two is needed,
+            // which the schema cannot say.
+            "edit_file" => check_tool_with(
+                tool.as_ref(),
+                ToolKitOptions::default()
+                    .valid_arguments(json!({"path": "a.txt", "old_text": "a", "new_text": "b"})),
+            ),
             _ => check_tool(tool.as_ref()),
         };
         all.merge(report);

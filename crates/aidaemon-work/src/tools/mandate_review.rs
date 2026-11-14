@@ -661,6 +661,7 @@ impl crate::traits::ToolSemantics for MandateReviewTool {
         crate::traits::ToolDispatchFacts {
             goal_context: crate::traits::GoalContext::MandateRun,
             offering: aidaemon_tools::semantics::Offering::Scoped,
+            semantic_scope: Some(aidaemon_tools::semantics::ToolSemanticScope::GoalState),
             ..Default::default()
         }
     }

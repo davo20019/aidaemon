@@ -442,7 +442,7 @@ mod tests {
                 id: 0,
                 task_id: task_id.clone(),
                 activity_type: "tool_call".to_string(),
-                tool_name: Some("run_command".to_string()),
+                tool_name: Some("terminal".to_string()),
                 tool_args: Some("{\"command\":\"npm run build\"}".to_string()),
                 result: Some(format!(
                     "Build failed: {} lacks the required numeric frontmatter id.",

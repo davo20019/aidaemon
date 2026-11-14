@@ -563,7 +563,6 @@ mod tests {
         );
         for tool_name in [
             "terminal",
-            "run_command",
             "browser",
             "computer_use",
             "health_probe",
@@ -573,10 +572,7 @@ mod tests {
             "write_file",
             "edit_file",
             "search_files",
-            "project_inspect",
             "send_file",
-            "git_info",
-            "git_commit",
             "check_environment",
         ] {
             assert_eq!(

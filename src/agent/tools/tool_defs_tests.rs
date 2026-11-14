@@ -7,9 +7,9 @@ use crate::traits::Tool;
 use crate::types::{WorkspaceAccessLevel, WorkspaceGrant};
 use aidaemon_runtime::engine::tool_roster::{ToolRoster as _, validate_tool_definition_contract};
 use aidaemon_runtime::turn::helpers::{
-    restrict_desktop_control_for_visibility, sort_tool_definitions_by_name,
-    tool_name_from_definition, visibility_allows_desktop_control,
+    restrict_to_channel_reach, sort_tool_definitions_by_name, tool_name_from_definition,
 };
+use aidaemon_tools::semantics::ChannelReach;
 use proptest::prelude::*;
 use std::sync::Arc;
 
@@ -82,29 +82,34 @@ fn tool_definition_contract_accepts_valid_definition() {
 }
 
 #[test]
-fn desktop_control_allowed_only_in_dms_and_internal() {
-    // Direct messages and internal/system sessions may drive the desktop.
-    assert!(visibility_allows_desktop_control(
-        ChannelVisibility::Private
-    ));
-    assert!(visibility_allows_desktop_control(
-        ChannelVisibility::Internal
-    ));
-    // Group and public conversations must not — a participant's message
-    // (or the bot's own echoed content) could otherwise launch it.
-    assert!(!visibility_allows_desktop_control(
-        ChannelVisibility::PrivateGroup
-    ));
-    assert!(!visibility_allows_desktop_control(
-        ChannelVisibility::Public
-    ));
-    assert!(!visibility_allows_desktop_control(
-        ChannelVisibility::PublicExternal
-    ));
+fn channel_reach_says_where_a_tool_may_be_offered() {
+    use ChannelVisibility::*;
+    // Desktop control: only direct messages and internal/system sessions.
+    // A group or public conversation must not reach it: a participant's
+    // message (or the bot's own echoed content) could otherwise launch it.
+    for visibility in [Private, Internal] {
+        assert!(ChannelReach::DirectOnly.offered_in(visibility));
+    }
+    for visibility in [PrivateGroup, Public, PublicExternal] {
+        assert!(!ChannelReach::DirectOnly.offered_in(visibility));
+    }
+    // A public external channel sees only the public tools.
+    assert!(ChannelReach::Public.offered_in(PublicExternal));
+    assert!(!ChannelReach::Shared.offered_in(PublicExternal));
+    assert!(ChannelReach::Shared.offered_in(Public));
+}
+
+/// The reach the tools in these tests declare.
+fn reach(name: &str) -> ChannelReach {
+    match name {
+        "computer_use" => ChannelReach::DirectOnly,
+        "web_search" => ChannelReach::Public,
+        _ => ChannelReach::Shared,
+    }
 }
 
 #[test]
-fn restrict_desktop_control_strips_computer_use_in_channels() {
+fn channel_reach_strips_desktop_control_in_channels() {
     for visibility in [
         ChannelVisibility::PrivateGroup,
         ChannelVisibility::Public,
@@ -115,7 +120,7 @@ fn restrict_desktop_control_strips_computer_use_in_channels() {
             ("computer_use".to_string(), ToolCapabilities::default()),
             ("web_search".to_string(), ToolCapabilities::default()),
         ]);
-        restrict_desktop_control_for_visibility(&mut defs, &mut caps, visibility);
+        restrict_to_channel_reach(&mut defs, &mut caps, visibility, reach);
         let names: Vec<&str> = defs.iter().filter_map(tool_name_from_definition).collect();
         assert!(
             !names.contains(&"computer_use"),
@@ -131,11 +136,11 @@ fn restrict_desktop_control_strips_computer_use_in_channels() {
 }
 
 #[test]
-fn restrict_desktop_control_keeps_computer_use_in_dm_and_internal() {
+fn channel_reach_keeps_computer_use_in_dm_and_internal() {
     for visibility in [ChannelVisibility::Private, ChannelVisibility::Internal] {
         let mut defs = vec![named_tool_def("computer_use"), named_tool_def("web_search")];
         let mut caps = HashMap::from([("computer_use".to_string(), ToolCapabilities::default())]);
-        restrict_desktop_control_for_visibility(&mut defs, &mut caps, visibility);
+        restrict_to_channel_reach(&mut defs, &mut caps, visibility, reach);
         let names: Vec<&str> = defs.iter().filter_map(tool_name_from_definition).collect();
         assert!(
             names.contains(&"computer_use"),
@@ -294,7 +299,16 @@ async fn session_static_roster_limits_scoped_guest_to_granted_file_tools() {
 
 #[tokio::test]
 async fn session_static_roster_applies_public_external_allowlist() {
-    let web = Arc::new(MockTool::new("web_search", "search", "ok")) as Arc<dyn Tool>;
+    // A public tool (the real web_search declares itself so) and one that
+    // is not.
+    let web = Arc::new(
+        MockTool::new("web_search", "search", "ok").with_dispatch_facts(
+            crate::traits::ToolDispatchFacts {
+                channel_reach: ChannelReach::Public,
+                ..Default::default()
+            },
+        ),
+    ) as Arc<dyn Tool>;
     let other = Arc::new(MockTool::new("alpha_tool", "a", "ok")) as Arc<dyn Tool>;
     let harness =
         setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![web, other])
@@ -402,10 +416,10 @@ async fn task_lead_policy_filter_keeps_delegation_tools_exposed() {
         named_tool_def("system_info"),
         named_tool_def("remember_fact"),
         named_tool_def("policy_metrics"),
-        named_tool_def("project_inspect"),
-        named_tool_def("git_info"),
+        named_tool_def("search_files"),
+        named_tool_def("read_file"),
         named_tool_def("check_environment"),
-        named_tool_def("service_status"),
+        named_tool_def("goal_trace"),
         named_tool_def("manage_goal_tasks"),
         named_tool_def("cli_agent"),
         named_tool_def("spawn_agent"),
@@ -442,7 +456,7 @@ async fn task_lead_policy_filter_keeps_delegation_tools_exposed() {
             },
         ),
         (
-            "project_inspect".to_string(),
+            "search_files".to_string(),
             ToolCapabilities {
                 read_only: true,
                 external_side_effect: false,
@@ -452,7 +466,7 @@ async fn task_lead_policy_filter_keeps_delegation_tools_exposed() {
             },
         ),
         (
-            "git_info".to_string(),
+            "read_file".to_string(),
             ToolCapabilities {
                 read_only: true,
                 external_side_effect: false,
@@ -472,7 +486,7 @@ async fn task_lead_policy_filter_keeps_delegation_tools_exposed() {
             },
         ),
         (
-            "service_status".to_string(),
+            "goal_trace".to_string(),
             ToolCapabilities {
                 read_only: true,
                 external_side_effect: false,

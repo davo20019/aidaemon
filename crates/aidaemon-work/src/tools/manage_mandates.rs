@@ -2287,6 +2287,14 @@ impl ManageMandatesTool {
 
 #[async_trait]
 impl crate::traits::ToolSemantics for ManageMandatesTool {
+    fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
+        aidaemon_tools::semantics::ToolDispatchFacts {
+            evidence: aidaemon_tools::semantics::EvidenceSource::Mandates,
+            semantic_scope: Some(aidaemon_tools::semantics::ToolSemanticScope::GoalState),
+            ..Default::default()
+        }
+    }
+
     /// Creating and updating a mandate are confirmed by the
     /// owner before they commit. The dispatcher runs the call only with that
     /// answer; a decline is recorded by the kernel and changes nothing.

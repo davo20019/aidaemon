@@ -865,17 +865,20 @@ pub async fn run_bootstrap(
             ));
         }
 
-        // Filter tools by channel visibility
-        if channel_ctx.visibility == ChannelVisibility::PublicExternal {
+        // Filter tools by channel visibility: each tool's `channel_reach`
+        // says where it may be offered (a public external channel only the
+        // public ones; desktop control only DMs and internal sessions, so a
+        // channel message that mentions it cannot launch it).
+        {
             let before = defs.len();
-            let allowed = ["web_search", "remember_fact", "system_info"];
-            defs.retain(|d| {
-                crate::turn::helpers::tool_name_from_definition(d)
-                    .is_some_and(|name| allowed.contains(&name))
-            });
-            caps.retain(|name, _| allowed.contains(&name.as_str()));
+            crate::turn::helpers::restrict_to_channel_reach(
+                &mut defs,
+                &mut caps,
+                channel_ctx.visibility,
+                |name| agent.registered_tool_facts(name).channel_reach,
+            );
             tool_filter_stages.push(GateFilterStage::new(
-                "public_external_allowlist",
+                "channel_reach",
                 before,
                 defs.len(),
                 if before == defs.len() {
@@ -884,27 +887,6 @@ pub async fn run_bootstrap(
                     "filtered"
                 },
             ));
-        }
-
-        // Desktop control (computer_use) is an owner-machine action and must not
-        // be reachable from shared/public conversations — only DMs and internal
-        // sessions. This stops a channel message that merely mentions the tool
-        // from launching it.
-        {
-            let before = defs.len();
-            crate::turn::helpers::restrict_desktop_control_for_visibility(
-                &mut defs,
-                &mut caps,
-                channel_ctx.visibility,
-            );
-            if before != defs.len() {
-                tool_filter_stages.push(GateFilterStage::new(
-                    "desktop_control_visibility",
-                    before,
-                    defs.len(),
-                    "filtered",
-                ));
-            }
         }
 
         // Tools whose offer depends on this session's live state (a client

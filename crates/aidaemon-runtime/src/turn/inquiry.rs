@@ -7,6 +7,8 @@
 
 use std::collections::HashSet;
 
+use aidaemon_tools::semantics::EvidenceSource;
+
 use aidaemon_events::traits::{
     EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
     ToolEvidenceCapability, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind,
@@ -40,6 +42,7 @@ fn string_argument(arguments: &str, key: &str) -> Option<String> {
 /// only states what a substantive result from that observation can support.
 pub fn evidence_capabilities_for_tool_call(
     tool_name: &str,
+    source: EvidenceSource,
     arguments: &str,
 ) -> Vec<ToolEvidenceCapability> {
     use EvidenceAuthority::{Advisory, Canonical, Direct};
@@ -55,8 +58,8 @@ pub fn evidence_capabilities_for_tool_call(
         return (facts.evidence)(arguments);
     }
 
-    match tool_name {
-        "goal_trace" => {
+    match source {
+        EvidenceSource::GoalTrace => {
             let targeted = string_argument(arguments, "goal_id").is_some()
                 || string_argument(arguments, "task_id").is_some();
             if targeted {
@@ -85,7 +88,7 @@ pub fn evidence_capabilities_for_tool_call(
                 )]
             }
         }
-        "manage_mandates" => {
+        EvidenceSource::Mandates => {
             let action = action_from_arguments(arguments);
             let targeted = string_argument(arguments, "mandate_id").is_some();
             match action.as_deref() {
@@ -127,7 +130,7 @@ pub fn evidence_capabilities_for_tool_call(
                 _ => Vec::new(),
             }
         }
-        "manage_goal_tasks" | "manage_automations" => vec![capability(
+        EvidenceSource::GoalRecords => vec![capability(
             GoalState,
             &[
                 CurrentState,
@@ -139,32 +142,32 @@ pub fn evidence_capabilities_for_tool_call(
             Canonical,
             Both,
         )],
-        "search_history" | "read_channel_history" => vec![capability(
+        EvidenceSource::ConversationHistory => vec![capability(
             ConversationHistory,
             &[HistoricalRecord, Content, Attribution],
             Canonical,
             Historical,
         )],
-        "http_request" | "web_fetch" | "browser" => vec![capability(
+        EvidenceSource::RemoteRead => vec![capability(
             ExternalRemote,
             &[CurrentState, Content, Outcome],
             Direct,
             Current,
         )],
-        "read_node_health" | "read_node_sensors" => vec![capability(
+        EvidenceSource::NodeReading => vec![capability(
             ExternalRemote,
             &[CurrentState, Content],
             Direct,
             Current,
         )],
-        "send_node_audio" => vec![capability(ExternalRemote, &[Outcome], Direct, Current)],
-        "web_search" => vec![capability(
+        EvidenceSource::NodeAction => vec![capability(ExternalRemote, &[Outcome], Direct, Current)],
+        EvidenceSource::WebSearch => vec![capability(
             ExternalRemote,
             &[CurrentState, Content],
             Advisory,
             Current,
         )],
-        "read_file" => vec![
+        EvidenceSource::FileRead => vec![
             capability(
                 LocalWorkspace,
                 &[CurrentState, Content, Outcome, CausalExplanation],
@@ -175,13 +178,13 @@ pub fn evidence_capabilities_for_tool_call(
             // before filesystem I/O and is therefore a host-local outcome.
             capability(HostLocal, &[Outcome], Direct, Current),
         ],
-        "search_files" => vec![capability(
+        EvidenceSource::FileSearch => vec![capability(
             LocalWorkspace,
             &[CurrentState, Content, CausalExplanation],
             Direct,
             Current,
         )],
-        "terminal" | "run_command" => vec![
+        EvidenceSource::Shell => vec![
             capability(
                 LocalWorkspace,
                 &[CurrentState, Content, Outcome, CausalExplanation],
@@ -195,13 +198,13 @@ pub fn evidence_capabilities_for_tool_call(
                 Current,
             ),
         ],
-        "system_info" | "check_environment" => vec![capability(
+        EvidenceSource::HostInfo => vec![capability(
             HostLocal,
             &[CurrentState, Content, Outcome, CausalExplanation],
             Direct,
             Current,
         )],
-        "self_diagnose" | "diagnose" => vec![capability(
+        EvidenceSource::Diagnostics => vec![capability(
             HostLocal,
             &[
                 CurrentState,
@@ -213,7 +216,7 @@ pub fn evidence_capabilities_for_tool_call(
             Canonical,
             Both,
         )],
-        _ => Vec::new(),
+        EvidenceSource::None => Vec::new(),
     }
 }
 
@@ -258,10 +261,13 @@ pub fn evidence_capabilities_from_target_hints(
 
 /// Union of action-specific affordances used only to recommend candidate
 /// tools. Exact receipt credit always uses `evidence_capabilities_for_tool_call`.
-fn static_evidence_capabilities(tool_name: &str) -> Vec<ToolEvidenceCapability> {
-    let representative_calls: &[&str] = match tool_name {
-        "goal_trace" => &[r#"{"action":"tool_trace","task_id":"candidate"}"#],
-        "manage_mandates" => &[
+fn static_evidence_capabilities(
+    tool_name: &str,
+    source: EvidenceSource,
+) -> Vec<ToolEvidenceCapability> {
+    let representative_calls: &[&str] = match source {
+        EvidenceSource::GoalTrace => &[r#"{"action":"tool_trace","task_id":"candidate"}"#],
+        EvidenceSource::Mandates => &[
             r#"{"action":"list"}"#,
             r#"{"action":"get","mandate_id":"candidate","section":"history"}"#,
             r#"{"action":"list_intentions","mandate_id":"candidate"}"#,
@@ -274,7 +280,7 @@ fn static_evidence_capabilities(tool_name: &str) -> Vec<ToolEvidenceCapability> 
         .map_or(representative_calls, |facts| facts.representative_calls);
     let mut capabilities = Vec::new();
     for arguments in representative_calls {
-        for capability in evidence_capabilities_for_tool_call(tool_name, arguments) {
+        for capability in evidence_capabilities_for_tool_call(tool_name, source, arguments) {
             if !capabilities.contains(&capability) {
                 capabilities.push(capability);
             }
@@ -285,11 +291,11 @@ fn static_evidence_capabilities(tool_name: &str) -> Vec<ToolEvidenceCapability> 
 
 /// Whether the controller has enough static evidence metadata to conclude
 /// that a visible tool cannot satisfy an inquiry. Custom/dynamic tools may
-/// advertise argument-dependent semantics only when they execute, so an
-/// unknown name must remain a possible candidate rather than being declared
-/// unavailable prematurely.
-pub fn has_static_evidence_model(tool_name: &str) -> bool {
-    !static_evidence_capabilities(tool_name).is_empty()
+/// advertise argument-dependent semantics only when they execute, so a tool
+/// without a declared evidence source must remain a possible candidate
+/// rather than being declared unavailable prematurely.
+pub fn has_static_evidence_model(tool_name: &str, source: EvidenceSource) -> bool {
+    !static_evidence_capabilities(tool_name, source).is_empty()
 }
 
 pub fn capability_supports_requirement(
@@ -324,42 +330,30 @@ pub fn requirement_has_builtin_evidence_route(requirement: &RequestEvidenceRequi
     if requirement_is_exact_invocation(requirement) {
         return true;
     }
-    const EVIDENCE_MODELED_TOOLS: &[&str] = &[
-        "goal_trace",
-        "manage_mandates",
-        "manage_goal_tasks",
-        "manage_automations",
-        "search_history",
-        "http_request",
-        "read_node_health",
-        "send_node_audio",
-        "web_search",
-        "read_file",
-        "search_files",
-        "terminal",
-        "system_info",
-        "self_diagnose",
-    ];
-    let memory_tools = crate::turn::tool_facts::modeled_memory_tools();
-    EVIDENCE_MODELED_TOOLS
-        .iter()
-        .copied()
-        .chain(memory_tools.iter().map(String::as_str))
-        .any(|tool_name| {
-            static_evidence_capabilities(tool_name)
-                .iter()
-                .any(|capability| capability_supports_requirement(capability, requirement))
-        })
+    let supports = |capabilities: Vec<ToolEvidenceCapability>| {
+        capabilities
+            .iter()
+            .any(|capability| capability_supports_requirement(capability, requirement))
+    };
+    EvidenceSource::MODELED
+        .into_iter()
+        .any(|source| supports(static_evidence_capabilities("", source)))
+        || crate::turn::tool_facts::modeled_memory_tools()
+            .iter()
+            .any(|tool| supports(static_evidence_capabilities(tool, EvidenceSource::None)))
 }
 
+/// The visible tools that could produce evidence for `requirements`, best
+/// covering first. `source` gives each tool's declared evidence source.
 pub fn candidate_tools_for_requirements<'a>(
     requirements: &[RequestEvidenceRequirement],
     visible_tool_names: impl IntoIterator<Item = &'a str>,
+    source: impl Fn(&str) -> EvidenceSource,
 ) -> Vec<String> {
     let mut scored = visible_tool_names
         .into_iter()
         .filter_map(|name| {
-            let capabilities = static_evidence_capabilities(name);
+            let capabilities = static_evidence_capabilities(name, source(name));
             let coverage = requirements
                 .iter()
                 .filter(|requirement| {
@@ -470,7 +464,11 @@ mod tests {
             EvidenceAuthority::Canonical,
             EvidenceTemporalScope::Historical,
         );
-        let external = evidence_capabilities_for_tool_call("http_request", r#"{"method":"GET"}"#);
+        let external = evidence_capabilities_for_tool_call(
+            "http_request",
+            EvidenceSource::RemoteRead,
+            r#"{"method":"GET"}"#,
+        );
         assert!(
             !external
                 .iter()
@@ -478,6 +476,7 @@ mod tests {
         );
         let trace = evidence_capabilities_for_tool_call(
             "goal_trace",
+            EvidenceSource::GoalTrace,
             r#"{"action":"tool_trace","task_id":"synthetic-task"}"#,
         );
         assert!(
@@ -497,6 +496,7 @@ mod tests {
         );
         let memory = evidence_capabilities_for_tool_call(
             "manage_memories",
+            EvidenceSource::None,
             r#"{"action":"search_episodes"}"#,
         );
         assert!(
@@ -535,6 +535,7 @@ mod tests {
         );
         let memory = evidence_capabilities_for_tool_call(
             "manage_memories",
+            EvidenceSource::None,
             r#"{"action":"search","query":"synthetic family facts"}"#,
         );
         assert!(
@@ -552,8 +553,11 @@ mod tests {
             EvidenceAuthority::Canonical,
             EvidenceTemporalScope::Historical,
         );
-        let recent =
-            evidence_capabilities_for_tool_call("goal_trace", r#"{"action":"tool_trace"}"#);
+        let recent = evidence_capabilities_for_tool_call(
+            "goal_trace",
+            EvidenceSource::GoalTrace,
+            r#"{"action":"tool_trace"}"#,
+        );
         assert!(
             !recent
                 .iter()
@@ -561,6 +565,7 @@ mod tests {
         );
         let targeted = evidence_capabilities_for_tool_call(
             "goal_trace",
+            EvidenceSource::GoalTrace,
             r#"{"action":"tool_trace","task_id":"synthetic-task"}"#,
         );
         assert!(
@@ -608,6 +613,11 @@ mod tests {
         let candidates = candidate_tools_for_requirements(
             &needs,
             ["http_request", "manage_memories", "goal_trace"],
+            |tool| match tool {
+                "http_request" => EvidenceSource::RemoteRead,
+                "goal_trace" => EvidenceSource::GoalTrace,
+                _ => EvidenceSource::None,
+            },
         );
         assert_eq!(candidates.first().map(String::as_str), Some("goal_trace"));
         assert!(candidates.iter().any(|name| name == "manage_memories"));
@@ -635,8 +645,17 @@ mod tests {
 
     #[test]
     fn unknown_dynamic_tool_prevents_a_false_unavailable_conclusion() {
-        assert!(has_static_evidence_model("web_search"));
-        assert!(has_static_evidence_model("system_info"));
-        assert!(!has_static_evidence_model("check_remote"));
+        assert!(has_static_evidence_model(
+            "web_search",
+            EvidenceSource::WebSearch
+        ));
+        assert!(has_static_evidence_model(
+            "system_info",
+            EvidenceSource::HostInfo
+        ));
+        assert!(!has_static_evidence_model(
+            "check_remote",
+            EvidenceSource::None
+        ));
     }
 }

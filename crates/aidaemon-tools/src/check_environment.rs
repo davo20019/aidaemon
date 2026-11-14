@@ -187,6 +187,10 @@ impl crate::semantics::ToolSemantics for CheckEnvironmentTool {
     fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
         crate::semantics::ToolDispatchFacts {
             same_tool_streak: crate::semantics::SameToolStreak::Versatile,
+            project_dir_argument: crate::semantics::ProjectDirArgument::SearchRoot,
+            evidence: crate::semantics::EvidenceSource::HostInfo,
+            semantic_scope: Some(crate::semantics::ToolSemanticScope::HostLocal),
+            low_signal_result: true,
             ..Default::default()
         }
     }

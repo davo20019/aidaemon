@@ -388,6 +388,11 @@ pub struct RunState {
     /// the turn that started it kept. A no-plan run's end edits exactly this
     /// card, never whichever card is newest.
     pub card: RunCard,
+    /// It runs in the background, past the turn that started it; `false`
+    /// for a helper its turn waits on.
+    pub background: bool,
+    /// The chat turn (its task id) whose request started it, when one did.
+    pub request: Option<String>,
 }
 
 /// Which chat card a run's line is drawn on once the turn that started it
@@ -461,7 +466,7 @@ impl RunState {
         HelperView {
             label: self.label.clone(),
             phase: self.phase,
-            background: true,
+            background: self.background,
             step: match self.phase {
                 RunPhase::Running => self.step.clone(),
                 _ => None,
@@ -481,9 +486,11 @@ impl RunState {
                 _ => None,
             },
             stopped_by_owner: self.stopped_by_owner(),
+            // A waited-on helper's header always carries its time: its turn
+            // is still open when it ends.
             took: self
                 .times()
-                .filter(|times| times.requested.is_some())
+                .filter(|times| !self.background || times.requested.is_some())
                 .map(|times| times.line()),
             since_request: self
                 .requested_at
@@ -509,6 +516,9 @@ pub struct RunEnded {
     pub state: RunState,
     pub report: RunReport,
 }
+
+/// How many ended waited-on runs a chat keeps on record.
+pub const MAX_WAITED_RUNS: usize = 32;
 
 /// Every helper run of one runtime. A run stays listed after it ends (until
 /// [`RunStates::forget`]), so a surface drawn late still reads how it ended.
@@ -634,6 +644,8 @@ impl RunStates {
             evidence: RunEvidence::default(),
             failure: None,
             card: RunCard::default(),
+            background: true,
+            request: None,
         };
         let seq = self
             .order
@@ -647,6 +659,51 @@ impl RunStates {
             },
         );
         state
+    }
+
+    /// Start run `id` in `chat`, a helper its turn waits on, begun at
+    /// `started_at` for the chat turn `request`. It has the same record as a
+    /// background run (so every surface reads it the same way) but no
+    /// subscriber: its turn takes its result. The chat keeps the last
+    /// [`MAX_WAITED_RUNS`] waited-on runs that ended.
+    pub fn begin_waited(
+        &self,
+        id: &str,
+        chat: &str,
+        label: &str,
+        started_at: DateTime<Utc>,
+        request: Option<&str>,
+    ) -> RunState {
+        let mut state = self.begin(id, chat, label, None);
+        state.background = false;
+        state.started_at = started_at;
+        state.request = request.map(str::to_string);
+        let mut runs = self.lock();
+        if let Some(entry) = runs.get_mut(id) {
+            entry.state = state.clone();
+        }
+        let mut ended: Vec<(u64, String)> = runs
+            .iter()
+            .filter(|(_, entry)| {
+                entry.state.chat == chat
+                    && !entry.state.background
+                    && entry.state.phase.is_terminal()
+            })
+            .map(|(id, entry)| (entry.seq, id.clone()))
+            .collect();
+        ended.sort();
+        let excess = ended.len().saturating_sub(MAX_WAITED_RUNS);
+        for (_, old) in ended.into_iter().take(excess) {
+            runs.remove(&old);
+        }
+        state
+    }
+
+    /// Run `id` was started by the chat turn `request` (its task id).
+    pub fn for_request(&self, id: &str, request: &str) {
+        if let Some(entry) = self.lock().get_mut(id) {
+            entry.state.request = Some(request.to_string());
+        }
     }
 
     /// Run `id` is one of the runs of `group`: the runs one turn started.
@@ -978,6 +1035,51 @@ pub struct RunMeasure {
 mod tests {
     use super::*;
 
+    /// A helper its turn waits on has the same record as a background one:
+    /// two attempts under one label are two records, each read by its id,
+    /// and a waited-on helper's view is not a background one.
+    #[test]
+    fn waited_on_attempts_with_one_label_are_two_records() {
+        let runs = RunStates::default();
+        let now = Utc::now();
+        runs.begin_waited("helper:a", "chat", "Install Drupal", now, Some("task-1"));
+        runs.begin_waited("helper:b", "chat", "Install Drupal", now, Some("task-1"));
+        let measure = RunMeasure {
+            ended_at: now,
+            work_began: None,
+            waited: Duration::ZERO,
+        };
+        runs.finish(
+            "helper:a",
+            RunEnd::Stopped(None),
+            measure,
+            RunEvidence::default(),
+            report(),
+        );
+        runs.finish(
+            "helper:b",
+            RunEnd::Succeeded,
+            measure,
+            RunEvidence::default(),
+            report(),
+        );
+        let chat = runs.for_chat("chat");
+        assert_eq!(
+            chat.iter()
+                .map(|run| (run.id.as_str(), run.phase))
+                .collect::<Vec<_>>(),
+            vec![
+                ("helper:a", RunPhase::Stopped),
+                ("helper:b", RunPhase::Succeeded)
+            ]
+        );
+        assert!(chat.iter().all(|run| !run.view().background));
+        assert!(
+            chat.iter()
+                .all(|run| run.request.as_deref() == Some("task-1"))
+        );
+    }
+
     fn report() -> RunReport {
         RunReport {
             text: "Done.".to_string(),
@@ -1054,6 +1156,8 @@ mod tests {
             evidence: RunEvidence::default(),
             failure: None,
             card: RunCard::default(),
+            background: true,
+            request: None,
         };
         let times = state.times().unwrap();
         let line = state.view().took.expect("the card's measured line");

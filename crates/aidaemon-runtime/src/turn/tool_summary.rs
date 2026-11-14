@@ -30,7 +30,7 @@ pub fn summarize_tool_args(name: &str, arguments: &str) -> String {
 
     match name {
         // --- Command execution ---
-        "terminal" | "run_command" => get_str("command")
+        "terminal" => get_str("command")
             .map(|cmd| {
                 // Order matters: shorten the home dir first (the "File path"
                 // secret pattern would otherwise swallow `/Users/...` whole),

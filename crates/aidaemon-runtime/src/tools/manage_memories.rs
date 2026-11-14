@@ -258,6 +258,7 @@ impl crate::tools::traits::ToolSemantics for ManageMemoriesTool {
         crate::tools::traits::ToolDispatchFacts {
             offering: aidaemon_tools::semantics::Offering::Core,
             status_from_arguments: true,
+            activity: aidaemon_tools::semantics::ToolActivity::Memory,
             ..Default::default()
         }
     }

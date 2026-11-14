@@ -117,7 +117,6 @@ pub struct CanonFacts<'a> {
 ///   authorized call. Dropping a read root does not change what it does.
 pub fn canonicalize_call(
     tool: Option<&dyn aidaemon_tools::OutcomeTool>,
-    name: &str,
     raw: &Value,
     facts: &CanonFacts<'_>,
 ) -> CanonicalCall {
@@ -128,12 +127,15 @@ pub fn canonicalize_call(
     // arguments would judge a call that never runs. A tool that binds the
     // owner's answer to the exact call (`browser`) then never finds it.
     let mut call = CanonicalCall::stripped(tool, raw);
+    let argument = tool
+        .map(|tool| tool.dispatch_facts().project_dir_argument)
+        .unwrap_or_default();
     let mut known = facts.known_project_dir.map(str::to_string);
     if !facts.workspace_grant
         && let Ok(text) = serde_json::to_string(&call.arguments)
     {
         if let Some(explicit) =
-            crate::turn::project_dir::project_dir_from_tool_args(facts.backend, name, &text)
+            crate::turn::project_dir::project_dir_from_tool_args(facts.backend, argument, &text)
         {
             known = Some(explicit.clone());
             call.explicit_dir = Some(explicit);
@@ -141,7 +143,7 @@ pub fn canonicalize_call(
         if let Some((updated, injected)) =
             crate::turn::project_dir::maybe_inject_project_dir_into_tool_args(
                 facts.backend,
-                name,
+                argument,
                 &text,
                 known.as_deref(),
             )
@@ -245,7 +247,6 @@ impl sdk::Hook for CanonicalCallHook {
         };
         let canonical = canonicalize_call(
             tool,
-            &call.name,
             &call.arguments,
             &CanonFacts {
                 backend: &*self.backend,
@@ -489,7 +490,7 @@ pub fn bind_receipt_to_contract(
 /// success after an error credits it as recovered.
 pub fn record_call_for_learning(
     learning: &mut crate::turn::post_task::LearningContext,
-    summary: String,
+    call: crate::turn::post_task::LearnedCall,
     output: &str,
     failed: bool,
 ) {
@@ -499,29 +500,31 @@ pub fn record_call_for_learning(
         }
         learning.errors.push((output.to_string(), false));
     } else if !learning.errors.is_empty() {
-        learning.recovery_actions.push(summary.clone());
+        learning.recovery_actions.push(call.line.clone());
         if let Some((_, recovered)) = learning.errors.last_mut() {
             *recovered = true;
         }
     }
-    learning.tool_calls.push(summary);
+    learning.tool_calls.push(call);
 }
 
-/// One tool call as post-task learning records it (a
-/// `tool_name(summary)` line, marked when it was rejected or failed so
-/// activity summaries never claim work that did not happen).
-pub fn learning_tool_summary(name: &str, arguments: &str, rejected: bool, failed: bool) -> String {
-    let line = format!(
-        "{name}({})",
-        crate::turn::tool_summary::summarize_tool_args(name, arguments)
-    );
-    if rejected {
-        format!("{line} [REJECTED]")
-    } else if failed {
-        format!("{line} [FAILED]")
-    } else {
-        line
-    }
+/// One tool call as post-task learning records it: its `tool_name(summary)`
+/// line, the tool's typed `recap` kind, and whether it was rejected or
+/// failed, so activity summaries never claim work that did not happen.
+pub fn learning_tool_summary(
+    name: &str,
+    arguments: &str,
+    recap: aidaemon_tools::semantics::RecapKind,
+    rejected: bool,
+    failed: bool,
+) -> crate::turn::post_task::LearnedCall {
+    crate::turn::post_task::LearnedCall::new(
+        name,
+        crate::turn::tool_summary::summarize_tool_args(name, arguments),
+        recap,
+        rejected,
+        failed,
+    )
 }
 
 /// A call as the dispatcher executes it: the model's `_` keys and unset

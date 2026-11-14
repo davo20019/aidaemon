@@ -2441,6 +2441,13 @@ impl crate::semantics::ToolSemantics for HttpRequestTool {
     fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
         crate::semantics::ToolDispatchFacts {
             network_reach: crate::semantics::NetworkReach::PublicAndLoopback,
+            recap: crate::semantics::RecapKind::ExternalRead,
+            result_fit: crate::semantics::ResultFit {
+                compact_json: true,
+                ..Default::default()
+            },
+            evidence: crate::semantics::EvidenceSource::RemoteRead,
+            semantic_scope: Some(crate::semantics::ToolSemanticScope::ExternalRemote),
             ..Default::default()
         }
     }

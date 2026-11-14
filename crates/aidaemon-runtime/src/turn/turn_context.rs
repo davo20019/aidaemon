@@ -179,8 +179,13 @@ pub fn is_low_signal_http_metadata_line(line: &str) -> bool {
         || lower.starts_with("x-")
 }
 
-pub fn is_low_info_recent_tool_context(tool_name: &str) -> bool {
-    matches!(tool_name, "write_file" | "edit_file" | "check_environment")
+/// A tool whose results say only that it worked (`low_signal_result`, or a
+/// memory tool's own fact): the recent-work context leaves them out.
+pub fn is_low_info_recent_tool_context(
+    tool_name: &str,
+    facts: &aidaemon_tools::semantics::ToolDispatchFacts,
+) -> bool {
+    facts.low_signal_result
         || crate::turn::tool_facts::memory_tool_facts(tool_name)
             .is_some_and(|facts| facts.low_signal_result)
 }
@@ -192,23 +197,6 @@ pub fn is_low_signal_tool_context_line(line: &str) -> bool {
         || lower == "[truncated]"
         || lower.starts_with("exit code:")
         || lower.starts_with("[mode:")
-}
-
-pub fn summarize_http_request_context(primary: &str) -> Option<String> {
-    let mut lines = primary
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty());
-    let first = lines.next()?;
-    if !first.to_ascii_lowercase().starts_with("http ") {
-        return Some(first.to_string());
-    }
-
-    let detail = lines.find(|line| !is_low_signal_http_metadata_line(line));
-    match detail {
-        Some(detail) if !detail.eq_ignore_ascii_case(first) => Some(format!("{first} | {detail}")),
-        _ => Some(first.to_string()),
-    }
 }
 
 pub fn summarize_generic_tool_context(primary: &str) -> Option<String> {
@@ -224,17 +212,20 @@ pub fn summarize_generic_tool_context(primary: &str) -> Option<String> {
     }
 }
 
-pub fn summarize_recent_tool_context(msg: &Message) -> Option<String> {
+/// One line for a recent tool result, unless its tool's results carry no
+/// signal. An HTTP response's headers are low-signal lines, so its status
+/// line and first detail are what remain.
+pub fn summarize_recent_tool_context(
+    msg: &Message,
+    facts: &aidaemon_tools::semantics::ToolDispatchFacts,
+) -> Option<String> {
     let tool_name = msg.tool_name.as_deref()?;
-    if is_low_info_recent_tool_context(tool_name) {
+    if is_low_info_recent_tool_context(tool_name, facts) {
         return None;
     }
 
     let primary = msg.primary_content()?;
-    let summary = match tool_name {
-        "http_request" => summarize_http_request_context(&primary)?,
-        _ => summarize_generic_tool_context(&primary)?,
-    };
+    let summary = summarize_generic_tool_context(&primary)?;
     Some(format!(
         "{}: {}",
         tool_name,
@@ -242,7 +233,14 @@ pub fn summarize_recent_tool_context(msg: &Message) -> Option<String> {
     ))
 }
 
-pub fn extract_recent_parent_messages(history: &[Message], max_messages: usize) -> Vec<Value> {
+/// The recent parent conversation for an assessment. `facts` gives each
+/// registered tool's dispatch facts, so a tool result is summarized by what
+/// its tool declares.
+pub fn extract_recent_parent_messages(
+    history: &[Message],
+    max_messages: usize,
+    facts: impl Fn(&str) -> aidaemon_tools::semantics::ToolDispatchFacts,
+) -> Vec<Value> {
     let mut rows_rev: Vec<Value> = Vec::new();
     let mut recent_tool_rows = 0usize;
 
@@ -278,7 +276,11 @@ pub fn extract_recent_parent_messages(history: &[Message], max_messages: usize) 
                     "content": truncate_for_resume(content.trim(), 500),
                 }))
             }
-            "tool" if recent_tool_rows < 2 => summarize_recent_tool_context(msg).map(|content| {
+            "tool" if recent_tool_rows < 2 => summarize_recent_tool_context(
+                msg,
+                &facts(msg.tool_name.as_deref().unwrap_or_default()),
+            )
+            .map(|content| {
                 recent_tool_rows += 1;
                 json!({
                     "message_id": msg.id,
@@ -640,6 +642,7 @@ pub trait TurnHistory: TurnHost {
                     .map(|index| &history[..index])
                     .unwrap_or(history.as_slice()),
                 GOAL_CONTEXT_RECENT_MESSAGES_LIMIT,
+                |name| self.registered_tool_facts(name),
             ),
             visible_antecedent_user_message_id: None,
             bound_workspace,
@@ -1065,6 +1068,7 @@ pub trait TurnHistory: TurnHost {
                 denial.proposed_evidence =
                     crate::turn::inquiry::evidence_capabilities_for_tool_call(
                         &tool_call.name,
+                        self.registered_tool_facts(&tool_call.name).evidence,
                         effective_arguments,
                     );
             }

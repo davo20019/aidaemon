@@ -17,7 +17,7 @@ input: >
   how long it took and each homepage URL.
 script:
   - tool_calls: [{ name: build_site, arguments: { project: school } }]
-  - tool_calls: [{ name: service_status, arguments: { service: orbstack } }]
+  - tool_calls: [{ name: check_service, arguments: { service: orbstack } }]
   - tool_calls: [{ name: start_service, arguments: { service: orbstack } }]
   - tool_calls: [{ name: build_site, arguments: { project: school } }, { name: build_site, arguments: { project: school-wp } }]
   - text: Both are up, at https://school.ddev.site and https://school-wp.ddev.site (OrbStack was stopped; I started it first).

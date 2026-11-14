@@ -422,6 +422,8 @@ impl crate::traits::ToolSemantics for ManageGoalTasksTool {
             task_lead_delegation: true,
             same_tool_streak: crate::traits::SameToolStreak::Versatile,
             goal_context: crate::traits::GoalContext::MandateRun,
+            evidence: aidaemon_tools::semantics::EvidenceSource::GoalRecords,
+            semantic_scope: Some(aidaemon_tools::semantics::ToolSemanticScope::GoalState),
             ..Default::default()
         }
     }

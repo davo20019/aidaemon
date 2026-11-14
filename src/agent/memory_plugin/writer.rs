@@ -84,11 +84,15 @@ pub(crate) mod tests {
             "remember that my favorite color is teal",
         )
         .await;
-        turn.learning
-            .lock()
-            .unwrap()
-            .tool_calls
-            .push("remember_fact(favorite_color)".to_string());
+        turn.learning.lock().unwrap().tool_calls.push(
+            aidaemon_runtime::turn::post_task::LearnedCall::new(
+                "remember_fact",
+                "favorite_color".to_string(),
+                Default::default(),
+                false,
+                false,
+            ),
+        );
         MemoryTurn { depth, ..turn }
     }
 
@@ -455,7 +459,7 @@ pub(crate) mod tests {
             recorded.learned[0]
                 .tool_calls
                 .iter()
-                .any(|call| call.starts_with("remember_fact")),
+                .any(|call| call.line.starts_with("remember_fact")),
             "{:?}",
             recorded.learned[0].tool_calls
         );

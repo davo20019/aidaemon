@@ -3546,7 +3546,8 @@ impl CliAgentTool {
                         let (label, summary) = aidaemon_tools::sanitize::user_facing_tool_activity(
                             tool_name,
                             "killed - infinite loop detected",
-                            aidaemon_core::ChannelVisibility::Public,
+                            &aidaemon_tools::semantics::ToolDispatchFacts::default(),
+                            false,
                         );
                         let _ = tx.try_send(StatusUpdate::ToolComplete {
                             name: label,
@@ -3577,7 +3578,8 @@ impl CliAgentTool {
                         let (label, summary) = aidaemon_tools::sanitize::user_facing_tool_activity(
                             tool_name,
                             "authentication failed",
-                            aidaemon_core::ChannelVisibility::Public,
+                            &aidaemon_tools::semantics::ToolDispatchFacts::default(),
+                            false,
                         );
                         let _ = tx.try_send(StatusUpdate::ToolComplete {
                             name: label,
@@ -3633,7 +3635,8 @@ impl CliAgentTool {
                     let (label, summary) = aidaemon_tools::sanitize::user_facing_tool_activity(
                         tool_name,
                         &raw_summary,
-                        aidaemon_core::ChannelVisibility::Public,
+                        &aidaemon_tools::semantics::ToolDispatchFacts::default(),
+                        false,
                     );
                     let _ = tx.try_send(StatusUpdate::ToolComplete {
                         name: label,
@@ -4875,6 +4878,15 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
             // inherits the turn's authority, narrowed by its declaration
             // ([`crate::helper_run::helper_authority`]).
             spawns_child_agents: true,
+            activity: aidaemon_tools::semantics::ToolActivity::Fixed(
+                aidaemon_core::card::ActivityKind::Delegate,
+            ),
+            project_dir_argument: aidaemon_tools::semantics::ProjectDirArgument::WorkingDir,
+            status_label: Some("delegating to a CLI agent"),
+            result_fit: aidaemon_tools::semantics::ResultFit {
+                cap_large_errors: true,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }

@@ -637,6 +637,12 @@ impl crate::tools::traits::ToolSemantics for SearchHistoryTool {
     fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
         crate::tools::traits::ToolDispatchFacts {
             offering: aidaemon_tools::semantics::Offering::Core,
+            activity: aidaemon_tools::semantics::ToolActivity::Fixed(
+                aidaemon_core::card::ActivityKind::Recall,
+            ),
+            evidence: aidaemon_tools::semantics::EvidenceSource::ConversationHistory,
+            semantic_scope: Some(aidaemon_tools::semantics::ToolSemanticScope::ConversationHistory),
+            status_label: Some("checking exact history"),
             ..Default::default()
         }
     }

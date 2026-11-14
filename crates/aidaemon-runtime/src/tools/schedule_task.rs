@@ -510,6 +510,8 @@ impl crate::tools::traits::ToolSemantics for ScheduleTaskTool {
     fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
         crate::tools::traits::ToolDispatchFacts {
             offering: aidaemon_tools::semantics::Offering::Core,
+            semantic_scope: Some(aidaemon_tools::semantics::ToolSemanticScope::GoalState),
+            status_label: Some("scheduling a task"),
             ..Default::default()
         }
     }

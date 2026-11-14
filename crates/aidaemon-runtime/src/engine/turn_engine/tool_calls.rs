@@ -73,7 +73,6 @@ pub fn canonicalize_dispatched_call(
                 .and_then(|known| known.clone());
             canonicalize_call(
                 tool,
-                &request.name,
                 &request.arguments,
                 &CanonFacts {
                     backend: scope.execution_backend,
@@ -167,6 +166,7 @@ impl TurnEngine<'_> {
         scope: &TurnScope<'_>,
         tool: &str,
         arguments: &str,
+        (facts, mutates): (&aidaemon_tools::semantics::ToolDispatchFacts, bool),
         summary: impl FnOnce() -> String,
     ) -> (String, String) {
         if let Some(title) = self
@@ -175,11 +175,7 @@ impl TurnEngine<'_> {
         {
             return (title, String::new());
         }
-        aidaemon_tools::sanitize::user_facing_tool_activity(
-            tool,
-            &summary(),
-            scope.channel_ctx.visibility,
-        )
+        aidaemon_tools::sanitize::user_facing_tool_activity(tool, &summary(), facts, mutates)
     }
 
     pub fn turn_tool_facts(
@@ -431,15 +427,12 @@ impl TurnEngine<'_> {
         // User-facing activity labels for the channel's status line;
         // `track_requirements` shows its checklist instead.
         if !facts.requirement_checklist {
-            let (name, summary) = self.step_activity(scope, &request.name, arguments, || {
-                crate::turn::tool_summary::summarize_tool_args(&request.name, arguments)
-            });
-            let kind = step_kind(
-                &request.name,
-                arguments,
-                &facts,
-                call_semantics.mutates_state(),
-            );
+            let mutates = call_semantics.mutates_state();
+            let (name, summary) =
+                self.step_activity(scope, &request.name, arguments, (&facts, mutates), || {
+                    crate::turn::tool_summary::summarize_tool_args(&request.name, arguments)
+                });
+            let kind = step_kind(&facts, mutates);
             if let Some(status_tx) = &scope.status_tx {
                 let _ = status_tx.try_send(StatusUpdate::ToolStart {
                     name,
@@ -479,6 +472,7 @@ impl TurnEngine<'_> {
                 // negative result).
                 crate::turn::tool_dispatch::complete_tool_result_semantics(
                     &request.name,
+                    self.turn_tool_facts(scope, &request.name).evidence,
                     arguments,
                     &call_semantics,
                     &mut outcome.metadata,
@@ -549,6 +543,7 @@ impl TurnEngine<'_> {
                 }
                 crate::turn::tool_dispatch::complete_tool_result_semantics(
                     &request.name,
+                    self.turn_tool_facts(scope, &request.name).evidence,
                     arguments,
                     &call_semantics,
                     &mut metadata,
@@ -757,6 +752,7 @@ impl TurnEngine<'_> {
                     .fit_tool_result_for_model(
                         &crate::engine::tool_result_fit::FitScope {
                             tool_name: &request.name,
+                            facts: self.turn_tool_facts(scope, &request.name),
                             session_id: scope.session_id,
                             task_id: scope.task_id,
                             model: scope.model,
@@ -1018,6 +1014,7 @@ impl TurnEngine<'_> {
                     .fit_tool_result_for_model(
                         &crate::engine::tool_result_fit::FitScope {
                             tool_name: &request.name,
+                            facts: self.turn_tool_facts(scope, &request.name),
                             session_id: scope.session_id,
                             task_id: scope.task_id,
                             model: scope.model,
@@ -1153,20 +1150,20 @@ impl TurnEngine<'_> {
                 let handed_off = metadata.as_ref().is_some_and(|metadata| {
                     metadata.background_handoff || metadata.background_started
                 });
+                let mutates = metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.semantics.mutates_state());
                 Some(if handed_off {
                     StatusUpdate::StepHandedOff {
-                        kind: step_kind(
-                            &request.name,
-                            arguments,
-                            &facts,
-                            metadata
-                                .as_ref()
-                                .is_some_and(|metadata| metadata.semantics.mutates_state()),
-                        ),
+                        kind: step_kind(&facts, mutates),
                     }
                 } else {
-                    let (name, summary) =
-                        self.step_activity(scope, &request.name, arguments, || {
+                    let (name, summary) = self.step_activity(
+                        scope,
+                        &request.name,
+                        arguments,
+                        (&facts, mutates),
+                        || {
                             if facts.status_from_arguments {
                                 crate::turn::tool_summary::summarize_tool_args(
                                     &request.name,
@@ -1175,7 +1172,8 @@ impl TurnEngine<'_> {
                             } else {
                                 crate::turn::tool_dispatch::summarize_completed_tool_result(&output)
                             }
-                        });
+                        },
+                    );
                     StatusUpdate::ToolComplete { name, summary }
                 })
             };
@@ -1200,8 +1198,14 @@ impl TurnEngine<'_> {
             let rejected = metadata
                 .as_ref()
                 .is_some_and(|metadata| metadata.contract_rejected);
-            let summary = learning_tool_summary(&request.name, arguments, rejected, failed);
-            record_call_for_learning(&mut learning, summary, &output, failed);
+            let call = learning_tool_summary(
+                &request.name,
+                arguments,
+                self.turn_tool_facts(scope, &request.name).recap,
+                rejected,
+                failed,
+            );
+            record_call_for_learning(&mut learning, call, &output, failed);
         }
 
         // The model sees the receipt footer replayed history renders
@@ -1804,7 +1808,7 @@ impl TurnEngine<'_> {
         let tracker = scope.instruction_tracker.as_ref()?;
         let targets = crate::turn::project_dir::project_instruction_targets_for_tool_call(
             &*self.execution_backend_handle(),
-            &request.name,
+            &self.turn_tool_facts(scope, &request.name),
             arguments,
             semantics,
         );
@@ -1933,17 +1937,14 @@ impl TurnEngine<'_> {
 }
 
 /// What kind of work a call is, as every card shows it: from the tool's
-/// typed identity, its dispatch facts and its admitted semantics.
+/// dispatch facts (a helper run delegates; else its declared `activity`) and
+/// its admitted semantics, never from its name.
 fn step_kind(
-    tool: &str,
-    arguments: &str,
     facts: &aidaemon_tools::semantics::ToolDispatchFacts,
     mutates: bool,
 ) -> aidaemon_core::card::ActivityKind {
-    aidaemon_tools::sanitize::tool_activity_kind(
-        tool,
-        &crate::turn::tool_summary::summarize_tool_args(tool, arguments),
-        facts.spawns_child_agents,
-        mutates,
-    )
+    if facts.spawns_child_agents {
+        return aidaemon_core::card::ActivityKind::Delegate;
+    }
+    facts.activity.kind(mutates)
 }
