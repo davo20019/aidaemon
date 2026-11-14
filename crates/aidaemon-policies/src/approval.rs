@@ -115,6 +115,10 @@ pub struct ApprovalPolicy {
     base_dir: Option<std::path::PathBuf>,
     ask_undeclared_writes: bool,
     path_free: HashSet<String>,
+    /// Declines a re-ask card has already explained. Each decline is said
+    /// on the first card it causes; later cards carry no reason line.
+    /// Clones share it: the daemon builds one policy per run.
+    explained: Arc<std::sync::Mutex<Vec<aidaemon_core::EffectKey>>>,
 }
 
 impl std::fmt::Debug for ApprovalPolicy {
@@ -132,6 +136,30 @@ impl std::fmt::Debug for ApprovalPolicy {
             .field("ask_undeclared_writes", &self.ask_undeclared_writes)
             .field("path_free", &self.path_free)
             .finish()
+    }
+}
+
+impl ApprovalPolicy {
+    /// Why a re-ask card is asked, for the declines no earlier card
+    /// explained: only the first card a decline affects says it. `None`
+    /// when every decline was already explained.
+    fn first_explanation(
+        &self,
+        declined: &[aidaemon_core::EffectKey],
+    ) -> Option<aidaemon_core::AskReason> {
+        let mut explained = self.explained.lock().unwrap_or_else(|e| e.into_inner());
+        let new: Vec<aidaemon_core::EffectKey> = declined
+            .iter()
+            .filter(|key| !explained.contains(key))
+            .cloned()
+            .collect();
+        if new.is_empty() {
+            return None;
+        }
+        explained.extend(new.iter().cloned());
+        Some(aidaemon_core::AskReason::AfterADecline {
+            declined: declined_in_words(&new),
+        })
     }
 }
 
@@ -540,9 +568,7 @@ impl Hook for ApprovalPolicy {
                 return decision;
             }
             if let Some(card) = &mut request.card {
-                card.reason = Some(aidaemon_core::AskReason::AfterADecline {
-                    declined: declined_in_words(ctx.declined),
-                });
+                card.reason = self.first_explanation(ctx.declined);
             }
             return ToolDecision::Interrupt {
                 reason: format!(
@@ -1024,6 +1050,49 @@ mod rules_tests {
                     &shell(vec![declined[1].clone()], true),
                 )
                 .await,
+        );
+    }
+
+    /// Live 2026-11-13: "You said no to ... earlier in this task" repeated
+    /// on every re-ask card after one decline. Only the first card a decline
+    /// affects explains it; a later decline is explained once on its own
+    /// first card.
+    #[tokio::test]
+    async fn a_decline_is_explained_on_its_first_card_only() {
+        let opaque = send_info(CallEffects::unknown());
+        let never = ApprovalPolicy::new(ApprovalMode::Never);
+        let reason = |decision: &ToolDecision| owner_request(decision).card.clone().unwrap().reason;
+
+        let first = [egress_key()];
+        let explained = reason(&never.before_tool(&hook_ctx(&first), &post(), &opaque).await);
+        assert!(
+            matches!(
+                explained,
+                Some(aidaemon_core::AskReason::AfterADecline { .. })
+            ),
+            "{explained:?}"
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                reason(&never.before_tool(&hook_ctx(&first), &post(), &opaque).await),
+                None
+            );
+        }
+
+        let titled = EffectKey::named(
+            EffectClass::Call,
+            r#"terminal {"command":"rotate.sh","description":"Rotate the admin password"}"#,
+        );
+        let both = [egress_key(), titled];
+        assert_eq!(
+            reason(&never.before_tool(&hook_ctx(&both), &post(), &opaque).await),
+            Some(aidaemon_core::AskReason::AfterADecline {
+                declined: Some("\u{201c}Rotate the admin password\u{201d}".into()),
+            })
+        );
+        assert_eq!(
+            reason(&never.before_tool(&hook_ctx(&both), &post(), &opaque).await),
+            None
         );
     }
 
