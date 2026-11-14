@@ -223,6 +223,7 @@ pub async fn known_resources(
             }
         }
     }
+    let started = std::time::Instant::now();
     let mut task_ids = current_task
         .map(str::to_string)
         .into_iter()
@@ -239,17 +240,45 @@ pub async fn known_resources(
             tracing::warn!(session_id, %error, "Could not read earlier tasks' resources");
         }
     }
-    // Each task with the runs it spawned, depth first: what a child
-    // established returns to its parent's context through the typed
-    // `spawned_by` link, not through the prose of its reply.
-    // As deep as spawning allowed (`subagents.max_depth`); the walk
-    // bounds only how many runs it reads.
+    let runs = handoff_runs(events, session_id, task_ids).await;
+    // The runs' aggregates are independent reads; fold them in walk order.
+    let aggregates = futures::future::join_all(
+        runs.iter()
+            .map(|(task_session, task_id)| events.task_run_aggregate(task_session, task_id)),
+    )
+    .await;
+    for run in aggregates.into_iter().flatten() {
+        known.extend_from_run(&run);
+    }
+    tracing::info!(
+        session_id,
+        tasks_read = runs.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Handoff resources read"
+    );
+    if let Some(inherited) = inherited {
+        known.extend(inherited.known_resources.as_slice());
+    }
+    known
+}
+
+/// The runs a handoff reads, in the order their resources are folded: each
+/// task with the runs it spawned, depth first. What a child established
+/// returns to its parent's context through the typed `spawned_by` link, not
+/// through the prose of its reply. As deep as spawning allowed
+/// (`subagents.max_depth`); the walk bounds only how many runs it reads.
+async fn handoff_runs(
+    events: &EventStore,
+    session_id: &str,
+    task_ids: Vec<String>,
+) -> Vec<(String, String)> {
     let mut pending = task_ids
         .into_iter()
         .rev()
         .map(|task_id| (session_id.to_string(), task_id))
         .collect::<Vec<_>>();
     let mut seen = std::collections::HashSet::new();
+    let mut runs = Vec::new();
     while let Some((task_session, task_id)) = pending.pop() {
         if !seen.insert(task_id.clone()) {
             continue;
@@ -257,19 +286,14 @@ pub async fn known_resources(
         if seen.len() > MAX_HANDOFF_TASKS {
             break;
         }
-        if let Ok(run) = events.task_run_aggregate(&task_session, &task_id).await {
-            known.extend_from_run(&run);
-        }
         if let Ok(children) = events.spawned_children(&task_id).await {
-            for child in children.into_iter() {
+            for child in children {
                 pending.push((child.session_id, child.task_id));
             }
         }
+        runs.push((task_session, task_id));
     }
-    if let Some(inherited) = inherited {
-        known.extend(inherited.known_resources.as_slice());
-    }
-    known
+    runs
 }
 
 /// The `[Handoff context]` section for an agent's turn: for a child, the
@@ -420,6 +444,257 @@ mod tests {
             "https://api.example.com/v1/items",
         ));
         assert_eq!(loose.working_dir(), None);
+    }
+
+    async fn append_task_start(
+        store: &EventStore,
+        session: &str,
+        task: &str,
+        turn: &str,
+        spawned_by: Option<(&str, &str)>,
+    ) {
+        use aidaemon_events::{Event, EventType, TaskRef, TaskStartData};
+        let mut event = Event::new(
+            session,
+            EventType::TaskStart,
+            serde_json::to_value(TaskStartData {
+                task_id: task.to_string(),
+                description: "synthetic".to_string(),
+                parent_task_id: None,
+                user_message: None,
+                turn_id: Some(turn.to_string()),
+                spawned_by: spawned_by.map(|(session_id, task_id)| TaskRef {
+                    session_id: session_id.to_string(),
+                    task_id: task_id.to_string(),
+                }),
+            })
+            .unwrap(),
+        );
+        event.task_id = Some(task.to_string());
+        event.turn_id = Some(turn.to_string());
+        store.append(event).await.unwrap();
+    }
+
+    async fn append_receipt(
+        store: &EventStore,
+        session: &str,
+        task: &str,
+        call_id: &str,
+        path: &str,
+        outcome: ToolOutcomeStatus,
+    ) {
+        use aidaemon_events::traits::{
+            ToolCallMetadata, ToolCallSemantics, ToolInvocationStage, ToolVerificationMode,
+        };
+        use aidaemon_events::{
+            Event, EventType, ToolCallData, ToolOutcomeEvidenceSource, ToolReceiptV1,
+            ToolResultData,
+        };
+        let call = ToolCallData {
+            tool_call_id: call_id.to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": path}),
+            summary: None,
+            task_id: Some(task.to_string()),
+            idempotency_key: None,
+            policy_rev: None,
+            risk_score: None,
+            stable_operation_key: None,
+            obligation_ids: Vec::new(),
+            max_operation_attempts: None,
+            max_operation_invocations: None,
+            operation_lineage: None,
+            turn_id: None,
+        };
+        let mut call_event = Event::new(
+            session,
+            EventType::ToolCall,
+            serde_json::to_value(&call).unwrap(),
+        );
+        call_event.task_id = Some(task.to_string());
+        store.append(call_event).await.unwrap();
+        let mut semantics = ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent);
+        semantics
+            .target_hints
+            .push(hint(ToolTargetHintKind::Path, path));
+        let metadata = ToolCallMetadata {
+            outcome_status: Some(outcome),
+            semantics,
+            ..ToolCallMetadata::default()
+        };
+        let mut receipt = ToolReceiptV1::from_metadata(
+            &metadata,
+            outcome,
+            ToolOutcomeEvidenceSource::ToolReported,
+            None,
+        );
+        receipt.result_provenance.result_id = Some(format!("result:{call_id}"));
+        receipt.invocation_stage = ToolInvocationStage::Dispatched;
+        let result = ToolResultData {
+            message_id: None,
+            tool_call_id: call_id.to_string(),
+            name: "read_file".to_string(),
+            result: "synthetic".to_string(),
+            success: outcome == ToolOutcomeStatus::Succeeded,
+            duration_ms: 1,
+            error: None,
+            task_id: Some(task.to_string()),
+            annotations: Vec::new(),
+            turn_id: None,
+            attachments: Vec::new(),
+            receipt: Some(receipt),
+        };
+        let mut result_event = Event::new(
+            session,
+            EventType::ToolResult,
+            serde_json::to_value(&result).unwrap(),
+        );
+        result_event.task_id = Some(task.to_string());
+        store.append(result_event).await.unwrap();
+    }
+
+    /// The serial walk `known_resources` made before its reads were
+    /// batched, kept as the reference its result must match.
+    async fn serial_walk_reference(
+        events: &EventStore,
+        session_id: &str,
+        task_ids: Vec<String>,
+    ) -> KnownResources {
+        let mut known = KnownResources::default();
+        let mut pending = task_ids
+            .into_iter()
+            .rev()
+            .map(|task_id| (session_id.to_string(), task_id))
+            .collect::<Vec<_>>();
+        let mut seen = std::collections::HashSet::new();
+        while let Some((task_session, task_id)) = pending.pop() {
+            if !seen.insert(task_id.clone()) {
+                continue;
+            }
+            if seen.len() > MAX_HANDOFF_TASKS {
+                break;
+            }
+            if let Ok(run) = events.task_run_aggregate(&task_session, &task_id).await {
+                known.extend_from_run(&run);
+            }
+            if let Ok(children) = events.spawned_children(&task_id).await {
+                for child in children {
+                    pending.push((child.session_id, child.task_id));
+                }
+            }
+        }
+        known
+    }
+
+    /// A spawn tree several levels deep hands on the same resources, in the
+    /// same order, as the serial depth-first walk did: every level's
+    /// successful targets, and never a failed call's.
+    #[tokio::test]
+    async fn a_multi_level_spawn_tree_hands_on_the_same_resources() {
+        use ToolOutcomeStatus::{FailedPermanent, Succeeded};
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", database.path().display()))
+            .await
+            .unwrap();
+        let store = EventStore::on_paths(
+            pool,
+            aidaemon_tools::LexicalPaths::daemon_host(),
+            std::sync::Arc::new(aidaemon_events::NoEventHost),
+        )
+        .await
+        .unwrap();
+        let session = "telegram:synthetic-user-1";
+        append_task_start(&store, session, "task-root", "turn-1", None).await;
+        append_receipt(
+            &store,
+            session,
+            "task-root",
+            "c-root",
+            "/srv/syn/root",
+            Succeeded,
+        )
+        .await;
+        append_receipt(
+            &store,
+            session,
+            "task-root",
+            "c-guess",
+            "/home/guessed",
+            FailedPermanent,
+        )
+        .await;
+        for (child_session, child, parent_session, parent, turn) in [
+            ("specialist:a", "task-a", session, "task-root", "turn-a"),
+            ("specialist:b", "task-b", session, "task-root", "turn-b"),
+            (
+                "specialist:a1",
+                "task-a1",
+                "specialist:a",
+                "task-a",
+                "turn-a1",
+            ),
+            (
+                "specialist:a1x",
+                "task-a1x",
+                "specialist:a1",
+                "task-a1",
+                "turn-a1x",
+            ),
+        ] {
+            append_task_start(
+                &store,
+                child_session,
+                child,
+                turn,
+                Some((parent_session, parent)),
+            )
+            .await;
+            append_receipt(
+                &store,
+                child_session,
+                child,
+                &format!("c-{child}"),
+                &format!("/srv/syn/{child}"),
+                Succeeded,
+            )
+            .await;
+        }
+        append_task_start(&store, session, "task-later", "turn-2", None).await;
+        append_receipt(
+            &store,
+            session,
+            "task-later",
+            "c-later",
+            "/srv/syn/later",
+            Succeeded,
+        )
+        .await;
+
+        let turns = ["turn-1".to_string(), "turn-2".to_string()];
+        let known = known_resources(&store, None, session, None, &turns).await;
+        let task_ids = store.task_ids_for_turns(session, &turns).await.unwrap();
+        assert_eq!(
+            known,
+            serial_walk_reference(&store, session, task_ids).await
+        );
+        let mut paths = known
+            .as_slice()
+            .iter()
+            .map(|hint| hint.value.as_str())
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            [
+                "/srv/syn/later",
+                "/srv/syn/root",
+                "/srv/syn/task-a",
+                "/srv/syn/task-a1",
+                "/srv/syn/task-a1x",
+                "/srv/syn/task-b",
+            ]
+        );
     }
 
     #[test]

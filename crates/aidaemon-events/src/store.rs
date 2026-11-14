@@ -1701,6 +1701,8 @@ impl EventStore {
     }
 
     /// The runs a task spawned as sub-agents (any session), oldest first.
+    /// Served by `idx_events_spawned_by`: the predicate must keep that
+    /// index's exact expression and its `event_type = 'task_start'` filter.
     pub async fn spawned_children(&self, task_id: &str) -> anyhow::Result<Vec<crate::TaskRef>> {
         let rows = sqlx::query_as::<_, (String, String)>(
             "SELECT session_id, task_id FROM events \
@@ -4280,6 +4282,30 @@ mod tests {
         event.task_id = Some(task.to_string());
         event.turn_id = Some(turn.to_string());
         store.append(event).await.expect("append task start");
+    }
+
+    /// Following a spawn link is an index lookup, never a parse of every
+    /// run's start event.
+    #[tokio::test]
+    async fn spawned_children_reads_the_spawned_by_index() {
+        let (store, _database) = setup_store().await;
+        let plan = sqlx::query_as::<_, (i64, i64, i64, String)>(
+            "EXPLAIN QUERY PLAN SELECT session_id, task_id FROM events \
+             WHERE event_type = 'task_start' AND task_id IS NOT NULL \
+               AND json_extract(data, '$.spawned_by.task_id') = ? \
+             ORDER BY id ASC",
+        )
+        .bind("task-parent")
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        let details = plan.into_iter().map(|row| row.3).collect::<Vec<_>>();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("USING INDEX idx_events_spawned_by")),
+            "{details:?}"
+        );
     }
 
     /// A parent finds the runs it spawned through the typed link, across

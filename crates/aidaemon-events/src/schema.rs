@@ -194,6 +194,17 @@ pub async fn migrate_events(pool: &SqlitePool) -> anyhow::Result<()> {
     }
     tx.commit().await?;
 
+    // `spawned_children` follows the typed `spawned_by` link of a run's
+    // start event. Without this index every lookup parses the JSON of every
+    // `task_start` row ever written, and a turn's handoff makes dozens.
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_events_spawned_by
+         ON events(json_extract(data, '$.spawned_by.task_id'))
+         WHERE event_type = 'task_start'",
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_events_consolidation
          ON events(consolidated_at) WHERE consolidated_at IS NULL",
